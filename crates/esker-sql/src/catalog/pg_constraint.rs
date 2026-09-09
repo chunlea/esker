@@ -43,6 +43,7 @@
 //! [`constraint_definition`] reverses it. Both are stable for as long as the column is, which is
 //! what a client that reads `c.oid` and then calls `pg_get_constraintdef(c.oid)` needs.
 
+use super::NO_LENGTH;
 use std::fmt::Write as _;
 
 use crate::backend::Txn;
@@ -760,19 +761,19 @@ fn not_null_of(oid: i64) -> Option<(u64, i16)> {
 }
 
 /// The columns of `pg_constraint`, in PostgreSQL's own order.
-pub const CONSTRAINT_COLUMNS: &[(&str, ColumnType)] = &[
-    ("oid", ColumnType::Int8),
-    ("conname", ColumnType::Name),
-    ("connamespace", ColumnType::Int8),
-    ("contype", ColumnType::Text),
-    ("condeferrable", ColumnType::Bool),
-    ("condeferred", ColumnType::Bool),
-    ("convalidated", ColumnType::Bool),
-    ("conrelid", ColumnType::Int8),
-    ("conindid", ColumnType::Int8),
-    ("confrelid", ColumnType::Int8),
-    ("confupdtype", ColumnType::Text),
-    ("confdeltype", ColumnType::Text),
+pub const CONSTRAINT_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    ("oid", ColumnType::Int8, NO_LENGTH),
+    ("conname", ColumnType::Name, NO_LENGTH),
+    ("connamespace", ColumnType::Int8, NO_LENGTH),
+    ("contype", ColumnType::Text, NO_LENGTH),
+    ("condeferrable", ColumnType::Bool, NO_LENGTH),
+    ("condeferred", ColumnType::Bool, NO_LENGTH),
+    ("convalidated", ColumnType::Bool, NO_LENGTH),
+    ("conrelid", ColumnType::Int8, NO_LENGTH),
+    ("conindid", ColumnType::Int8, NO_LENGTH),
+    ("confrelid", ColumnType::Int8, NO_LENGTH),
+    ("confupdtype", ColumnType::Text, NO_LENGTH),
+    ("confdeltype", ColumnType::Text, NO_LENGTH),
     // **`smallint[]`, which is what they are on a real server** — measured:
     // `pg_typeof(conkey)` is `smallint[]` and `pg_typeof(conkey[1])` is `smallint`. They were
     // `text` holding the same characters, which read back the same for `SELECT conkey` and was
@@ -783,11 +784,11 @@ pub const CONSTRAINT_COLUMNS: &[(&str, ColumnType)] = &[
     // **`pg_index.indkey` is not this type and stays text**: it is an `int2vector`, which prints
     // `1 2` rather than `{1,2}` and is subscripted from **zero**. Two shapes that look alike, and
     // `tests/corpus/pg19_catalog_vectors.txt` is the file that keeps them apart.
-    ("conkey", ColumnType::Int2Array),
-    ("confkey", ColumnType::Int2Array),
+    ("conkey", ColumnType::Int2Array, NO_LENGTH),
+    ("confkey", ColumnType::Int2Array, NO_LENGTH),
     // **Last**, the rule every column list in this crate follows: `SELECT *` expands in declared
     // order. The **domain** a constraint belongs to, and 0 for one on a table — a `CHECK` written
     // on a domain has a `pg_constraint` row of its own there, with `conrelid` 0 and this set
     // ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)).
-    ("contypid", ColumnType::Int8),
+    ("contypid", ColumnType::Int8, NO_LENGTH),
 ];

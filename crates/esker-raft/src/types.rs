@@ -500,3 +500,35 @@ mod tests {
         assert_eq!(large.cost() - small.cost(), 100);
     }
 }
+
+/// **What a node's elections have done, counted rather than logged.**
+///
+/// A stall in a three-voter group is a race between a tick, a message and an election timeout, and
+/// the window is small enough that logging each event displaces it — measured: a promotion stall
+/// that reproduces one run in ten under load passed 4 of 4 with `RUST_LOG=esker_raft=debug` on. A
+/// counter costs an add and is read once at the end, so it can be present while the race is.
+///
+/// Every field is monotonic and none is reset by a term change or a role change: what a reader
+/// wants to know is what the node did over the *whole* run, not since the last thing that went
+/// wrong.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Counters {
+    /// Pre-vote rounds entered.
+    pub campaigns_pre: u64,
+    /// Real campaigns entered — each one adopts a term, so this is the term ladder's height.
+    pub campaigns_real: u64,
+    /// `RequestVote` messages sent, both kinds.
+    pub vote_requests_sent: u64,
+    /// `RequestVoteResponse` messages sent, both kinds.
+    pub vote_responses_sent: u64,
+    /// Of those, the ones that granted.
+    pub vote_responses_granted: u64,
+    /// Responses **dropped on arrival** because the round they answer is over: this node is no
+    /// longer a candidate, or it is running the other kind of round. A large number here against a
+    /// small `campaigns_real` is the signature of votes that keep arriving too late — the shape a
+    /// slow delivery under load produces, and one no log line at `warn` would show.
+    pub vote_responses_ignored: u64,
+    /// Times a leader stood down because `check_quorum` found no majority contact within an
+    /// election timeout.
+    pub check_quorum_step_downs: u64,
+}

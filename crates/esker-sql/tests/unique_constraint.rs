@@ -16,9 +16,6 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `information_schema` reports `name` and `character varying(3)` where this node answers `text` — the trade every catalog column makes, with identical values. The row agrees, `is_deferrable` and `initially_deferred` included, which is what this unit changed: they were hardcoded `NO` while nothing could be deferred.
     types: &[
-        "SELECT 'r', constraint_name, constraint_type, is_deferrable, initially_deferred FROM \
-         information_schema.table_constraints WHERE table_name = 'test_unique_constraints' ORDER BY \
-         constraint_name",
         // `pg_constraint.conname` is a `name` there and `text` here, and `pg_typeof` answers a
         // `regtype` where this node says `text` — the two standing catalog trades. These lines
         // were **swallowed by an aborted block** until `ALTER TABLE … ADD CONSTRAINT … UNIQUE`

@@ -1,5 +1,10 @@
 # Debts still open at v1
 
+> **Superseded for anything after v1: [`debts-v1.1.md`](debts-v1.1.md).** It carries #4 forward —
+> still the only row of the original eight that is open — and numbers what came after it from #9,
+> so a number quoted from either file means one thing. This file is the v1 record and stops here.
+
+
 **Status: one of the original eight is still open — #4.** Everything else has been
 closed and moved to §2 with the commit that closed it, and the numbers are quoted across lanes, so
 a closed row leaves a **gap** rather than renumbering the rows after it. Each remaining row names

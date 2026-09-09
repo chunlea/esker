@@ -221,9 +221,15 @@ async fn put(stores: &[&Arc<Store>], key: Bytes, value: &[u8]) {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
+                // **The counters, on the same line as the state they explain.** A term ladder
+                // with no ignored responses is a split vote; one with many is delivery arriving
+                // after the round it answers. The state alone cannot tell those apart, and turning
+                // tracing up stops the stall reproducing.
+                let counters = peer.counters().await.ok();
                 seen.push(format!(
                     "store {id}: region {region_id} term={} is_leader={} believes_leader={:?} \
-                     raft_role={role} voted_for={voted_for:?}; membership [{membership}]",
+                     raft_role={role} voted_for={voted_for:?}; membership [{membership}]; \
+                     elections {counters:?}",
                     peer.term(),
                     peer.is_leader(),
                     peer.leader()
@@ -420,6 +426,38 @@ fn one_peer_per_store(region: &Region) {
     }
 }
 
+/// Every store's election counters for `region`, as one line.
+///
+/// The four numbers that separate the hypotheses this stall has left: `campaigns_real` is the term
+/// ladder's height, `ignored` counts vote responses that arrived after the round they answer had
+/// ended — the signature of delivery that is late rather than lost — and `step_downs` counts a
+/// leader standing down because `check_quorum` found no majority contact. A region with no leader
+/// and no ignored responses and no step-downs is a region nobody is campaigning for, which is a
+/// different problem again.
+async fn election_counters(all: &[&Node], region_id: u64) -> String {
+    let mut out = Vec::new();
+    for node in all {
+        let Some(peer) = node.store.peer_of(region_id) else {
+            continue;
+        };
+        let Ok(counters) = peer.counters().await else {
+            continue;
+        };
+        out.push(format!(
+            "store {}: pre={} real={} sent={} answered={} granted={} ignored={} step_downs={}",
+            node.store.store_id(),
+            counters.campaigns_pre,
+            counters.campaigns_real,
+            counters.vote_requests_sent,
+            counters.vote_responses_sent,
+            counters.vote_responses_granted,
+            counters.vote_responses_ignored,
+            counters.check_quorum_step_downs,
+        ));
+    }
+    out.join("; ")
+}
+
 /// What whichever store leads `region` believes about `peer`, or why nobody could say.
 ///
 /// [`esker_store::RaftPeer::progress`] answers with the leader's `Progress` table and is **empty
@@ -559,11 +597,16 @@ async fn watch_until_every_learner_votes(
                             // `RaftPeer::progress` is empty unless the peer leads, so asking all
                             // three and keeping what answers finds the leader without naming it.
                             let believed = leader_progress(all, region.id, peer.peer_id).await;
+                            // **Counted, not traced.** Four sightings of this stall share one
+                            // state — a region with no leader for tens of seconds — and turning
+                            // `esker_raft` up to `debug` made it stop reproducing, four runs of
+                            // four. These are cheap enough to leave on while the race is on.
+                            let elections = election_counters(all, region.id).await;
                             panic!(
                                 "peer {} of region {} has been a learner for {:?} — the phase-4 \
                                  acceptance stall. the placement driver holds {:?} at epoch {:?}, \
                                  led by peer {}. the learner's own store says: {theirs:?}. the \
-                                 leader believes: {believed}",
+                                 leader believes: {believed}. elections: {elections}",
                                 peer.peer_id,
                                 region.id,
                                 since.elapsed(),

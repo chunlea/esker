@@ -39,6 +39,7 @@
 //! real server, which is the divergence `tests/pg_catalog.rs` declares: there are no roles here,
 //! and a computed relation has nothing to write to.
 
+use super::NO_LENGTH;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -510,6 +511,15 @@ impl CatalogView {
     /// is a divergence in the honest direction: a column answered with a value nobody measured
     /// would be a wrong answer, and one refused by name is a gap a capture closes.
     ///
+    /// **The third element is the length the column declares**, PostgreSQL's `atttypmod`, and it
+    /// is `catalog::NO_LENGTH` — a spelling of `value::NO_TYPMOD` — for all but one family: `information_schema`'s `yes_or_no` columns
+    /// are a domain over `character varying(3)`. Measured, and the measurement is why the slot
+    /// exists rather than a constant beside it — **no `pg_catalog` column has a typmod at all** on
+    /// a real server (`atttypmod` is `-1` for every one of them), and of `information_schema`'s
+    /// five domains only `yes_or_no` and `time_stamp`, which no view here serves, carry one. So
+    /// the slot is worth six columns and the honesty of the other 269: a column list that could
+    /// not say "no length" was not saying anything.
+    ///
     /// The types are this node's own. A real server's `pg_type.oid` is `oid`, `typname` is `name`,
     /// `typdelim` and `typtype` are `"char"` and `typinput` is `regproc`; this node has none of
     /// those four, so an `oid` is a `bigint` and the other three are `text`. The *values* are
@@ -520,90 +530,90 @@ impl CatalogView {
         reason = "one arm per view, each the column list a client reads; splitting it would put \
                   half the catalog's vocabulary somewhere else"
     )]
-    pub fn columns(self) -> &'static [(&'static str, ColumnType)] {
+    pub fn columns(self) -> &'static [(&'static str, ColumnType, i32)] {
         match self {
             CatalogView::PgType => &[
-                ("oid", ColumnType::Int8),
-                ("typname", ColumnType::Name),
-                ("typelem", ColumnType::Int8),
-                ("typdelim", ColumnType::Text),
-                ("typinput", ColumnType::Text),
-                ("typtype", ColumnType::Text),
-                ("typbasetype", ColumnType::Int8),
+                ("oid", ColumnType::Int8, NO_LENGTH),
+                ("typname", ColumnType::Name, NO_LENGTH),
+                ("typelem", ColumnType::Int8, NO_LENGTH),
+                ("typdelim", ColumnType::Text, NO_LENGTH),
+                ("typinput", ColumnType::Text, NO_LENGTH),
+                ("typtype", ColumnType::Text, NO_LENGTH),
+                ("typbasetype", ColumnType::Int8, NO_LENGTH),
                 // **Last**, because `SELECT *` expands in this order (`7be39ca`) and a column
                 // added anywhere else would move every one after it. Read only by
                 // `ActiveRecord`'s `columns()`, and only as `a.attcollation <> t.typcollation`
                 // — see `CatalogView::PgCollation`.
-                ("typcollation", ColumnType::Int8),
+                ("typcollation", ColumnType::Int8, NO_LENGTH),
                 // **Last for the same reason**, and added for boot statement 26, which joins
                 // `pg_type` to `pg_namespace` on it to find a schema's enum types. Every type here
                 // reports the one namespace this node has, exactly as every relation's
                 // `relnamespace` does; on a real server they are in `pg_catalog`, which is a
                 // difference in the schema model and not in this column
                 // (`PUBLIC_NAMESPACE_OID`).
-                ("typnamespace", ColumnType::Int8),
+                ("typnamespace", ColumnType::Int8, NO_LENGTH),
                 // **Last again**, and for the third time the reason is `SELECT *`'s order. Two
                 // columns three captures wanted and none of them could get: `typlen` is the
                 // width in bytes, `-1` for a varlena, and `typcategory` is PostgreSQL's coarse
                 // grouping. Both are derived — the width from `PgType::type_len`, the category
                 // from a match a new type has to answer — so neither can drift from the type it
                 // describes.
-                ("typlen", ColumnType::Int2),
-                ("typcategory", ColumnType::Text),
+                ("typlen", ColumnType::Int2, NO_LENGTH),
+                ("typcategory", ColumnType::Text, NO_LENGTH),
                 // **Last for the fourth time**, and the reason has not changed. `typarray` is the
                 // oid of the array type paired with this one — a user-defined type gets one made
                 // for it by `CREATE TYPE`, with no statement asking — and `typrelid` is the
                 // `pg_class` row a **composite** owns and every other type reports as `0`.
-                ("typarray", ColumnType::Int8),
-                ("typrelid", ColumnType::Int8),
+                ("typarray", ColumnType::Int8, NO_LENGTH),
+                ("typrelid", ColumnType::Int8, NO_LENGTH),
                 // **Last for the fifth time.** A **domain**'s two: whether it refuses a NULL and
                 // the `DEFAULT` expression it prints back (ADR 0065). Every other type answers
                 // `f` and NULL, which is what a real server reports for one — these describe a
                 // constraint a domain carries and nothing else can.
-                ("typnotnull", ColumnType::Bool),
-                ("typdefault", ColumnType::Text),
+                ("typnotnull", ColumnType::Bool, NO_LENGTH),
+                ("typdefault", ColumnType::Text, NO_LENGTH),
             ],
             // No `oid`: see the module note. It is what keeps `ON oid = rngtypid` unambiguous.
             CatalogView::PgRange => &[
-                ("rngtypid", ColumnType::Int8),
-                ("rngsubtype", ColumnType::Int8),
+                ("rngtypid", ColumnType::Int8, NO_LENGTH),
+                ("rngsubtype", ColumnType::Int8, NO_LENGTH),
             ],
             // Exactly the five `ActiveRecord` reads. `relname` and `nspname` are `name` on a real
             // server — the 64-byte identifier type — and `text` here, which compares identically.
             CatalogView::PgClass => &[
-                ("oid", ColumnType::Int8),
-                ("relname", ColumnType::Name),
-                ("relnamespace", ColumnType::Int8),
-                ("relkind", ColumnType::Text),
-                ("relhastriggers", ColumnType::Bool),
+                ("oid", ColumnType::Int8, NO_LENGTH),
+                ("relname", ColumnType::Name, NO_LENGTH),
+                ("relnamespace", ColumnType::Int8, NO_LENGTH),
+                ("relkind", ColumnType::Text, NO_LENGTH),
+                ("relhastriggers", ColumnType::Bool, NO_LENGTH),
                 // Added for declarative partitioning. `relispartition` says the relation *is* a
                 // partition, `relhassubclass` that something inherits from or partitions it, and
                 // `relpartbound` holds the bound `pg_get_expr` prints.
-                ("relispartition", ColumnType::Bool),
-                ("relhassubclass", ColumnType::Bool),
-                ("relpartbound", ColumnType::Text),
+                ("relispartition", ColumnType::Bool, NO_LENGTH),
+                ("relhassubclass", ColumnType::Bool, NO_LENGTH),
+                ("relpartbound", ColumnType::Text, NO_LENGTH),
                 // **Last**, because `SELECT *` expands in this order. The access method of an
                 // index and **zero** for everything else, which is what a real server reports for
                 // a table — the join `pg_am am ON am.oid = i.relam` then finds nothing for one,
                 // which is how a client filters indexes by method.
-                ("relam", ColumnType::Int8),
+                ("relam", ColumnType::Int8, NO_LENGTH),
                 // **Last again.** A `"char"` on a real server and `text` here, with the same
                 // single character in it. The one column that tells an `UNLOGGED` table from an
                 // ordinary one — `information_schema.tables` calls both `BASE TABLE`, so a client
                 // that reads the standard view cannot see persistence at all.
-                ("relpersistence", ColumnType::Text),
+                ("relpersistence", ColumnType::Text, NO_LENGTH),
                 // **Last again**, for the same reason. `t` for every relation that is not a
                 // materialized view — measured, a real server reports `relispopulated = t` for an
                 // ordinary table — and `f` only for one created `WITH NO DATA` and not yet
                 // refreshed (ADR 0064).
-                ("relispopulated", ColumnType::Bool),
+                ("relispopulated", ColumnType::Bool, NO_LENGTH),
             ],
             // Exactly the three a client reads. `amname` is a `name` on a real server and `amtype`
             // a `"char"`; both are `text` here, the trade every `pg_catalog` column makes.
             CatalogView::PgAm => &[
-                ("oid", ColumnType::Int8),
-                ("amname", ColumnType::Name),
-                ("amtype", ColumnType::Text),
+                ("oid", ColumnType::Int8, NO_LENGTH),
+                ("amname", ColumnType::Name, NO_LENGTH),
+                ("amtype", ColumnType::Text, NO_LENGTH),
             ],
             // Exactly the five a client reads of it. `opcname` is a `name` on a real server and
             // `opcdefault` a boolean; the three oids are `oid` there and this node's own types
@@ -615,27 +625,30 @@ impl CatalogView {
             // one representation where a `bigint` beside one is not (ADR 0077). `castcontext` and
             // `castmethod` are `"char"` there and `text` here, which is the trade unchanged.
             CatalogView::PgCast => &[
-                ("castsource", ColumnType::Oid),
-                ("casttarget", ColumnType::Oid),
-                ("castcontext", ColumnType::Text),
-                ("castmethod", ColumnType::Text),
+                ("castsource", ColumnType::Oid, NO_LENGTH),
+                ("casttarget", ColumnType::Oid, NO_LENGTH),
+                ("castcontext", ColumnType::Text, NO_LENGTH),
+                ("castmethod", ColumnType::Text, NO_LENGTH),
             ],
             CatalogView::PgOpclass => &[
-                ("oid", ColumnType::Int8),
-                ("opcname", ColumnType::Name),
-                ("opcmethod", ColumnType::Int8),
-                ("opcintype", ColumnType::Int8),
-                ("opcdefault", ColumnType::Bool),
+                ("oid", ColumnType::Int8, NO_LENGTH),
+                ("opcname", ColumnType::Name, NO_LENGTH),
+                ("opcmethod", ColumnType::Int8, NO_LENGTH),
+                ("opcintype", ColumnType::Int8, NO_LENGTH),
+                ("opcdefault", ColumnType::Bool, NO_LENGTH),
             ],
             // `cfgname` is a `name` on a real server, `text` here — the trade every `pg_catalog`
             // column makes. `cfgnamespace` is the oid a client joins to `pg_namespace`, which is
             // exactly what the capture's query does.
             CatalogView::PgTsConfig => &[
-                ("oid", ColumnType::Int8),
-                ("cfgname", ColumnType::Name),
-                ("cfgnamespace", ColumnType::Int8),
+                ("oid", ColumnType::Int8, NO_LENGTH),
+                ("cfgname", ColumnType::Name, NO_LENGTH),
+                ("cfgnamespace", ColumnType::Int8, NO_LENGTH),
             ],
-            CatalogView::PgNamespace => &[("oid", ColumnType::Int8), ("nspname", ColumnType::Name)],
+            CatalogView::PgNamespace => &[
+                ("oid", ColumnType::Int8, NO_LENGTH),
+                ("nspname", ColumnType::Name, NO_LENGTH),
+            ],
             // In PostgreSQL's own order, restricted to what this node has — `SELECT *` expands in
             // that order and a client reading by position would otherwise read the wrong column.
             // `attnum` is an `int2` and `atttypmod` an `int4` on both servers, which is two fewer
@@ -644,48 +657,49 @@ impl CatalogView {
             CatalogView::PgAttrdef => super::pg_attribute::ATTRDEF_COLUMNS,
             CatalogView::PgIndex => super::pg_index::INDEX_COLUMNS,
             CatalogView::PgConstraint => super::pg_constraint::CONSTRAINT_COLUMNS,
-            CatalogView::PgCollation => {
-                &[("oid", ColumnType::Int8), ("collname", ColumnType::Name)]
-            }
+            CatalogView::PgCollation => &[
+                ("oid", ColumnType::Int8, NO_LENGTH),
+                ("collname", ColumnType::Name, NO_LENGTH),
+            ],
             // Exactly the two `ActiveRecord` reads of each, which is this module's standing rule:
             // a column it does not read is `42703`, the answer a real server gives for a name that
             // is not a column at all, rather than a value nobody measured. `extname` is a `name`
             // and the three oids are `oid` on a real server; all four are this node's own types.
             CatalogView::PgExtension => &[
-                ("extname", ColumnType::Name),
-                ("extnamespace", ColumnType::Int8),
+                ("extname", ColumnType::Name, NO_LENGTH),
+                ("extnamespace", ColumnType::Int8, NO_LENGTH),
                 // Added for `CREATE EXTENSION`, which is where a version comes from: the one the
                 // build offers as `default_version`, not one the statement chooses.
-                ("extversion", ColumnType::Text),
+                ("extversion", ColumnType::Text, NO_LENGTH),
             ],
             // `inhseqno` numbers a child's parents from **1**, in the order the `INHERITS` clause
             // wrote them — measured, and it is what tells multiple inheritance apart.
             CatalogView::PgInherits => &[
-                ("inhrelid", ColumnType::Int8),
-                ("inhparent", ColumnType::Int8),
-                ("inhseqno", ColumnType::Int4),
+                ("inhrelid", ColumnType::Int8, NO_LENGTH),
+                ("inhparent", ColumnType::Int8, NO_LENGTH),
+                ("inhseqno", ColumnType::Int4, NO_LENGTH),
             ],
             // What the capture reads, and `prosrc` because its **length** is how a client checks
             // the body survived. `prokind` is `f` and `provolatile` `v`, both `"char"` on a real
             // server and `text` here.
             CatalogView::PgLanguage => &[
-                ("oid", ColumnType::Int8),
-                ("lanname", ColumnType::Name),
-                ("lanpltrusted", ColumnType::Bool),
+                ("oid", ColumnType::Int8, NO_LENGTH),
+                ("lanname", ColumnType::Name, NO_LENGTH),
+                ("lanpltrusted", ColumnType::Bool, NO_LENGTH),
             ],
             CatalogView::PgProc => &[
-                ("oid", ColumnType::Int8),
-                ("proname", ColumnType::Name),
-                ("pronamespace", ColumnType::Int8),
-                ("prokind", ColumnType::Text),
-                ("pronargs", ColumnType::Int2),
-                ("provolatile", ColumnType::Text),
-                ("prosrc", ColumnType::Text),
+                ("oid", ColumnType::Int8, NO_LENGTH),
+                ("proname", ColumnType::Name, NO_LENGTH),
+                ("pronamespace", ColumnType::Int8, NO_LENGTH),
+                ("prokind", ColumnType::Text, NO_LENGTH),
+                ("pronargs", ColumnType::Int2, NO_LENGTH),
+                ("provolatile", ColumnType::Text, NO_LENGTH),
+                ("prosrc", ColumnType::Text, NO_LENGTH),
                 // **An oid, not the name.** `pg_language.oid = pg_proc.prolang` is the join
                 // every client writes to learn a function's language, and a `text` here made it
                 // `42883 operator does not exist: bigint = text` — a join that reads as a type
                 // error about a catalog rather than as a missing column.
-                ("prolang", ColumnType::Int8),
+                ("prolang", ColumnType::Int8, NO_LENGTH),
                 // `oidvector` on a real server: the argument types, space separated. Rendered as
                 // text here, which is order-sensitive and so compares exactly as an `oidvector`
                 // does — the same trade `regtype` and `name` make in every other view.
@@ -697,51 +711,51 @@ impl CatalogView {
                 // **`oidvector`** — the type the `::oidvector` cast beside it already names,
                 // and the one `ActiveRecord` compares against in
                 // `can_perform_case_insensitive_comparison_for?` (ADR 0077).
-                ("proargtypes", ColumnType::OidVector),
+                ("proargtypes", ColumnType::OidVector, NO_LENGTH),
             ],
             // `tgenabled` is a **letter** and `tgtype` a bitmask, neither of which is the word the
             // DDL used.
             CatalogView::PgTrigger => &[
-                ("oid", ColumnType::Int8),
-                ("tgrelid", ColumnType::Int8),
-                ("tgname", ColumnType::Name),
-                ("tgenabled", ColumnType::Text),
-                ("tgtype", ColumnType::Int2),
-                ("tgnargs", ColumnType::Int2),
-                ("tgisinternal", ColumnType::Bool),
-                ("tgfoid", ColumnType::Int8),
+                ("oid", ColumnType::Int8, NO_LENGTH),
+                ("tgrelid", ColumnType::Int8, NO_LENGTH),
+                ("tgname", ColumnType::Name, NO_LENGTH),
+                ("tgenabled", ColumnType::Text, NO_LENGTH),
+                ("tgtype", ColumnType::Int2, NO_LENGTH),
+                ("tgnargs", ColumnType::Int2, NO_LENGTH),
+                ("tgisinternal", ColumnType::Bool, NO_LENGTH),
+                ("tgfoid", ColumnType::Int8, NO_LENGTH),
             ],
             // `schemaname` and `tablespace` are what a real server's view has and this node has
             // neither concept: one schema, and no tablespaces — `public` and NULL, which is what
             // a real server answers for an index in the default tablespace too.
             CatalogView::PgIndexes => &[
-                ("schemaname", ColumnType::Name),
-                ("tablename", ColumnType::Name),
-                ("indexname", ColumnType::Name),
-                ("tablespace", ColumnType::Name),
-                ("indexdef", ColumnType::Text),
+                ("schemaname", ColumnType::Name, NO_LENGTH),
+                ("tablename", ColumnType::Name, NO_LENGTH),
+                ("indexname", ColumnType::Name, NO_LENGTH),
+                ("tablespace", ColumnType::Name, NO_LENGTH),
+                ("indexdef", ColumnType::Text, NO_LENGTH),
             ],
             // **`viewowner` is here and is empty**, because this node has no roles: the column has
             // to exist for `SELECT * FROM pg_views` to have PostgreSQL's shape, and a name
             // invented for it would be a user nobody created.
             CatalogView::PgViews => &[
-                ("schemaname", ColumnType::Name),
-                ("viewname", ColumnType::Name),
-                ("viewowner", ColumnType::Name),
-                ("definition", ColumnType::Text),
+                ("schemaname", ColumnType::Name, NO_LENGTH),
+                ("viewname", ColumnType::Name, NO_LENGTH),
+                ("viewowner", ColumnType::Name, NO_LENGTH),
+                ("definition", ColumnType::Text, NO_LENGTH),
             ],
             // A real server's order, so `SELECT *` expands the way a client expects.
             // `matviewowner` and `tablespace` are empty here for the same reason `viewowner` is:
             // this node has neither roles nor tablespaces, and a name invented for one would be an
             // object nobody created.
             CatalogView::PgMatviews => &[
-                ("schemaname", ColumnType::Name),
-                ("matviewname", ColumnType::Name),
-                ("matviewowner", ColumnType::Name),
-                ("tablespace", ColumnType::Name),
-                ("hasindexes", ColumnType::Bool),
-                ("ispopulated", ColumnType::Bool),
-                ("definition", ColumnType::Text),
+                ("schemaname", ColumnType::Name, NO_LENGTH),
+                ("matviewname", ColumnType::Name, NO_LENGTH),
+                ("matviewowner", ColumnType::Name, NO_LENGTH),
+                ("tablespace", ColumnType::Name, NO_LENGTH),
+                ("hasindexes", ColumnType::Bool, NO_LENGTH),
+                ("ispopulated", ColumnType::Bool, NO_LENGTH),
+                ("definition", ColumnType::Text, NO_LENGTH),
             ],
             // **All twenty-two, in a real server's order**, because `SELECT *` on this view is
             // what a client writes and the column *after* the one it wanted has to be where it
@@ -754,22 +768,22 @@ impl CatalogView {
             // node does not have, and `transactionid` is an `int8` here carrying the holder's
             // start timestamp, which is the identity a waiter is waiting for.
             CatalogView::PgLocks => &[
-                ("locktype", ColumnType::Text),
-                ("database", ColumnType::Oid),
-                ("relation", ColumnType::Oid),
-                ("page", ColumnType::Int4),
-                ("tuple", ColumnType::Int2),
-                ("virtualxid", ColumnType::Text),
-                ("transactionid", ColumnType::Int8),
-                ("classid", ColumnType::Oid),
-                ("objid", ColumnType::Oid),
-                ("objsubid", ColumnType::Int2),
-                ("virtualtransaction", ColumnType::Text),
-                ("pid", ColumnType::Int4),
-                ("mode", ColumnType::Text),
-                ("granted", ColumnType::Bool),
-                ("fastpath", ColumnType::Bool),
-                ("waitstart", ColumnType::TimestampTz),
+                ("locktype", ColumnType::Text, NO_LENGTH),
+                ("database", ColumnType::Oid, NO_LENGTH),
+                ("relation", ColumnType::Oid, NO_LENGTH),
+                ("page", ColumnType::Int4, NO_LENGTH),
+                ("tuple", ColumnType::Int2, NO_LENGTH),
+                ("virtualxid", ColumnType::Text, NO_LENGTH),
+                ("transactionid", ColumnType::Int8, NO_LENGTH),
+                ("classid", ColumnType::Oid, NO_LENGTH),
+                ("objid", ColumnType::Oid, NO_LENGTH),
+                ("objsubid", ColumnType::Int2, NO_LENGTH),
+                ("virtualtransaction", ColumnType::Text, NO_LENGTH),
+                ("pid", ColumnType::Int4, NO_LENGTH),
+                ("mode", ColumnType::Text, NO_LENGTH),
+                ("granted", ColumnType::Bool, NO_LENGTH),
+                ("fastpath", ColumnType::Bool, NO_LENGTH),
+                ("waitstart", ColumnType::TimestampTz, NO_LENGTH),
             ],
             // **`pg_roles` and `pg_authid` are the same rows.** On a real server `pg_roles` is a
             // view over `pg_authid` that replaces the password with `********` and is readable by
@@ -777,18 +791,18 @@ impl CatalogView {
             // enforces no privilege, so the two differ in exactly one column and that is honest
             // rather than lazy: `rolpassword` is NULL here either way.
             CatalogView::PgRoles | CatalogView::PgAuthid => &[
-                ("oid", ColumnType::Oid),
-                ("rolname", ColumnType::Name),
-                ("rolsuper", ColumnType::Bool),
-                ("rolinherit", ColumnType::Bool),
-                ("rolcreaterole", ColumnType::Bool),
-                ("rolcreatedb", ColumnType::Bool),
-                ("rolcanlogin", ColumnType::Bool),
-                ("rolreplication", ColumnType::Bool),
-                ("rolbypassrls", ColumnType::Bool),
-                ("rolconnlimit", ColumnType::Int4),
-                ("rolpassword", ColumnType::Text),
-                ("rolvaliduntil", ColumnType::TimestampTz),
+                ("oid", ColumnType::Oid, NO_LENGTH),
+                ("rolname", ColumnType::Name, NO_LENGTH),
+                ("rolsuper", ColumnType::Bool, NO_LENGTH),
+                ("rolinherit", ColumnType::Bool, NO_LENGTH),
+                ("rolcreaterole", ColumnType::Bool, NO_LENGTH),
+                ("rolcreatedb", ColumnType::Bool, NO_LENGTH),
+                ("rolcanlogin", ColumnType::Bool, NO_LENGTH),
+                ("rolreplication", ColumnType::Bool, NO_LENGTH),
+                ("rolbypassrls", ColumnType::Bool, NO_LENGTH),
+                ("rolconnlimit", ColumnType::Int4, NO_LENGTH),
+                ("rolpassword", ColumnType::Text, NO_LENGTH),
+                ("rolvaliduntil", ColumnType::TimestampTz, NO_LENGTH),
             ],
             // Eight columns in PostgreSQL 19's order, from `\d pg_prepared_statements`.
             // `parameter_types` and `result_types` are `regtype[]` there and here, and they spell
@@ -800,90 +814,90 @@ impl CatalogView {
                 // one, measured off `pg_type` rather than read off the column's spelling. A
                 // prepared statement's name is a client's string and not an identifier: it can be
                 // longer than 63 characters and is not truncated.
-                ("name", ColumnType::Text),
-                ("statement", ColumnType::Text),
-                ("prepare_time", ColumnType::TimestampTz),
-                ("parameter_types", ColumnType::RegTypeArray),
-                ("result_types", ColumnType::RegTypeArray),
-                ("from_sql", ColumnType::Bool),
-                ("generic_plans", ColumnType::Int8),
-                ("custom_plans", ColumnType::Int8),
+                ("name", ColumnType::Text, NO_LENGTH),
+                ("statement", ColumnType::Text, NO_LENGTH),
+                ("prepare_time", ColumnType::TimestampTz, NO_LENGTH),
+                ("parameter_types", ColumnType::RegTypeArray, NO_LENGTH),
+                ("result_types", ColumnType::RegTypeArray, NO_LENGTH),
+                ("from_sql", ColumnType::Bool, NO_LENGTH),
+                ("generic_plans", ColumnType::Int8, NO_LENGTH),
+                ("custom_plans", ColumnType::Int8, NO_LENGTH),
             ],
             CatalogView::PgStatActivity => &[
-                ("datid", ColumnType::Oid),
-                ("datname", ColumnType::Name),
-                ("pid", ColumnType::Int4),
-                ("leader_pid", ColumnType::Int4),
-                ("usesysid", ColumnType::Oid),
-                ("usename", ColumnType::Name),
-                ("application_name", ColumnType::Text),
-                ("client_addr", ColumnType::Text),
-                ("client_hostname", ColumnType::Text),
-                ("client_port", ColumnType::Int4),
-                ("backend_start", ColumnType::TimestampTz),
-                ("xact_start", ColumnType::TimestampTz),
-                ("query_start", ColumnType::TimestampTz),
-                ("state_change", ColumnType::TimestampTz),
-                ("wait_event_type", ColumnType::Text),
-                ("wait_event", ColumnType::Text),
-                ("state", ColumnType::Text),
-                ("backend_xid", ColumnType::Int8),
-                ("backend_xmin", ColumnType::Int8),
-                ("query_id", ColumnType::Int8),
-                ("query", ColumnType::Text),
-                ("backend_type", ColumnType::Text),
+                ("datid", ColumnType::Oid, NO_LENGTH),
+                ("datname", ColumnType::Name, NO_LENGTH),
+                ("pid", ColumnType::Int4, NO_LENGTH),
+                ("leader_pid", ColumnType::Int4, NO_LENGTH),
+                ("usesysid", ColumnType::Oid, NO_LENGTH),
+                ("usename", ColumnType::Name, NO_LENGTH),
+                ("application_name", ColumnType::Text, NO_LENGTH),
+                ("client_addr", ColumnType::Text, NO_LENGTH),
+                ("client_hostname", ColumnType::Text, NO_LENGTH),
+                ("client_port", ColumnType::Int4, NO_LENGTH),
+                ("backend_start", ColumnType::TimestampTz, NO_LENGTH),
+                ("xact_start", ColumnType::TimestampTz, NO_LENGTH),
+                ("query_start", ColumnType::TimestampTz, NO_LENGTH),
+                ("state_change", ColumnType::TimestampTz, NO_LENGTH),
+                ("wait_event_type", ColumnType::Text, NO_LENGTH),
+                ("wait_event", ColumnType::Text, NO_LENGTH),
+                ("state", ColumnType::Text, NO_LENGTH),
+                ("backend_xid", ColumnType::Int8, NO_LENGTH),
+                ("backend_xmin", ColumnType::Int8, NO_LENGTH),
+                ("query_id", ColumnType::Int8, NO_LENGTH),
+                ("query", ColumnType::Text, NO_LENGTH),
+                ("backend_type", ColumnType::Text, NO_LENGTH),
             ],
             // `partstrat` is a **one-letter code** and `partattrs` an `int2vector` — neither is
             // the word the DDL used, which `pg_get_partkeydef` gives instead.
             CatalogView::PgPartitionedTable => &[
-                ("partrelid", ColumnType::Int8),
-                ("partstrat", ColumnType::Text),
-                ("partnatts", ColumnType::Int2),
-                ("partattrs", ColumnType::Text),
+                ("partrelid", ColumnType::Int8, NO_LENGTH),
+                ("partstrat", ColumnType::Text, NO_LENGTH),
+                ("partnatts", ColumnType::Int2, NO_LENGTH),
+                ("partattrs", ColumnType::Text, NO_LENGTH),
             ],
             // The five a real server has, in its order. `name` is of type `name` there and the
             // four others are `text`; this node has one string type and answers `text` for all
             // five, which is the same trade every `pg_catalog` column makes.
             CatalogView::PgAvailableExtensions => &[
-                ("name", ColumnType::Name),
-                ("default_version", ColumnType::Text),
-                ("installed_version", ColumnType::Text),
-                ("location", ColumnType::Text),
-                ("comment", ColumnType::Text),
+                ("name", ColumnType::Name, NO_LENGTH),
+                ("default_version", ColumnType::Text, NO_LENGTH),
+                ("installed_version", ColumnType::Text, NO_LENGTH),
+                ("location", ColumnType::Text, NO_LENGTH),
+                ("comment", ColumnType::Text, NO_LENGTH),
             ],
             // `enumsortorder` is a `real` on a real server, which is the one place this view's
             // types are worth reading: the order is a float so a value can be inserted *between*
             // two others without renumbering.
             // The four the adapter reads, plus the `oid` every catalog relation carries.
             CatalogView::PgDatabase => &[
-                ("oid", ColumnType::Int8),
-                ("datname", ColumnType::Name),
-                ("encoding", ColumnType::Int4),
-                ("datcollate", ColumnType::Text),
-                ("datctype", ColumnType::Text),
+                ("oid", ColumnType::Int8, NO_LENGTH),
+                ("datname", ColumnType::Name, NO_LENGTH),
+                ("encoding", ColumnType::Int4, NO_LENGTH),
+                ("datcollate", ColumnType::Text, NO_LENGTH),
+                ("datctype", ColumnType::Text, NO_LENGTH),
             ],
             // PostgreSQL's own seven columns, in its own order. `classid`/`objid`/`objsubid`
             // name the **dependent** object and `refclassid`/`refobjid`/`refobjsubid` the one it
             // depends on — a sequence depending on the column it fills, which is the only
             // dependency this node records.
             CatalogView::PgDepend => &[
-                ("classid", ColumnType::Int8),
-                ("objid", ColumnType::Int8),
-                ("objsubid", ColumnType::Int4),
-                ("refclassid", ColumnType::Int8),
-                ("refobjid", ColumnType::Int8),
-                ("refobjsubid", ColumnType::Int4),
-                ("deptype", ColumnType::Text),
+                ("classid", ColumnType::Int8, NO_LENGTH),
+                ("objid", ColumnType::Int8, NO_LENGTH),
+                ("objsubid", ColumnType::Int4, NO_LENGTH),
+                ("refclassid", ColumnType::Int8, NO_LENGTH),
+                ("refobjid", ColumnType::Int8, NO_LENGTH),
+                ("refobjsubid", ColumnType::Int4, NO_LENGTH),
+                ("deptype", ColumnType::Text, NO_LENGTH),
             ],
             CatalogView::PgSequence => &[
-                ("seqrelid", ColumnType::Int8),
-                ("seqtypid", ColumnType::Int8),
-                ("seqstart", ColumnType::Int8),
-                ("seqincrement", ColumnType::Int8),
-                ("seqmax", ColumnType::Int8),
-                ("seqmin", ColumnType::Int8),
-                ("seqcache", ColumnType::Int8),
-                ("seqcycle", ColumnType::Bool),
+                ("seqrelid", ColumnType::Int8, NO_LENGTH),
+                ("seqtypid", ColumnType::Int8, NO_LENGTH),
+                ("seqstart", ColumnType::Int8, NO_LENGTH),
+                ("seqincrement", ColumnType::Int8, NO_LENGTH),
+                ("seqmax", ColumnType::Int8, NO_LENGTH),
+                ("seqmin", ColumnType::Int8, NO_LENGTH),
+                ("seqcache", ColumnType::Int8, NO_LENGTH),
+                ("seqcycle", ColumnType::Bool, NO_LENGTH),
             ],
             // `enumtypid` is an `oid`, here as on a real server, and for the reason
             // `pg_cast.castsource` is: it is what a `regtype` is compared against.
@@ -891,9 +905,9 @@ impl CatalogView {
             // labels, and an `oid` beside a `regtype` is one representation where a `bigint`
             // beside one is not (ADR 0077).
             CatalogView::PgEnum => &[
-                ("enumtypid", ColumnType::Oid),
-                ("enumlabel", ColumnType::Name),
-                ("enumsortorder", ColumnType::Real),
+                ("enumtypid", ColumnType::Oid, NO_LENGTH),
+                ("enumlabel", ColumnType::Name, NO_LENGTH),
+                ("enumsortorder", ColumnType::Real, NO_LENGTH),
             ],
             CatalogView::InformationSchemaTables => super::information_schema::TABLES_COLUMNS,
             CatalogView::InformationSchemaViews => super::information_schema::VIEWS_COLUMNS,
@@ -1190,12 +1204,17 @@ impl CatalogView {
                         columns: view
                             .columns()
                             .iter()
-                            .map(|(name, ty)| ColumnDef {
+                            .map(|(name, ty, typmod)| ColumnDef {
                                 collation: None,
                                 name: (*name).to_owned(),
                                 ty: *ty,
-                                // A computed relation declares no lengths.
-                                typmod: crate::value::NO_TYPMOD,
+                                // **The length its own column list declares.** "A computed
+                                // relation declares no lengths" stood here and was a property of
+                                // the list rather than of the relation: `information_schema`'s
+                                // `yes_or_no` columns are `character varying(3)` on a real
+                                // server, which is a domain's typmod and reaches a client through
+                                // this field.
+                                typmod: *typmod,
                                 default_expr: None,
                                 not_null: false,
                                 default: None,

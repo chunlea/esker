@@ -15,9 +15,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         // `information_schema`'s own domains — `name` and two `character varying(3)`s — are `text`
         // here, with identical characters. The trade every catalog column makes.
-        "SELECT 'r', constraint_name, constraint_type, is_deferrable, initially_deferred FROM \
-         information_schema.table_constraints WHERE table_name = 'test_exclusion_constraints' \
-         ORDER BY constraint_name",
         "SELECT 'r', daterange('2026-01-01','2026-02-01'), daterange('2026-01-01','2026-02-01') && \
          daterange('2026-02-01','2026-03-01'), daterange('2026-01-01','2026-02-01') && \
          daterange('2026-01-15','2026-03-01')",
