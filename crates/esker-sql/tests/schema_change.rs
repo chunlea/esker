@@ -42,11 +42,20 @@ impl Node {
             TENANT,
             esker_sql::session::register(),
         );
-        Node {
+        let mut node = Node {
             backend,
             catalog,
             executor,
-        }
+        };
+        // **These tests drive the change by hand, so the statement must not finish it.** A
+        // `CREATE INDEX CONCURRENTLY` answers its client when the build is done, the way
+        // PostgreSQL does (`tests/invalid_index.rs`) — and a state machine cannot be watched
+        // through a statement that has already run it to the end. `stage` is the other half of
+        // `esker.concurrent_index_build`: the job record is written and left for a driver, which
+        // is what `esker_schema_step` is and what every step below takes.
+        node.run("SET esker.concurrent_index_build = 'stage'")
+            .expect("the staged mode is a boot-value away");
+        node
     }
 
     fn run(&mut self, sql: &str) -> esker_sql::Result<Outcome> {

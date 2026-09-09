@@ -180,7 +180,7 @@ impl Cluster {
             gate: Arc::new(Gate::default()),
         });
         let catalog = Arc::new(Catalog::new());
-        Node {
+        let mut node = Node {
             executor: Executor::new(
                 Arc::clone(&backend) as Arc<dyn Backend>,
                 Arc::clone(&catalog),
@@ -194,7 +194,15 @@ impl Cluster {
             ),
             backend,
             catalog,
-        }
+        };
+        // **A job has to be orphanable to be re-driven.** A `CREATE INDEX CONCURRENTLY` now
+        // drives its own build and answers when it is finished, which is PostgreSQL's contract
+        // and leaves nothing behind for anybody to adopt (`tests/invalid_index.rs`). `stage` is
+        // the other half of `esker.concurrent_index_build`: the job is written and left, which is
+        // the node these tests are about — one that started a change and then died.
+        node.run("SET esker.concurrent_index_build = 'stage'")
+            .expect("the staged mode is a boot-value away");
+        node
     }
 }
 

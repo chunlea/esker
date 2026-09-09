@@ -285,6 +285,13 @@ state that guards it is skipped, which is what makes them tests of the rule rath
 - [x] 5 — **`CREATE INDEX` becomes the job.** `CONCURRENTLY` declares the index at `absent` and
   records a job; `esker_schema_step('<index>')` takes one step and says which; `SELECT * FROM
   esker_schema_jobs()` is the `psql`-visible progress.
+
+  > **Amended (phase 9, run 104 item 16): the statement drives its own job and answers when the
+  > change is over**, which is what PostgreSQL's client sees — including the `23505 could not
+  > create unique index "…"` that leaves an invalid index behind. The job, the states and the
+  > interval are unchanged; `esker.concurrent_index_build = 'stage'` is this row's behaviour under
+  > a name, and it is what the tests here drive by hand.
+  > [ADR 0083](../adr/0083-a-concurrent-build-answers-when-it-is-built.md).
 - [x] 4 — **the backfill as a resumable job.** Batched `[cursor, cursor + 256)` transactions with
   the cursor durable in the catalog, resume-not-restart across sessions, live DML converging with
   the backfill, and a `UNIQUE` duplicate failing the whole change and unwinding the states.

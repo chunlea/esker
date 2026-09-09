@@ -125,6 +125,11 @@ async fn a_job_orphaned_on_one_node_is_finished_by_the_other() {
         session
             .run(&format!("INSERT INTO t VALUES {}", values.join(", ")))
             .unwrap();
+        // Staged, so that there is a job to orphan: a driven build finishes inside the statement
+        // and leaves nothing for another node to adopt (`tests/invalid_index.rs`).
+        session
+            .run("SET esker.concurrent_index_build = 'stage'")
+            .unwrap();
         session
             .run("CREATE INDEX CONCURRENTLY ti ON t (a)")
             .unwrap();
