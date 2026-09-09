@@ -302,6 +302,14 @@ pub trait Txn: fmt::Debug + Send {
     /// that was `None`. Also no default, for the same reason.
     fn restore(&mut self, key: &[u8], prior: Buffered);
 
+    /// This transaction is no longer waiting for a row lock.
+    ///
+    /// **Required, with no default on purpose.** A wrapper that silently answered for this would
+    /// leave the wait-for graph naming a waiter that has stopped waiting, and the reader of that
+    /// graph is the deadlock detector — the failure is a `40P01` raised against a transaction in no
+    /// cycle at all, which is the shape this trait has produced twice already.
+    fn stop_waiting(&mut self);
+
     /// Whether this transaction already holds `key`'s row lock.
     ///
     /// [`Lock::Taken`] cannot answer this — it means "holds it now, **or held it already**" — and a
@@ -972,6 +980,11 @@ impl Txn for MemoryTxn {
                 self.read_ts.remove(key);
             }
         }
+    }
+
+    fn stop_waiting(&mut self) {
+        let id = self.id;
+        self.versions().row_locks.stop_waiting(id);
     }
 
     fn holds(&self, key: &[u8]) -> bool {

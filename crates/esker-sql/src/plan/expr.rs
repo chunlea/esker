@@ -2161,6 +2161,21 @@ impl Literal {
                     | ColumnType::Numeric
             ),
             Literal::Bool(_) => matches!(ty, ColumnType::Bool),
+            // **A `numeric` literal compares like any other number**, which is the set above and
+            // not what `fits` answers. `fits` is the *assignment* rule — what may be stored in a
+            // column of that type — and using it here would make `id = 9223372036854775808`
+            // against a `bigint` key `42883 operator does not exist: bigint = numeric`, where
+            // PostgreSQL promotes the column and answers false. An integer past `int8` is the only
+            // way to write this literal without a cast, and it is what `or_test.rb` sends.
+            Literal::Typed(value) if matches!(**value, Datum::Numeric(_)) => matches!(
+                ty,
+                ColumnType::Int8
+                    | ColumnType::Int4
+                    | ColumnType::Int2
+                    | ColumnType::Double
+                    | ColumnType::Real
+                    | ColumnType::Numeric
+            ),
             Literal::Typed(value) => value.fits(ty),
         }
     }
@@ -2396,6 +2411,38 @@ impl Literal {
                 )
             }
             Literal::Typed(value) if value.fits(ty) => Ok((**value).clone()),
+            // **A whole `numeric` into an integer column is an assignment that can overflow,
+            // and the overflow is the answer.** An integer literal past `int8` is a `numeric`
+            // (see `lower_value`), so `INSERT INTO t (a_bigint) VALUES (9223372036854775808)` is
+            // this arm — and on PostgreSQL it is `22003 bigint out of range`, measured: the
+            // literal is fine and *storing* it is not.
+            //
+            // **The literal's own three-word message**, which is a different sentence from the one
+            // the input function gives: PostgreSQL says `bigint out of range` for
+            // `VALUES (9223372036854775808)` and `value "9223372036854775808" is out of range for
+            // type bigint` for `VALUES ('9223372036854775808')`. Two paths, two messages, both
+            // measured — so the value is *read* through the column's input function and the
+            // refusal is written here.
+            //
+            // Whole numbers only. A fractional `numeric` in an integer column is a rounding
+            // assignment cast on a real server and neither this nor the `42804` below is that
+            // answer; it is left where it was rather than given a second wrong one.
+            Literal::Typed(value)
+                if matches!(**value, Datum::Numeric(_))
+                    && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+                    && value
+                        .to_text()
+                        .is_some_and(|text| !text.contains(['.', 'e', 'E'])) =>
+            {
+                let fits = value
+                    .to_text()
+                    .and_then(|text| Datum::from_text(ty, &text).ok());
+                fits.ok_or(SqlError::IntegerLiteralOutOfRange(match ty {
+                    ColumnType::Int2 => "smallint",
+                    ColumnType::Int4 => "integer",
+                    _ => "bigint",
+                }))
+            }
             // **An `ARRAY[…]`'s element type is settled by the column**, the way an integer
             // literal's is one level down. `ARRAY[1,2,3]` is `integer[]` on a real server and
             // `bigint[]` here — an integer literal is an `int8` in this crate until a column says
@@ -2610,13 +2657,21 @@ fn describe(expr: &Expr) -> &'static str {
 
 /// Which advisory-lock function was written.
 ///
-/// The **blocking** forms (`pg_advisory_lock`, `pg_advisory_lock_shared` and the `xact` family)
-/// are deliberately not here: they wait, and nothing in this node has anything to wait on — a
-/// `pg_try_advisory_lock` that cannot take the lock answers `false` instead. `ActiveRecord` sends
-/// only the two `try`/`unlock` shapes (`postgresql_adapter.rb:474`), so the blocking ones are
-/// refused by name in `crate::parse` rather than approximated by a spin.
+/// The two blocking forms wait: they poll the table on the statement's own clock and answer only
+/// once they hold the lock, which is what separates them from the `try` pair. They were refused by
+/// name until `connection_test.rb`'s *get and release advisory lock* turned up sending
+/// `pg_advisory_lock` — `ActiveRecord`'s migrator sends the `try` shape
+/// (`postgresql_adapter.rb:474`) and its connection tests do not.
+///
+/// The `xact` family (`pg_advisory_xact_lock` and friends) is still refused by name: those are
+/// released by the *transaction* ending rather than by an unlock, which is a lifetime this table
+/// does not model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdvisoryCall {
+    /// `pg_advisory_lock(bigint)` / `(int4, int4)` — the **blocking** form, which waits.
+    Lock,
+    /// `pg_advisory_lock_shared(bigint)` / `(int4, int4)`.
+    LockShared,
     /// `pg_try_advisory_lock(bigint)` / `(int4, int4)`.
     TryLock,
     /// `pg_try_advisory_lock_shared(bigint)` / `(int4, int4)`.
@@ -2625,6 +2680,8 @@ pub enum AdvisoryCall {
     Unlock,
     /// `pg_advisory_unlock_shared(bigint)` / `(int4, int4)`.
     UnlockShared,
+    /// `pg_advisory_unlock_all()` — no arguments, and it releases every lock this session holds.
+    UnlockAll,
 }
 
 impl AdvisoryCall {
@@ -2632,25 +2689,65 @@ impl AdvisoryCall {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
+            AdvisoryCall::Lock => "pg_advisory_lock",
+            AdvisoryCall::LockShared => "pg_advisory_lock_shared",
             AdvisoryCall::TryLock => "pg_try_advisory_lock",
             AdvisoryCall::TryLockShared => "pg_try_advisory_lock_shared",
             AdvisoryCall::Unlock => "pg_advisory_unlock",
             AdvisoryCall::UnlockShared => "pg_advisory_unlock_shared",
+            AdvisoryCall::UnlockAll => "pg_advisory_unlock_all",
         }
     }
 
     /// Whether this one takes a lock (rather than releasing one).
     #[must_use]
     pub fn takes(self) -> bool {
-        matches!(self, AdvisoryCall::TryLock | AdvisoryCall::TryLockShared)
+        matches!(
+            self,
+            AdvisoryCall::TryLock
+                | AdvisoryCall::TryLockShared
+                | AdvisoryCall::Lock
+                | AdvisoryCall::LockShared
+        )
+    }
+
+    /// Whether it **waits** for the lock rather than answering `false`.
+    ///
+    /// The difference is the whole of the two families: `pg_try_advisory_lock` answers now, and
+    /// `pg_advisory_lock` does not answer until it has the lock. It also decides what the call
+    /// evaluates to — a `boolean` for the first and `void` for the second.
+    #[must_use]
+    pub fn blocks(self) -> bool {
+        matches!(self, AdvisoryCall::Lock | AdvisoryCall::LockShared)
+    }
+
+    /// Whether it answers `void` rather than a `boolean`.
+    ///
+    /// **`void` is not NULL**, which is the trap: `pg_advisory_unlock_all() IS NULL` is `f` on a
+    /// real server, measured in `pg19_advisory_lock.txt`. This node has no `void` type, so these
+    /// answer an **empty string** — every observable except `pg_typeof` then matches, where a NULL
+    /// would have answered `t` to that `IS NULL` and been a wrong answer rather than a missing
+    /// type.
+    #[must_use]
+    pub fn is_void(self) -> bool {
+        matches!(
+            self,
+            AdvisoryCall::Lock | AdvisoryCall::LockShared | AdvisoryCall::UnlockAll
+        )
     }
 
     /// The mode it works in.
     #[must_use]
     pub fn mode(self) -> crate::advisory::Mode {
         match self {
-            AdvisoryCall::TryLock | AdvisoryCall::Unlock => crate::advisory::Mode::Exclusive,
-            AdvisoryCall::TryLockShared | AdvisoryCall::UnlockShared => {
+            AdvisoryCall::Lock | AdvisoryCall::TryLock | AdvisoryCall::Unlock => {
+                crate::advisory::Mode::Exclusive
+            }
+            AdvisoryCall::LockShared
+            | AdvisoryCall::TryLockShared
+            | AdvisoryCall::UnlockShared
+            // It releases both modes; the mode is not consulted.
+            | AdvisoryCall::UnlockAll => {
                 crate::advisory::Mode::Shared
             }
         }

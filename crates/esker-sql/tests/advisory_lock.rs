@@ -17,71 +17,15 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
-        // **`pg_locks` is a relation this node does not have**, so it is `42P01` — the same answer
-        // it gives for every other relation it has never heard of, and not a special case. The
-        // lock *semantics* are all here and tested; what is missing is the view that reports them,
-        // and it is missing for a structural reason worth naming: `CatalogView::rows_of` takes a
-        // transaction and a tenant, because every other view in this node is a read of the store.
-        // These rows are **session state** and are in no transaction at all, so the view machinery
-        // has to learn to carry a second source before this one can exist. One of the 99 tests
-        // reads it (`connection_test.rb:203`); the other 98 are migrations that need only the two
-        // functions above, which is why this is a divergence rather than a blocker.
-        (
-            "SELECT 'r', locktype, classid, objid, objsubid, mode, granted FROM pg_locks WHERE \
-             locktype = 'advisory'",
-            "`42P01`: this node has no `pg_locks`. The lock is held — the line before this one \
-             says so — and there is nothing here that reports it.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'r', (classid::bigint << 32) | objid::bigint AS lock_id FROM pg_locks WHERE \
-             locktype = 'advisory'",
-            "The same. `advisory::Key` packs and splits on exactly this expression and its own \
-             test pins it against the same literal the suite uses, so what is untested here is \
-             the view and not the arithmetic.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory'",
-            "The same, four times over — the corpus counts the locks after each step.",
-            "pg19_advisory_lock.txt:33",
-        ),
-        (
-            "SELECT 'r', classid, objid, objsubid FROM pg_locks WHERE locktype = 'advisory'",
-            "The same. `objsubid` 1 against 2 is what tells the two key spaces apart, and \
-             `advisory::Space` carries it for when the view exists.",
-            "pg19_advisory_lock.txt:48",
-        ),
-        (
-            "SELECT 'r', objsubid FROM pg_locks WHERE locktype = 'advisory' ORDER BY objsubid",
-            "The same.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'r', mode FROM pg_locks WHERE locktype = 'advisory'",
-            "The same.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'r', objid FROM pg_locks WHERE locktype = 'advisory' ORDER BY objid",
-            "The same — and this is the line that proves a session lock survives `ROLLBACK`, \
-             which `a_session_lock_outlives_the_transaction_that_took_it` asserts instead.",
-            "UNMEASURED",
-        ),
-        // **`pg_advisory_unlock_all()` needs a `void`**, which this node has no type for: every
-        // function here answers a value. `ActiveRecord` never calls it — the migrator unlocks the
-        // one key it took — so it is refused by name rather than given a type it would be the only
-        // user of. `Executor::release_advisory_locks` does the same job where it actually matters,
-        // at the end of a session.
-        (
-            "SELECT 'r', pg_advisory_unlock_all() IS NULL",
-            "`0A000` naming the function: it returns `void` and this node has no such type. The \
-             session-end release it exists for is done by the connection instead.",
-            "pg19_advisory_lock.txt:79",
-        ),
+        // **`void` is the one thing left, and it is a type this node does not have.** Every
+        // advisory function that returns `void` on a real server answers an **empty string** here:
+        // the value prints the same, and `pg_advisory_unlock_all() IS NULL` is `f` on both, which
+        // a NULL would have got wrong. What still differs is the name of the type, and closing it
+        // means a `ColumnType::Void` — a type-surface change, which is not this unit's to make.
         (
             "SELECT 'r', pg_typeof(pg_advisory_unlock_all())::text",
-            "The same refusal, and the line that says why: the answer is `void`.",
+            "`text`, because this node has no `void` type. The function runs and releases the \
+             locks — the two lines around this one measure that — and only the type name differs.",
             "UNMEASURED",
         ),
     ],
@@ -188,5 +132,91 @@ fn a_second_session_cannot_take_a_lock_the_first_holds() {
         answer(&mut b, "SELECT pg_try_advisory_lock(7)"),
         "t",
         "the first session's locks go when it does"
+    );
+}
+
+/// **A session advisory lock is a row in `pg_locks`**, and `connection_test.rb`'s
+/// *get and release advisory lock* reads it back by reassembling the key from two halves.
+///
+/// Measured on PostgreSQL 19, `pg_advisory_lock(5295901941258979200)`:
+///
+/// ```text
+/// locktype | database | relation | page | tuple | virtualxid | transactionid |  classid   |   objid    | objsubid |     mode      | granted | fastpath
+/// advisory |   132527 |   (null) |(null)|(null) |   (null)   |    (null)     | 1233048257 | 3054176128 |        1 | ExclusiveLock |    t    |    f
+/// ```
+///
+/// `classid` is the key's high 32 bits and `objid` its low 32, which is what makes
+/// `(classid::bigint << 32) | objid::bigint` the id the client passed. `objsubid` is `1` for the
+/// single-argument form — the two-argument `pg_advisory_lock(int, int)` is `2`, which is the whole
+/// reason the column is there.
+#[test]
+fn a_session_advisory_lock_is_a_row_in_pg_locks() {
+    let mut node = parity::Node::new(&[]);
+    node.run("SELECT pg_advisory_lock(5295901941258979200)")
+        .unwrap();
+
+    // The client's own query, verbatim from `connection_test.rb`.
+    assert_eq!(
+        node.rows(
+            "SELECT locktype, (classid::bigint << 32) | objid::bigint AS lock_id \
+             FROM pg_locks WHERE locktype = 'advisory'"
+        ),
+        vec![vec![
+            "advisory".to_string(),
+            "5295901941258979200".to_string()
+        ]]
+    );
+
+    // And the rest of the row, which is what says the two halves were split rather than invented.
+    assert_eq!(
+        node.rows(
+            "SELECT classid, objid, objsubid, mode, granted, fastpath, relation, page, tuple, \
+             virtualxid, transactionid FROM pg_locks WHERE locktype = 'advisory'"
+        ),
+        vec![vec![
+            "1233048257".to_string(),
+            "3054176128".to_string(),
+            "1".to_string(),
+            "ExclusiveLock".to_string(),
+            "t".to_string(),
+            "f".to_string(),
+            // The harness prints a NULL as `\\N`, and every one of these is NULL on a real
+            // server too: an advisory lock has no relation, no page, no tuple and no transaction.
+            "\\N".to_string(),
+            "\\N".to_string(),
+            "\\N".to_string(),
+            "\\N".to_string(),
+            "\\N".to_string(),
+        ]]
+    );
+
+    // **Re-entrant, and still one row.** A session never conflicts with itself, and a second hold
+    // of the same key in the same mode is not a second row — measured.
+    node.run("SELECT pg_advisory_lock(5295901941258979200)")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'"),
+        vec![vec!["1".to_string()]]
+    );
+
+    // Two holds, two unlocks, both `t`; and then the row is gone.
+    assert_eq!(
+        node.rows("SELECT pg_advisory_unlock(5295901941258979200)"),
+        vec![vec!["t".to_string()]]
+    );
+    assert_eq!(
+        node.rows("SELECT pg_advisory_unlock(5295901941258979200)"),
+        vec![vec!["t".to_string()]]
+    );
+    assert!(
+        node.rows("SELECT * FROM pg_locks WHERE locktype = 'advisory'")
+            .is_empty(),
+        "released, so the row goes with it"
+    );
+
+    // Releasing one nobody holds is `f`, not an error.
+    assert_eq!(
+        node.rows("SELECT pg_advisory_unlock(5295901941258979200)"),
+        vec![vec!["f".to_string()]]
     );
 }

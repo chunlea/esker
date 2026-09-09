@@ -118,6 +118,32 @@ const STACK_PER_PLAN_LEVEL: usize = if cfg!(debug_assertions) {
 /// in debug and 204 in release, against a measured 138 in debug.
 pub const MAX_PLAN_DEPTH: usize = INLINE_STACK_BUDGET / STACK_PER_PLAN_LEVEL;
 
+/// How much stack one link of a boolean chain costs, by profile.
+///
+/// **Not a parse frame and not a plan level — a `Drop` frame.** `a OR b OR c …` parses with a loop
+/// rather than by recursion and lowers into a balanced tree, so the only cost still linear in the
+/// number of terms is freeing the `sqlparser` tree, which leans left and unwinds one `Box` per
+/// frame. Measured with `tests/lowering_depth.rs`'s child probe, the same instrument the nesting
+/// figures came from: on a 2 MiB worker stack a debug build survives a chain of **16,000** and dies
+/// by **20,000**, which is about 116 bytes a link. Rounded up by half again to 192, the way the
+/// nesting numbers are. The release figure is the debug one over four — the file's other pair puts
+/// release frames at a fifth to a sixth of debug, so a quarter is the conservative side of that,
+/// and being wrong here costs a refusal rather than a crash.
+const STACK_PER_CHAIN_LINK: usize = if cfg!(debug_assertions) { 192 } else { 48 };
+
+/// The longest boolean chain this node will parse.
+///
+/// PostgreSQL 19 answers a flat chain of twenty thousand terms — measured on the oracle, and five
+/// thousand levels of brackets with it — so a bound here is about this node's stack and not about
+/// what SQL means. Half the worker stack over the per-link cost, the same budget the parser's own
+/// inline limit works to: **5,461 terms in debug and 21,845 in release**, against `or_test.rb`'s
+/// 1001 and a measured death at 20,000 in the smaller of the two profiles.
+///
+/// Past it the answer is `54001`, which is this node saying it accepts a shorter chain than
+/// PostgreSQL rather than crashing on the difference — the same declared shape [`MAX_PLAN_DEPTH`]
+/// has.
+pub const MAX_BOOLEAN_CHAIN: usize = INLINE_STACK_BUDGET / STACK_PER_CHAIN_LINK;
+
 /// The recursion limit handed to `sqlparser` itself.
 ///
 /// Its own default is **50**, which rejects `SELECT ((((...1...))))` at 51 parentheses with a parser
@@ -2838,6 +2864,13 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     if scanned.max_depth > MAX_NESTING_DEPTH {
         return Err(SqlError::StatementTooComplex);
     }
+    // **A chain is bounded too, by its own number.** What it costs is the drop of a left-leaning
+    // tree rather than a descent, so it is measured against [`MAX_BOOLEAN_CHAIN`] and not against
+    // the nesting limit. Counting the two together is what refused `or_test.rb`'s 1001-relation
+    // `.or` with `54001` where PostgreSQL 19 answers a number.
+    if scanned.max_chain > MAX_BOOLEAN_CHAIN {
+        return Err(SqlError::StatementTooComplex);
+    }
     // **A set-operation chain has no brackets to count.** `a UNION ALL b UNION ALL …` parses as a
     // tree leaning left one level per operator, and the lowering and the drop of that tree each
     // cost a frame per level; ten thousand of them is the overflow the bracket count exists to
@@ -2928,7 +2961,10 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         .or_else(|| read_alter_table_reset(sql, &scanned).map(|_| "SELECT 1"));
     let text = refresh_placeholder.or(rewritten.as_deref()).unwrap_or(sql);
 
-    let parsed = if scanned.max_depth <= INLINE_PARSE_DEPTH {
+    // The chain counts here even though it does not count as depth: a long one is dropped on
+    // whichever stack parsed it.
+    let inline_chain = INLINE_STACK_BUDGET / STACK_PER_CHAIN_LINK;
+    let parsed = if scanned.max_depth <= INLINE_PARSE_DEPTH && scanned.max_chain <= inline_chain {
         parse_inner(text)
     } else {
         parse_on_a_deep_stack(text)
@@ -3945,6 +3981,15 @@ pub fn nesting_depth(sql: &str) -> usize {
 struct Scan<'a> {
     /// The deepest nesting anywhere in the statement.
     max_depth: usize,
+    /// The longest run of `AND`/`OR` operators at one bracket level.
+    ///
+    /// **Counted apart from `max_depth`, because a chain is siblings and not generations.** The
+    /// lowering folds `a OR b OR c …` into a balanced tree, so *n* terms cost about `log2(n)`
+    /// levels of every later walk; what is still linear in *n* is dropping the `sqlparser` tree,
+    /// which leans left and frees one `Box` per frame. So the two numbers bound two different
+    /// things and cannot share a limit: `or_test.rb` sends 1001 terms and PostgreSQL 19 answers it,
+    /// while 1001 levels of real nesting is a stack this node will not spend.
+    max_chain: usize,
     /// Every bare word, in order, as it appears in the source. Punctuation, literals, quoted
     /// identifiers and comments are not words: a recognizer matches keywords, and keywords are
     /// exactly what survives this filter.
@@ -3965,6 +4010,7 @@ fn scan(sql: &str) -> Scan<'_> {
     let mut max: usize = 0;
     // How many `AND`/`OR` operators have chained at the current bracket level.
     let mut chain: usize = 0;
+    let mut max_chain: usize = 0;
     let mut run: usize = 0;
 
     while index < bytes.len() {
@@ -4037,7 +4083,7 @@ fn scan(sql: &str) -> Scan<'_> {
                     // its own rather than folded into `run`, which any word clears.
                     Keyword::Chain => {
                         chain += 1;
-                        max = max.max(depth + chain);
+                        max_chain = max_chain.max(chain);
                     }
                     Keyword::Other => run = 0,
                 }
@@ -4051,6 +4097,7 @@ fn scan(sql: &str) -> Scan<'_> {
     }
     Scan {
         max_depth: max,
+        max_chain,
         words,
         first_word,
     }
