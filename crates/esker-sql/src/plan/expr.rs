@@ -131,20 +131,30 @@ pub enum Expr {
         /// entirely in what NULL does.
         negated: bool,
     },
-    /// `x = ANY(<array>)` where the array is a **value of the row** rather than a list the
-    /// lowering could see — `a.attnum = ANY(i.indkey)`.
+    /// `x <op> ANY(<array>)` and `x <op> ALL(<array>)` — a comparison, a quantifier, and an array
+    /// that is a **value of the row** rather than a list the lowering could see
+    /// (`a.attnum = ANY(i.indkey)`).
     ///
-    /// [`Expr::InList`] is the same rule over a list known at plan time, and every array this node
-    /// had until now was one: `ARRAY[1,2]`, `'{a,b}'` and `current_schemas(false)` are all expanded
-    /// where they are lowered. A **column** cannot be, because its value differs per row — which is
-    /// why this is a variant and not a rewrite, and why boot statement 17 was refused by name until
-    /// it existed.
+    /// [`Expr::InList`] is the same rule over a list known at plan time for the two spellings that
+    /// have one, and the lowering prefers it: `ARRAY[1,2]`, `'{a,b}'` and `current_schemas(false)`
+    /// are expanded where they are written, which is what lets an index seek use them. A
+    /// **column** cannot be, because its value differs per row — which is why this is a variant
+    /// and not a rewrite, and why boot statement 17 was refused by name until it existed.
     ///
-    /// The three-valued rule is [`Expr::InList`]'s, shared rather than copied: a match wins over a
-    /// NULL, a NULL wins over no match, and a NULL operand is NULL whatever the array holds.
-    AnyArray {
+    /// **The three-valued rule is the subquery form's, shared rather than copied**
+    /// (`crate::exec::subquery`): no elements settles it with no comparison — `ANY` false and
+    /// `ALL` true, even for a NULL operand — one definite answer wins past any number of NULLs,
+    /// and otherwise a NULL leaves it unknown. Measured on 19beta1 for both right-hand sides in
+    /// one session, `tests/corpus/pg19_all_quantifier.txt`.
+    QuantifiedArray {
         /// The left-hand side, evaluated once.
         operand: Box<Expr>,
+        /// The comparison, which is any of the six and not only `=`.
+        op: BinaryOp,
+        /// `ALL` rather than `ANY`. The two differ in **one** thing — which answer is decisive —
+        /// so they are a flag on one node and not two nodes, exactly as
+        /// [`crate::plan::SubqueryKind::Quantified`] holds them.
+        all: bool,
         /// The array, evaluated once per row and read from its own text form
         /// (`crate::value::vector`). A NULL array makes the whole comparison NULL — measured,
         /// `1 = ANY(NULL::int[])` is NULL where `1 = ANY('{}')` is false.
@@ -2667,7 +2677,29 @@ fn describe(expr: &Expr) -> &'static str {
         Expr::Not(_) => "NOT",
         Expr::IsNull { .. } => "IS NULL",
         Expr::InList { negated: false, .. } => "IN",
-        Expr::AnyArray { .. } => "= ANY",
+        // **Named by its own spelling**, now that there are twelve of them: this string reaches a
+        // user inside a `0A000`, and "= ANY" was a lie for `> ALL` the moment the node could hold
+        // one. Written out rather than formatted because the answer is a `&'static str`, and
+        // written as a pair rather than two lookups because "the operator" and "the quantifier"
+        // are not separately meaningful in the sentence a refusal makes.
+        Expr::QuantifiedArray { op, all, .. } => match (op, all) {
+            (BinaryOp::Eq, false) => "= ANY",
+            (BinaryOp::Eq, true) => "= ALL",
+            (BinaryOp::NotEq, false) => "<> ANY",
+            (BinaryOp::NotEq, true) => "<> ALL",
+            (BinaryOp::Lt, false) => "< ANY",
+            (BinaryOp::Lt, true) => "< ALL",
+            (BinaryOp::LtEq, false) => "<= ANY",
+            (BinaryOp::LtEq, true) => "<= ALL",
+            (BinaryOp::Gt, false) => "> ANY",
+            (BinaryOp::Gt, true) => "> ALL",
+            (BinaryOp::GtEq, false) => ">= ANY",
+            (BinaryOp::GtEq, true) => ">= ALL",
+            // `AND`, `OR` and the two `DISTINCT` forms are not comparisons a quantifier accepts,
+            // and `parse::lower` refuses them before this node can be built
+            // (`the operator <op> with ANY/ALL`).
+            _ => "a quantified comparison",
+        },
         Expr::Subscript { .. } => "a subscript",
         Expr::Uuid(func) => func.name(),
         Expr::CurrentSetting { .. } => "current_setting",

@@ -1,0 +1,108 @@
+# **`<op> ANY (array)` and `<op> ALL (array)`**, measured shape by shape on PostgreSQL 19beta1.
+#
+# `docs/plans/debts-v1.1.md` #21 said this node has no `ALL` quantifier. It has one — for a
+# **subquery** on the right, where `SubqueryKind::Quantified { op, all }` takes all six comparison
+# operators — and `exec::subquery::quantified` is exactly the three-valued rule the rows below
+# measure. What is missing is the *array* form for everything but `= ANY`, which `parse::lower`
+# refuses by name (`0A000 ALL over an array`, `0A000 the quantifier <op> ANY`).
+#
+# **The rule, read off the rows and not asserted here.** A quantified comparison is a three-valued
+# conjunction (`ALL`) or disjunction (`ANY`) over the element comparisons:
+#
+#   * an **empty** array settles it with no comparison at all — `ALL` is `true` and `ANY` is
+#     `false`, and that holds even when the *operand* is NULL: `NULL = ALL (ARRAY[]::integer[])` is
+#     `t`, because nothing is ever compared;
+#   * one decisive element settles it past any NULLs — `1 = ALL (ARRAY[2, NULL])` is `f` and
+#     `1 = ANY (ARRAY[1, NULL])` is `t`;
+#   * otherwise a NULL leaves it **unknown** — `1 = ALL (ARRAY[1, NULL])` is NULL, and so is
+#     `1 <> ALL (ARRAY[2, NULL])`;
+#   * a NULL operand against a non-empty array is unknown for both.
+#
+# Two refusals, each measured rather than invented: a **non-array** right side is
+# `42809 op ANY/ALL (array) requires array on right side`, and an element type with no operator is
+# `42883 operator does not exist: integer = text` with PostgreSQL's own DETAIL and HINT.
+#
+# **`NOT IN` and `<> ALL` print identically.** `pg_get_expr` gives `(c1 <> ALL (ARRAY[1, 2]))` for
+# both spellings, which is why the deparser rows are here and not in `pg19_deparse_parens.txt`:
+# that file could measure the printed form and not the value, and #21 was a *language* gap behind
+# a printer that was already right (ADR 0090's read-back guard kept the written text instead).
+# The text elements carry their coercion — `(t <> ALL (ARRAY['a'::text, 'b'::text]))` — and an
+# index over one keeps the shape's own pair, `(((c1 <> ALL (ARRAY[1, 2]))))` in `pg_get_indexdef`.
+#
+# The generated columns are **inserted into and read back** in the same file, so the value is
+# asserted beside the deparse: a printed form that does not read back computes the wrong value, and
+# only the rows can say which.
+#
+# **The nested-array probe is guarded by a savepoint**, and parity rule 3 is why: this node
+# refuses it (see `tests/all_quantifier.rs`'s one declared divergence) and a refusal inside a
+# `BEGIN` aborts the transaction, so every statement after it came back `25P02` and 40 rows of this
+# file were counted as swallowed rather than compared. The harness reports that as a rule-3
+# failure — a declared divergence may not swallow the file — which is exactly what it is for.
+#
+# Captured against esker-pg19 (PostgreSQL 19beta1) with
+# `sesscap.py captures-src/pg19_all_quantifier.txt.in`, inside one `BEGIN ... ROLLBACK`, and
+# verified idempotent by replaying `cut -f1` of the result through the same recorder.
+BEGIN		-
+SELECT 'r', 1 = ALL (ARRAY[1, 1])	text,boolean	r|t
+SELECT 'r', 1 = ALL (ARRAY[1, 2])	text,boolean	r|f
+SELECT 'r', 1 <> ALL (ARRAY[2, 3])	text,boolean	r|t
+SELECT 'r', 1 <> ALL (ARRAY[1, 2])	text,boolean	r|f
+SELECT 'r', 3 > ALL (ARRAY[1, 2])	text,boolean	r|t
+SELECT 'r', 1 > ALL (ARRAY[1, 2])	text,boolean	r|f
+SELECT 'r', 1 >= ALL (ARRAY[1, 1])	text,boolean	r|t
+SELECT 'r', 1 < ALL (ARRAY[2, 3])	text,boolean	r|t
+SELECT 'r', 1 <= ALL (ARRAY[1, 2])	text,boolean	r|t
+SELECT 'r', 1 = ALL (ARRAY[]::integer[])	text,boolean	r|t
+SELECT 'r', 1 <> ALL (ARRAY[]::integer[])	text,boolean	r|t
+SELECT 'r', 1 > ALL (ARRAY[]::integer[])	text,boolean	r|t
+SELECT 'r', 1 = ALL (ARRAY[1, NULL])	text,boolean	r|\N
+SELECT 'r', 1 = ALL (ARRAY[2, NULL])	text,boolean	r|f
+SELECT 'r', 1 <> ALL (ARRAY[2, NULL])	text,boolean	r|\N
+SELECT 'r', 1 <> ALL (ARRAY[1, NULL])	text,boolean	r|f
+SELECT 'r', 1 > ALL (ARRAY[0, NULL])	text,boolean	r|\N
+SELECT 'r', 1 > ALL (ARRAY[2, NULL])	text,boolean	r|f
+SELECT 'r', NULL = ALL (ARRAY[1, 2])	text,boolean	r|\N
+SELECT 'r', NULL = ALL (ARRAY[]::integer[])	text,boolean	r|t
+SELECT 'r', 1 = ANY (ARRAY[1, NULL])	text,boolean	r|t
+SELECT 'r', 1 = ANY (ARRAY[2, NULL])	text,boolean	r|\N
+SELECT 'r', 1 = ANY (ARRAY[]::integer[])	text,boolean	r|f
+SELECT 'r', NULL = ANY (ARRAY[]::integer[])	text,boolean	r|f
+SELECT 'r', pg_typeof(1 = ALL (ARRAY[1]))	text,regtype	r|boolean
+SELECT 'r', 'a' = ALL (ARRAY['a', 'a'])	text,boolean	r|t
+SELECT 'r', 'a' <> ALL (ARRAY['b', 'c'])	text,boolean	r|t
+SELECT 'r', 1 = ALL ('{1,1}'::integer[])	text,boolean	r|t
+SELECT 'r', 1 = ALL ('{1,2}')	text,boolean	r|f
+SAVEPOINT sp_nested		-
+SELECT 'r', 1 = ALL (ARRAY[ARRAY[1,1], ARRAY[1,1]])	text,boolean	r|t
+ROLLBACK TO sp_nested		-
+SAVEPOINT sp_scalar		-
+SELECT 'r', 1 = ALL (1)	!42809 op ANY/ALL (array) requires array on right side
+ROLLBACK TO sp_scalar		-
+SAVEPOINT sp_mixed		-
+SELECT 'r', 1 = ALL (ARRAY['a'])	!42883 operator does not exist: integer = text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO sp_mixed		-
+SELECT 'r', 1 = ALL (SELECT 1 UNION SELECT 1)	text,boolean	r|t
+SELECT 'r', 1 = ALL (SELECT 1 UNION SELECT 2)	text,boolean	r|f
+SELECT 'r', 1 <> ALL (SELECT 2)	text,boolean	r|t
+SELECT 'r', 1 = ALL (SELECT 1 WHERE false)	text,boolean	r|t
+CREATE TABLE g1all (c1 integer, c2 integer, t text)		-
+ALTER TABLE g1all ADD COLUMN q_notin boolean GENERATED ALWAYS AS (c1 NOT IN (1, 2)) STORED		-
+ALTER TABLE g1all ADD COLUMN q_all boolean GENERATED ALWAYS AS (c1 <> ALL (ARRAY[1, 2])) STORED		-
+ALTER TABLE g1all ADD COLUMN q_eqall boolean GENERATED ALWAYS AS (c1 = ALL (ARRAY[1, 2])) STORED		-
+ALTER TABLE g1all ADD COLUMN q_gtall boolean GENERATED ALWAYS AS (c1 > ALL (ARRAY[1, 2])) STORED		-
+ALTER TABLE g1all ADD COLUMN q_notin_t boolean GENERATED ALWAYS AS (t NOT IN ('a', 'b')) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1all'::regclass AND a.attname = 'q_notin'		r|q_notin|(c1 <> ALL (ARRAY[1, 2]))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1all'::regclass AND a.attname = 'q_all'		r|q_all|(c1 <> ALL (ARRAY[1, 2]))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1all'::regclass AND a.attname = 'q_eqall'		r|q_eqall|(c1 = ALL (ARRAY[1, 2]))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1all'::regclass AND a.attname = 'q_gtall'		r|q_gtall|(c1 > ALL (ARRAY[1, 2]))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1all'::regclass AND a.attname = 'q_notin_t'		r|q_notin_t|(t <> ALL (ARRAY['a'::text, 'b'::text]))
+INSERT INTO g1all (c1, c2, t) VALUES (3, 1, 'z')		-
+SELECT 'r', q_notin, q_all, q_eqall, q_gtall, q_notin_t FROM g1all		r|t|t|f|t|t
+INSERT INTO g1all (c1, c2, t) VALUES (1, 1, 'a')		-
+SELECT 'r', c1, q_notin, q_all, q_eqall, q_gtall, q_notin_t FROM g1all ORDER BY c1		r|1|f|f|f|f|f ; r|3|t|t|f|t|t
+CREATE INDEX g1all_ix ON g1all ((c1 <> ALL (ARRAY[1, 2])))		-
+SELECT 'r', pg_get_indexdef('g1all_ix'::regclass)		r|CREATE INDEX g1all_ix ON public.g1all USING btree (((c1 <> ALL (ARRAY[1, 2]))))
+SELECT 'r', pg_get_expr(x.indexprs, x.indrelid) FROM pg_index x WHERE x.indexrelid = 'g1all_ix'::regclass		r|(c1 <> ALL (ARRAY[1, 2]))
+DROP TABLE g1all		-
+ROLLBACK		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 'g1all'	text,bigint	r|0

@@ -88,6 +88,13 @@ fn queries() -> Vec<(&'static str, Vec<Vec<String>>)> {
     ]
 }
 
+/// How long one query's fragments may take to start answering before it is compared without them.
+///
+/// Smaller than the table-wide wait above it on purpose: by the time the loop runs, *some* query
+/// has already answered from the columns, so this is the tail of one learner catching up rather
+/// than placement completing.
+const READINESS: u64 = 60;
+
 #[test]
 fn a_multi_region_table_is_never_answered_wrongly() {
     let cluster = Cluster::start_with(STORES, SPLIT_SIZE);
@@ -131,9 +138,26 @@ fn a_multi_region_table_is_never_answered_wrongly() {
         if guarded { "false" } else { "true" }
     );
 
+    // **Readiness is waited for per query, and a timeout defers that query rather than failing
+    // it.** The wait above is one query's — `count(*)` — and a learner catches up per column
+    // family and per region, so it says nothing about `min(amount)`. Asserting `Engine: columnar`
+    // for every query after waiting for one is what reddened this test six times in a night, each
+    // time green on the rerun: the message said "had to be answered by the columns" where the
+    // truth was "was not ready yet", which is a readiness state wearing a correctness message's
+    // clothes.
+    //
+    // What is **not** relaxed is the answer. `rows == expected` is asserted for every query in
+    // every state, and a query whose columns did answer is still compared against them. A
+    // deferral only drops the *declaration* for that one query, and the guard after the loop
+    // refuses the degenerate case where nothing ran on the columns at all — a test that deferred
+    // everything would be comparing the row engine with itself and calling the agreement
+    // evidence, which is the trap this file's own header warns about.
+    let mut on_the_columns = 0_usize;
+    let mut deferred: Vec<&str> = Vec::new();
+
     for (query, expected) in queries() {
+        let ready = guarded || cluster.columnar_within(query, READINESS);
         let rows = rows_of(&cluster.query_on("row", query));
-        let columns = rows_of(&cluster.query_on("columnar", query));
         let plan = cluster.query_on("auto", &format!("EXPLAIN ANALYZE {query}"));
         let flat: Vec<String> = expected
             .iter()
@@ -146,12 +170,15 @@ fn a_multi_region_table_is_never_answered_wrongly() {
                 "the source cannot scope a fragment, so `{query}` over {regions} regions had to \
                  be guarded and was not:\n{plan}"
             );
-        } else {
+        } else if ready {
             assert!(
                 plan.contains("Engine: columnar"),
                 "the source declares its runs are region-scoped, so `{query}` over {regions} \
                  regions had to be answered by the columns:\n{plan}"
             );
+            on_the_columns += 1;
+        } else {
+            deferred.push(query);
         }
 
         // True in both states, and the whole point: the answer is right.
@@ -159,9 +186,77 @@ fn a_multi_region_table_is_never_answered_wrongly() {
             rows, flat,
             "the row engine answered `{query}` wrongly over {regions} regions"
         );
-        assert_eq!(
-            columns, flat,
-            "the columnar arm answered `{query}` wrongly over {regions} regions"
+        // The columnar arm is compared whenever it can answer at all. In the guarded state that is
+        // the declaration's own claim; in the deferred one there is nothing to compare against,
+        // and saying so is the point of the guard below.
+        if ready {
+            let columns = rows_of(&cluster.query_on("columnar", query));
+            assert_eq!(
+                columns, flat,
+                "the columnar arm answered `{query}` wrongly over {regions} regions"
+            );
+        }
+    }
+
+    if !deferred.is_empty() {
+        eprintln!(
+            "harness: {} of {} queries were still on the rows after {READINESS}s and were \
+             compared without the columns: {deferred:?}",
+            deferred.len(),
+            queries().len()
+        );
+    }
+    assert!(
+        guarded || on_the_columns > 0,
+        "every one of the {} queries deferred, so nothing ran on the columns and this round \
+         compared the row engine with itself: {deferred:?}",
+        deferred.len()
+    );
+}
+
+/// **The transient-refusal list, against the sentences it was built from.**
+///
+/// The three rounds this change was verified with all passed on the first attempt and printed no
+/// `harness:` line, which means neither new waiting path ran: at moderate load the split produced
+/// no transient refusal and every fragment was ready. Three green runs prove the change did not
+/// break the test; they prove nothing about the code that only runs when it is *not* green.
+///
+/// So the half that is a pure function of a string gets a test, with the strings copied from the
+/// gate logs that reddened this test six times in one night. The other half —
+/// `Cluster::columnar_within` returning `false` and the loop deferring that query — is only
+/// reachable against a cluster whose learner is behind, and is not exercised here; the guard after
+/// the loop is what stops a deferral from being silent.
+#[test]
+fn the_refusals_the_harness_waits_out_are_the_ones_it_measured() {
+    for waited in [
+        "ERROR 40003: the transaction's outcome is unknown: the TxnPrewrite may or may not have \
+         been applied: connection closed: region 1 stopped leading with this proposal in its log; \
+         it may still commit",
+        "ERROR 08006: could not reach the store: deadline passed after 14 attempts",
+        "ERROR 08006: could not reach the store: gave up after 9 attempts: peer is not the leader \
+         of region 1",
+        "ERROR 25006: this node's schema lease has expired and the placement driver is unreachable",
+    ] {
+        assert!(
+            Cluster::waited_out(waited),
+            "should be waited out: {waited}"
+        );
+    }
+
+    // And the ones that must fail on sight. The first is the reason `08006` is matched by its
+    // *sentence* and not by its sqlstate: a store that is gone answers the same class as a region
+    // being re-elected, and only the words tell them apart. The second is a duplicate key, which
+    // `run` accepts **only** after an unknown outcome — a fixture that writes a row twice on the
+    // first attempt is a defect in the fixture.
+    for refused in [
+        "ERROR 08006: could not reach the store: connection refused",
+        "ERROR 23505: duplicate key value violates unique constraint \"ledger_pkey\"",
+        "ERROR 42P01: relation \"ledger\" does not exist",
+        "ERROR 22003: bigint out of range",
+    ] {
+        assert!(
+            !Cluster::waited_out(refused),
+            "should fail on sight: {refused}"
         );
     }
 }

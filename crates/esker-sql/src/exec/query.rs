@@ -2940,9 +2940,22 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         // have no type of their own here — they are text in the catalog — so what gives them one
         // is the operand, at evaluation, exactly as the plan-time form types its list against the
         // operand it is compared with.
-        Expr::AnyArray { operand, array } => {
+        Expr::QuantifiedArray {
+            operand,
+            op,
+            all,
+            array,
+        } => {
             let operand = resolve(operand, scope)?;
             let array = resolve(array, scope)?;
+            // **A right-hand side that cannot hold more than one value**, which is PostgreSQL's
+            // `42809` and not a missing operator: the operator exists and the *shape* is wrong,
+            // and the sentence it uses names both quantifiers at once. Measured, `1 = ALL (1)`.
+            if let Ok(right) = expr_type(&array, scope)
+                && !holds_many(right)
+            {
+                return Err(SqlError::QuantifierNeedsArray);
+            }
             // **An array that knows its element type is not `unknown`.** `'{1,2}'` is an unknown
             // literal and takes the operand's type at evaluation, which is the arm below; an
             // `ARRAY['1','2']` is a `text[]` **value** — `pg_typeof` says so on a real server —
@@ -2950,20 +2963,33 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             // naming the *element* type. Without this the evaluator read each element at the
             // operand's type and answered a row, which is a wrong row set rather than a wrong
             // error.
-            if let Some(element) = expr_type(&array, scope)
-                .ok()
-                .and_then(esker_keys::array::ArrayValue::element_of)
+            if let Some(element) = quantified_element_type(&array, scope)
                 && let Ok(left) = expr_type(&operand, scope)
+                // **An unknown literal on the left takes the element's type**, which is the same
+                // coercion a real server applies and the same one this arm's own comment claims
+                // for the *right*. A bare `NULL` is `unknown` on 19beta1 and `text` here, so
+                // without this `NULL = ALL (ARRAY[1, 2])` raised
+                // `42883 operator does not exist: text = integer` where a real server answers
+                // NULL — the check written for `id = ANY(ARRAY['1','2'])` firing in the opposite
+                // direction. The measured refusal is still refused: `1 = ALL (ARRAY['a'])` has an
+                // *integer* literal on the left and stays `42883`.
+                && !is_unknown_literal(&operand)
                 && !same_family(left, element)
             {
                 return Err(SqlError::UndefinedOperator {
                     left: left.name().to_owned(),
-                    op: "=",
+                    // **The operator that is missing, not the one this arm used to assume.**
+                    // `1 = ALL (ARRAY['a'])` is `operator does not exist: integer = text` on
+                    // 19beta1 and `1 > ALL (ARRAY['a'])` names `>`; hard-coding `=` was right
+                    // only while `=` was the sole spelling that reached here.
+                    op: op.symbol(),
                     right: element.name().to_owned(),
                 });
             }
-            Expr::AnyArray {
+            Expr::QuantifiedArray {
                 operand: Box::new(operand),
+                op: *op,
+                all: *all,
                 array: Box::new(array),
             }
         }
@@ -3335,6 +3361,94 @@ fn subquery_operand(
         });
     }
     Ok(operand)
+}
+
+/// Whether a type can stand on the right of a quantifier — that is, whether it holds **more than
+/// one value**.
+///
+/// Three groups, and the third is the one a shorter rule gets wrong:
+///
+/// * the `*Array` family, which is what `ArrayValue::element_of` answers for;
+/// * the two **vector** types, `int2vector` and `oidvector`. They are not in the array family and
+///   they are exactly what this node's quantified-array variant was built for —
+///   `a.attnum = ANY(i.indkey)`, which the schema dump sends and which
+///   `tests/indkey_any.rs` pins. A first version of this check listed the text types and not
+///   these, and refused six of that corpus's rows;
+/// * **text**, because this node has no `unknown`: `'{1,2}'` is a `text` literal that a real
+///   server coerces to the operand's array type, and an array reaches some readers as its own text
+///   form (`crate::value::vector`).
+///
+/// Everything else — an integer, a date, a boolean — is one value, and a quantifier over one value
+/// is the `42809` above. Written as an allow-list because the cheap mistake is to *accept*: a type
+/// wrongly listed here reaches the evaluator, which reads it as an array's text and answers
+/// something, where a type wrongly left out is a refusal a reader can see and report.
+fn holds_many(ty: ColumnType) -> bool {
+    esker_keys::array::ArrayValue::element_of(ty).is_some()
+        || matches!(
+            ty,
+            ColumnType::Int2Vector
+                | ColumnType::OidVector
+                | ColumnType::Text
+                | ColumnType::Varchar
+                | ColumnType::Bpchar
+                | ColumnType::Name
+        )
+}
+
+/// The element type a quantifier's right-hand side compares against, as PostgreSQL resolves it.
+///
+/// **An `unknown` element takes the type the typed ones settle, and only an array of nothing but
+/// unknowns is `text`.** That is one sentence and it decides three cases the same way a real
+/// server does:
+///
+/// ```text
+/// 1 = ALL (ARRAY[1, NULL])     integer[]   the NULL takes the integer's type; answers NULL
+/// 1 = ALL (ARRAY['a'])         text[]      nothing typed to take; 42883 integer = text
+/// id = ANY (ARRAY['1','2'])    text[]      the same, and the case this check was written for
+/// ```
+///
+/// A plain widening over *every* element gets the first one wrong: `wider_element(integer, text)`
+/// is `text`, so `ARRAY[1, NULL]` resolved to `text[]` and the comparison was refused where a real
+/// server answers NULL. The array's own type resolution is independent of what it is compared
+/// with, which is why PostgreSQL still refuses `ARRAY['a']` against an integer even though the
+/// operand would have given it a type.
+///
+/// `None` means "not an array whose elements are decidable here" — a column of a vector type, or
+/// text holding an array's own form — and the caller then leaves the comparison to the evaluator,
+/// where each element is read as the operand's type.
+fn quantified_element_type(array: &Expr, scope: &Scope<'_>) -> Option<ColumnType> {
+    if let Expr::Array { elements, element } = array {
+        let typed: Vec<Expr> = elements
+            .iter()
+            .filter(|element| !is_unknown_literal(element))
+            .cloned()
+            .collect();
+        // **The node's own settled type is not consulted when an element is unknown**, and that
+        // ordering is the whole fix: `resolve` sets it by widening over *every* element, and
+        // `wider_element(integer, text)` is `text`, so `ARRAY[1, NULL]` arrives here already
+        // labelled `text[]`. Recomputing over the typed elements is what PostgreSQL does.
+        if !typed.is_empty() && typed.len() < elements.len() {
+            return array_element_type(&typed, None, scope).ok().flatten();
+        }
+        if let Some(settled) = element {
+            return Some(*settled);
+        }
+        return array_element_type(elements, None, scope).ok().flatten();
+    }
+    expr_type(array, scope)
+        .ok()
+        .and_then(esker_keys::array::ArrayValue::element_of)
+}
+
+/// Whether an expression is a literal PostgreSQL would call **`unknown`** — a bare `NULL` or a
+/// quoted string with no cast — and so takes its type from what it is compared against.
+///
+/// This node has no `unknown`: a `NULL` literal is `text` here and so is `'1'`, which is why a
+/// type check that reads those as *decided* rejects comparisons a real server coerces. Used by the
+/// quantified-array arm; the plan-time `IN` form has never needed it, because its list is retyped
+/// against the operand rather than checked against it.
+fn is_unknown_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(Literal::Null | Literal::String(_)))
 }
 
 /// Whether an operator exists between two types, as coarsely as this node's type surface allows.
@@ -4156,7 +4270,7 @@ fn check_predicate(expr: &Expr, clause: &'static str, scope: &Scope<'_>) -> Resu
         | Expr::InList { .. }
         // A comparison like the rest, and the shape `ActiveRecord` puts a join condition in:
         // `JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)`.
-        | Expr::AnyArray { .. }
+        | Expr::QuantifiedArray { .. }
         | Expr::Literal(Literal::Bool(_) | Literal::Null)
         | Expr::Ordinal {
             ty: ColumnType::Bool,
@@ -4863,7 +4977,7 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         | Expr::Not(_)
         | Expr::IsNull { .. }
         | Expr::InList { .. }
-        | Expr::AnyArray { .. } => ColumnType::Bool,
+        | Expr::QuantifiedArray { .. } => ColumnType::Bool,
         // A scalar subquery has the type of the column it returns and the other four are
         // predicates, which is the whole of what `SubqueryExpr::value_type` says.
         Expr::Subquery(sub) => sub.value_type(),

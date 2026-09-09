@@ -5505,7 +5505,7 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
         | Expr::Like { .. }
         | Expr::RegexMatch { .. }
         | Expr::InList { .. }
-        | Expr::AnyArray { .. }
+        | Expr::QuantifiedArray { .. }
         | Expr::Cast { .. }
         | Expr::ToText { .. }
         | Expr::Scalar { .. }
@@ -5788,8 +5788,28 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         Expr::CatalogFunc(call) => format!("{}(...)", call.func.name()),
         Expr::Aggregate(call) => format!("{}(...)", call.func.name()),
         Expr::Subquery(sub) => sub.kind.describe().to_owned(),
-        Expr::AnyArray { operand, array } => {
-            format!("({} = ANY ({}))", sub(operand), sub(array))
+        // **The quantifier prints as the operator and the word**, which is what `pg_get_expr`
+        // gives for every one of the twelve spellings: `(c1 <> ALL (ARRAY[1, 2]))`,
+        // `(c1 = ALL (ARRAY[1, 2]))`, `(c1 > ALL (ARRAY[1, 2]))` — measured on 19beta1
+        // (`tests/corpus/pg19_all_quantifier.txt`). `NOT IN` and `<> ALL` print *identically*,
+        // which is why `parse::lower` is free to prefer the `IN` form and why this arm and the
+        // `InList` arm below print the same characters for them.
+        Expr::QuantifiedArray {
+            operand,
+            op,
+            all,
+            array,
+        } => {
+            // The elements take the operand's type, the same correction the `InList` arm carries:
+            // a text array's elements print `'a'::text` and the expression's own type is boolean.
+            let element = column_type_of(operand, table).unwrap_or(ty);
+            format!(
+                "({} {} {} ({}))",
+                deparse(operand, table, element),
+                op.symbol(),
+                if *all { "ALL" } else { "ANY" },
+                deparse(array, table, element)
+            )
         }
         Expr::Subscript { operand, index, .. } => format!("{}[{}]", sub(operand), sub(index)),
         Expr::Uuid(func) => format!("{}()", func.name()),

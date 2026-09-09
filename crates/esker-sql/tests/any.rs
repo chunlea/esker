@@ -149,12 +149,28 @@ fn a_bare_current_schema_is_the_function() {
     assert_eq!(error.sqlstate(), "42703");
 }
 
-/// A quantifier this node does not have is named rather than answered by the one it does.
+/// **Every quantifier this node has, and it has all twelve now.**
+///
+/// This test asserted `0A000` for these two statements — "a quantifier this node does not have is
+/// named rather than answered by the one it does", which was the right refusal for as long as the
+/// array form only knew `= ANY`. `docs/plans/debts-v1.1.md` #21 closed that, so the test asserts
+/// the **answers** instead, and each is measured rather than reasoned: `1 > ANY (ARRAY[1,2])` is
+/// `f` and not `t`, because no element of the array is *less than* one, which is the direction
+/// this reader had to check twice.
+///
+/// Kept as a test rather than deleted, because what it pins is still the same thing: that the
+/// spelling reaches an implementation. `tests/all_quantifier.rs` is where the rule itself is
+/// measured against the oracle, including the two refusals PostgreSQL keeps.
 #[test]
-fn another_quantifier_is_refused_by_name() {
+fn every_quantifier_over_an_array_is_answered() {
     let mut node = parity::Node::new(&[]);
-    for sql in ["SELECT 1 > ANY(ARRAY[1,2])", "SELECT 1 = ALL(ARRAY[1,2])"] {
-        let error = node.run(sql).unwrap_err();
-        assert_eq!(error.sqlstate(), "0A000", "{sql}");
+    for (sql, expected) in [
+        ("SELECT 1 > ANY(ARRAY[1,2])", "f"),
+        ("SELECT 1 = ALL(ARRAY[1,2])", "f"),
+        ("SELECT 2 > ANY(ARRAY[1,2])", "t"),
+        ("SELECT 1 >= ANY(ARRAY[1,2])", "t"),
+        ("SELECT 1 <> ANY(ARRAY[1,2])", "t"),
+    ] {
+        assert_eq!(node.rows(sql), vec![vec![expected.to_owned()]], "{sql}");
     }
 }
