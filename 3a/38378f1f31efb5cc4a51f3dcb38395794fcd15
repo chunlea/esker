@@ -1,0 +1,19 @@
+crates/esker-store/tests/promotion.rs
+  s_6f7019c05b578b::t_04be385fc535bb 143-150,168-186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "3a38378f1f31efb5cc4a51f3dcb38395794fcd15",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
