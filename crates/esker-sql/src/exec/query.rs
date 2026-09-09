@@ -4056,10 +4056,19 @@ fn attnum_vector_element(operand: &Expr, scope: &Scope<'_>) -> Option<ColumnType
     // **A real array knows its own element type**, so a subscript of one needs no rule: the
     // catalog's text vectors below are the case that does, because their element type is a fact
     // about the relation rather than about the value.
-    if let Ok(ty) = expr_type(operand, scope)
-        && let Some(element) = esker_keys::array::ArrayValue::element_of(ty)
-    {
-        return Some(element);
+    if let Ok(ty) = expr_type(operand, scope) {
+        if let Some(element) = esker_keys::array::ArrayValue::element_of(ty) {
+            return Some(element);
+        }
+        // **A vector's element is a property of the type**, which is what `pg_type.typelem` says:
+        // 21 for an `int2vector` and 26 for an `oidvector`, measured. Asked before the column
+        // names below, because a vector that is not a catalog column has the same element —
+        // `('23 25'::oidvector)[0]` is an `oid` on a real server and was `text` here.
+        match ty {
+            ColumnType::Int2Vector => return Some(ColumnType::Int2),
+            ColumnType::OidVector => return Some(ColumnType::Oid),
+            _ => {}
+        }
     }
     let Expr::Column { table, name } = operand else {
         return None;
@@ -5471,12 +5480,16 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // filled where the expression is lowered, before anything knows what it is subscripting;
         // a real array carries its element type in the value, so it answers for itself and the
         // stored field is the fallback for the catalog's text vectors.
+        // **One reader for a subscript's element type, not two.** This asked the operand's array
+        // element and fell back to the `element` the node carries; `resolve` set that field from
+        // [`attnum_vector_element`], which also knows the catalog's text vectors. So the two
+        // agreed only *after* resolution — and `output_columns` types a projection **before** it,
+        // which is why `indkey[0]` was described `text` (25) while `pg_typeof(indkey[0])` answered
+        // `smallint`. The wire and the function disagreed about the same expression, and only a
+        // `Describe` could see it.
         Expr::Subscript {
             operand, element, ..
-        } => expr_type(operand, scope)
-            .ok()
-            .and_then(esker_keys::array::ArrayValue::element_of)
-            .unwrap_or(*element),
+        } => attnum_vector_element(operand, scope).unwrap_or(*element),
         Expr::Uuid(_) => ColumnType::Uuid,
         // Resolution has already given every argument the common type, so the first one that
         // **carries** a type is the answer. `branch_type` rather than `expr_type` is the whole of

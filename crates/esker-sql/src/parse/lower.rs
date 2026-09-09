@@ -6376,6 +6376,26 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `ARRAY[…]::oidvector`, which `ActiveRecord`'s case-insensitivity probe compares against
         // `pg_proc.proargtypes`. The elements' oids, space separated — digits and not names.
         (CastTarget::OidVector, _) => {
+            // **A string is read as a vector, an array is built into one.** `'23 25'::oidvector`
+            // was `42846 cannot cast type text to oidvector` here while `'1 2'::int2vector`
+            // answered — the same spelling one type over, and the asymmetry was only that
+            // `oidvector` is a `CastTarget` (`sqlparser` has no `DataType` for it) while
+            // `int2vector` reaches `lower_type` and the ordinary literal path.
+            if let Some(text) = cast_literal_text(expr)?
+                && is_string_literal(expr)
+            {
+                // **Under a `Cast` node, because the datum cannot say what it is.** A vector is a
+                // `Datum::Text` here, so folding to the value alone answered `text` from
+                // `pg_typeof` where a real server says `oidvector` — the sentence ADR 0086 is,
+                // reached by a path that does not go through the fold that carries it.
+                return Ok(plan::Expr::Cast {
+                    operand: Box::new(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                        Datum::from_text(ColumnType::OidVector, &text)?,
+                    )))),
+                    to: ColumnType::OidVector,
+                    typmod: NO_TYPMOD,
+                });
+            }
             Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                 func: plan::CatalogFunc::OidVector,
                 args: vec![lower_expr(expr)?],

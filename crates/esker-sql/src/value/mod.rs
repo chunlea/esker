@@ -2168,7 +2168,29 @@ impl PgDatum for Datum {
             // the seam that has a catalog — `CatalogFunc::RegClass`, where every `::regclass` cast
             // is lowered — so reaching here with one means a path that bypassed it.
             // Text's representation: the numbers space separated, read back as written.
-            ColumnType::Int2Vector | ColumnType::OidVector => Datum::Text(text.to_owned()),
+            // **Each element is read, and the spaces are normalised.** A vector's input function
+            // is its element's applied to every word: `'abc'::int2vector` is
+            // `22P02 invalid input syntax for type smallint: "abc"` and `'abc'::oidvector` names
+            // `oid` instead — measured, and this node used to keep whatever it was handed, which
+            // is an answer where a real server refuses. `'23  25'` is `23 25` and `''` is the
+            // empty vector, also measured.
+            ColumnType::Int2Vector | ColumnType::OidVector => {
+                let element = if ty == ColumnType::Int2Vector {
+                    ColumnType::Int2
+                } else {
+                    ColumnType::Oid
+                };
+                let mut words = Vec::new();
+                for word in text.split_whitespace() {
+                    let value = Datum::from_text(element, word)?;
+                    words.push(
+                        value
+                            .to_text()
+                            .ok_or_else(|| SqlError::DatatypeMismatch("a vector element".into()))?,
+                    );
+                }
+                Datum::Text(words.join(" "))
+            }
             ColumnType::RegClass => {
                 return text.parse::<i64>().map(regclass_of_oid).map_err(|_| {
                     SqlError::unsupported("a relation name read as a regclass without a catalog")
