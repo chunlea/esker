@@ -1419,10 +1419,16 @@ fn render(expr: &Expr, columns: &[String]) -> String {
                 .join(", ")
         ),
         Expr::Case {
+            operand,
             branches,
             otherwise,
         } => {
-            let mut text = "CASE".to_owned();
+            // The simple form's operand belongs on the `CASE` itself, which is where it was
+            // written and where every reader of a stored one prints it back.
+            let mut text = match operand {
+                Some(operand) => format!("CASE {}", render(operand, columns)),
+                None => "CASE".to_owned(),
+            };
             for branch in branches {
                 let _ = write!(
                     text,

@@ -816,6 +816,14 @@ fn substitute_outer(node: &mut Node, outer: &[Datum], depth: usize) {
 
 /// [`substitute_in_expr`] over a list, which is what an `ARRAY[…]`'s elements are — and over the
 /// one operand a cast has, so both arms are one line in the match rather than four.
+/// [`substitute_in_each`] for the child a node may or may not have — a `CASE`'s operand and its
+/// `ELSE`, which are the same `Option<Box<Expr>>` twice in one arm.
+fn substitute_in_maybe(expr: Option<&mut Box<Expr>>, outer: &[Datum], depth: usize) {
+    if let Some(expr) = expr {
+        substitute_in_expr(expr, outer, depth);
+    }
+}
+
 fn substitute_in_each(elements: &mut [Expr], outer: &[Datum], depth: usize) {
     for element in elements {
         substitute_in_expr(element, outer, depth);
@@ -872,16 +880,16 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
             }
         }
         Expr::Case {
+            operand,
             branches,
             otherwise,
         } => {
+            substitute_in_maybe(operand.as_mut(), outer, depth);
             for branch in branches {
                 substitute_in_expr(&mut branch.when, outer, depth);
                 substitute_in_expr(&mut branch.then, outer, depth);
             }
-            if let Some(otherwise) = otherwise {
-                substitute_in_expr(otherwise, outer, depth);
-            }
+            substitute_in_maybe(otherwise.as_mut(), outer, depth);
         }
         Expr::InList { operand, list, .. } => {
             substitute_in_expr(operand, outer, depth);
@@ -1448,9 +1456,13 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             }
         }
         Expr::Case {
+            operand,
             branches,
             otherwise,
         } => {
+            if let Some(operand) = operand {
+                walk(operand, visit);
+            }
             for branch in branches {
                 walk(&branch.when, visit);
                 walk(&branch.then, visit);
@@ -1549,9 +1561,13 @@ pub(super) fn walk_mut(
             }
         }
         Expr::Case {
+            operand,
             branches,
             otherwise,
         } => {
+            if let Some(operand) = operand {
+                walk_mut(operand, visit)?;
+            }
             for branch in branches {
                 walk_mut(&mut branch.when, visit)?;
                 walk_mut(&mut branch.then, visit)?;

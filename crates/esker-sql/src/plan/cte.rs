@@ -303,9 +303,13 @@ fn for_each_subquery_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut TableRef))
             }
         }
         Expr::Case {
+            operand,
             branches,
             otherwise,
         } => {
+            if let Some(operand) = operand {
+                for_each_subquery_mut(operand, visit);
+            }
             for branch in branches {
                 for_each_subquery_mut(&mut branch.when, visit);
                 for_each_subquery_mut(&mut branch.then, visit);

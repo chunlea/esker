@@ -1115,9 +1115,13 @@ pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) 
             }
         }
         Expr::Case {
+            operand,
             branches,
             otherwise,
         } => {
+            if let Some(operand) = operand {
+                walk_expr_mut(operand, visit);
+            }
             for branch in branches {
                 walk_expr_mut(&mut branch.when, visit);
                 walk_expr_mut(&mut branch.then, visit);
@@ -1430,9 +1434,13 @@ pub(super) fn descend<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
             }
         }
         Expr::Case {
+            operand,
             branches,
             otherwise,
         } => {
+            if let Some(operand) = operand {
+                descend(operand, visit);
+            }
             for branch in branches {
                 descend(&branch.when, visit);
                 descend(&branch.then, visit);

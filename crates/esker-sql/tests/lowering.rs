@@ -102,12 +102,11 @@ fn a_clause_we_do_not_honour_is_refused_by_name() {
         // `CASCADE` is built and `DROP ... PURGE` is Oracle's, which PostgreSQL does not take
         // either — so it is the one `DROP` clause left to name.
         ("DROP TABLE t PURGE", "DROP ... PURGE"),
-        // The **simple** form of `CASE`. The searched form runs; this one prints back as
-        // `CASE x WHEN 1 THEN …`, so desugaring it would store a definition nobody wrote.
-        (
-            "SELECT CASE a WHEN 1 THEN 'x' END FROM t",
-            "CASE <expression> WHEN ..., the simple form",
-        ),
+        // **The simple `CASE` left this list** with group F of the deparse census. It is lowered
+        // now, with its operand carried rather than desugared — for the reason this entry used to
+        // give as the reason to refuse it: a real server prints `CASE x WHEN 1 THEN …` back, so
+        // rewriting it to `WHEN x = 1` would store a definition nobody wrote. Carrying it keeps
+        // the printed form and the evaluation both.
         ("CREATE INDEX i ON t USING hash (a)", "an index USING"),
         // **`INCLUDE` left this list** with statement 787. What it still refuses is the payload
         // on an access method that cannot carry one, and that message is PostgreSQL's own rather
