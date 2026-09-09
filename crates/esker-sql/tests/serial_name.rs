@@ -41,6 +41,30 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          = 'S' AND c.relname LIKE 'long_table_name%' ORDER BY c.relname",
     ],
     answers: &[
+        (
+            "SELECT 'r', count(*) AS columns_that_OWN_a_sequence FROM pg_attribute a WHERE \
+             a.attrelid = 'postgresql_serials'::regclass AND a.attnum > 0 AND \
+             pg_get_serial_sequence('postgresql_serials', a.attname) IS NOT NULL",
+            "**A plan-shape divergence, and it became visible the day a NULL stopped hiding it.** \
+             PostgreSQL answers `2`; this node raises `42703 column \"oid\" of relation \
+             \"postgresql_serials\" does not exist`. Neither server short-circuits `AND` — \
+             measured, `WHERE a = 2 AND 1/0 = 1` raises on both — so the difference is not the \
+             operator but which rows reach it: a real server's index scan on `pg_attribute` \
+             applies `attrelid = 'postgresql_serials'::regclass` first and never calls the \
+             function for another relation's row, while this node evaluates the whole predicate \
+             over every row of a computed view, including catalog relations that have a column \
+             called `oid`. Ordering the conjuncts cheapest-first here would close this statement \
+             and open a worse hole: `WHERE a = 2 AND 1/0 = 1` would then answer where a real \
+             server raises, which is the wrong-answer shape. Until this crate has a planner that \
+             restricts a scan, the honest answer is the error. **This statement passed before, \
+             and passed for the wrong reason**: `pg_get_serial_sequence` answered NULL for a \
+             column that is not there, where PostgreSQL raises, so the `IS NOT NULL` filtered the \
+             row and two bugs cancelled. Closing the function's own gap — which is what \
+             `postgresql_adapter_test`'s `test_serial_sequence` and \
+             `test_default_sequence_name_bad_table` need, because `default_sequence_name` rescues \
+             the exception to build its fallback — uncancelled them.",
+            "pg19_serial.txt:44",
+        ),
         // **`last_value` counts the block that was reserved, not the rows that were inserted.**
         // Two `INSERT`s give `2` on a real server and `32` here, because a sequence hands out
         // `catalog::SEQUENCE_BATCH` at a time to the node that asks
@@ -58,7 +82,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', last_value, is_called FROM foo_id_seq",
             "a sequence block is reserved 32 at a time (ADR 0072), and last_value reports the reservation",
-            "pg19_serial.txt:71",
+            "pg19_serial.txt:73",
         ),
     ],
 };

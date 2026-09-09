@@ -1617,6 +1617,39 @@ pub struct ExcludeDef {
 ///
 /// Split on the **top level only**: a keyword inside parentheses or inside a string literal is
 /// part of an operand, not a separator.
+/// Whether an expression is nothing but one column name — bare, or delimited.
+///
+/// **The one shape PostgreSQL's boolean deparser leaves unparenthesised.** Measured on 19beta1,
+/// over a partial index's predicate and an exclusion constraint's alike:
+///
+/// ```text
+/// WHERE "primary"        -> "primary"            WHERE n > 0 AND flag -> ((n > 0) AND flag)
+/// WHERE flag             -> flag                 WHERE NOT flag       -> (NOT flag)
+/// WHERE (flag)           -> flag                 WHERE n > 0          -> (n > 0)
+/// ```
+///
+/// Deliberately narrow: anything with an operator, a call, a space outside quotes or a second
+/// token is not this shape and takes its pair. A delimited name may hold any character but `"`,
+/// so that case is matched on its own rather than by scanning for spaces.
+#[must_use]
+pub(crate) fn is_column_reference(expr: &str) -> bool {
+    let expr = expr.trim();
+    if let Some(inner) = expr
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        return !inner.is_empty() && !inner.contains('"');
+    }
+    !expr.is_empty()
+        && expr
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && expr
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 pub(crate) fn parenthesised_operands(predicate: &str) -> String {
     let bytes = predicate.as_bytes();
     let upper = predicate.to_ascii_uppercase();
@@ -1648,9 +1681,20 @@ pub(crate) fn parenthesised_operands(predicate: &str) -> String {
         return predicate.to_owned();
     }
     operands.push(predicate[start..].trim());
-    let mut out = format!("({})", operands[0]);
+    // **A bare column operand takes no pair**, which is the server's own rule and not a nicety:
+    // `n > 0 AND flag` comes back `((n > 0) AND flag)`, measured through a partial index and an
+    // exclusion constraint both.
+    let wrap = |operand: &str| {
+        if is_column_reference(operand) {
+            operand.to_owned()
+        } else {
+            format!("({operand})")
+        }
+    };
+    let mut out = wrap(operands[0]);
     for (operand, separator) in operands[1..].iter().zip(&separators) {
-        let _ = std::fmt::Write::write_fmt(&mut out, format_args!(" {separator} ({operand})"));
+        let _ =
+            std::fmt::Write::write_fmt(&mut out, format_args!(" {separator} {}", wrap(operand)));
     }
     out
 }
@@ -3074,19 +3118,29 @@ pub fn rename_sequence(
     sequence: &SequenceDef,
     to: &str,
 ) -> Result<()> {
-    if txn.get(&record::name_key(tenant, to))?.is_some() {
+    // **The new name goes in the sequence's own schema**, which is the third face of one
+    // mechanism: a table's `RENAME TO` and an index's each asked `public` for a bare target
+    // before this one did. `ALTER TABLE "my.schema"."posts_id_seq" RENAME TO "articles_id_seq"`
+    // is what `SchemaWithDotsTest#test_rename_table` sends after renaming the table, and
+    // `public.articles_id_seq` is a suite fixture's sequence that is always there — so the check
+    // fired on a name in a schema nobody had named. Measured on 19beta1: the statement succeeds
+    // and the sequence stays in `my.schema`; a collision **inside** that schema is still
+    // `42P07 relation "a_seq" already exists`.
+    let target = qualify(split_qualified(&sequence.name).0, to);
+    if txn.get(&record::name_key(tenant, &target))?.is_some() {
+        // The bare name in the message, the way every `42P07` names what the user wrote.
         return Err(SqlError::DuplicateTable(to.to_owned()));
     }
     let mut renamed = sequence.clone();
     renamed.name.clear();
-    renamed.name.push_str(to);
+    renamed.name.push_str(&target);
     txn.delete(&record::name_key(tenant, &sequence.name));
     txn.put(
         &record::sequence_key(tenant, renamed.table_id, renamed.id),
         &record::encode_sequence(&renamed),
     );
     txn.put(
-        &record::name_key(tenant, to),
+        &record::name_key(tenant, &target),
         &record::encode_relation(&Relation::Sequence {
             table_id: renamed.table_id,
             sequence_id: renamed.id,

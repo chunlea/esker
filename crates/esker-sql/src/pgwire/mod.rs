@@ -52,6 +52,9 @@ pub fn error_fields(error: &SqlError) -> Vec<(ErrorField, String)> {
     if let Some(position) = error.position() {
         fields.push((ErrorField::POSITION, position.to_string()));
     }
+    if let Some(function) = error.source_function() {
+        fields.push((ErrorField::SOURCE_FUNCTION, function.to_owned()));
+    }
     fields
 }
 
