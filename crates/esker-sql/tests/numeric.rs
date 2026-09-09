@@ -10,8 +10,8 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // Six, and **the rows agree in every one** — this is the declared type only. Two different
-    // things used to be behind it and one of them is gone.
+    // One, and **the rows agree** — this is the declared type only. Two things used to be behind
+    // it and both are gone.
     //
     // **The corpus format was the first, and it was not this node.** A types field was split on
     // every comma and `numeric(10,2)` contains one, so PostgreSQL's three types arrived as five
@@ -20,14 +20,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // zero, which is decidable without any escape, and `SELECT id, n, d FROM nm ORDER BY id`
     // agreed the moment it did (`docs/plans/debts-v1.1.md` #20).
     //
-    // **What is left is real and small: a cast's result carries no typmod here**, so
-    // `1.0::numeric(10,3)` describes itself as bare `numeric` where a real server says
-    // `numeric(10,3)`. The rule is `exec::query::output_columns`'s — a typmod travels only with
-    // a plain column reference, which was measured for `bpchar` (`min(c)` is `bpchar` with none)
-    // and is too narrow for a cast. That is register row **#28**, whose other instance is
-    // `nullif(c, 'x')` over a `char(4)` column answering `bpchar` where a real server keeps
-    // `character(4)`: one seam, two readers. Closing it means an expression carrying a typmod at
-    // all, which is a change to the plan's value shape and not to this type.
+    // **The second is gone too, and it was smaller than its row said.** A cast's result used to
+    // carry no typmod — `1.0::numeric(10,3)` described itself as bare `numeric` — because a
+    // modifier travelled only with a plain column reference. Register row #28 sized that as a
+    // type-surface change; it was one rule in `exec::query::typmod_of` plus one clause in the
+    // fold, which was already keeping a `Cast` node "when the value cannot speak for itself" and
+    // needed to keep one when the value cannot speak for its *modifier* either. Six statements
+    // left this list at once (`tests/corpus/pg19_expression_typmod.txt`).
     types: &[
         // **All four answers agree now**, and it took two units: `pg_typeof` answers them at all
         // (it was `0A000` naming itself), and the first of the four — a bare `1.5` — is a
@@ -38,12 +37,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
         "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'numeric'",
-        "SELECT 1.5::numeric(10,2), 1.5::numeric(10,0), 1.5::numeric(10)",
-        "SELECT 1.0::numeric(10,3)",
-        "SELECT 1.235::numeric(10,2), 1.245::numeric(10,2), 1.255::numeric(10,2)",
-        "SELECT (-1.235)::numeric(10,2), (-1.245)::numeric(10,2)",
-        "SELECT 'NaN'::numeric(10,2)",
-        "SELECT 12345.6789::numeric(10,-2)",
     ],
     // Twenty-one of eighty, and **every one is a missing function or a refused feature** — not one is
     // a value where PostgreSQL answers something else. Everything the type *is* agrees: the scale

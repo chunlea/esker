@@ -1,0 +1,81 @@
+# **Which expressions carry a typmod into the `RowDescription`**, measured for every shape this
+# node can build one from.
+#
+# `docs/plans/debts-v1.1.md` #28. A `character(4)` column is `character(4)` to a client and an
+# expression over it was `bpchar` here whatever it was there — the row was found on
+# `nullif(c, 'x')` and a second reader turned up while closing #20, where five statements in
+# `tests/numeric.rs` were declared because `1.0::numeric(10,3)` described itself as bare `numeric`.
+#
+# ## The rule, and it is short
+#
+#     a plain column          its own                 SELECT c              character(4)
+#     a cast                  the cast's own          c::char(2)            character(2)
+#     NULLIF                  its left argument's     nullif(c, 'x')        character(4)
+#       ... unless the comparison changed the type:   nullif(v, 'x')        text
+#     COALESCE/GREATEST/LEAST all inputs' if they agree, else none
+#                                                     coalesce(c, c)        character(4)
+#                                                     coalesce(c, d)        bpchar
+#                                                     coalesce(c, 'x')      bpchar
+#     CASE                    none, always            CASE ... THEN c ...   bpchar
+#     everything else         none                    c || 'x', min(c), n + 1
+#
+# `bpchar` and bare `numeric` are what PostgreSQL calls those types when the modifier is unknown,
+# so a row answering one of those is a row where a real server has none either.
+#
+# ## Two oracles disagree about `CASE`, and this file follows the one a client reads
+#
+# `CREATE TABLE AS SELECT (CASE WHEN true THEN c ELSE 'x' END)` gives a column whose
+# `format_type(atttypid, atttypmod)` is **`character(4)`** — the first branch's — while `\gdesc`
+# on the same expression says **`bpchar`**. Both were measured on 19beta1. The `RowDescription` is
+# the one this row is about and the one this corpus's types field holds, so `CASE` is "none" here;
+# the CTAS answer is recorded because the next person to probe this will find it and it would look
+# like a contradiction.
+#
+# ## Captured by hand, and why
+#
+# `sesscap.py` takes its types from a **second** `\gdesc` pass after the transaction has rolled
+# back, so a statement over a table the capture created describes nothing — every row below came
+# back with an empty types field, which is the field this file is about. The types here are one
+# `psql` session's `\gdesc` beside each statement (`scratchpad/gdesc.sql`) and the rows are
+# `sesscap.py`'s own. That limitation is r1's, beside the two in
+# `NOTE-for-r1-corpus-escape-contract.md`: a capture tool that cannot describe a statement over its
+# own fixture cannot measure a declared type at all.
+
+BEGIN		-
+CREATE TABLE g1tm (c char(4), d char(2), v varchar(10), n numeric(10,2), m numeric(8,1), ts timestamp(3))		-
+INSERT INTO g1tm VALUES ('x', 'y', 'z', 1.5, 2.5, '2020-01-01 00:00:00')		-
+SELECT c FROM g1tm	character(4)	x   
+SELECT v FROM g1tm	character varying(10)	z
+SELECT n FROM g1tm	numeric(10,2)	1.50
+SELECT ts FROM g1tm	timestamp(3) without time zone	2020-01-01 00:00:00
+SELECT c::char(2) FROM g1tm	character(2)	x 
+SELECT v::varchar(5) FROM g1tm	character varying(5)	z
+SELECT 1.0::numeric(10,3)	numeric(10,3)	1.000
+SELECT n::numeric(6,1) FROM g1tm	numeric(6,1)	1.5
+SELECT ts::timestamp(1) FROM g1tm	timestamp(1) without time zone	2020-01-01 00:00:00
+SELECT nullif(c, 'x') FROM g1tm	character(4)	\N
+SELECT nullif(n, 1) FROM g1tm	numeric(10,2)	1.50
+SELECT nullif(v, 'x') FROM g1tm	text	z
+SELECT CASE WHEN true THEN c ELSE 'x' END FROM g1tm	bpchar	x   
+SELECT CASE WHEN true THEN c ELSE d END FROM g1tm	bpchar	x   
+SELECT CASE WHEN true THEN d ELSE c END FROM g1tm	bpchar	y 
+SELECT CASE WHEN true THEN 'x' ELSE c END FROM g1tm	bpchar	x
+SELECT CASE WHEN true THEN n ELSE m END FROM g1tm	numeric	1.50
+SELECT coalesce(c, c) FROM g1tm	character(4)	x   
+SELECT coalesce(c, d) FROM g1tm	bpchar	x   
+SELECT coalesce(c, 'x') FROM g1tm	bpchar	x   
+SELECT greatest(d, d) FROM g1tm	character(2)	y 
+SELECT greatest(c, 'x') FROM g1tm	bpchar	x   
+SELECT least(n, n) FROM g1tm	numeric(10,2)	1.50
+SELECT c || 'x' FROM g1tm	text	xx
+SELECT length(c) FROM g1tm	integer	1
+SELECT n + 1 FROM g1tm	numeric	2.50
+SELECT min(c) FROM g1tm	bpchar	x   
+SELECT sum(n) FROM g1tm	numeric	1.50
+SELECT upper(c) FROM g1tm	text	X
+SELECT 1.5::numeric(10,2)	numeric(10,2)	1.50
+SELECT 1.5::numeric(10,0)	numeric(10,0)	2
+SELECT 1.5::numeric(10)	numeric(10,0)	2
+SELECT 1.5::numeric	numeric	1.5
+SELECT 1.5::numeric(10,2), 1.5::numeric(10,0), 1.5::numeric(10)	numeric(10,2),numeric(10,0),numeric(10,0)	1.50|2|2
+ROLLBACK		-
