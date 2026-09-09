@@ -219,6 +219,8 @@ pub enum PeerMsg {
     Membership(oneshot::Sender<ConfState>),
     /// Ask this region's leadership to move to another peer.
     TransferLeader(NodeId),
+    /// Stand for election now (ADR 0094): a split child, asked by the store that led its parent.
+    Campaign,
     /// What became of a snapshot transfer this store was serving to `to`. The core stops sending
     /// to a peer it has offered a snapshot, so this is what ends that wait when the transfer,
     /// rather than the follower, is what failed.
@@ -1137,6 +1139,14 @@ impl PeerCore {
                 let _ = notify.send(self.node.conf_state());
             }
             PeerMsg::TransferLeader(target) => self.node.transfer_leader(target),
+            PeerMsg::Campaign => {
+                if let Err(error) = self.node.campaign() {
+                    // A campaign this core will not start is not a failure of the split that asked
+                    // for it: the region keeps the leader it has, or elects one on the timeout the
+                    // way it always did. Saying so is all this can usefully do.
+                    tracing::debug!(%error, "a split child would not campaign");
+                }
+            }
             PeerMsg::ReportSnapshot { to, status } => self.node.report_snapshot(to, status),
             PeerMsg::Stop => return false,
         }
@@ -1509,6 +1519,22 @@ impl RaftPeer {
     /// re-issues from what the next heartbeat reports rather than waiting for an answer.
     pub async fn transfer_leader(&self, target: NodeId) -> std::result::Result<(), ProtoError> {
         self.send(PeerMsg::TransferLeader(target)).await
+    }
+
+    /// **Stands for election now, instead of waiting out a timeout**
+    /// ([ADR 0094](../../../docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md)).
+    ///
+    /// The one caller is `Store::adopt_split`, on the store that led the **parent**: a split child
+    /// starts with every replica a follower, so without this the group waits an election timeout
+    /// before anyone stands — a median of 62 ms measured across 132 splits, once per split.
+    ///
+    /// Fire and forget, like [`RaftPeer::transfer_leader`] and for the same reason: what completes
+    /// it is an election, which nothing here can await. **And it decides nothing**: the campaign is
+    /// an ordinary one, the other replicas grant or refuse by the ordinary rules, and
+    /// [ADR 0085](../../../docs/adr/0085-a-vote-is-not-granted-to-a-learner.md)'s guard still says
+    /// who may be voted for. What it removes is the waiting, not the election.
+    pub async fn campaign(&self) -> std::result::Result<(), ProtoError> {
+        self.send(PeerMsg::Campaign).await
     }
 
     /// Tells the core what became of a snapshot transfer this store was serving.

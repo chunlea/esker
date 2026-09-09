@@ -170,8 +170,12 @@ impl<S: LogStorage> RawNode<S> {
 
     /// Starts an election immediately, skipping the timeout.
     ///
-    /// Exists so a test or the simulator can drive an election deterministically instead of
-    /// ticking until one happens by itself.
+    /// Written so a test or the simulator could drive an election deterministically instead of
+    /// ticking until one happened by itself, and it has a production caller since
+    /// [ADR 0094](../../../docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md): the store
+    /// that led a region calls it on the **child** of a split, which otherwise waits out a timeout
+    /// with every replica a follower. The core is unchanged by that — this is the same campaign a
+    /// timeout would have started, and every rule about who may win it still applies.
     pub fn campaign(&mut self) -> Result<()> {
         let kind = if self.raft.pre_vote {
             CampaignKind::PreElection

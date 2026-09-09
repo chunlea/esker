@@ -212,6 +212,31 @@ fn sort_level(files: &mut [Arc<FileMeta>], level: usize, comparator: &InternalKe
 
 /// Below L0 the files partition the key space; two that overlap would make a binary search
 /// return the wrong file and a read miss a key that is on disk.
+/// An internal key as something a person reading a gate log can compare.
+///
+/// Printable bytes as themselves and the rest in hex, because a key that is mostly ASCII with a
+/// timestamp suffix — which is every SQL key — is unreadable as pure hex and misleading as pure
+/// text. Truncated, because a message is not a dump.
+fn render_key(key: &[u8]) -> String {
+    let user = crate::dbformat::extract_user_key(key);
+    let shown: String = user
+        .iter()
+        .take(24)
+        .map(|byte| {
+            if byte.is_ascii_graphic() {
+                char::from(*byte).to_string()
+            } else {
+                format!("\\x{byte:02x}")
+            }
+        })
+        .collect();
+    if user.len() > 24 {
+        format!("{shown}…({} bytes)", user.len())
+    } else {
+        shown
+    }
+}
+
 fn check_disjoint(
     files: &[Arc<FileMeta>],
     cf: u32,
@@ -220,11 +245,23 @@ fn check_disjoint(
 ) -> Result<()> {
     for pair in files.windows(2) {
         if comparator.cmp(&pair[0].largest, &pair[1].smallest) != Ordering::Less {
+            // **The bounds go into the message, because the message is all a gate log keeps.**
+            // This refusal has appeared once in sixty on a loaded gate and the line printed was
+            // `files 124 and 121 overlap` and nothing else — which cannot say whether the two
+            // came from one compaction or two, nor where they meet. The numbers are the file
+            // numbers, so the *provenance* is added by `db::compact` where the plan is known;
+            // what belongs here is the geometry, which only this comparison can see.
             return Err(Error::corruption(
                 "manifest",
                 format!(
-                    "column family {cf} level {level}: files {} and {} overlap",
-                    pair[0].number, pair[1].number
+                    "column family {cf} level {level}: files {} and {} overlap — {} ends at {} \
+                     and {} starts at {}",
+                    pair[0].number,
+                    pair[1].number,
+                    pair[0].number,
+                    render_key(&pair[0].largest),
+                    pair[1].number,
+                    render_key(&pair[1].smallest),
                 ),
             ));
         }
