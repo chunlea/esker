@@ -1,0 +1,38 @@
+SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, t.typcategory, t.typlen FROM pg_type t WHERE t.typname IN ('circle','_circle','path','_path','polygon','_polygon','lseg','_lseg','line','_line','point','_point','box','_box') ORDER BY t.oid	oid,name,oid,"char",regproc,"char",smallint	600|point|701|,|point_in|G|16 ; 601|lseg|600|,|lseg_in|G|32 ; 602|path|0|,|path_in|G|-1 ; 603|box|600|;|box_in|G|32 ; 604|polygon|0|,|poly_in|G|-1 ; 628|line|701|,|line_in|G|24 ; 629|_line|628|,|array_in|A|-1 ; 718|circle|0|,|circle_in|G|24 ; 719|_circle|718|,|array_in|A|-1 ; 1017|_point|600|,|array_in|A|-1 ; 1018|_lseg|601|,|array_in|A|-1 ; 1019|_path|602|,|array_in|A|-1 ; 1020|_box|603|;|array_in|A|-1 ; 1027|_polygon|604|,|array_in|A|-1
+SELECT pg_typeof(array_agg(c::circle)) FROM (VALUES ('<(0,0),1>')) s(c)	regtype	circle[]
+SELECT pg_typeof(ARRAY[c::circle]) FROM (VALUES ('<(0,0),1>')) s(c)	regtype	circle[]
+SELECT array_agg(c::circle) FROM (VALUES ('<(0,0),1>'),('<(2,2),3>')) s(c)	circle[]	{"<(0,0),1>","<(2,2),3>"}
+SELECT ARRAY['<(0,0),1>'::circle]	circle[]	{"<(0,0),1>"}
+SELECT pg_typeof(array_agg(c::path)) FROM (VALUES ('((0,0),(1,1))')) s(c)	regtype	path[]
+SELECT array_agg(c::path) FROM (VALUES ('((0,0),(1,1))'),('[(2,2),(3,3)]')) s(c)	path[]	{"((0,0),(1,1))","[(2,2),(3,3)]"}
+SELECT ARRAY['((0,0),(1,1))'::path]	path[]	{"((0,0),(1,1))"}
+SELECT pg_typeof(array_agg(c::polygon)) FROM (VALUES ('((0,0),(1,1),(1,0))')) s(c)	regtype	polygon[]
+SELECT array_agg(c::polygon) FROM (VALUES ('((0,0),(1,1),(1,0))')) s(c)	polygon[]	{"((0,0),(1,1),(1,0))"}
+SELECT ARRAY['((0,0),(1,1),(1,0))'::polygon]	polygon[]	{"((0,0),(1,1),(1,0))"}
+SELECT pg_typeof(array_agg(c::lseg)) FROM (VALUES ('[(0,0),(1,1)]')) s(c)	regtype	lseg[]
+SELECT array_agg(c::lseg) FROM (VALUES ('[(0,0),(1,1)]')) s(c)	lseg[]	{"[(0,0),(1,1)]"}
+SELECT ARRAY['[(0,0),(1,1)]'::lseg]	lseg[]	{"[(0,0),(1,1)]"}
+SELECT pg_typeof(array_agg(c::line)) FROM (VALUES ('{1,2,3}')) s(c)	regtype	line[]
+SELECT array_agg(c::line) FROM (VALUES ('{1,2,3}')) s(c)	line[]	{"{1,2,3}"}
+SELECT ARRAY['{1,2,3}'::line]	line[]	{"{1,2,3}"}
+SELECT '{"<(0,0),1>"}'::circle[]	circle[]	{"<(0,0),1>"}
+SELECT '{"((0,0),(1,1))"}'::path[]	path[]	{"((0,0),(1,1))"}
+SELECT '{"((0,0),(1,1),(1,0))"}'::polygon[]	polygon[]	{"((0,0),(1,1),(1,0))"}
+SELECT '{"[(0,0),(1,1)]"}'::lseg[]	lseg[]	{"[(0,0),(1,1)]"}
+SELECT '{"{1,2,3}"}'::line[]	line[]	{"{1,2,3}"}
+SELECT pg_typeof(unnest('{"<(0,0),1>"}'::circle[]))	regtype	circle
+SELECT unnest('{"<(0,0),1>","<(2,2),3>"}'::circle[])	circle	<(0,0),1> ; <(2,2),3>
+SELECT array_length('{"<(0,0),1>","<(2,2),3>"}'::circle[], 1)	integer	2
+SELECT '<(0,0),1>'::circle = '<(0,0),1>'::circle	boolean	t
+SELECT min(c::circle) FROM (VALUES ('<(0,0),1>')) s(c)	!42883 function min(circle) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '{"<(0,0),1>"}'::circle[] = '{"<(0,0),1>"}'::circle[]	!42883 could not identify an equality operator for type circle
+SELECT typarray FROM pg_type WHERE typname IN ('circle','path','polygon','lseg','line') ORDER BY typname	oid	719 ; 629 ; 1018 ; 1019 ; 1027
+SELECT min(c::point) FROM (VALUES ('(0,0)')) s(c)	!42883 function min(point) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT min(c::box) FROM (VALUES ('((0,0),(1,1))')) s(c)	!42883 function min(box) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT min(c::lseg) FROM (VALUES ('[(0,0),(1,1)]')) s(c)	!42883 function min(lseg) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT max(c::polygon) FROM (VALUES ('((0,0),(1,1),(1,0))')) s(c)	!42883 function max(polygon) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT max(c::line) FROM (VALUES ('{1,2,3}')) s(c)	!42883 function max(line) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '{"(0,0)"}'::point[] = '{"(0,0)"}'::point[]	!42883 could not identify an equality operator for type point
+SELECT '{"{1,2,3}"}'::line[] = '{"{1,2,3}"}'::line[]	!42883 could not identify an equality operator for type line
+SELECT '{"((0,0),(1,1))"}'::path[] = '{"((0,0),(1,1))"}'::path[]	!42883 could not identify an equality operator for type path
+SELECT '{a}'::text[] = '{a}'::text[]	boolean	t

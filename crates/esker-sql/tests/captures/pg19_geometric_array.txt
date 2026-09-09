@@ -1,0 +1,115 @@
+# **The five geometric shapes get their arrays** — PostgreSQL 19beta1, 2026-09-09. One
+# `BEGIN … ROLLBACK`, `ON_ERROR_ROLLBACK on` so a refusal cannot swallow the statements after it.
+#
+# r1's wire sweep filed six rows: `array_agg` and `ARRAY[…]` over `circle`, `path` and `polygon`
+# all lost their array type — the aggregate came back a **scalar `text`** (OID 25) and the
+# constructor a `text[]` (1009) — where a real server declares `circle[]` (719), `path[]` (1019)
+# and `polygon[]` (1027). The same shape `name[]` was (ADR 0086): an element type with no array to
+# be aggregated into falls back to `text`.
+#
+# ## All five, not the three that were probed
+#
+#     oid   typname    typelem  typdelim  typinput    typcategory  typlen
+#     600   point      701      ,         point_in    G            16
+#     601   lseg       600      ,         lseg_in     G            32
+#     602   path       0        ,         path_in     G            -1
+#     603   box        600      ;         box_in      G            32
+#     604   polygon    0        ,         poly_in     G            -1
+#     628   line       701      ,         line_in     G            24
+#     629   _line      628      ,         array_in    A            -1
+#     718   circle     0        ,         circle_in   G            24
+#     719   _circle    718      ,         array_in    A            -1
+#     1017  _point     600      ,         array_in    A            -1
+#     1018  _lseg      601      ,         array_in    A            -1
+#     1019  _path      602      ,         array_in    A            -1
+#     1020  _box       603      ;         array_in    A            -1
+#     1027  _polygon   604      ,         array_in    A            -1
+#
+# `point` and `box` already had theirs here. **`lseg` and `line` were not in r1's six and are
+# built anyway**: `tests/array_delimiter.rs` carried "the five remaining geometric shapes" as *one*
+# named gap with one reason — no suite test declares an array of one — and that reason is now false
+# for three of the five. Splitting it 3/2 would leave a worse gap than the one it closes, and the
+# mechanism is identical for all five.
+#
+# `_box`'s delimiter is still the only one that is not a comma.
+#
+# ## What each answers
+#
+#     array_agg(c::circle)   circle[]   {"<(0,0),1>","<(2,2),3>"}
+#     ARRAY['<(0,0),1>'::circle]        circle[]   {"<(0,0),1>"}
+#     array_agg(c::path)     path[]     {"((0,0),(1,1))","[(2,2),(3,3)]"}   <- the bracket is data
+#     array_agg(c::polygon)  polygon[]  {"((0,0),(1,1),(1,0))"}
+#     array_agg(c::lseg)     lseg[]     {"[(0,0),(1,1)]"}
+#     array_agg(c::line)     line[]     {"{1,2,3}"}
+#     unnest('{…}'::circle[])           circle     one row per element
+#     array_length('{…,…}'::circle[], 1)   2
+#
+# Every element quotes itself inside the array literal, because each of the five prints characters
+# the array grammar reserves.
+#
+# ## Two refusals that are the point of the family
+#
+#     min(c::circle)                    42883 function min(circle) does not exist
+#     '{…}'::circle[] = '{…}'::circle[] 42883 could not identify an equality operator for type circle
+#
+# **`'<(0,0),1>'::circle = '<(0,0),1>'::circle` is `t`**, and the array comparison beside it is not:
+# array equality needs the element type's *btree* equality and a `circle`'s `=` compares areas
+# without one. The scalar `=` answering and the array `=` refusing is exactly the shape
+# `ColumnType::Lseg`'s doc comment already records for `CREATE INDEX` and `count(DISTINCT)`.
+#
+# ## And the rule holds for every element type without a btree equality
+#
+#     min(point) / min(box) / min(lseg) / min(path) / max(polygon) / min(circle) / max(line)
+#                                       42883 function min(<type>) does not exist   — all seven
+#     '{…}'::point[]  = '{…}'::point[]  42883 could not identify an equality operator for type point
+#     '{…}'::line[]   = '{…}'::line[]   … for type line
+#     '{…}'::path[]   = '{…}'::path[]   … for type path
+#     ARRAY['<a/>'::xml] = same         … for type xml
+#     ARRAY['{"a":1}'::json] = same     … for type json
+#     '{a}'::text[]   = '{a}'::text[]   t                                  <- the control
+#
+# **The message names the element**, not the array. `min(lseg)` is the sharpest of the seven: the
+# scalar `=` answers and the aggregate still does not exist, because an aggregate needs a btree
+# family and equality alone is not one.
+#
+# The 38 statements below are the capture itself — `statement`, `\gdesc` types, rows — taken in
+# this session against `127.0.0.1:55432` with no fixture at all.
+
+SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, t.typcategory, t.typlen FROM pg_type t WHERE t.typname IN ('circle','_circle','path','_path','polygon','_polygon','lseg','_lseg','line','_line','point','_point','box','_box') ORDER BY t.oid	oid,name,oid,"char",regproc,"char",smallint	600|point|701|,|point_in|G|16 ; 601|lseg|600|,|lseg_in|G|32 ; 602|path|0|,|path_in|G|-1 ; 603|box|600|;|box_in|G|32 ; 604|polygon|0|,|poly_in|G|-1 ; 628|line|701|,|line_in|G|24 ; 629|_line|628|,|array_in|A|-1 ; 718|circle|0|,|circle_in|G|24 ; 719|_circle|718|,|array_in|A|-1 ; 1017|_point|600|,|array_in|A|-1 ; 1018|_lseg|601|,|array_in|A|-1 ; 1019|_path|602|,|array_in|A|-1 ; 1020|_box|603|;|array_in|A|-1 ; 1027|_polygon|604|,|array_in|A|-1
+SELECT pg_typeof(array_agg(c::circle)) FROM (VALUES ('<(0,0),1>')) s(c)	regtype	circle[]
+SELECT pg_typeof(ARRAY[c::circle]) FROM (VALUES ('<(0,0),1>')) s(c)	regtype	circle[]
+SELECT array_agg(c::circle) FROM (VALUES ('<(0,0),1>'),('<(2,2),3>')) s(c)	circle[]	{"<(0,0),1>","<(2,2),3>"}
+SELECT ARRAY['<(0,0),1>'::circle]	circle[]	{"<(0,0),1>"}
+SELECT pg_typeof(array_agg(c::path)) FROM (VALUES ('((0,0),(1,1))')) s(c)	regtype	path[]
+SELECT array_agg(c::path) FROM (VALUES ('((0,0),(1,1))'),('[(2,2),(3,3)]')) s(c)	path[]	{"((0,0),(1,1))","[(2,2),(3,3)]"}
+SELECT ARRAY['((0,0),(1,1))'::path]	path[]	{"((0,0),(1,1))"}
+SELECT pg_typeof(array_agg(c::polygon)) FROM (VALUES ('((0,0),(1,1),(1,0))')) s(c)	regtype	polygon[]
+SELECT array_agg(c::polygon) FROM (VALUES ('((0,0),(1,1),(1,0))')) s(c)	polygon[]	{"((0,0),(1,1),(1,0))"}
+SELECT ARRAY['((0,0),(1,1),(1,0))'::polygon]	polygon[]	{"((0,0),(1,1),(1,0))"}
+SELECT pg_typeof(array_agg(c::lseg)) FROM (VALUES ('[(0,0),(1,1)]')) s(c)	regtype	lseg[]
+SELECT array_agg(c::lseg) FROM (VALUES ('[(0,0),(1,1)]')) s(c)	lseg[]	{"[(0,0),(1,1)]"}
+SELECT ARRAY['[(0,0),(1,1)]'::lseg]	lseg[]	{"[(0,0),(1,1)]"}
+SELECT pg_typeof(array_agg(c::line)) FROM (VALUES ('{1,2,3}')) s(c)	regtype	line[]
+SELECT array_agg(c::line) FROM (VALUES ('{1,2,3}')) s(c)	line[]	{"{1,2,3}"}
+SELECT ARRAY['{1,2,3}'::line]	line[]	{"{1,2,3}"}
+SELECT '{"<(0,0),1>"}'::circle[]	circle[]	{"<(0,0),1>"}
+SELECT '{"((0,0),(1,1))"}'::path[]	path[]	{"((0,0),(1,1))"}
+SELECT '{"((0,0),(1,1),(1,0))"}'::polygon[]	polygon[]	{"((0,0),(1,1),(1,0))"}
+SELECT '{"[(0,0),(1,1)]"}'::lseg[]	lseg[]	{"[(0,0),(1,1)]"}
+SELECT '{"{1,2,3}"}'::line[]	line[]	{"{1,2,3}"}
+SELECT pg_typeof(unnest('{"<(0,0),1>"}'::circle[]))	regtype	circle
+SELECT unnest('{"<(0,0),1>","<(2,2),3>"}'::circle[])	circle	<(0,0),1> ; <(2,2),3>
+SELECT array_length('{"<(0,0),1>","<(2,2),3>"}'::circle[], 1)	integer	2
+SELECT '<(0,0),1>'::circle = '<(0,0),1>'::circle	boolean	t
+SELECT min(c::circle) FROM (VALUES ('<(0,0),1>')) s(c)	!42883 function min(circle) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '{"<(0,0),1>"}'::circle[] = '{"<(0,0),1>"}'::circle[]	!42883 could not identify an equality operator for type circle
+SELECT typarray FROM pg_type WHERE typname IN ('circle','path','polygon','lseg','line') ORDER BY typname	oid	719 ; 629 ; 1018 ; 1019 ; 1027
+SELECT min(c::point) FROM (VALUES ('(0,0)')) s(c)	!42883 function min(point) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT min(c::box) FROM (VALUES ('((0,0),(1,1))')) s(c)	!42883 function min(box) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT min(c::lseg) FROM (VALUES ('[(0,0),(1,1)]')) s(c)	!42883 function min(lseg) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT max(c::polygon) FROM (VALUES ('((0,0),(1,1),(1,0))')) s(c)	!42883 function max(polygon) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT max(c::line) FROM (VALUES ('{1,2,3}')) s(c)	!42883 function max(line) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '{"(0,0)"}'::point[] = '{"(0,0)"}'::point[]	!42883 could not identify an equality operator for type point
+SELECT '{"{1,2,3}"}'::line[] = '{"{1,2,3}"}'::line[]	!42883 could not identify an equality operator for type line
+SELECT '{"((0,0),(1,1))"}'::path[] = '{"((0,0),(1,1))"}'::path[]	!42883 could not identify an equality operator for type path
+SELECT '{a}'::text[] = '{a}'::text[]	boolean	t

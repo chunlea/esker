@@ -303,7 +303,7 @@ fn activerecord_s_four_type_map_queries_answer() {
         ]
     );
 
-    // 9 — array types, found by their element type. **Thirty-six rows**, which is every array
+    // 9 — array types, found by their element type. **Forty-one rows**, which is every array
     // type whose element is in the adapter's list: `typelem` is the element's oid, which is how
     // `ActiveRecord` finds them, and `typinput` is `array_in`, which is how it decides a column
     // is an array at all. It answered nothing while this node had no arrays and five rows while
@@ -312,7 +312,9 @@ fn activerecord_s_four_type_map_queries_answer() {
     // here and are not missing: an extension's element oid is above 16384 and is not in the
     // adapter's fixed list at all. `_tsvector` is the thirty-fifth and arrived with the
     // `tsvector` type: **3614 was already in the adapter's list**, waiting for a row, and `_name`
-    // is the thirty-sixth for the same reason — 19 was in the list and had no array.
+    // is the thirty-sixth for the same reason — 19 was in the list and had no array. The five
+    // geometric arrays are thirty-seven through forty-one, and every one of their element oids was
+    // in the list too (ADR 0091).
     assert_eq!(
         node.rows(
             "SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, \
@@ -411,6 +413,20 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "b".to_owned(),
                 "0".to_owned(),
             ],
+            // **The five geometric arrays**, which arrived when r1's wire sweep found `array_agg`
+            // over a `circle` coming back a scalar `text` (ADR 0091). Every one of their element
+            // oids — 601, 602, 604, 628 and 718 — was already in the adapter's list above, waiting
+            // for a row, the way 3614 and 19 were.
+            vec![
+                "629".to_owned(),
+                "_line".to_owned(),
+                "628".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
             vec![
                 "651".to_owned(),
                 "_cidr".to_owned(),
@@ -423,6 +439,16 @@ fn activerecord_s_four_type_map_queries_answer() {
             ],
             // `_money`, which a real server makes with the type — the adapter's list has had
             // `790` in it all along and got nothing back for it until now.
+            vec![
+                "719".to_owned(),
+                "_circle".to_owned(),
+                "718".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
             vec![
                 "791".to_owned(),
                 "_money".to_owned(),
@@ -547,6 +573,26 @@ fn activerecord_s_four_type_map_queries_answer() {
             // `_path`, `_polygon`, `_line`, `_circle` and `_name`
             // (`array_delimiter.rs::every_base_type_has_an_array_or_is_listed`).
             vec![
+                "1018".to_owned(),
+                "_lseg".to_owned(),
+                "601".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1019".to_owned(),
+                "_path".to_owned(),
+                "602".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
                 "1020".to_owned(),
                 "_box".to_owned(),
                 "603".to_owned(),
@@ -570,6 +616,16 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "1022".to_owned(),
                 "_float8".to_owned(),
                 "701".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "1027".to_owned(),
+                "_polygon".to_owned(),
+                "604".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),

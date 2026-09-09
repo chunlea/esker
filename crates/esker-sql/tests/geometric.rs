@@ -25,21 +25,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // probe found answering `,` here.
         "SELECT 'r', typname, typdelim FROM pg_type WHERE typname IN \
          ('box','lseg','path','polygon','circle','line','point','xml') ORDER BY typname",
+        // **`typarray` was `0` for all six and this was an `answers` entry**: a real server pairs
+        // each shape with an array and `geometric_test.rb` declares none, so it was a named gap
+        // rather than six more types. r1's wire sweep made that reason false — `array_agg` over a
+        // `circle` came back a scalar `text` — and all five that were left arrived at once
+        // (ADR 0091). Every value in this row agrees now; what is left is the catalog's own
+        // columns, `oid` and `"char"` and `regproc` against `bigint` and `text`, each its own unit.
+        "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type \
+         WHERE typname IN ('lseg','box','path','polygon','circle','line') ORDER BY typname",
     ],
-    answers: &[
-        // **`typarray` is `0` for all six**, which is the one declared gap and it is a named one:
-        // a real server pairs each shape with an array (`_lseg` 1018 and so on) and
-        // `geometric_test.rb` declares none, so six more `ColumnType`s would buy no test. The
-        // same call `floatrange[]` got. Every other column of this row agrees — the oids, the
-        // widths (32, 32, 24, 24 and `-1` for the two point lists), category `G`, and
-        // `poly_in` rather than `polygon_in`.
-        (
-            "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type \
-             WHERE typname IN ('lseg','box','path','polygon','circle','line') ORDER BY typname",
-            "no array type for a shape here; every other column agrees",
-            "UNMEASURED",
-        ),
-    ],
+    answers: &[],
 };
 
 #[test]

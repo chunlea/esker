@@ -2905,6 +2905,21 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             } else {
                 (left, right)
             };
+            // **An array's `=` is its element's, and the element must have a *btree* equality.**
+            // Measured for six element types at once — `point`, `line`, `path`, `xml`, `json` and
+            // `circle` — and the sentence names the **element**, not the array:
+            // `'{…}'::circle[] = '{…}'::circle[]` is
+            // `42883 could not identify an equality operator for type circle` while the scalar
+            // `'…'::circle = '…'::circle` is `t`. `'{a}'::text[] = '{a}'::text[]` is the control
+            // and answers. The same list `SELECT DISTINCT` and `count(DISTINCT)` read, so a type
+            // cannot be refused by one and answered by another.
+            if op.is_comparison()
+                && let Ok(ty) = expr_type(&left, scope)
+                && let Some(element) = esker_keys::array::ArrayValue::element_of(ty)
+                && !crate::value::has_equality_operator(ty)
+            {
+                return Err(SqlError::NoEqualityOperator(element.name()));
+            }
             Expr::Binary {
                 op: *op,
                 left: Box::new(left),
@@ -3328,6 +3343,12 @@ fn subquery_operand(
 /// grouping [`crate::plan::Literal::comparable_with`] already uses for a literal against a column,
 /// lifted to two columns. Coarse in the safe direction: it refuses only pairs that no cast in
 /// PostgreSQL relates either, so it cannot turn a comparison a real server runs into an error.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over the whole type vocabulary, and it is a list of names \
+              rather than of rules; splitting it would put half the vocabulary somewhere \
+              else and let a type be added to one half without the other"
+)]
 pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
     // **`json` compares with nothing, including another `json`.** Measured:
     // `'{"a":1}'::json = '{"a":1}'::json` is `42883 operator does not exist: json = json` -- the
@@ -3439,6 +3460,15 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // Its own family: an array compares with an array of the same element, and 85 is the
             // next number nothing else uses — 59 is `floatrange`'s and 77 `xml`'s.
             ColumnType::BoxArray => 85,
+            // **Five families, one per element type**, which is every array's rule: measured,
+            // `'{…}'::circle[] = '{…}'::circle[]` is `42883 could not identify an equality
+            // operator for type circle` on a real server even though the scalar `=` answers, so
+            // sharing a family with anything would answer where PostgreSQL refuses.
+            ColumnType::LsegArray => 87,
+            ColumnType::PathArray => 88,
+            ColumnType::PolygonArray => 89,
+            ColumnType::CircleArray => 90,
+            ColumnType::LineArray => 91,
             // A family each, like every other range: a `floatrange` compares with a
             // `floatrange` and `float_range = '[0.5,0.7]'::numrange` is `42883`, measured.
             ColumnType::FloatRange => 59,

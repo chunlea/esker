@@ -784,6 +784,11 @@ pub fn has_equality_operator(ty: ColumnType) -> bool {
             | ColumnType::Point
             | ColumnType::PointArray
             | ColumnType::BoxArray
+            | ColumnType::LsegArray
+            | ColumnType::PathArray
+            | ColumnType::PolygonArray
+            | ColumnType::CircleArray
+            | ColumnType::LineArray
             | ColumnType::Lseg
             | ColumnType::Box
             | ColumnType::Path
@@ -1248,7 +1253,7 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::NumRangeArray
         | ColumnType::Int8RangeArray
         | ColumnType::PointArray
-        | ColumnType::BoxArray
+        | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray
         | ColumnType::CidrArray
@@ -1260,15 +1265,6 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // gap rather than a guess at an oid that is allocated per database anyway.
         | ColumnType::FloatRange
         | ColumnType::VarcharRange
-        // **And no array of the other five shapes.** A real server pairs each with one (`_lseg`
-        // is 1018 and so on) and `geometric_test.rb` declares none, so this is a named gap rather
-        // than five more types — the same call `floatrange[]` got. `box` left this list when
-        // `type_lookup_test.rb` turned out to look `_box` up by oid for its delimiter.
-        | ColumnType::Lseg
-        | ColumnType::Path
-        | ColumnType::Polygon
-        | ColumnType::Circle
-        | ColumnType::Line
         | ColumnType::XmlArray
         | ColumnType::LtreeArray
         | ColumnType::LQuery => 0,
@@ -1293,6 +1289,13 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         ColumnType::Point => 1017,
         // `_box`, whose delimiter is `;` — the one array type in `pg_type` where it is not a comma.
         ColumnType::Box => 1020,
+        // **The other five shapes, measured one row at a time**: `_lseg` and `_path` are adjacent
+        // and `_circle` and `_line` sit beside their own element types rather than with them.
+        ColumnType::Lseg => 1018,
+        ColumnType::Path => 1019,
+        ColumnType::Polygon => 1027,
+        ColumnType::Circle => 719,
+        ColumnType::Line => 629,
         ColumnType::Bool => 1000,
         ColumnType::Bytea => 1001,
         ColumnType::Int8 => 1016,
@@ -1468,7 +1471,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray
         | ColumnType::Point
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
     }
 }
 
@@ -1562,6 +1565,12 @@ pub trait PgType: Copy {
 }
 
 impl PgType for ColumnType {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match over the whole type vocabulary, and it is a list of names \
+                  rather than of rules; splitting it would put half the vocabulary \
+                  somewhere else and let a type be added to one half without the other"
+    )]
     fn oid(self) -> u32 {
         // **An array type's OID is its element's `typarray`**, which this crate already knows —
         // `array_oid` is where `_int4` is 1007 and `_int8` is 1016. Derived rather than repeated,
@@ -1674,10 +1683,21 @@ impl PgType for ColumnType {
             | ColumnType::NumRangeArray
             | ColumnType::Int8RangeArray
             | ColumnType::PointArray
-            | ColumnType::BoxArray => 0,
+            | ColumnType::BoxArray
+            | ColumnType::LsegArray
+            | ColumnType::PathArray
+            | ColumnType::PolygonArray
+            | ColumnType::CircleArray
+            | ColumnType::LineArray => 0,
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match over the whole type vocabulary, and it is a list of names \
+                  rather than of rules; splitting it would put half the vocabulary \
+                  somewhere else and let a type be added to one half without the other"
+    )]
     fn name(self) -> &'static str {
         match self {
             // What an error message calls it: the element's name with `[]`, which is how
@@ -1709,6 +1729,11 @@ impl PgType for ColumnType {
             ColumnType::Point => "point",
             ColumnType::PointArray => "point[]",
             ColumnType::BoxArray => "box[]",
+            ColumnType::LsegArray => "lseg[]",
+            ColumnType::PathArray => "path[]",
+            ColumnType::PolygonArray => "polygon[]",
+            ColumnType::CircleArray => "circle[]",
+            ColumnType::LineArray => "line[]",
             ColumnType::Money => "money",
             ColumnType::MoneyArray => "money[]",
             ColumnType::Inet => "inet",
@@ -1843,7 +1868,7 @@ impl PgType for ColumnType {
             | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
-            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray
+            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray
             | ColumnType::Text
             | ColumnType::Varchar
             | ColumnType::Bpchar
@@ -2078,6 +2103,11 @@ impl PgDatum for Datum {
             | ColumnType::Int8RangeArray
             | ColumnType::PointArray
             | ColumnType::BoxArray
+            | ColumnType::LsegArray
+            | ColumnType::PathArray
+            | ColumnType::PolygonArray
+            | ColumnType::CircleArray
+            | ColumnType::LineArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray
             | ColumnType::CidrArray
@@ -2343,6 +2373,11 @@ impl PgDatum for Datum {
             | ColumnType::Int8RangeArray
             | ColumnType::PointArray
             | ColumnType::BoxArray
+            | ColumnType::LsegArray
+            | ColumnType::PathArray
+            | ColumnType::PolygonArray
+            | ColumnType::CircleArray
+            | ColumnType::LineArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray
             | ColumnType::CidrArray
@@ -3139,7 +3174,7 @@ mod tests {
                         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
-                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray
+                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray
                         | ColumnType::XmlArray
                         | ColumnType::LtreeArray
                         | ColumnType::Bytea
