@@ -13,11 +13,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // The standing `pg_catalog` trade in both its shapes: a schema name is `name` on a real
     // server and an array of them is `name[]`; both are `text` here, which compares identically
     // and prints identically. **Every row agrees**, the `{pg_catalog,public}` text included.
-    types: &[
-        "SELECT current_schemas(false)",
-        "SELECT current_schemas(true)",
-        "SELECT current_schema",
-    ],
+    types: &[],
     answers: &[],
 };
 

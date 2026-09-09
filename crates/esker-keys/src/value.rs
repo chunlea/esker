@@ -500,6 +500,13 @@ pub enum ColumnType {
     BpcharArray,
     /// `character varying[]`.
     VarcharArray,
+    /// `name[]` — oid 1003, `_name`.
+    ///
+    /// The type `array_agg(enum.enumlabel)` has, which is how `ActiveRecord` reads an enum's
+    /// labels: every identifier column of the catalog is a [`ColumnType::Name`], so an aggregate
+    /// over one is an array of them and a client decodes the literal into a list. Told `text`
+    /// instead it keeps the string, which is the ten tests run 106 lost.
+    NameArray,
     /// `date[]`.
     DateArray,
     /// `time without time zone[]`.
@@ -541,7 +548,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 92] = [
+    pub const ALL: [ColumnType; 93] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -587,6 +594,7 @@ impl ColumnType {
         ColumnType::ByteaArray,
         ColumnType::BpcharArray,
         ColumnType::VarcharArray,
+        ColumnType::NameArray,
         ColumnType::DateArray,
         ColumnType::TimeArray,
         ColumnType::TimestampArray,

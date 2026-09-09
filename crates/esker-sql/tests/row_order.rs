@@ -242,6 +242,11 @@ fn column_type(name: &str) -> ColumnType {
         "bytea[]" => ColumnType::ByteaArray,
         "bpchar[]" => ColumnType::BpcharArray,
         "varchar[]" => ColumnType::VarcharArray,
+        // **`name[]`'s capitals sort before its lower case** where `text[]`'s do not: the elements
+        // carry `name`'s C collation, which is byte order, and a memcomparable key is already in
+        // byte order (ADR 0076). Measured on the oracle rather than copied from `text[]`'s line,
+        // because that line has no capitals in it and could not have shown the difference.
+        "name[]" => ColumnType::NameArray,
         "citext[]" => ColumnType::CitextArray,
         "date[]" => ColumnType::DateArray,
         "time[]" => ColumnType::TimeArray,

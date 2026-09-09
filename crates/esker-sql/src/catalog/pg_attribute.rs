@@ -456,6 +456,7 @@ pub(crate) fn typcollation(ty: ColumnType) -> i64 {
         | ColumnType::Citext
         | ColumnType::TextArray
         | ColumnType::VarcharArray
+        | ColumnType::NameArray
         | ColumnType::BpcharArray
         | ColumnType::CitextArray => DEFAULT_COLLATION,
         // **`name`'s own collation is C**, not the database default: it is the type the catalog

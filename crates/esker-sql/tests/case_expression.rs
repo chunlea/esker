@@ -11,14 +11,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[
-        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
-        // differs is one of the standing declared-type families listed on
-        // `parity::Divergences::types`. The reason each one used to carry described an answer
-        // that had stopped differing.
-        "SELECT CASE WHEN true THEN 1 ELSE 1/0 END",
-        "SELECT CASE WHEN false THEN 1/0 ELSE 2 END",
-    ],
+    // **Empty.** These two carried the arithmetic refusal `1/0` used to raise, then the width a
+    // bare `1` used to have; the literal ladder's `int4` rung (ADR 0087) closed the second and the
+    // rows had agreed since the first.
+    types: &[],
     // Three, and all three are the same missing feature: this node has **no arithmetic
     // operators**, so `1/0` — the only expression PostgreSQL can be made to raise from inside an
     // unreached branch — is `0A000` naming `/` before the `CASE` is reached at all. The lines are

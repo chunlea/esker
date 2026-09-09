@@ -14,24 +14,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **One fact, thirteen times**: a bare integer constant is `int8` here and `int4` on a real
-    // server, and `generate_series` takes its arguments' type — so the column it makes is `bigint`
-    // where PostgreSQL says `integer`. Every row is identical; only the declared type differs.
-    types: &[
-        "SELECT 'r', generate_series(1, 3)",
-        "SELECT 'r', generate_series(1, 0)",
-        "SELECT 'r', generate_series(3, 1, -1)",
-        "SELECT 'r', generate_series(1, 2), generate_series(1, 2)",
-        "SELECT 'r', generate_series(1, 3), generate_series(1, 2)",
-        "SELECT 'r', generate_series(1, 2) + 10",
-        "SELECT 'r', abs(generate_series(-1, 1))",
-        "SELECT 'r', id, generate_series(1, 2) FROM sr WHERE id = 1",
-        "SELECT 'r', unnest(ARRAY[1,2,3])",
-        "SELECT 'r', pg_typeof(unnest(ARRAY['a','b']::text[]))",
-        "SELECT 'r', g FROM (SELECT generate_series(1, 3) AS g) s WHERE g > 1 ORDER BY g DESC",
-        "SELECT 'r', generate_series(1, 3) ORDER BY 2 DESC",
-        "SELECT 'r', generate_series(1, 3) LIMIT 2",
-    ],
+    // **One entry, and there were thirteen.** Every one of the other twelve said that a bare
+    // integer constant was an `int8` here where a real server's is an `int4`, so a
+    // `generate_series` or an `unnest` over one declared `bigint`; the literal ladder's `int4` rung
+    // (ADR 0087) closed all of them. What is left is `pg_typeof`, which answers a `regtype` there
+    // and `text` here (ADR 0077), with the row identical.
+    types: &["SELECT 'r', pg_typeof(unnest(ARRAY['a','b']::text[]))"],
     answers: &[
         // `generate_series` takes its arguments' type and this node's integer constants are `int8`
         // where a real server's are `int4` — the standing constant-width divergence, showing

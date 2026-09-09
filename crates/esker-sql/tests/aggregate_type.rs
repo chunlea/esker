@@ -24,6 +24,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
+        // `array_agg(1)` joined them with the literal ladder's `int4` rung: its rows used to
+        // differ too — `bigint[]` against a real server's `integer[]` — and now only `pg_typeof`'s
+        // own answer does.
+        "SELECT 'r', pg_typeof(array_agg(1)) FROM ag",
         "SELECT 'r', pg_typeof(array_agg(i2)) FROM ag",
         "SELECT 'r', pg_typeof(array_agg(d)) FROM ag",
         "SELECT 'r', pg_typeof(array_agg(b)) FROM ag",
@@ -66,13 +70,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         (
             "SELECT 'r', pg_typeof(string_agg(t, ',')) FROM ag",
             "string_agg is not implemented",
-            "UNMEASURED",
-        ),
-        // The standing constant-width divergence, one array deeper: a bare integer constant is
-        // `int8` here and `int4` there, so an array of them is `bigint[]`.
-        (
-            "SELECT 'r', pg_typeof(array_agg(1)) FROM ag",
-            "a bare integer constant is int8 here and int4 there",
             "UNMEASURED",
         ),
         // **A bare NULL is still resolved to `text` where PostgreSQL calls it `unknown`.** The

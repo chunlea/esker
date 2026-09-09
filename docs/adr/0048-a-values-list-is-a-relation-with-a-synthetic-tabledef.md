@@ -49,9 +49,12 @@ Splitting it the other way would put half the answer in each place.
   `tests/corpus/pg19_values_relation.txt` holds all 36 statements.
 - A column of nothing but NULL is `text`, which is what an untyped NULL is everywhere in this crate.
 - The rows keep the order they were written in. Nothing sorts them; an `ORDER BY` above does.
-- The standing constant-width divergence shows through every one of these columns: a bare integer
+- ~~The standing constant-width divergence shows through every one of these columns: a bare integer
   constant is `int8` here and `int4` on a real server, so `VALUES (1)` declares `bigint`. Twenty-five
   statements in the corpus are listed for it, one fact each, so that fixing the width fails the test
-  rather than passing quietly.
+  rather than passing quietly.~~ **Closed by
+  [ADR 0087](0087-an-integer-literal-is-the-narrowest-type-that-holds-it.md)**, and the twenty-five
+  entries did exactly what they were written to do: fixing the width failed this test and named all
+  twenty-seven of them.
 - A comma-separated `FROM` list is still refused, for `VALUES` as for every other relation. The
   `CROSS JOIN` spelling of the same statement answers.

@@ -39,44 +39,19 @@ const CORPUS_FIXTURE: &[&str] = &[
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **One fact, eight times, and it is not about recursion**: an unadorned integer literal
-    // is an `int8` in this crate and an `integer` to PostgreSQL's resolver, so a column
-    // seeded by `SELECT 1` is `bigint` here. The rows are identical; `sum` over it is
-    // `numeric` for the same reason, being the sum of a `bigint`.
-    types: &[
-        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 5) SELECT i FROM n",
-        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 5) SELECT sum(i), count(*) FROM n",
-        "WITH RECURSIVE n(i) AS (SELECT 1 UNION SELECT 1 FROM n) SELECT i FROM n",
-        "WITH RECURSIVE t AS (SELECT 1 AS a, 'x'::text AS b UNION ALL SELECT a+1, b FROM t WHERE a < 2) SELECT * FROM t",
-        "WITH RECURSIVE t(p, q) AS (SELECT 1, 'x'::text UNION ALL SELECT p+1, q FROM t WHERE p < 2) SELECT * FROM t",
-        "WITH RECURSIVE plain AS (SELECT 1 AS n), rec(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM rec WHERE i < 3) SELECT (SELECT n FROM plain) AS p, i FROM rec",
-        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 3) SELECT (SELECT count(*) FROM n) AS c, i FROM n ORDER BY i",
-        "WITH RECURSIVE t AS (SELECT 1 AS n) SELECT n FROM t",
-    ],
-    // **PostgreSQL streams the working table**, so a `LIMIT` over an unbounded recursion stops it
-    // and answers `1, 1, 1`. This node materialises each iteration, so the same statement reaches
-    // the iteration cap and raises. The divergence is the *cap*, not the arithmetic: any
-    // implementation that does not stream has to raise here, and the alternative to raising is
-    // looping forever, which invariant 9 forbids in spirit. Measured, and recorded before the cap
-    // was written so the number could not be chosen to make a test pass.
-    answers: &[
-        (
-            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i FROM n) SELECT i FROM n LIMIT 3",
-            "PostgreSQL streams the working table, so its LIMIT stops an unbounded recursion and it \
+    // **Empty, and it was eight entries long.** Every one of them said the same thing — an
+    // unadorned integer literal was an `int8` in this crate and an `integer` to PostgreSQL's
+    // resolver, so a column seeded by `SELECT 1` was `bigint` here and `sum` over it was
+    // `numeric`. The literal ladder gained its `int4` rung and all eight agree, declared types
+    // included.
+    types: &[],
+    answers: &[(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i FROM n) SELECT i FROM n LIMIT 3",
+        "PostgreSQL streams the working table, so its LIMIT stops an unbounded recursion and it \
          answers 1, 1, 1. This node materialises each iteration, reaches the cap and raises. The \
          divergence is the cap, and the alternative to raising is looping forever.",
-            "pg19_recursive_cte.txt:100",
-        ),
-        (
-            "WITH RECURSIVE t AS (SELECT 1 AS a UNION ALL SELECT 'x'::text FROM t) SELECT * FROM t",
-            "The same refusal, naming a different type: an unadorned integer literal is `int8` in \
-         this crate and `integer` to PostgreSQL's resolver, so the message reads `bigint and \
-         text` where a real server says `integer and text`. The rows agree — there are none — \
-         and the class and code are the same; what differs is the literal's width, which is a \
-         property of this node everywhere and not of recursion.",
-            "pg19_recursive_cte.txt:101",
-        ),
-    ],
+        "pg19_recursive_cte.txt:100",
+    )],
 };
 
 #[test]
@@ -208,13 +183,13 @@ fn the_recursive_term_must_already_fit_the_seed() {
             "WITH RECURSIVE t AS (SELECT 1 AS a UNION ALL SELECT 'x'::text FROM t) SELECT * FROM t",
         )
         .unwrap_err();
-    // **`bigint`, not `integer`**: an unadorned literal is an `int8` in this crate. The rule
-    // under test is that a mismatch with no common type keeps the *ordinary* union message rather
-    // than the recursive one, and that is what this asserts; the width is a declared divergence
-    // of its own (see `DIVERGENCES`).
+    // **`integer`, and it used to read `bigint`**: the rule under test is that a mismatch with no
+    // common type keeps the *ordinary* union message rather than the recursive one, and the width
+    // in it is the literal ladder's — a bare `1` is an `int4` here since the `int4` rung, which is
+    // what a real server calls it too.
     assert_eq!(
         error.to_string(),
-        "UNION types bigint and text cannot be matched"
+        "UNION types integer and text cannot be matched"
     );
 }
 

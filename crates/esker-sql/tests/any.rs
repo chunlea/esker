@@ -14,21 +14,11 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[
-        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
-        // differs is one of the standing declared-type families listed on
-        // `parity::Divergences::types`. The reason each one used to carry described an answer
-        // that had stopped differing.
-        "SELECT current_schemas(false)",
-        "SELECT current_schemas(true)",
-        // A real server types these `name` and `name[]` — `name` being the 64-byte identifier type
-        // that `pg_class.relname` and `pg_namespace.nspname` are. This node has no `name`, so it
-        // answers `text`, whose *values* are identical and which is what every comparison against
-        // one already does. The array form never reaches a client at all: `current_schemas` is
-        // legal here only as an `ANY` operand, where it becomes an `IN` list before the planner
-        // sees it, so there is no array value for a `RowDescription` to describe.
-        "SELECT current_schema()",
-    ],
+    // **Empty.** `current_schemas(false)` and `(true)` stood here, first as refusals — selecting
+    // one returned an array and this node had no array value — then as declared types, because a
+    // real server calls them `name[]` and this node called them `text`. Both halves are closed:
+    // `name[]` is a type here (ADR 0086) and `current_schemas` folds to a real array of it.
+    types: &[],
     answers: &[],
 };
 

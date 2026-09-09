@@ -21,8 +21,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT 'r', current_database()",
         "SELECT 'r', pg_encoding_to_char(encoding) FROM pg_database WHERE datname = current_database()",
-        "SELECT 'r', COALESCE(NULL, 1), COALESCE(1, 2), COALESCE(NULL, NULL, 3)",
-        "SELECT 'r', COALESCE(1, NULL) + COALESCE(NULL, 2)",
         "SELECT 'r', COALESCE(NULL, current_database())",
     ],
     answers: &[
@@ -63,16 +61,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // Both messages are right in every part except that width: the `22P02` is the unknown
         // literal coerced to the common type, and the `42804` names `COALESCE` and the two types
         // in the order the list is walked.
-        (
-            "SELECT COALESCE(1, 'notanumber')",
-            "the type named in the message is bigint here and integer there",
-            "pg19_coalesce_current_database.txt:77",
-        ),
-        (
-            "SELECT COALESCE(1, 'x'::text)",
-            "the type named in the message is bigint here and integer there",
-            "pg19_coalesce_current_database.txt:80",
-        ),
     ],
 };
 

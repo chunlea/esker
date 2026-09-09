@@ -51,14 +51,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `tests/unknown_literal.rs` for the counterexample that made widening to `double` the
         // wrong fix. Comparing the two *exactly* rather than through `f64` answers this line and
         // that counterexample the same way a real server does — see `value::float::pg_cmp_int`.
-        (
-            "SELECT 'a' IN (1)",
-            "the `int4` divergence, not the untyped-literal one: the rule is working and `'a'` \
-             *is* being read as an integer because of the `1`, so both servers raise `22P02`. \
-             A bare constant is `integer` on a real server and `int8` here, so the message names \
-             `bigint`. `tests/unknown_literal.rs` has the eleven statements this costs.",
-            "UNMEASURED",
-        ),
     ],
 };
 

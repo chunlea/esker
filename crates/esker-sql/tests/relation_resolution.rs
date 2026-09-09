@@ -41,7 +41,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // **`name[]` there and `text` here**, which is the array half of the same trade:
         // `current_schemas` answers an array on a real server and this node prints the `{a,b}`
         // literal it renders as. The rows are byte-identical, which is what a client reads.
-        "SELECT 'r', current_schemas(false), current_schemas(true)",
     ],
     answers: &[
         (

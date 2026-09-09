@@ -126,7 +126,10 @@ fn a_select_with_no_from_returns_one_row() {
         Outcome::Rows {
             fields: vec![esker_sql::pgwire::message::FieldDescription::computed(
                 "?column?",
-                ColumnType::Int8
+                // **`Int4`, since the literal ladder gained its `int4` rung**: a driver
+                // probing a connection with `SELECT 1` is told `integer`, as a real server tells
+                // it.
+                ColumnType::Int4
             )],
             rows: vec![vec![Some(b"1".to_vec())]],
             tag: "SELECT 1".to_owned(),

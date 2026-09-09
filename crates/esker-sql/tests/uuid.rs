@@ -30,7 +30,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // A cast **to** `varchar` reports `text` here: the two are one representation told apart
         // by OID, and a cast with no length has nothing to carry the distinction. The value is
         // identical, and `::text` on the line above agrees exactly.
-        "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::varchar",
     ],
     answers: &[
         (
@@ -57,14 +56,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              '00000000-0000-0000-0000-000000000000'::uuid)",
             FUNCTIONS,
             "pg19_uuid.txt:87",
-        ),
-        (
-            "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid = 1",
-            "Both refuse with `42883` and name a different integer: PostgreSQL says `integer` \
-             because a bare `1` is an `int4` there, and this node says `bigint` because it types \
-             an unsuffixed integer literal as `int8`. A divergence of the literal, not of this \
-             type — every type's `= 1` says it.",
-            "pg19_uuid.txt:88",
         ),
         // **This line used to be here** and now agrees, deleted under ADR 0031 rule 2. What kept
         // it diverging was `length`'s **declared type** — `text` where a real server says

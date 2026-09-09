@@ -3017,9 +3017,23 @@ impl Executor {
             *expr = match all {
                 // **NULL when nothing resolves**, not `public` and not an error: measured, `SET
                 // search_path TO nosuchschema` makes `current_schema()` NULL.
+                // **A `name`, not a `text`** — measured, `pg_typeof(current_schema())` is `name`
+                // on a real server — so the literal carries a `Cast` for the reason every folded
+                // cast does: the two types are one `Datum` and the declared type is what a client
+                // reads (`tests/name_array.rs`).
                 None => match path.first() {
-                    None => Expr::Literal(Literal::Null),
-                    Some(first) => Expr::Literal(Literal::String(first.clone())),
+                    // **A `name` even when it is NULL**: `SET search_path TO nosuchschema` makes
+                    // this NULL on a real server and `pg_typeof` still says `name`, so an untyped
+                    // NULL — which is a `text` everywhere in this crate — would be the right value
+                    // under the wrong declared type.
+                    None => Expr::Literal(Literal::TypedNull(ColumnType::Name)),
+                    Some(first) => Expr::Cast {
+                        operand: Box::new(Expr::Literal(Literal::Typed(Box::new(Datum::Text(
+                            first.clone(),
+                        ))))),
+                        to: ColumnType::Name,
+                        typmod: -1,
+                    },
                 },
                 // `current_schemas(true)` prepends `pg_catalog`, and only that one — it is the
                 // *implicit* schema the argument names.
@@ -3033,8 +3047,16 @@ impl Executor {
                         all.push(Some("pg_catalog".to_owned()));
                     }
                     all.extend(path.iter().map(|name| Some(name.clone())));
-                    Expr::Literal(Literal::Typed(Box::new(Datum::Text(
-                        crate::value::vector::Array::write(&all),
+                    // **A real `name[]`**, which is what `n.nspname = ANY (current_schemas(false))`
+                    // is compared against in every catalog query `ActiveRecord` sends. It was the
+                    // *text* of an array while this node had no array of `name`, so the column was
+                    // declared `text` and a client decoding by OID got a string.
+                    Expr::Literal(Literal::Typed(Box::new(Datum::Array(
+                        esker_keys::array::ArrayValue::one_dimensional(
+                            ColumnType::Name,
+                            1,
+                            all.into_iter().map(|name| name.map(Datum::Text)).collect(),
+                        ),
                     ))))
                 }
             };

@@ -303,7 +303,7 @@ fn activerecord_s_four_type_map_queries_answer() {
         ]
     );
 
-    // 9 — array types, found by their element type. **Thirty-five rows**, which is every array
+    // 9 — array types, found by their element type. **Thirty-six rows**, which is every array
     // type whose element is in the adapter's list: `typelem` is the element's oid, which is how
     // `ActiveRecord` finds them, and `typinput` is `array_in`, which is how it decides a column
     // is an array at all. It answered nothing while this node had no arrays and five rows while
@@ -311,7 +311,8 @@ fn activerecord_s_four_type_map_queries_answer() {
     // exists, which is what `TypeError: can't quote Array` was. `_hstore` and `_citext` are not
     // here and are not missing: an extension's element oid is above 16384 and is not in the
     // adapter's fixed list at all. `_tsvector` is the thirty-fifth and arrived with the
-    // `tsvector` type: **3614 was already in the adapter's list**, waiting for a row.
+    // `tsvector` type: **3614 was already in the adapter's list**, waiting for a row, and `_name`
+    // is the thirty-sixth for the same reason — 19 was in the list and had no array.
     assert_eq!(
         node.rows(
             "SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, \
@@ -446,6 +447,20 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "1001".to_owned(),
                 "_bytea".to_owned(),
                 "17".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            // **`_name` (1003), the thirty-sixth**, which arrived with the `name[]` type: run 106
+            // lost ten tests because `array_agg(enum.enumlabel)` over a `name` column had no array
+            // type to be declared as. 19 is `name` and it was already in the list above, waiting
+            // for a row, the way 3614 was.
+            vec![
+                "1003".to_owned(),
+                "_name".to_owned(),
+                "19".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),

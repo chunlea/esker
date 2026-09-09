@@ -1,0 +1,39 @@
+SELECT oid, typname, typlen, typtype, typcategory, typdelim, typelem, typarray, typinput FROM pg_type WHERE oid IN (19, 1003) ORDER BY oid	oid,name,smallint,"char","char","char",oid,oid,regproc	19|name|64|b|S|,|18|1003|namein ; 1003|_name|-1|b|A|,|19|0|array_in
+SELECT pg_typeof('x'::name)	regtype	name
+SELECT pg_typeof(array_agg(c::name)) FROM (VALUES ('x')) s(c)	regtype	name[]
+SELECT pg_typeof(ARRAY[c::name]) FROM (VALUES ('x')) s(c)	regtype	name[]
+SELECT pg_typeof(ARRAY['a'::name,'b'::name])	regtype	name[]
+SELECT pg_typeof(min(c::name)) FROM (VALUES ('x')) s(c)	regtype	text
+SELECT pg_typeof(max(c::name)) FROM (VALUES ('x')) s(c)	regtype	text
+SELECT min(c::name), max(c::name) FROM (VALUES ('b'),('a')) s(c)	text,text	a|b
+SELECT array_agg(c::name) FROM (VALUES ('a'),('b')) s(c)	name[]	{a,b}
+SELECT array_agg(c::name ORDER BY c::name DESC) FROM (VALUES ('a'),('b')) s(c)	name[]	{b,a}
+SELECT ARRAY['a'::name,'b'::name]	name[]	{a,b}
+SELECT pg_typeof(array_agg(relname)) FROM (SELECT relname FROM pg_class LIMIT 2) s	regtype	name[]
+SELECT pg_typeof(array_agg(attname)) FROM (SELECT attname FROM pg_attribute LIMIT 2) s	regtype	name[]
+SELECT pg_typeof(array_agg(enumlabel)) FROM pg_enum	regtype	name[]
+SELECT pg_typeof(array_agg(table_name)) FROM (SELECT table_name FROM information_schema.tables LIMIT 2) s	regtype	information_schema.sql_identifier[]
+SELECT pg_typeof(current_schemas(false))	regtype	name[]
+SELECT pg_typeof(array_agg(data)) FROM b4_nm	regtype	name[]
+SELECT array_agg(data ORDER BY id) FROM b4_nm	name[]	{plain,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,"",MiXeD,apple,Apple}
+SELECT '{a,b}'::name[]	name[]	{a,b}
+SELECT pg_typeof('{a,b}'::name[])	regtype	name[]
+SELECT array_dims('{a,b}'::name[]), array_length('{a,b}'::name[], 1), cardinality('{a,b}'::name[])	text,integer,integer	[1:2]|2|2
+SELECT pg_typeof(unnest('{a,b}'::name[]))	regtype	name ; name
+SELECT unnest('{a,b}'::name[])	name	a ; b
+SELECT array_to_string('{a,b}'::name[], '-')	text	a-b
+SELECT 'x'::name = ANY('{x,y}'::name[])	boolean	t
+SELECT 'x'::name = ANY(ARRAY['x'::name])	boolean	t
+SELECT 'x'::text = ANY('{x,y}'::name[])	boolean	t
+SELECT '{a,b}'::name[] = '{a,b}'::text[]	!42883 operator does not exist: name[] = text[] DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT pg_typeof('{a,b}'::name[] || 'c'::name)	regtype	name[]
+SELECT pg_typeof(coalesce('a'::name, 'b'::name))	regtype	name
+SELECT pg_typeof(coalesce('a'::name, 'b'::text))	regtype	name
+SELECT pg_typeof(CASE WHEN true THEN 'a'::name ELSE 'b'::name END)	regtype	name
+SELECT pg_typeof(CASE WHEN true THEN 'a'::name ELSE 'b'::text END)	regtype	text
+SELECT array_position('{a,b}'::name[], 'b'::name)	integer	2
+SELECT typname AS name, oid, array_agg(oid) FROM pg_type WHERE typname = 'name' GROUP BY typname, oid	name,oid,oid[]	name|19|{19}
+SELECT n.nspname FROM pg_namespace n WHERE n.nspname = ANY (current_schemas(false)) ORDER BY 1	name	public
+SELECT pg_typeof(array_agg(nspname)) FROM pg_namespace	regtype	name[]
+SELECT array_agg(x) FROM unnest('{a,b}'::name[]) AS x	name[]	{a,b}
+SELECT pg_typeof(x) FROM unnest('{a,b}'::name[]) AS x LIMIT 1	regtype	name

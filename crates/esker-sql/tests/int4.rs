@@ -24,14 +24,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[(
-        "SELECT id FROM i4 WHERE n = 10::int8",
-        "a cast is `0A000` naming itself and was before this type. The line is in the corpus \
-         because it is the evidence that `int4` and `int8` compare — a real server has an \
-         `integer = bigint` operator and answers this with the row. `the_two_integer_widths_compare` \
-         asserts the same thing in a shape this node can write, over two columns rather than a cast.",
-        "UNMEASURED",
-    )],
+    // **Empty, and its one entry was `SELECT id FROM i4 WHERE n = 10::int8`.** It recorded a cast
+    // refused by name, and the reason it was in the corpus at all was as evidence that the two
+    // integer widths compare. They do now — an integer value compares like an integer literal
+    // whatever width it arrived as (ADR 0087) — so the statement answers the row a real server
+    // answers and the entry is gone.
+    answers: &[],
 };
 
 #[test]

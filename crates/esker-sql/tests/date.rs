@@ -63,11 +63,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`to_char`/`to_date` are `0A000` naming themselves — a whole format-picture language, and nothing `ActiveRecord` sends.",
             "pg19_date.txt:102",
         ),
-        (
-            "SELECT '2020-01-01'::date = 1",
-            "**Both raise `42883`, and the type named in the sentence differs**: `date = bigint` here where a real server says `date = integer`, because a bare integer constant is `int8` in this crate. The declared bare-integer divergence (`tests/unknown_literal.rs`), reached through a new type — and it is here rather than absent because this unit is what made the line raise at all: before it, a `date` compared to an integer answered **`f`**.",
-            "pg19_date.txt:107",
-        ),
     ],
 };
 

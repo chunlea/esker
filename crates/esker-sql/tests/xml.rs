@@ -31,15 +31,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // which the `format_type` and `information_schema` statements above check. It is only a
         // bare literal or cast that loses it. `tests/json.rs` carries the identical list for the
         // identical reason; a `Datum` variant of its own closes both at once.
-        "SELECT 'r', '<a/>'::text::xml",
-        "SELECT 'r', '<!-- <a> --><b/>'::xml",
-        "SELECT 'r', '<?php echo 1; ?><a/>'::xml",
-        "SELECT 'r', '<a><![CDATA[<not a tag>]]></a>'::xml",
-        "SELECT 'r', '&amp;'::xml, '&#65;'::xml",
-        "SELECT 'r', '<_a/>'::xml, '<a-b/>'::xml, '<a:b/>'::xml",
-        "SELECT 'r', '<a b=\"1\" c=''2''/>'::xml",
-        "SELECT 'r', '<?xml version=\"1.0\"?><a/>'::xml",
-        "SELECT 'r', '<?xml version=\"1.0\" encoding=\"UTF-8\"?><a>x</a>'::xml",
     ],
     answers: &[
         // **`pg_typeof` reads the value, not the plan**, which is [`esker_sql::plan::CatalogFunc`]

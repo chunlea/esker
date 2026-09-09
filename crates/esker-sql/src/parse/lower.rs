@@ -5440,7 +5440,18 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             Value::Number(digits, _) if digits.contains('.') => {
                 (Some(digits.clone()), Some(ColumnType::Numeric))
             }
-            Value::Number(digits, _) => (Some(digits.clone()), Some(ColumnType::Int8)),
+            // **The literal ladder, inside the constructor** (ADR 0087): an integer element is an
+            // `int4` when it fits one, so `ARRAY[1,2,3]` is an `integer[]` as it is on a real
+            // server, and `ARRAY[1,3000000000]` is a `bigint[]` because the widening below settles
+            // on the wider of the two. A number too large for either is left to `from_text`, which
+            // raises the `22003` a real server raises.
+            Value::Number(digits, _) => (
+                Some(digits.clone()),
+                Some(match digits.parse::<i32>() {
+                    Ok(_) => ColumnType::Int4,
+                    Err(_) => ColumnType::Int8,
+                }),
+            ),
             Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
                 (Some(text.clone()), Some(ColumnType::Text))
             }
@@ -5462,6 +5473,11 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             (Some(ColumnType::Numeric), _) | (_, Some(ColumnType::Numeric)) => {
                 Some(ColumnType::Numeric)
             }
+            // **The wider integer wins**, which the first-wins arm below cannot do: without this
+            // `ARRAY[1,3000000000]` would settle on the `int4` its first element asked for and
+            // then refuse its second with a `22003` that a real server does not raise.
+            (Some(ColumnType::Int8), Some(ColumnType::Int4))
+            | (Some(ColumnType::Int4), Some(ColumnType::Int8)) => Some(ColumnType::Int8),
             (known, None) => known,
             (None, wanted) => wanted,
             (known, _) => known,
@@ -6121,7 +6137,24 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 // cast and an `INSERT` cannot disagree about what `(3)` means.
                 let (ty, typmod) = lower_type(data_type)?;
                 let value = value::fit_to_typmod(Datum::from_text(ty, &text)?, ty, typmod)?;
-                Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(value))))
+                // **A folded cast still carries the type it named.** Several types share one
+                // `Datum` — `text`, `varchar`, `bpchar` and `name` are all a `Datum::Text` — so
+                // folding `'x'::name` to its value alone threw the *declared* type away and the
+                // `RowDescription` said `text`, OID 25, where a real server says 19. A column of
+                // the type answered correctly all along; it was the bare cast that could not,
+                // which is why no corpus saw it (`tests/captures/pg19_name_array.txt`).
+                //
+                // The `Cast` node is kept only when the value cannot speak for itself. It is a
+                // no-op on the value — the datum below it is already this type's — and it is what
+                // `expr_type` reads.
+                if value.column_type() == Some(ty) {
+                    return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(value))));
+                }
+                Ok(plan::Expr::Cast {
+                    operand: Box::new(plan::Expr::Literal(plan::Literal::Typed(Box::new(value)))),
+                    to: ty,
+                    typmod,
+                })
             }
             // Not a literal, so the cast happens **per row**. Only `text` is a target: a cast to
             // `text` is the operand's own output function and needs nothing of the operand but

@@ -2236,6 +2236,15 @@ pub fn casts_to(from: ColumnType, to: ColumnType) -> bool {
     if from == to || typcategory(from) == "S" || typcategory(to) == "S" {
         return true;
     }
+    // **An array casts to an array exactly when its element does**, which no `pg_cast` row says:
+    // a real server has no `_int4 -> _int8` row and derives the coercion from the element pair.
+    // Measured, four each way — `int4[]::int8[]`, `::text[]`, `::numeric[]` and `::bool[]` all
+    // answer, and `int4[]::date[]` and `date[]::int4[]` are `42846`, which is the element rule
+    // exactly. It became reachable when `ARRAY(SELECT 1)` started folding to an `int4[]`
+    // (ADR 0087) and `ARRAY(SELECT 1)::int8[]` refused itself.
+    if let (Some(held), Some(wanted)) = (ArrayValue::element_of(from), ArrayValue::element_of(to)) {
+        return casts_to(held, wanted);
+    }
     let (from, to) = (i64::from(from.oid()), i64::from(to.oid()));
     CASTS
         .iter()
@@ -2908,6 +2917,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::ByteaArray => "_bytea",
         ColumnType::BpcharArray => "_bpchar",
         ColumnType::VarcharArray => "_varchar",
+        ColumnType::NameArray => "_name",
         ColumnType::DateArray => "_date",
         ColumnType::TimeArray => "_time",
         ColumnType::TimestampArray => "_timestamp",
@@ -3032,7 +3042,7 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::HstoreArray
         | ColumnType::TsVectorArray
         | ColumnType::TsQueryArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
         // **`A` for the two vectors too**, measured: `int2vector` and `oidvector` are in
         // PostgreSQL's array category despite not being array types.
         | ColumnType::Int2Vector
@@ -3158,6 +3168,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
         | ColumnType::VarcharArray
+        | ColumnType::NameArray
         | ColumnType::DateArray
         | ColumnType::TimeArray
         | ColumnType::TimestampArray

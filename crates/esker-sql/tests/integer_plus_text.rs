@@ -21,8 +21,6 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
         // divergence until `||` over text was built — `numeric|text` is now right on both, and
         // `pg_typeof(1::text || '2')` saying `text` is the half that was missing.
         "SELECT 'r', pg_typeof(1 + '2'::numeric), pg_typeof(1::text || '2')",
-        "SELECT 'r', 1 + $1",
-        "SELECT 'r', 1 + '2'",
     ],
     answers: &[
         // **`||` over text is not built**, which is the debt `tests/aggregate_type.rs` has
@@ -58,11 +56,6 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
             "a bare integer constant is int8 here and int4 there, and an unquoted literal is text \
              here and unknown there",
             "pg19_integer_plus_text.txt:60",
-        ),
-        (
-            "SELECT 'r', 1 + 'x'",
-            "the same constant width, in the input function's message",
-            "pg19_integer_plus_text.txt:62",
         ),
         (
             "SELECT 'r', 1 + '2'::text",

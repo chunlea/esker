@@ -145,15 +145,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_time.txt:105",
         ),
         (
-            "SELECT '12:34:56'::time = 1",
-            "Both refuse with `42883` and name a different integer: PostgreSQL says `integer` \
-             because a bare `1` is an `int4` there, and this node says `bigint` because it types \
-             an unsuffixed integer literal as `int8`. A pre-existing divergence of the literal, \
-             not of this type — every type's `= 1` says it — and it closes when integer literals \
-             are typed by width.",
-            "pg19_time.txt:106",
-        ),
-        (
             "SELECT '12:34:56'::timetz, '12:34:56+02'::timetz, '12:34:56+02'::timetz::text",
             TIMETZ,
             "pg19_time.txt:109",
