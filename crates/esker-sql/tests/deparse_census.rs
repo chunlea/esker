@@ -103,22 +103,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_deparse_census.txt:513",
         ),
         (
-            "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_notdistinct'",
-            "**Group B -- PostgreSQL rewrites three shapes and this node prints them as written.** `a BETWEEN 1 AND 10` is `((a >= 1) AND (a <= 10))` there, `a NOT BETWEEN 1 AND 10` is `((a < 1) OR (a > 10))`, and `a IS NOT DISTINCT FROM b` is `(NOT (a IS DISTINCT FROM b))`. These are not parenthesis differences: the node in the tree is different, because the parser expands them. **And the `AND` inside a `BETWEEN` is not a chain separator** -- the splitter took it for one and produced `CHECK (((a BETWEEN 1) AND (10)))`, which no longer parses. Same defect as the `CASE` one closed in `3b688020`, one keyword over.",
-            "pg19_deparse_census.txt:565",
-        ),
-        (
-            "SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_notdistinct'",
-            "**Group B -- PostgreSQL rewrites three shapes and this node prints them as written.** `a BETWEEN 1 AND 10` is `((a >= 1) AND (a <= 10))` there, `a NOT BETWEEN 1 AND 10` is `((a < 1) OR (a > 10))`, and `a IS NOT DISTINCT FROM b` is `(NOT (a IS DISTINCT FROM b))`. These are not parenthesis differences: the node in the tree is different, because the parser expands them. **And the `AND` inside a `BETWEEN` is not a chain separator** -- the splitter took it for one and produced `CHECK (((a BETWEEN 1) AND (10)))`, which no longer parses. Same defect as the `CASE` one closed in `3b688020`, one keyword over.",
-            "pg19_deparse_census.txt:569",
-        ),
-        (
-            "SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_notdistinct'::regclass",
-            "**Group B -- PostgreSQL rewrites three shapes and this node prints them as written.** `a BETWEEN 1 AND 10` is `((a >= 1) AND (a <= 10))` there, `a NOT BETWEEN 1 AND 10` is `((a < 1) OR (a > 10))`, and `a IS NOT DISTINCT FROM b` is `(NOT (a IS DISTINCT FROM b))`. These are not parenthesis differences: the node in the tree is different, because the parser expands them. **And the `AND` inside a `BETWEEN` is not a chain separator** -- the splitter took it for one and produced `CHECK (((a BETWEEN 1) AND (10)))`, which no longer parses. Same defect as the `CASE` one closed in `3b688020`, one keyword over.",
-            "pg19_deparse_census.txt:573",
-        ),
-        // ---- C-array: 14 statements ----
-        (
             "SELECT pg_get_indexdef('ix_arr_ctor'::regclass)",
             "**Group C -- arrays, and three separate things behind one word.** A subscript takes one pair and this node writes two (`((arr[1]))` against `(arr[1])`); an array **slice** is `0A000` here; and a generated column over `(ARRAY[...])::text` is *accepted* here and **refused** by PostgreSQL -- `generation expression is not immutable`, because the array-to-text cast reads settings. The last is the interesting direction: this node is more permissive than the server it copies, which no corpus had asked about.",
             "pg19_deparse_census.txt:354",
@@ -372,6 +356,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_bool'::regclass",
             "**Group H -- a `CASE`'s layout, and the leading newline belongs to the reader.** Three facts, measured: PostgreSQL's `pg_get_expr(indexprs)` gives `CASE\\n    WHEN ...` with **no** leading newline while the `CHECK` printer adds one (`CHECK (\\nCASE`), so the newline this node stores in the expression is the printer's and not the expression's; a **nested** `CASE` goes on its own line after `THEN` and is indented four further spaces, where this node inlines it at the same depth; and `pg_get_expr(indpred)` gives a bare `CASE ... END` where this node wraps it in a pair. All three are the same mistake in opposite directions -- the layout is split between the writer and the reader, and this node put all of it in the writer.",
             "pg19_deparse_census.txt:286",
+        ),
+        (
+            "SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_notdistinct'",
+            "**Group H's shape, reached by group B's fix.** Now that `IS NOT DISTINCT FROM` prints as the negation PostgreSQL holds, the *pretty* form has a pair to elide and this node has none of that machinery: `CHECK (NOT a IS DISTINCT FROM b)` there against `CHECK (NOT (a IS DISTINCT FROM b))` here. It is **not** \"strip the pair after NOT\" — the census's `chain_not` row has PostgreSQL *keeping* it, `NOT (a > 0 AND flag)`, because there the operand is a chain and needs it. Which pairs are redundant is a precedence question, which is exactly what group A says a flat string cannot answer; this row closes with A and H.",
+            "pg19_deparse_census.txt:569",
         ),
     ],
 };

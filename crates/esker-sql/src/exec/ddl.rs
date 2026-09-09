@@ -6085,6 +6085,18 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             } else {
                 comparison_operand_type(left, right, table).unwrap_or(ColumnType::Text)
             };
+            // **`IS NOT DISTINCT FROM` is a negation on a real server, not an operator.**
+            // PostgreSQL holds `NOT (a IS DISTINCT FROM b)` and prints exactly that, where this
+            // node held one operator and printed its own spelling. Measured across the census's
+            // readers; the *values* were never in question, only which node the tree has.
+            if *op == plan::BinaryOp::NotDistinct {
+                return format!(
+                    "(NOT ({} {} {}))",
+                    deparse(left, table, operand),
+                    plan::BinaryOp::Distinct.symbol(),
+                    deparse(right, table, operand)
+                );
+            }
             format!(
                 "({} {} {})",
                 deparse(left, table, operand),

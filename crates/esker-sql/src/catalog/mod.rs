@@ -1737,6 +1737,13 @@ pub(crate) fn boolean_chain(predicate: &str) -> Option<(Vec<&str>, Vec<&str>)> {
     // parses. Measured through `pg_get_constraintdef`; the index predicate reader had the same
     // hole, since both callers are this one scanner.
     let mut cases = 0_i32;
+    // **And a `BETWEEN` owns the next `AND`.** `a BETWEEN 1 AND 10` has one at parenthesis depth
+    // zero that belongs to the `BETWEEN`, and splitting there produced
+    // `CHECK (((a BETWEEN 1) AND (10)))` — text that no longer parses, so the deparser could not
+    // even read it back to print PostgreSQL's `((a >= 1) AND (a <= 10))`. The lowering has done
+    // that rewrite since it was written; the corruption was here, one keyword away from the `CASE`
+    // hole. Counted rather than flagged, because a chain may hold several.
+    let mut betweens = 0_i32;
     let word = |at: usize, keyword: &str| {
         upper[at..].starts_with(keyword.as_bytes())
             && !upper
@@ -1753,6 +1760,8 @@ pub(crate) fn boolean_chain(predicate: &str) -> Option<(Vec<&str>, Vec<&str>)> {
             _ if word(at, "CASE") => cases += 1,
             _ if word(at, "END") => cases -= 1,
             _ if depth != 0 || cases != 0 => {}
+            _ if word(at, "BETWEEN") => betweens += 1,
+            _ if betweens > 0 && upper[at..].starts_with(b" AND ") => betweens -= 1,
             _ => {
                 for keyword in [" AND ", " OR "] {
                     if upper[at..].starts_with(keyword.as_bytes()) {
