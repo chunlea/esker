@@ -80,17 +80,6 @@ const SHAPE_DIVERGENCES: parity::Divergences = parity::Divergences {
             "**No collation derivation, so a text call over nothing but literals is accepted          where a real server refuses it.** PostgreSQL answers `42P22 could not determine which          collation to use for upper() function`: a generated column's expression must have a          determinable collation, a literal argument carries none, and the column's own is not          consulted. Measured, and it is the reason this corpus tests a literal argument as a          *default* (`g1dp3`) rather than as a generated column. This node has no collation          inference at all — `COLLATE` is recorded per column and never derived through an          expression — so it builds the column and stores `upper('a'::text)`, which is what the          same expression prints as a default here and there. C3, in the direction that accepts          more than the oracle; the value it computes is the value a real server would compute if          it built it.",
             "pg19_deparse_parens.txt:141",
         ),
-        (
-            "SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_notin'",
-            "**`NOT IN` prints as a quantifier this node's expression language does not have.** \
-         PostgreSQL says `(c1 <> ALL (ARRAY[1, 2]))`. There is an `Expr::AnyArray` here and no \
-         `AllArray` -- `= ANY` exists because a query needs it, `<> ALL` has never been written -- \
-         so the printed form cannot be parsed back at all, and `reads_back` keeps the written \
-         `(c1 NOT IN (1, 2))` rather than storing a string the next `INSERT` would raise `XX000` \
-         on. Recorded as `docs/plans/debts-v1.1.md` #21: it is a **language** gap and not a \
-         printer one, and the printer is already right for the day the node has the node.",
-            "pg19_deparse_parens.txt:129",
-        ),
     ],
 };
 

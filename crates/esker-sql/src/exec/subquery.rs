@@ -853,7 +853,7 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
         | Expr::IsNull { operand: inner, .. }
         | Expr::Negate(inner) => substitute_in_expr(inner, outer, depth),
         Expr::Array { elements, .. } => substitute_in_each(elements, outer, depth),
-        Expr::AnyArray { operand, array } => {
+        Expr::QuantifiedArray { operand, array, .. } => {
             substitute_in_expr(operand, outer, depth);
             substitute_in_expr(array, outer, depth);
         }
@@ -1057,6 +1057,22 @@ pub(super) fn value_of(
 /// matches and the other is unknown — while `(1,NULL) IN (SELECT 2,3)` is **false**, because a
 /// definite mismatch in *any* column decides the row whatever else is NULL. A one-column left-hand
 /// side is that rule with one column, which is why there is one implementation.
+/// The same four rules over **one column of values**, which is what an array's elements are.
+///
+/// `plan::Expr::QuantifiedArray` is the other right-hand side of the node above, and the rule must
+/// be the same rule rather than the same *shape* of rule: the array form had its own loop and its
+/// own NULL ordering, and the ordering was wrong — it answered NULL for
+/// `NULL = ANY (ARRAY[]::integer[])` where a real server answers `f`, because it checked the
+/// operand before it had looked at the array. So it delegates, and the adaptation is one `map`.
+///
+/// The per-element `Vec` is the price of having one implementation, and it is paid on arrays that
+/// are lists a user wrote — `lower_quantified` turns a *visible* list into an `IN` before it gets
+/// here, so what reaches this is a column's value or a spelling with no `IN` form.
+pub(super) fn quantified_over(op: BinaryOp, all: bool, operand: &Datum, values: &[Datum]) -> Datum {
+    let rows: Vec<Vec<Datum>> = values.iter().map(|value| vec![value.clone()]).collect();
+    quantified(op, all, std::slice::from_ref(operand), &rows)
+}
+
 fn quantified(op: BinaryOp, all: bool, operand: &[Datum], values: &[Vec<Datum>]) -> Datum {
     if values.is_empty() {
         return Datum::Bool(all);
@@ -1413,7 +1429,7 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
             walk(pattern, visit);
         }
         Expr::IsNull { operand, .. } | Expr::Negate(operand) => walk(operand, visit),
-        Expr::AnyArray { operand, array } => {
+        Expr::QuantifiedArray { operand, array, .. } => {
             walk(operand, visit);
             walk(array, visit);
         }
@@ -1514,7 +1530,7 @@ pub(super) fn walk_mut(
             walk_mut(pattern, visit)?;
         }
         Expr::IsNull { operand, .. } | Expr::Negate(operand) => walk_mut(operand, visit)?,
-        Expr::AnyArray { operand, array } => {
+        Expr::QuantifiedArray { operand, array, .. } => {
             walk_mut(operand, visit)?;
             walk_mut(array, visit)?;
         }

@@ -300,45 +300,45 @@ fn a_subquery_is_named_after_what_it_returns() {
 fn the_shapes_this_phase_does_not_run_name_themselves() {
     let mut node = parity::Node::new(FIXTURE);
 
-    for (statement, named) in [
-        // **`WITH RECURSIVE` left this list twice, and both times for a different reason.** The
-        // entry was once the keyword — `WITH RECURSIVE t AS (SELECT 1 AS n)`, which a real server
-        // answers — and then a body that names itself, which the inlining a CTE uses could not do.
-        // `exec::recursive` iterates that one to a fixed point now (`tests/recursive_cte.rs`), so
-        // there is nothing of this shape left to name. A refusal list is worth only what its
-        // reasons are worth: both entries went on passing for a while after their reason stopped
-        // being true.
-        // The boundary with the type lane's arrays is decided by the **right-hand side** and not
-        // by the quantifier: `= ANY (array)` is `IN (list)` and runs, any other operator over an
-        // array is a quantifier this node does not have, and `ALL (array)` is named the same way.
-        // Every one of the six over a *subquery* runs, which is what this unit built.
-        (
-            "SELECT id FROM sq_a WHERE id > ANY ('{1,2}')",
-            "the quantifier > ANY",
-        ),
-        (
-            "SELECT id FROM sq_a WHERE id > ALL ('{1,2}')",
-            "ALL over an array",
-        ),
-        (
-            // The comma list itself runs now — it is a cross join, and
-            // `tests/reset_pk_sequence.rs` is the five-table one `ActiveRecord` writes. What is
-            // still refused is `LATERAL`, which is what this line names.
-            "SELECT id FROM sq_a, LATERAL (SELECT 1) AS x",
-            "LATERAL",
-        ),
-    ] {
-        let error = refusal(&mut node, statement);
-        assert_eq!(
-            error.sqlstate(),
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "{statement} -> {error}"
-        );
-        assert!(
-            error.to_string().contains(named),
-            "{statement} -> `{error}`, which does not name `{named}`"
-        );
-    }
+    // **One entry left, and clippy is what says so out loud.** This was a `for` over a list of
+    // three and is now a single assertion, because a loop over one element is
+    // `clippy::single_element_loop` — a lint that reads, in a refusal list, as "this list is nearly
+    // empty". The two comment blocks below are kept where the entries were: what a refusal list is
+    // worth is what its reasons are worth, and a list that shrinks silently is how an entry goes on
+    // passing after its reason stops being true.
+    //
+    // **`WITH RECURSIVE` left this list twice, and both times for a different reason.** The
+    // entry was once the keyword — `WITH RECURSIVE t AS (SELECT 1 AS n)`, which a real server
+    // answers — and then a body that names itself, which the inlining a CTE uses could not do.
+    // `exec::recursive` iterates that one to a fixed point now (`tests/recursive_cte.rs`), so
+    // there is nothing of this shape left to name. A refusal list is worth only what its
+    // reasons are worth: both entries went on passing for a while after their reason stopped
+    // being true.
+    // **Two entries left this list when the array side caught up with the subquery side.**
+    // They were `id > ANY ('{1,2}')` and `id > ALL ('{1,2}')`, named "the quantifier > ANY"
+    // and "ALL over an array" — a boundary drawn by the *right-hand side*, where every one of
+    // the six operators ran over a subquery and only `= ANY` ran over an array. That was
+    // `docs/plans/debts-v1.1.md` #21 and it is paid: the same `(op, all)` pair now reaches
+    // both right-hand sides through one rule (`tests/all_quantifier.rs`). Recorded here rather
+    // than deleted silently, because this list's own comment above says what a refusal list is
+    // worth — and both of these went on passing for a while after their reason stopped being
+    // true, which is the failure this file has now had twice.
+    //
+    // The comma list itself runs now — it is a cross join, and `tests/reset_pk_sequence.rs` is the
+    // five-table one `ActiveRecord` writes. What is still refused is `LATERAL`, which is what the
+    // one remaining entry names.
+    let statement = "SELECT id FROM sq_a, LATERAL (SELECT 1) AS x";
+    let named = "LATERAL";
+    let error = refusal(&mut node, statement);
+    assert_eq!(
+        error.sqlstate(),
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "{statement} -> {error}"
+    );
+    assert!(
+        error.to_string().contains(named),
+        "{statement} -> `{error}`, which does not name `{named}`"
+    );
 
     // And the two either side of that boundary, which both run.
     assert_eq!(

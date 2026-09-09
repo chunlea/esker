@@ -595,7 +595,14 @@ impl Aggregation {
                 }
                 Expr::CatalogFunc(rewritten)
             }
-            Expr::AnyArray { operand, array } => Expr::AnyArray {
+            Expr::QuantifiedArray {
+                operand,
+                op,
+                all,
+                array,
+            } => Expr::QuantifiedArray {
+                op: *op,
+                all: *all,
                 operand: Box::new(self.rewrite(operand, scope)?),
                 array: Box::new(self.rewrite(array, scope)?),
             },
@@ -863,9 +870,10 @@ fn walk<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
         | Expr::ToText { operand, .. } => walk(operand, visit),
         Expr::Binary { left, right, .. }
         | Expr::Arithmetic { left, right, .. }
-        | Expr::AnyArray {
+        | Expr::QuantifiedArray {
             operand: left,
             array: right,
+            ..
         }
         | Expr::Subscript {
             operand: left,

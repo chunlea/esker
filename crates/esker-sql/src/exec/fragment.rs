@@ -837,7 +837,9 @@ fn push_filter(
         Expr::Coalesce(_) => return Err(refused("a COALESCE expression")),
         Expr::Case { .. } => return Err(refused("a CASE expression")),
         // The fragment language has no array. Rows, and the row evaluator answers it.
-        Expr::AnyArray { .. } => return Err(refused("= ANY over an array value")),
+        Expr::QuantifiedArray { .. } => {
+            return Err(refused("a quantified comparison over an array value"));
+        }
         Expr::Subscript { .. } => return Err(refused("an array subscript")),
         // Volatile: a fragment the columnar side evaluated would answer a different UUID from the
         // row side, which is the one thing a differential must never allow.
@@ -1304,7 +1306,7 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
                 collect_columns(otherwise, into);
             }
         }
-        Expr::AnyArray { operand, array } => {
+        Expr::QuantifiedArray { operand, array, .. } => {
             collect_columns(operand, into);
             collect_columns(array, into);
         }

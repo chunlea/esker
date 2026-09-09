@@ -4542,35 +4542,23 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         } if matches!(strip_nesting(right), Expr::Subquery(_)) => {
             lower_quantified(left, compare_op, right, false)
         }
-        // **A list when the lowering can see one, and a value when it cannot.** `ARRAY[1,2]`,
-        // `'{a,b}'` and `current_schemas(false)` are all known here, and expanding them into an
-        // `IN` list is what lets an index seek use them. A **column** — `a.attnum =
-        // ANY(i.indkey)` — is not: its value differs per row, so it stays an array and is read
-        // when the row is (`plan::Expr::AnyArray`).
+        // **An array on the right, with any of the six operators and either quantifier.**
+        //
+        // Two of the twelve spellings have an `IN` form and the lowering prefers it when it can
+        // see the list: `= ANY (ARRAY[1,2])` is `x IN (1,2)` and `<> ALL (ARRAY[1,2])` is
+        // `x NOT IN (1,2)` — the same rule over a list known at plan time, and expanding it is
+        // what lets an index seek use it. PostgreSQL agrees the two are one thing and prints both
+        // as `(x <> ALL (ARRAY[1, 2]))`, measured (`tests/corpus/pg19_all_quantifier.txt`).
+        //
+        // Everything else — `> ALL`, `= ALL`, `<> ANY` — and every array the lowering *cannot*
+        // see, a column being the case that matters (`a.attnum = ANY(i.indkey)`), keeps the
+        // operator and the quantifier and is decided per row.
         Expr::AnyOp {
             left,
             compare_op,
             right,
             ..
-        } if *compare_op == BinaryOperator::Eq => {
-            let operand = Box::new(lower_expr(left)?);
-            match lower_array(right)? {
-                Some(list) => Ok(plan::Expr::InList {
-                    operand,
-                    list,
-                    negated: false,
-                }),
-                None => Ok(plan::Expr::AnyArray {
-                    operand,
-                    array: Box::new(lower_expr(strip_nesting(right))?),
-                }),
-            }
-        }
-        // Any other operator against an array — `> ANY`, `<> ANY` — is a different quantifier and
-        // is named rather than approximated by the one this node has.
-        Expr::AnyOp { compare_op, .. } => Err(SqlError::unsupported(format!(
-            "the quantifier {compare_op} ANY"
-        ))),
+        } => lower_quantified(left, compare_op, right, false),
         Expr::AllOp {
             left,
             compare_op,
@@ -4668,17 +4656,71 @@ fn lower_quantified(
             )));
         }
     };
-    let quantifier = if all { "ALL" } else { "ANY" };
-    let Expr::Subquery(query) = strip_nesting(right) else {
-        return Err(SqlError::unsupported(format!("{quantifier} over an array")));
-    };
-    Ok(plan::Expr::Subquery(Box::new(
-        plan::SubqueryExpr::compared(
-            plan::SubqueryKind::Quantified { op, all },
-            lower_expr(left)?,
-            Box::new(lower_query(query)?),
-        ),
-    )))
+    if let Expr::Subquery(query) = strip_nesting(right) {
+        return Ok(plan::Expr::Subquery(Box::new(
+            plan::SubqueryExpr::compared(
+                plan::SubqueryKind::Quantified { op, all },
+                lower_expr(left)?,
+                Box::new(lower_query(query)?),
+            ),
+        )));
+    }
+    // **The array form of the same node.** The `IN` shortcut is taken only for the two spellings
+    // that have one and only when the list is visible here; `lower_array` answers `None` for a
+    // column, which is the case the per-row variant exists for.
+    let operand = Box::new(lower_expr(left)?);
+    if let Some(list) = match (op, all) {
+        (plan::BinaryOp::Eq, false) | (plan::BinaryOp::NotEq, true) => lower_array(right)?,
+        _ => None,
+    }
+    // **An empty array is not an empty `IN` list, because there is no such thing.**
+    // `Expr::InList`'s own doc says PostgreSQL's grammar has no empty one, and its evaluator is
+    // written for that: it answers NULL for a NULL operand before it counts the list. So
+    // `NULL = ANY (ARRAY[]::integer[])` came back NULL through the shortcut where a real server
+    // answers `f` — the quantifier's first rule is that an empty right-hand side settles it with
+    // no comparison, and only the array node knows it is empty.
+    .filter(|list| !list.is_empty())
+    {
+        return Ok(plan::Expr::InList {
+            operand,
+            list,
+            negated: all,
+        });
+    }
+    // **A constructor stays a constructor**, which is the one thing `pg_get_expr` keeps that a
+    // fold destroys. Measured on 19beta1, three spellings of the same array in a generated column:
+    //
+    // ```text
+    // (c1 = ALL (ARRAY[1,2]))        ->  (c1 = ALL (ARRAY[1, 2]))
+    // (c1 = ALL ('{1,2}'::int[]))    ->  (c1 = ALL ('{1,2}'::integer[]))
+    // (c1 = ALL ('{1,2}'))           ->  (c1 = ALL ('{1,2}'::integer[]))
+    // ```
+    //
+    // PostgreSQL prints the node it parsed, so the constructor and the literal are two answers.
+    // `lower_expr` folds a constant `ARRAY[…]` into a `Datum::Array` — right for evaluation, and
+    // it makes the two spellings one node, so the printer could only ever give the literal form.
+    // The `IN` shortcut above never had this problem, because its list is elements and its deparse
+    // writes them back as `ARRAY[…]`; this keeps the same shape for the spellings that have no
+    // `IN` form. The elements are already lowered by `lower_array`, so nothing is parsed twice.
+    if let Some(elements) = lower_array(right)?.filter(|list| !list.is_empty())
+        && matches!(strip_nesting(right), Expr::Array(_))
+    {
+        return Ok(plan::Expr::QuantifiedArray {
+            operand,
+            op,
+            all,
+            array: Box::new(plan::Expr::Array {
+                elements,
+                element: None,
+            }),
+        });
+    }
+    Ok(plan::Expr::QuantifiedArray {
+        operand,
+        op,
+        all,
+        array: Box::new(lower_expr(strip_nesting(right))?),
+    })
 }
 
 /// Past any number of `(…)` wrappers, which is how `= ANY ((SELECT …))` parses.

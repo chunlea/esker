@@ -73,16 +73,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_array.txt:125",
         ),
         (
-            "SELECT 1 = ALL('{1,1}'::int[]), 1 = ALL('{1,2}'::int[])",
-            "`= ANY` over an array **column value** and `= ALL` over any array. `= ANY` over an array *expression* has worked since phase 6a and still does — `id = ANY('{1,3}')` is in this corpus and agrees — and what is new is an array that arrives as a value rather than as text. The next slice, with the operators.",
-            "pg19_array.txt:133",
-        ),
-        (
-            "SELECT 1 = ANY('{}'::int[]), 1 = ALL('{}'::int[])",
-            "`= ANY` over an array **column value** and `= ALL` over any array. `= ANY` over an array *expression* has worked since phase 6a and still does — `id = ANY('{1,3}')` is in this corpus and agrees — and what is new is an array that arrives as a value rather than as text. The next slice, with the operators.",
-            "pg19_array.txt:137",
-        ),
-        (
             "SELECT '{1,2}'::int[] @> '{1}'::int[], '{1}'::int[] <@ '{1,2}'::int[], '{1,2}'::int[] && '{2,3}'::int[]",
             "The array **operators** — `@>`, `<@`, `&&`, `||` — which are the slice after the constructor. Nothing here is approximated in the meantime: each is `0A000` naming itself.",
             "pg19_array.txt:145",

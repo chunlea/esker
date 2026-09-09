@@ -240,20 +240,84 @@ impl Cluster {
     /// expired and the placement driver is unreachable"*. It is a startup race, not a refusal —
     /// `esker bench-mpp` learned it the same way, six runs in — so readiness here means a node
     /// that accepts a **write**, not one that answers.
+    ///
+    /// # And three more, each measured off a gate log rather than guessed
+    ///
+    /// `multi_region_differential` loads 8 KiB rows until the table splits, so its `INSERT`s run
+    /// *while* regions are being cut and re-elected. That reddened the gate six times in one
+    /// night, always green on the rerun, and the three failures are these:
+    ///
+    /// ```text
+    /// 40003 the transaction's outcome is unknown: the TxnPrewrite may or may not have been
+    ///       applied: connection closed: region 1 stopped leading with this proposal in its log
+    /// 08006 could not reach the store: deadline passed after 14 attempts
+    /// 08006 could not reach the store: gave up after 9 attempts: peer is not the leader of
+    ///       region 1
+    /// ```
+    ///
+    /// **All three say "not now", and none of them says "not ever".** A region mid-election has no
+    /// leader to prewrite against and a client that has spent its attempts says so; the answer a
+    /// second later is a commit. This is the same reading h1 landed inside the client — wait the
+    /// *caller's* deadline instead of a hard-coded number of attempts — applied at the layer that
+    /// has a deadline to give, and it is a **bounded** wait rather than a loop: past the deadline
+    /// the assertion fires with the server's own words, so a store that is really gone still fails
+    /// the test.
+    ///
+    /// **Why this is waiting and not a weaker assertion.** Nothing about what the statement must
+    /// *do* is relaxed: every row still has to be written, and the test's `assert_eq!` on the rows
+    /// is untouched. What changes is that the harness stops treating "the cluster is busy
+    /// splitting" — a state it deliberately provokes — as a defect in the thing it is measuring.
+    ///
+    /// # Retrying `40003` is only safe because these writes carry their own key
+    ///
+    /// An unknown outcome may have applied. Retrying one is a **double write** unless the write is
+    /// idempotent, and here it is: every `INSERT` this harness sends names its `id`, which is the
+    /// table's primary key, so a retry either writes the row or hits `23505` on the row its own
+    /// first attempt wrote. That second case is a **success** and is treated as one — which is
+    /// also why a `23505` is only accepted *after* an unknown outcome and not in general, since a
+    /// duplicate key on the first attempt is a real defect in the fixture.
     pub fn run(&self, sql: &str) {
         let deadline = Instant::now() + Duration::from_secs(120);
+        let mut outcome_was_unknown = false;
         loop {
             let answer = self.query(sql);
             if !answer.contains("ERROR") {
                 return;
             }
+            // The retry finding its own earlier attempt applied. See the doc above: accepted only
+            // after an unknown outcome, because otherwise it is the fixture writing a row twice.
+            if outcome_was_unknown && answer.contains("23505") {
+                eprintln!("harness: `{sql}` had already applied; the unknown outcome was a commit");
+                return;
+            }
+            outcome_was_unknown |= answer.contains("40003");
             assert!(
-                answer.contains("25006") && Instant::now() < deadline,
+                Self::waited_out(&answer) && Instant::now() < deadline,
                 "`{sql}` was refused: {}",
                 answer.trim()
             );
             std::thread::sleep(Duration::from_millis(500));
         }
+    }
+
+    /// Whether a refusal is one of the four transient states [`Cluster::run`] waits out.
+    ///
+    /// Listed by **sqlstate and sentence**, not by sqlstate alone: `08006` is "could not reach the
+    /// store" for a region being re-elected and also for a store that has died, and only the
+    /// sentence tells them apart. A state not named here fails the test on its first appearance,
+    /// which is the property this list exists to keep — a harness that waited out every error
+    /// would wait out the defect it was built to find.
+    pub fn waited_out(answer: &str) -> bool {
+        // A node that has connections and not yet a schema lease.
+        answer.contains("25006")
+            // A prewrite whose region stopped leading mid-proposal. Idempotent to retry here; see
+            // `run`'s doc for why that is true of this harness's writes and not in general.
+            || answer.contains("40003")
+            // A client that spent its attempts on a region with no leader yet. Both spellings are
+            // from gate logs: one ran out of deadline, one ran out of attempts.
+            || (answer.contains("08006")
+                && (answer.contains("deadline passed after")
+                    || answer.contains("peer is not the leader")))
     }
 
     /// How many regions the cluster holds, from the placement driver's own routing table.
@@ -302,24 +366,48 @@ impl Cluster {
     /// not a failure of the query — it is the fragment path not being ready yet, which is why the
     /// message says `placement never completed` rather than blaming the answer.
     pub fn wait_until_fragments_answer(&self, probe: &str, seconds: u64) {
+        assert!(
+            self.columnar_within(probe, seconds),
+            "placement never completed: no fragment answered within {seconds}s, so \
+             \"columnar agreed\" could only have meant \"columnar never ran\". The last plan \
+             was:\n{}",
+            self.query_on("auto", &format!("EXPLAIN ANALYZE {probe}"))
+        );
+    }
+
+    /// Whether **this** query's fragments answer within the bound — `true` when the plan says the
+    /// columns ran, `false` on the timeout, and no panic either way.
+    ///
+    /// **Readiness is per query, not per table**, which is the second half of the same night's
+    /// gate flakes. `multi_region_differential` waited once, on `SELECT count(*)`, and then
+    /// asserted `Engine: columnar` for every query it compares — so a `min`/`max` whose fragment
+    /// was still catching up made the *declaration* assertion fail and read as
+    /// "the columns had to answer this and did not", which is a readiness message wearing a
+    /// correctness message's clothes. A learner catches up per column family and per region, so
+    /// `count(*)` answering says nothing about `min(amount)`.
+    ///
+    /// **`Engine: columnar` is the readiness condition, and it is the only one that covers both
+    /// halves.** A plan that was never routed carries no `Fragments:` line at all — the planner's
+    /// own region cache had not yet seen a learner — and one that was routed and refused carries
+    /// `N asked, 0 answered`. Waiting on the fragment counts alone waits for ever in the first
+    /// case, which is what it did.
+    ///
+    /// The caller decides what a timeout means. [`Cluster::wait_until_fragments_answer`] makes it
+    /// a failure, because it is asked once about the table and nothing can be compared until the
+    /// columns answer *something*; the per-query caller makes it a **deferral** and keeps
+    /// comparing the answers, because the row engine is always there and the answer being right is
+    /// the assertion that must not be waited out.
+    pub fn columnar_within(&self, probe: &str, seconds: u64) -> bool {
         let deadline = Instant::now() + Duration::from_secs(seconds);
         loop {
             let plan = self.query_on("auto", &format!("EXPLAIN ANALYZE {probe}"));
-            // **`Engine: columnar` is the readiness condition, and it is the only one that
-            // covers both halves.** A plan that was never routed carries no `Fragments:` line at
-            // all — the planner's own region cache had not yet seen a learner — and one that was
-            // routed and refused carries `N asked, 0 answered`. Waiting on the fragment counts
-            // alone waits for ever in the first case, which is what it did.
             if plan.contains("Engine: columnar") {
-                eprintln!("harness: the columns are answering");
-                return;
+                return true;
             }
-            assert!(
-                Instant::now() < deadline,
-                "placement never completed: no fragment answered within {seconds}s, so \
-                 \"columnar agreed\" could only have meant \"columnar never ran\". \
-                 The last plan was:\n{plan}"
-            );
+            if Instant::now() >= deadline {
+                eprintln!("harness: `{probe}` was still on the rows after {seconds}s");
+                return false;
+            }
             std::thread::sleep(Duration::from_secs(2));
         }
     }
