@@ -184,6 +184,44 @@ the client sends it**, which is client behaviour and not a format. This ADR supe
 **If the build finds a shape that needs a new tag, a new method, or a changed golden, it stops and
 asks the human** — that is the charter's rule and nothing here weakens it.
 
+### What it costs, measured
+
+The draft asked for one number before anything was built — *"the cost of a lock-only prewrite for a
+hundred-row `FOR UPDATE`, measured, against the hash lookup it replaces. If it is a round trip per
+**statement** rather than per row, (a') is affordable; if it is per row, the batching has to come
+first."* `crates/esker-sql/tests/lock_cost.rs` is that measurement, against a real three-store
+cluster, medians of five rounds, and the answer is that **the question was aimed at the wrong cost**.
+
+| | 10 rows | 100 rows | 200 rows |
+|---|---|---|---|
+| lock-only prewrite, one region | 0.6–2.3 ms | 7.1–10.8 ms | 15.0–18.5 ms |
+| the same 100 keys spread over **three** regions | | 10.9–12.6 ms | |
+
+* **It is linear in rows and flat in regions.** A hundred keys in three regions cost what a hundred
+  keys in one region cost, and two hundred keys cost twice what one hundred do — about **0.1 ms per
+  locked row**. So the round trips are not the price: `commit` already groups checked keys by region
+  exactly as it groups writes, which is the batching the draft was asking whether it needed, and it
+  is already written. What is left is the lock **record**, one replicated write per key, and that is
+  inherent — it is what a lock another node can see *is*.
+* **A hundred sequential round trips cost 9.4–11.8 ms**, 0.1 ms each. That is the same order as the
+  batched prewrite of the same hundred keys, which says the same thing from the other side: the
+  network is not where this goes.
+* **The statement goes from ~3.5 ms to ~13 ms.** Today `SELECT … FOR UPDATE` over a hundred rows is
+  3.5–4.2 ms, of which the in-process hash table is 0.0–0.5 ms — at or below the statement's own
+  noise floor. The lock is what stops being free.
+* **And it is about a tenth of the write it precedes.** The `UPDATE` those hundred rows were locked
+  *for* costs 85–100 ms on the same cluster. A lock-only prewrite stages no value, so it is the
+  cheap half of a transaction that was always going to pay the expensive half.
+
+**So: affordable, per statement, and no batching work comes first.** The ADR's condition is met by
+the code that already exists.
+
+Two honesty notes on the numbers. They are a **debug build** — `--release` would move all of them
+and would not change a ratio. And one round in four landed on a busy box and reported three times
+the cost for the same arm (65 ms for 200 keys against 15–18 ms in the other three), which is what
+these numbers are worth: an order of magnitude and a shape, not a precision. The shape is what the
+decision needs, and it was the same in every round.
+
 ### The one thing (a') adds that is not free
 
 Today no transaction is ever in the state "holds a lock and waits for another", and that is not an
@@ -219,9 +257,10 @@ measured against, not assumed.
 * **Until it is built**, two application servers behind two nodes get a lock that does not lock. It
   is silent, and it is the kind of silence that shows up as data that cannot be explained rather
   than as an error anyone can route. That is why (c)'s sentence lands first and alone.
-* **A `FOR UPDATE` costs a round trip** where it cost a hash lookup. Per statement that is
-  affordable; per row it is not, and the batching comes first — the number is measured in the same
-  register the decision is, below the build.
+* **A `FOR UPDATE` over a hundred rows costs about 10 ms** where the hash table cost less than the
+  statement's own noise, and the cost is linear in rows rather than in round trips — measured, above.
+  It is a tenth of the `UPDATE` those rows were locked for, and it is the price of a lock a second
+  node can see.
 * **The ordering property stops being a proof.** `prewrite_ordering.rs` keeps its two tests and they
   keep passing — the primary is still the smallest key of the write set — but the sentence that
   hangs off them, *"a wait-for chain that only ascends cannot come back to where it started"*, stops
