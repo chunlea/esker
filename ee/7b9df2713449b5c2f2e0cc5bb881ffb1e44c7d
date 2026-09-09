@@ -1,0 +1,77 @@
+crates/esker-keys/src/array.rs
+  s_2bed4ac2b1c944::t_a927b595707266 108,158
+crates/esker-keys/src/columnar.rs
+  s_2bed4ac2b1c944::t_ce34a01faf82eb 136,138,233
+crates/esker-keys/src/row.rs
+  s_2bed4ac2b1c944::t_6c1dbda10aa599 520,1267,2157
+crates/esker-keys/src/value.rs
+  s_2bed4ac2b1c944::t_8832762fe3661c 503-509,551,597
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_2bed4ac2b1c944::t_e65636e805ba6f 454
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2bed4ac2b1c944::t_b17b615473c4e9 2892,3017,3143
+crates/esker-sql/src/catalog/record.rs
+  s_2bed4ac2b1c944::t_3c3c1b46501694 341-342,472,615
+crates/esker-sql/src/exec/aggregate.rs
+  s_2bed4ac2b1c944::t_1ddffb7cbdadb2 242-247
+crates/esker-sql/src/exec/bind.rs
+  s_2bed4ac2b1c944::t_b82cd36fe2f29e 1551
+crates/esker-sql/src/exec/fragment.rs
+  s_2bed4ac2b1c944::t_18c633c218a66b 1030
+crates/esker-sql/src/exec/mod.rs
+  s_2bed4ac2b1c944::t_287f2525e3432d 3020-3023,3025-3036,3050-3059
+crates/esker-sql/src/exec/query.rs
+  s_2bed4ac2b1c944::t_1bdfb5c4bbb7e0 3398-3402,4784-4793
+crates/esker-sql/src/parse/lower.rs
+  s_2bed4ac2b1c944::t_b50456c82719ad 6140-6157
+crates/esker-sql/src/plan/expr.rs
+  s_2bed4ac2b1c944::t_ad5cdc0c061b13 2326,2413,2582
+crates/esker-sql/src/row.rs
+  s_2bed4ac2b1c944::t_d43d5ecc72f4c8 88
+crates/esker-sql/src/value/mod.rs
+  s_2bed4ac2b1c944::t_6056df4934a1d7 1205-1209,1231,1471,1655,1742,1846,2091,2356,3142
+crates/esker-sql/tests/any.rs
+  s_2bed4ac2b1c944::t_e1a3c2a7a5d5a8 25
+crates/esker-sql/tests/array_delimiter.rs
+  s_2bed4ac2b1c944::t_cd9e2ca9164cea 153-155
+crates/esker-sql/tests/captures/pg19_name_array.txt
+  s_2bed4ac2b1c944::t_a3b38256c8ae87 1-122
+crates/esker-sql/tests/corpus/pg19_name_array.txt
+  s_2bed4ac2b1c944::t_5358e6182319cd 1-39
+crates/esker-sql/tests/corpus/pg19_order.txt
+  s_2bed4ac2b1c944::t_888f1b95ee79e2 79
+crates/esker-sql/tests/current_schemas_value.rs
+  s_2bed4ac2b1c944::t_41956a61500f24 16
+crates/esker-sql/tests/json.rs
+  s_2bed4ac2b1c944::t_5b5b7a00e858cb 28-39
+crates/esker-sql/tests/name_array.rs
+  s_2bed4ac2b1c944::t_41b1088dcfbaa9 1-328
+crates/esker-sql/tests/pg_catalog.rs
+  s_2bed4ac2b1c944::t_9d04cf9c30a300 306,314-315,456-469
+crates/esker-sql/tests/row_order.rs
+  s_2bed4ac2b1c944::t_57afe857e8ce57 245-249
+crates/esker-sql/tests/search_path.rs
+  s_2bed4ac2b1c944::t_e2c96ae0776f4a 16
+crates/esker-sql/tests/set_parameters.rs
+  s_2bed4ac2b1c944::t_6126b3647adefb 22-25
+crates/esker-store/src/columnar/decode.rs
+  s_2bed4ac2b1c944::t_e52cd65a867f6a 204
+docs/adr/0086-a-folded-cast-keeps-the-type-it-named.md
+  s_2bed4ac2b1c944::t_301cb97a441527 1-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "ee7b9df2713449b5c2f2e0cc5bb881ffb1e44c7d",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
