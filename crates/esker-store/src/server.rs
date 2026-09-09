@@ -1089,11 +1089,80 @@ impl Store {
                     Some(self.columnar_slot(child.id)),
                 )?;
                 self.spawn_ticker(&peer, raft.tick);
+                // **The child stands for election at once, if this store led the parent**
+                // ([ADR 0094](../../../docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md)).
+                //
+                // Without it every replica of the child is a follower and the group waits out an
+                // election timeout before anyone stands — a median of **62 ms** measured across 132
+                // splits, once per split, and a tail that reached half a minute. The store that led
+                // the parent knows everything an election would establish: that it is the leader,
+                // that the child's membership is the parent's, and that the child's log is empty.
+                //
+                // **It is still an election**, and that is the point of doing it this way rather
+                // than starting the child *as* leader: the other replicas grant or refuse by the
+                // ordinary rules and ADR 0085's guard still decides who may win, so nothing here
+                // fabricates leadership. What it removes is the waiting.
+                //
+                // Only on the parent's leader, because two replicas campaigning at once is a split
+                // vote that costs another timeout — the thing this exists to avoid.
+                if self
+                    .regions
+                    .get(parent.id)
+                    .and_then(|state| state.peer().map(|peer| peer.is_leader()))
+                    .unwrap_or(false)
+                {
+                    // **The store's own runtime handle, not `tokio::spawn`.** This runs on the
+                    // parent's *driver* thread, which is a plain thread from `DriverPool` and not a
+                    // reactor worker — `tokio::spawn` there panics for want of a runtime context,
+                    // and a panic on the driver thread stops the region applying anything. The
+                    // first version of this did exactly that: the same load split twice instead of
+                    // a hundred and thirty times, and the writer got seventy-nine `08006`s because
+                    // the regions it wanted had stopped moving.
+                    //
+                    // Spawned rather than awaited because the child's driver is another thread:
+                    // awaiting here would have the parent's apply loop wait on the child's.
+                    if let Some(runtime) = &self.runtime {
+                        let child_peer = Arc::clone(&peer);
+                        let tick = raft.tick;
+                        runtime.spawn(async move {
+                            Self::campaign_the_child(&child_peer, tick).await;
+                        });
+                    }
+                }
                 RegionState::replicated(RegionMeta::new(child.clone()), peer, view)
             }
             _ => RegionState::unreplicated(RegionMeta::new(child.clone())),
         };
         self.regions.apply_split(parent.clone(), child_state)
+    }
+
+    /// Stands the child for election until somebody can vote for it
+    /// ([ADR 0094](../../../docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md)).
+    ///
+    /// **One campaign is not enough, and the reason is the shape of a split.** Every replica creates
+    /// the child when *it* applies the split entry, and the leader applies first — so a campaign fired
+    /// the instant the leader adopts its child reaches stores that do not serve that region yet, and a
+    /// Raft batch for a region a store does not serve is **dropped** rather than refused. The child
+    /// then waits out the timeout it was supposed to skip. Measured: campaigning once left the median
+    /// where it was, at 63 ms.
+    ///
+    /// So it asks again, briefly, and stops the moment there is a leader — which is also what makes it
+    /// safe to be wrong about: every attempt is an ordinary pre-vote, it changes no term when it fails,
+    /// and if none of them lands the region elects on its timeout exactly as it did before.
+    async fn campaign_the_child(peer: &Arc<RaftPeer>, tick: std::time::Duration) {
+        // A handful of ticks: long enough for the followers to have applied the same entry, far short
+        // of the election timeout this exists to beat.
+        for _ in 0..8 {
+            if peer.campaign().await.is_err() {
+                return;
+            }
+            tokio::time::sleep(tick).await;
+            match peer.status().await {
+                Ok(status) if status.leader.is_some() => return,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
     }
 
     /// Starts the task that reports to the placement driver.

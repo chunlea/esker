@@ -1583,7 +1583,6 @@ async fn where_a_bulk_load_into_a_splitting_table_breaks() {
 /// The number is a lower bound on the real window: the sampler learns of the child after the split
 /// has applied, so the leaderless time before that is invisible here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "an investigation: samples leadership while a table splits"]
 async fn how_long_a_split_child_has_no_leader() {
     let gate = Gate::start_splitting(8 * 1024).await;
     tokio::task::block_in_place(|| {
@@ -1674,12 +1673,32 @@ async fn how_long_a_split_child_has_no_leader() {
     let rows = loader.join().unwrap();
 
     let refusals = refusals.lock().map(|seen| seen.clone()).unwrap_or_default();
-    report(rows, gate.regions(), &mut led_after, &refusals);
+    let median = report(rows, gate.regions(), &mut led_after, &refusals);
     gate.stop().await;
+
+    assert!(
+        led_after.len() >= 20,
+        "only {} children were measured, so this asserts nothing",
+        led_after.len()
+    );
+    // **A quorum round trip, not an election timeout** — [ADR 0094]
+    // (../../../docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md). Before it: a median
+    // of 62 ms, p90 77, max 93, because every child waited out a timeout before anyone stood. After
+    // it the parent's leader campaigns its child at once and what is left is one round trip to a
+    // quorum, which is single digits in this harness.
+    //
+    // Thirty is chosen with a factor of two either side: half the measured *before*, and several
+    // times an in-process round trip. It is a threshold on the mechanism rather than a stopwatch on
+    // the box — a timeout and a round trip are an order of magnitude apart here.
+    assert!(
+        median < 30.0,
+        "a split child waited a median of {median:.0} ms for a leader, which is an election \
+         timeout and not a round trip"
+    );
 }
 
 /// The distribution and the refusals, lifted out of the test that takes them.
-fn report(rows: i64, regions: usize, led_after: &mut [f64], refusals: &[String]) {
+fn report(rows: i64, regions: usize, led_after: &mut [f64], refusals: &[String]) -> f64 {
     led_after.sort_by(f64::total_cmp);
     println!("\n  {rows} rows loaded, {regions} regions");
     println!(
@@ -1704,4 +1723,73 @@ fn report(rows: i64, regions: usize, led_after: &mut [f64], refusals: &[String])
     for (code, count) in kinds {
         println!("    {code} x{count}");
     }
+    if led_after.is_empty() {
+        0.0
+    } else {
+        led_after[(led_after.len() - 1) / 2]
+    }
+}
+
+/// **A bulk load into a table that splits fifty times is not refused because it split.**
+///
+/// [ADR 0094](../../../docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md)'s red test, in
+/// the shape that produces the failure: two hundred and fifty rows a statement, which met `40003`
+/// at 37 and at 76 regions where a fifty-row loader met none.
+///
+/// **What it asserts is the code and not the count.** A refusal that is `08006` — a client whose
+/// region cache is behind a split — is the routing repair working and is not this test's subject.
+/// A `40003` is *the outcome of this statement is unknown*, which a client cannot retry and a user
+/// cannot ignore, and a table splitting under its own load is not a reason to hand one out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "counts ambiguous outcomes across fifty splits; one run in three sees one"]
+async fn a_bulk_load_into_a_splitting_table_is_not_told_it_does_not_know() {
+    let gate = Gate::start_splitting(8 * 1024).await;
+    let ambiguous = tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, pad text)",
+        );
+        let mut ambiguous: Vec<String> = Vec::new();
+        let mut id = 1_i64;
+        while id < 6_000 && gate.regions() < 60 {
+            let values: Vec<String> = (id..id + 250)
+                .map(|n| format!("({n}, 'pad-{n}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')"))
+                .collect();
+            // `run`, not `settle`: the retry is what hides the answer this test is about.
+            if let Err(error) = session.run(&format!("INSERT INTO t VALUES {}", values.join(", ")))
+                && error.sqlstate() == esker_sql::sqlstate::STATEMENT_COMPLETION_UNKNOWN
+            {
+                ambiguous.push(format!(
+                    "at {} rows, {} regions: {error}",
+                    id,
+                    gate.regions()
+                ));
+            }
+            id += 250;
+        }
+        ambiguous
+    });
+    let regions = gate.regions();
+    gate.stop().await;
+
+    assert!(
+        regions >= 50,
+        "the table split only {regions} times, so this measured nothing"
+    );
+    // **Counted, not asserted, and the three rounds that decided it are the reason.** One of them
+    // was refused twice and two were not, so an assertion here would be a gate test that fails one
+    // run in three — and the message on those refusals is `region N *stopped leading* with this
+    // proposal in its log`, which is a peer that had leadership and lost it, not a child that never
+    // had one. ADR 0094 removes the second and says so: *"the `40003` is not removed, it is made
+    // rare"*. What it changes is measured by `how_long_a_split_child_has_no_leader`, which asserts.
+    println!(
+        "  {} ambiguous outcome(s) across {regions} splits{}",
+        ambiguous.len(),
+        if ambiguous.is_empty() {
+            String::new()
+        } else {
+            format!(":\n  {}", ambiguous.join("\n  "))
+        }
+    );
 }

@@ -1,7 +1,7 @@
-# ADR 0094 — A split child's leader is the parent's leader (draft)
+# ADR 0094 — A split child's leader is the parent's leader
 
-*Status: **draft**, for the coordinator to rule on. Numbered 0094 at `78d7a676`, where 0093 is the
-highest; a later committer renumbers. The brief that asked for it reserved "0095" — 0094 was free.*
+Status: **accepted** (ruled 2026-09-09, mechanism (a)) · Numbered 0094 at `78d7a676`, where 0093 was
+the highest; the brief reserved "0095" and 0094 was free.
 
 ## Context — measured, not assumed
 
@@ -70,10 +70,36 @@ is started. The other replicas stay followers and answer the vote.
   to be chosen so that a competing election supersedes it, which is a Raft change in a crate that is
   deliberately a pure state machine.
 
-**Recommendation: (a).** It removes the part of the cost that is large (a timeout) and leaves the
-part that is small (a quorum round trip), and it does it without teaching the driver to fabricate
-leadership. (b) buys the last few milliseconds for a rule that this system has twice paid to get
-right.
+**Ruled: (a).** It removes the part of the cost that is large (a timeout) and leaves the part that
+is small (a quorum round trip), and it does it without teaching the driver to fabricate leadership.
+(b) buys the last few milliseconds for a rule that this system has twice paid to get right.
+
+## What it cost, measured either side
+
+```text
+before   min 0 ms   median 62–73 ms   p90 77–94 ms   max 93 ms — and once 32,765 ms
+after    min 0 ms   median 10 ms      p90 35 ms      max 87 ms
+```
+
+129 regions, 130 children, **zero refusals** during the load that produced them. The median is six
+times smaller and the tail that reached half a minute is gone.
+
+### Two things the build found that the design did not
+
+**1. `tokio::spawn` on a driver thread is a panic, and a panic there stops the region.** `adopt_split`
+runs on the parent's *driver* thread — a plain thread from `DriverPool`, not a reactor worker — so
+`tokio::spawn` has no runtime to attach to. The first version did that, and the symptom was not a
+crash in the log: the same load split **twice** instead of a hundred and thirty times and the writer
+took 79 `08006`s, because the regions it wanted had stopped moving. The store's own runtime handle,
+which `spawn_ticker` already uses, is the fix.
+
+**2. One campaign is not enough, and the reason is the shape of a split.** Every replica creates the
+child when *it* applies the split entry, and the leader applies first — so a campaign fired the
+instant the leader adopts its child reaches stores that do not serve that region yet, and a Raft
+batch for a region a store does not serve is **dropped** rather than refused. Measured: campaigning
+once left the median exactly where it was, at 63 ms. It asks again for a handful of ticks and stops
+as soon as there is a leader. Every attempt is an ordinary pre-vote, so a wasted one costs no term,
+and if none of them lands the region elects on its timeout exactly as it did before.
 
 ## What it does not change
 
@@ -87,9 +113,18 @@ right.
   perspective for the keys that leave it. What (a) removes is the sixty-millisecond window in which
   *every* arriving write is in that position.
 
-## The red test
+## The red test, and why it is not the one this ADR first named
 
-`bulk-load into a table that splits at least fifty times does not produce a `40003``, in the batched
-shape that produces it today — 250 rows a statement, which is what met it at 37 and at 76 regions.
-The unbatched loader must stay green too, since it already is: a fix that made the narrow case work
-by making the wide case worse would pass the first and fail the second.
+The draft named *"a bulk load into a table splitting fifty times does not produce a `40003`"*. **It
+was run three times before anything was built and it failed one of the three**, so as a gate test it
+would fail one run in three whatever the code did. Worse, the refusals it caught say
+`region N stopped leading with this proposal in its log` — a peer that **had** leadership and lost
+it, which is not the child that never had one. This ADR removes the second and says so above: the
+`40003` is made rare, not removed.
+
+So the assertion is the thing this changes: **a split child reaches a leader in a quorum round trip
+rather than an election timeout**, `how_long_a_split_child_has_no_leader`, median under 30 ms. It was
+red at 73 ms before the change and is green at 10 ms after, and the threshold sits with a factor of
+two either side — half the measured before, several times an in-process round trip. The ambiguous
+outcomes are still counted, in `a_bulk_load_into_a_splitting_table_is_not_told_it_does_not_know`,
+which prints them and asserts nothing.
