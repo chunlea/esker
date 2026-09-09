@@ -1,0 +1,27 @@
+crates/esker-raft/src/raw_node.rs
+  s_dc640bf0df4adb::t_4b00d8fe5eb31a 173-178
+crates/esker-sql/tests/routing_differential.rs
+  s_dc640bf0df4adb::t_024104cd70f820 1676,1678-1697,1701,1726-1794
+crates/esker-store/src/peer.rs
+  s_dc640bf0df4adb::t_0c4c7d00cc3562 222-223,1142-1149,1524-1539
+crates/esker-store/src/server.rs
+  s_dc640bf0df4adb::t_0917719e899245 1092-1131,1139-1167
+docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md
+  s_dc640bf0df4adb::t_cc8f7865b25023 1,3-4,73-102,116-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f0581498c30b0a6510fb0fb8a5be94b7180d7c25",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
