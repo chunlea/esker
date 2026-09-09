@@ -1,0 +1,19 @@
+docs/plans/phase-16-mpp.md
+  s_dc640bf0df4adb::t_87f1708df77c3c 713-777,1212-1229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "c04f194297e4d0ec4fcda62bc76444178973f4af",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
