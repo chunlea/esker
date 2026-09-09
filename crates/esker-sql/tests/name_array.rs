@@ -61,11 +61,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // caller that asks the value instead. Closing it means resolving `pg_typeof` against the
         // declared type at plan time, where a scope exists — its own unit, and it would close the
         // `regtype`/`text` half (ADR 0077) at the same time.
-        (
-            "SELECT pg_typeof('{a,b}'::name[] || 'c'::name)",
-            "The same, through the array `||`.",
-            "pg19_name_array.txt:112",
-        ),
         // ----- two array functions this node does not have ---------------------------------------
         (
             "SELECT array_dims('{a,b}'::name[]), array_length('{a,b}'::name[], 1), \

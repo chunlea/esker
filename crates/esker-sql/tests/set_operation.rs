@@ -371,3 +371,85 @@ fn the_two_refusals_are_told_apart() {
         assert_eq!(error.to_string(), message, "{sql}");
     }
 }
+
+/// **The common type is PostgreSQL's rule, and it is asymmetric.**
+///
+/// `select_common_type` keeps the running candidate unless it is *not* its category's preferred
+/// type **and** it can be implicitly cast to the other while the other cannot be cast back. This
+/// crate had the rule and asked `is_preferred` of the left alone, so a right-hand preferred type
+/// never won; making it *symmetric* fixed fifteen shapes and broke two, which is how the shape
+/// came out.
+///
+/// **The pair that shows the asymmetry is `name` and `text`**, which cast implicitly **both**
+/// ways: neither displaces the other, so the arm that came **first** wins. A symmetric rule
+/// answers `text` for both, because `text` is preferred and it lets the right side win a tie the
+/// left had already taken. Measured on 19beta1, and the two orders are the whole test.
+#[test]
+fn the_arm_that_came_first_wins_a_tie_and_only_a_tie() {
+    let mut node = parity::Node::new(&[]);
+    // Both directions implicit: first wins, and it wins in *both* orders.
+    assert_eq!(
+        node.rows("SELECT pg_typeof(coalesce('a'::name, 'b'::text))"),
+        vec![vec!["name"]]
+    );
+    assert_eq!(
+        node.rows("SELECT pg_typeof(coalesce('a'::text, 'b'::name))"),
+        vec![vec!["text"]]
+    );
+    // And a `UNION` over the same pair answers the same way, because it is the same function.
+    assert_eq!(
+        node.rows(
+            "SELECT pg_typeof(v) FROM (SELECT 'a'::name AS v UNION ALL SELECT 'b'::text) t LIMIT 1"
+        ),
+        vec![vec!["name"]]
+    );
+}
+
+/// **Two rungs of the ladder are not what reasoning gives**, and both are measured.
+#[test]
+fn float4_sits_above_numeric_and_name_above_varchar() {
+    let mut node = parity::Node::new(&[]);
+    // `numeric -> float4` is implicit and `float4 -> numeric` is only an assignment, so the pair
+    // is `real` — **in both orders**, which is what says it is a property of the pair and not of
+    // which arm came first.
+    for statement in [
+        "SELECT pg_typeof(v) FROM (SELECT 1::numeric AS v UNION ALL SELECT 1::float4) t LIMIT 1",
+        "SELECT pg_typeof(v) FROM (SELECT 1::float4 AS v UNION ALL SELECT 1::numeric) t LIMIT 1",
+    ] {
+        assert_eq!(node.rows(statement), vec![vec!["real"]], "{statement}");
+    }
+    // `name` beats the other string types and loses to `text`; `varchar -> name` is implicit
+    // where `name -> varchar` is an assignment.
+    assert_eq!(
+        node.rows(
+            "SELECT pg_typeof(v) FROM (SELECT 'a'::varchar AS v UNION ALL SELECT 'b'::name) t \
+             LIMIT 1"
+        ),
+        vec![vec!["name"]]
+    );
+}
+
+/// **`GREATEST` and `LEAST` take the common type, not arithmetic's.**
+///
+/// They used `+`'s promotion, which is a right answer to a different question: `int2 + float4`
+/// really is a `double precision`, because adding them needs the wider float. `GREATEST` picks one
+/// of the values it was given, so it takes the type the pair resolves to.
+#[test]
+fn greatest_takes_the_common_type_and_not_the_wider_one() {
+    let mut node = parity::Node::new(&[]);
+    assert_eq!(
+        node.rows(
+            "SELECT pg_typeof(GREATEST(1::int2, 1::float4)), pg_typeof(LEAST(1::int2, 1::float4))"
+        ),
+        vec![vec!["real", "real"]]
+    );
+    assert_eq!(
+        node.rows("SELECT pg_typeof(GREATEST(1::numeric, 1::float4))"),
+        vec![vec!["real"]]
+    );
+    // The values are unchanged, which is what makes this a declared type and not an answer.
+    assert_eq!(
+        node.rows("SELECT GREATEST(1::int2, 2::float4), LEAST(1::int2, 2::float4)"),
+        vec![vec!["2", "1"]]
+    );
+}

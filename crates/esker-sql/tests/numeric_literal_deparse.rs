@@ -21,21 +21,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[(
-        "SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nd'::regclass ORDER BY a.attnum",
-        "**One of nine, and after #24 the only one: the *spelling*, not the form.** \
-         `DEFAULT -1::bigint` is `(- (1)::bigint)` on a real server — `::` binds tighter than \
-         unary minus, so it is an operator over a cast, not a cast over a negative constant — and \
-         `(-1::BIGINT)` here, the expression as written with the type name upper-cased. \
-         `debts-v1.1.md` #24 closed the other two shapes in this row: `DEFAULT (-1)::bigint` is \
-         `('-1'::integer)::bigint` in both now, and so is `DEFAULT (-1.5)::double precision`. \
-         What is left is not a printer gap. Both spellings fold to the same constant here, so \
-         after lowering there is nothing to tell them apart and the printer would have to invent \
-         one; keeping the unary minus as a node is a change to what the plan holds. Measured over \
-         four target types in `tests/corpus/pg19_negative_constant.txt`, whose `u_*` rows are \
-         this shape, and #24's row carries it.",
-        "pg19_numeric_literal_deparse.txt:83",
-    )],
+    // **Empty.** The last entry was the *spelling* `DEFAULT -1::bigint`, which a real server
+    // prints `(- (1)::bigint)` — `::` binds tighter than unary minus, so it is an operator over a
+    // cast — and which this node printed as written. The plan held the difference all along;
+    // what printed the two alike was `Negate` sitting on `reprinted_by_pg_get_expr`'s "nothing to
+    // reprint" list, on a reason true of `DEFAULT - 1` and false of this one
+    // (`debts-v1.1.md` #30).
+    answers: &[],
 };
 
 #[test]

@@ -40,3 +40,11 @@ SELECT 'r', pg_typeof(c.conkey[1]), pg_typeof(i.indkey[0]) FROM pg_constraint c,
 SELECT 'r', generate_subscripts(conkey, 1) FROM pg_constraint WHERE conname = 'vt_pkey'	text,integer	r|1 ; r|2
 SELECT 'r', generate_subscripts(indkey, 1) FROM pg_index WHERE indexrelid = 'vt_ab'::regclass	text,integer	r|0 ; r|1
 SELECT 'r', a.attname FROM (SELECT idx, c.conkey[idx] AS elem FROM pg_constraint c, generate_subscripts(c.conkey, 1) AS idx WHERE c.conname = 'vt_pkey') k JOIN pg_attribute a ON a.attnum = k.elem AND a.attrelid = 'vt'::regclass ORDER BY idx	text,name	r|a ; r|b
+SELECT 'r', pg_typeof(indkey), pg_typeof(indkey[0]), pg_typeof(indoption) FROM pg_index WHERE indexrelid = 'vt_ab'::regclass	text,regtype,regtype,regtype	r|int2vector|smallint|int2vector
+SELECT 'r', array_position(indkey, 1::int2), array_position(indkey, 2::int2) FROM pg_index WHERE indexrelid = 'vt_ab'::regclass	text,integer,integer	r|0|1
+SELECT 'r', '23 25'::oidvector, ('23 25'::oidvector)[0], pg_typeof('23 25'::oidvector)	text,oidvector,oid,regtype	r|23 25|23|oidvector
+SELECT 'r', '23  25'::oidvector	text,oidvector	r|23 25
+SELECT 'r', ''::oidvector, ''::int2vector	text,oidvector,int2vector	r||
+SELECT 'r', 'abc'::oidvector	!22P02 invalid input syntax for type oid: "abc"
+SELECT 'r', 'abc'::int2vector	!22P02 invalid input syntax for type smallint: "abc"
+SELECT 'r', oid, typname, typlen, typtype, typcategory, typdelim, typinput, typelem, typarray FROM pg_type WHERE typname IN ('int2vector','oidvector') ORDER BY oid	text,oid,name,smallint,"char","char","char",regproc,oid,oid	r|22|int2vector|-1|b|A|,|int2vectorin|21|1006 ; r|30|oidvector|-1|b|A|,|oidvectorin|26|1013

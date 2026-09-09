@@ -2147,7 +2147,7 @@ fn pg_depend_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
 ///
 /// `(castsource, casttarget, castcontext, castmethod)`. `castcontext` is `e` explicit, `a`
 /// assignment, `i` implicit; `castmethod` is `f` a function, `b` binary-coercible, `i` I/O.
-pub const CASTS: [(i64, i64, &str, &str); 113] = [
+pub const CASTS: [(i64, i64, &str, &str); 115] = [
     // **`regclass`'s nine rows, measured** rather than reasoned: `SELECT castsource, casttarget,
     // castcontext, castmethod FROM pg_cast WHERE castsource = 2205 OR casttarget = 2205`. Six
     // types reach a `regclass` implicitly and three leave it — `regclass -> bigint` and
@@ -2162,6 +2162,12 @@ pub const CASTS: [(i64, i64, &str, &str); 113] = [
     (2205, 20, "a", "f"),
     (2205, 23, "a", "b"),
     (2205, 26, "i", "b"),
+    // **`regtype` and `oid` are one representation too**, implicit both ways and by
+    // reinterpretation — measured, the same pair `regproc` has (ADR 0098). It is what makes
+    // `t::regtype::oid` the 23 a real server answers; the *literal* spelling
+    // `'int4'::regtype::oid` was folded at parse time and never asked `pg_cast`.
+    (2206, 26, "i", "b"),
+    (26, 2206, "i", "b"),
     (16, 23, "e", "f"),
     (16, 25, "a", "f"),
     (16, 1042, "a", "f"),

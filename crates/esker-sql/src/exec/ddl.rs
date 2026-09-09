@@ -5926,6 +5926,17 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
         // coercion they took. These are the shapes the corpus measured a difference on.
         Expr::Arithmetic { .. }
         | Expr::Binary { .. }
+        // **A `Negate` that survives lowering was written**, so it belongs with the operators.
+        // It used to be on the "nothing to reprint" list below, with the reason that a folded
+        // negative literal is stored as a *value* — `DEFAULT - 1` is the `Datum` `-1` and no
+        // `Negate` node reaches here at all. True, and not the whole list: `::` binds tighter than
+        // unary minus, so `DEFAULT -1::bigint` is an operator **over a cast** and does keep its
+        // node. PostgreSQL prints it `(- (1)::bigint)`, and the operand — an `int8` holding a
+        // value that fits an `int4`, so it can only have come from a cast — already prints
+        // `(1)::bigint` through [`numeric_constant`]. Exactly the correction `Literal` got one
+        // revision earlier, for the same reason: true of the value, false of the text
+        // (`debts-v1.1.md` #30).
+        | Expr::Negate(_)
         | Expr::Not(_)
         | Expr::IsNull { .. }
         | Expr::Like { .. }
@@ -5992,13 +6003,7 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
         | Expr::CurrentDatabase
         | Expr::CurrentSetting { .. }
         | Expr::Advisory { .. }
-        // *There is nothing to reprint.* A folded negative literal is stored as a **value** —
-        // `DEFAULT - 1` is the `Datum` `-1` — which is why `Negate` is here and not above with
-        // the operators. `Literal` used to be on this line with it, on the reasoning that a bare
-        // literal never reaches here either; that is true of the *value* and false of the text,
-        // because `parse::fold_column_default` keeps the unfolded expression beside the folded
-        // datum and `deparse_default` reads that. See the numeric arm below.
-        | Expr::Negate(_)
+        // *There is nothing to reprint.*
         | Expr::Array { .. }
         | Expr::Subscript { .. }
         // *It cannot be written in a `DEFAULT` at all.* A column reference, a subquery and a
