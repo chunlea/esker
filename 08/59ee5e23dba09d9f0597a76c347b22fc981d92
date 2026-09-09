@@ -1,0 +1,23 @@
+crates/esker-sql/tests/routing_differential.rs
+  s_2d916f5f540186::t_d69a180518a6b5 1573-1707
+docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md
+  s_2d916f5f540186::t_f7d70c9cd8450c 1-95
+docs/plans/split-region.md
+  s_2d916f5f540186::t_5d707a1e0c6bd2 233-263
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "0859ee5e23dba09d9f0597a76c347b22fc981d92",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
