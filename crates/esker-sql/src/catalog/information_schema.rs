@@ -340,10 +340,61 @@ pub fn columns(txn: &dyn Txn, tenant: u64, rendering: Rendering) -> Result<Vec<V
                             |def| super::split_qualified(&def.name).0.to_owned(),
                         ),
                 ),
+                collation_catalog(column),
+                collation_schema(column),
+                collation_name(column),
             ]);
         }
     }
     Ok(rows)
+}
+
+/// `collation_catalog`, `collation_schema` and `collation_name` — **three columns, one question.**
+///
+/// All three are NULL together and non-NULL together, and the condition is "did this column ask
+/// for a collation", which [`ColumnDef::collation`] records as `Some`. Measured on 19beta1 over
+/// five columns of one table:
+///
+/// ```text
+/// a text                        attcollation 100 (default)   NULL   NULL         NULL
+/// b text COLLATE "C"                         950             esker  pg_catalog   C
+/// c integer                                    0             NULL   NULL         NULL
+/// d varchar(10) COLLATE "POSIX"               951             esker  pg_catalog   POSIX
+/// e char(3)                                  100 (default)   NULL   NULL         NULL
+/// ```
+///
+/// Three functions rather than one returning a triple, because the row above reads left to right
+/// and a triple would have to be destructured in the middle of it — and split out of
+/// [`columns`] at all because three inline `match`es took that function past the hundred-line
+/// lint, which is a fair thing for the lint to have said.
+fn collation_catalog(column: &ColumnDef) -> Datum {
+    match &column.collation {
+        // The one database this node has, and the same string `pg_database.datname` carries, so a
+        // client that joins the two gets a match whatever it connected as.
+        Some(_) => Datum::Text(crate::parse::DATABASE_NAME.to_owned()),
+        None => Datum::Null,
+    }
+}
+
+/// The schema `C` and `POSIX` live in, which is where PostgreSQL puts them too.
+///
+/// See [`collation_catalog`] for the measurement all three share.
+fn collation_schema(column: &ColumnDef) -> Datum {
+    match &column.collation {
+        Some(_) => Datum::Text(PG_CATALOG_SCHEMA.to_owned()),
+        None => Datum::Null,
+    }
+}
+
+/// The collation the column was declared with — `C` or `POSIX`
+/// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+///
+/// See [`collation_catalog`] for the measurement all three share.
+fn collation_name(column: &ColumnDef) -> Datum {
+    match &column.collation {
+        Some(name) => Datum::Text(name.clone()),
+        None => Datum::Null,
+    }
 }
 
 /// Every `information_schema.table_constraints` row, out of `pg_constraint`.
@@ -589,6 +640,27 @@ pub const COLUMNS_COLUMNS: &[(&str, ColumnType, i32)] = &[
     // type's. A client that qualifies a type name reads it, and asking for a column this view
     // does not have is `42703`.
     ("udt_schema", ColumnType::Name, NO_LENGTH),
+    // **Last again, and the three are one family**: the collation a column was *declared* with,
+    // and nothing when it takes its type's. Measured on 19beta1 — five columns, one table:
+    //
+    // ```text
+    // a text                     attcollation 100 (default)   NULL         NULL          NULL
+    // b text COLLATE "C"                      950             esker    pg_catalog   C
+    // c integer                                 0             NULL         NULL          NULL
+    // d varchar(10) COLLATE "POSIX"           951             esker    pg_catalog   POSIX
+    // e char(3)                               100 (default)   NULL         NULL          NULL
+    // ```
+    //
+    // So all three are NULL together, and they are non-NULL exactly when the column asked for a
+    // collation — the same condition `pg_attribute.attcollation <> typcollation` names, which is
+    // what `ActiveRecord` already reads and what `catalog::ColumnDef::collation` records.
+    // `collation_schema` is `pg_catalog` because that is where `C` and `POSIX` live
+    // ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)), and
+    // `collation_catalog` is the database name — `crate::parse::DATABASE_NAME`, the same string
+    // `pg_database.datname` carries, so the two agree whatever a client connected as.
+    ("collation_catalog", ColumnType::Name, NO_LENGTH),
+    ("collation_schema", ColumnType::Name, NO_LENGTH),
+    ("collation_name", ColumnType::Name, NO_LENGTH),
 ];
 
 /// The columns of `information_schema.table_constraints`, in the standard's order.

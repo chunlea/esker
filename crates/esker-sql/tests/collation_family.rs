@@ -70,7 +70,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ),
         (
             "ALTER TABLE g1co ADD COLUMN gc_md5_lit text GENERATED ALWAYS AS (md5('a')) STORED",
-            "**A wrong refusal, and the message may be naming the wrong thing.** PostgreSQL accepts `GENERATED ALWAYS AS (md5('a'))` -- `md5` is `provolatile = 'i'`, measured off `pg_proc` -- and this node answers `42P17 functions in index expression must be marked IMMUTABLE` for a *generated column*. `md5` appears nowhere in this crate's source, so the honest reading is that an unknown function reaches the immutability guard and is refused there instead of being named `0A000 the function md5`, which is what every other missing function gets. Not a collation matter: a refusal on a statement a real server runs, and it wants one grep by whoever takes it.",
+            "**A function this node does not have, named.** PostgreSQL accepts `GENERATED ALWAYS AS (md5('a'))` -- `md5` is `provolatile = 'i'`, measured off `pg_proc` -- and this node answers `0A000 the function md5 is not supported`, the same refusal the query path gives for the same name. It used to answer `42P17 functions in index expression must be marked IMMUTABLE`, which was a true sentence about a false premise: `md5` appears nowhere in this crate, so what was wrong was the *reason* and not the refusal. `docs/plans/debts-v1.1.md` #26, and the record of why it had been left that way is kept in `tests/index_expression_volatility.rs`. The suite never sends `md5` -- 0 occurrences in the captured statements, censused -- so implementing it would be building what nothing asks for, which is the C2 contract's own reasoning.",
             "pg19_collation_family.txt:117",
         ),
         (
@@ -122,11 +122,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', (u COLLATE \"C\") < (t COLLATE \"POSIX\") FROM g1co",
             "**The other half of the same absence: two explicit collations that disagree.** PostgreSQL answers `42P21 collation mismatch between explicit collations` -- a different sqlstate from the indeterminate case, because this one is over-determined rather than under-determined -- and this node compares the two columns and answers. Both collations it has order by byte (ADR 0076), so the answer is the answer either would give; what is missing is the refusal. Its own line because it is a second sqlstate to implement.",
             "pg19_collation_family.txt:179",
-        ),
-        (
-            "SELECT 'r', collation_name FROM information_schema.columns WHERE table_name = 'g1co' AND column_name = 'u'",
-            "**`information_schema.columns` has no `collation_name` column here**, so reading it is `42703` where a real server answers `C` for a column declared `COLLATE \"C\"`. A catalog gap rather than a collation one, and the only row of this corpus a client could hit without writing a stored expression.",
-            "pg19_collation_family.txt:182",
         ),
     ],
 };
