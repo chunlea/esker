@@ -18,6 +18,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `pg_typeof` answers a `regtype` on a real server and `text` here — the same trade
     // `'x'::regtype` makes, and the same characters either way. The row agrees.
     types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT 'r', ARRAY(SELECT 1)::int8[], pg_typeof(ARRAY(SELECT 1)::int8[])",
+        "SELECT 'r', ARRAY(SELECT NULL::int4), ARRAY(SELECT x FROM (VALUES (1),(NULL),(3)) AS t(x))",
         // Surfaced with the two below it when the runtime cast stopped aborting this file. The
         // rows agree; what differs is the standing integer-width trade — a small constant is
         // `integer` on a real server and `bigint` here — seen through `ARRAY(VALUES …)`.
@@ -55,11 +61,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // for a **per-row** cast — a cast of anything but a constant has only `text` as a target —
         // and not something about arrays: `ARRAY(SELECT 1)` itself answers on the line above.
         (
-            "SELECT 'r', ARRAY(SELECT 1)::int8[], pg_typeof(ARRAY(SELECT 1)::int8[])",
-            "a cast of a non-constant expression has only `text` as a target here, whatever the type",
-            "pg19_array_subquery.txt:73",
-        ),
-        (
             "SELECT 'r', ARRAY(SELECT 1), pg_typeof(ARRAY(SELECT 1))",
             "**The rows agree and the constant's width does not.** `ARRAY(SELECT 1)` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here (`tests/unknown_literal.rs`); `generate_series`' column follows its arguments, so it inherits the same difference. `pg_typeof` reports `regtype` there and `text` here, which is the trade `'x'::regtype` already makes. Every value is identical.",
             "pg19_array_subquery.txt:63",
@@ -73,11 +74,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', ARRAY(SELECT 1 WHERE false), pg_typeof(ARRAY(SELECT 1 WHERE false))",
             "**The rows agree and the constant's width does not.** `ARRAY(SELECT 1)` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here (`tests/unknown_literal.rs`); `generate_series`' column follows its arguments, so it inherits the same difference. `pg_typeof` reports `regtype` there and `text` here, which is the trade `'x'::regtype` already makes. Every value is identical.",
             "pg19_array_subquery.txt:66",
-        ),
-        (
-            "SELECT 'r', ARRAY(SELECT NULL::int4), ARRAY(SELECT x FROM (VALUES (1),(NULL),(3)) AS t(x))",
-            "**`VALUES` as a query** — a relation made of constant rows — which this node does not have in either spelling: as a derived table (`(VALUES …) AS t(x)`) or as the argument of this constructor. It is a feature of its own and not an array one, and it is the **last blocker on this corpus**: the capture runs inside one transaction, so the statements after these two are swallowed by the abort rather than checked. What they cover is asserted directly in this file instead, so nothing here rests on a statement that did not run.",
-            "pg19_array_subquery.txt:69",
         ),
     ],
 };

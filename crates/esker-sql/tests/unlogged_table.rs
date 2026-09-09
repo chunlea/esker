@@ -28,8 +28,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', relname, relpersistence FROM pg_class WHERE relname = 'fk_unlogged_to_unlogged'",
         // `information_schema`'s own domains again: `name` and `character varying` where this node
         // says `text`, with identical characters.
-        "SELECT 'r', table_name, table_type FROM information_schema.tables WHERE table_name IN \
-         ('unlogged_probe','logged_probe') ORDER BY table_name",
     ],
     answers: &[
         // **A temporary table is a different feature, not a kind of unlogged one**, and this file

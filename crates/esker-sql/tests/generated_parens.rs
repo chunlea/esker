@@ -31,13 +31,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // declares `text` for it. The rows agree to the character; only the declared type differs, and
     // it is the same family as `sql_identifier` and `name` (b4's type unit). The two rows below
     // that also disagree about the *value* carry the same type difference inside their own reason.
-    types: &[
-        "SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_plus'",
-        "SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_col'",
-        "SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_now'",
-        "SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_bool'",
-        "SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_cast'",
-    ],
+    types: &[],
     answers: &[
         (
             "SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_nested'",

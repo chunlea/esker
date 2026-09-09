@@ -14,9 +14,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // The standing `pg_catalog` trade: `attname` and `column_name` are `name` on a real server and
     // `column_default` is a `character varying`; all three are `text` here. **Every row agrees**,
     // `gen_random_uuid()` and `uuid_generate_v4()` printed byte for byte.
-    types: &[
-        "SELECT column_name, column_default FROM information_schema.columns WHERE table_name = 'du' ORDER BY ordinal_position",
-    ],
+    types: &[],
     answers: &[],
 };
 

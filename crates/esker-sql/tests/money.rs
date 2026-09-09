@@ -23,9 +23,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT 'r', typname, typlen, typcategory, typinput FROM pg_type WHERE typname IN \
          ('money','_money') ORDER BY typname",
-        "SELECT 'r', column_name, data_type, udt_name, numeric_precision, numeric_scale, \
-         column_default FROM information_schema.columns WHERE table_name = 'm' ORDER BY \
-         ordinal_position",
         "SELECT 'r', '150.55'::money::text, pg_typeof('150.55'::money)",
         "SELECT 'r', '6.00'::money / '2.00'::money, pg_typeof('6.00'::money / '2.00'::money)",
         "SELECT 'r', '567.89'::money::numeric, pg_typeof('567.89'::money::numeric)",

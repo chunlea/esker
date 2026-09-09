@@ -11,27 +11,21 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[],
+    types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT CASE WHEN true THEN 1 ELSE 1/0 END",
+        "SELECT CASE WHEN false THEN 1/0 ELSE 2 END",
+    ],
     // Three, and all three are the same missing feature: this node has **no arithmetic
     // operators**, so `1/0` — the only expression PostgreSQL can be made to raise from inside an
     // unreached branch — is `0A000` naming `/` before the `CASE` is reached at all. The lines are
     // kept rather than dropped because they are the oracle's own proof that a `CASE`
     // short-circuits, and the property they prove is asserted against this node in
     // `only_the_chosen_branch_is_evaluated` with the per-row error it does have.
-    answers: &[
-        (
-            "SELECT CASE WHEN true THEN 1 ELSE 1/0 END",
-            "PostgreSQL answers 1: the ELSE is not evaluated. This node has no `/` operator, so \
-             the statement stops at `0A000 the operator / is not supported` — the short-circuit \
-             is not what is missing",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT CASE WHEN false THEN 1/0 ELSE 2 END",
-            "The mirror of the line above, and the same refusal for the same reason",
-            "UNMEASURED",
-        ),
-    ],
+    answers: &[],
 };
 
 #[test]

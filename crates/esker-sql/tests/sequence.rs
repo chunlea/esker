@@ -26,17 +26,19 @@ const DIVERGENCES: &[(&str, &str, &str)] = &[
     // absorbed silently.
     // `smallserial` was here too, and went with `int2`. Both serial entries are gone: a serial
     // is not a type, and each was refused only while its integer was missing.
-    (
-        concat!(
-            "SELECT column_name, is_nullable FROM information_schema.columns ",
-            "WHERE table_name = 'z2' ORDER BY ordinal_position"
-        ),
-        "information_schema is unit 5. Captured here because it is how a client asks whether the \
-         identity column came out NOT NULL, and the answer is worth having on file before the \
-         unit that serves it",
-        "UNMEASURED",
-    ),
 ];
+
+/// **Moved out of `DIVERGENCES` by parity rule 4**: the rows agree and one typmod does not.
+///
+/// It was declared because `information_schema` was a later unit than this corpus — "the answer is
+/// worth having on file before the unit that serves it" — and that unit landed. What is left is
+/// `is_nullable`: it is `yes_or_no` on a real server, a domain over **`character varying(3)`**,
+/// and this node's catalog column list carries a type and no typmod, so it declares
+/// `character varying`. The base type is right and the length is not there to declare.
+const TYPE_DIVERGENCES: &[&str] = &[concat!(
+    "SELECT column_name, is_nullable FROM information_schema.columns ",
+    "WHERE table_name = 'z2' ORDER BY ordinal_position"
+)];
 
 #[test]
 fn every_sequence_statement_answers_the_way_postgresql_19_does() {
@@ -44,7 +46,7 @@ fn every_sequence_statement_answers_the_way_postgresql_19_does() {
         include_str!("corpus/pg19_sequence.txt"),
         FIXTURE,
         &parity::Divergences {
-            types: &[],
+            types: TYPE_DIVERGENCES,
             answers: DIVERGENCES,
         },
     );

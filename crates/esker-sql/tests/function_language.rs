@@ -25,9 +25,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `lanname` and `proname` are `name` on a real server and `text` here, with identical
     // characters — the standing trade every `pg_catalog` column makes.
-    types: &[
-        "SELECT 'r', column_name, column_default FROM information_schema.columns WHERE table_name = 'fl_t' AND column_name = 'id'",
-    ],
+    types: &[],
     answers: &[
         (
             "CREATE FUNCTION fl_c() RETURNS integer AS 'x', 'y' LANGUAGE c",

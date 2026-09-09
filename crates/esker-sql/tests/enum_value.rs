@@ -25,10 +25,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // and the rows are identical. Nothing to do with enums — the `USER-DEFINED` and the `udt_name`
     // in those rows are what this unit is about, and both agree.
     types: &[
-        "SELECT 'r', column_name, data_type, udt_name FROM information_schema.columns WHERE \
-         table_name = 'postgresql_enums' ORDER BY ordinal_position",
-        "SELECT 'r', column_name, column_default FROM information_schema.columns WHERE table_name \
-         = 'postgresql_enums' AND column_name = 'good_mood'",
         // **`ActiveRecord`'s own `enum_types()` query, and the rows agree now**: `pg_enum` is a
         // view over the type records, so the labels come back in declaration order with
         // `enumsortorder` 1, 2, 3. What is left is the same trade one line up — `typname` and

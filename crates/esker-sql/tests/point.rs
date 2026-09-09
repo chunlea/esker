@@ -14,15 +14,11 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog type trade: `column_name` is a `name` on a real server and the two
-    // `information_schema` columns beside it are its own domains, all three `text` here. **Every
-    // value agrees**, and the values are what this line is for — `data_type` and `udt_name` both
-    // say `point`, and the two defaults come back as `'(12.2,13.3)'::point`, which is what the
-    // schema dumper reads.
+    // **The `information_schema` line that used to be here is gone**: `column_name` took `name`
+    // and `data_type`, `column_default` and `udt_name` took `character varying`, which is what
+    // `character_data` is on the wire — so the row agrees whole and the entry is deleted (ADR 0031
+    // rule 2). What stays below is `pg_typeof`, which is a `regtype` there and `text` here.
     types: &[
-        "SELECT 'r', column_name, column_default, data_type, udt_name FROM \
-         information_schema.columns WHERE table_name = 'postgresql_points' ORDER BY \
-         ordinal_position",
         // `pg_typeof` answers a `regtype` there and `text` here — the trade `'x'::regtype`
         // already makes — and the values are `point` and `point[]`, which is what these two ask.
         "SELECT 'r', pg_typeof('(1,2)'::point), '(1,2)'::point::text",

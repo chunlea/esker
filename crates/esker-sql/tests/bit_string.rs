@@ -24,7 +24,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // cast pads on the right (`10100000`) and truncates (`1010`, `101`) exactly as measured.
     types: &[
         "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type WHERE typname IN ('bit','varbit','_bit','_varbit') ORDER BY typname",
-        "SELECT 'r', column_name, data_type, udt_name, character_maximum_length, column_default FROM information_schema.columns WHERE table_name = 'b' ORDER BY ordinal_position",
         "SELECT 'r', '101'::bit(3), '101'::bit varying(5)",
         "SELECT 'r', pg_typeof('101'::bit(3)), pg_typeof('101'::bit varying(5))",
         "SELECT 'r', '{101,010}'::bit(3)[], pg_typeof('{101}'::bit(3)[])",
@@ -47,8 +46,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // and `text` here. **Every value agrees** — including `'00000011'::"bit"` and
         // `'0011'::"bit"`, which is the quoted spelling a real server prints for a `B'…'` default
         // even on a `bit varying` column, and `bit(1)` for the bare `another_bit`.
-        "SELECT 'r', column_name, data_type, character_maximum_length, column_default FROM \
-         information_schema.columns WHERE table_name = 'bl' ORDER BY ordinal_position",
     ],
     answers: &[
         // **`integer -> bit` is a cast and not a reading of the digits.** `5::int4::bit(8)` is

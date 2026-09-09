@@ -18,7 +18,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[],
+    types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT 'r', current_user, session_user",
+    ],
     answers: &[
         (
             "SET LOCAL search_path TO 'ss_two'",
@@ -38,15 +44,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              sentence differs — PostgreSQL's parser says `syntax error at or near \"search_path\"` \
              and `sqlparser` 0.62.0 lists the tokens it expected.",
             "pg19_set_session.txt:53",
-        ),
-        (
-            "SELECT 'r', current_user, session_user",
-            "`current_user` and `session_user` are `0A000` by name: **this node has no roles at \
-             all**, so there is no user for them to answer with and inventing one would be a name \
-             nobody created. It is the same absence `SET SESSION AUTHORIZATION` reports below and \
-             the same one `CREATE DATABASE … OWNER` reports, and the feature that closes all three \
-             is `CREATE USER` — which is what `schema_authorization_test.rb` actually needs.",
-            "pg19_set_session.txt:56",
         ),
         (
             "SET SESSION AUTHORIZATION esker",

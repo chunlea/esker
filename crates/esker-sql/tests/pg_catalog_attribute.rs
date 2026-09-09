@@ -26,6 +26,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // (`tests/pg_catalog.rs`). **`attnum` is an `int2` and `atttypmod` an `int4` on both**, which
     // is two fewer than `pg_class` needed.
     types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT attname, attcollation FROM pg_attribute WHERE attrelid = 'cb'::regclass AND attnum IN (1, 3) ORDER BY attnum",
+        "SELECT typname, typcollation FROM pg_type WHERE typname IN ('int8', 'text') ORDER BY typname",
         "SELECT attname, attnum, attnotnull, atthasdef, atttypmod, attisdropped, attidentity, attgenerated FROM pg_attribute WHERE attrelid = 'ca'::regclass AND attnum > 0 ORDER BY attnum",
         "SELECT attname, atttypid, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'ca'::regclass AND attnum > 0 ORDER BY attnum",
         "SELECT attname, attnum, attnotnull, atthasdef, atttypmod, attidentity FROM pg_attribute WHERE attrelid = 'cb'::regclass AND attnum > 0 ORDER BY attnum",
@@ -37,31 +43,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT attname, attcollation FROM pg_attribute WHERE attrelid = 'cb'::regclass AND attnum IN (1, 3) ORDER BY attnum",
         "SELECT typname, typcollation FROM pg_type WHERE typname IN ('int8', 'text') ORDER BY typname",
     ],
-    answers: &[
-        (
-            "SELECT attname, attcollation FROM pg_attribute WHERE attrelid = 'cb'::regclass AND attnum IN (1, 3) ORDER BY attnum",
-            "**every `attcollation` here is 0**, where a real server says `100` for a `text` \
-             column and `0` for an `int8` one. `pg_type.typcollation` says the same on both sides \
-             — 0 for every type here, 100 for the string types there — which is what makes the \
-             *comparison* `ActiveRecord` writes agree: `a.attcollation <> t.typcollation` is \
-             false for every column on both servers, so `collname` is NULL on both. This node has \
-             no collation feature at all, so there is no id to report and none to compare.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT typname, typcollation FROM pg_type WHERE typname IN ('int8', 'text') ORDER BY typname",
-            "the other half of the same fact, at the type rather than the column.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT count(*) FROM pg_collation",
-            "**`pg_collation` is empty**, where a real server has 880 rows. The argument \
+    answers: &[(
+        "SELECT count(*) FROM pg_collation",
+        "**`pg_collation` is empty**, where a real server has 880 rows. The argument \
              `pg_range` makes: a collation is a feature this node does not have, so listing \
              PostgreSQL's would tell a client it could ask for one. What makes the emptiness safe \
              is above — the join that reads it never matches on a real server either.",
-            "UNMEASURED",
-        ),
-    ],
+        "UNMEASURED",
+    )],
 };
 
 #[test]
