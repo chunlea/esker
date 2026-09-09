@@ -322,8 +322,14 @@ impl Group {
                 }
                 self.round();
             }
+            // **The flag, not `is_finished`.** The worker sets `done` and *then* returns, so
+            // between those two there is a window in which the call has been answered and the
+            // thread has not been scheduled to finish — microseconds on an idle box, and long
+            // enough to fail this assertion on a gate running at load 8. What the assertion is
+            // about is whether the call returned, which is exactly what `done` says, and `done`
+            // being set is also the proof that joining below cannot hang.
             assert!(
-                worker.is_finished(),
+                done.load(std::sync::atomic::Ordering::SeqCst),
                 "{what} never returned, and joining it now would hang; the members believe {:?}",
                 self.beliefs()
             );
