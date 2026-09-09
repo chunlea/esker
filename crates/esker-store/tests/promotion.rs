@@ -487,6 +487,7 @@ async fn no_core_disagrees_for_long(
     all: &[&Node],
     region: &Region,
     since: &mut BTreeMap<(u64, u64), Instant>,
+    longest: &mut Duration,
 ) {
     for node in all {
         let Some(peer) = node.store.peer_of(region.id) else {
@@ -516,8 +517,13 @@ async fn no_core_disagrees_for_long(
                     recorded.role,
                     conf.voters
                 );
-            } else {
-                since.remove(&key);
+            } else if let Some(started) = since.remove(&key) {
+                // **The window, as it really was.** `DISAGREEMENT_ALLOWED` was chosen as a
+                // generous bound — "250 heartbeats is not a window" — and never measured. This is
+                // where the measurement is available: the disagreement has just cleared, so its
+                // duration is known exactly, and the longest one a run sees is the upper bound
+                // the constant should be justified against.
+                *longest = (*longest).max(started.elapsed());
             }
         }
     }
@@ -643,6 +649,7 @@ async fn watch_until_every_learner_votes(
         .collect();
     let mut first_seen: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
     let mut disagreeing: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
+    let mut longest_disagreement = Duration::ZERO;
     let mut promoted: BTreeSet<(u64, u64)> = BTreeSet::new();
     // Whether the load was still in flight when the cluster started to grow, so that "under
     // load" is checked rather than hoped for. Sampled at the first learner, and at the window's
@@ -675,7 +682,8 @@ async fn watch_until_every_learner_votes(
             // Checked on every pass rather than at a deadline, because the divergence is a *state*
             // and not a delay — the fault this test was opened for arrives as a stall, and that is
             // exactly the thirty-second detour this avoids.
-            no_core_disagrees_for_long(all, &region, &mut disagreeing).await;
+            no_core_disagrees_for_long(all, &region, &mut disagreeing, &mut longest_disagreement)
+                .await;
             for peer in &region.peers {
                 let id = (region.id, peer.peer_id);
                 if peer.store_id != 1 {
@@ -822,6 +830,7 @@ async fn watch_until_every_learner_votes(
             // about a term that climbs through pre-vote rounds, and a run that *passes* is where
             // the evidence for "it does not any more" has to come from: a failure prints these
             // already, and ten green runs that printed nothing would say only that nothing stalled.
+            eprintln!("longest core/driver role disagreement this run: {longest_disagreement:?}");
             for id in pd_regions(pd).iter().map(|region| region.id) {
                 eprintln!(
                     "promotion settled: region {id}: {}",
