@@ -23,21 +23,18 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `column_name` is a `name` there and `is_generated` a `character varying(3)`; both are `text`
     // here, with identical characters — the standing `information_schema` trade.
-    types: &[
-        "SELECT column_name, is_generated, generation_expression, column_default FROM information_schema.columns WHERE table_name = 'vg' ORDER BY ordinal_position;",
-    ],
+    // **This list is empty and that is the finding.** It held one entry: `information_schema`'s
+    // `is_generated`, `generation_expression` and `column_default` are `character_data` on a real
+    // server — a domain over `character varying` — and this node declared them `text`. The
+    // columns took the type (g1's catalog columns) and the row agrees whole, so the entry is
+    // deleted rather than moved (ADR 0031 rule 2).
+    types: &[],
     // **A rendering divergence, and the same family as `pg_get_viewdef`'s.** PostgreSQL prints
     // `generation_expression` through its own deparser, which lower-cases the function name:
     // `upper(name)` where this node stores and returns `UPPER(name)`, the text as written. The
     // expression *is* the same expression and evaluates identically — every value in this corpus
     // agrees — and what differs is the spelling a schema dumper would echo.
-    answers: &[(
-        "SELECT column_name, is_generated, generation_expression, column_default FROM information_schema.columns WHERE table_name = 'vg' ORDER BY ordinal_position;",
-        "`UPPER(name)` against `upper(name)`: the stored text against PostgreSQL's deparse of its \
-         own parse tree. Same expression, same values; reproducing the deparser is `ruleutils.c` \
-         and is declared rather than attempted, exactly as for `pg_get_viewdef`.",
-        "pg19_virtual_generated_column.txt:40",
-    )],
+    answers: &[],
 };
 
 #[test]

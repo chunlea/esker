@@ -15,6 +15,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // differs is the OID a client is told to expect, and closing it means the array type of ADR
     // 0033's third tier rather than anything this unit could do.
     types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT pg_typeof(generate_subscripts('{a}'::text[], 1))",
         "SELECT conname, contype, conkey FROM pg_constraint WHERE conrelid = 'gsc'::regclass ORDER BY conname",
         "SELECT c.conname, (SELECT array_agg(a.attname ORDER BY idx) FROM (SELECT idx, c.conkey[idx] AS conkey_elem FROM generate_subscripts(c.conkey, 1) AS idx) indexed_conkeys JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = indexed_conkeys.conkey_elem) AS cols FROM pg_constraint c WHERE c.conrelid = 'gsc'::regclass AND c.contype IN ('p','f') ORDER BY c.conname",
     ],
@@ -28,11 +33,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'g', generate_subscripts(1, 1)",
             "**A set-returning function in the SELECT list**, which is a second mechanism and not this one: there it multiplies the rows of the query it is written in, and two of them run in lockstep rather than as a cross product (line 68: the shorter is padded with NULL, not cycled). This node has the `FROM` form, which is what the schema dump and boot statements 35 and 36 use; the target-list form is refused by name and counted here. Its two `42883`s (lines 69 and 70) carry the same refusal for the same reason — the arity and argument types are checked by the `FROM` path, which these never reach.",
             "pg19_generate_subscripts.txt:70",
-        ),
-        (
-            "SELECT pg_typeof(generate_subscripts('{a}'::text[], 1))",
-            "`pg_typeof` is not built. It would answer `integer` here — the function's rows are `int4`, which the `FROM` form already reports — but the function itself is a separate unit and is refused by name rather than special-cased for one argument.",
-            "pg19_generate_subscripts.txt:62",
         ),
     ],
 };

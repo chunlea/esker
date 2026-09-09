@@ -12,7 +12,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[],
+    types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT pg_typeof(CURRENT_TIMESTAMP), pg_typeof(now()), pg_typeof(LOCALTIMESTAMP), pg_typeof(CURRENT_DATE)",
+    ],
     answers: &[
         // **Two entries stood here and both are deleted** (ADR 0031, rule 2). One said this
         // node could not tell `DEFAULT CURRENT_TIMESTAMP` from `DEFAULT now()`, because a default
@@ -26,15 +32,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // gives the unzoned form of it. `insert_all` needed the difference — a `timestamp`
         // column takes one with no cast and the other through one — so the two spellings are
         // now two members with two types (`tests/values_catalog_function.rs`).
-        (
-            "SELECT pg_typeof(CURRENT_TIMESTAMP), pg_typeof(now()), pg_typeof(LOCALTIMESTAMP), \
-             pg_typeof(CURRENT_DATE)",
-            "**The rows agree and the declared types do not**, which is the standing `regtype` \
-             trade rather than anything about these four: `pg_typeof` answers a `regtype` on a \
-             real server and `text` here, the same trade `'x'::regtype` makes \
-             (`tests/array_subquery.rs`). All four names are the ones a real server prints.",
-            "UNMEASURED",
-        ),
         (
             "SELECT CURRENT_TIMESTAMP(0) IS NOT NULL",
             "A precision on the function, which is the same instant rounded. Carrying it needs \

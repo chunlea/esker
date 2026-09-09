@@ -248,6 +248,26 @@ fn allowed_in_a_failed_block(class: &StatementClass) -> bool {
 #[derive(Default)]
 pub(crate) struct Divergences {
     /// Statements whose rows agree and whose declared types do not.
+    ///
+    /// **The standing families, so that a corpus's entry can name one instead of arguing it
+    /// again.** Every one is a type this node does not have or has at a different width, and each
+    /// is measured; nothing here is about a value, which is what separates this list from
+    /// [`Divergences::answers`]:
+    ///
+    /// | PostgreSQL | here | why |
+    /// |---|---|---|
+    /// | `regtype` | `text` | `pg_typeof` and `x::regtype` answer the name; ADR 0077 |
+    /// | `oid` | `bigint` | an oid is an `int8` here — the catalog's own oid columns |
+    /// | `"char"` | `text` | the one-byte type is not in `ColumnType`: `relkind`, `contype`, `typcategory`, `typdelim` |
+    /// | `regproc` | `text` | `typinput`'s type; the names are identical |
+    /// | `name[]` | `text` | `current_schemas()`; a `NameArray` is a named gap (ADR 0084) |
+    /// | `integer` | `bigint` | a bare integer constant is an `int8` here — the constant-width trade |
+    /// | `integer[]` | `bigint[]` | the same, one dimension out |
+    /// | `character varying(3)` | `character varying` | `yes_or_no`'s length: a catalog column list carries a type and no typmod |
+    ///
+    /// Two closed since the census was written, and both by giving the catalog's own columns the
+    /// type a real server declares: `name` for every identifier column, and `character varying`
+    /// for `information_schema`'s `character_data`.
     pub(crate) types: &'static [&'static str],
     /// Statements answered differently, each with the reason.
     pub(crate) answers: &'static [provenance::Divergence],
@@ -522,6 +542,9 @@ pub(crate) fn replay_reporting(
     // entry fails only when **every** occurrence agreed. `(entry, line, statement)`.
     let mut listed_agreements: Vec<(usize, usize, String)> = Vec::new();
     let mut listed_seen: Vec<usize> = Vec::new();
+    // **Rule 4's evidence**: listed answer divergences whose *rows* now agree, so that all that
+    // still differs is the declared type. See the assertion at the end of this function.
+    let mut misfiled: Vec<String> = Vec::new();
     // The last **listed** divergence this node answered with a refusal, and therefore the
     // candidate for having aborted the transaction. See `swallowers` below.
     let mut last_listed_refusal: Option<(String, String)> = None;
@@ -541,6 +564,34 @@ pub(crate) fn replay_reporting(
             listed_seen.push(entry);
             if actual == expected {
                 listed_agreements.push((entry, line_number, statement.clone()));
+            }
+            // **Rule 4: an answer divergence whose rows have started agreeing.** A listed entry
+            // skips the comparison below, so what keeps it "still diverging" is the whole
+            // `Answer` — types and rows together. The day the *rows* start agreeing, an entry
+            // whose reason is about the answer goes stale behind the declared type, and nothing
+            // says so: rule 2 only fires when the type agrees too.
+            //
+            // It happened. `activerecord_schema_dump` declared that `= ANY(i.indkey)` over an
+            // array value and a per-row `t2.oid::regclass::text` were refused `0A000`. Both had
+            // started answering — `id`, and no rows, which is what the oracle says — and the
+            // entries stood because `attname` and `conname` were `text` here and `name` there.
+            // Two closed features recorded as open ones, for as long as one column's type was
+            // wrong.
+            if let (
+                Answer::Rows { types, rows },
+                Answer::Rows {
+                    types: ours,
+                    rows: theirs,
+                },
+            ) = (&expected, &actual)
+                && rows == theirs
+                && !types.is_empty()
+                && types != ours
+            {
+                misfiled.push(format!(
+                    "line {line_number}: {statement}\n  the rows agree; only the declared type \
+                     differs\n  PostgreSQL: {types:?}\n  Esker:      {ours:?}"
+                ));
             }
             // **A listed divergence that is a *refusal* can abort the transaction**, and then
             // every statement after it is `25P02` and counted as swallowed — so the entry that
@@ -644,6 +695,18 @@ pub(crate) fn replay_reporting(
         "{} statements have the right rows and an unlisted type divergence:\n\n{}",
         type_mismatched.len(),
         type_mismatched.join("\n\n")
+    );
+    // **Rule 4: an entry in `answers` whose rows agree belongs in `types`.** Its reason describes
+    // an answer that no longer differs, and leaving it there means the corpus records a closed
+    // feature as an open one — invisibly, because a listed entry is never compared. Move the
+    // statement to the `types` list with a reason about the *type*, or delete it if the type
+    // agrees too (rule 2 will say so).
+    assert!(
+        misfiled.is_empty(),
+        "{} listed answer divergence(s) have started agreeing on the rows — move them to \
+         `types`, with a reason about the declared type, or delete them:\n\n{}",
+        misfiled.len(),
+        misfiled.join("\n\n")
     );
     // Rule 2, decided per entry: an entry is stale only when **every** occurrence of its statement
     // agreed. One that still covers a second occurrence stays.

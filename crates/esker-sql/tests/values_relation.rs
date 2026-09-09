@@ -20,6 +20,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // type differs. Listing them one by one rather than dropping the type column is what makes the
     // day this is fixed a *failing* test rather than a silent improvement.
     types: &[
+        // **Moved from `answers` by parity rule 4.** Its reason was that a comma-separated `FROM`
+        // list is refused for every relation; it runs now, and the projected `1` is an
+        // `integer` there and a `bigint` here — the standing constant-width trade.
+        "SELECT 'r', 1 FROM (VALUES (1),(2)) AS t(x), (VALUES (3)) AS u(y)",
         "SELECT 'r', * FROM (VALUES (1),(2),(3)) AS t(x) ORDER BY x",
         "SELECT 'r', a, b FROM (VALUES (1,'x'),(2,'y')) AS t(a,b) ORDER BY a",
         "SELECT 'r', column1, column2 FROM (VALUES (1,'x'),(2,'y')) AS t ORDER BY column1",
@@ -74,11 +78,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // **Not a `VALUES` gap.** A comma-separated `FROM` list is refused for every relation in
         // this crate; the `CROSS JOIN` spelling of this same statement is the line above it and it
         // answers.
-        (
-            "SELECT 'r', 1 FROM (VALUES (1),(2)) AS t(x), (VALUES (3)) AS u(y)",
-            "a comma-separated FROM list is refused for every relation, not only for VALUES",
-            "UNMEASURED",
-        ),
     ],
 };
 

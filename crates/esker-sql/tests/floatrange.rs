@@ -15,19 +15,17 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog type trade, three times: `typname` and `udt_name` are `name` on a real
-    // server, `column_name` and `data_type` are `information_schema`'s own domains, and
-    // `rngsubtype::regtype` is a `regtype` — all `text` here, all comparing identically. **Every
-    // value agrees**, and the values are what these ask: `floatrange` is `typtype` `r` and
-    // `typcategory` `R`, its `rngsubtype` is `double precision`, and the two columns report
-    // `USER-DEFINED` with the declared name in `udt_name`, which is what the schema dumper reads.
+    // The standing catalog type trade, twice now rather than three times: `typname` is a `name`
+    // on a real server and `rngsubtype::regtype` is a `regtype`, both `text` here. The
+    // `information_schema` line left this list when its columns took `name` and
+    // `character varying` — the row agrees whole (ADR 0031 rule 2). **Every value agrees** on the
+    // two that remain, and the values are what they ask: `floatrange` is `typtype` `r` and
+    // `typcategory` `R`, and its `rngsubtype` is `double precision`.
     types: &[
         "SELECT 'r', typname, typtype, typcategory FROM pg_type WHERE typname IN \
          ('floatrange','stringrange') ORDER BY typname",
         "SELECT 'r', t.typname, r.rngsubtype::regtype FROM pg_range r JOIN pg_type t ON t.oid = \
          r.rngtypid WHERE t.typname IN ('floatrange','stringrange') ORDER BY 2",
-        "SELECT 'r', column_name, data_type, udt_name FROM information_schema.columns WHERE \
-         table_name = 'fr' ORDER BY ordinal_position",
     ],
     answers: &[
         // **A `varchar` bound comes back as `text`.** The value is right — `["ca""t","do\g")`

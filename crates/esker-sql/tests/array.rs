@@ -22,6 +22,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // builds its array as text: now that an array is a type it could build one, and that is the
     // slice after the constructor rather than part of storage.
     types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT '{1,2,3}'::int[], ARRAY[1,2,3], ARRAY[1,2,3]::int[]",
+        "SELECT '{1,NULL,3}'::int[], ARRAY[1,NULL,3]",
         // These two used to be listed below as refusals: a bare `VALUES` list was not a relation
         // and the statement could not run. It runs now and the **rows are right**; what is left is
         // that `array_agg` declares `text` whatever it collects, where a real server declares the
@@ -45,16 +51,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT id FROM ar WHERE n @> '{1}' ORDER BY id",
             "The array **operators** — `@>`, `<@`, `&&`, `||` — which are the slice after the constructor. Nothing here is approximated in the meantime: each is `0A000` naming itself.",
             "pg19_array.txt:86",
-        ),
-        (
-            "SELECT '{1,2,3}'::int[], ARRAY[1,2,3], ARRAY[1,2,3]::int[]",
-            "**The rows agree and the element's width does not.** `ARRAY[1,2,3]` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here — `tests/unknown_literal.rs`'s standing divergence, showing through the constructor. The values are identical and the same statement written `'{1,2,3}'::int[]` agrees on the type as well, which is the line beside each of these.",
-            "pg19_array.txt:96",
-        ),
-        (
-            "SELECT '{1,NULL,3}'::int[], ARRAY[1,NULL,3]",
-            "**The rows agree and the element's width does not.** `ARRAY[1,2,3]` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here — `tests/unknown_literal.rs`'s standing divergence, showing through the constructor. The values are identical and the same statement written `'{1,2,3}'::int[]` agrees on the type as well, which is the line beside each of these.",
-            "pg19_array.txt:99",
         ),
         (
             "SELECT array_length('{}'::int[], 1), array_ndims('{}'::int[]), array_dims('{}'::int[]), cardinality('{}'::int[])",

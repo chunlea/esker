@@ -18,7 +18,12 @@
 /// 207 → 186 when the catalog's identifier columns became `name`: twenty-one entries stopped being
 /// divergences at all, because what they recorded was a *declared type* — `text` here where a real
 /// server says `name` — and the rows underneath had always agreed.
-const BUDGET: usize = 186;
+///
+/// 186 → 167 with the divergence-table scan behind parity rule 4. Every one of those nineteen was
+/// an entry whose *reason* described an answer that had started agreeing, standing on a declared
+/// type in front of it — so they were UNMEASURED reasons about closed features, which is the worst
+/// kind of number to keep.
+const BUDGET: usize = 167;
 
 #[test]
 fn unmeasured_divergences_do_not_grow() {

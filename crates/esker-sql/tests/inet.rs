@@ -25,8 +25,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type WHERE \
          typname IN ('inet','cidr','macaddr','_inet','_cidr','_macaddr') ORDER BY typname",
-        "SELECT 'r', column_name, data_type, udt_name, column_default FROM \
-         information_schema.columns WHERE table_name = 'n' ORDER BY ordinal_position",
         "SELECT 'r', pg_typeof('192.168.1.1'::inet), pg_typeof('192.168.1.0/24'::cidr), \
          pg_typeof('ff:ff:ff:ff:ff:ff'::macaddr)",
         "SELECT 'r', '{192.168.1.1,10.0.0.1}'::inet[], pg_typeof('{192.168.1.1}'::inet[])",

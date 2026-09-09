@@ -28,12 +28,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT table_name, table_type, table_schema, table_catalog FROM information_schema.tables WHERE table_name IN ('sa','sb','sc') ORDER BY table_name",
         "SELECT column_name, ordinal_position, is_nullable, data_type FROM information_schema.columns WHERE table_name = 'sa' ORDER BY ordinal_position",
-        "SELECT column_name, udt_name, column_default FROM information_schema.columns WHERE table_name = 'sa' ORDER BY ordinal_position",
         "SELECT column_name, ordinal_position, is_nullable, data_type, column_default FROM information_schema.columns WHERE table_name = 'sb' ORDER BY ordinal_position",
         "SELECT column_name, is_identity, identity_generation, is_generated FROM information_schema.columns WHERE table_name = 'sb' ORDER BY ordinal_position",
         "SELECT constraint_name, constraint_type, table_name, is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE table_name IN ('sa','sb','sc') ORDER BY constraint_name",
         "SELECT constraint_catalog, constraint_schema, table_catalog, table_schema FROM information_schema.key_column_usage WHERE table_name = 'sb'",
-        "SELECT c.column_name, c.data_type FROM information_schema.columns c WHERE c.table_name = 'sb' AND c.column_name = 'x'",
     ],
     answers: &[
         (

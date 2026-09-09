@@ -46,6 +46,10 @@ const FIXTURE: &[&str] = &[
 /// client sees only in the OID rather than a wrong number. The input that *does* overflow is in
 /// [`DIVERGENCES`], where it belongs.
 const TYPE_DIVERGENCES: &[&str] = &[
+    // **Moved here from `answers` by parity rule 4**: the rows agree and what
+    // still differs is the declared type, which is one of the standing
+    // families — see `parity::Divergences::types`.
+    "SELECT pg_typeof(count(*)), pg_typeof(sum(n)), pg_typeof(avg(n)), pg_typeof(sum(f)), pg_typeof(avg(f)) FROM agg",
     // A self-join under two aliases, which ran for the first time when unit 5 built them. Its
     // rows agree; what differs is what `sum(int8)` is called, the same as every line above.
 ];
@@ -106,12 +110,6 @@ const DIVERGENCES: &[(&str, &str, &str)] = &[
     (
         "SELECT DISTINCT ON (g) g, n FROM agg ORDER BY g, n",
         "SELECT DISTINCT ON",
-        "UNMEASURED",
-    ),
-    (
-        "SELECT pg_typeof(count(*)), pg_typeof(sum(n)), pg_typeof(avg(n)), pg_typeof(sum(f)), \
-         pg_typeof(avg(f)) FROM agg",
-        "pg_typeof, which needs the catalog unit",
         "UNMEASURED",
     ),
 ];

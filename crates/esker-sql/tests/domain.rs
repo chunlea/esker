@@ -24,8 +24,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // makes.
     types: &[
         "SELECT 'r', typname, typtype, typbasetype::regtype::text, typnotnull, typdefault FROM pg_type WHERE typname = 'dm_money'",
-        "SELECT 'r', domain_name, data_type, numeric_precision, numeric_scale FROM information_schema.domains WHERE domain_name = 'dm_money'",
-        "SELECT 'r', column_name, data_type, domain_name, udt_name FROM information_schema.columns WHERE table_name = 'dm_t' AND column_name = 'price'",
         "SELECT 'r', n.nspname, t.typname, t.typtype FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'text' ORDER BY n.nspname",
         "SELECT 'r', format_type(a.atttypid, a.atttypmod), t.typtype FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid = 'dm_shadow'::regclass AND a.attname = 'c'",
     ],

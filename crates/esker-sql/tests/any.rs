@@ -15,6 +15,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT current_schemas(false)",
+        "SELECT current_schemas(true)",
         // A real server types these `name` and `name[]` — `name` being the 64-byte identifier type
         // that `pg_class.relname` and `pg_namespace.nspname` are. This node has no `name`, so it
         // answers `text`, whose *values* are identical and which is what every comparison against
@@ -23,23 +29,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // sees it, so there is no array value for a `RowDescription` to describe.
         "SELECT current_schema()",
     ],
-    answers: &[
-        (
-            "SELECT current_schemas(false)",
-            "`{public}` on a real server, and `0A000` here: selecting it **returns an array**, and \
-         this node has array *expressions* only — no array `Datum`, no array column, nothing a \
-         `RowDescription` could type. Inside an `= ANY` it is a list of names and answers exactly; \
-         on its own it would need the stored-array unit that ADR 0033's roadmap puts in tier 2. \
-         Refusing by name is the honest half: `ActiveRecord` only ever writes it inside an `ANY`.",
-            "pg19_current_schemas.txt:50",
-        ),
-        (
-            "SELECT current_schemas(true)",
-            "The same refusal for the same reason: it is the form that also lists `pg_catalog`, \
-             and selecting either returns an array.",
-            "pg19_current_schemas.txt:51",
-        ),
-    ],
+    answers: &[],
 };
 
 #[test]

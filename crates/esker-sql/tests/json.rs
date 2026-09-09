@@ -33,6 +33,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 /// from its values; it is only a bare literal or cast that loses it. Giving `jsonb` a `Datum` of
 /// its own closes both at once.
 const TYPES: &[&str] = &[
+    // **Moved here from `answers` by parity rule 4**: the rows agree and what
+    // still differs is the declared type, which is one of the standing
+    // families — see `parity::Divergences::types`.
+    "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN ('json','jsonb') ORDER BY oid",
     "SELECT '{\"b\":1, \"a\":2}'::json, '{\"b\":1, \"a\":2}'::jsonb",
     "SELECT '{\"a\":1,\"a\":2}'::json, '{\"a\":1,\"a\":2}'::jsonb",
     "SELECT '{  \"a\"  :  1  }'::json, '{  \"a\"  :  1  }'::jsonb",
@@ -102,12 +106,6 @@ const CASTS: &str = "**Both refuse a `jsonb` *object* cast to a scalar; the code
      with this one.";
 /// Every statement this node answers differently, each pointing at one reason above.
 const ANSWERS: &[(&str, &str, &str)] = &[
-    (
-        "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE \
-             typname IN ('json','jsonb') ORDER BY oid",
-        CATALOG,
-        "pg19_json.txt:59",
-    ),
     (
         "SELECT pg_typeof('{}'::json), pg_typeof('{}'::jsonb), format_type(114, -1), \
              format_type(3802, -1)",

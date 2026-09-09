@@ -85,7 +85,7 @@ pub fn tables(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
 pub const DOMAINS_COLUMNS: &[(&str, ColumnType)] = &[
     ("domain_schema", ColumnType::Name),
     ("domain_name", ColumnType::Name),
-    ("data_type", ColumnType::Text),
+    ("data_type", ColumnType::Varchar),
     ("numeric_precision", ColumnType::Int4),
     ("numeric_scale", ColumnType::Int4),
 ];
@@ -121,9 +121,9 @@ pub fn domains(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
 pub const VIEWS_COLUMNS: &[(&str, ColumnType)] = &[
     ("table_schema", ColumnType::Name),
     ("table_name", ColumnType::Name),
-    ("view_definition", ColumnType::Text),
-    ("is_updatable", ColumnType::Text),
-    ("is_insertable_into", ColumnType::Text),
+    ("view_definition", ColumnType::Varchar),
+    ("is_updatable", ColumnType::Varchar),
+    ("is_insertable_into", ColumnType::Varchar),
 ];
 
 /// Whether PostgreSQL would treat this view's query as **automatically updatable**.
@@ -538,7 +538,7 @@ fn datetime_precision(column: &ColumnDef) -> Datum {
 pub const TABLES_COLUMNS: &[(&str, ColumnType)] = &[
     ("table_schema", ColumnType::Name),
     ("table_name", ColumnType::Name),
-    ("table_type", ColumnType::Text),
+    ("table_type", ColumnType::Varchar),
 ];
 
 /// The columns of `information_schema.columns`, in the standard's order.
@@ -547,20 +547,20 @@ pub const COLUMNS_COLUMNS: &[(&str, ColumnType)] = &[
     ("table_name", ColumnType::Name),
     ("column_name", ColumnType::Name),
     ("ordinal_position", ColumnType::Int4),
-    ("column_default", ColumnType::Text),
-    ("is_nullable", ColumnType::Text),
-    ("data_type", ColumnType::Text),
+    ("column_default", ColumnType::Varchar),
+    ("is_nullable", ColumnType::Varchar),
+    ("data_type", ColumnType::Varchar),
     ("character_maximum_length", ColumnType::Int4),
     ("numeric_precision", ColumnType::Int4),
     ("numeric_scale", ColumnType::Int4),
     ("datetime_precision", ColumnType::Int4),
     ("udt_name", ColumnType::Name),
-    ("is_identity", ColumnType::Text),
-    ("identity_generation", ColumnType::Text),
-    ("is_generated", ColumnType::Text),
+    ("is_identity", ColumnType::Varchar),
+    ("identity_generation", ColumnType::Varchar),
+    ("is_generated", ColumnType::Varchar),
     // **Last**, the rule `pg_type`'s columns follow: `SELECT *` expands in declared order, so a
     // column added anywhere else moves every one after it.
-    ("generation_expression", ColumnType::Text),
+    ("generation_expression", ColumnType::Varchar),
     // **Last again**, same rule. The **domain** a column was declared as, and NULL for a column
     // declared as an ordinary type (ADR 0065). This is the one column that tells the two apart
     // here: `data_type` and `udt_name` both report the *base* type — measured, a `custom_money`
@@ -579,9 +579,9 @@ pub const TABLE_CONSTRAINTS_COLUMNS: &[(&str, ColumnType)] = &[
     ("constraint_name", ColumnType::Name),
     ("table_schema", ColumnType::Name),
     ("table_name", ColumnType::Name),
-    ("constraint_type", ColumnType::Text),
-    ("is_deferrable", ColumnType::Text),
-    ("initially_deferred", ColumnType::Text),
+    ("constraint_type", ColumnType::Varchar),
+    ("is_deferrable", ColumnType::Varchar),
+    ("initially_deferred", ColumnType::Varchar),
 ];
 
 /// The columns of `information_schema.key_column_usage`, in the standard's order.
@@ -601,7 +601,7 @@ pub const REFERENTIAL_CONSTRAINTS_COLUMNS: &[(&str, ColumnType)] = &[
     ("constraint_name", ColumnType::Name),
     ("unique_constraint_schema", ColumnType::Name),
     ("unique_constraint_name", ColumnType::Name),
-    ("match_option", ColumnType::Text),
-    ("update_rule", ColumnType::Text),
-    ("delete_rule", ColumnType::Text),
+    ("match_option", ColumnType::Varchar),
+    ("update_rule", ColumnType::Varchar),
+    ("delete_rule", ColumnType::Varchar),
 ];

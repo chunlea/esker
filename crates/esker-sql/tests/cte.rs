@@ -37,6 +37,12 @@ const FIXTURE: &[&str] = &[
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "WITH RECURSIVE t AS (SELECT 1 AS n) SELECT * FROM t",
+        "WITH RECURSIVE t (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT * FROM t",
         // A bare integer constant is `integer` on a real server and `int8` here. The rows agree.
         "WITH ct_a AS (SELECT 99 AS id) SELECT * FROM ct_a",
         "WITH ct_a AS (SELECT 99 AS id) SELECT id FROM ct_a",
@@ -44,20 +50,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "WITH t AS (SELECT id FROM ct_a) SELECT 1",
     ],
     answers: &[
-        (
-            "WITH RECURSIVE t AS (SELECT 1 AS n) SELECT * FROM t",
-            "`WITH RECURSIVE` is `0A000` naming itself — and this line is the reason the refusal \
-             is on the keyword rather than on a recursive *body*: a real server runs this one, \
-             because the body does not recurse. A second evaluation model is a phase, not a unit \
-             (`docs/plans/phase-12-subquery.md` §4).",
-            "UNMEASURED",
-        ),
-        (
-            "WITH RECURSIVE t (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
-             SELECT * FROM t",
-            "`WITH RECURSIVE`, and `UNION ALL` under it, both `0A000` by name.",
-            "UNMEASURED",
-        ),
         (
             "WITH t AS (DELETE FROM ct_b WHERE id = 12 RETURNING id) SELECT * FROM t",
             "a data-modifying `WITH` item is `0A000` naming itself: the read path is this phase \

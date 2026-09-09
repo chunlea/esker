@@ -10,22 +10,19 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[],
+    types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT oid, typname, typlen, typinput, typelem, typcategory FROM pg_type WHERE typname = 'date'",
+        "SELECT pg_typeof('2020-01-01'::date)",
+    ],
     // Nineteen, and **every one is a refusal or a feature this node does not have** — not one is a
     // value where PostgreSQL answers something else. Every `date` this node stores, orders,
     // compares, prints and reads back is byte-identical to a real server's, which is the column
     // ADR 0031 measures a type by. Ten of the nineteen are one gap: this crate has no arithmetic.
     answers: &[
-        (
-            "SELECT oid, typname, typlen, typinput, typelem, typcategory FROM pg_type WHERE typname = 'date'",
-            "`pg_type.typlen` is a column this node's `pg_type` does not have, for every type. Not this unit's: every other column of the row agrees, and the `date` row is there with oid 1082 and `date_in`.",
-            "pg19_date.txt:45",
-        ),
-        (
-            "SELECT pg_typeof('2020-01-01'::date)",
-            "`pg_typeof` is `0A000` naming itself, for every type. Not this unit's.",
-            "pg19_date.txt:46",
-        ),
         (
             "SELECT format_type(1082, -1), format_type(1082, 3)",
             "`format_type(1082, 3)` prints `date(3)` on a real server: it prints the typmod it is handed whether or not the type takes one. A `date` **has** no typmod — `CREATE TABLE t (d date(3))` is a syntax error there — so no column can reach this and only a hand-written oid can.",

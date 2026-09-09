@@ -10,7 +10,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[],
+    types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT pg_typeof(random()), pg_typeof(concat('a','b')), pg_typeof(convert_to('A','UTF8')), pg_typeof(CURRENT_DATE)",
+    ],
     answers: &[
         (
             "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON \
@@ -33,14 +39,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              because it is the statement that would prove `convert_to` counted the bytes rather \
              than the characters. The two disagree only on multi-byte input, and the byte string \
              itself is checked directly in the test below.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT pg_typeof(random()), pg_typeof(concat('a','b')), pg_typeof(convert_to('A','UTF8')), pg_typeof(CURRENT_DATE)",
-            "`pg_typeof` is not implemented — contract C2, and the standing divergence of every \
-             corpus that would use it to prove a declared type. The four types it would report \
-             are what `PlainFunc::result_type` returns, and the `\\gdesc` column of every other \
-             line here checks them the long way.",
             "UNMEASURED",
         ),
         // **Both arithmetic entries are deleted** (ADR 0031, rule 2). They recorded that this
