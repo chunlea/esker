@@ -23,7 +23,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
         "SELECT 'r', ARRAY(SELECT 1)::int8[], pg_typeof(ARRAY(SELECT 1)::int8[])",
-        // These two moved up from `answers` with the literal ladder's `int4` rung (ADR 0085):
+        // These two moved up from `answers` with the literal ladder's `int4` rung (ADR 0087):
         // `ARRAY(SELECT 1)` is an `integer[]` on both now, and `pg_typeof`'s own answer is all
         // that is left of a reason that used to be about the constant's width.
         "SELECT 'r', ARRAY(SELECT 1), pg_typeof(ARRAY(SELECT 1))",

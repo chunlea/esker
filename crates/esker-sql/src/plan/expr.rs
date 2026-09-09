@@ -2181,7 +2181,7 @@ impl Literal {
             // `int8` and does not go into one without a conversion — but comparison is a different
             // question and PostgreSQL has `int84eq`: `id = 1::int4` against a `bigint` key is a
             // row, not a `42883`. It became reachable when `ARRAY[1,3]` started folding to `int4`
-            // elements (ADR 0085) and `id = ANY(ARRAY[1,3])` refused itself.
+            // elements (ADR 0087) and `id = ANY(ARRAY[1,3])` refused itself.
             Literal::Typed(value)
                 if matches!(**value, Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)) =>
             {

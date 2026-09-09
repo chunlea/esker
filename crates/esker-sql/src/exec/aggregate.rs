@@ -1117,7 +1117,7 @@ fn fold_interval(
 /// The `numeric` an exact-typed value adds into an average.
 ///
 /// Every width, because `avg` is chosen from the *declared* type and the datum beside it may be any
-/// integer this crate holds — an `int4`-declared literal arrives as an `Int8` (ADR 0085), and an
+/// integer this crate holds — an `int4`-declared literal arrives as an `Int8` (ADR 0087), and an
 /// `int2` column as an `Int2`.
 fn exact_addend(value: &Datum) -> Result<esker_keys::numeric::Numeric> {
     Ok(match value {

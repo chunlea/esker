@@ -1,4 +1,4 @@
-# 0085 — An integer literal is the narrowest type that holds it, and only its *type* narrows
+# 0087 — An integer literal is the narrowest type that holds it, and only its *type* narrows
 
 Status: accepted · 2026-09-09
 

@@ -17,7 +17,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // **One entry, and there were thirteen.** Every one of the other twelve said that a bare
     // integer constant was an `int8` here where a real server's is an `int4`, so a
     // `generate_series` or an `unnest` over one declared `bigint`; the literal ladder's `int4` rung
-    // (ADR 0085) closed all of them. What is left is `pg_typeof`, which answers a `regtype` there
+    // (ADR 0087) closed all of them. What is left is `pg_typeof`, which answers a `regtype` there
     // and `text` here (ADR 0077), with the row identical.
     types: &["SELECT 'r', pg_typeof(unnest(ARRAY['a','b']::text[]))"],
     answers: &[

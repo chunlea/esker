@@ -2241,7 +2241,7 @@ pub fn casts_to(from: ColumnType, to: ColumnType) -> bool {
     // Measured, four each way — `int4[]::int8[]`, `::text[]`, `::numeric[]` and `::bool[]` all
     // answer, and `int4[]::date[]` and `date[]::int4[]` are `42846`, which is the element rule
     // exactly. It became reachable when `ARRAY(SELECT 1)` started folding to an `int4[]`
-    // (ADR 0085) and `ARRAY(SELECT 1)::int8[]` refused itself.
+    // (ADR 0087) and `ARRAY(SELECT 1)::int8[]` refused itself.
     if let (Some(held), Some(wanted)) = (ArrayValue::element_of(from), ArrayValue::element_of(to)) {
         return casts_to(held, wanted);
     }

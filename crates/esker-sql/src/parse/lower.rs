@@ -5440,7 +5440,7 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             Value::Number(digits, _) if digits.contains('.') => {
                 (Some(digits.clone()), Some(ColumnType::Numeric))
             }
-            // **The literal ladder, inside the constructor** (ADR 0085): an integer element is an
+            // **The literal ladder, inside the constructor** (ADR 0087): an integer element is an
             // `int4` when it fits one, so `ARRAY[1,2,3]` is an `integer[]` as it is on a real
             // server, and `ARRAY[1,3000000000]` is a `bigint[]` because the widening below settles
             // on the wider of the two. A number too large for either is left to `from_text`, which

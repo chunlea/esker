@@ -27,7 +27,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // **Empty, and its one entry was `SELECT id FROM i4 WHERE n = 10::int8`.** It recorded a cast
     // refused by name, and the reason it was in the corpus at all was as evidence that the two
     // integer widths compare. They do now — an integer value compares like an integer literal
-    // whatever width it arrived as (ADR 0085) — so the statement answers the row a real server
+    // whatever width it arrived as (ADR 0087) — so the statement answers the row a real server
     // answers and the entry is gone.
     answers: &[],
 };

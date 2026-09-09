@@ -84,7 +84,7 @@ a wrong statement about a real server rather than a missing feature (ADR 0031).
   and rounding it into a float would answer where the answer is not PostgreSQL's.
 * ~~A bare integer constant is `int8` here and `int4` on a real server, so an operator over two
   constants reports `bigint` where PostgreSQL reports `integer`.~~ **Closed by
-  [ADR 0085](0085-an-integer-literal-is-the-narrowest-type-that-holds-it.md)**: a literal's declared
+  [ADR 0087](0087-an-integer-literal-is-the-narrowest-type-that-holds-it.md)**: a literal's declared
   type is now the narrowest that holds it, and `arithmetic_type` takes the wider of its two
   operands, so `1 + 1` is an `integer` and `1 + 3000000000` a `bigint`. The nine entries this
   paragraph explained are gone from `tests/arithmetic.rs`.

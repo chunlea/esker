@@ -17,7 +17,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // **One entry, and it was twenty-six.** Twenty-five of them said that a bare integer constant
     // was an `int8` here where a real server's is an `int4`, so every column a `VALUES` list built
     // from one was `bigint`; listing them one by one rather than dropping the type column is what
-    // made the day the ladder gained its `int4` rung (ADR 0085) a *failing* test rather than a
+    // made the day the ladder gained its `int4` rung (ADR 0087) a *failing* test rather than a
     // silent improvement, and all twenty-five went at once. What is left is `pg_typeof`'s own
     // `regtype`/`text` trade (ADR 0077), whose two answers are now right.
     types: &[

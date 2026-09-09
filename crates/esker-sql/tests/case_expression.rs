@@ -12,7 +12,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // **Empty.** These two carried the arithmetic refusal `1/0` used to raise, then the width a
-    // bare `1` used to have; the literal ladder's `int4` rung (ADR 0085) closed the second and the
+    // bare `1` used to have; the literal ladder's `int4` rung (ADR 0087) closed the second and the
     // rows had agreed since the first.
     types: &[],
     // Three, and all three are the same missing feature: this node has **no arithmetic
