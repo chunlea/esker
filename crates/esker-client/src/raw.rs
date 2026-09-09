@@ -222,7 +222,7 @@ impl RawClient {
             // — which under load is a fact about the driver being a heartbeat behind, not about the
             // cluster. That is the `08006 … key is not in region 0` a loaded gate produced while
             // the same test passed alone.
-            let boundary = match self.router.route(&cursor) {
+            let boundary = match self.router.route(&cursor, None) {
                 Ok(route) => route.region.end_key,
                 Err(refusal) => {
                     repair_route(&self.router, &cursor, &refusal)?

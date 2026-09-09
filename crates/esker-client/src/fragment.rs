@@ -147,7 +147,7 @@ impl FragmentClient {
             // what put `08006 … key is not in region 0` in front of a `GROUP BY` in a gate — and
             // it survived making the cluster tests exclusive, which is what showed it was never
             // contention. One repair, the same one (`router::repair_route`).
-            let mut route = match self.router.route(&key) {
+            let mut route = match self.router.route(&key, None) {
                 Ok(route) => route,
                 Err(refusal) => crate::router::repair_route(&self.router, &key, &refusal)?,
             };
