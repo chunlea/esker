@@ -40,8 +40,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          BY b.typname",
         "SELECT 'r', typname, typcategory, typelem <> 0 AS has_element, typinput FROM pg_type \
          WHERE typname IN ('_int4','_varchar','int4','varchar') ORDER BY typname",
-        "SELECT 'r', pg_typeof(ARRAY['a','b']::varchar[]), pg_typeof(ARRAY[1.5]::numeric[]), \
-         pg_typeof(ARRAY[true])",
         "SELECT 'r', b.typname, b.typarray, a.typname AS array_name FROM pg_type b JOIN pg_type a \
          ON a.oid = b.typarray WHERE b.typname IN \
          ('bytea','bpchar','float4','float8','interval','json','oid','time') ORDER BY b.typname",
@@ -86,11 +84,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // what `Datum::fits` is about. Answering `character varying` would mean a value that
         // remembers a type its bytes do not distinguish, which is the citext shape and is a
         // change to the value vocabulary rather than to arrays.
-        (
-            "SELECT 'r', pg_typeof(tags), pg_typeof(tags[1]), array_length(tags, 1) FROM atm",
-            "an array element is a Datum::Text: varchar and text are one representation here",
-            "pg19_array_type_map.txt:63",
-        ),
         // **`_record` is the exception the capture warns about**, and this node has no
         // pseudo-types: `array_in` implies `typcategory = 'A'` for every row here and for all but
         // one row there. The warning is why the two columns are populated from what each means

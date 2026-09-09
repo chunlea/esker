@@ -1671,7 +1671,6 @@ impl CatalogFunc {
             | CatalogFunc::PgGetConstraintdef
             | CatalogFunc::PgGetViewdef
             | CatalogFunc::PgGetTriggerdef
-            | CatalogFunc::DateRange
             | CatalogFunc::ColDescription
             // `void` on a real server, which prints as the empty string; `text` here for the same
             // reason `regclass` is text — what it prints as is what a client sees.
@@ -1693,13 +1692,16 @@ impl CatalogFunc {
             | CatalogFunc::Substr
             | CatalogFunc::Substring
             | CatalogFunc::Replace
-            // A `regtype` on a real server, and `text` here for the reason `'x'::regtype` is:
-            // this node has no `regtype`, and what it prints is the name either way.
-            | CatalogFunc::PgTypeof
             | CatalogFunc::HstoreFetch
             | CatalogFunc::LtreeToText
             // `ts_headline` answers the marked-up text.
             | CatalogFunc::TsHeadline => ColumnType::Text,
+            // **`pg_typeof` answers a `regtype`**, which is its `prorettype` on a real server and
+            // was `text` here while this node had no such type. It has had one since
+            // [ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md), and
+            // the comment that stood here — "this node has no `regtype`" — outlived the decision
+            // that made it false by fifteen ADRs.
+            CatalogFunc::PgTypeof => ColumnType::RegType,
             // `ts_rank` answers a `real`, measured with `pg_typeof`.
             CatalogFunc::TsRank => ColumnType::Real,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.
@@ -1771,6 +1773,12 @@ impl CatalogFunc {
             | CatalogFunc::PhraseToTsQuery
             | CatalogFunc::WebsearchToTsQuery => ColumnType::TsQuery,
             CatalogFunc::RangeBuild => ColumnType::TsRange,
+            // **`daterange(a, b)` is a `daterange`**, which it always was as a *value* — the
+            // evaluator builds a `Datum::Range` over `date` — and was called `text` only because
+            // `pg_typeof` read the datum and nothing else asked. Resolving that function against
+            // the declared type (ADR 0093) made the two disagree out loud, which is what a
+            // measured answer is for.
+            CatalogFunc::DateRange => ColumnType::DateRange,
             // **`LOCALTIMESTAMP` is the one of the four without a zone**, which is the whole
             // reason it is a separate member: the type is what decides whether a column takes it.
             CatalogFunc::Now

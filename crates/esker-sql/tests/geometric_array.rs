@@ -33,13 +33,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          pg_type t WHERE t.typname IN \
          ('circle','_circle','path','_path','polygon','_polygon','lseg','_lseg','line','_line','point','_point','box','_box') \
          ORDER BY t.oid",
-        "SELECT pg_typeof(array_agg(c::circle)) FROM (VALUES ('<(0,0),1>')) s(c)",
-        "SELECT pg_typeof(ARRAY[c::circle]) FROM (VALUES ('<(0,0),1>')) s(c)",
-        "SELECT pg_typeof(array_agg(c::path)) FROM (VALUES ('((0,0),(1,1))')) s(c)",
-        "SELECT pg_typeof(array_agg(c::polygon)) FROM (VALUES ('((0,0),(1,1),(1,0))')) s(c)",
-        "SELECT pg_typeof(array_agg(c::lseg)) FROM (VALUES ('[(0,0),(1,1)]')) s(c)",
-        "SELECT pg_typeof(array_agg(c::line)) FROM (VALUES ('{1,2,3}')) s(c)",
-        "SELECT pg_typeof(unnest('{\"<(0,0),1>\"}'::circle[]))",
         "SELECT typarray FROM pg_type WHERE typname IN \
          ('circle','path','polygon','lseg','line') ORDER BY typname",
     ],

@@ -28,28 +28,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `pg_typeof` answers a `regtype` on a real server and `text` here (ADR 0077); every row
     // agrees, and the catalog row's own columns are the `oid`/`"char"`/`regproc` families.
     types: &[
-        "SELECT 'r', pg_typeof(pg_advisory_unlock(1))",
-        "SELECT 'r', pg_try_advisory_lock(2), pg_typeof(pg_try_advisory_lock(2))",
         "SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput, typarray FROM \
          pg_type WHERE typname = 'void'",
-        "SELECT 'r', pg_advisory_unlock_all()::text, pg_typeof(pg_advisory_unlock_all()::text)",
     ],
     answers: &[
         // **`pg_typeof` reads the datum, and a void's datum is a `Datum::Text("")`.** These two are
         // the rows whose type is carried by the *expression*; the `RowDescription` for both is
         // 2278, which is what a client reads and what `the_advisory_family_splits_two_and_two`
         // asserts. The seam ADR 0086, ADR 0089 and `tests/cidr_aggregate.rs` all name.
-        (
-            "SELECT 'r', pg_typeof(pg_advisory_unlock_all())",
-            "`pg_typeof` reads the datum, which is the empty string a void is carried as; the \
-             column is declared 2278, which is what a client is told.",
-            "pg19_void.txt:44",
-        ),
-        (
-            "SELECT 'r', pg_typeof(pg_advisory_lock(1))",
-            "The same, through the blocking acquire.",
-            "pg19_void.txt:46",
-        ),
         // `pg_notify` is not built, which is a named gap of its own and nothing to do with `void`.
         (
             "SELECT 'r', pg_typeof(pg_notify('c','p'))",

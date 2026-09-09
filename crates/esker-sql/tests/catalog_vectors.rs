@@ -20,38 +20,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `conkey` half of the same file is not in this list any more, which is the unit.
     types: &[
         "SELECT 'r', indkey[0], indkey[1], array_length(indkey, 1) FROM pg_index WHERE indexrelid = 'vt_ab'::regclass",
-        "SELECT 'r', pg_typeof(c.conkey[1]), pg_typeof(i.indkey[0]) FROM pg_constraint c, pg_index i WHERE c.conname = 'vt_pkey' AND i.indexrelid = 'vt_ab'::regclass",
     ],
-    answers: &[
-        // **`int2vector` is a type this node does not have.** `indkey` and `indoption` are `text`
-        // holding the same characters — `1 2`, space-separated and zero-based — which is what
-        // every reader of them here expects. Giving them the array type would change both the
-        // printed form and the subscript base, so they stay text and this line says so. `conkey`
-        // is a `smallint[]` on a real server and is one here now, which is the rest of this file.
-        (
-            "SELECT 'r', pg_typeof(indkey), pg_typeof(indoption) FROM pg_index WHERE indexrelid = \
-             'vt_ab'::regclass",
-            "int2vector is a type this node does not have; indkey and indoption are text",
-            "UNMEASURED",
-        ),
-        // `confkey` is NULL on a primary key, and `pg_typeof` here reads the **value** rather than
-        // the static type — the standing divergence of that function. `conkey` beside it in the
-        // same row answers `smallint[]`, which is what this unit changed.
-        (
-            "SELECT 'r', pg_typeof(conkey), pg_typeof(confkey) FROM pg_constraint WHERE conname = \
-             'vt_pkey'",
-            "pg_typeof reads the value, and confkey is NULL on a constraint that is not a foreign \
-             key",
-            "UNMEASURED",
-        ),
-        // A set-returning function in the **target list** is a different feature from one in
-        // `FROM`, which is where `generate_subscripts` is implemented. Both lines below are that
-        // gap and neither is about the vectors.
-        // **An implicit `LATERAL`.** A set-returning function in a comma `FROM` list may name a
-        // table to its left on a real server — `generate_subscripts(c.conkey, 1)` after
-        // `pg_constraint c` — and here the entries are independent, so `c` is not in scope. The
-        // same query with the function first is what `tests/generate_subscripts.rs` runs.
-    ],
+    answers: &[],
 };
 
 #[test]

@@ -22,16 +22,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
-        "SELECT 'r', ARRAY(SELECT 1)::int8[], pg_typeof(ARRAY(SELECT 1)::int8[])",
         // These two moved up from `answers` with the literal ladder's `int4` rung (ADR 0087):
         // `ARRAY(SELECT 1)` is an `integer[]` on both now, and `pg_typeof`'s own answer is all
         // that is left of a reason that used to be about the constant's width.
-        "SELECT 'r', ARRAY(SELECT 1), pg_typeof(ARRAY(SELECT 1))",
-        "SELECT 'r', ARRAY(SELECT 1 WHERE false), pg_typeof(ARRAY(SELECT 1 WHERE false))",
         // Surfaced with the two below it when the runtime cast stopped aborting this file. The
         // rows agree; what differs is the standing integer-width trade — a small constant is
         // `integer` on a real server and `bigint` here — seen through `ARRAY(VALUES …)`.
-        "SELECT 'r', ARRAY(SELECT 'a'::text), pg_typeof(ARRAY(SELECT 'a'::text))",
         // The three below are reached for the first time now that a bare `VALUES` list runs; they
         // were swallowed by the aborted block before. Their rows are right and two facts show in
         // the declared types: a bare integer constant is `int8` here and `int4` there, so an array

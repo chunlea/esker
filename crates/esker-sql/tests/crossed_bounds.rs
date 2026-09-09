@@ -24,7 +24,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // text — a half-open pair with no brackets to report — while a stored range column is a
     // `Datum::Range`; the two shapes are documented where they part company
     // (`exec::cursor::range_value_function`). The rows agree, which is what this file is about.
-    types: &["SELECT 'r', daterange('2026-01-01', '2026-03-01') AS in_order"],
+    types: &[],
     answers: &[],
 };
 

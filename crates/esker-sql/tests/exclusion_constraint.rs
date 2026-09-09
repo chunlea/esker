@@ -10,24 +10,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // A range is `daterange` on a real server and `text` here — the standing type trade, and the
-    // one `pg_typeof` would prove. `&&` and `isempty` answer `boolean` on both.
-    types: &[
-        // `information_schema`'s own domains — `name` and two `character varying(3)`s — are `text`
-        // here, with identical characters. The trade every catalog column makes.
-        "SELECT 'r', daterange('2026-01-01','2026-02-01'), daterange('2026-01-01','2026-02-01') && \
-         daterange('2026-02-01','2026-03-01'), daterange('2026-01-01','2026-02-01') && \
-         daterange('2026-01-15','2026-03-01')",
-        "SELECT 'r', daterange(NULL,'2026-02-01'), daterange('2026-01-01',NULL), \
-         daterange(NULL,NULL) && daterange('2026-01-01','2026-02-01')",
-        // **Three more, and every value in them agrees.** `conname` and `amname` are `name` on
-        // a real server and `text` here, and `pg_typeof` answers a `regtype` there and `text`
-        // here — the trade `'x'::regtype` already makes. The `pg_typeof` line's *values* are the
-        // point and they are right: `daterange` and `boolean`, which is what says the constructor
-        // answers a range and not a string.
-        "SELECT 'r', pg_typeof(daterange('2026-01-01','2026-02-01')), \
-         pg_typeof(daterange('2026-01-01','2026-02-01') && daterange('2026-01-01','2026-02-01'))",
-    ],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
     answers: &[
         // **A scalar key**, which a real server refuses for a reason this node cannot reach.
         (

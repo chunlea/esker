@@ -24,21 +24,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `information_schema` views declare their own domain types on a real server and `text` here,
     // and the rows are identical. Nothing to do with enums — the `USER-DEFINED` and the `udt_name`
     // in those rows are what this unit is about, and both agree.
-    types: &[
-        // **`ActiveRecord`'s own `enum_types()` query, and the rows agree now**: `pg_enum` is a
-        // view over the type records, so the labels come back in declaration order with
-        // `enumsortorder` 1, 2, 3. What is left is the same trade one line up — `typname` and
-        // `nspname` are `name` on a real server and `text` here, so `array_agg` of the labels is
-        // `name[]` there and `text[]` here, with the same three strings in it.
-        // **The four `pg_enum` probes, and every row of every one of them agrees.** `typname`
-        // and `enumlabel` are `name` on a real server and `text` here — so `array_agg` of the
-        // labels is `name[]` there and `text[]` here — and `pg_typeof` answers a `regtype` there
-        // and `text` here, which is the trade `'x'::regtype` already makes. `enumsortorder` is a
-        // `real` on **both**, which is the one column of this view that had to be got right
-        // rather than traded: it is not the label's index.
-        "SELECT 'r', e.enumsortorder, pg_typeof(e.enumsortorder) FROM pg_enum e JOIN pg_type t ON \
-         t.oid = e.enumtypid WHERE t.typname = 'mood' ORDER BY e.enumsortorder",
-    ],
+    types: &[],
     answers: &[
         // **`pg_type` holds this node's own types and the tenant's, and PostgreSQL's built-in
         // ranges and domains are neither.** `daterange` is a *value* here (`crate::value::range`)

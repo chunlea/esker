@@ -1,6 +1,8 @@
 # 0077 — `regtype` is an oid that prints as a name
 
-**Status**: accepted · **Date**: 2026-09-05
+**Status**: accepted · **Date**: 2026-09-05 · the `pg_typeof` half is superseded by
+[ADR 0093](0093-pg_typeof-is-resolved-against-the-declared-type.md), which made the model this file
+chose reach the function that motivated recording it
 
 ## Context
 

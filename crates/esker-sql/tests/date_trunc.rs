@@ -36,16 +36,10 @@ const CORPUS_FIXTURE: &[&str] = &[
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **One fact, six times**: `pg_typeof` answers a `regtype` on a real server and `text` here,
-    // the trade `'x'::regtype` makes everywhere in this crate (ADR 0077). The rows are identical.
-    types: &[
-        "SELECT pg_typeof(date_trunc('day', TIMESTAMP '2026-09-05 14:37:59'))",
-        "SELECT pg_typeof(date_trunc('day', TIMESTAMPTZ '2026-09-05 14:37:59+00'))",
-        "SELECT pg_typeof(date_trunc('hour', INTERVAL '3 days 04:05:06.789'))",
-        "SELECT pg_typeof(date_trunc('day', DATE '2026-09-05'))",
-        "SELECT pg_typeof(date_trunc('day', TIMESTAMPTZ '2026-09-05 14:37:59+00', \
-         'Australia/Sydney'))",
-    ],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
     answers: &[],
 };
 

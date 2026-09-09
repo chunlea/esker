@@ -40,14 +40,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              first. Nothing reads it; the two methods this view exists for read the view itself.",
             "pg19_pg_available_extensions.txt:39",
         ),
-        (
-            "SELECT 'g', pg_typeof(name), pg_typeof(default_version), pg_typeof(installed_version) \
-             FROM pg_available_extensions WHERE name = 'plpgsql'",
-            "`pg_typeof` is not implemented for any type, so this is `0A000` naming the function. \
-             It is in the corpus because it is the statement that would *prove* the `name`-vs-\
-             `text` divergence declared above.",
-            "pg19_pg_available_extensions.txt:51",
-        ),
     ],
 };
 

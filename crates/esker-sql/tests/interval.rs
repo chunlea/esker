@@ -61,7 +61,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
-        "SELECT pg_typeof('1 day'::interval), format_type(1186, -1)",
         "SELECT '1 second'::interval(0), '1.5 seconds'::interval(0)",
         // `typname` is a `name`, `typinput` a `regproc` and `typcategory` a `"char"` on a real
         // server; all three are `text` here with identical characters, and `typlen` agrees

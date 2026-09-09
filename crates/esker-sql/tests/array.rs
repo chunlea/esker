@@ -28,8 +28,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // that had stopped differing.
         // `pg_typeof`'s own `regtype`/`text` trade (ADR 0077), and nothing else: the two array
         // types it names agree since the `int4` rung, and both `format_type` calls always did.
-        "SELECT pg_typeof('{1,2}'::int[]), pg_typeof(ARRAY[1,2]), format_type(1007, -1), \
-         format_type(1009, -1)",
         // These two used to be listed below as refusals: a bare `VALUES` list was not a relation
         // and the statement could not run. It runs now and the **rows are right**; what is left is
         // that `array_agg` declares `text` whatever it collects, where a real server declares the

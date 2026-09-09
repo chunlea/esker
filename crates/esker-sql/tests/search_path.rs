@@ -11,17 +11,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog trade: `current_schema()` is a `name` and `current_schemas` a `name[]`
-    // on a real server, `text` here, with the same characters in them.
+    // **Both lists are empty and both were about the same row.** `current_schema()` is a `name`
+    // and `current_schemas` a `name[]`, which this node answers since ADR 0086; and the row that
+    // made the trade *visible* — `pg_typeof` of the two — read the datum, which it does not since
+    // ADR 0093. Nothing in this file differs any more.
     types: &[],
-    answers: &[(
-        "SELECT 'r', pg_typeof(current_schema()), pg_typeof(current_schemas(false))",
-        "The standing catalog trade made visible as a **row**, because `pg_typeof` returns the \
-         type as a value: `name` and `name[]` there against `text` and `text` here. This node has \
-         neither type, and every other line in this file shows the two functions answering the \
-         same characters",
-        "pg19_search_path.txt:82",
-    )],
+    answers: &[],
 };
 
 #[test]

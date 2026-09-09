@@ -18,8 +18,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // **Every value agrees**, which is what these two are for: the five columns report their own
     // type names, and a cast's `pg_typeof` names the shape rather than the text it is stored as.
     types: &[
-        "SELECT 'r', pg_typeof('(2,3),(5.5,7)'::lseg), pg_typeof('2,3,5.5,7'::box), \
-         pg_typeof('{2,3,5.5}'::line)",
         // The standing `name`/`"char"` trade again, and **every value agrees**: `box` is the one
         // type in the catalog whose array delimiter is a semicolon, which r1's run-75 provenance
         // probe found answering `,` here.

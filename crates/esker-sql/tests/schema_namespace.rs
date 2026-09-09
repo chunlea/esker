@@ -24,25 +24,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname LIKE 'test_schema%' ORDER BY n.nspname, c.relname",
     ],
-    answers: &[
-        (
-            "DROP SCHEMA test_schema",
-            "**Which dependent the `DETAIL` names.** Both refuse, with the same code and the same \
+    answers: &[(
+        "DROP SCHEMA test_schema",
+        "**Which dependent the `DETAIL` names.** Both refuse, with the same code and the same \
              sentence; PostgreSQL names `things` and this node names `Things`, because the schema \
              holds four relations and the two pick a different one — a real server walks its \
              dependency entries and this walks the name records, which are in byte order and put a \
              capital `T` first. Neither order is a contract, and both name a relation that really \
              is in the way",
-            "pg19_create_schema_elements.txt:89",
-        ),
-        (
-            "SELECT 'r', pg_typeof(current_schema), pg_typeof(current_schemas(false))",
-            "The standing catalog trade made visible as a **row**, because `pg_typeof` returns the \
-             type as a value: `name` and `name[]` there against `text` and `text` here. The values \
-             those functions answer are identical, which every other line in this file shows",
-            "pg19_schema.txt:114",
-        ),
-    ],
+        "pg19_create_schema_elements.txt:89",
+    )],
 };
 
 #[test]

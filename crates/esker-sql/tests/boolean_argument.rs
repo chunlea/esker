@@ -16,9 +16,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `regtype` there and `text` here, which is what `pg_typeof` is everywhere in this crate:
-    // the printed name is identical and the declared type is not.
-    types: &["SELECT 'r', pg_typeof('a' IS NOT DISTINCT FROM 'a')"],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
     answers: &[(
         "SELECT 'r', 1 FROM bl WHERE name AND true",
         "**`character varying` there and `text` here**, and the difference is where the type is \

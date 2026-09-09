@@ -24,8 +24,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // decimal-literal `numeric` closed the widths, and **the promotion itself was always
         // right** — the integer gives way to the wider type rather than the first argument
         // winning, which is what this line was added to measure.
-        "SELECT 'r', pg_typeof(COALESCE(NULL::int4, 0)), pg_typeof(COALESCE(NULL::text, 'x')), \
-         pg_typeof(COALESCE(1, 2.5))",
         "SELECT 'r', current_database()",
         "SELECT 'r', pg_encoding_to_char(encoding) FROM pg_database WHERE datname = current_database()",
         "SELECT 'r', COALESCE(NULL, current_database())",

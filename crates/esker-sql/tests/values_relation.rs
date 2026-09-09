@@ -14,30 +14,11 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **One entry, and it was twenty-six.** Twenty-five of them said that a bare integer constant
-    // was an `int8` here where a real server's is an `int4`, so every column a `VALUES` list built
-    // from one was `bigint`; listing them one by one rather than dropping the type column is what
-    // made the day the ladder gained its `int4` rung (ADR 0087) a *failing* test rather than a
-    // silent improvement, and all twenty-five went at once. What is left is `pg_typeof`'s own
-    // `regtype`/`text` trade (ADR 0077), whose two answers are now right.
-    types: &[
-        "SELECT 'r', pg_typeof(x), pg_typeof(y) FROM (VALUES (1,'a'),(2,'b')) AS t(x,y) LIMIT 1",
-        // The decimal's own column, whose width was the other half of the same trade: a bare
-        // `1.5` is a `numeric` here now, so only `pg_typeof`'s answer differs.
-        "SELECT 'r', pg_typeof(column1) FROM (VALUES (1.5)) AS t LIMIT 1",
-    ],
-    answers: &[
-        // The standing constant-width divergence, showing through the one function that reports a
-        // type as a value: a bare integer constant is `int8` here and `int4` on a real server, so
-        // a `VALUES` column built from one is `bigint`. `pg_typeof` itself answers `text` rather
-        // than `regtype` here, which is why the declared types differ too.
-        // The rule is right and the type in the message is the constant-width divergence: the
-        // second row is read as the first row's type and fails to parse as it, which is the whole
-        // point of the line.
-        // **Not a `VALUES` gap.** A comma-separated `FROM` list is refused for every relation in
-        // this crate; the `CROSS JOIN` spelling of this same statement is the line above it and it
-        // answers.
-    ],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
+    answers: &[],
 };
 
 #[test]

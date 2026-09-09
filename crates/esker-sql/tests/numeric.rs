@@ -29,14 +29,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // (it was `0A000` naming itself), and the first of the four — a bare `1.5` — is a
         // `numeric` here as it is there. What is left is `pg_typeof`'s own `regtype`/`text` trade
         // (ADR 0077).
-        "SELECT pg_typeof(1.5), pg_typeof(1.5::numeric), pg_typeof(sum(1.5::numeric)), \
-         pg_typeof(avg(1::int8))",
         // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
         "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'numeric'",
-        "SELECT pg_typeof(1.5::numeric(10,2) + 1::int4), pg_typeof(1.5::numeric + 1.5::float8)",
         "SELECT id, n, d FROM nm ORDER BY id",
         "SELECT 1.5::numeric(10,2), 1.5::numeric(10,0), 1.5::numeric(10)",
         "SELECT 1.0::numeric(10,3)",
