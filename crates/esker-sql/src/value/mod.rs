@@ -378,6 +378,11 @@ pub fn stored_shape(value: Datum, ty: ColumnType, rendering: Rendering) -> Resul
     clippy::cast_possible_truncation,
     reason = "`in_range` checks the bound first, which is what makes each cast exact"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per pair of types whose conversion is not a text round trip; splitting it \
+              would put half the rules somewhere other than beside the other half"
+)]
 pub fn assignment_cast(value: Datum, ty: ColumnType, rendering: Rendering) -> Result<Datum> {
     if matches!(value, Datum::Null) || value.column_type() == Some(ty) {
         return Ok(value);
@@ -416,6 +421,19 @@ pub fn assignment_cast(value: Datum, ty: ColumnType, rendering: Rendering) -> Re
         return Ok(Datum::Date(
             i32::try_from(local.div_euclid(86_400_000_000)).unwrap_or(i32::MAX),
         ));
+    }
+    // **A `numeric` into an integer rounds half *away from zero***, which is the other rule from
+    // the float one below: `2.5::numeric::int` is 3 and `2.5::float8::int` is 2, measured. Scale
+    // zero is what "an integer" means, so this is `numeric`'s own `fit_to_typmod` and a cast and
+    // an assignment into a `numeric(p,0)` cannot disagree.
+    //
+    // It lives here rather than in `parse::lower` because the cast is no longer always folded: a
+    // lossy one keeps its node and converts **per row** (`debts-v1.1.md` #30), and the per-row
+    // path was a text round trip that handed `2.5` to `int4in`.
+    if let Datum::Numeric(digits) = &value
+        && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+    {
+        return numeric_to_integer(digits.clone(), ty);
     }
     // **A float into an integer rounds, and it rounds half to *even*.** Measured on 19beta1:
     // `0.5` is `0`, `1.5` is `2`, `2.5` is `2`, `3.5` is `4`, and the negatives mirror it. That is
@@ -512,6 +530,27 @@ pub fn assignment_cast(value: Datum, ty: ColumnType, rendering: Rendering) -> Re
         Some(text) => Datum::from_text(ty, &text),
         None => Ok(Datum::Null),
     }
+}
+
+/// A `numeric` as one of the three integer widths, rounded PostgreSQL's way.
+///
+/// **Half away from zero**, which is `numeric`'s rounding and not the `rint` a float gets:
+/// `2.5::numeric::int` is 3 where `2.5::float8::int` is 2. Out of range is
+/// `22003`, at the width asked for.
+pub fn numeric_to_integer(digits: esker_keys::numeric::Numeric, ty: ColumnType) -> Result<Datum> {
+    let rounded = numeric::fit_to_typmod(digits, numeric::typmod_of(1000, 0))?;
+    let wide: i64 = numeric::to_text(&rounded)
+        .parse()
+        .map_err(|_| SqlError::IntegerLiteralOutOfRange(ty.name()))?;
+    Ok(match ty {
+        ColumnType::Int8 => Datum::Int8(wide),
+        ColumnType::Int4 => Datum::Int4(
+            i32::try_from(wide).map_err(|_| SqlError::IntegerLiteralOutOfRange(ty.name()))?,
+        ),
+        _ => Datum::Int2(
+            i16::try_from(wide).map_err(|_| SqlError::IntegerLiteralOutOfRange(ty.name()))?,
+        ),
+    })
 }
 
 /// A rounded float, if it is inside an integer type's range — NaN and the infinities are not.

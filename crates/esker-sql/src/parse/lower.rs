@@ -6196,8 +6196,21 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             && matches!(to, ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2)
             && let Some(text) = cast_literal_text(expr)?
         {
-            return numeric_to_integer(&text, to)
-                .map(|value| plan::Expr::Literal(plan::Literal::Typed(Box::new(value))));
+            // **The rounding is kept under a `Cast` node, because rounding is not invertible.**
+            // `(-1.5)::integer` is `-2`, and no rule over `-2` can say the expression was written
+            // with `-1.5` — a real server holds `('-1.5'::numeric)::integer` and prints that
+            // (`debts-v1.1.md` #30). The value is unchanged either way; what the node keeps is the
+            // number that was written. Third clause of the same sentence ADR 0086 opened: a datum
+            // carries its type, never its modifier, and never the value it was converted *from*.
+            // `numeric_to_integer` still runs, because its **range** error belongs at parse time:
+            // `(1e30)::integer` is `22003` before any row exists. Its value is discarded — the
+            // conversion happens per row under the node, which is where a real server does it too.
+            numeric_to_integer(&text, to)?;
+            return Ok(plan::Expr::Cast {
+                operand: Box::new(lower_expr(expr)?),
+                to,
+                typmod: NO_TYPMOD,
+            });
         }
         return match cast_literal_text(expr)? {
             Some(text) => {
@@ -6226,6 +6239,18 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 // already makes one clause further: a value carries its type and never its
                 // modifier. Keeping the node costs a no-op cast at evaluation and is what
                 // `exec::query::typmod_of` reads.
+                // **The digits that were written, under the node.** Where the conversion lost
+                // them, the operand has to be the literal as it was — folding it and then wrapping
+                // the *result* would keep a node over a constant nobody wrote. Same shape as the
+                // rounding arm above, and the conversion happens per row, which is where a real
+                // server does it.
+                if !fold_keeps_the_digits(&text, ty, &value) {
+                    return Ok(plan::Expr::Cast {
+                        operand: Box::new(lower_expr(expr)?),
+                        to: ty,
+                        typmod,
+                    });
+                }
                 if value.column_type() == Some(ty) && typmod == NO_TYPMOD {
                     return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(value))));
                 }
@@ -6489,23 +6514,11 @@ fn is_comparison(op: &BinaryOperator) -> bool {
 /// constant that far out gets — a `numeric` past `int4` is `integer out of range`, not a
 /// `numeric` error.
 fn numeric_to_integer(text: &str, to: ColumnType) -> Result<Datum> {
-    let value = value::numeric::from_text(text)?;
-    // Scale zero is what "an integer" means here, and `fit_to_typmod` is where the rounding rule
-    // lives — so the cast and an assignment into a `numeric(p,0)` round identically.
-    let rounded = value::numeric::fit_to_typmod(value, value::numeric::typmod_of(1000, 0))?;
-    let digits = value::numeric::to_text(&rounded);
-    let wide: i64 = digits
-        .parse()
-        .map_err(|_| SqlError::IntegerLiteralOutOfRange(to.name()))?;
-    Ok(match to {
-        ColumnType::Int8 => Datum::Int8(wide),
-        ColumnType::Int4 => Datum::Int4(
-            i32::try_from(wide).map_err(|_| SqlError::IntegerLiteralOutOfRange(to.name()))?,
-        ),
-        _ => Datum::Int2(
-            i16::try_from(wide).map_err(|_| SqlError::IntegerLiteralOutOfRange(to.name()))?,
-        ),
-    })
+    // **One rule, one place.** The rounding lives beside every other cast between two datums
+    // (`value::numeric_to_integer`), because the fold is no longer the only caller: a lossy cast
+    // keeps its node and converts per row (`debts-v1.1.md` #30). Asked here only for the
+    // **range** error, which belongs at parse time.
+    value::numeric_to_integer(value::numeric::from_text(text)?, to)
 }
 
 /// The `42846` a pair of types with no cast between them gets, or `None` for a pair that has one.
@@ -6812,6 +6825,28 @@ fn cast_operand(expr: &Expr, data_type: &DataType) -> Result<String> {
     // readers and the narrow one was the bug.
     cast_literal_text(expr)?
         .ok_or_else(|| SqlError::unsupported(format!("the cast {expr}::{data_type}")))
+}
+
+/// Whether folding this literal to `ty` still holds the number that was **written**.
+///
+/// Asked only of the two floats, and that is the whole of the rule: a float has 53 bits, so
+/// `(9223372036854775807)::double precision` comes back `9.223372036854776e+18` and the digits
+/// that were written are gone. A real server never folds the cast at all — it holds
+/// `('9223372036854775807'::bigint)::double precision` — and this node reconstructs that form from
+/// the folded constant wherever the value survives ([`exec::ddl::numeric_constant`], debt #24);
+/// where it does not, the node is what carries it (`debts-v1.1.md` #30).
+///
+/// **Not asked of the other types, deliberately.** A spelling difference is not a loss:
+/// `'2020-1-1'::date` folds to a `date` that prints `2020-01-01`, and a real server normalises it
+/// the same way — keeping a node there would print a constant nobody wrote. The float case is a
+/// difference in the *value*, which is a different thing from a difference in the spelling.
+fn fold_keeps_the_digits(text: &str, ty: ColumnType, value: &Datum) -> bool {
+    if !matches!(ty, ColumnType::Real | ColumnType::Double) {
+        return true;
+    }
+    value
+        .to_text()
+        .is_some_and(|rendered| rendered == text.trim())
 }
 
 /// The two cast targets this node answers, or `None` for every other one.

@@ -2280,6 +2280,16 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     crate::value::Rendering::default(),
                 )?
             }
+            // **A `numeric` to an integer rounds; it does not go through text.** `numeric`'s
+            // output function writes `2.5` and `int4in` refuses it, so the round trip made a
+            // conversion a real server performs into a `22P02`. It became reachable when a lossy
+            // cast started keeping its node and converting per row (`debts-v1.1.md` #30) — before
+            // that the fold did it at parse time and nothing asked the evaluator.
+            value @ Datum::Numeric(_)
+                if matches!(to, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8) =>
+            {
+                crate::value::assignment_cast(value, *to, crate::value::Rendering::default())?
+            }
             value => {
                 // **The session's output function, not the boot one.** A cast between two types
                 // here is a text round trip, so the text it goes through has to be the text the
