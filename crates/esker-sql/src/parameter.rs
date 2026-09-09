@@ -281,6 +281,29 @@ pub const PARAMETERS: &[Parameter] = &[
         values: Values::Enum(&["row", "columnar", "auto"]),
         read_only: false,
     },
+    // **Who finishes a `CREATE INDEX CONCURRENTLY`, and therefore when its client is told.**
+    //
+    // `wait` is PostgreSQL's contract and the boot value: the statement drives the change through
+    // ADR 0020's states and answers when the index is public — or with the build's own `23505`
+    // when a duplicate fails it, leaving the invalid index behind exactly as a real server does
+    // (`tests/invalid_index.rs`, `postgresql_adapter_test#test_invalid_index`).
+    //
+    // `stage` is what this node did before and it is not a debug knob: a concurrent build here
+    // waits PD's step interval between transitions, so on a real cluster the statement holds its
+    // client for `3 × (lease + lock TTL)`, and an operator starting one from a migration may want
+    // the job left for the re-driver instead. It is also how the staged machine's own tests drive
+    // it by hand (`tests/schema_change.rs`, `tests/redrive.rs`) — the states cannot be watched
+    // through a statement that has already finished them.
+    //
+    // A real server accepts `SET esker.concurrent_index_build = 'sideways'` because it validates
+    // no custom parameter, so the enum is a declared divergence, the same one `esker.engine` is.
+    Parameter {
+        name: "esker.concurrent_index_build",
+        reported: "esker.concurrent_index_build",
+        boot: "wait",
+        values: Values::Enum(&["wait", "stage"]),
+        read_only: false,
+    },
     Parameter {
         name: "max_identifier_length",
         reported: "max_identifier_length",

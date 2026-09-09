@@ -5143,8 +5143,15 @@ pub(super) fn create_index(
                 removing: false,
             },
         );
-        // The statement returns as soon as the job exists, which is what `CONCURRENTLY` means:
-        // `esker_schema_jobs()` is where a human watches the states advance.
+        // **And the statement waits for it, unless this session asked not to.** PostgreSQL
+        // answers a concurrent build when the build is done — with the build's own `23505` when a
+        // duplicate fails it — so the id is left for the far side of the commit
+        // (`finish_concurrent_build`), which is the earliest a job step can see the declaration.
+        // Under `esker.concurrent_index_build = 'stage'` the statement returns as soon as the job
+        // record exists, and `esker_schema_jobs()` is where a human watches the states advance.
+        if drives_the_build(executor) {
+            executor.concurrent_build = Some(index_id);
+        }
         return Ok(Outcome::done("CREATE INDEX"));
     }
     // An index over a table that already has rows has to be *built*, not just declared. An index
@@ -5157,6 +5164,115 @@ pub(super) fn create_index(
     catalog::replace_table(txn, executor.tenant, &table, &updated)?;
     Ok(Outcome::done("CREATE INDEX"))
 }
+
+/// Whether this session's `CREATE INDEX CONCURRENTLY` waits for the build it starts.
+///
+/// `esker.concurrent_index_build`, whose boot value is `wait` because that is PostgreSQL's
+/// contract. The parameter is in the table, so `lookup` cannot fail.
+fn drives_the_build(executor: &Executor) -> bool {
+    crate::parameter::lookup("esker.concurrent_index_build")
+        .is_ok_and(|parameter| executor.parameter(parameter) == "wait")
+}
+
+/// Drives the `CREATE INDEX CONCURRENTLY` this statement declared, and answers when it is done.
+///
+/// Called on the far side of the statement's commit and nowhere else: a job step is a transaction
+/// of its own, so it cannot see a declaration this statement has not committed yet. That the
+/// statement *has* one of its own is what `25001` guarantees — a concurrent build inside a
+/// transaction block is refused, so there is never a block whose rollback could take the
+/// declaration back after the build has begun.
+///
+/// # What the client is told
+///
+/// * the change reaches `public` — the statement answers `CREATE INDEX`, and the index is readable
+///   the moment the client hears back, which is what makes it usable from the next statement;
+/// * the backfill meets a duplicate — the states unwind, the **invalid index stays in the
+///   catalog** (`indisvalid = f`, its name still taken) and the client is told the build's own
+///   `23505 could not create unique index "…"`. All three halves measured on 19beta1 and pinned in
+///   `tests/invalid_index.rs`; `postgresql_adapter_test#test_invalid_index` asserts all three;
+/// * this node loses its schema lease part-way — `55000`, and the job is left where it is for
+///   another node's re-driver, which is the same rule the re-driver applies to itself.
+///
+/// # The wait between transitions is kept
+///
+/// A state transition may not be followed by another until PD's step interval has passed, or a
+/// node one state behind could end up two (ADR 0020, [`crate::exec::verbs::Stepped`]). Driving
+/// from the statement does not make that cheaper, so the wait is taken here — three of them for a
+/// build, and on a real cluster that is `3 × (lease + lock TTL)`. A node the interval was never
+/// published to takes none: it has no placement driver, and so no second node that could be a
+/// state behind it (`bin/esker-sql.rs`).
+///
+/// Interruptible throughout, in short sleeps: `statement_timeout` and a cancel both reach a
+/// statement that is waiting, the way they reach `pg_sleep`.
+pub(super) fn finish_concurrent_build(executor: &mut Executor) -> Result<()> {
+    let Some(index_id) = executor.concurrent_build.take() else {
+        return Ok(());
+    };
+    let step_wait = executor
+        .backend
+        .schema_step_interval()
+        .map(|interval| std::time::Duration::from_millis(interval.step_ms));
+    // Only an `Overtaken` step leaves the change where it was, and only another driver can cause
+    // one — a re-driver adopts a job that has been idle for a whole pass, which this one is not.
+    // So this bounds something that should not happen at all, rather than the loop itself: every
+    // other step either moves a state or moves the backfill cursor, and the change is finished
+    // when its job record is gone.
+    let mut overtaken = 0;
+    loop {
+        super::cancel::check()?;
+        // **The lease is checked before every step**, not once at the start: a build is many
+        // transactions over minutes, and a node past its lease may be acting on a schema the
+        // cluster has moved two states beyond (ADR 0028). Stopping leaves the job for another
+        // node, which is what the re-driver is for.
+        if executor.backend.schema_lease_remaining().is_none() {
+            return Err(SqlError::SchemaLeaseExpired {
+                command: "CREATE INDEX CONCURRENTLY",
+            });
+        }
+        let mut txn = executor.plain_read()?;
+        let running = catalog::job(&*txn, executor.tenant, index_id)?.is_some();
+        if !running {
+            // Finished — its own last step forgets the record — or finished by somebody else.
+            let _ = txn.rollback();
+            return Ok(());
+        }
+        let stepped = super::verbs::step_job(executor, &mut *txn, index_id, None);
+        // Read-only: every write a step makes is in a transaction `crate::exec::job` opens and
+        // commits itself, which is what makes a step a step.
+        let _ = txn.rollback();
+        // A duplicate has already unwound the change by the time this is an error, so the invalid
+        // index is in the catalog and this is the client's answer.
+        let stepped = stepped?;
+        if matches!(stepped, super::verbs::Stepped::Overtaken) {
+            overtaken += 1;
+            if overtaken > OVERTAKEN_LIMIT {
+                return Err(SqlError::Internal(format!(
+                    "the concurrent build of index {index_id} was overtaken \
+                     {OVERTAKEN_LIMIT} times without finishing"
+                )));
+            }
+        } else {
+            overtaken = 0;
+        }
+        if stepped.starts_the_wait()
+            && let Some(wait) = step_wait
+        {
+            let until = std::time::Instant::now() + wait;
+            loop {
+                super::cancel::check()?;
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                // Short steps, so a cancel is acted on promptly rather than an interval later.
+                std::thread::sleep(left.min(std::time::Duration::from_millis(10)));
+            }
+        }
+    }
+}
+
+/// How many times in a row a driven build may be overtaken before it is called stuck.
+const OVERTAKEN_LIMIT: u32 = 64;
 
 /// Checks that an index expression can be an index key, and resolves it against the table.
 ///

@@ -202,6 +202,15 @@ pub struct Executor {
     /// rather than from the shared cache: they answer with its own uncommitted definitions, which
     /// must not reach the other sessions on this node (`crate::catalog`).
     catalog_written: bool,
+    /// The `CREATE INDEX CONCURRENTLY` this statement declared, to be driven **after** it commits.
+    ///
+    /// PostgreSQL answers a concurrent build when the build is done, and so does this node
+    /// (`esker.concurrent_index_build`). The drive cannot happen inside the statement: a job step
+    /// is a transaction of its own and would not see a declaration that is still uncommitted, so
+    /// the id is left here and `crate::exec::ddl::finish_concurrent_build` picks it up on the far
+    /// side of the commit. There is at most one, and it is only ever the implicit transaction's:
+    /// `25001` refuses the statement inside a block.
+    concurrent_build: Option<u64>,
     /// The snapshot this session reads at, when it is not reading the present.
     read_as_of: Option<ReadAsOf>,
     /// Whether the open transaction has run a statement.
@@ -770,6 +779,7 @@ impl Executor {
             last_sequence: None,
             savepoints: savepoint::Savepoints::default(),
             catalog_written: false,
+            concurrent_build: None,
             read_as_of: None,
             open_used: false,
             block_read_only: false,
@@ -999,7 +1009,12 @@ impl Executor {
                         Ok(()) => {
                             // After the commit, and only after it.
                             self.report_columnar();
-                            Ok(outcome)
+                            // **And the concurrent build after that**, because a job step is a
+                            // transaction of its own and cannot see a declaration this one has
+                            // not committed yet. Its error is the statement's: a duplicate leaves
+                            // the invalid index behind and tells the client `23505`, which is
+                            // what a real server does (`crate::exec::ddl`).
+                            ddl::finish_concurrent_build(self).and(Ok(outcome))
                         }
                         Err(error) => Err(error),
                     };
@@ -1009,6 +1024,9 @@ impl Executor {
                     let _ = txn.rollback();
                     txn = self.open_txn()?;
                     self.catalog_written = false;
+                    // Declared by the attempt that is being thrown away, so the re-run declares
+                    // it again — and a job whose declaration was rolled back must not be driven.
+                    self.concurrent_build = None;
                 }
                 Err(error) => {
                     // The rollback's own failure is not what the client asked about; the
@@ -1029,6 +1047,7 @@ impl Executor {
         // A statement that did not commit changed nothing PD could act on, whether it was rolled
         // back or refused.
         self.columnar_changed = false;
+        self.concurrent_build = None;
         outcome
     }
 

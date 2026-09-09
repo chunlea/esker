@@ -250,6 +250,16 @@ is how that TODO closes.
   > coordinating" is not a reason to stop, but stepping without an interval means inventing one and
   > an invented interval that is short is the unsafety the number exists to prevent.
   > `docs/plans/debt-c2.md`.
+  >
+  > **Amended a third time: the statement that starts a change is a driver too, and its client
+  > waits.** "`CREATE INDEX` becoming a job rather than a statement that finishes" was read here as
+  > a change to what the *client* sees, and that half was wrong: PostgreSQL's concurrent build is
+  > synchronous to its client, and a failed one answers `23505 could not create unique index "…"`
+  > with the invalid index left in the catalog. So the statement now drives its own job to the end,
+  > taking the interval between transitions like any other driver, and answers when the change is
+  > over. The states, the interval, the cursor and the re-driver are unchanged — what changed is
+  > who takes the first steps and who is told. [ADR 0083](0083-a-concurrent-build-answers-when-it-is-built.md),
+  > and `esker.concurrent_index_build = 'stage'` is the old behaviour under a name.
 * **`esker-proto`** — the messages PD needs to hand a schema-change job out and collect its
   progress, and the lease. **Amended (phase 6e):** the lease is a method of its own,
   `Pd::SchemaLease` (0x0307), rather than a field on a message PD already sends — PD sends a SQL

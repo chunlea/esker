@@ -220,7 +220,9 @@ fn a_key_part_past_the_last_one_is_the_empty_string() {
 /// as the one `CREATE INDEX` builds inside its own transaction.
 ///
 /// The fourth place index entries are made (ADR 0020's backfill job), and the one a test that only
-/// exercises the plain form leaves uncovered.
+/// exercises the plain form leaves uncovered. The job is driven by the statement itself now, which
+/// is PostgreSQL's contract (`tests/invalid_index.rs`) — the same backfill code either way, and
+/// nothing left over to step by hand.
 #[test]
 fn a_concurrent_expression_index_is_built_by_the_job() {
     let mut node = parity::Node::new(&[]);
@@ -232,13 +234,10 @@ fn a_concurrent_expression_index_is_built_by_the_job() {
     ] {
         node.run(statement).unwrap();
     }
-    for step in 1..500 {
-        let said = node.rows("SELECT esker_schema_step('xi_expr')")[0][0].clone();
-        assert!(step < 499, "the job did not finish");
-        if said == "public" {
-            break;
-        }
-    }
+    assert!(
+        node.rows("SELECT * FROM esker_schema_jobs()").is_empty(),
+        "the build finished inside the statement that asked for it"
+    );
     assert_eq!(
         node.rows("SELECT pg_get_indexdef('xi_expr'::regclass)"),
         [["CREATE UNIQUE INDEX xi_expr ON public.xi USING btree (lower(b))"]]

@@ -77,6 +77,11 @@ fn a_half_built_index_is_not_valid() {
         "INSERT INTO iv VALUES (1, 10), (2, 20)",
     ]);
 
+    // Staged rather than driven, because a build the statement finishes has nothing half-built
+    // to report: `wait` is the boot value and PostgreSQL's contract (`tests/invalid_index.rs`),
+    // and `stage` is what leaves an index between states for this to read.
+    node.run("SET esker.concurrent_index_build = 'stage'")
+        .unwrap();
     node.run("CREATE INDEX CONCURRENTLY iv_a_idx ON iv (a)")
         .unwrap();
     assert_eq!(
