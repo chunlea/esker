@@ -36,21 +36,19 @@ const PG_TYPEOF: &str = "`pg_typeof` is not implemented at all, so this is `0A00
      function rather than a wrong type — the honest answer under contract C2. Several of these \
      lines would *prove* the `regtype`-is-`text` divergence above if the function existed.";
 
-/// The other direction: an OID back to a name.
-const REVERSE: &str = "**The reverse direction answers now** — `t.typelem::regtype` is how \
-     `ActiveRecord` reads what an array type is over, which is the caller this half never had — \
-     and every value below is byte-identical: `23` is `integer`, `1007` is `integer[]`, oid 0 is \
-     `-` and an unknown number prints as itself. What is left is the standing trade: a `regtype` \
-     is a type of its own on a real server, four bytes holding an oid that print as a name, and \
-     `text` here, so `RowDescription` differs and the characters do not.";
-
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
-        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
-        // differs is one of the standing declared-type families listed on
-        // `parity::Divergences::types`. The reason each one used to carry described an answer
-        // that had stopped differing.
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still differs
+        // is one of the standing declared-type families listed on `parity::Divergences::types`.
+        //
+        // The reason they used to carry was about the *answer*, and it had stopped being true:
+        // "the reverse direction answers now — `t.typelem::regtype` is how `ActiveRecord` reads
+        // what an array type is over, which is the caller this half never had — and every value
+        // below is byte-identical: `23` is `integer`, `1007` is `integer[]`, oid 0 is `-` and an
+        // unknown number prints as itself." What is left is the trade a `regtype` always was: a
+        // type of its own on a real server, four bytes holding an oid that print as a name, and
+        // `text` here — so `RowDescription` differs and the characters do not.
         "SELECT 23::regtype, 1043::regtype",
         "SELECT 1007::regtype, 1009::regtype",
         "SELECT 999999::regtype",
