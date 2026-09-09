@@ -130,7 +130,63 @@ The three shapes are not a ladder — A does not become B by adding to it, becau
 does not carry the identity through the pipeline and B is exactly that carrying. Choosing A and
 later wanting arrays means doing B anyway.
 
-What would decide it, if the answer is not obvious: whether any client in the acceptance suite
-branches on `typtype = 'd'` or reads `udt_name`, and whether `information_schema` queries in the
-Rails suite ever wrap a domain column in an expression rather than selecting it bare. Both are
-measurable against the corpus without writing any of this.
+Both halves of that question have now been measured against the captured suites rather than
+guessed. Sources: `esker-rails-harness/results/` and `triage/` (the `log_statement` captures, 378 MB),
+and the ActiveRecord checkout the suite runs from, `esker-rails-harness/rails/`.
+
+### Who branches on `typtype = 'd'`
+
+**ActiveRecord does, on every connection, and it asks for domains by name.** Its type-map load is
+
+```sql
+SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, t.typtype, t.typbasetype
+FROM pg_type as t LEFT JOIN pg_range as r ON oid = rngtypid
+WHERE t.typtype IN ('r', 'e', 'd')
+```
+
+— **712 occurrences across 164 captured files**. It selects `typbasetype` beside `typtype` for
+exactly one reason: a domain's oid is registered against its *base type's* decoder.
+
+That is the constraint the two building shapes have to meet, and it is sharper than "add a row to
+`pg_type`": **if this node ever sends a domain's oid on the wire, that oid must come back from
+this query, or ActiveRecord has no decoder for it** and falls back to a string. Shape C never
+sends one, which is why it is safe today without anything being added at all.
+
+Nothing else in the corpus branches on it. `domain_name` appears **zero** times.
+`information_schema.domains` appears **once**, in `results/run-77/provenance.txt:18`, and it is one
+of this project's own corpus probes rather than a client statement.
+
+### How the suite reads a domain column
+
+**Bare, and only twice, and neither read is about the type.**
+
+* `activerecord/test/cases/adapters/postgresql/timestamp_test.rb:202` asserts
+  `{"data_type" => "USER-DEFINED", "udt_name" => "custom_time_format"}` from
+  `select data_type, udt_name from information_schema.columns where column_name = 'times'`. Both
+  columns are domains (`character_data`, `sql_identifier`) and both are selected bare — but what
+  the test checks is an **enum's name**, a value. It would pass against a node that answered
+  `name` for the column's own type.
+* `activerecord/lib/active_record/connection_adapters/postgresql/referential_integrity.rb:53`
+  reads `constraint_name`, `table_schema` and `table_name` from
+  `information_schema.table_constraints` — three `sql_identifier` domains, and it **wraps all three
+  in `format()`**. A wrap is the case shape A gets wrong, and it does not matter here: `format()`
+  returns `text` on both servers, so the domain is gone on the real one too.
+
+**No statement in the suite puts a domain column into an aggregate.** The only one in the corpus is
+`array_agg(table_name)`, which is r1's own wire probe — and r1 recorded the verdict beside it in
+`results/run-107.md:43`: *"ACCEPTED. PG's `information_schema` column is a DOMAIN over `name`; the
+node returns the base array type. An improvement on `text`, and ActiveRecord decodes 1003 as an
+array either way."*
+
+### What that leaves
+
+The array half is what shape **B** exists for, and the wire sweep has already accepted it. The
+scalar half is what shape **A** buys, and the two suite reads that touch it are a value assertion
+and a `format()` wrap. So **nothing measured here is failing today for want of a domain type**, and
+the risk runs the other way: sending a domain oid that the type-map query above does not return
+would turn a correct value into a string.
+
+That does not make C the answer — `udt_name` is one schema-dumper change away from mattering, and
+this project has been bitten three times by *right bytes, wrong declared type* (ADR 0086). It makes
+the milestone a **choice about when**, with no test currently forcing it, which is what a milestone
+the user sets should look like.
