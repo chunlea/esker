@@ -215,6 +215,8 @@ pub enum PeerMsg {
     Progress(oneshot::Sender<Vec<esker_raft::PeerProgress>>),
     /// What this peer's elections have done. See [`esker_raft::Counters`].
     Counters(oneshot::Sender<esker_raft::Counters>),
+    /// The membership **this peer's own core** believes it is in.
+    Membership(oneshot::Sender<ConfState>),
     /// Ask this region's leadership to move to another peer.
     TransferLeader(NodeId),
     /// What became of a snapshot transfer this store was serving to `to`. The core stops sending
@@ -1131,6 +1133,9 @@ impl PeerCore {
             PeerMsg::Counters(notify) => {
                 let _ = notify.send(self.node.counters());
             }
+            PeerMsg::Membership(notify) => {
+                let _ = notify.send(self.node.conf_state());
+            }
             PeerMsg::TransferLeader(target) => self.node.transfer_leader(target),
             PeerMsg::ReportSnapshot { to, status } => self.node.report_snapshot(to, status),
             PeerMsg::Stop => return false,
@@ -1474,6 +1479,23 @@ impl RaftPeer {
     pub async fn counters(&self) -> std::result::Result<esker_raft::Counters, ProtoError> {
         let (notify, answer) = oneshot::channel();
         self.send(PeerMsg::Counters(notify)).await?;
+        answer
+            .await
+            .map_err(|_| ProtoError::internal("the Raft peer stopped"))
+    }
+
+    /// **What this peer's own core believes the membership is**, which is not always what the
+    /// placement driver believes.
+    ///
+    /// The two coming apart is the root of the stall
+    /// [ADR 0085](../../../docs/adr/0085-a-vote-is-not-granted-to-a-learner.md) contains: a peer
+    /// the driver held as a learner had itself among the voters and therefore campaigned. Every
+    /// construction path was read and each builds the configuration correctly from the region
+    /// record, so what is missing is the peer's own answer at the moment it goes wrong — which is
+    /// this.
+    pub async fn membership(&self) -> std::result::Result<ConfState, ProtoError> {
+        let (notify, answer) = oneshot::channel();
+        self.send(PeerMsg::Membership(notify)).await?;
         answer
             .await
             .map_err(|_| ProtoError::internal("the Raft peer stopped"))

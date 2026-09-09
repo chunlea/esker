@@ -229,10 +229,15 @@ async fn put(stores: &[&Arc<Store>], key: Bytes, value: &[u8]) {
                 // after the round it answers. The state alone cannot tell those apart, and turning
                 // tracing up stops the stall reproducing.
                 let counters = peer.counters().await.ok();
+                // **And what this peer's own core believes the membership is.** Every construction
+                // path builds it correctly from the region record, so the next reproduction has to
+                // say where the divergence comes in instead — and it cannot say that unless the
+                // peer's own answer is on the line beside the driver's.
+                let mine = peer.membership().await.ok();
                 seen.push(format!(
                     "store {id}: region {region_id} term={} is_leader={} believes_leader={:?} \
                      raft_role={role} voted_for={voted_for:?}; membership [{membership}]; \
-                     elections {counters:?}",
+                     its own core says {mine:?}; elections {counters:?}",
                     peer.term(),
                     peer.is_leader(),
                     peer.leader()
@@ -429,6 +434,30 @@ fn one_peer_per_store(region: &Region) {
     }
 }
 
+/// What each store's core believes the membership of `region` is.
+///
+/// The placement driver's answer is already on the line above it. These two disagreeing is the root
+/// of the stall ADR 0085 contains, and no construction path in `esker-store` explains it — so the
+/// next reproduction has to be asked directly.
+async fn memberships(all: &[&Node], region_id: u64) -> String {
+    let mut out = Vec::new();
+    for node in all {
+        let Some(peer) = node.store.peer_of(region_id) else {
+            continue;
+        };
+        let Ok(conf) = peer.membership().await else {
+            continue;
+        };
+        out.push(format!(
+            "store {}: voters {:?} learners {:?}",
+            node.store.store_id(),
+            conf.voters,
+            conf.learners
+        ));
+    }
+    out.join("; ")
+}
+
 /// Every store's election counters for `region`, as one line.
 ///
 /// The four numbers that separate the hypotheses this stall has left: `campaigns_real` is the term
@@ -605,11 +634,13 @@ async fn watch_until_every_learner_votes(
                             // `esker_raft` up to `debug` made it stop reproducing, four runs of
                             // four. These are cheap enough to leave on while the race is on.
                             let elections = election_counters(all, region.id).await;
+                            let beliefs = memberships(all, region.id).await;
                             panic!(
                                 "peer {} of region {} has been a learner for {:?} — the phase-4 \
                                  acceptance stall. the placement driver holds {:?} at epoch {:?}, \
                                  led by peer {}. the learner's own store says: {theirs:?}. the \
-                                 leader believes: {believed}. elections: {elections}",
+                                 leader believes: {believed}. each core's own membership: \
+                                 {beliefs}. elections: {elections}",
                                 peer.peer_id,
                                 region.id,
                                 since.elapsed(),
