@@ -66,7 +66,38 @@ fn action() -> impl Strategy<Value = Action> {
 }
 
 fn run(ids: &[NodeId], seed: u64, actions: &[Action]) -> Result<(), TestCaseError> {
-    let mut group = Harness::new(ids, seed);
+    run_group(Harness::new(ids, seed), ids, &[], actions)
+}
+
+/// The same schedule over a group that has a **learner** in it.
+///
+/// Every checker this project had modelled voters only — the exhaustive model next door, the
+/// simulator's five nodes, and the three properties below — so none of them could have found
+/// [ADR 0085](../../../docs/adr/0085-a-vote-is-not-granted-to-a-learner.md)'s defect, and none did:
+/// a learner whose own configuration wrongly had it as a voter campaigned, was granted votes by a
+/// voter that was between leaders, and kept a region leaderless for as long as the load lasted.
+/// A property cannot fail on a shape it never builds.
+fn run_with_learner(
+    voters: &[NodeId],
+    learners: &[NodeId],
+    seed: u64,
+    actions: &[Action],
+) -> Result<(), TestCaseError> {
+    let ids: Vec<NodeId> = voters.iter().chain(learners).copied().collect();
+    run_group(
+        Harness::with_learners(voters, learners, seed),
+        &ids,
+        learners,
+        actions,
+    )
+}
+
+fn run_group(
+    mut group: Harness,
+    ids: &[NodeId],
+    learners: &[NodeId],
+    actions: &[Action],
+) -> Result<(), TestCaseError> {
     for (at, action) in actions.iter().enumerate() {
         let node = |index: u8| ids[usize::from(index) % ids.len()];
         match *action {
@@ -115,12 +146,44 @@ fn run(ids: &[NodeId], seed: u64, actions: &[Action]) -> Result<(), TestCaseErro
                 "after action {at} ({action:?}): {violation}"
             )));
         }
+        // **A node outside the voter set is never granted a vote** (ADR 0085). It cannot reach a
+        // quorum, so a grant buys nothing and costs the granter its vote for the term and, for a
+        // real vote, its leader — which is a loop that does not end, because the next round starts
+        // from the same place.
+        for message in group.pending_messages() {
+            if let crate::message::Message::RequestVoteResponse {
+                from,
+                to,
+                granted: true,
+                ..
+            } = message
+                && learners.contains(to)
+            {
+                return Err(TestCaseError::fail(format!(
+                    "after action {at} ({action:?}): node {from} granted a vote to {to}, which \
+                     this configuration holds as a learner"
+                )));
+            }
+        }
     }
     Ok(())
 }
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    /// **Three voters and a learner**, which is the shape every other property here cannot build.
+    ///
+    /// The learner is in each node's `ConfState`. What is asserted beyond the two safety checks is
+    /// ADR 0085's rule: no schedule of ticks, campaigns, deliveries, drops and duplicates ever has
+    /// a voter grant it a vote.
+    #[test]
+    fn a_learner_is_never_granted_a_vote(
+        seed in any::<u64>(),
+        actions in prop::collection::vec(action(), 1..48),
+    ) {
+        run_with_learner(&[1, 2, 3], &[4], seed, &actions)?;
+    }
 
     /// Three voters: the smallest group where a split vote is possible.
     #[test]
