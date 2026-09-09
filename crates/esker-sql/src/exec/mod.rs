@@ -2526,6 +2526,7 @@ impl Executor {
         self.resolve_current_user(&mut statement);
         self.resolve_current_setting(&mut statement)?;
         self.resolve_advisory(&mut statement)?;
+        self.resolve_functional_notation(txn, &mut statement)?;
         self.resolve_regclass(txn, &mut statement)?;
         self.resolve_user_cast(txn, &mut statement)?;
         self.resolve_user_functions(txn, &mut statement)?;
@@ -2709,6 +2710,78 @@ impl Executor {
             }
             std::thread::sleep(std::time::Duration::from_millis(WAIT_STEP_MS));
         }
+    }
+
+    /// **`posts.count` is `count(posts)`**: PostgreSQL's functional notation, where a qualified
+    /// name that is not a column is read as a call on the row.
+    ///
+    /// `calculations · test_group_by_with_order_by_virtual_count_attribute` orders by
+    /// `"posts"."count"`, which is a column on neither server — `information_schema` has no row for
+    /// it on either — and PostgreSQL answers anyway. This node said
+    /// `42703 column posts.count does not exist`, which was **literally true and still the wrong
+    /// answer**.
+    ///
+    /// **A column always wins**, which is why this needs the catalog and cannot be a rewrite in the
+    /// lowering: a table that really has a `count` column must keep meaning the column. So the
+    /// rewrite happens only where the qualifier names a table in this statement and that table has
+    /// no such column, and a name that is neither is left to the `42703` it always had — measured,
+    /// `SELECT h1p.nosuchfn FROM h1p` is that error on PostgreSQL 19 too.
+    ///
+    /// **Only `count`, and only without an outer join.** The notation applies to any function whose
+    /// argument is the row type, and `count` is the one this node can answer: a whole-row value has
+    /// no representation here, and `count(t)` over a base table is `count(*)` exactly, because a
+    /// table's row is never NULL. That equivalence is what an outer join breaks — the null-extended
+    /// side's row *is* NULL and PostgreSQL counts only the matched rows — so a statement with one
+    /// keeps the column error rather than being given an answer that is right only sometimes.
+    fn resolve_functional_notation(&self, txn: &dyn Txn, statement: &mut Statement) -> Result<()> {
+        use crate::plan::{AggregateCall, AggregateFunc, Expr};
+
+        let qualified = |expr: &Expr| {
+            matches!(expr, Expr::Column { table: Some(_), name }
+                if name.eq_ignore_ascii_case("count"))
+        };
+        if !bind::any(statement, qualified) {
+            return Ok(());
+        }
+        if let Statement::Select(select) = statement
+            && select
+                .joins
+                .iter()
+                .any(|join| !matches!(join.kind, crate::plan::JoinKind::Inner))
+        {
+            return Ok(());
+        }
+        let tables = self.tables_for(txn, statement)?;
+        let mut rewrite = |expr: &mut Expr| {
+            let Expr::Column {
+                table: Some(relation),
+                name,
+            } = expr
+            else {
+                return;
+            };
+            if !name.eq_ignore_ascii_case("count") {
+                return;
+            }
+            let named = tables
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(relation));
+            // A qualifier this statement does not name is somebody else's error to report, and a
+            // table that really has the column keeps it.
+            let Some(table) = named else { return };
+            if table.column(name).is_some() {
+                return;
+            }
+            *expr = Expr::Aggregate(Box::new(AggregateCall {
+                func: AggregateFunc::Count,
+                args: Vec::new(),
+                star: true,
+                distinct: false,
+                order_by: Vec::new(),
+            }));
+        };
+        bind::walk_mut(statement, &mut rewrite);
+        Ok(())
     }
 
     /// Folds every `current_setting(…)` to the value this session reports.
@@ -4573,6 +4646,10 @@ impl Executor {
         // order is: type, then expand. `tables` is untouched by the move for an `INSERT`, `UPDATE`
         // or `DELETE` — `expand_views` only rewrites a `SELECT` — and those are the three that read
         // it again below for their `RETURNING` fields.
+        // **The `Describe` path needs it too, and that is the path the client uses.** Active Record
+        // prepares by default, so `ORDER BY "posts"."count"` reaches `Describe` before it reaches
+        // `execute` — and a `42703` here fails the statement before it is ever bound.
+        self.resolve_functional_notation(txn, &mut statement)?;
         let tables = self.tables_for(txn, &statement)?;
         let types = bind::infer(&statement, &tables, declared);
         let parameters = types.iter().copied().map(ColumnType::oid).collect();
