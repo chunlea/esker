@@ -3955,6 +3955,17 @@ fn retype(
     if !literal.comparable_with(ty) {
         return Err(undefined_operator(ty, literal, op, literal_on_the_left));
     }
+    // **A `numeric` literal against an integer column is compared, not narrowed.** PostgreSQL
+    // resolves `bigint = numeric` by promoting the *column* — measured, `9223372036854775808 =
+    // 1::bigint` is `f` and not an error — so `id = 9223372036854775808` is false for every row.
+    // Narrowing is what an assignment does, and an assignment of this literal is `22003 bigint out
+    // of range`, which is the right answer to `INSERT` and the wrong one to `WHERE`. The
+    // comparison itself is exact: `Datum`'s ordering has a `numeric`-against-`int8` arm.
+    if matches!(literal, Literal::Typed(value) if matches!(**value, Datum::Numeric(_)))
+        && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+    {
+        return Ok(literal.clone());
+    }
     match literal.assign(ty, "?column?") {
         // Reduced to a value of the column's own type, so the comparison is between two of them.
         Ok(value) => Ok(match value {

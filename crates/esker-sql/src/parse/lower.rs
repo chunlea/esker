@@ -6671,12 +6671,32 @@ fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {
             if digits.contains(['.', 'e', 'E']) {
                 plan::Literal::Decimal(text)
             } else {
-                // `bigint out of range`, not the input function's longer message: a literal
-                // too large is caught on a different path in PostgreSQL and says so differently.
-                plan::Literal::Integer(
-                    text.parse()
-                        .map_err(|_| SqlError::IntegerLiteralOutOfRange("bigint"))?,
-                )
+                // **A literal past `int8` is a `numeric`, not an error.** PostgreSQL gives an
+                // unadorned integer the smallest type that holds it, and `numeric` is the last
+                // rung: `pg_typeof(9223372036854775807)` is `bigint` and
+                // `pg_typeof(9223372036854775808)` is `numeric` — measured. So
+                // `WHERE id = 9223372036854775808` against a `bigint` column is a comparison the
+                // column is promoted for and is simply false, which is `or_test.rb`'s *or with
+                // large number* answering one row where this node raised `22003`.
+                //
+                // The sign is part of the literal and is folded before the choice — `-9223372036854775808`
+                // is a `bigint` and `-9223372036854775809` a `numeric` — which is why `text`
+                // carries it into the parse rather than being negated afterwards.
+                //
+                // The only way a run of digits fails to parse as an `i64` is by not fitting in
+                // one: the lexer has already kept `.`, `e` and `E` out of it above.
+                match text.parse() {
+                    Ok(fits) => plan::Literal::Integer(fits),
+                    // **A real `numeric`, not this crate's `Literal::Decimal`.** That variant is
+                    // `double precision` here — a divergence this node declares for `SELECT 1.5`
+                    // — and routing an out-of-range integer through it would answer
+                    // `double precision` where PostgreSQL says `numeric`, trading one wrong type
+                    // for another. A typed literal carries the value itself and types as what it
+                    // is.
+                    Err(_) => plan::Literal::Typed(Box::new(Datum::Numeric(
+                        value::numeric::from_text(&text)?,
+                    ))),
+                }
             }
         }
         Value::SingleQuotedString(text)

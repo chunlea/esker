@@ -2144,6 +2144,21 @@ impl Literal {
                     | ColumnType::Numeric
             ),
             Literal::Bool(_) => matches!(ty, ColumnType::Bool),
+            // **A `numeric` literal compares like any other number**, which is the set above and
+            // not what `fits` answers. `fits` is the *assignment* rule — what may be stored in a
+            // column of that type — and using it here would make `id = 9223372036854775808`
+            // against a `bigint` key `42883 operator does not exist: bigint = numeric`, where
+            // PostgreSQL promotes the column and answers false. An integer past `int8` is the only
+            // way to write this literal without a cast, and it is what `or_test.rb` sends.
+            Literal::Typed(value) if matches!(**value, Datum::Numeric(_)) => matches!(
+                ty,
+                ColumnType::Int8
+                    | ColumnType::Int4
+                    | ColumnType::Int2
+                    | ColumnType::Double
+                    | ColumnType::Real
+                    | ColumnType::Numeric
+            ),
             Literal::Typed(value) => value.fits(ty),
         }
     }
@@ -2379,6 +2394,38 @@ impl Literal {
                 )
             }
             Literal::Typed(value) if value.fits(ty) => Ok((**value).clone()),
+            // **A whole `numeric` into an integer column is an assignment that can overflow,
+            // and the overflow is the answer.** An integer literal past `int8` is a `numeric`
+            // (see `lower_value`), so `INSERT INTO t (a_bigint) VALUES (9223372036854775808)` is
+            // this arm — and on PostgreSQL it is `22003 bigint out of range`, measured: the
+            // literal is fine and *storing* it is not.
+            //
+            // **The literal's own three-word message**, which is a different sentence from the one
+            // the input function gives: PostgreSQL says `bigint out of range` for
+            // `VALUES (9223372036854775808)` and `value "9223372036854775808" is out of range for
+            // type bigint` for `VALUES ('9223372036854775808')`. Two paths, two messages, both
+            // measured — so the value is *read* through the column's input function and the
+            // refusal is written here.
+            //
+            // Whole numbers only. A fractional `numeric` in an integer column is a rounding
+            // assignment cast on a real server and neither this nor the `42804` below is that
+            // answer; it is left where it was rather than given a second wrong one.
+            Literal::Typed(value)
+                if matches!(**value, Datum::Numeric(_))
+                    && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+                    && value
+                        .to_text()
+                        .is_some_and(|text| !text.contains(['.', 'e', 'E'])) =>
+            {
+                let fits = value
+                    .to_text()
+                    .and_then(|text| Datum::from_text(ty, &text).ok());
+                fits.ok_or(SqlError::IntegerLiteralOutOfRange(match ty {
+                    ColumnType::Int2 => "smallint",
+                    ColumnType::Int4 => "integer",
+                    _ => "bigint",
+                }))
+            }
             // **An `ARRAY[…]`'s element type is settled by the column**, the way an integer
             // literal's is one level down. `ARRAY[1,2,3]` is `integer[]` on a real server and
             // `bigint[]` here — an integer literal is an `int8` in this crate until a column says
