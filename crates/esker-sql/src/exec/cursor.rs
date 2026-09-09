@@ -3356,6 +3356,22 @@ fn catalog_function(
                 _ => left.clone(),
             }
         }
+        // **`mod(a, b)` delegates to the operator it shares an implementation with.** PostgreSQL's
+        // `%` is the same C function, so there is one remainder here too — what the call keeps is
+        // its *spelling*, so that `pg_get_indexdef` prints `mod(id, 10)` and not `id % 10`
+        // (`postgresql_adapter_test#test_expression_index` asserts that string exactly).
+        CatalogFunc::Mod => {
+            let (Some(left), Some(right)) = (args.first(), args.get(1)) else {
+                return Ok(Datum::Null);
+            };
+            match (left.column_type(), right.column_type()) {
+                (Some(l), Some(r)) => {
+                    let ty = crate::value::arith::result_type(crate::plan::ArithOp::Modulo, l, r)?;
+                    crate::value::arith::apply(crate::plan::ArithOp::Modulo, ty, left, right)?
+                }
+                _ => Datum::Null,
+            }
+        }
         CatalogFunc::Concat => Datum::Text(
             args.iter()
                 .filter(|arg| !matches!(arg, Datum::Null))

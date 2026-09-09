@@ -357,11 +357,35 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>, pretty: bo
         // `CHECK ((quantity > 0)) NOT VALID` and `CHECK (quantity > 0) NOT VALID`, always
         // **outside** the parentheses, which is what lets `ActiveRecord`'s greedy
         // `/CHECK \((.+)\)/` stop before it.
+        // **And the plain form parenthesises each operand of a top-level chain, where the pretty
+        // one does not.** `CHECK (a > 0 AND b > 0)` comes back `CHECK (((a > 0) AND (b > 0)))`
+        // plain and `CHECK (a > 0 AND b > 0)` pretty — measured, both. That is the same rule
+        // `pg_get_expr(indpred)` applies (`catalog::parenthesised_operands`, called from
+        // `pg_index::parenthesised`), so the two readers now want the **same stored text** and
+        // `exec::ddl::normalise_checks` can keep giving them one: operands without their own
+        // pairs, each reader adding what it adds.
         let suffix = if check.validated { "" } else { " NOT VALID" };
         return Datum::Text(if pretty {
-            format!("CHECK ({}){suffix}", check.expr)
+            format!("CHECK ({}){suffix}", super::pretty_case(&check.expr))
         } else {
-            format!("CHECK (({})){suffix}", check.expr)
+            // **The plain form's inner pair is the *expression's* own, not the printer's.** An
+            // operator node prints one — `CHECK ((price > 0))` — and a `CASE` does not:
+            // `CHECK (⏎CASE…END)` with a single pair, measured. So the wrap is conditional, the
+            // same shape `pg_index::parenthesised` already has for a bare column reference.
+            //
+            // **"Is a `CASE`" means the whole body, not its first word.**
+            // `CHECK (CASE … END > 0)` is a comparison whose left operand is a `CASE`, and a real
+            // server gives it both pairs — `CHECK ((⏎CASE…END > 0))`. Starting with `CASE` was not
+            // enough; it has to end with `END` too.
+            let body = super::parenthesised_operands(&check.expr);
+            let whole_case =
+                body.trim_start().starts_with("CASE") && body.trim_end().ends_with("END");
+            let wrapped = if whole_case {
+                body
+            } else {
+                format!("({body})")
+            };
+            format!("CHECK ({wrapped}){suffix}")
         });
     }
     // A `FOREIGN KEY`: the oid is the table and the constraint's position in its list.

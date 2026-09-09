@@ -1,0 +1,49 @@
+# **`mod(a, b)` prints as `mod`, and `a % b` prints as `%`** -- two spellings of one remainder,
+# measured in every reader.
+#
+# Run 108's second new red. `postgresql_adapter_test#test_expression_index` builds
+# `add_index "ex", "mod(id, 10), abs(number)"` and asserts `index.columns` **equals that string**;
+# this node answered `id % 10`.
+#
+# `parse::lower` rewrote the call into the arithmetic node on purpose -- PostgreSQL's `%` for
+# `int8` is `int8mod`, the same C function `mod()` calls, so the rewrite bought the evaluation, the
+# tests and the immutability for free. What it threw away is the **spelling**, and
+# `pg_get_indexdef` prints the node the tree holds. On a real server the two are different nodes:
+#
+#     mod(id, 10)   ->  mod(id, 10)              whole, per column, plain and pretty, all four
+#     id % 10       ->  (id % 10)                the operator keeps its pair
+#     mod(big, 10)  ->  mod(big, (10)::bigint)   the arguments take the common type
+#
+# So the call keeps its own node here too and the evaluator delegates to the operator's
+# implementation: one remainder, two spellings.
+#
+# **The last row is the values**, in both spellings and both sign combinations, because a node that
+# prints one thing and computes another would pass every row above it. `mod(23, 10)` is `3`,
+# `mod(-23, 10)` is `-3` and `mod(23, -10)` is `3` -- the sign follows the *dividend*, which is the
+# half of this that a printed form cannot check.
+#
+# That row was lost the first time this was captured: it read from the table the `CHECK` above is
+# on, `mod(23, 10) = 0` is false, and the `INSERT` aborted the transaction and swallowed it. The
+# values live on their own unconstrained table now -- guard every probe, including the ones that
+# are not asking the server for a refusal.
+#
+# Captured against esker-pg19 (PostgreSQL 19beta1) with
+# `sesscap.py src/pg19_mod_spelling.txt.in`, inside one `BEGIN ... ROLLBACK`.
+BEGIN		-
+CREATE TABLE g1md (id integer, big bigint, number integer)		-
+CREATE INDEX g1md_ix ON g1md (mod(id, 10), abs(number))		-
+SELECT 'r', pg_get_indexdef('g1md_ix'::regclass)		r|CREATE INDEX g1md_ix ON public.g1md USING btree (mod(id, 10), abs(number))
+SELECT 'r', pg_get_indexdef('g1md_ix'::regclass, 1, true), pg_get_indexdef('g1md_ix'::regclass, 2, true)		r|mod(id, 10)|abs(number)
+SELECT 'r', pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'g1md_ix'::regclass		r|mod(id, 10), abs(number)
+CREATE INDEX g1md_pc ON g1md ((id % 10))		-
+SELECT 'r', pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'g1md_pc'::regclass		r|(id % 10)
+CREATE INDEX g1md_i8 ON g1md ((mod(big, 10)))		-
+SELECT 'r', pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'g1md_i8'::regclass		r|mod(big, (10)::bigint)
+ALTER TABLE g1md ADD CONSTRAINT g1md_ck CHECK (mod(id, 10) = 0)		-
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'g1md'::regclass AND contype = 'c'		r|g1md_ck|CHECK ((mod(id, 10) = 0))
+ALTER TABLE g1md ADD COLUMN g integer GENERATED ALWAYS AS (mod(id, 10)) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1md'::regclass AND a.attname = 'g'		r|g|mod(id, 10)
+CREATE TABLE g1mv (id integer, big bigint)		-
+INSERT INTO g1mv VALUES (23, 23)		-
+SELECT 'r', mod(id, 10), id % 10, mod(-id, 10), mod(id, -10), mod(big, 10) FROM g1mv		r|3|3|-3|3|3
+ROLLBACK		-

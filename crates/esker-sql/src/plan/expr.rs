@@ -808,6 +808,8 @@ impl CatalogFuncCall {
             // measured, `CREATE INDEX i ON t ((nullif(t, 'x')))` is built by a real server and
             // `pg_get_indexdef` prints `btree (NULLIF(t, 'x'::text))`.
             | CatalogFunc::NullIf
+            // `provolatile = 'i'`, measured with the rest of the census.
+            | CatalogFunc::Mod
             | CatalogFunc::Substr
             | CatalogFunc::Substring
             // **The JSON accessors, `i` on a real server** — measured through `pg_operator`
@@ -1333,6 +1335,21 @@ pub enum CatalogFunc {
     Greatest,
     /// `least(...)`, which is [`CatalogFunc::Greatest`] with the comparison turned round.
     Least,
+    /// `mod(a, b)`: the remainder, and **a function rather than the operator it shares a C
+    /// implementation with**.
+    ///
+    /// PostgreSQL's `%` for `int8` is `int8mod`, the same function `mod()` calls, and the two agree
+    /// on every sign combination — which is why this crate lowered the call into
+    /// [`Expr::Arithmetic`] and got the evaluation, the tests and the immutability for free. What
+    /// that threw away is the **spelling**: `pg_get_indexdef` prints back the node the tree holds,
+    /// so `mod(id, 10)` came back `id % 10` where a real server prints `mod(id, 10)` — measured in
+    /// every form, whole and per column, plain and pretty. `postgresql_adapter_test#test_expression_index`
+    /// asserts that string exactly.
+    ///
+    /// So the call keeps its own node and the evaluator delegates: one implementation of the
+    /// remainder, two spellings that print as they were written, which is what `%` and `mod` are
+    /// on a real server too.
+    Mod,
     /// `nullif(a, b)`: `a`, or NULL when the two are equal.
     ///
     /// **The third of PostgreSQL's four comparison productions to live in this enum**, beside
@@ -1488,6 +1505,7 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("rtrim") => Some(CatalogFunc::Rtrim),
             () if name.eq_ignore_ascii_case("greatest") => Some(CatalogFunc::Greatest),
             () if name.eq_ignore_ascii_case("nullif") => Some(CatalogFunc::NullIf),
+            () if name.eq_ignore_ascii_case("mod") => Some(CatalogFunc::Mod),
             () if name.eq_ignore_ascii_case("least") => Some(CatalogFunc::Least),
             () if name.eq_ignore_ascii_case("substr") => Some(CatalogFunc::Substr),
             () if name.eq_ignore_ascii_case("substring") => Some(CatalogFunc::Substring),
@@ -1617,6 +1635,7 @@ impl CatalogFunc {
             CatalogFunc::Rtrim => "rtrim",
             CatalogFunc::Greatest => "greatest",
             CatalogFunc::NullIf => "nullif",
+            CatalogFunc::Mod => "mod",
             CatalogFunc::Least => "least",
             CatalogFunc::Substr => "substr",
             CatalogFunc::Substring => "substring",
@@ -1648,6 +1667,7 @@ impl CatalogFunc {
             // `42883` this set gives everything else. One sqlstate apart, on a statement nothing
             // sends; the variant's doc records it rather than the parser special-casing it.
             | CatalogFunc::NullIf
+            | CatalogFunc::Mod
             // The type's name, then the operand.
             | CatalogFunc::UserCast
             | CatalogFunc::ArrayLower
@@ -1765,6 +1785,7 @@ impl CatalogFunc {
             CatalogFunc::Greatest
             | CatalogFunc::Least
             | CatalogFunc::NullIf
+            | CatalogFunc::Mod
             | CatalogFunc::Btrim
             | CatalogFunc::Ltrim
             | CatalogFunc::Rtrim

@@ -12,6 +12,10 @@
 //! * **A type name with a comma** — `numeric(10,2)` — is decidable, because a comma that separates
 //!   two types is never inside parentheses. `parity_harness::declared_types` splits at depth zero
 //!   and six statements in `tests/numeric.rs` stopped needing a declaration for it.
+//! * **The directive's position is part of the contract**: `#!escaped` must appear in the
+//!   **header comment block**, before the first line that is neither blank nor a comment. Not
+//!   merely somewhere in the file — this very corpus writes the directive as an example in its own
+//!   header prose, and a file explaining the format would otherwise silently start escaping.
 //! * **A `|`, a `;`, a newline or a tab inside a value** is not. It needs an escape, which needs
 //!   the *writer* to emit one — so the contract is opt-in per file (`#!escaped`), measured that
 //!   way: 19 rows across `tests/corpus/` already hold a `\\` or a `\n` inside a value, and

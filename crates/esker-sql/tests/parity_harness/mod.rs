@@ -676,11 +676,30 @@ pub(crate) fn replay_reporting(
         }
     }
 
+    // **The type divergences ride along with the value ones, because this assertion hides them.**
+    // It fires before the `type_mismatched` one below, so a corpus with any disagreeing *value*
+    // reports **no** type divergences at all — and the reader has no way to know there were any.
+    // Thirteen of them sat behind four value rows while `debts-v1.1.md` #28 was being measured,
+    // and they only came out when the four were declared by hand, one round later.
+    //
+    // The ordering stays: a value that differs is the bigger fact and belongs first, and the
+    // `{cascaded} more were swallowed` count keeps saying what it said. What changes is that the
+    // message no longer stops at the first thing wrong with the file.
+    let also_typed = if type_mismatched.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nand {} statement(s) have the right rows and an unlisted type divergence, which \
+             this assertion would otherwise hide until the values agree:\n\n{}",
+            type_mismatched.len(),
+            type_mismatched.join("\n\n")
+        )
+    };
     assert!(
         mismatched.is_empty(),
         "{} of {checked} statements disagree with PostgreSQL 19 and are not listed as \
          divergences ({cascaded} more were swallowed by the aborted transaction and are not \
-         counted):\n\n{}",
+         counted):\n\n{}{also_typed}",
         mismatched.len(),
         mismatched.join("\n\n")
     );
@@ -790,6 +809,11 @@ fn type_name(oid: u32, typmod: i32) -> String {
 
 /// One corpus file, as `(line number, statement, what PostgreSQL answered)`.
 /// The directive a corpus file uses to say its **values are escaped**.
+///
+/// **It must be in the header comment block** — before the first line that is neither blank nor a
+/// comment — and not merely somewhere in the file. A corpus that *documents* this format writes
+/// the directive as an example (`pg19_corpus_format.txt` does, in its own header prose), and
+/// anywhere-in-the-file would make such a file silently start escaping.
 ///
 /// A comment line to every reader that does not know about it, so a file carrying it is still a
 /// valid corpus for anything else, and old files are untouched — which matters, because 19 rows
@@ -940,7 +964,12 @@ fn declared_types(field: &str) -> Vec<String> {
 }
 
 fn parse(corpus: &str) -> Vec<(usize, String, Answer)> {
-    let escaped = corpus.lines().any(|line| line.trim() == ESCAPED_DIRECTIVE);
+    // In the header block only: the directive is positional, and the rule is decidable — everything
+    // up to the first line that is neither blank nor a comment.
+    let escaped = corpus
+        .lines()
+        .take_while(|line| line.trim_start().starts_with('#') || line.trim().is_empty())
+        .any(|line| line.trim() == ESCAPED_DIRECTIVE);
     corpus
         .lines()
         .enumerate()

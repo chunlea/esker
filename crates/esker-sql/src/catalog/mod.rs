@@ -1652,6 +1652,70 @@ pub struct ExcludeDef {
     pub deferred: bool,
 }
 
+/// A printed `CASE` with the parentheses PostgreSQL's **pretty** form leaves off.
+///
+/// A real server holds a tree and renders it twice: `pg_get_constraintdef(oid)` parenthesises the
+/// `WHEN` condition, the `THEN` and the `ELSE`, and `pg_get_constraintdef(oid, true)` parenthesises
+/// none of them. Measured side by side in `tests/corpus/pg19_case_printed.txt`, and
+/// `ActiveRecord` reads the second — `check_constraint_test#test_check_constraints` asserts
+/// `WHEN price IS NOT NULL` to the character.
+///
+/// This node stores one text, in the plain shape, because that is what
+/// `pg_get_expr(indexprs)` and the plain `pg_get_constraintdef` want. So the pretty reader strips.
+/// **This is not a general parenthesis remover** and must not become one: it is the inverse of one
+/// emitter (`exec::ddl::deparse`'s `Case` arm), which writes a line per branch in a layout this
+/// function matches exactly, and it uses [`unparenthesised`] — the same helper that emitter's
+/// callers use — for the three positions. A nested `CASE` starts on its own line, so its `THEN`
+/// half is empty here and is left alone, which is what makes the recursion unnecessary.
+pub(crate) fn pretty_case(printed: &str) -> String {
+    printed
+        .split('\n')
+        .map(|line| {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let body = line.trim_start();
+            if let Some(rest) = body.strip_prefix("WHEN ")
+                && let Some(at) = last_then(rest)
+            {
+                let (when, then) = (&rest[..at], &rest[at + " THEN".len()..]);
+                return format!(
+                    "{indent}WHEN {} THEN{}",
+                    unparenthesised(when.trim()),
+                    if then.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", unparenthesised(then.trim()))
+                    }
+                );
+            }
+            match body.strip_prefix("ELSE ") {
+                Some(rest) => format!("{indent}ELSE {}", unparenthesised(rest.trim())),
+                None => line.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The ` THEN` that ends a `WHEN` line's condition — the **last** one at parenthesis depth zero,
+/// since the condition may itself contain a nested `CASE … THEN … END` on one line.
+fn last_then(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let (mut depth, mut quoted, mut found) = (0_i32, false, None);
+    let mut at = 0;
+    while at < line.len() {
+        match bytes[at] {
+            b'\'' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => depth -= 1,
+            _ if quoted || depth != 0 => {}
+            _ if line[at..].starts_with(" THEN") => found = Some(at),
+            _ => {}
+        }
+        at += 1;
+    }
+    found
+}
+
 /// The operands of a top-level `AND`/`OR` chain and the keywords between them, or `None` for a
 /// predicate that is not a chain.
 ///
@@ -1667,12 +1731,28 @@ pub(crate) fn boolean_chain(predicate: &str) -> Option<(Vec<&str>, Vec<&str>)> {
     let mut operands = Vec::new();
     let mut separators = Vec::new();
     let (mut depth, mut quoted, mut start, mut at) = (0_i32, false, 0, 0);
+    // **A `CASE` is a depth of its own.** `CASE WHEN a AND b THEN … END` has an `AND` at
+    // parenthesis depth zero that is not a chain separator, and splitting there produced
+    // `CHECK (((CASE WHEN a) AND (b THEN true ELSE false END)))` — a `CHECK` that no longer
+    // parses. Measured through `pg_get_constraintdef`; the index predicate reader had the same
+    // hole, since both callers are this one scanner.
+    let mut cases = 0_i32;
+    let word = |at: usize, keyword: &str| {
+        upper[at..].starts_with(keyword.as_bytes())
+            && !upper
+                .get(at + keyword.len())
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            && (at == 0 || !(upper[at - 1].is_ascii_alphanumeric() || upper[at - 1] == b'_'))
+    };
     while at < bytes.len() {
         match bytes[at] {
             b'\'' => quoted = !quoted,
             b'(' if !quoted => depth += 1,
             b')' if !quoted => depth -= 1,
-            _ if quoted || depth != 0 => {}
+            _ if quoted => {}
+            _ if word(at, "CASE") => cases += 1,
+            _ if word(at, "END") => cases -= 1,
+            _ if depth != 0 || cases != 0 => {}
             _ => {
                 for keyword in [" AND ", " OR "] {
                     if upper[at..].starts_with(keyword.as_bytes()) {
