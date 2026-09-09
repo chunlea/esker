@@ -1069,7 +1069,7 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // `esker_store::columnar::decode::columnar_type`, which says why.
         Row::RegType
         | Row::RegProc
-        | Row::RegProcArray
+        | Row::RegProcArray | Row::RegClassArray
         | Row::RegTypeArray
         | Row::RegClass
         | Row::Int2Vector

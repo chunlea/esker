@@ -295,7 +295,7 @@ fn shift_enum_ordinals(
         let mut rows: Vec<Vec<crate::value::Datum>> = Vec::new();
         super::for_each_page(txn, &start, &end, |_, page| {
             for (_, value) in page {
-                rows.push(crate::row::decode_row(&schema, value)?);
+                rows.push(crate::row::decode_row(&schema, value, None)?);
             }
             Ok(())
         })?;

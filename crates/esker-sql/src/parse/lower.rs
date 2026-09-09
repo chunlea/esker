@@ -5455,7 +5455,16 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             // `value::named_type`, which only knows the built-ins, and answered `42704` for a type
             // that exists. The runtime constructor lowers each element through `lower_expr`, where
             // the regtype cast already has its catalog seam.
-            if cast_to == ColumnType::RegType && value::named_type(text)?.is_none() {
+            // **A `regclass` is that seam every time**, not only for a name the value layer does
+            // not know: *every* relation name is a catalog lookup, and `Datum::from_text` has no
+            // catalog. This arm did not exist while `regclass` was not a column type — `lower_type`
+            // refused it, so the guard above never matched — and the moment it became one
+            // (`debts-v1.1.md` #35) `ARRAY['t'::regclass]` started folding here and answering
+            // `0A000 a relation name read as a regclass without a catalog`. One face fixed, the
+            // next promoted; the runtime constructor below is where it belongs.
+            if cast_to == ColumnType::RegClass
+                || (cast_to == ColumnType::RegType && value::named_type(text)?.is_none())
+            {
                 return Ok(plan::Expr::Array {
                     elements: elements
                         .iter()
@@ -5623,6 +5632,20 @@ fn lower_array(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {
         // that writes it reads a catalog view, which has no index to seek.
         Expr::Function(function) => {
             let _ = schema_function(function)?;
+            return Ok(None);
+        }
+        // **A `regclass[]` keeps its cast**, because its elements are *names* and reading one
+        // needs the catalog. Dropped, `'rc'::regclass = ANY('{rc}'::regclass[])` became the `IN`
+        // list `('rc')` of bare strings, and the comparison then read `rc` at the left operand's
+        // type through `Datum::from_text`, which has no catalog to ask: `0A000` for a statement a
+        // real server answers `t`. Answering `None` here keeps it an expression, and the array is
+        // built by the resolution that *does* have one.
+        Expr::Cast {
+            data_type: DataType::Array(inner),
+            ..
+        } if array_element(inner)
+            .is_some_and(|inner| cast_target(inner) == Some(CastTarget::RegClass)) =>
+        {
             return Ok(None);
         }
         // `'{a,b}'::text[]` and a bare `'{a,b}'`: the cast is a no-op here, because what the array
@@ -5888,6 +5911,17 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
     // `'{a,b}'::text[]` reported its type as `text`. Now that an array is a type, this is an
     // ordinary cast to a stored type: `Datum::from_text` is `array_in`, and it is the element
     // type that answers for a bad element.
+    // **`regclass[]` is lowered before the general path**, because its element's input function
+    // is a catalog lookup and `Datum::from_text` has no catalog. A literal's names become one
+    // `CatalogFunc::RegClass` each — the same resolution `'x'::regclass` gets, so a name nothing
+    // answers to is the same `42P01` in the same place — and anything else becomes an ordinary
+    // cast the row evaluator answers, where `env` is.
+    if let DataType::Array(inner) = data_type
+        && let Some(inner) = array_element(inner)
+        && cast_target(inner) == Some(CastTarget::RegClass)
+    {
+        return lower_regclass_array(expr).map(Some);
+    }
     if let DataType::Array(inner) = data_type
         && let Some(element) = array_element(inner)
         && let Ok((element, NO_TYPMOD)) = lower_type(element)
@@ -5922,6 +5956,65 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
     Ok(None)
 }
 
+/// `'{pg_class,pg_type}'::regclass[]`, and every other operand cast to one.
+///
+/// **Two doors, because a `regclass` has two directions and an array does not change that.** A
+/// string literal is `array_in` over `regclassin`: the text is split into element *names*, each
+/// resolved once per statement by the same [`plan::CatalogFunc::RegClass`] a scalar
+/// `'x'::regclass` lowers to. That is what keeps `'{nosuchrel}'::regclass[]` the `42P01` a real
+/// server raises, in the same place and with the same message, rather than a `22P02` from an
+/// integer parser that was handed a name.
+///
+/// Anything else — an `oid[]` column, an `array_agg` — is an ordinary cast to
+/// [`ColumnType::RegClassArray`], resolved per row in `exec::cursor`, which is the only layer that
+/// has a catalog to ask.
+///
+/// The elements are split by `array_in` itself, read at `text`: quoting, escapes, `NULL` and the
+/// `[1:2]=` bound prefix are that function's rules, and a second reader of the same grammar is how
+/// two spellings of one literal come to disagree.
+fn lower_regclass_array(expr: &Expr) -> Result<plan::Expr> {
+    // `ARRAY[]::regclass[]` is the empty array, as it is at every other element type: the
+    // constructor has no element to take a type from and the cast is what supplies one.
+    if matches!(strip_nesting(expr), Expr::Array(array) if array.elem.is_empty()) {
+        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            Datum::Array(esker_keys::array::ArrayValue::empty(ColumnType::RegClass)),
+        ))));
+    }
+    // **A string literal is a name and everything else is a value**, which is the scalar rule one
+    // dimension up. Asking `cast_literal_text` instead read through the cast in
+    // `'{1259}'::oid[]::regclass[]` and handed `1259` to the *name* lookup, which is
+    // `42P01 relation "1259" does not exist` for a statement a real server answers `{pg_class}`.
+    let Some(text) = (if is_string_literal(expr) {
+        cast_literal_text(expr)?
+    } else {
+        None
+    }) else {
+        return Ok(plan::Expr::Cast {
+            operand: Box::new(lower_expr(expr)?),
+            to: ColumnType::RegClassArray,
+            typmod: NO_TYPMOD,
+        });
+    };
+    let literal = value::array::from_text(&text, ColumnType::Text)?;
+    let elements = literal
+        .values
+        .iter()
+        .map(|value| match value {
+            None => plan::Expr::Literal(plan::Literal::Null),
+            Some(element) => plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func: plan::CatalogFunc::RegClass,
+                args: vec![plan::Expr::Literal(plan::Literal::String(
+                    element.to_text().unwrap_or_default(),
+                ))],
+            })),
+        })
+        .collect();
+    Ok(plan::Expr::Array {
+        elements,
+        element: Some(ColumnType::RegClass),
+    })
+}
+
 /// `'x'::regclass::text` — **the relation's name**, not the digits its oid prints as.
 ///
 /// A `regclass` on a real server is an oid whose *output function* is the name, so the text of one
@@ -5948,12 +6041,19 @@ fn lower_regclass_text(expr: &Expr, data_type: &DataType) -> Result<Option<plan:
     if cast_target(inner_type) != Some(CastTarget::RegClass) || !is_string_literal(inner) {
         return Ok(None);
     }
-    Ok(Some(plan::Expr::CatalogFunc(Box::new(
-        plan::CatalogFuncCall {
+    // **The `::text` is a cast now**, not the identity on what `RegClassName` answers. That
+    // function returned a `Datum::Text` while a `regclass` was described as 25; it answers a
+    // `regclass` since it had to be described as 2205, so composing the two without this would
+    // give `'x'::regclass::text` the type `regclass` — right characters, wrong declared type, in
+    // the shape `ActiveRecord`'s `foreign_keys()` reads.
+    Ok(Some(plan::Expr::Cast {
+        operand: Box::new(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
             func: plan::CatalogFunc::RegClassName,
             args: vec![lower_cast(inner, inner_type)?],
-        },
-    ))))
+        }))),
+        to: ColumnType::Text,
+        typmod: NO_TYPMOD,
+    }))
 }
 
 /// One operand of `AND`/`OR`, with an unadorned string literal read as a boolean.
@@ -6195,6 +6295,46 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
                 Datum::from_text(ColumnType::Numeric, &value::money::to_numeric_text(cents))?,
             ))));
+        }
+        // **The permission is `pg_cast`'s, and the fold has to ask it too.** `casts_to` is the one
+        // gate for a cast over an *expression* (`exec::query`), and a folded literal never reached
+        // it: `'101'::bit(3)::int2` read the digits as decimal and answered `101` where a real
+        // server has no such row and says `42846`, and `5::int2::bit(4)` blamed the *value* with a
+        // `22P02` for a pair that does not exist at all. Two readers of one fact, and this is the
+        // second asking the first.
+        //
+        // Asked here only where a bit string is involved, because that family's rows are a
+        // measured census (see `pg_catalog::CASTS`) and the other families' folds are not this
+        // unit's to re-decide.
+        if let Some(from) = source_type(expr)?
+            && let Ok((to, _)) = lower_type(data_type)
+            && (matches!(from, ColumnType::Bit | ColumnType::VarBit)
+                || matches!(to, ColumnType::Bit | ColumnType::VarBit))
+            && !catalog::pg_catalog::casts_to(from, to)
+        {
+            return Err(SqlError::CannotCast {
+                from: from.name(),
+                to: to.name(),
+            });
+        }
+        // **A bit string and an integer convert; the fold below would read the digits.**
+        // `5::int4::bit(4)` is `0101` on a real server and `cast_literal_text` hands the fold the
+        // characters `5`, which `bit`'s input function refuses — `22P02 "5" is not a valid binary
+        // digit` for a statement that has an answer. The other direction is worse, because it has
+        // no refusal to stop it: `'101'::bit(3)::int` read `101` as decimal and answered `101`
+        // where a real server says `5`. So neither is folded here; the `Cast` node carries the
+        // typmod — the width the integer is written in, which is the whole of `bit(4)` — down to
+        // `exec::cursor`, where `value::bit` holds both measured rules.
+        if let Some(from) = source_type(expr)?
+            && let Ok((to, typmod)) = lower_type(data_type)
+            && (matches!(from, ColumnType::Int4 | ColumnType::Int8) && to == ColumnType::Bit
+                || from == ColumnType::Bit && matches!(to, ColumnType::Int4 | ColumnType::Int8))
+        {
+            return Ok(plan::Expr::Cast {
+                operand: Box::new(lower_expr(expr)?),
+                to,
+                typmod,
+            });
         }
         if source_type(expr)? == Some(ColumnType::Numeric)
             && let Some(to) = lower_type(data_type).ok().map(|(ty, _)| ty)
@@ -8533,6 +8673,34 @@ fn is_serial_spelling(data_type: &DataType) -> bool {
     serial_identity(data_type).is_some()
 }
 
+/// **A `regclass[]` is an expression type and not yet a column type.**
+///
+/// A narrower statement than it looks: `'{t}'::regclass[]`, `array_agg(c::regclass)` and
+/// `ARRAY[c::regclass]` all answer 2210 and none of them reaches [`lower_type`] — what is refused
+/// is the *declaration*. A scalar `regclass` column stores its number and resolves the name on the
+/// way out (`debts-v1.1.md` #35); the array's write path still rebuilds its elements through the
+/// element type's input function, and `regclassin` needs a catalog it cannot be handed there.
+///
+/// Refused by name rather than accepted and then failing on the first `INSERT`, which is what it
+/// did for as long as the declaration was allowed.
+fn refuse_a_regclass_array_column(element: ColumnType) -> Result<()> {
+    if element == ColumnType::RegClass {
+        return Err(SqlError::unsupported(
+            "a column of type regclass[] -- the scalar is a column type, and the array is an \
+             expression type until its write path stops reading its elements from text",
+        ));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one function per spelling a type can be written in, over the whole vocabulary: the \
+              quoted names, the three that carry a number, the arrays, and the table of custom \
+              names. Splitting it would put half the spellings somewhere other than beside the \
+              other half, which is the mistake the `\"char\"` unit found when two readers of one \
+              name grammar disagreed"
+)]
 pub(super) fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
     let plain = |ty| Ok((ty, NO_TYPMOD));
     // **A quoted type name is a type name.** `'101'::"bit"`, `'101'::"varchar"` and `'1'::"int4"`
@@ -8561,10 +8729,26 @@ pub(super) fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
             Vec::new(),
         ));
     }
+    // **A `regclass` is a column type** since the row stopped carrying the printed name beside
+    // the oid — see `refuse_a_regclass_array_column` above for the half that is still not one.
+    if matches!(data_type, DataType::Regclass) {
+        return plain(ColumnType::RegClass);
+    }
     // **The typmod is the length**, not the length plus a header: `character_maximum_length` for
     // `bit(8)` is 8 and `format_type(1560, 8)` is `bit(8)`, both measured. A bare `bit` keeps
     // `NO_TYPMOD` and reads back as `bit(1)`, which is where that rule lives.
-    if let DataType::Bit(length) | DataType::BitVarying(length) = data_type {
+    //
+    // **`varbit` and `bit varying` are one type under two spellings**, and `sqlparser` gives them
+    // two `DataType` variants — `VarBit` for the one word, `BitVarying` for the two. Only the
+    // second was read here, so `'101'::bit varying` answered and `'101'::varbit` was
+    // `0A000 the type VARBIT is not supported`, and with it every statement that reaches the type
+    // through that spelling: the array, the aggregates, the operators, a column declaration. One
+    // missing variant, six wire probes. The printed name of both is `bit varying` — measured,
+    // `pg_typeof('101'::varbit)` and `'varbit'::regtype` both answer it — so nothing downstream
+    // has to know which spelling was written.
+    if let DataType::Bit(length) | DataType::BitVarying(length) | DataType::VarBit(length) =
+        data_type
+    {
         let ty = if matches!(data_type, DataType::Bit(_)) {
             ColumnType::Bit
         } else {
@@ -8595,6 +8779,7 @@ pub(super) fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
                 return Err(SqlError::unsupported(format!("the type {data_type}")));
             };
             let (element, typmod) = lower_type(element)?;
+            refuse_a_regclass_array_column(element)?;
             let Some(array) = esker_keys::array::ArrayValue::array_of(element) else {
                 return Err(SqlError::unsupported(format!("the type {data_type}")));
             };

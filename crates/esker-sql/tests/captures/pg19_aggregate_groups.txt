@@ -1,0 +1,84 @@
+# **The four small aggregate groups** — PostgreSQL 19beta1, 2026-09-09.
+# `ON_ERROR_ROLLBACK on`, one `BEGIN … ROLLBACK`, fixture in the first two statements.
+#
+# Groups 8, 9, 10 and 11 of r1's wire-108 baseline, measured together because they are all
+# questions about what an aggregate answers.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **A `real` sums to a `real` and averages to a `double precision`.** Not a widening rule and
+#     not a narrowing one — `pg_aggregate` says why: `sum(float4)`'s transition type is `float4`
+#     and `avg(float4)`'s is `float8[]`, so the sum accumulates in single precision and the average
+#     widens *before* the division. The same sentence `min(time)` and `sum(time)` make: the result
+#     is per (aggregate, type) and not per type.
+#
+#   * **`min` and `max` do not exist over `tsvector` or `tsquery`** — `42883` — and the list is a
+#     census rather than a growing collection of surprises. `pg_proc` holds twenty-five
+#     one-argument `min`s:
+#
+#         anyarray, anyenum, bigint, bytea, character, date, double precision, inet, integer,
+#         interval, money, numeric, oid, oid8, pg_lsn, real, record, smallint, text, tid,
+#         timestamp, timestamptz, time, timetz, xid8
+#
+#     Everything else is `42883`, `uuid`, `boolean` and `jsonb` included — each checked directly
+#     as well, because a list read off a catalog is a claim until one of its members is asked.
+#
+#   * **`string_agg` has exactly two overloads**, `(text,text)` and `(bytea,bytea)`, so a `real`
+#     first argument is `42883` rather than a coercion. Its **NULL delimiter is an empty
+#     separator**, not a NULL answer: `string_agg(t, NULL)` over `a` and `b` is `ab`. Over no rows
+#     it is NULL. `ORDER BY` inside the parentheses orders the join; `DISTINCT` folds first.
+#
+#   * **An aggregate over a *domain* column answers the domain's own array.**
+#     `information_schema.tables.table_name` is the domain `sql_identifier` (13361, `typtype = d`,
+#     base `name`), and `array_agg` of it is `_sql_identifier` (13360) — not `_name` (1003). The
+#     two oids are assigned when `information_schema` is created rather than fixed by catalog
+#     version, which is why they are recorded beside the query that read them. **`min` of the same
+#     column is a plain `text`**: the domain decays to its base's rule, and `name`'s rule is to
+#     borrow `text`'s.
+#
+# ## The measurements
+#
+CREATE TABLE ag (id int8, r real, d double precision, n numeric, t text, i int4)		-
+INSERT INTO ag VALUES (1, 1.5, 1.5, 1.5, 'a', 1), (2, 2.25, 2.25, 2.25, 'b', 2), (3, NULL, NULL, NULL, NULL, NULL)		-
+SELECT sum(r) FROM ag	real	3.75
+SELECT pg_typeof(sum(r)) FROM ag	regtype	real
+SELECT avg(r) FROM ag	double precision	1.875
+SELECT pg_typeof(avg(r)) FROM ag	regtype	double precision
+SELECT pg_typeof(sum(d)) FROM ag	regtype	double precision
+SELECT pg_typeof(avg(d)) FROM ag	regtype	double precision
+SELECT pg_typeof(sum(n)) FROM ag	regtype	numeric
+SELECT pg_typeof(avg(n)) FROM ag	regtype	numeric
+SELECT pg_typeof(sum(i)) FROM ag	regtype	bigint
+SELECT pg_typeof(avg(i)) FROM ag	regtype	numeric
+SELECT min(r) FROM ag	real	1.5
+SELECT pg_typeof(min(r)) FROM ag	regtype	real
+SELECT max(r) FROM ag	real	2.25
+SELECT count(r) FROM ag	bigint	2
+SELECT sum(r) FROM ag WHERE false	real	\N
+SELECT avg(r) FROM ag WHERE false	double precision	\N
+SELECT string_agg(t, ',') FROM ag	text	a,b
+SELECT pg_typeof(string_agg(t, ',')) FROM ag	regtype	text
+SELECT string_agg(t, ',' ORDER BY t DESC) FROM ag	text	b,a
+SELECT string_agg(DISTINCT t, ',') FROM ag	text	a,b
+SELECT string_agg(t, ',') FROM ag WHERE false	text	\N
+SELECT string_agg(t, NULL) FROM ag	text	ab
+SELECT string_agg(id::text, '-' ORDER BY id) FROM ag	text	1-2-3
+SELECT string_agg(t, ',') FILTER (WHERE t <> 'a') FROM ag	text	b
+SELECT string_agg(t) FROM ag	!42883 function string_agg(text) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT string_agg(r, ',') FROM ag	!42883 function string_agg(real, unknown) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT min(v) FROM (VALUES ('a b'::tsvector)) s(v)	!42883 function min(tsvector) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT max(v) FROM (VALUES ('a b'::tsvector)) s(v)	!42883 function max(tsvector) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT min(q) FROM (VALUES ('a & b'::tsquery)) s(q)	!42883 function min(tsquery) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT max(q) FROM (VALUES ('a & b'::tsquery)) s(q)	!42883 function max(tsquery) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT count(v) FROM (VALUES ('a b'::tsvector)) s(v)	bigint	1
+SELECT array_agg(v) FROM (VALUES ('a b'::tsvector)) s(v)	tsvector[]	{"'a' 'b'"}
+SELECT pg_typeof(array_agg(v)) FROM (VALUES ('a b'::tsvector)) s(v)	regtype	tsvector[]
+SELECT array_agg(table_name) FROM (SELECT table_name FROM information_schema.tables ORDER BY table_name LIMIT 2) s	information_schema.sql_identifier[]	{1_need_quoting,CamelCase}
+SELECT pg_typeof(array_agg(table_name)) FROM (SELECT table_name FROM information_schema.tables LIMIT 2) s	regtype	information_schema.sql_identifier[]
+SELECT pg_typeof(table_name) FROM information_schema.tables LIMIT 1	regtype	information_schema.sql_identifier
+SELECT oid, typname, typtype, typbasetype, typarray FROM pg_type WHERE typname = 'sql_identifier'	oid,name,"char",oid,oid	13361|sql_identifier|d|19|13360
+SELECT oid, typname, typtype, typelem FROM pg_type WHERE typname = '_sql_identifier'	oid,name,"char",oid	13360|_sql_identifier|b|13361
+SELECT min(table_name) FROM information_schema.tables	text	1_need_quoting
+SELECT pg_typeof(min(table_name)) FROM information_schema.tables	regtype	text
+SELECT string_agg(table_name, ',') FROM (SELECT table_name FROM information_schema.tables ORDER BY table_name LIMIT 2) s	text	1_need_quoting,CamelCase
+DROP TABLE ag CASCADE		-

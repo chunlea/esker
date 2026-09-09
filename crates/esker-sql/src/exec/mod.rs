@@ -3576,11 +3576,33 @@ impl Executor {
             // whether a relation is there without ending the transaction if it is not.
             if asking == CatalogFunc::ToRegClass {
                 match self.relation_named(&mut relations, txn, name) {
-                    Ok(found) => {
-                        *expr = Expr::Literal(Literal::Typed(Box::new(
-                            found.map_or(Datum::Null, Datum::Text),
-                        )));
+                    // **A `regclass` when it finds one**, the same datum `::regclass` builds and
+                    // for the same reason: `to_regclass` is declared `regclass` on a real server,
+                    // measured, and the two forms differ only in what a miss is. Answering a
+                    // `text` here made `pg_typeof(to_regclass('t'))` read `text` off a value the
+                    // `RowDescription` had already called 2205.
+                    // **The NULL is cast, not bare.** A `Datum::Null` has no type of its own, so
+                    // replacing the call with one described the column as whatever a typeless
+                    // literal is — `text` — where a real server says `regclass` even for the miss.
+                    // The cast is the type; it evaluates to the same NULL.
+                    Ok(None) => {
+                        *expr = Expr::Cast {
+                            operand: Box::new(Expr::Literal(Literal::Null)),
+                            to: ColumnType::RegClass,
+                            typmod: crate::value::NO_TYPMOD,
+                        };
                     }
+                    Ok(Some(printed)) => match self.relation_oid(&mut relations, txn, name) {
+                        Ok(oid) => {
+                            *expr = Expr::Literal(Literal::Typed(Box::new(Datum::RegClass {
+                                oid,
+                                name: printed.into(),
+                            })));
+                        }
+                        Err(error) => {
+                            failure.get_or_insert(error);
+                        }
+                    },
                     Err(error) => {
                         failure.get_or_insert(error);
                     }

@@ -1,0 +1,141 @@
+# **`regclass[]` is oid 2210, and `min` of a `reg*` is an `oid`** — PostgreSQL 19beta1, 2026-09-09.
+# `ON_ERROR_ROLLBACK on`, one `BEGIN … ROLLBACK`, fixture `CREATE TABLE rc (id int8 PRIMARY KEY, a int4)`.
+#
+# Group 5 of r1's wire-108 baseline (`array_agg`/`ARRAY[]` over a `regclass` came back a scalar
+# `text`), and group 7 beside it (`min`/`max` over a `reg*`), because the two are one measurement:
+# both are answers about what a `regclass` *is* rather than about how it prints.
+#
+# ## The two catalog rows
+#
+#     SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput::text, typelem, typarray
+#       FROM pg_type WHERE oid IN (2205, 2210) ORDER BY oid;
+#
+#     2205|regclass |  4|b|N|,|regclassin|   0|2210
+#     2210|_regclass| -1|b|A|,|array_in  |2205|   0
+#
+# `regclass`'s `typarray` was `0` in this node — "an array of a regclass is not a type this node
+# offers" — and it is **2210** on a real server. Not adjacent to 2205, the way `_regtype` (2211) is
+# adjacent to `regtype` (2206): the `reg*` arrays were assigned in a later initdb than the scalars
+# they wrap, so neither number is derivable from the other and both are measured.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **`min` and `max` over a `regclass` are an `oid` — and so are a `regtype`'s and a
+#     `regproc`'s.** All three, measured on a real column of each:
+#
+#         CREATE TEMP TABLE g5b (t regtype, p regproc, c regclass);
+#         INSERT INTO g5b VALUES ('int4','int4in','pg_class'), ('text','textin','pg_type');
+#         SELECT pg_typeof(min(t)), pg_typeof(max(t)), pg_typeof(min(p)), pg_typeof(min(c)) FROM g5b;
+#           oid|oid|oid|oid
+#         SELECT min(t), max(t), min(p), min(c) FROM g5b;
+#           23|25|42|1247
+#
+#     None of the three has a `min` of its own: the aggregate PostgreSQL resolves is `min(oid)` and
+#     the argument is coerced to reach it. So the **value** decays with the type — `min(t)` is `23`,
+#     not `integer` — which is the half a declared-type-only fix would leave wrong.
+#
+#     **ADR 0098 recorded the opposite for `regtype`** ("a `regtype` beside it does not decay — it
+#     keeps its own type"), from one probe rather than from the family. It is wrong, and this is
+#     the measurement that says so.
+#
+#   * **An array of them does not decay.** `min` over a `regclass[]` is a `regclass[]`, because an
+#     array *does* have a `min` of its own. The rule is about the scalar, not about the name.
+#
+#   * **`to_regclass` is a `regclass`, including when it finds nothing.** The NULL is a
+#     `regclass` NULL: `pg_typeof(to_regclass('nosuchrel'))` is `regclass`, not `text`.
+#
+#   * **A name that answers to nothing is `42P01`, inside an array literal too.**
+#     `'{nosuchrel}'::regclass[]` is `relation "nosuchrel" does not exist` — `array_in` calls
+#     `regclassin` per element, so the element's own error is what comes out, in the element's own
+#     words. An **empty** name is a different code: `''::regclass` is `42602 invalid name syntax`.
+#
+#   * **`regclass[] = oid[]` does not exist**: `42883 operator does not exist: regclass[] = oid[]`,
+#     where the scalars compare fine (`'pg_class'::regclass = 1259` is `t`). An array's comparison
+#     is its element type's, and two element types are two operators.
+#
+#   * `'{rc}'::regclass[]::oid[]` is the numbers and `'{1259,1247}'::oid[]::regclass[]` is the
+#     names, both measured; `regclass[]::regtype[]` is `42846 cannot cast type regclass[] to
+#     regtype[]`, which is the pair that does *not* exist.
+#
+# ## The measurements
+#
+CREATE TABLE rc (id int8 PRIMARY KEY, a int4)		-
+SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput::text, typelem, typarray FROM pg_type WHERE oid IN (2205, 2210) ORDER BY oid	oid,name,smallint,"char","char","char",text,oid,oid	2205|regclass|4|b|N|,|regclassin|0|2210 ; 2210|_regclass|-1|b|A|,|array_in|2205|0
+SELECT typarray FROM pg_type WHERE typname = 'regclass'	oid	2210
+SELECT 'rc'::regclass	regclass	rc
+SELECT pg_typeof('rc'::regclass)	regtype	regclass
+SELECT 'rc'::regclass::text	text	rc
+SELECT pg_typeof('rc'::regclass::text)	regtype	text
+SELECT to_regclass('rc')	regclass	rc
+SELECT pg_typeof(to_regclass('rc'))	regtype	regclass
+SELECT to_regclass('nosuchrel')	regclass	\N
+SELECT pg_typeof(to_regclass('nosuchrel'))	regtype	regclass
+SELECT 'nosuchrel'::regclass	!42P01 relation "nosuchrel" does not exist
+SELECT ''::regclass	!42602 invalid name syntax
+SELECT '{rc}'::regclass[]	regclass[]	{rc}
+SELECT pg_typeof('{rc}'::regclass[])	regtype	regclass[]
+SELECT '{rc,rc_pkey}'::regclass[]	regclass[]	{rc,rc_pkey}
+SELECT '{rc,NULL}'::regclass[]	regclass[]	{rc,NULL}
+SELECT '{}'::regclass[]	regclass[]	{}
+SELECT ARRAY[]::regclass[]	regclass[]	{}
+SELECT ARRAY['rc'::regclass]	regclass[]	{rc}
+SELECT pg_typeof(ARRAY['rc'::regclass])	regtype	regclass[]
+SELECT '{nosuchrel}'::regclass[]	!42P01 relation "nosuchrel" does not exist
+SELECT array_agg(c) FROM (SELECT 'rc'::regclass AS c) s	regclass[]	{rc}
+SELECT pg_typeof(array_agg(c)) FROM (SELECT 'rc'::regclass AS c) s	regtype	regclass[]
+SELECT array_agg(c.oid::regclass) FROM pg_class c WHERE c.relname = 'rc'	regclass[]	{rc}
+SELECT pg_typeof(array_agg(c.oid::regclass)) FROM pg_class c WHERE c.relname = 'rc'	regtype	regclass[]
+SELECT unnest('{rc,rc_pkey}'::regclass[])	regclass	rc ; rc_pkey
+SELECT pg_typeof(unnest('{rc}'::regclass[]))	regtype	regclass
+SELECT ('{rc,rc_pkey}'::regclass[])[2]	regclass	rc_pkey
+SELECT pg_typeof(('{rc}'::regclass[])[1])	regtype	regclass
+SELECT array_length('{rc,rc_pkey}'::regclass[], 1)	integer	2
+SELECT '{rc}'::regclass[] || 'rc_pkey'::regclass	regclass[]	{rc,rc_pkey}
+SELECT pg_typeof('{rc}'::regclass[] || 'rc_pkey'::regclass)	regtype	regclass[]
+SELECT '{rc}'::regclass[] || '{rc_pkey}'::regclass[]	regclass[]	{rc,rc_pkey}
+SELECT '{rc}'::regclass[]::text	text	{rc}
+SELECT pg_typeof('{rc}'::regclass[]::text)	regtype	text
+SELECT pg_typeof('{rc}'::regclass[]::oid[])	regtype	oid[]
+SELECT '{rc}'::regclass[]::oid[] = ARRAY['rc'::regclass::oid]	boolean	t
+SELECT '{rc}'::regclass[] = '{rc}'::regclass[]	boolean	t
+SELECT 'rc'::regclass = ANY('{rc,rc_pkey}'::regclass[])	boolean	t
+SELECT '{rc}'::regclass[] @> '{rc}'::regclass[]	boolean	t
+SELECT count(c) FROM (SELECT 'rc'::regclass AS c) s	bigint	1
+SELECT pg_typeof(count(c)) FROM (SELECT 'rc'::regclass AS c) s	regtype	bigint
+SELECT pg_typeof(min(c)) FROM (VALUES ('rc'::regclass)) s(c)	regtype	oid
+SELECT pg_typeof(max(c)) FROM (VALUES ('rc'::regclass)) s(c)	regtype	oid
+SELECT min(c) = 'rc'::regclass::oid FROM (VALUES ('rc'::regclass)) s(c)	boolean	t
+SELECT pg_typeof(min(c)) FROM (VALUES ('int4'::regtype)) s(c)	regtype	oid
+SELECT min(c) FROM (VALUES ('int4'::regtype), ('text'::regtype)) s(c)	oid	23
+SELECT max(c) FROM (VALUES ('int4'::regtype), ('text'::regtype)) s(c)	oid	25
+SELECT pg_typeof(min(c)) FROM (VALUES ('int4in'::regproc)) s(c)	regtype	oid
+SELECT min(c) FROM (VALUES ('int4in'::regproc), ('textin'::regproc)) s(c)	oid	42
+SELECT pg_typeof(min(c)) FROM (VALUES ('{rc}'::regclass[])) s(c)	regtype	regclass[]
+SELECT min(c) FROM (VALUES ('{rc}'::regclass[]), ('{rc_pkey}'::regclass[])) s(c)	regclass[]	{rc}
+SELECT 1259::regclass	regclass	pg_class
+SELECT 'pg_class'::regclass::oid	oid	1259
+SELECT 'pg_class'::regclass = 1259	boolean	t
+SELECT '{pg_class}'::regclass[] = '{1259}'::oid[]	!42883 operator does not exist: regclass[] = oid[]
+DROP TABLE rc CASCADE		-
+#
+# ## A column of one, measured in the same transaction
+#
+#     CREATE TEMP TABLE g5 (id int8, r regclass, rs regclass[]);
+#     INSERT INTO g5 VALUES (1, 'pg_class', '{pg_class,pg_type}');
+#     SELECT id, r, rs FROM g5;
+#       bigint|regclass|regclass[]      1|pg_class|{pg_class,pg_type}
+#     SELECT atttypid, attname FROM pg_attribute
+#       WHERE attrelid = 'g5'::regclass AND attnum > 0 ORDER BY attnum;
+#       20|id ; 2205|r ; 2210|rs
+#     CREATE INDEX ON g5 (r);
+#       CREATE INDEX
+#     SELECT indkey FROM pg_index WHERE indrelid = 'g5'::regclass;
+#       int2vector      2
+#
+# So a real server lets a `regclass` be a **stored** column and lets an index be built over one.
+# This node refuses the declaration (`0A000 the type REGCLASS is not supported`), which is a
+# deliberate gap rather than an oversight: a stored `regclass` here would carry the printed name
+# into the row beside the oid — that is what the datum is — and the name would go stale the moment
+# the relation it names is renamed, where a real server resolves it at output time from the oid
+# alone. Closing it needs a row shape that stores the number and nothing else, which is a unit of
+# its own; the cast and the array literal reach every shape the suite writes.

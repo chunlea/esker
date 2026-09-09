@@ -1,0 +1,125 @@
+# **`varbit`, the one-word spelling of `bit varying`** — against PostgreSQL 19beta1.
+#
+# Group 6 of r1's wire-108 baseline. Six probes, one cause: `sqlparser` files `varbit` and
+# `bit varying` as two `DataType` variants and only the second was read, so the type this node has
+# had since the bit-string unit was unreachable through the spelling a person writes.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Both spellings print as `bit varying`.** `varbit` survives only as `pg_type.typname`.
+#   * **A cast truncates where an assignment refuses**: `'10101'::varbit(3)` is `101`, and the
+#     same value into a `varbit(3)` column is `22001`.
+#   * **`min`/`max` do not exist over a bit string** — `42883` — and this node agrees.
+#   * **The input function reads a `b` or `x` prefix**, which is not the `B'…'`/`X'…'` literal
+#     syntax: `'xff'::varbit` is `11111111`, and `'xyz'::varbit` blames the *second* character.
+#   * **A bit string converts with `int4` and `int8` only, and only `bit` does.** Eight rows of
+#     `pg_cast`, measured as a census; everything else is `42846`.
+#
+# Measured in `tests/captures/pg19_varbit.txt`.
+CREATE TABLE vb (id int8, b varbit, b5 varbit(5), bv bit varying(4), a varbit[])		-
+SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput::text, typelem, typarray FROM pg_type WHERE oid IN (1562, 1563) ORDER BY oid	oid,name,smallint,"char","char","char",text,oid,oid	1562|varbit|-1|b|V|,|varbit_in|0|1563 ; 1563|_varbit|-1|b|A|,|array_in|1562|0
+SELECT '101'::varbit	bit varying	101
+SELECT pg_typeof('101'::varbit)	regtype	bit varying
+SELECT '101'::bit varying	bit varying	101
+SELECT pg_typeof('101'::bit varying)	regtype	bit varying
+SELECT '101'::varbit(5)	bit varying(5)	101
+SELECT pg_typeof('101'::varbit(5))	regtype	bit varying
+SELECT format_type('varbit'::regtype, 5)	text	bit varying(5)
+SELECT '101'::bit varying(5)	bit varying(5)	101
+SELECT 'varbit'::regtype	regtype	bit varying
+SELECT 'bit varying'::regtype	regtype	bit varying
+SELECT 'varbit(5)'::regtype	regtype	bit varying
+SELECT '10101'::varbit(3)	bit varying(3)	101
+SELECT '101'::varbit(5)::text	text	101
+SELECT '1010'::bit(2)	bit(2)	10
+SELECT B'101'::varbit	bit varying	101
+SELECT 'xyz'::varbit	!22P02 "y" is not a valid hexadecimal digit
+SELECT '{101,11}'::varbit[]	bit varying[]	{101,11}
+SELECT pg_typeof('{101,11}'::varbit[])	regtype	bit varying[]
+SELECT ARRAY['101'::varbit, '11'::varbit]	bit varying[]	{101,11}
+SELECT pg_typeof(ARRAY['101'::varbit])	regtype	bit varying[]
+SELECT array_agg(c) FROM (SELECT '101'::varbit AS c) s	bit varying[]	{101}
+SELECT pg_typeof(array_agg(c)) FROM (SELECT '101'::varbit AS c) s	regtype	bit varying[]
+SELECT unnest('{101,11}'::varbit[])	bit varying	101 ; 11
+SELECT ('{101,11}'::varbit[])[2]	bit varying	11
+SELECT '{101}'::varbit[] || '11'::varbit	bit varying[]	{101,11}
+SELECT count(c) FROM (SELECT '101'::varbit AS c) s	bigint	1
+SELECT pg_typeof(count(c)) FROM (SELECT '101'::varbit AS c) s	regtype	bigint
+SELECT min(c) FROM (VALUES ('101'::varbit), ('11'::varbit)) s(c)	!42883 function min(bit varying) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT pg_typeof(min(c)) FROM (VALUES ('101'::varbit)) s(c)	!42883 function min(bit varying) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT max(c) FROM (VALUES ('101'::varbit), ('11'::varbit)) s(c)	!42883 function max(bit varying) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT pg_typeof(max(c)) FROM (VALUES ('101'::varbit)) s(c)	!42883 function max(bit varying) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT '101'::varbit || '11'::varbit	bit varying	10111
+SELECT pg_typeof('101'::varbit || '11'::varbit)	regtype	bit varying
+SELECT '101'::varbit || '11'::bit(2)	bit varying	10111
+SELECT pg_typeof('101'::varbit || '11'::bit(2))	regtype	bit varying
+SELECT length('101'::varbit)	integer	3
+SELECT bit_length('101'::varbit)	integer	3
+SELECT octet_length('101'::varbit)	integer	1
+SELECT '101'::varbit & '110'::varbit	"bit"	100
+SELECT '101'::varbit | '110'::varbit	"bit"	111
+SELECT '101'::varbit # '110'::varbit	"bit"	011
+SELECT ~ '101'::varbit	"bit"	010
+SELECT '101'::varbit << 1	"bit"	010
+SELECT substring('10110'::varbit from 2 for 3)	"bit"	011
+SELECT position('11'::varbit in '10110'::varbit)	integer	3
+SELECT '101'::varbit = '101'::varbit	boolean	t
+SELECT '101'::varbit < '110'::varbit	boolean	t
+SELECT '101'::varbit::bit(3)	bit(3)	101
+SELECT '101'::varbit::text	text	101
+SELECT pg_typeof('101'::varbit::text)	regtype	text
+SELECT 5::int::bit(4)	bit(4)	0101
+SELECT '101'::varbit::int	!42846 cannot cast type bit varying to integer
+INSERT INTO vb VALUES (1, '1011', '101', '11', '{101,11}')		-
+SELECT id, b, b5, bv, a FROM vb	bigint,bit varying,bit varying(5),bit varying(4),bit varying[]	1|1011|101|11|{101,11}
+SELECT attname, atttypid, atttypmod, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'vb'::regclass AND attnum > 0 ORDER BY attnum	name,oid,integer,text	id|20|-1|bigint ; b|1562|-1|bit varying ; b5|1562|5|bit varying(5) ; bv|1562|4|bit varying(4) ; a|1563|-1|bit varying[]
+SELECT array_agg(b) FROM vb	bit varying[]	{1011}
+SELECT pg_typeof(array_agg(b)) FROM vb	regtype	bit varying[]
+CREATE INDEX vb_b ON vb (b)		-
+SELECT length(''::varbit)	integer	0
+SELECT 'b101'::varbit	bit varying	101
+SELECT 'xff'::varbit	bit varying	11111111
+SELECT 'x1A'::varbit	bit varying	00011010
+SELECT 'X0f'::varbit	bit varying	00001111
+SELECT 5::int4::bit(4)	bit(4)	0101
+SELECT pg_typeof(5::int4::bit(4))	regtype	bit
+SELECT 5::int4::bit(2)	bit(2)	01
+SELECT 5::int4::bit(40)	bit(40)	0000000000000000000000000000000000000101
+SELECT 5::int4::bit	bit(1)	1
+SELECT 5::bigint::bit(4)	bit(4)	0101
+SELECT 300::int4::bit(8)	bit(8)	00101100
+SELECT (-1)::int4::bit(8)	bit(8)	11111111
+SELECT (-1)::int4::bit(32)	bit(32)	11111111111111111111111111111111
+SELECT (-1)::int4::bit(40)	bit(40)	1111111111111111111111111111111111111111
+SELECT (-5)::int4::bit(8)	bit(8)	11111011
+SELECT '101'::bit(3)::int4	integer	5
+SELECT '1111'::bit(4)::int4	integer	15
+SELECT '101'::bit(3)::bigint	bigint	5
+SELECT '1'::bit(1)::int4	integer	1
+SELECT '11111111111111111111111111111111'::bit(32)::int4	integer	-1
+SELECT 5::int2::bit(4)	!42846 cannot cast type smallint to bit
+SELECT 5::numeric::bit(4)	!42846 cannot cast type numeric to bit
+SELECT 5::int4::varbit	!42846 cannot cast type integer to bit varying
+SELECT '101'::bit(3)::int2	!42846 cannot cast type bit to smallint
+SELECT '101'::bit(3)::numeric	!42846 cannot cast type bit to numeric
+SELECT '101'::bit(3)::bool	!42846 cannot cast type bit to boolean
+SELECT '101'::varbit::bigint	!42846 cannot cast type bit varying to bigint
+SELECT substring('10110'::varbit from 2)	"bit"	0110
+SELECT substring('10110'::varbit from 0 for 3)	"bit"	10
+SELECT substring('10110'::bit(5) from 2 for 3)	"bit"	011
+SELECT pg_typeof(substring('10110'::bit(5) from 2 for 3))	regtype	bit
+SELECT X'F'::bit(4)	bit(4)	1111
+SELECT B'1010'::bit(2)	bit(2)	10
+SELECT castsource, casttarget, castcontext, castmethod FROM pg_cast WHERE castsource IN (1560,1562) OR casttarget IN (1560,1562) ORDER BY 1, 2	oid,oid,"char","char"	20|1560|e|f ; 23|1560|e|f ; 1560|20|e|f ; 1560|23|e|f ; 1560|1560|i|f ; 1560|1562|i|b ; 1562|1560|i|b ; 1562|1562|i|f
+CREATE TABLE vb3 (b varbit(3))		-
+INSERT INTO vb3 VALUES ('10101')	!22001 bit string too long for type bit varying(3)
+CREATE TABLE vb4 (b bit(3))		-
+INSERT INTO vb4 VALUES ('10101')	!22026 bit string length 5 does not match type bit(3)
+INSERT INTO vb4 VALUES ('1')	!22026 bit string length 1 does not match type bit(3)
+DROP TABLE vb3		-
+DROP TABLE vb4		-
+DROP TABLE vb CASCADE		-

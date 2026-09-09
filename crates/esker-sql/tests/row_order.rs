@@ -169,7 +169,7 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 // `int4in` is 42 and `namein` is 34, so the names sort the other way from the
                 // oids (ADR 0098).
                 | ColumnType::RegProc
-                | ColumnType::RegProcArray
+                | ColumnType::RegProcArray | ColumnType::RegClassArray
                 // A `regclass` is not one for `regtype`'s reason — an oid that prints as a name —
                 // and `is_index_key` in `esker_keys::row` refuses it, with the decoder agreeing.
                 // **A pseudo-type is not a column**, so there is nothing for a key to order:

@@ -9,9 +9,51 @@
 //! mapping, and the property tests that need PostgreSQL's ordering to state at all.
 
 pub use esker_keys::row::{
-    ROW_FORMAT_VERSION, RowError, RowSchema, decode_key_columns, decode_row, encode_row, index_key,
+    ROW_FORMAT_VERSION, RowError, RowSchema, decode_key_columns, encode_row, index_key,
     index_range, index_value_range, row_key, table_row_range, unique_index_key_is_unique_by_value,
 };
+
+use crate::value::Datum;
+
+/// How a stored `regclass` gets its name back: a function from an oid to what it prints as.
+///
+/// **The parameter is the rule and not the catalog**, which is the one place this differs from the
+/// shape it was asked for. A `Relations` alone cannot answer it: a relation's printed name is
+/// **search-path dependent** — `'s1.t'::regclass` prints `s1.t` out of the path and `t` in it,
+/// measured — so producing one needs the session's resolved `search_path` as well as the catalog.
+/// Handing the caller's own rule in keeps that decision where the session is, and keeps this module
+/// free of both.
+pub type NameOfRelation<'a> = &'a dyn Fn(i64) -> Box<str>;
+
+/// [`esker_keys::row::decode_row`], with the one thing a stored row cannot carry.
+///
+/// **A `regclass` column holds eight bytes and no name** (`debts-v1.1.md` #35), because a name in a
+/// row goes stale the moment its relation is renamed — measured: a real server prints the *new*
+/// name after `ALTER TABLE … RENAME`, and the oid's digits after the relation is dropped. So the
+/// name is resolved here, on the way out, from a catalog the codec must not have.
+///
+/// **`None` is a decision, not a default.** Every caller in this crate passes one explicitly, and
+/// the ones that pass `None` are the paths where no value is ever printed — a foreign-key check
+/// compares oids, and a catalog record's row is read for its own fields. Passing `None` where a
+/// client *will* see the value is not a crash and not corruption: it leaves the unresolved form,
+/// which is a real server's answer for an oid that names nothing. That is the failure mode this
+/// design chooses, and it is why the raw codec is no longer re-exported from this module — the
+/// only way to decode a row in `esker-sql` is to say which of the two you meant.
+pub fn decode_row(
+    schema: &RowSchema,
+    bytes: &[u8],
+    name_of: Option<NameOfRelation<'_>>,
+) -> Result<Vec<Datum>, RowError> {
+    let mut row = esker_keys::row::decode_row(schema, bytes)?;
+    if let Some(name_of) = name_of {
+        for value in &mut row {
+            if let Datum::RegClass { oid, name } = value {
+                *name = name_of(*oid);
+            }
+        }
+    }
+    Ok(row)
+}
 
 #[cfg(test)]
 mod tests {
@@ -110,7 +152,7 @@ mod tests {
             | ColumnType::JsonbArray
             | ColumnType::OidArray
             | ColumnType::RegTypeArray
-            | ColumnType::RegProcArray
+            | ColumnType::RegProcArray | ColumnType::RegClassArray
             | ColumnType::CitextArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray

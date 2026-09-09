@@ -662,7 +662,7 @@ impl<'a> Cursor<'a> {
                 loop {
                     if let Some((key, value)) = batch.next() {
                         *next = successor(&key);
-                        let row = row::decode_row(columns, &value)?;
+                        let row = row::decode_row(columns, &value, Some(&relation_namer(env)))?;
                         // **A child's row is decoded as the child and answered as the parent.**
                         // The two layouts differ whenever the child has a row id the parent has
                         // not, or a column of its own, so the values are lifted by position from
@@ -704,7 +704,8 @@ impl<'a> Cursor<'a> {
                 if std::mem::replace(looked, true) {
                     return Ok(None);
                 }
-                point(self.txn, self.tenant, node)
+                let namer = relation_namer(env);
+                point(self.txn, self.tenant, node, Some(&namer))
             }
 
             Kind::NestedLoop {
@@ -792,7 +793,8 @@ impl<'a> Cursor<'a> {
                             continue;
                         }
                         let node = probe_node(probe, *inner_table_id, inner_columns, row);
-                        if let Some(inner) = point(self.txn, self.tenant, &node)? {
+                        let namer = relation_namer(env);
+                        if let Some(inner) = point(self.txn, self.tenant, &node, Some(&namer))? {
                             let mut joined = row.clone();
                             joined.extend(inner);
                             *current = None;
@@ -1080,7 +1082,13 @@ fn fold(
             for key in &spec.order_by {
                 sort_key.push(evaluate_in(&key.expr, &row, env)?);
             }
-            accumulator.push(&value, sort_key)?;
+            // `string_agg`'s delimiter, read from the same row as its value — see
+            // `plan::AggregateFunc::StringAgg` for why it is not folded once.
+            let delimiter = match &spec.delimiter {
+                None => None,
+                Some(expr) => Some(evaluate_in(expr, &row, env)?),
+            };
+            accumulator.push(&value, sort_key, delimiter.as_ref())?;
         }
     }
 
@@ -1142,7 +1150,12 @@ fn probe_node(probe: &Probe, table_id: u64, columns: &RowSchema, outer: &[Datum]
     }
 }
 
-fn point(txn: &dyn Txn, tenant: u64, node: &Node) -> Result<Option<Vec<Datum>>> {
+fn point(
+    txn: &dyn Txn,
+    tenant: u64,
+    node: &Node,
+    name_of: Option<row::NameOfRelation<'_>>,
+) -> Result<Option<Vec<Datum>>> {
     match node {
         Node::PointGet {
             table_id,
@@ -1151,7 +1164,7 @@ fn point(txn: &dyn Txn, tenant: u64, node: &Node) -> Result<Option<Vec<Datum>>> 
         } => {
             let key = row::row_key(tenant, *table_id, key)?;
             txn.get(&key)?
-                .map(|value| row::decode_row(columns, &value))
+                .map(|value| row::decode_row(columns, &value, name_of))
                 .transpose()
                 .map_err(SqlError::from)
         }
@@ -1167,10 +1180,10 @@ fn point(txn: &dyn Txn, tenant: u64, node: &Node) -> Result<Option<Vec<Datum>>> 
             let Some(entry) = txn.get(&index_key)? else {
                 return Ok(None);
             };
-            let primary_key = row::decode_row(primary_key_types, &entry)?;
+            let primary_key = row::decode_row(primary_key_types, &entry, name_of)?;
             let key = row::row_key(tenant, *table_id, &primary_key)?;
             match txn.get(&key)? {
-                Some(value) => row::decode_row(columns, &value)
+                Some(value) => row::decode_row(columns, &value, name_of)
                     .map(Some)
                     .map_err(SqlError::from),
                 // An index entry pointing at a row that is not there is corruption, not a miss:
@@ -2262,6 +2275,88 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     crate::value::Rendering::default(),
                 )?
             }
+            // **A bit string and an integer convert, they do not round-trip through the text.**
+            // `pg_cast` has `bit->integer`, `bit->bigint` and both backs as explicit casts by
+            // function, and a function is what they are: the digits of `'101'::bit(3)` are a
+            // *number written in base two*, so reading them as decimal answered `101` where a real
+            // server says `5`. `value::bit` holds the two rules, each measured, and the typmod is
+            // the width the integer is written in — which is why this cannot live in
+            // `assignment_cast`, where there is no typmod to read. A `bit varying` reaches neither
+            // arm: it has no numeric cast at all, and `parse::lower` refuses it before here.
+            Datum::Bit {
+                varying: false,
+                bits,
+            } if matches!(to, ColumnType::Int4 | ColumnType::Int8) => {
+                let (width, name) = if *to == ColumnType::Int4 {
+                    (32, "integer")
+                } else {
+                    (64, "bigint")
+                };
+                let value = crate::value::bit::to_integer(&bits, width, name)?;
+                if *to == ColumnType::Int4 {
+                    Datum::Int4(
+                        i32::try_from(value)
+                            .map_err(|_| SqlError::IntegerLiteralOutOfRange("integer"))?,
+                    )
+                } else {
+                    Datum::Int8(value)
+                }
+            }
+            // **A bare `bit` is `bit(1)`**, which is the grammar's rule and the one `lower_type`
+            // already applies; `NO_TYPMOD` here means the cast was written without a length, so
+            // the target is one bit wide and `5::int4::bit` is `1`.
+            Datum::Int4(value) if *to == ColumnType::Bit => Datum::Bit {
+                varying: false,
+                bits: crate::value::bit::from_integer(
+                    i64::from(value),
+                    32,
+                    u32::try_from(*typmod).unwrap_or(1).max(1),
+                ),
+            },
+            Datum::Int8(value) if *to == ColumnType::Bit => Datum::Bit {
+                varying: false,
+                bits: crate::value::bit::from_integer(
+                    value,
+                    64,
+                    u32::try_from(*typmod).unwrap_or(1).max(1),
+                ),
+            },
+            // **An array to `regclass[]` resolves every element**, because the type is a name per
+            // element and the names come from the catalog. `array_in` cannot do it — the input
+            // function of a `regclass` needs a relation lookup and `crate::value` has none — so it
+            // is done here, where the row evaluator already has `env`, and by the same
+            // `regclass_of` the scalar direction uses so the two cannot disagree about a name.
+            Datum::Array(mut values) if *to == ColumnType::RegClassArray => {
+                for value in &mut values.values {
+                    if let Some(element) = value
+                        && let Some(oid) = oid_argument(Some(element))?
+                    {
+                        *element = regclass_of(env, oid)?;
+                    }
+                }
+                values.element = ColumnType::RegClass;
+                Datum::Array(values)
+            }
+            // **And the inverse, element by element**: `regclass[]::oid[]` is the numbers. It is
+            // the same `stored_shape` the scalar direction uses, so the two cannot disagree about
+            // what an oid past four bytes is; going through the text handed `pg_class` to `oidin`,
+            // which is `22P02` for a statement a real server answers `{1259}`.
+            Datum::Array(mut values)
+                if matches!(
+                    values.element,
+                    ColumnType::RegType | ColumnType::RegProc | ColumnType::RegClass
+                ) && let Some(element) = esker_keys::array::ArrayValue::element_of(*to) =>
+            {
+                for datum in values.values.iter_mut().flatten() {
+                    *datum = crate::value::stored_shape(
+                        datum.clone(),
+                        element,
+                        crate::value::Rendering::default(),
+                    )?;
+                }
+                values.element = element;
+                Datum::Array(values)
+            }
             // **A `regtype` or a `regproc` to a number is the oid too**, for the same reason and
             // with one difference: their oid is already four bytes. Without this arm
             // `typinput::oid` rendered `boolin` and handed it to `oidin`, which is
@@ -2651,7 +2746,28 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             array,
         } => {
             let operand = evaluate_in(operand, row, env)?;
-            let Some(array) = read_array(&evaluate_in(array, row, env)?)? else {
+            let array_value = evaluate_in(array, row, env)?;
+            // **An array whose element type already *is* the operand's is used as it stands.**
+            // The text path below re-reads every element through the operand type's input
+            // function, which was right while an array was text and is wrong for a type whose
+            // input function needs something the evaluator cannot hand it: `regclassin` is a
+            // catalog lookup, so `'rc'::regclass = ANY('{rc}'::regclass[])` — a statement whose
+            // two sides are already the right type — came back `0A000` for want of a catalog.
+            // Rendering a datum and reading it back is a round trip, and a round trip is only
+            // ever as good as the pair of functions it goes through.
+            if let Datum::Array(value) = &array_value
+                && value.element == operand.column_type().unwrap_or(ColumnType::Text)
+            {
+                let values: Vec<Datum> = value
+                    .values
+                    .iter()
+                    .map(|element| element.clone().unwrap_or(Datum::Null))
+                    .collect();
+                return Ok(crate::exec::subquery::quantified_over(
+                    *op, *all, &operand, &values,
+                ));
+            }
+            let Some(array) = read_array(&array_value)? else {
                 // A NULL array, which is not an empty one: `1 = ANY(NULL::int[])` is NULL where
                 // `1 = ANY('{}')` is false. Measured, both.
                 return Ok(Datum::Null);
@@ -3234,8 +3350,14 @@ fn catalog_function(
         // positions -1, 0 and 1, of which only 1 exists. Getting that wrong by clamping `from`
         // before applying `count` gives `hel`, which is the plausible answer and not the measured
         // one.
+        // **A bit string is substringed as its digits**, and comes back a bit string: measured,
+        // `substring('10110'::varbit from 2 for 3)` is `011` and `pg_typeof` of it is `bit` — a
+        // plain `bit`, whichever of the two the argument was. The digits *are* the value, so the
+        // arithmetic below is the same arithmetic; what was wrong was that a `Datum::Bit` matched
+        // none of these arms and fell through to the NULL at the end, which is a wrong answer
+        // wearing a right one's clothes.
         CatalogFunc::Substr | CatalogFunc::Substring => match (args.first(), args.get(1)) {
-            (Some(Datum::Text(text)), Some(from)) => {
+            (Some(Datum::Text(text) | Datum::Bit { bits: text, .. }), Some(from)) => {
                 let Some(from) = whole_number(Some(from)) else {
                     return Ok(Datum::Null);
                 };
@@ -3264,7 +3386,14 @@ fn catalog_function(
                         within.then_some(ch)
                     })
                     .collect();
-                Datum::Text(taken)
+                if matches!(args.first(), Some(Datum::Bit { .. })) {
+                    Datum::Bit {
+                        varying: false,
+                        bits: taken,
+                    }
+                } else {
+                    Datum::Text(taken)
+                }
             }
             _ => Datum::Null,
         },
@@ -3538,25 +3667,19 @@ fn catalog_function(
         // has no match.
         CatalogFunc::RegClassName => match oid_argument(args.first())? {
             None => Datum::Null,
+            // **A `regclass`, not the name it prints as.** The three answers below are the
+            // *output function*; the datum carries the oid beside them, which is what makes
+            // `array_agg(oid::regclass)` a `regclass[]` (2210) and `min` of one an `oid`. It was a
+            // `Datum::Text` here, and every one of those read the right characters off a column
+            // described as 25 — the difference only a `Describe` sees, which is what r1's wire
+            // sweep is for.
+            //
             // **The catalog's own oids print as names too**, and they are asked for first: a
             // catalog relation is not in `Relations`, which reads the name records, so an oid of
             // one used to print its digits back. `CatalogView::name` is the printed form and
             // already carries the rule — `pg_class` bare because `pg_catalog` is in the search
             // path, `information_schema.tables` qualified because that schema is not.
-            Some(oid) => match crate::catalog::pg_catalog::view_by_oid(oid) {
-                Some(view) => Datum::Text(view.name().to_owned()),
-                None => match env.relations()?.by_oid(oid) {
-                    // **Qualified only when the schema is not on the `search_path`** — measured:
-                    // `'g1_rc.t'::regclass::text` is `g1_rc.t` under the default path and `t`
-                    // after `SET search_path = g1_rc, public`. `RelationRow::name` is the bare
-                    // name with the schema beside it, so printing `name` alone dropped the schema
-                    // for every relation outside `public` and `ActiveRecord`'s schema dump lost
-                    // the qualifier its two `dump_schemas` tests disagree about.
-                    Some(relation) => Datum::Text(qualified_for(env.settings, relation)),
-                    None if oid == 0 => Datum::Text("-".to_owned()),
-                    None => Datum::Text(oid.to_string()),
-                },
-            },
+            Some(oid) => regclass_of(env, oid)?,
         },
         // **The inverse of `'x'::regtype`, and per row**, with the three answers `RegClassName`
         // has and each of them measured: a type's printed name, `-` for oid 0 — which is what
@@ -3987,6 +4110,52 @@ fn array_concat(left: Option<&Datum>, right: Option<&Datum>) -> Datum {
         1,
         values,
     ))
+}
+
+/// One oid as the `regclass` it is: the number, and the name it prints as.
+///
+/// **The output function of a `regclass`, in one place**, because three callers need exactly the
+/// same three answers and a second copy of them is how two readers of one fact come to disagree.
+/// A catalog view is asked for first — it is not in `Relations`, which reads the name records, so
+/// an oid of one used to print its digits back. `CatalogView::name` already carries the
+/// search-path rule: `pg_class` bare because `pg_catalog` is on the path,
+/// `information_schema.tables` qualified because that schema is not.
+///
+/// A relation outside `public` is **qualified only when its schema is not on the `search_path`** —
+/// measured: `'g1_rc.t'::regclass::text` is `g1_rc.t` under the default path and `t` after
+/// `SET search_path = g1_rc, public`. Oid 0 is `-`, PostgreSQL's rendering of `InvalidOid`, and an
+/// oid naming nothing prints its digits: measured, both, and neither is an error — raising here
+/// would break a `LEFT JOIN` that legitimately has no match.
+/// The rule a decoded row's `regclass` columns get their names from.
+///
+/// **A `regclass` column stores eight bytes and no name** (`debts-v1.1.md` #35) — a name in a row
+/// goes stale the moment its relation is renamed — so the name is put back here, where the session
+/// and the catalog both are. Measured on a real server: after `ALTER TABLE rc_a RENAME TO rc_b` a
+/// stored `regclass` prints `rc_b`, and after the relation is dropped it prints the oid's digits.
+///
+/// **A lookup that fails falls back to the digits**, which is that second measured answer: an oid
+/// naming nothing prints as its number there, so a catalog this cursor cannot read degrades to a
+/// real server's rendering rather than to an error in the middle of a scan.
+fn relation_namer(env: Env<'_>) -> impl Fn(i64) -> Box<str> + '_ {
+    move |oid| match regclass_of(env, oid) {
+        Ok(Datum::RegClass { name, .. }) => name,
+        _ => oid.to_string().into_boxed_str(),
+    }
+}
+
+fn regclass_of(env: Env<'_>, oid: i64) -> Result<Datum> {
+    let printed = match crate::catalog::pg_catalog::view_by_oid(oid) {
+        Some(view) => view.name().to_owned(),
+        None => match env.relations()?.by_oid(oid) {
+            Some(relation) => qualified_for(env.settings, relation),
+            None if oid == 0 => "-".to_owned(),
+            None => oid.to_string(),
+        },
+    };
+    Ok(Datum::RegClass {
+        oid,
+        name: printed.into(),
+    })
 }
 
 /// An `oid` argument, which is an integer of whatever width the column it came from has.
