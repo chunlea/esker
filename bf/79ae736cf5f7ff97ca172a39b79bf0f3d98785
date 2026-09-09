@@ -1,0 +1,19 @@
+docs/plans/debts-v1.1.md
+  s_2d916f5f540186::t_bc38cbe7873ee4 24,31-42,74-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "bf79ae736cf5f7ff97ca172a39b79bf0f3d98785",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
