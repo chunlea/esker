@@ -1,0 +1,59 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_6f7019c05b578b::t_ea441c97a147e0 1655-1718,1734-1746,1752-1755
+crates/esker-sql/src/catalog/pg_constraint.rs
+  s_6f7019c05b578b::t_a5d3719a8d7579 360-366,369,371-388
+crates/esker-sql/src/exec/cursor.rs
+  s_6f7019c05b578b::t_78bc93877d468c 3359-3374
+crates/esker-sql/src/exec/ddl.rs
+  s_6f7019c05b578b::t_d4f3eed3195e34 5949,6011-6022,6208-6212,6234,6355-6366
+crates/esker-sql/src/exec/query.rs
+  s_6f7019c05b578b::t_6bd53bf0f51bdc 5283-5293
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_ee8077080d83b8 4880,4882-4889,4898-4901
+crates/esker-sql/src/plan/expr.rs
+  s_6f7019c05b578b::t_d43ac592932768 811-812,1338-1352,1508,1638,1670,1788
+crates/esker-sql/tests/captures/pg19_case_printed.txt
+  s_6f7019c05b578b::t_5de51e2f3ec7fd 1-47
+crates/esker-sql/tests/captures/pg19_mod_spelling.txt
+  s_6f7019c05b578b::t_d7598f46d9b6c8 1-49
+crates/esker-sql/tests/captures/pg19_quoted_identifier.txt
+  s_6f7019c05b578b::t_66bd41be3953cd 1-61
+crates/esker-sql/tests/case_printed.rs
+  s_6f7019c05b578b::t_065ffe542b4b7d 1-62
+crates/esker-sql/tests/corpus/pg19_case_printed.txt
+  s_6f7019c05b578b::t_2d9441e116d2c2 1-47
+crates/esker-sql/tests/corpus/pg19_mod_spelling.txt
+  s_6f7019c05b578b::t_c7eb2e49033e56 1-49
+crates/esker-sql/tests/corpus/pg19_quoted_identifier.txt
+  s_6f7019c05b578b::t_16b21257f0af76 1-61
+crates/esker-sql/tests/corpus_format.rs
+  s_6f7019c05b578b::t_f96e69ec856cff 15-18
+crates/esker-sql/tests/mod_spelling.rs
+  s_6f7019c05b578b::t_9e94526f2d7404 1-48
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_6f7019c05b578b::t_db2f08b9e571cc 679-697,702,813-817,967-972
+crates/esker-sql/tests/quoted_identifier.rs
+  s_6f7019c05b578b::t_5da4904d2a5864 1-49
+docs/DESIGN.md
+  s_6f7019c05b578b::t_52279b5ba04874 380-384,430-434,1038-1055,1167-1171
+docs/plans/debts-v1.1.md
+  s_6f7019c05b578b::t_3455a5fa14680f 50-56,63,82,85,89-91
+docs/plans/phase-9-rails.md
+  s_6f7019c05b578b::t_b595ebf46ae06c 1278-1279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "fa15a76fbcfdd75aed586cb2fcf7c8838e4b7cb7",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
