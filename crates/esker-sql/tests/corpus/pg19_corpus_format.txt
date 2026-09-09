@@ -1,0 +1,45 @@
+# **The corpus format's own escape contract**, as a real PostgreSQL 19beta1 answers the four
+# values that break it unescaped.
+#
+#!escaped
+#
+# `docs/plans/debts-v1.1.md` #20. A corpus row is `statement TAB types TAB rows`, rows separated by
+# `" ; "` and cells by `"|"`, and until this file nothing said what happens when a **value** holds
+# one of those. The answer was that it silently became extra cells: `to_tsquery('fat | cat')`
+# renders `'fat' | 'cat'` and parsed as three columns where the node answered two, so a row that
+# read identically was reported as a disagreement -- and declared as one, in three files, two of
+# them with an `UNMEASURED` provenance.
+#
+# ## The contract
+#
+# In a file whose header carries the `#!escaped` line above, a value's
+#
+#     \   |   ;   newline   carriage return   tab
+#
+# are written
+#
+#     \\  \|  \;  \n        \r                \t
+#
+# and **nothing else is escaped**. An escape this contract does not define is kept as written,
+# which is what keeps `\N` -- this format's NULL marker, and equally a two-character value -- and
+# `\x0102` reading as themselves. `tests/parity_harness/mod.rs::unescape` is the reader.
+#
+# **Opt-in, and the reason is measured**: 19 rows across `tests/corpus/` already hold a `\\` or a
+# `\n` inside a value, and un-escaping every file would silently change what they assert -- which
+# is the same class of defect this contract exists to close. A file says it is escaped or it is
+# parsed the way it always was.
+#
+# ## This file is also the specification for the writer
+#
+# The capture tool (`sesscap.py`, r1's) has to produce these four rows. It cannot today: it writes
+# no escapes, and it drops any output line beginning with a space -- its psql-error-context filter
+# -- which is every continuation line of a multi-line value, so row 2 below came back as `one` with
+# the rest silently gone. Hand-written here from a `psql -A -F'~'` reading of the same four
+# statements, which is the measurement; a re-capture through a fixed tool must reproduce it
+# byte for byte. The two multi-line values are written `E'...'` because that is how a newline fits
+# on one line of *SQL*; the point of the row is that it does not fit in one line of this *format*
+# without the escape.
+SELECT 'a|b', 'a ; b', 'a\b', 'x'	text,text,text,text	a\|b|a \; b|a\\b|x
+SELECT E'one\ntwo', length(E'one\ntwo')	text,integer	one\ntwo|7
+SELECT E'tab\tend', length(E'tab\tend')	text,integer	tab\tend|7
+SELECT to_tsquery('english', 'fat | cat')::text	text	'fat' \| 'cat'

@@ -15,13 +15,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[(
-        "SELECT f::text, length(f::text), f::text || '|' FROM tt WHERE id = 1",
-        "The same two operators. The `f::text` in it is right — `tests/to_text.rs` asserts \
-             the padding strip directly — and the line stays here so the operator unit inherits \
-             the whole statement rather than half of it.",
-        "UNMEASURED",
-    )],
+    // **Nothing.** The entry that stood here was `f::text || '|'`, whose value ends in a `|` — so the
+    // row parsed as one cell too many and was reported as a disagreement while reading identically.
+    // It was declared with an `UNMEASURED` provenance and a reason about "the same two operators".
+    // The cause was the corpus format (`docs/plans/debts-v1.1.md` #20); the value is escaped now and
+    // the row agrees.
+    answers: &[],
 };
 
 #[test]

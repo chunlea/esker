@@ -10,20 +10,24 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // Seven, and **the rows agree in every one** — this is the declared type only, and two
-    // different things are behind it.
+    // Six, and **the rows agree in every one** — this is the declared type only. Two different
+    // things used to be behind it and one of them is gone.
     //
-    // The first is **the corpus format**, not this node: a types field is comma-separated, and
-    // `numeric(10,2)` contains a comma. PostgreSQL's `numeric(10,2)` arrives as two entries
-    // where ours stays one, so the column case (`d` below) is a *string* this format cannot
-    // hold rather than an answer that differs. The same class as the vanishing empty string.
+    // **The corpus format was the first, and it was not this node.** A types field was split on
+    // every comma and `numeric(10,2)` contains one, so PostgreSQL's three types arrived as five
+    // and a row declaring them could not agree whatever this node answered — six statements sat
+    // here for that reason. `parity_harness`'s `declared_types` now splits at parenthesis depth
+    // zero, which is decidable without any escape, and `SELECT id, n, d FROM nm ORDER BY id`
+    // agreed the moment it did (`docs/plans/debts-v1.1.md` #20).
     //
-    // The second is real and small: **a cast's result carries no typmod here**, so
+    // **What is left is real and small: a cast's result carries no typmod here**, so
     // `1.0::numeric(10,3)` describes itself as bare `numeric` where a real server says
     // `numeric(10,3)`. The rule is `exec::query::output_columns`'s — a typmod travels only with
     // a plain column reference, which was measured for `bpchar` (`min(c)` is `bpchar` with none)
-    // and is too narrow for a cast. Closing it means `plan::Literal::Typed` carrying the typmod
-    // it was cast to, which is a change to the plan's value shape and not to this type.
+    // and is too narrow for a cast. That is register row **#28**, whose other instance is
+    // `nullif(c, 'x')` over a `char(4)` column answering `bpchar` where a real server keeps
+    // `character(4)`: one seam, two readers. Closing it means an expression carrying a typmod at
+    // all, which is a change to the plan's value shape and not to this type.
     types: &[
         // **All four answers agree now**, and it took two units: `pg_typeof` answers them at all
         // (it was `0A000` naming itself), and the first of the four — a bare `1.5` — is a
@@ -34,7 +38,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
         "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'numeric'",
-        "SELECT id, n, d FROM nm ORDER BY id",
         "SELECT 1.5::numeric(10,2), 1.5::numeric(10,0), 1.5::numeric(10)",
         "SELECT 1.0::numeric(10,3)",
         "SELECT 1.235::numeric(10,2), 1.245::numeric(10,2), 1.255::numeric(10,2)",
