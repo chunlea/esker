@@ -135,7 +135,14 @@ impl Aggregation {
     /// either, so `42883` there is **parity**; `avg(bigint)` does exist and is `numeric`, which
     /// this node has no way to be right with, so it is `0A000` naming the type it would need
     /// (`docs/adr/0031-rails-compatibility-is-measured.md`).
-    fn result_type(func: AggregateFunc, arg: Option<ColumnType>) -> Result<ColumnType> {
+    ///
+    /// **Reachable from outside the aggregation** — `crate::exec::query::expr_type` and
+    /// `crate::exec::bind` both ask it — because an aggregate's type is needed *before* the
+    /// aggregation exists. A parameter takes its type from the other side of a comparison, and on
+    /// a real server that includes `sum(salary) > $1` (`tests/having_bind.rs`); a second copy of
+    /// this table living in the type inference is how `sum(int8)` would come to be `bigint` in one
+    /// place and `numeric` in the other.
+    pub(super) fn result_type(func: AggregateFunc, arg: Option<ColumnType>) -> Result<ColumnType> {
         let Some(arg) = arg else {
             // `count(*)`.
             return Ok(ColumnType::Int8);
@@ -714,6 +721,27 @@ fn widen_for_dependencies(
     }
     if let Some(having) = &select.having {
         consider(having)?;
+    }
+    // **And the `ORDER BY`**, which is the clause `ActiveRecord` actually reaches this through and
+    // the one this function was missing. `Company.includes(:comments).order(:rating).ids` sends
+    //
+    //   SELECT "companies"."id" FROM "companies"
+    //     LEFT OUTER JOIN "comments" ON "comments"."company" = "companies"."id"
+    //     GROUP BY "companies"."id" ORDER BY "companies"."rating" ASC
+    //
+    // and the ordered column is nowhere else in the statement: not in the select list, not in the
+    // `HAVING`. So the dependency was measured, implemented and then not applied to the one shape
+    // the suite sends — `42803 column "companies.rating" must appear in the GROUP BY clause` for a
+    // query a real server answers with fifteen rows
+    // (`calculations_test#test_ids_with_includes_and_non_primary_key_order`).
+    //
+    // Measured with the rest of the family in `tests/corpus/pg19_group_by_key.txt`: `DESC`, an
+    // expression over the dependent column, a second key beside it, and both tables' keys grouped
+    // are all accepted, and the refusals stay refusals — the *other* table's column, a table whose
+    // key is not grouped, a composite key only half grouped, and a `UNIQUE NOT NULL` column, which
+    // determines nothing on a real server because only the primary key does.
+    for item in &select.order_by {
+        consider(&item.expr)?;
     }
     for key in determined {
         key_types.push(super::query::expr_type(&key, scope)?);
