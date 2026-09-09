@@ -1,0 +1,687 @@
+# **The deparse census: expression shape x reader**, measured on PostgreSQL 19beta1.
+#
+#!escaped
+#
+# Two days of run-108-shaped reds had one thing in common -- they were **wrong and green**: the
+# node printed a stored expression differently from a real server and no test in this repository
+# said so, because each reader had been measured on the shapes that happened to reach it. This
+# file is the cross product instead: 42 expression shapes and 10 constants against the eight
+# readers each admits, 160 probes, so the next parenthesis rule is learned here and not from the
+# suite.
+#
+#     shapes   binary chains (AND/OR mixed and nested) * operator-spelled functions in both
+#              directions * CASE searched and simple, with comparisons and functions in every
+#              position * cast chains and negative constants * array constructor, subscript,
+#              slice and concatenation * nested string functions * NULL tests * BETWEEN * LIKE
+#              and ILIKE * IS DISTINCT FROM * IN * COALESCE/GREATEST/NULLIF
+#
+#     readers  pg_get_constraintdef plain and pretty * pg_get_indexdef * pg_get_expr(indexprs) *
+#              pg_get_expr(indpred) * pg_get_expr(adbin) for a generated column and for a DEFAULT *
+#              pg_get_viewdef
+#
+# **Every probe is inside its own savepoint**, and three of them earn it: PostgreSQL refuses
+# `(ARRAY[...])::text` in a generated column -- `generation expression is not immutable`, because
+# the array-to-text cast reads settings -- and the refusal is recorded rather than repaired, since
+# a reader that refuses is as much a fact as one that prints.
+#
+# Captured by a `psql -At` script with a marker per probe
+# (`scratchpad/census/probe.sql`), **not** by `sesscap.py`: a `CASE` read-back and a view
+# definition both hold newlines, and that tool still drops every output line beginning with a
+# space (`docs/plans/debts-v1.1.md` #20's second half, r1's). The values carry this format's escape
+# contract, which is what makes a newline expressible at all.
+
+BEGIN		-
+CREATE TABLE cen (a integer, b integer, t text, flag boolean, arr integer[], d date, n numeric)		-
+CREATE TABLE cend (a integer, b integer, t text, arr integer[])		-
+SAVEPOINT sp_chain_and		-
+ALTER TABLE cen ADD CONSTRAINT k_chain_and CHECK (a > 0 AND b > 0)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_chain_and'		CHECK (((a > 0) AND (b > 0)))
+ROLLBACK TO sp_chain_and		-
+SAVEPOINT sp_chain_and_p		-
+ALTER TABLE cen ADD CONSTRAINT k_chain_and CHECK (a > 0 AND b > 0)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_chain_and'		CHECK (a > 0 AND b > 0)
+ROLLBACK TO sp_chain_and_p		-
+SAVEPOINT sp_chain_and_w		-
+CREATE INDEX ix_chain_and ON cen (a) WHERE a > 0 AND b > 0		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_chain_and'::regclass		((a > 0) AND (b > 0))
+ROLLBACK TO sp_chain_and_w		-
+SAVEPOINT sp_chain_or		-
+ALTER TABLE cen ADD CONSTRAINT k_chain_or CHECK (a > 0 OR b > 0)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_chain_or'		CHECK (((a > 0) OR (b > 0)))
+ROLLBACK TO sp_chain_or		-
+SAVEPOINT sp_chain_or_p		-
+ALTER TABLE cen ADD CONSTRAINT k_chain_or CHECK (a > 0 OR b > 0)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_chain_or'		CHECK (a > 0 OR b > 0)
+ROLLBACK TO sp_chain_or_p		-
+SAVEPOINT sp_chain_or_w		-
+CREATE INDEX ix_chain_or ON cen (a) WHERE a > 0 OR b > 0		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_chain_or'::regclass		((a > 0) OR (b > 0))
+ROLLBACK TO sp_chain_or_w		-
+SAVEPOINT sp_chain_mix		-
+ALTER TABLE cen ADD CONSTRAINT k_chain_mix CHECK (a > 0 AND b > 0 OR flag)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_chain_mix'		CHECK ((((a > 0) AND (b > 0)) OR flag))
+ROLLBACK TO sp_chain_mix		-
+SAVEPOINT sp_chain_mix_p		-
+ALTER TABLE cen ADD CONSTRAINT k_chain_mix CHECK (a > 0 AND b > 0 OR flag)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_chain_mix'		CHECK (a > 0 AND b > 0 OR flag)
+ROLLBACK TO sp_chain_mix_p		-
+SAVEPOINT sp_chain_mix_w		-
+CREATE INDEX ix_chain_mix ON cen (a) WHERE a > 0 AND b > 0 OR flag		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_chain_mix'::regclass		(((a > 0) AND (b > 0)) OR flag)
+ROLLBACK TO sp_chain_mix_w		-
+SAVEPOINT sp_chain_nest		-
+ALTER TABLE cen ADD CONSTRAINT k_chain_nest CHECK ((a > 0 OR b > 0) AND flag)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_chain_nest'		CHECK ((((a > 0) OR (b > 0)) AND flag))
+ROLLBACK TO sp_chain_nest		-
+SAVEPOINT sp_chain_nest_p		-
+ALTER TABLE cen ADD CONSTRAINT k_chain_nest CHECK ((a > 0 OR b > 0) AND flag)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_chain_nest'		CHECK ((a > 0 OR b > 0) AND flag)
+ROLLBACK TO sp_chain_nest_p		-
+SAVEPOINT sp_chain_nest_w		-
+CREATE INDEX ix_chain_nest ON cen (a) WHERE (a > 0 OR b > 0) AND flag		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_chain_nest'::regclass		(((a > 0) OR (b > 0)) AND flag)
+ROLLBACK TO sp_chain_nest_w		-
+SAVEPOINT sp_chain_not		-
+ALTER TABLE cen ADD CONSTRAINT k_chain_not CHECK (NOT (a > 0 AND flag))		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_chain_not'		CHECK ((NOT ((a > 0) AND flag)))
+ROLLBACK TO sp_chain_not		-
+SAVEPOINT sp_chain_not_p		-
+ALTER TABLE cen ADD CONSTRAINT k_chain_not CHECK (NOT (a > 0 AND flag))		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_chain_not'		CHECK (NOT (a > 0 AND flag))
+ROLLBACK TO sp_chain_not_p		-
+SAVEPOINT sp_chain_not_w		-
+CREATE INDEX ix_chain_not ON cen (a) WHERE NOT (a > 0 AND flag)		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_chain_not'::regclass		(NOT ((a > 0) AND flag))
+ROLLBACK TO sp_chain_not_w		-
+SAVEPOINT sp_chain_three		-
+ALTER TABLE cen ADD CONSTRAINT k_chain_three CHECK (a > 0 AND b > 0 AND flag)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_chain_three'		CHECK (((a > 0) AND (b > 0) AND flag))
+ROLLBACK TO sp_chain_three		-
+SAVEPOINT sp_chain_three_p		-
+ALTER TABLE cen ADD CONSTRAINT k_chain_three CHECK (a > 0 AND b > 0 AND flag)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_chain_three'		CHECK (a > 0 AND b > 0 AND flag)
+ROLLBACK TO sp_chain_three_p		-
+SAVEPOINT sp_chain_three_w		-
+CREATE INDEX ix_chain_three ON cen (a) WHERE a > 0 AND b > 0 AND flag		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_chain_three'::regclass		((a > 0) AND (b > 0) AND flag)
+ROLLBACK TO sp_chain_three_w		-
+SAVEPOINT sp_fn_mod		-
+CREATE INDEX ix_fn_mod ON cen ((mod(a, 10)))		-
+SELECT pg_get_indexdef('ix_fn_mod'::regclass)		CREATE INDEX ix_fn_mod ON public.cen USING btree (mod(a, 10))
+ROLLBACK TO sp_fn_mod		-
+SAVEPOINT sp_fn_mod_e		-
+CREATE INDEX ix_fn_mod ON cen ((mod(a, 10)))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_fn_mod'::regclass		mod(a, 10)
+ROLLBACK TO sp_fn_mod_e		-
+SAVEPOINT sp_fn_mod_g		-
+ALTER TABLE cen ADD COLUMN g_fn_mod text GENERATED ALWAYS AS ((mod(a, 10))::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_fn_mod'		(mod(a, 10))::text
+ROLLBACK TO sp_fn_mod_g		-
+SAVEPOINT sp_fn_mod_v		-
+CREATE VIEW v_fn_mod AS SELECT mod(a, 10) AS x FROM cen		-
+SELECT pg_get_viewdef('v_fn_mod'::regclass)		 SELECT mod(a, 10) AS x\n   FROM cen\;
+ROLLBACK TO sp_fn_mod_v		-
+SAVEPOINT sp_op_mod		-
+CREATE INDEX ix_op_mod ON cen ((a % 10))		-
+SELECT pg_get_indexdef('ix_op_mod'::regclass)		CREATE INDEX ix_op_mod ON public.cen USING btree (((a % 10)))
+ROLLBACK TO sp_op_mod		-
+SAVEPOINT sp_op_mod_e		-
+CREATE INDEX ix_op_mod ON cen ((a % 10))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_op_mod'::regclass		(a % 10)
+ROLLBACK TO sp_op_mod_e		-
+SAVEPOINT sp_op_mod_g		-
+ALTER TABLE cen ADD COLUMN g_op_mod text GENERATED ALWAYS AS ((a % 10)::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_op_mod'		((a % 10))::text
+ROLLBACK TO sp_op_mod_g		-
+SAVEPOINT sp_op_mod_v		-
+CREATE VIEW v_op_mod AS SELECT a % 10 AS x FROM cen		-
+SELECT pg_get_viewdef('v_op_mod'::regclass)		 SELECT (a % 10) AS x\n   FROM cen\;
+ROLLBACK TO sp_op_mod_v		-
+SAVEPOINT sp_fn_abs		-
+CREATE INDEX ix_fn_abs ON cen ((abs(a)))		-
+SELECT pg_get_indexdef('ix_fn_abs'::regclass)		CREATE INDEX ix_fn_abs ON public.cen USING btree (abs(a))
+ROLLBACK TO sp_fn_abs		-
+SAVEPOINT sp_fn_abs_e		-
+CREATE INDEX ix_fn_abs ON cen ((abs(a)))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_fn_abs'::regclass		abs(a)
+ROLLBACK TO sp_fn_abs_e		-
+SAVEPOINT sp_fn_abs_g		-
+ALTER TABLE cen ADD COLUMN g_fn_abs text GENERATED ALWAYS AS ((abs(a))::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_fn_abs'		(abs(a))::text
+ROLLBACK TO sp_fn_abs_g		-
+SAVEPOINT sp_fn_abs_v		-
+CREATE VIEW v_fn_abs AS SELECT abs(a) AS x FROM cen		-
+SELECT pg_get_viewdef('v_fn_abs'::regclass)		 SELECT abs(a) AS x\n   FROM cen\;
+ROLLBACK TO sp_fn_abs_v		-
+SAVEPOINT sp_op_plus		-
+CREATE INDEX ix_op_plus ON cen ((a + b * 2))		-
+SELECT pg_get_indexdef('ix_op_plus'::regclass)		CREATE INDEX ix_op_plus ON public.cen USING btree (((a + (b * 2))))
+ROLLBACK TO sp_op_plus		-
+SAVEPOINT sp_op_plus_e		-
+CREATE INDEX ix_op_plus ON cen ((a + b * 2))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_op_plus'::regclass		(a + (b * 2))
+ROLLBACK TO sp_op_plus_e		-
+SAVEPOINT sp_op_plus_g		-
+ALTER TABLE cen ADD COLUMN g_op_plus text GENERATED ALWAYS AS ((a + b * 2)::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_op_plus'		((a + (b * 2)))::text
+ROLLBACK TO sp_op_plus_g		-
+SAVEPOINT sp_op_plus_v		-
+CREATE VIEW v_op_plus AS SELECT a + b * 2 AS x FROM cen		-
+SELECT pg_get_viewdef('v_op_plus'::regclass)		 SELECT (a + (b * 2)) AS x\n   FROM cen\;
+ROLLBACK TO sp_op_plus_v		-
+SAVEPOINT sp_op_nest		-
+CREATE INDEX ix_op_nest ON cen (((a + b) * 2))		-
+SELECT pg_get_indexdef('ix_op_nest'::regclass)		CREATE INDEX ix_op_nest ON public.cen USING btree ((((a + b) * 2)))
+ROLLBACK TO sp_op_nest		-
+SAVEPOINT sp_op_nest_e		-
+CREATE INDEX ix_op_nest ON cen (((a + b) * 2))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_op_nest'::regclass		((a + b) * 2)
+ROLLBACK TO sp_op_nest_e		-
+SAVEPOINT sp_op_nest_g		-
+ALTER TABLE cen ADD COLUMN g_op_nest text GENERATED ALWAYS AS (((a + b) * 2)::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_op_nest'		(((a + b) * 2))::text
+ROLLBACK TO sp_op_nest_g		-
+SAVEPOINT sp_op_nest_v		-
+CREATE VIEW v_op_nest AS SELECT (a + b) * 2 AS x FROM cen		-
+SELECT pg_get_viewdef('v_op_nest'::regclass)		 SELECT ((a + b) * 2) AS x\n   FROM cen\;
+ROLLBACK TO sp_op_nest_v		-
+SAVEPOINT sp_case_search		-
+CREATE INDEX ix_case_search ON cen ((CASE WHEN a > 0 THEN b ELSE 0 END))		-
+SELECT pg_get_indexdef('ix_case_search'::regclass)		CREATE INDEX ix_case_search ON public.cen USING btree ((\nCASE\n    WHEN (a > 0) THEN b\n    ELSE 0\nEND))
+ROLLBACK TO sp_case_search		-
+SAVEPOINT sp_case_search_e		-
+CREATE INDEX ix_case_search ON cen ((CASE WHEN a > 0 THEN b ELSE 0 END))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_search'::regclass		CASE\n    WHEN (a > 0) THEN b\n    ELSE 0\nEND
+ROLLBACK TO sp_case_search_e		-
+SAVEPOINT sp_case_search_g		-
+ALTER TABLE cen ADD COLUMN g_case_search text GENERATED ALWAYS AS ((CASE WHEN a > 0 THEN b ELSE 0 END)::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_case_search'		(\nCASE\n    WHEN (a > 0) THEN b\n    ELSE 0\nEND)::text
+ROLLBACK TO sp_case_search_g		-
+SAVEPOINT sp_case_search_v		-
+CREATE VIEW v_case_search AS SELECT CASE WHEN a > 0 THEN b ELSE 0 END AS x FROM cen		-
+SELECT pg_get_viewdef('v_case_search'::regclass)		 SELECT\n        CASE\n            WHEN (a > 0) THEN b\n            ELSE 0\n        END AS x\n   FROM cen\;
+ROLLBACK TO sp_case_search_v		-
+SAVEPOINT sp_case_simple		-
+CREATE INDEX ix_case_simple ON cen ((CASE a WHEN 1 THEN b ELSE 0 END))		-
+# (the read-back this node cannot reach yet — PostgreSQL's answer, kept as evidence
+#  rather than as a comparison, because the refusal above swallows anything after it)
+# SELECT pg_get_indexdef('ix_case_simple'::regclass)		CREATE INDEX ix_case_simple ON public.cen USING btree ((\nCASE a\n    WHEN 1 THEN b\n    ELSE 0\nEND))
+ROLLBACK TO sp_case_simple		-
+SAVEPOINT sp_case_simple_e		-
+CREATE INDEX ix_case_simple ON cen ((CASE a WHEN 1 THEN b ELSE 0 END))		-
+# (the read-back this node cannot reach yet — PostgreSQL's answer, kept as evidence
+#  rather than as a comparison, because the refusal above swallows anything after it)
+# SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_simple'::regclass		CASE a\n    WHEN 1 THEN b\n    ELSE 0\nEND
+ROLLBACK TO sp_case_simple_e		-
+SAVEPOINT sp_case_simple_g		-
+ALTER TABLE cen ADD COLUMN g_case_simple text GENERATED ALWAYS AS ((CASE a WHEN 1 THEN b ELSE 0 END)::text) STORED		-
+# (the read-back this node cannot reach yet — PostgreSQL's answer, kept as evidence
+#  rather than as a comparison, because the refusal above swallows anything after it)
+# SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_case_simple'		(\nCASE a\n    WHEN 1 THEN b\n    ELSE 0\nEND)::text
+ROLLBACK TO sp_case_simple_g		-
+SAVEPOINT sp_case_simple_v		-
+CREATE VIEW v_case_simple AS SELECT CASE a WHEN 1 THEN b ELSE 0 END AS x FROM cen		-
+# (the read-back this node cannot reach yet — PostgreSQL's answer, kept as evidence
+#  rather than as a comparison, because the refusal above swallows anything after it)
+# SELECT pg_get_viewdef('v_case_simple'::regclass)		 SELECT\n        CASE a\n            WHEN 1 THEN b\n            ELSE 0\n        END AS x\n   FROM cen\;
+ROLLBACK TO sp_case_simple_v		-
+SAVEPOINT sp_case_fn		-
+CREATE INDEX ix_case_fn ON cen ((CASE WHEN abs(a) > 0 THEN abs(b) ELSE abs(a) END))		-
+SELECT pg_get_indexdef('ix_case_fn'::regclass)		CREATE INDEX ix_case_fn ON public.cen USING btree ((\nCASE\n    WHEN (abs(a) > 0) THEN abs(b)\n    ELSE abs(a)\nEND))
+ROLLBACK TO sp_case_fn		-
+SAVEPOINT sp_case_fn_e		-
+CREATE INDEX ix_case_fn ON cen ((CASE WHEN abs(a) > 0 THEN abs(b) ELSE abs(a) END))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_fn'::regclass		CASE\n    WHEN (abs(a) > 0) THEN abs(b)\n    ELSE abs(a)\nEND
+ROLLBACK TO sp_case_fn_e		-
+SAVEPOINT sp_case_fn_g		-
+ALTER TABLE cen ADD COLUMN g_case_fn text GENERATED ALWAYS AS ((CASE WHEN abs(a) > 0 THEN abs(b) ELSE abs(a) END)::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_case_fn'		(\nCASE\n    WHEN (abs(a) > 0) THEN abs(b)\n    ELSE abs(a)\nEND)::text
+ROLLBACK TO sp_case_fn_g		-
+SAVEPOINT sp_case_fn_v		-
+CREATE VIEW v_case_fn AS SELECT CASE WHEN abs(a) > 0 THEN abs(b) ELSE abs(a) END AS x FROM cen		-
+SELECT pg_get_viewdef('v_case_fn'::regclass)		 SELECT\n        CASE\n            WHEN (abs(a) > 0) THEN abs(b)\n            ELSE abs(a)\n        END AS x\n   FROM cen\;
+ROLLBACK TO sp_case_fn_v		-
+SAVEPOINT sp_case_nest		-
+CREATE INDEX ix_case_nest ON cen ((CASE WHEN a > 0 THEN CASE WHEN b > 0 THEN 1 ELSE 2 END ELSE 3 END))		-
+SELECT pg_get_indexdef('ix_case_nest'::regclass)		CREATE INDEX ix_case_nest ON public.cen USING btree ((\nCASE\n    WHEN (a > 0) THEN\n    CASE\n        WHEN (b > 0) THEN 1\n        ELSE 2\n    END\n    ELSE 3\nEND))
+ROLLBACK TO sp_case_nest		-
+SAVEPOINT sp_case_nest_e		-
+CREATE INDEX ix_case_nest ON cen ((CASE WHEN a > 0 THEN CASE WHEN b > 0 THEN 1 ELSE 2 END ELSE 3 END))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_nest'::regclass		CASE\n    WHEN (a > 0) THEN\n    CASE\n        WHEN (b > 0) THEN 1\n        ELSE 2\n    END\n    ELSE 3\nEND
+ROLLBACK TO sp_case_nest_e		-
+SAVEPOINT sp_case_nest_g		-
+ALTER TABLE cen ADD COLUMN g_case_nest text GENERATED ALWAYS AS ((CASE WHEN a > 0 THEN CASE WHEN b > 0 THEN 1 ELSE 2 END ELSE 3 END)::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_case_nest'		(\nCASE\n    WHEN (a > 0) THEN\n    CASE\n        WHEN (b > 0) THEN 1\n        ELSE 2\n    END\n    ELSE 3\nEND)::text
+ROLLBACK TO sp_case_nest_g		-
+SAVEPOINT sp_case_nest_v		-
+CREATE VIEW v_case_nest AS SELECT CASE WHEN a > 0 THEN CASE WHEN b > 0 THEN 1 ELSE 2 END ELSE 3 END AS x FROM cen		-
+SELECT pg_get_viewdef('v_case_nest'::regclass)		 SELECT\n        CASE\n            WHEN (a > 0) THEN\n            CASE\n                WHEN (b > 0) THEN 1\n                ELSE 2\n            END\n            ELSE 3\n        END AS x\n   FROM cen\;
+ROLLBACK TO sp_case_nest_v		-
+SAVEPOINT sp_case_null		-
+CREATE INDEX ix_case_null ON cen ((CASE WHEN a IS NULL THEN 0 ELSE a END))		-
+SELECT pg_get_indexdef('ix_case_null'::regclass)		CREATE INDEX ix_case_null ON public.cen USING btree ((\nCASE\n    WHEN (a IS NULL) THEN 0\n    ELSE a\nEND))
+ROLLBACK TO sp_case_null		-
+SAVEPOINT sp_case_null_e		-
+CREATE INDEX ix_case_null ON cen ((CASE WHEN a IS NULL THEN 0 ELSE a END))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_null'::regclass		CASE\n    WHEN (a IS NULL) THEN 0\n    ELSE a\nEND
+ROLLBACK TO sp_case_null_e		-
+SAVEPOINT sp_case_null_g		-
+ALTER TABLE cen ADD COLUMN g_case_null text GENERATED ALWAYS AS ((CASE WHEN a IS NULL THEN 0 ELSE a END)::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_case_null'		(\nCASE\n    WHEN (a IS NULL) THEN 0\n    ELSE a\nEND)::text
+ROLLBACK TO sp_case_null_g		-
+SAVEPOINT sp_case_null_v		-
+CREATE VIEW v_case_null AS SELECT CASE WHEN a IS NULL THEN 0 ELSE a END AS x FROM cen		-
+SELECT pg_get_viewdef('v_case_null'::regclass)		 SELECT\n        CASE\n            WHEN (a IS NULL) THEN 0\n            ELSE a\n        END AS x\n   FROM cen\;
+ROLLBACK TO sp_case_null_v		-
+SAVEPOINT sp_case_bool		-
+ALTER TABLE cen ADD CONSTRAINT k_case_bool CHECK (CASE WHEN a > 0 THEN flag ELSE NOT flag END)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_case_bool'		CHECK (\nCASE\n    WHEN (a > 0) THEN flag\n    ELSE (NOT flag)\nEND)
+ROLLBACK TO sp_case_bool		-
+SAVEPOINT sp_case_bool_p		-
+ALTER TABLE cen ADD CONSTRAINT k_case_bool CHECK (CASE WHEN a > 0 THEN flag ELSE NOT flag END)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_case_bool'		CHECK (\nCASE\n    WHEN a > 0 THEN flag\n    ELSE NOT flag\nEND)
+ROLLBACK TO sp_case_bool_p		-
+SAVEPOINT sp_case_bool_w		-
+CREATE INDEX ix_case_bool ON cen (a) WHERE CASE WHEN a > 0 THEN flag ELSE NOT flag END		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_bool'::regclass		CASE\n    WHEN (a > 0) THEN flag\n    ELSE (NOT flag)\nEND
+ROLLBACK TO sp_case_bool_w		-
+SAVEPOINT sp_cast_chain		-
+CREATE INDEX ix_cast_chain ON cen (((a::bigint)::numeric))		-
+SELECT pg_get_indexdef('ix_cast_chain'::regclass)		CREATE INDEX ix_cast_chain ON public.cen USING btree ((((a)::bigint)::numeric))
+ROLLBACK TO sp_cast_chain		-
+SAVEPOINT sp_cast_chain_e		-
+CREATE INDEX ix_cast_chain ON cen (((a::bigint)::numeric))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_cast_chain'::regclass		((a)::bigint)::numeric
+ROLLBACK TO sp_cast_chain_e		-
+SAVEPOINT sp_cast_chain_g		-
+ALTER TABLE cen ADD COLUMN g_cast_chain text GENERATED ALWAYS AS (((a::bigint)::numeric)::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_cast_chain'		(((a)::bigint)::numeric)::text
+ROLLBACK TO sp_cast_chain_g		-
+SAVEPOINT sp_cast_chain_v		-
+CREATE VIEW v_cast_chain AS SELECT (a::bigint)::numeric AS x FROM cen		-
+SELECT pg_get_viewdef('v_cast_chain'::regclass)		 SELECT ((a)::bigint)::numeric AS x\n   FROM cen\;
+ROLLBACK TO sp_cast_chain_v		-
+SAVEPOINT sp_cast_text		-
+CREATE INDEX ix_cast_text ON cen (((t)::varchar))		-
+SELECT pg_get_indexdef('ix_cast_text'::regclass)		CREATE INDEX ix_cast_text ON public.cen USING btree (((t)::character varying))
+ROLLBACK TO sp_cast_text		-
+SAVEPOINT sp_cast_text_e		-
+CREATE INDEX ix_cast_text ON cen (((t)::varchar))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_cast_text'::regclass		(t)::character varying
+ROLLBACK TO sp_cast_text_e		-
+SAVEPOINT sp_cast_text_g		-
+ALTER TABLE cen ADD COLUMN g_cast_text text GENERATED ALWAYS AS (((t)::varchar)::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_cast_text'		((t)::character varying)::text
+ROLLBACK TO sp_cast_text_g		-
+SAVEPOINT sp_cast_text_v		-
+CREATE VIEW v_cast_text AS SELECT (t)::varchar AS x FROM cen		-
+SELECT pg_get_viewdef('v_cast_text'::regclass)		 SELECT (t)::character varying AS x\n   FROM cen\;
+ROLLBACK TO sp_cast_text_v		-
+SAVEPOINT sp_neg_cast		-
+CREATE INDEX ix_neg_cast ON cen ((a + (-1)::bigint))		-
+SELECT pg_get_indexdef('ix_neg_cast'::regclass)		CREATE INDEX ix_neg_cast ON public.cen USING btree (((a + ('-1'::integer)::bigint)))
+ROLLBACK TO sp_neg_cast		-
+SAVEPOINT sp_neg_cast_e		-
+CREATE INDEX ix_neg_cast ON cen ((a + (-1)::bigint))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_neg_cast'::regclass		(a + ('-1'::integer)::bigint)
+ROLLBACK TO sp_neg_cast_e		-
+SAVEPOINT sp_neg_cast_g		-
+ALTER TABLE cen ADD COLUMN g_neg_cast text GENERATED ALWAYS AS ((a + (-1)::bigint)::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_neg_cast'		((a + ('-1'::integer)::bigint))::text
+ROLLBACK TO sp_neg_cast_g		-
+SAVEPOINT sp_neg_cast_v		-
+CREATE VIEW v_neg_cast AS SELECT a + (-1)::bigint AS x FROM cen		-
+SELECT pg_get_viewdef('v_neg_cast'::regclass)		 SELECT (a + ('-1'::integer)::bigint) AS x\n   FROM cen\;
+ROLLBACK TO sp_neg_cast_v		-
+SAVEPOINT sp_neg_bare		-
+CREATE INDEX ix_neg_bare ON cen ((a + -1))		-
+SELECT pg_get_indexdef('ix_neg_bare'::regclass)		CREATE INDEX ix_neg_bare ON public.cen USING btree (((a + '-1'::integer)))
+ROLLBACK TO sp_neg_bare		-
+SAVEPOINT sp_neg_bare_e		-
+CREATE INDEX ix_neg_bare ON cen ((a + -1))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_neg_bare'::regclass		(a + '-1'::integer)
+ROLLBACK TO sp_neg_bare_e		-
+SAVEPOINT sp_neg_bare_g		-
+ALTER TABLE cen ADD COLUMN g_neg_bare text GENERATED ALWAYS AS ((a + -1)::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_neg_bare'		((a + '-1'::integer))::text
+ROLLBACK TO sp_neg_bare_g		-
+SAVEPOINT sp_neg_bare_v		-
+CREATE VIEW v_neg_bare AS SELECT a + -1 AS x FROM cen		-
+SELECT pg_get_viewdef('v_neg_bare'::regclass)		 SELECT (a + '-1'::integer) AS x\n   FROM cen\;
+ROLLBACK TO sp_neg_bare_v		-
+SAVEPOINT sp_arr_ctor		-
+CREATE INDEX ix_arr_ctor ON cen ((ARRAY[a, b]))		-
+SELECT pg_get_indexdef('ix_arr_ctor'::regclass)		CREATE INDEX ix_arr_ctor ON public.cen USING btree ((ARRAY[a, b]))
+ROLLBACK TO sp_arr_ctor		-
+SAVEPOINT sp_arr_ctor_e		-
+CREATE INDEX ix_arr_ctor ON cen ((ARRAY[a, b]))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_arr_ctor'::regclass		ARRAY[a, b]\n!generation expression is not immutable
+ROLLBACK TO sp_arr_ctor_e		-
+SAVEPOINT sp_arr_ctor_g		-
+ALTER TABLE cen ADD COLUMN g_arr_ctor text GENERATED ALWAYS AS ((ARRAY[a, b])::text) STORED		!current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK TO sp_arr_ctor_g		-
+SAVEPOINT sp_arr_ctor_v		-
+CREATE VIEW v_arr_ctor AS SELECT ARRAY[a, b] AS x FROM cen		-
+SELECT pg_get_viewdef('v_arr_ctor'::regclass)		 SELECT ARRAY[a, b] AS x\n   FROM cen\;
+ROLLBACK TO sp_arr_ctor_v		-
+SAVEPOINT sp_arr_sub		-
+CREATE INDEX ix_arr_sub ON cen ((arr[1]))		-
+SELECT pg_get_indexdef('ix_arr_sub'::regclass)		CREATE INDEX ix_arr_sub ON public.cen USING btree ((arr[1]))
+ROLLBACK TO sp_arr_sub		-
+SAVEPOINT sp_arr_sub_e		-
+CREATE INDEX ix_arr_sub ON cen ((arr[1]))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_arr_sub'::regclass		arr[1]
+ROLLBACK TO sp_arr_sub_e		-
+SAVEPOINT sp_arr_sub_g		-
+ALTER TABLE cen ADD COLUMN g_arr_sub text GENERATED ALWAYS AS ((arr[1])::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_arr_sub'		(arr[1])::text
+ROLLBACK TO sp_arr_sub_g		-
+SAVEPOINT sp_arr_sub_v		-
+CREATE VIEW v_arr_sub AS SELECT arr[1] AS x FROM cen		-
+SELECT pg_get_viewdef('v_arr_sub'::regclass)		 SELECT arr[1] AS x\n   FROM cen\;
+ROLLBACK TO sp_arr_sub_v		-
+SAVEPOINT sp_arr_slice		-
+CREATE INDEX ix_arr_slice ON cen ((arr[1:2]))		-
+# (the read-back this node cannot reach yet — PostgreSQL's answer, kept as evidence
+#  rather than as a comparison, because the refusal above swallows anything after it)
+# SELECT pg_get_indexdef('ix_arr_slice'::regclass)		CREATE INDEX ix_arr_slice ON public.cen USING btree ((arr[1:2]))
+ROLLBACK TO sp_arr_slice		-
+SAVEPOINT sp_arr_slice_e		-
+CREATE INDEX ix_arr_slice ON cen ((arr[1:2]))		-
+# (the read-back this node cannot reach yet — PostgreSQL's answer, kept as evidence
+#  rather than as a comparison, because the refusal above swallows anything after it)
+# SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_arr_slice'::regclass		arr[1:2]\n!generation expression is not immutable
+ROLLBACK TO sp_arr_slice_e		-
+SAVEPOINT sp_arr_slice_g		-
+ALTER TABLE cen ADD COLUMN g_arr_slice text GENERATED ALWAYS AS ((arr[1:2])::text) STORED		!current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK TO sp_arr_slice_g		-
+SAVEPOINT sp_arr_slice_v		-
+CREATE VIEW v_arr_slice AS SELECT arr[1:2] AS x FROM cen		-
+# (the read-back this node cannot reach yet — PostgreSQL's answer, kept as evidence
+#  rather than as a comparison, because the refusal above swallows anything after it)
+# SELECT pg_get_viewdef('v_arr_slice'::regclass)		 SELECT arr[1:2] AS x\n   FROM cen\;
+ROLLBACK TO sp_arr_slice_v		-
+SAVEPOINT sp_arr_cat		-
+CREATE INDEX ix_arr_cat ON cen ((arr || ARRAY[a]))		-
+SELECT pg_get_indexdef('ix_arr_cat'::regclass)		CREATE INDEX ix_arr_cat ON public.cen USING btree (((arr \|\| ARRAY[a])))
+ROLLBACK TO sp_arr_cat		-
+SAVEPOINT sp_arr_cat_e		-
+CREATE INDEX ix_arr_cat ON cen ((arr || ARRAY[a]))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_arr_cat'::regclass		(arr \|\| ARRAY[a])\n!generation expression is not immutable
+ROLLBACK TO sp_arr_cat_e		-
+SAVEPOINT sp_arr_cat_g		-
+ALTER TABLE cen ADD COLUMN g_arr_cat text GENERATED ALWAYS AS ((arr || ARRAY[a])::text) STORED		!current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK TO sp_arr_cat_g		-
+SAVEPOINT sp_arr_cat_v		-
+CREATE VIEW v_arr_cat AS SELECT arr || ARRAY[a] AS x FROM cen		-
+SELECT pg_get_viewdef('v_arr_cat'::regclass)		 SELECT (arr \|\| ARRAY[a]) AS x\n   FROM cen\;
+ROLLBACK TO sp_arr_cat_v		-
+SAVEPOINT sp_str_nest		-
+CREATE INDEX ix_str_nest ON cen ((upper(btrim(t))))		-
+SELECT pg_get_indexdef('ix_str_nest'::regclass)		CREATE INDEX ix_str_nest ON public.cen USING btree (upper(btrim(t)))
+ROLLBACK TO sp_str_nest		-
+SAVEPOINT sp_str_nest_e		-
+CREATE INDEX ix_str_nest ON cen ((upper(btrim(t))))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_str_nest'::regclass		upper(btrim(t))
+ROLLBACK TO sp_str_nest_e		-
+SAVEPOINT sp_str_nest_g		-
+ALTER TABLE cen ADD COLUMN g_str_nest text GENERATED ALWAYS AS ((upper(btrim(t)))::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_str_nest'		upper(btrim(t))
+ROLLBACK TO sp_str_nest_g		-
+SAVEPOINT sp_str_nest_v		-
+CREATE VIEW v_str_nest AS SELECT upper(btrim(t)) AS x FROM cen		-
+SELECT pg_get_viewdef('v_str_nest'::regclass)		 SELECT upper(btrim(t)) AS x\n   FROM cen\;
+ROLLBACK TO sp_str_nest_v		-
+SAVEPOINT sp_str_cat		-
+CREATE INDEX ix_str_cat ON cen ((t || upper(t)))		-
+SELECT pg_get_indexdef('ix_str_cat'::regclass)		CREATE INDEX ix_str_cat ON public.cen USING btree (((t \|\| upper(t))))
+ROLLBACK TO sp_str_cat		-
+SAVEPOINT sp_str_cat_e		-
+CREATE INDEX ix_str_cat ON cen ((t || upper(t)))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_str_cat'::regclass		(t \|\| upper(t))
+ROLLBACK TO sp_str_cat_e		-
+SAVEPOINT sp_str_cat_g		-
+ALTER TABLE cen ADD COLUMN g_str_cat text GENERATED ALWAYS AS ((t || upper(t))::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_str_cat'		(t \|\| upper(t))
+ROLLBACK TO sp_str_cat_g		-
+SAVEPOINT sp_str_cat_v		-
+CREATE VIEW v_str_cat AS SELECT t || upper(t) AS x FROM cen		-
+SELECT pg_get_viewdef('v_str_cat'::regclass)		 SELECT (t \|\| upper(t)) AS x\n   FROM cen\;
+ROLLBACK TO sp_str_cat_v		-
+SAVEPOINT sp_str_len		-
+CREATE INDEX ix_str_len ON cen ((length(btrim(t, 'x'))))		-
+SELECT pg_get_indexdef('ix_str_len'::regclass)		CREATE INDEX ix_str_len ON public.cen USING btree (length(btrim(t, 'x'::text)))
+ROLLBACK TO sp_str_len		-
+SAVEPOINT sp_str_len_e		-
+CREATE INDEX ix_str_len ON cen ((length(btrim(t, 'x'))))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_str_len'::regclass		length(btrim(t, 'x'::text))
+ROLLBACK TO sp_str_len_e		-
+SAVEPOINT sp_str_len_g		-
+ALTER TABLE cen ADD COLUMN g_str_len text GENERATED ALWAYS AS ((length(btrim(t, 'x')))::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_str_len'		(length(btrim(t, 'x'::text)))::text
+ROLLBACK TO sp_str_len_g		-
+SAVEPOINT sp_str_len_v		-
+CREATE VIEW v_str_len AS SELECT length(btrim(t, 'x')) AS x FROM cen		-
+SELECT pg_get_viewdef('v_str_len'::regclass)		 SELECT length(btrim(t, 'x'::text)) AS x\n   FROM cen\;
+ROLLBACK TO sp_str_len_v		-
+SAVEPOINT sp_null_is		-
+ALTER TABLE cen ADD CONSTRAINT k_null_is CHECK (a IS NULL)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_null_is'		CHECK ((a IS NULL))
+ROLLBACK TO sp_null_is		-
+SAVEPOINT sp_null_is_p		-
+ALTER TABLE cen ADD CONSTRAINT k_null_is CHECK (a IS NULL)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_null_is'		CHECK (a IS NULL)
+ROLLBACK TO sp_null_is_p		-
+SAVEPOINT sp_null_is_w		-
+CREATE INDEX ix_null_is ON cen (a) WHERE a IS NULL		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_null_is'::regclass		(a IS NULL)
+ROLLBACK TO sp_null_is_w		-
+SAVEPOINT sp_null_isnot		-
+ALTER TABLE cen ADD CONSTRAINT k_null_isnot CHECK (t IS NOT NULL)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_null_isnot'		CHECK ((t IS NOT NULL))
+ROLLBACK TO sp_null_isnot		-
+SAVEPOINT sp_null_isnot_p		-
+ALTER TABLE cen ADD CONSTRAINT k_null_isnot CHECK (t IS NOT NULL)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_null_isnot'		CHECK (t IS NOT NULL)
+ROLLBACK TO sp_null_isnot_p		-
+SAVEPOINT sp_null_isnot_w		-
+CREATE INDEX ix_null_isnot ON cen (a) WHERE t IS NOT NULL		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_null_isnot'::regclass		(t IS NOT NULL)
+ROLLBACK TO sp_null_isnot_w		-
+SAVEPOINT sp_between		-
+ALTER TABLE cen ADD CONSTRAINT k_between CHECK (a BETWEEN 1 AND 10)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_between'		CHECK (((a >= 1) AND (a <= 10)))
+ROLLBACK TO sp_between		-
+SAVEPOINT sp_between_p		-
+ALTER TABLE cen ADD CONSTRAINT k_between CHECK (a BETWEEN 1 AND 10)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_between'		CHECK (a >= 1 AND a <= 10)
+ROLLBACK TO sp_between_p		-
+SAVEPOINT sp_between_w		-
+CREATE INDEX ix_between ON cen (a) WHERE a BETWEEN 1 AND 10		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_between'::regclass		((a >= 1) AND (a <= 10))
+ROLLBACK TO sp_between_w		-
+SAVEPOINT sp_not_between		-
+ALTER TABLE cen ADD CONSTRAINT k_not_between CHECK (a NOT BETWEEN 1 AND 10)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_not_between'		CHECK (((a < 1) OR (a > 10)))
+ROLLBACK TO sp_not_between		-
+SAVEPOINT sp_not_between_p		-
+ALTER TABLE cen ADD CONSTRAINT k_not_between CHECK (a NOT BETWEEN 1 AND 10)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_not_between'		CHECK (a < 1 OR a > 10)
+ROLLBACK TO sp_not_between_p		-
+SAVEPOINT sp_not_between_w		-
+CREATE INDEX ix_not_between ON cen (a) WHERE a NOT BETWEEN 1 AND 10		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_not_between'::regclass		((a < 1) OR (a > 10))
+ROLLBACK TO sp_not_between_w		-
+SAVEPOINT sp_like		-
+ALTER TABLE cen ADD CONSTRAINT k_like CHECK (t LIKE 'x%')		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_like'		CHECK ((t ~~ 'x%'::text))
+ROLLBACK TO sp_like		-
+SAVEPOINT sp_like_p		-
+ALTER TABLE cen ADD CONSTRAINT k_like CHECK (t LIKE 'x%')		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_like'		CHECK (t ~~ 'x%'::text)
+ROLLBACK TO sp_like_p		-
+SAVEPOINT sp_like_w		-
+CREATE INDEX ix_like ON cen (a) WHERE t LIKE 'x%'		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_like'::regclass		(t ~~ 'x%'::text)
+ROLLBACK TO sp_like_w		-
+SAVEPOINT sp_not_like		-
+ALTER TABLE cen ADD CONSTRAINT k_not_like CHECK (t NOT LIKE 'x%')		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_not_like'		CHECK ((t !~~ 'x%'::text))
+ROLLBACK TO sp_not_like		-
+SAVEPOINT sp_not_like_p		-
+ALTER TABLE cen ADD CONSTRAINT k_not_like CHECK (t NOT LIKE 'x%')		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_not_like'		CHECK (t !~~ 'x%'::text)
+ROLLBACK TO sp_not_like_p		-
+SAVEPOINT sp_not_like_w		-
+CREATE INDEX ix_not_like ON cen (a) WHERE t NOT LIKE 'x%'		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_not_like'::regclass		(t !~~ 'x%'::text)
+ROLLBACK TO sp_not_like_w		-
+SAVEPOINT sp_ilike		-
+ALTER TABLE cen ADD CONSTRAINT k_ilike CHECK (t ILIKE 'x%')		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_ilike'		CHECK ((t ~~* 'x%'::text))
+ROLLBACK TO sp_ilike		-
+SAVEPOINT sp_ilike_p		-
+ALTER TABLE cen ADD CONSTRAINT k_ilike CHECK (t ILIKE 'x%')		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_ilike'		CHECK (t ~~* 'x%'::text)
+ROLLBACK TO sp_ilike_p		-
+SAVEPOINT sp_ilike_w		-
+CREATE INDEX ix_ilike ON cen (a) WHERE t ILIKE 'x%'		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_ilike'::regclass		(t ~~* 'x%'::text)
+ROLLBACK TO sp_ilike_w		-
+SAVEPOINT sp_distinct		-
+ALTER TABLE cen ADD CONSTRAINT k_distinct CHECK (a IS DISTINCT FROM b)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_distinct'		CHECK ((a IS DISTINCT FROM b))
+ROLLBACK TO sp_distinct		-
+SAVEPOINT sp_distinct_p		-
+ALTER TABLE cen ADD CONSTRAINT k_distinct CHECK (a IS DISTINCT FROM b)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_distinct'		CHECK (a IS DISTINCT FROM b)
+ROLLBACK TO sp_distinct_p		-
+SAVEPOINT sp_distinct_w		-
+CREATE INDEX ix_distinct ON cen (a) WHERE a IS DISTINCT FROM b		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_distinct'::regclass		(a IS DISTINCT FROM b)
+ROLLBACK TO sp_distinct_w		-
+SAVEPOINT sp_notdistinct		-
+ALTER TABLE cen ADD CONSTRAINT k_notdistinct CHECK (a IS NOT DISTINCT FROM b)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_notdistinct'		CHECK ((NOT (a IS DISTINCT FROM b)))
+ROLLBACK TO sp_notdistinct		-
+SAVEPOINT sp_notdistinct_p		-
+ALTER TABLE cen ADD CONSTRAINT k_notdistinct CHECK (a IS NOT DISTINCT FROM b)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_notdistinct'		CHECK (NOT a IS DISTINCT FROM b)
+ROLLBACK TO sp_notdistinct_p		-
+SAVEPOINT sp_notdistinct_w		-
+CREATE INDEX ix_notdistinct ON cen (a) WHERE a IS NOT DISTINCT FROM b		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_notdistinct'::regclass		(NOT (a IS DISTINCT FROM b))
+ROLLBACK TO sp_notdistinct_w		-
+SAVEPOINT sp_in_list		-
+ALTER TABLE cen ADD CONSTRAINT k_in_list CHECK (a IN (1, 2, 3))		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_in_list'		CHECK ((a = ANY (ARRAY[1, 2, 3])))
+ROLLBACK TO sp_in_list		-
+SAVEPOINT sp_in_list_p		-
+ALTER TABLE cen ADD CONSTRAINT k_in_list CHECK (a IN (1, 2, 3))		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_in_list'		CHECK (a = ANY (ARRAY[1, 2, 3]))
+ROLLBACK TO sp_in_list_p		-
+SAVEPOINT sp_in_list_w		-
+CREATE INDEX ix_in_list ON cen (a) WHERE a IN (1, 2, 3)		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_in_list'::regclass		(a = ANY (ARRAY[1, 2, 3]))
+ROLLBACK TO sp_in_list_w		-
+SAVEPOINT sp_not_in		-
+ALTER TABLE cen ADD CONSTRAINT k_not_in CHECK (a NOT IN (1, 2))		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k_not_in'		CHECK ((a <> ALL (ARRAY[1, 2])))
+ROLLBACK TO sp_not_in		-
+SAVEPOINT sp_not_in_p		-
+ALTER TABLE cen ADD CONSTRAINT k_not_in CHECK (a NOT IN (1, 2))		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k_not_in'		CHECK (a <> ALL (ARRAY[1, 2]))
+ROLLBACK TO sp_not_in_p		-
+SAVEPOINT sp_not_in_w		-
+CREATE INDEX ix_not_in ON cen (a) WHERE a NOT IN (1, 2)		-
+SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_not_in'::regclass		(a <> ALL (ARRAY[1, 2]))
+ROLLBACK TO sp_not_in_w		-
+SAVEPOINT sp_coalesce		-
+CREATE INDEX ix_coalesce ON cen ((coalesce(a, b, 0)))		-
+SELECT pg_get_indexdef('ix_coalesce'::regclass)		CREATE INDEX ix_coalesce ON public.cen USING btree (COALESCE(a, b, 0))
+ROLLBACK TO sp_coalesce		-
+SAVEPOINT sp_coalesce_e		-
+CREATE INDEX ix_coalesce ON cen ((coalesce(a, b, 0)))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_coalesce'::regclass		COALESCE(a, b, 0)
+ROLLBACK TO sp_coalesce_e		-
+SAVEPOINT sp_coalesce_g		-
+ALTER TABLE cen ADD COLUMN g_coalesce text GENERATED ALWAYS AS ((coalesce(a, b, 0))::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_coalesce'		(COALESCE(a, b, 0))::text
+ROLLBACK TO sp_coalesce_g		-
+SAVEPOINT sp_coalesce_v		-
+CREATE VIEW v_coalesce AS SELECT coalesce(a, b, 0) AS x FROM cen		-
+SELECT pg_get_viewdef('v_coalesce'::regclass)		 SELECT COALESCE(a, b, 0) AS x\n   FROM cen\;
+ROLLBACK TO sp_coalesce_v		-
+SAVEPOINT sp_greatest		-
+CREATE INDEX ix_greatest ON cen ((greatest(a, b)))		-
+SELECT pg_get_indexdef('ix_greatest'::regclass)		CREATE INDEX ix_greatest ON public.cen USING btree (GREATEST(a, b))
+ROLLBACK TO sp_greatest		-
+SAVEPOINT sp_greatest_e		-
+CREATE INDEX ix_greatest ON cen ((greatest(a, b)))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_greatest'::regclass		GREATEST(a, b)
+ROLLBACK TO sp_greatest_e		-
+SAVEPOINT sp_greatest_g		-
+ALTER TABLE cen ADD COLUMN g_greatest text GENERATED ALWAYS AS ((greatest(a, b))::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_greatest'		(GREATEST(a, b))::text
+ROLLBACK TO sp_greatest_g		-
+SAVEPOINT sp_greatest_v		-
+CREATE VIEW v_greatest AS SELECT greatest(a, b) AS x FROM cen		-
+SELECT pg_get_viewdef('v_greatest'::regclass)		 SELECT GREATEST(a, b) AS x\n   FROM cen\;
+ROLLBACK TO sp_greatest_v		-
+SAVEPOINT sp_nullif		-
+CREATE INDEX ix_nullif ON cen ((nullif(a, 0)))		-
+SELECT pg_get_indexdef('ix_nullif'::regclass)		CREATE INDEX ix_nullif ON public.cen USING btree (NULLIF(a, 0))
+ROLLBACK TO sp_nullif		-
+SAVEPOINT sp_nullif_e		-
+CREATE INDEX ix_nullif ON cen ((nullif(a, 0)))		-
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_nullif'::regclass		NULLIF(a, 0)
+ROLLBACK TO sp_nullif_e		-
+SAVEPOINT sp_nullif_g		-
+ALTER TABLE cen ADD COLUMN g_nullif text GENERATED ALWAYS AS ((nullif(a, 0))::text) STORED		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_nullif'		(NULLIF(a, 0))::text
+ROLLBACK TO sp_nullif_g		-
+SAVEPOINT sp_nullif_v		-
+CREATE VIEW v_nullif AS SELECT nullif(a, 0) AS x FROM cen		-
+SELECT pg_get_viewdef('v_nullif'::regclass)		 SELECT NULLIF(a, 0) AS x\n   FROM cen\;
+ROLLBACK TO sp_nullif_v		-
+SAVEPOINT sp_d_int		-
+ALTER TABLE cend ALTER COLUMN t SET DEFAULT (42)::text		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'		(42)::text
+ROLLBACK TO sp_d_int		-
+SAVEPOINT sp_d_neg		-
+ALTER TABLE cend ALTER COLUMN t SET DEFAULT (-1)::text		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'		('-1'::integer)::text
+ROLLBACK TO sp_d_neg		-
+SAVEPOINT sp_d_cast		-
+ALTER TABLE cend ALTER COLUMN t SET DEFAULT ((1)::bigint)::text		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'		((1)::bigint)::text
+ROLLBACK TO sp_d_cast		-
+SAVEPOINT sp_d_negcast		-
+ALTER TABLE cend ALTER COLUMN t SET DEFAULT ((-1)::bigint)::text		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'		(('-1'::integer)::bigint)::text
+ROLLBACK TO sp_d_negcast		-
+SAVEPOINT sp_d_str		-
+ALTER TABLE cend ALTER COLUMN t SET DEFAULT ('x')::text		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'		'x'::text
+ROLLBACK TO sp_d_str		-
+SAVEPOINT sp_d_arr		-
+ALTER TABLE cend ALTER COLUMN t SET DEFAULT (ARRAY[1, 2])::text		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'		(ARRAY[1, 2])::text
+ROLLBACK TO sp_d_arr		-
+SAVEPOINT sp_d_case		-
+ALTER TABLE cend ALTER COLUMN t SET DEFAULT (CASE WHEN true THEN 1 ELSE 2 END)::text		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'		(\nCASE\n    WHEN true THEN 1\n    ELSE 2\nEND)::text
+ROLLBACK TO sp_d_case		-
+SAVEPOINT sp_d_expr		-
+ALTER TABLE cend ALTER COLUMN t SET DEFAULT (1 + 2 * 3)::text		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'		((1 + (2 * 3)))::text
+ROLLBACK TO sp_d_expr		-
+SAVEPOINT sp_d_fn		-
+ALTER TABLE cend ALTER COLUMN t SET DEFAULT (abs(-1))::text		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'		(abs('-1'::integer))::text
+ROLLBACK TO sp_d_fn		-
+SAVEPOINT sp_d_mod		-
+ALTER TABLE cend ALTER COLUMN t SET DEFAULT (mod(7, 3))::text		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'		(mod(7, 3))::text
+ROLLBACK TO sp_d_mod		-
+ROLLBACK		-
