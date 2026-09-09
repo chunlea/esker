@@ -1460,6 +1460,7 @@ impl Executor {
             search_path,
             rendering: self.rendering(),
             prepared: &self.prepared,
+            advisory: Some(&self.locks),
         }
     }
 
@@ -2642,9 +2643,40 @@ impl Executor {
                 return;
             };
             let (call, args) = (*call, std::mem::take(args));
+            // **No key, so no key to parse.** `pg_advisory_unlock_all()` takes no arguments and
+            // releases everything this session holds — what the connection does when a session
+            // ends, asked for early.
+            if matches!(call, crate::plan::AdvisoryCall::UnlockAll) {
+                if args.is_empty() {
+                    self.locks.unlock_all(self.session);
+                    *expr = Expr::Literal(Literal::String(String::new()));
+                } else {
+                    failed.get_or_insert(SqlError::UndefinedFunction(format!("{}()", call.name())));
+                }
+                return;
+            }
             let answered = match advisory_key(call, &args) {
                 Ok(key) => {
-                    if call.takes() {
+                    if call.blocks() {
+                        // **The wait, on the statement's own clock.** `pg_advisory_lock` does not
+                        // answer until it holds the lock, so this polls the table the way a row
+                        // lock's wait does — the same cancel check at the top, so a
+                        // `pg_cancel_backend` reaches a session parked here, and the same
+                        // `lock_timeout` / `statement_timeout` pair, so a wait that a client
+                        // bounded stays bounded. `void` is what it evaluates to on a real server;
+                        // this node has no `void`, so it is the **empty string** — see
+                        // `AdvisoryCall::is_void` for why not a NULL.
+                        match self.wait_for_advisory(key, call.mode()) {
+                            Ok(()) => {
+                                *expr = Expr::Literal(Literal::String(String::new()));
+                                return;
+                            }
+                            Err(error) => {
+                                failed.get_or_insert(error);
+                                false
+                            }
+                        }
+                    } else if call.takes() {
                         self.locks.try_lock(self.session, key, call.mode())
                     } else {
                         let released = self.locks.unlock(self.session, key, call.mode());
@@ -2666,6 +2698,34 @@ impl Executor {
         };
         bind::walk_mut(statement, &mut resolve);
         failed.map_or(Ok(()), Err)
+    }
+
+    /// Waits until this session holds `key` in `mode`, or the statement's deadline ends the wait.
+    ///
+    /// The same three exits a row lock's wait has — the lock comes free, the statement is
+    /// cancelled, a timeout fires — and deliberately **not** a fourth: there is no deadlock
+    /// detection between advisory locks, because nothing here can tell an application's lock order
+    /// from a cycle. PostgreSQL does detect them; that difference is declared rather than
+    /// approximated, and a client that sets `lock_timeout` gets the same protection either way.
+    fn wait_for_advisory(
+        &self,
+        key: crate::advisory::Key,
+        mode: crate::advisory::Mode,
+    ) -> Result<()> {
+        let deadline = self.lock_deadline();
+        let began = std::time::Instant::now();
+        loop {
+            cancel::check()?;
+            if self.locks.try_lock(self.session, key, mode) {
+                return Ok(());
+            }
+            if let Some((limit, which)) = deadline
+                && u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX) >= limit
+            {
+                return Err(which.expired());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(WAIT_STEP_MS));
+        }
     }
 
     /// Folds every `current_setting(…)` to the value this session reports.

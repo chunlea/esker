@@ -3277,17 +3277,20 @@ fn lower_trigger_state(
 
 /// The advisory-lock function of that name, or `None`.
 ///
-/// Matched on the whole name rather than a prefix so that `pg_advisory_lock` — the **blocking**
-/// form — falls through to the refusal table instead of being read as a `try`. Answering a wait
-/// with an immediate failure would be the worse kind of wrong: a migrator told it holds the lock
-/// when it does not.
+/// Matched on the whole name rather than a prefix, because the blocking and the `try` families are
+/// two behaviours and not two spellings: reading `pg_advisory_lock` as a `try` would answer a wait
+/// with an immediate failure, which is the worse kind of wrong — a migrator told it holds a lock it
+/// does not. The blocking pair waits; see [`plan::AdvisoryCall::blocks`].
 fn advisory_call(name: &str) -> Option<plan::AdvisoryCall> {
     let folded = name.to_ascii_lowercase();
     match folded.as_str() {
+        "pg_advisory_lock" => Some(plan::AdvisoryCall::Lock),
+        "pg_advisory_lock_shared" => Some(plan::AdvisoryCall::LockShared),
         "pg_try_advisory_lock" => Some(plan::AdvisoryCall::TryLock),
         "pg_try_advisory_lock_shared" => Some(plan::AdvisoryCall::TryLockShared),
         "pg_advisory_unlock" => Some(plan::AdvisoryCall::Unlock),
         "pg_advisory_unlock_shared" => Some(plan::AdvisoryCall::UnlockShared),
+        "pg_advisory_unlock_all" => Some(plan::AdvisoryCall::UnlockAll),
         _ => None,
     }
 }
@@ -4727,10 +4730,25 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         refuse_wrong_arity(function, "current_user", 0)?;
         return Ok(plan::Expr::CurrentUser);
     }
-    // The advisory-lock functions this node answers. The **blocking** forms are not here and are
-    // refused by name: they wait, and nothing here has anything to wait on. `ActiveRecord` sends
-    // only these (`postgresql_adapter.rb:474`), so the refusal costs the suite nothing.
+    // The advisory-lock functions this node answers, blocking forms included — see
+    // [`plan::AdvisoryCall`] for which are still refused and why.
     if let Some(call) = advisory_call(&name) {
+        // **`pg_advisory_unlock_all()` is the one with no arguments**, and `sqlparser` spells an
+        // empty argument list either way depending on how the call was written, so both are it.
+        let no_arguments = matches!(function.args, FunctionArguments::None)
+            || matches!(&function.args, FunctionArguments::List(list) if list.args.is_empty());
+        if matches!(call, plan::AdvisoryCall::UnlockAll) {
+            if !no_arguments {
+                return Err(SqlError::UndefinedFunction(format!(
+                    "{}() with arguments",
+                    call.name()
+                )));
+            }
+            return Ok(plan::Expr::Advisory {
+                call,
+                args: Vec::new(),
+            });
+        }
         let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
             return Err(SqlError::UndefinedFunction(format!("{}()", call.name())));
         };

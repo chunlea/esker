@@ -37,29 +37,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // corpus proves now is the whole sequence: `DISCARD PLANS` and `DISCARD TEMP` leave a
         // prepared statement alone, `DEALLOCATE ALL` and `DISCARD ALL` clear it, and the view
         // counts it either way.
-        // **`pg_locks` exists now and answers `0` correctly**, so the two lines that count zero
-        // advisory locks have been deleted from this list — they agree. What is left is the two
-        // that count a lock *while it is held*, and they diverge for a reason worth naming: the
-        // view reports **row** locks, which live in the node's lock table, and an advisory lock is
-        // **session** state. A catalog view is handed a transaction and a tenant, not a session,
-        // so the advisory table cannot be reached from here. `pg_prepared_statements` was behind
-        // that same wall until this unit and is the way through it: its rows are handed down from
-        // the session before each statement runs, which is what an advisory-lock row would need
-        // too.
-        (
-            "SELECT 'r', count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 7001",
-            "`0` here and `1` on the oracle: the lock is taken and released correctly (asserted in \
-             `discarding_all_clears_the_session`), and `pg_locks` shows row locks rather than \
-             advisory ones — session state a catalog view is not given.",
-            "pg19_discard_all.txt:46",
-        ),
-        (
-            "SELECT 'r', current_setting('statement_timeout'), count(*) FROM pg_locks WHERE \
-             locktype = 'advisory' AND objid = 7001",
-            "The same, and the `statement_timeout` half agrees: `DEALLOCATE ALL` leaves it at \
-             `31s`, which is the point of the line.",
-            "pg19_discard_all.txt:72",
-        ),
+        // **`pg_locks` reports advisory locks now**, so the four lines that counted them — two
+        // expecting zero and two expecting one while the lock was held — all agree and have been
+        // deleted from this list. The wall this comment used to describe is gone: `Settings`
+        // carries the node's advisory table down to the view the same way it already carried the
+        // session's prepared statements, which is exactly the way through that was predicted here.
         // **The reset itself is right and one boot value is spelled differently.** `DISCARD ALL`
         // put `statement_timeout` back to `0`; the container boots `TimeZone` at `Etc/UTC` and
         // this node at `UTC`, which is the same instant and an older difference.

@@ -2657,13 +2657,21 @@ fn describe(expr: &Expr) -> &'static str {
 
 /// Which advisory-lock function was written.
 ///
-/// The **blocking** forms (`pg_advisory_lock`, `pg_advisory_lock_shared` and the `xact` family)
-/// are deliberately not here: they wait, and nothing in this node has anything to wait on — a
-/// `pg_try_advisory_lock` that cannot take the lock answers `false` instead. `ActiveRecord` sends
-/// only the two `try`/`unlock` shapes (`postgresql_adapter.rb:474`), so the blocking ones are
-/// refused by name in `crate::parse` rather than approximated by a spin.
+/// The two blocking forms wait: they poll the table on the statement's own clock and answer only
+/// once they hold the lock, which is what separates them from the `try` pair. They were refused by
+/// name until `connection_test.rb`'s *get and release advisory lock* turned up sending
+/// `pg_advisory_lock` — `ActiveRecord`'s migrator sends the `try` shape
+/// (`postgresql_adapter.rb:474`) and its connection tests do not.
+///
+/// The `xact` family (`pg_advisory_xact_lock` and friends) is still refused by name: those are
+/// released by the *transaction* ending rather than by an unlock, which is a lifetime this table
+/// does not model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdvisoryCall {
+    /// `pg_advisory_lock(bigint)` / `(int4, int4)` — the **blocking** form, which waits.
+    Lock,
+    /// `pg_advisory_lock_shared(bigint)` / `(int4, int4)`.
+    LockShared,
     /// `pg_try_advisory_lock(bigint)` / `(int4, int4)`.
     TryLock,
     /// `pg_try_advisory_lock_shared(bigint)` / `(int4, int4)`.
@@ -2672,6 +2680,8 @@ pub enum AdvisoryCall {
     Unlock,
     /// `pg_advisory_unlock_shared(bigint)` / `(int4, int4)`.
     UnlockShared,
+    /// `pg_advisory_unlock_all()` — no arguments, and it releases every lock this session holds.
+    UnlockAll,
 }
 
 impl AdvisoryCall {
@@ -2679,25 +2689,65 @@ impl AdvisoryCall {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
+            AdvisoryCall::Lock => "pg_advisory_lock",
+            AdvisoryCall::LockShared => "pg_advisory_lock_shared",
             AdvisoryCall::TryLock => "pg_try_advisory_lock",
             AdvisoryCall::TryLockShared => "pg_try_advisory_lock_shared",
             AdvisoryCall::Unlock => "pg_advisory_unlock",
             AdvisoryCall::UnlockShared => "pg_advisory_unlock_shared",
+            AdvisoryCall::UnlockAll => "pg_advisory_unlock_all",
         }
     }
 
     /// Whether this one takes a lock (rather than releasing one).
     #[must_use]
     pub fn takes(self) -> bool {
-        matches!(self, AdvisoryCall::TryLock | AdvisoryCall::TryLockShared)
+        matches!(
+            self,
+            AdvisoryCall::TryLock
+                | AdvisoryCall::TryLockShared
+                | AdvisoryCall::Lock
+                | AdvisoryCall::LockShared
+        )
+    }
+
+    /// Whether it **waits** for the lock rather than answering `false`.
+    ///
+    /// The difference is the whole of the two families: `pg_try_advisory_lock` answers now, and
+    /// `pg_advisory_lock` does not answer until it has the lock. It also decides what the call
+    /// evaluates to — a `boolean` for the first and `void` for the second.
+    #[must_use]
+    pub fn blocks(self) -> bool {
+        matches!(self, AdvisoryCall::Lock | AdvisoryCall::LockShared)
+    }
+
+    /// Whether it answers `void` rather than a `boolean`.
+    ///
+    /// **`void` is not NULL**, which is the trap: `pg_advisory_unlock_all() IS NULL` is `f` on a
+    /// real server, measured in `pg19_advisory_lock.txt`. This node has no `void` type, so these
+    /// answer an **empty string** — every observable except `pg_typeof` then matches, where a NULL
+    /// would have answered `t` to that `IS NULL` and been a wrong answer rather than a missing
+    /// type.
+    #[must_use]
+    pub fn is_void(self) -> bool {
+        matches!(
+            self,
+            AdvisoryCall::Lock | AdvisoryCall::LockShared | AdvisoryCall::UnlockAll
+        )
     }
 
     /// The mode it works in.
     #[must_use]
     pub fn mode(self) -> crate::advisory::Mode {
         match self {
-            AdvisoryCall::TryLock | AdvisoryCall::Unlock => crate::advisory::Mode::Exclusive,
-            AdvisoryCall::TryLockShared | AdvisoryCall::UnlockShared => {
+            AdvisoryCall::Lock | AdvisoryCall::TryLock | AdvisoryCall::Unlock => {
+                crate::advisory::Mode::Exclusive
+            }
+            AdvisoryCall::LockShared
+            | AdvisoryCall::TryLockShared
+            | AdvisoryCall::UnlockShared
+            // It releases both modes; the mode is not consulted.
+            | AdvisoryCall::UnlockAll => {
                 crate::advisory::Mode::Shared
             }
         }
