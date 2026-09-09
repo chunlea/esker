@@ -762,14 +762,18 @@ fn not_null_of(oid: i64) -> Option<(u64, i16)> {
 
 /// The columns of `pg_constraint`, in PostgreSQL's own order.
 pub const CONSTRAINT_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    // **A `bigint`**: every constraint oid here is derived, from one of the four bases at bits
+    // 56–61 (`CHECK_OID_BASE` and its siblings below), so none of them fits four bytes (ADR 0097).
     ("oid", ColumnType::Int8, NO_LENGTH),
     ("conname", ColumnType::Name, NO_LENGTH),
-    ("connamespace", ColumnType::Int8, NO_LENGTH),
+    ("connamespace", ColumnType::Oid, NO_LENGTH),
     ("contype", ColumnType::Char, NO_LENGTH),
     ("condeferrable", ColumnType::Bool, NO_LENGTH),
     ("condeferred", ColumnType::Bool, NO_LENGTH),
     ("convalidated", ColumnType::Bool, NO_LENGTH),
     ("conrelid", ColumnType::Int8, NO_LENGTH),
+    // **A `bigint`**: it names the index behind the constraint, and for a primary key that is
+    // `pg_relations::PRIMARY_KEY_OID_BASE + table_id` (ADR 0097).
     ("conindid", ColumnType::Int8, NO_LENGTH),
     ("confrelid", ColumnType::Int8, NO_LENGTH),
     ("confupdtype", ColumnType::Char, NO_LENGTH),
@@ -790,5 +794,5 @@ pub const CONSTRAINT_COLUMNS: &[(&str, ColumnType, i32)] = &[
     // order. The **domain** a constraint belongs to, and 0 for one on a table — a `CHECK` written
     // on a domain has a `pg_constraint` row of its own there, with `conrelid` 0 and this set
     // ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)).
-    ("contypid", ColumnType::Int8, NO_LENGTH),
+    ("contypid", ColumnType::Oid, NO_LENGTH),
 ];

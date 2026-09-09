@@ -30,14 +30,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
-        "SELECT attname, attcollation FROM pg_attribute WHERE attrelid = 'cb'::regclass AND attnum IN (1, 3) ORDER BY attnum",
-        "SELECT typname, typcollation FROM pg_type WHERE typname IN ('int8', 'text') ORDER BY typname",
-        "SELECT attname, atttypid, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'ca'::regclass AND attnum > 0 ORDER BY attnum",
-        "SELECT attname, attnum, atttypid, atttypmod FROM pg_attribute WHERE attrelid = 'cb_x_idx'::regclass AND attnum > 0 ORDER BY attnum",
-        "SELECT attname, attnum, atttypid, atttypmod FROM pg_attribute WHERE attrelid = 'cb_yz_idx'::regclass AND attnum > 0 ORDER BY attnum",
-        "SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '\"cb\"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
-        "SELECT attname, attcollation FROM pg_attribute WHERE attrelid = 'cb'::regclass AND attnum IN (1, 3) ORDER BY attnum",
-        "SELECT typname, typcollation FROM pg_type WHERE typname IN ('int8', 'text') ORDER BY typname",
     ],
     answers: &[(
         "SELECT count(*) FROM pg_collation",

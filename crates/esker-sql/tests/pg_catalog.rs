@@ -58,17 +58,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'bytea'",
         "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'float8'",
         "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'timestamptz'",
-        "SELECT oid FROM pg_type WHERE typname IN ('int8', 'text', 'bool', 'bytea', 'float8', 'timestamptz') ORDER BY oid",
-        "SELECT t.oid FROM pg_type AS t WHERE t.typname = 'int8'",
         "SELECT typinput FROM pg_type WHERE typname = 'bool'",
         "SELECT typinput FROM pg_type WHERE typname = 'timestamptz'",
-        "SELECT typelem, typbasetype FROM pg_type WHERE typname = 'text'",
-        "SELECT oid FROM pg_type WHERE typname = 'int8' AND typtype = 'b'",
-        "SELECT oid FROM pg_type WHERE typtype IN ('r', 'e', 'd') AND typname IN ('int8', 'text')",
-        "SELECT oid FROM pg_type WHERE typelem IN (16, 17) AND typname IN ('int8', 'text')",
-        "SELECT rngsubtype FROM pg_range WHERE rngtypid = 20",
-        "SELECT t.typname, r.rngsubtype FROM pg_type AS t LEFT JOIN pg_range AS r ON t.oid = r.rngtypid WHERE t.typname = 'int8'",
-        "SELECT t.typname, r.rngsubtype FROM pg_type AS t LEFT JOIN pg_range AS r ON oid = rngtypid WHERE t.typname IN ('int8', 'text') ORDER BY t.oid",
     ],
     answers: &[
         (

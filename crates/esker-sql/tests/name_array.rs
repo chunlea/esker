@@ -45,8 +45,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         // `oid` and `oid[]` on a real server where this node says `bigint` and `bigint[]` — the
         // catalog-oid family, its own unit. `typname` agrees on both since ADR 0084.
-        "SELECT typname AS name, oid, array_agg(oid) FROM pg_type WHERE typname = 'name' GROUP \
-         BY typname, oid",
         // **Every row of this one agrees now**, which is why it is here rather than in `answers`:
         // the value that differed was `name`'s `typelem`, 0 here against 18 on a real server,
         // and it is 18 since `"char"` became a row (ADR 0095). What is left is `oid` answered as

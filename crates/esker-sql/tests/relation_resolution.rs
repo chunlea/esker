@@ -32,9 +32,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE \
          a.attrelid = 'pg_stat_activity'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER \
          BY a.attnum",
-        "SELECT 'r', t.typname, t.typelem, t.typdelim, t.typtype FROM pg_type as t LEFT JOIN \
-         pg_range as r ON t.oid = r.rngtypid WHERE t.typname IN ('int2','int4','int8') ORDER BY \
-         t.typname",
         // **`name[]` there and `text` here**, which is the array half of the same trade:
         // `current_schemas` answers an array on a real server and this node prints the `{a,b}`
         // literal it renders as. The rows are byte-identical, which is what a client reads.

@@ -6784,17 +6784,15 @@ fn cast_literal_text(expr: &Expr) -> Result<Option<String>> {
 /// Only a literal: `column::regtype` would need the cast at run time, and answering it here from
 /// the text of an expression would be a wrong answer rather than a missing feature.
 fn cast_operand(expr: &Expr, data_type: &DataType) -> Result<String> {
-    match expr {
-        Expr::Value(value) => match &value.value {
-            Value::SingleQuotedString(text) => Ok(text.clone()),
-            _ => Err(SqlError::unsupported(format!(
-                "the cast {expr}::{data_type}"
-            ))),
-        },
-        _ => Err(SqlError::unsupported(format!(
-            "the cast {expr}::{data_type}"
-        ))),
-    }
+    // **One reader for the literal, not two.** This function used to accept a single-quoted string
+    // and nothing else, so `'26'::oid` answered and `26::oid` was
+    // `0A000 the cast 26::oid is not supported` — a refusal for a spelling a real server takes and
+    // the one a person writes. [`cast_literal_text`] already knows every shape a literal has here:
+    // a number, a signed number, a bit string, and a cast chain whose inner step folded (ADR 0086).
+    // Asking it is the whole fix, and it is the third time in this crate that one grammar had two
+    // readers and the narrow one was the bug.
+    cast_literal_text(expr)?
+        .ok_or_else(|| SqlError::unsupported(format!("the cast {expr}::{data_type}")))
 }
 
 /// The two cast targets this node answers, or `None` for every other one.

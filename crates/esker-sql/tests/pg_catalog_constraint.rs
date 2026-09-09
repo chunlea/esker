@@ -18,21 +18,28 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `conname` is a `name` here (ADR 0084) and `contype` a `"char"` (ADR 0095); what is left is
-    // `conrelid`, `conindid` and `confrelid`, which are `oid`s on a real server and `bigint` here.
-    // Every value is identical.
+    // `conname` is a `name` here (ADR 0084) and `contype` a `"char"` (ADR 0095). What is left is
+    // `conrelid`, `conindid` and `confrelid`: they name a **relation**, and a relation's oid stays
+    // a `bigint` here because a catalog view's id comes from `VIEW_ID_BASE` and a primary key's
+    // index oid from `PRIMARY_KEY_OID_BASE`, neither of which fits four bytes (ADR 0097). Every
+    // value is identical.
     types: &[
-        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
-        // differs is one of the standing declared-type families listed on
-        // `parity::Divergences::types`. The reason each one used to carry described an answer
-        // that had stopped differing.
-        "SELECT conname, conrelid = 'ka'::regclass, confrelid FROM pg_constraint WHERE conrelid = 'ka'::regclass AND contype = 'p'",
-        "SELECT conname, confupdtype = ' ', confdeltype = ' ', confrelid, conindid = 0 FROM pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname",
+        "SELECT conname, conrelid = 'ka'::regclass, confrelid FROM pg_constraint WHERE conrelid = \
+         'ka'::regclass AND contype = 'p'",
+        "SELECT conname, confupdtype = ' ', confdeltype = ' ', confrelid, conindid = 0 FROM \
+         pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname",
     ],
     answers: &[(
-        "SELECT pg_typeof(contype), pg_typeof(conname), pg_typeof(conrelid) FROM pg_constraint WHERE conrelid = 'kd'::regclass AND contype = 'p'",
-        "`pg_typeof` is a function this node does not have. What it would have said is the \
-             type divergence declared above.",
+        "SELECT pg_typeof(contype), pg_typeof(conname), pg_typeof(conrelid) FROM pg_constraint \
+         WHERE conrelid = 'kd'::regclass AND contype = 'p'",
+        "**`pg_typeof(conrelid)` is the type divergence above, read through a function** — and it \
+         is a row difference rather than a declared-type one because `pg_typeof` answers a name. \
+         `contype` and `conname` agree; the third names a relation, whose oid is a `bigint` here \
+         (ADR 0097).",
+        // `UNMEASURED` because there is no session capture under `tests/captures/` for this
+        // corpus — the oracle's answer is recorded on the corpus row itself
+        // (`corpus/pg19_catalog_constraint.txt:68`, `"char"|name|oid`), which is what the entry
+        // this replaced also declared.
         "UNMEASURED",
     )],
 };

@@ -1,0 +1,89 @@
+# **`oid` is a four-byte unsigned integer, and the catalog's columns are declared as one** —
+# PostgreSQL 19beta1, 2026-09-09. `ON_ERROR_ROLLBACK on`, one `BEGIN … ROLLBACK`, no fixture.
+#
+# ## The census: which catalog columns are `oid`
+#
+#     SELECT c.relname, a.attname
+#       FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+#      WHERE a.atttypid = 26 AND c.relnamespace = 'pg_catalog'::regnamespace
+#        AND c.relkind IN ('r','v') AND a.attnum > 0 AND NOT a.attisdropped
+#      ORDER BY c.relname, a.attnum;
+#
+# **308 columns on PG 19beta1, 46 distinct names**, of which this node declares 46 and can carry
+# 41 (see below). The full list is `oid26.txt` in the capture session; the names this node has are
+# enumerated in `tests/oid_type.rs::DECLARED`.
+#
+# ## The two catalog rows
+#
+#     oid   typname  typlen  typtype  typcategory  typdelim  typinput  typarray
+#     26    oid      4       b        N            ,         oidin     1028
+#     1028  _oid     -1      b        A            ,         array_in  0
+#
+# **`typcategory` is `N`** — numeric, with the integers, not a group of its own. That is why
+# `CASE WHEN true THEN 1::oid ELSE 1::int8 END` has a common type (`oid`) where the same shape over
+# a `"char"` is `42804`: an `oid` unifies with the integers and wins the pair.
+#
+# ## What it is not
+#
+#     1::oid + 1              !42883 operator does not exist: oid + integer
+#     sum(oid)                !42883 function sum(oid) does not exist
+#     26::oid::"char"         !42846 cannot cast type oid to "char"
+#
+# No arithmetic and no `sum`, which is what says an oid is an identifier rather than a number to do
+# sums with. `min`/`max` **keep** the type — where `varchar`, `name`, `cidr` and `"char"` all decay
+# to `text` — and `count` is a `bigint` over anything.
+#
+# ## `oidin` is C's `strtoul` with base 0, and `int4in` is not
+#
+#     '010'::oid     8        '010'::int4    10      <- a leading zero is octal to one and nothing
+#     '0x10'::oid    16       '0x10'::int4   16         to the other
+#     '0o17'::oid    22P02    '0o17'::int4   15
+#     '0b101'::oid   22P02    '0b101'::int4  5
+#     '1_000'::oid   22P02    '1_000'::int4  1000
+#     '0x_1_0'::oid  22P02    '0x_10'::int4  16
+#     '08'::oid      22P02                          <- 8 is not an octal digit
+#
+# So the same digits are different numbers in the two types, and neither behaviour is guessable
+# from the other. Whitespace is trimmed (`' 0x10 '` is 16) and `+` is accepted.
+#
+# ## Unsigned, and the two ends are not symmetric
+#
+#     '-1'::oid           4294967295     <- wraps: the bits, reinterpreted
+#     (-1)::int4::oid     4294967295
+#     (-1)::int8::oid     !22003 OID out of range
+#     '-0x10'::oid        4294967280
+#     '0xffffffff'::oid   4294967295
+#     '0x100000000'::oid  !22003 value "0x100000000" is out of range for type oid
+#     '4294967296'::oid   !22003 value "4294967296" is out of range for type oid
+#     ''::oid             !22P02 invalid input syntax for type oid: ""
+#
+# ## Ordering is numeric
+#
+#     '10'::oid < '9'::oid    f        <- and `t` if it were text
+#     1::oid = 1::int4        t        1::oid = 1::int8   t
+#
+SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput, typarray FROM pg_type WHERE typname IN ('oid','_oid') ORDER BY oid	oid,name,smallint,"char","char","char",regproc,oid	26|oid|4|b|N|,|oidin|1028 ; 1028|_oid|-1|b|A|,|array_in|0
+SELECT format_type(26,-1), format_type(1028,-1)	text,text	oid|oid[]
+SELECT pg_typeof(oid), pg_typeof(relnamespace) FROM pg_class LIMIT 1	regtype,regtype	oid|oid
+SELECT pg_typeof(atttypid), pg_typeof(attrelid) FROM pg_attribute LIMIT 1	regtype,regtype	oid|oid
+SELECT pg_typeof(min(atttypid)) FROM pg_attribute	regtype	oid
+SELECT pg_typeof(array_agg(oid)) FROM (SELECT oid FROM pg_class LIMIT 2) s	regtype	oid[]
+SELECT pg_typeof(count(oid)) FROM pg_class	regtype	bigint
+SELECT pg_typeof(CASE WHEN true THEN 1::oid ELSE 1::int8 END)	regtype	oid
+SELECT pg_typeof(COALESCE(1::oid, 1))	regtype	oid
+SELECT '10'::oid < '9'::oid, 1::oid < 2::oid	boolean,boolean	f|t
+SELECT 1::oid = 1::int4, 1::oid = 1::int8	boolean,boolean	t|t
+SELECT '-1'::oid, (-1)::int4::oid	oid,oid	4294967295|4294967295
+SELECT '0x10'::oid, '0X10'::oid, '010'::oid, '-0x10'::oid	oid,oid,oid,oid	16|16|8|4294967280
+SELECT '010'::int4, '1_000'::int4, '0x_10'::int4	integer,integer,integer	10|1000|16
+SELECT ' 0x10 '::oid, '+10'::oid, ' 42 '::oid	oid,oid,oid	16|10|42
+SELECT '0xffffffff'::oid	oid	4294967295
+SELECT 1::oid + 1	!42883 operator does not exist: oid + integer
+SELECT sum(oid) FROM pg_class	!42883 function sum(oid) does not exist
+SELECT '0o17'::oid	!22P02 invalid input syntax for type oid: "0o17"
+SELECT '0b101'::oid	!22P02 invalid input syntax for type oid: "0b101"
+SELECT '1_000'::oid	!22P02 invalid input syntax for type oid: "1_000"
+SELECT '08'::oid	!22P02 invalid input syntax for type oid: "08"
+SELECT ''::oid	!22P02 invalid input syntax for type oid: ""
+SELECT '4294967296'::oid	!22003 value "4294967296" is out of range for type oid
+SELECT 26::oid::"char"	!42846 cannot cast type oid to "char"

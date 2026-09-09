@@ -32,16 +32,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          t.typname IN \
          ('_int4','_text','_varchar','_timestamp','_timestamptz','_date','_numeric','_uuid','_bool','_jsonb') \
          ORDER BY t.typname",
-        "SELECT 'r', b.typname AS base, b.typarray, a.typname AS array_name, a.typelem, a.typelem \
-         = b.oid AS points_back FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE \
-         b.typname IN \
-         ('varchar','int4','timestamp','timestamptz','numeric','text','uuid','bool','date') ORDER \
-         BY b.typname",
         "SELECT 'r', typname, typcategory, typelem <> 0 AS has_element, typinput FROM pg_type \
          WHERE typname IN ('_int4','_varchar','int4','varchar') ORDER BY typname",
-        "SELECT 'r', b.typname, b.typarray, a.typname AS array_name FROM pg_type b JOIN pg_type a \
-         ON a.oid = b.typarray WHERE b.typname IN \
-         ('bytea','bpchar','float4','float8','interval','json','oid','time') ORDER BY b.typname",
     ],
     answers: &[
         // **`regproc` is not a type here**, and the three statements that need it are the

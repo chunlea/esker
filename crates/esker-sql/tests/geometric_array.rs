@@ -33,8 +33,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          pg_type t WHERE t.typname IN \
          ('circle','_circle','path','_path','polygon','_polygon','lseg','_lseg','line','_line','point','_point','box','_box') \
          ORDER BY t.oid",
-        "SELECT typarray FROM pg_type WHERE typname IN \
-         ('circle','path','polygon','lseg','line') ORDER BY typname",
     ],
     answers: &[],
 };

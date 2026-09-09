@@ -583,9 +583,12 @@ pub fn default_expression(
 
 /// The columns of `pg_attribute`, in PostgreSQL's own order.
 pub const ATTRIBUTE_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    // **A `bigint`, for `pg_class.oid`'s reason**: this view has a row per column of every
+    // relation, a primary key's index included, and that relation's oid is
+    // `pg_relations::PRIMARY_KEY_OID_BASE + table_id` (ADR 0097).
     ("attrelid", ColumnType::Int8, NO_LENGTH),
     ("attname", ColumnType::Name, NO_LENGTH),
-    ("atttypid", ColumnType::Int8, NO_LENGTH),
+    ("atttypid", ColumnType::Oid, NO_LENGTH),
     ("attnum", ColumnType::Int2, NO_LENGTH),
     ("atttypmod", ColumnType::Int4, NO_LENGTH),
     ("attnotnull", ColumnType::Bool, NO_LENGTH),
@@ -599,12 +602,15 @@ pub const ATTRIBUTE_COLUMNS: &[(&str, ColumnType, i32)] = &[
     ("attidentity", ColumnType::Char, NO_LENGTH),
     ("attgenerated", ColumnType::Char, NO_LENGTH),
     ("attisdropped", ColumnType::Bool, NO_LENGTH),
-    ("attcollation", ColumnType::Int8, NO_LENGTH),
+    ("attcollation", ColumnType::Oid, NO_LENGTH),
 ];
 
 /// The columns of `pg_attrdef`, in PostgreSQL's own order.
 pub const ATTRDEF_COLUMNS: &[(&str, ColumnType, i32)] = &[
-    ("oid", ColumnType::Int8, NO_LENGTH),
+    ("oid", ColumnType::Oid, NO_LENGTH),
+    // **A `bigint`, with every other column that names a relation** (ADR 0097): the guard says
+    // this one's values fit, and the rule is not about the values — a client may write
+    // `WHERE adrelid = 'pg_class'::regclass`, and a catalog view's id comes from `VIEW_ID_BASE`.
     ("adrelid", ColumnType::Int8, NO_LENGTH),
     ("adnum", ColumnType::Int2, NO_LENGTH),
     ("adbin", ColumnType::Text, NO_LENGTH),

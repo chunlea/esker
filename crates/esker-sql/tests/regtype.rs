@@ -47,7 +47,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 23::regtype, 1043::regtype",
         "SELECT 1007::regtype, 1009::regtype",
         "SELECT 999999::regtype",
-        "SELECT oid, typname, typlen, typcategory FROM pg_type WHERE typname IN ('date','time','numeric','uuid','json','jsonb','interval') ORDER BY oid",
         // A real server's `regtype` is a type of its own — four bytes holding an OID that print as
         // the type's name. This node has no `regtype`, so `'x'::regtype` answers the **name**, as
         // text: the value is byte-identical and only `RowDescription`'s OID differs, `text` where
