@@ -85,14 +85,19 @@ fn a_case_index_prints_over_five_lines_with_its_else_filled_in() {
             "for {name}"
         );
     }
-    // `pg_get_expr` is the same text with **one pair of parentheses fewer** — the pair the key
-    // list adds and this does not.
+    // `pg_get_expr` is the same text with **one pair of parentheses fewer, and the line break that
+    // came with it** — the pair the key list adds and this does not. The break was on the wrong
+    // side of that sentence until the deparse census measured it: PostgreSQL puts it *after* an
+    // opening parenthesis, so `pg_get_indexdef` gives `btree ((⏎CASE …))` and `pg_get_expr` gives
+    // `CASE ⏎…` with none (`tests/corpus/pg19_deparse_census.txt`). This node had the newline
+    // inside the expression, so the reader that adds no pair had one too many, and this assertion
+    // was pinning that.
     assert_eq!(
         node.rows(
             "SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = \
              'cs_case'::regclass"
         ),
-        [["\nCASE\n    WHEN (rating > 0) THEN lower(name)\n    ELSE NULL::text\nEND"]]
+        [["CASE\n    WHEN (rating > 0) THEN lower(name)\n    ELSE NULL::text\nEND"]]
     );
 }
 

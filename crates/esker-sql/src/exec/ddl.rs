@@ -5656,6 +5656,31 @@ fn normalise_defaults(table: &mut TableDef) {
     }
 }
 
+/// A printed block, moved four spaces to the right.
+///
+/// What a nested `CASE` needs: PostgreSQL indents the inner one by four relative to the outer, on
+/// every line including its `CASE` and `END`. The inner call has already produced the block, so
+/// the outer one only has to move it — which is why the `Case` arm needs no depth parameter.
+fn indented(block: &str) -> String {
+    block
+        .split('\n')
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A body in parentheses, with the line break PostgreSQL puts after the `(` when a `CASE` follows.
+///
+/// `CHECK (\nCASE …)`, `btree ((\nCASE …))`, `(\nCASE …)::text` — the break belongs to the pair
+/// and not to the keyword, which is why [`deparse`]'s `Case` arm emits none of its own.
+fn parenthesise(body: &str) -> String {
+    if body.starts_with("CASE") {
+        format!("(\n{body})")
+    } else {
+        format!("({body})")
+    }
+}
+
 /// One boolean expression a **reader wraps**, printed the way that reader prints it.
 ///
 /// A `CHECK` and a partial index's predicate are both stored as text and both re-parenthesised on
@@ -6085,20 +6110,30 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             } else {
                 comparison_operand_type(left, right, table).unwrap_or(ColumnType::Text)
             };
-            format!(
-                "({} {} {})",
+            // **`IS NOT DISTINCT FROM` is a negation on a real server, not an operator.**
+            // PostgreSQL holds `NOT (a IS DISTINCT FROM b)` and prints exactly that, where this
+            // node held one operator and printed its own spelling. Measured across the census's
+            // readers; the *values* were never in question, only which node the tree has.
+            if *op == plan::BinaryOp::NotDistinct {
+                return format!(
+                    "(NOT ({} {} {}))",
+                    deparse(left, table, operand),
+                    plan::BinaryOp::Distinct.symbol(),
+                    deparse(right, table, operand)
+                );
+            }
+            parenthesise(&format!(
+                "{} {} {}",
                 deparse(left, table, operand),
                 op.symbol(),
                 deparse(right, table, operand)
-            )
+            ))
         }
         Expr::Negate(operand) => format!("(- {})", sub(operand)),
         Expr::Arithmetic {
             op, left, right, ..
-        } => {
-            format!("({} {} {})", sub(left), op.symbol(), sub(right))
-        }
-        Expr::Not(operand) => format!("(NOT {})", sub(operand)),
+        } => parenthesise(&format!("{} {} {}", sub(left), op.symbol(), sub(right))),
+        Expr::Not(operand) => parenthesise(&format!("NOT {}", sub(operand))),
         Expr::IsNull { operand, negated } => format!(
             "({} IS {}NULL)",
             sub(operand),
@@ -6161,7 +6196,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
                 format!("{}({argument})", func.name())
             }
         }
-        Expr::ToText { operand, .. } => format!("({})::text", sub(operand)),
+        Expr::ToText { operand, .. } => format!("{}::text", parenthesise(&sub(operand))),
         // **A cast over an unadorned string literal is *one* node on a real server**, so it prints
         // as one: `'{}'::jsonb` and not `('{}'::text)::jsonb`. The parser coerces an `unknown`
         // constant straight to the target type rather than building a cast over a `text` one, so
@@ -6174,7 +6209,9 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         Expr::Cast { operand, to, .. } if written_as_a_quoted_string(operand) => {
             deparse_literal_of(operand, *to)
         }
-        Expr::Cast { operand, to, .. } => format!("({})::{}", sub(operand), to.name()),
+        Expr::Cast { operand, to, .. } => {
+            format!("{}::{}", parenthesise(&sub(operand)), to.name())
+        }
         // **Five lines, indented four spaces, with the implicit `ELSE` materialised.** This layout
         // is what `pg_get_indexdef` answers on a real server — `pg_get_indexdef` deparses with
         // `PRETTYFLAG_INDENT`, which puts every keyword of a `CASE` on its own line — and it is
@@ -6210,14 +6247,25 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             // `pg_get_expr(indexprs)` gives an index key. The *pretty* form takes none of them,
             // and that is `catalog::pretty_case`'s job at the one reader that asks for it: the
             // text is stored once, in this shape, and stripped on the way out.
-            let mut text = "\nCASE".to_owned();
+            // **No leading newline: that belongs to whatever parenthesises this.** PostgreSQL's
+            // `pg_get_expr(indexprs)` gives `CASE\n    WHEN …` and its `CHECK` printer gives
+            // `CHECK (\nCASE` — the break comes after an opening parenthesis, not before the
+            // keyword. This node put it in the expression, so every reader inherited it and the
+            // two that add no pair had one too many.
+            //
+            // **A nested `CASE` starts on the line after its `THEN`, indented four further
+            // spaces.** Measured; this node inlined it at the same depth. [`indented`] is what
+            // makes the recursion work without a depth parameter: the inner call has already
+            // produced a block, and a block moves as a whole.
+            let mut text = "CASE".to_owned();
             for branch in branches {
-                let _ = write!(
-                    text,
-                    "\n    WHEN {} THEN {}",
-                    sub(&branch.when),
-                    sub(&branch.then)
-                );
+                let when = sub(&branch.when);
+                let then = sub(&branch.then);
+                if then.starts_with("CASE") {
+                    let _ = write!(text, "\n    WHEN {when} THEN\n{}", indented(&then));
+                } else {
+                    let _ = write!(text, "\n    WHEN {when} THEN {then}");
+                }
             }
             // An `ELSE` that was not written is **not** absent from the printed form: it is
             // `NULL` of the type the branches resolved to, which is the one part of this text that
@@ -6225,7 +6273,11 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             let otherwise = otherwise
                 .as_deref()
                 .map_or_else(|| deparse_literal(&plan::Literal::Null, ty), &sub);
-            let _ = write!(text, "\n    ELSE {otherwise}\nEND");
+            if otherwise.starts_with("CASE") {
+                let _ = write!(text, "\n    ELSE\n{}\nEND", indented(&otherwise));
+            } else {
+                let _ = write!(text, "\n    ELSE {otherwise}\nEND");
+            }
             text
         }
         // Refused before this is reached: `refuse_unless_immutable` rejects every one of them as
