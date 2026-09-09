@@ -1,0 +1,73 @@
+crates/esker-keys/src/array.rs
+  s_2bed4ac2b1c944::t_d0f0f0b7c26762 103,152
+crates/esker-keys/src/columnar.rs
+  s_2bed4ac2b1c944::t_1cca19e263c3fb 75-76,136-137,176,231
+crates/esker-keys/src/row.rs
+  s_2bed4ac2b1c944::t_e8848cb17f660d 516,562-564,973,1263,1479-1481,2152,2211-2214
+crates/esker-keys/src/value.rs
+  s_2bed4ac2b1c944::t_8ae24d0988ac64 125-138,253-259,544,551,613,1123-1126
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_2bed4ac2b1c944::t_42d7fd6c23b0a8 456-460
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2bed4ac2b1c944::t_48fb023f4d89aa 2832,2881,2975-2979,3016,3057-3063,3065,3097,3128-3129
+crates/esker-sql/src/catalog/record.rs
+  s_2bed4ac2b1c944::t_6ed3a5db6c0606 335-340,400,469,542,611
+crates/esker-sql/src/exec/bind.rs
+  s_2bed4ac2b1c944::t_3005244a26199b 1547,1582
+crates/esker-sql/src/exec/fragment.rs
+  s_2bed4ac2b1c944::t_57b07c93ebdd9b 1026-1030,1080
+crates/esker-sql/src/exec/mod.rs
+  s_2bed4ac2b1c944::t_91d364059aa091 1816-1818,4145-4149,4151-4155,4157-4159,4162-4163,4169-4170,4717-4721
+crates/esker-sql/src/exec/query.rs
+  s_2bed4ac2b1c944::t_a80a172bd3e0dc 3366,3426-3428
+crates/esker-sql/src/parse/lower.rs
+  s_2bed4ac2b1c944::t_dfb675b59c1d23 8612-8629
+crates/esker-sql/src/plan/expr.rs
+  s_2bed4ac2b1c944::t_a7cc31cee5e474 2259,2306,2349,2393,2508-2511,2562
+crates/esker-sql/src/row.rs
+  s_2bed4ac2b1c944::t_4e788b5c7302af 84,184-186
+crates/esker-sql/src/value/array.rs
+  s_2bed4ac2b1c944::t_d906b4d1c5e89d 34-47,67,110-114,159-161,172,241,247,304,314,328,331-333
+crates/esker-sql/src/value/mod.rs
+  s_2bed4ac2b1c944::t_875aa7af05c65c 786,1169-1189,1205-1207,1215,1250,1262-1265,1293-1294,1453-1455,1470,1574,1674-1675,1709,1766-1767,1793-1795,1843,2077,2113-2117,2341,2480-2485,3137
+crates/esker-sql/tests/array_delimiter.rs
+  s_2bed4ac2b1c944::t_774371a8be72cb 1-173
+crates/esker-sql/tests/captures/pg19_name_type.txt
+  s_2bed4ac2b1c944::t_3bc133a20885c3 1-98
+crates/esker-sql/tests/corpus/pg19_name_type.txt
+  s_2bed4ac2b1c944::t_8810316903f0f4 1-45
+crates/esker-sql/tests/corpus/pg19_order.txt
+  s_2bed4ac2b1c944::t_af501421f28cb7 18-23,50
+crates/esker-sql/tests/enum_extended_protocol.rs
+  s_2bed4ac2b1c944::t_91a1a8c88c80ba 1-101
+crates/esker-sql/tests/name_type.rs
+  s_2bed4ac2b1c944::t_4464bd70b909a2 1-219
+crates/esker-sql/tests/pg_catalog.rs
+  s_2bed4ac2b1c944::t_b3de1263d51c30 192-195,470-483
+crates/esker-sql/tests/pg_catalog_format_type.rs
+  s_2bed4ac2b1c944::t_a49b31492aae9c 36-42
+crates/esker-sql/tests/row_order.rs
+  s_2bed4ac2b1c944::t_4386924f96bac9 110-114,210
+crates/esker-sql/tests/two_database_dogs.rs
+  s_2bed4ac2b1c944::t_9cbc90f144a09a 27-31
+crates/esker-store/src/columnar/decode.rs
+  s_2bed4ac2b1c944::t_980b595357da70 200-203,264
+docs/adr/0084-name-is-a-stored-type-and-its-tag-is-additive.md
+  s_2bed4ac2b1c944::t_ccd61e20800018 1-85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "c31da34840505ac528c3bc04cf4ab731f111b182",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
