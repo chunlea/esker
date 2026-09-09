@@ -1007,6 +1007,12 @@ fn comparable(
 /// A total match, so a ninth type on either side is a compile error here rather than a column that
 /// silently stops being comparable — the same rule `esker_store::columnar::wire` keeps for the
 /// value vocabulary, and for the same reason.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over the whole type vocabulary, and it is a list of names \
+              rather than of rules; splitting it would put half the vocabulary somewhere \
+              else and let a type be added to one half without the other"
+)]
 fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnType> {
     use crate::value::ColumnType as Row;
     use esker_columnar::ColumnType as Col;
@@ -1029,7 +1035,16 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // type whose whole point is a 63-byte catalog identifier would be a representation this
         // node made up. `None` keeps the filter on the row side, which is the same answer
         // `regtype` gets two arms above and for the same reason.
-        Row::Name | Row::NameArray => return None,
+        // **And the five geometric arrays for the same reason the shapes themselves are not
+        // columnar**: `esker-columnar` has no tag for a geometric value, so an array of one has
+        // nowhere to go either.
+        Row::Name
+        | Row::NameArray
+        | Row::LsegArray
+        | Row::PathArray
+        | Row::PolygonArray
+        | Row::CircleArray
+        | Row::LineArray => return None,
         Row::Bpchar => Col::Bpchar,
         Row::Json => Col::Json,
         Row::Jsonb => Col::Jsonb,

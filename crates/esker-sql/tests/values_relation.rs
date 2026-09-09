@@ -22,19 +22,15 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `regtype`/`text` trade (ADR 0077), whose two answers are now right.
     types: &[
         "SELECT 'r', pg_typeof(x), pg_typeof(y) FROM (VALUES (1,'a'),(2,'b')) AS t(x,y) LIMIT 1",
+        // The decimal's own column, whose width was the other half of the same trade: a bare
+        // `1.5` is a `numeric` here now, so only `pg_typeof`'s answer differs.
+        "SELECT 'r', pg_typeof(column1) FROM (VALUES (1.5)) AS t LIMIT 1",
     ],
     answers: &[
         // The standing constant-width divergence, showing through the one function that reports a
         // type as a value: a bare integer constant is `int8` here and `int4` on a real server, so
         // a `VALUES` column built from one is `bigint`. `pg_typeof` itself answers `text` rather
         // than `regtype` here, which is why the declared types differ too.
-        // The same divergence for the other constant: a decimal constant is `double precision`
-        // here and `numeric` there, which `Literal::Decimal` already chooses everywhere else.
-        (
-            "SELECT 'r', pg_typeof(column1) FROM (VALUES (1.5)) AS t LIMIT 1",
-            "a decimal constant is double precision here and numeric there",
-            "UNMEASURED",
-        ),
         // The rule is right and the type in the message is the constant-width divergence: the
         // second row is read as the first row's type and fails to parse as it, which is the whole
         // point of the line.

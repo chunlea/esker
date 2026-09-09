@@ -1544,7 +1544,7 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::NumRangeArray
         | ColumnType::Int8RangeArray
         | ColumnType::PointArray
-        | ColumnType::BoxArray
+        | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray

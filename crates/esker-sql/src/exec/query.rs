@@ -2905,6 +2905,21 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             } else {
                 (left, right)
             };
+            // **An array's `=` is its element's, and the element must have a *btree* equality.**
+            // Measured for six element types at once — `point`, `line`, `path`, `xml`, `json` and
+            // `circle` — and the sentence names the **element**, not the array:
+            // `'{…}'::circle[] = '{…}'::circle[]` is
+            // `42883 could not identify an equality operator for type circle` while the scalar
+            // `'…'::circle = '…'::circle` is `t`. `'{a}'::text[] = '{a}'::text[]` is the control
+            // and answers. The same list `SELECT DISTINCT` and `count(DISTINCT)` read, so a type
+            // cannot be refused by one and answered by another.
+            if op.is_comparison()
+                && let Ok(ty) = expr_type(&left, scope)
+                && let Some(element) = esker_keys::array::ArrayValue::element_of(ty)
+                && !crate::value::has_equality_operator(ty)
+            {
+                return Err(SqlError::NoEqualityOperator(element.name()));
+            }
             Expr::Binary {
                 op: *op,
                 left: Box::new(left),
@@ -3216,7 +3231,15 @@ fn resolve_case(
         };
         match common {
             None => common = Some(ty),
-            Some(chosen) if same_family(chosen, ty) => {}
+            // **The wider of the two, not the first one seen.** This kept whatever the head of the
+            // list carried and only checked that the rest were in its family, so
+            // `CASE WHEN true THEN 1.10 ELSE 2 END` settled on `integer` — the `ELSE` is walked
+            // first — and then refused to assign `1.10` to it. `carried_type` had always answered
+            // `numeric` for the same expression, so the declared type and the value path were
+            // two different rules; folded through `unify` they are one.
+            Some(chosen) if same_family(chosen, ty) => {
+                common = Some(unify(chosen, ty).unwrap_or(chosen));
+            }
             Some(chosen) => {
                 // The **resolved** type first and the offending one second, which is the
                 // order the list is walked in and therefore the order PostgreSQL names
@@ -3434,6 +3457,12 @@ fn is_unknown_literal(expr: &Expr) -> bool {
 /// grouping [`crate::plan::Literal::comparable_with`] already uses for a literal against a column,
 /// lifted to two columns. Coarse in the safe direction: it refuses only pairs that no cast in
 /// PostgreSQL relates either, so it cannot turn a comparison a real server runs into an error.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over the whole type vocabulary, and it is a list of names \
+              rather than of rules; splitting it would put half the vocabulary somewhere \
+              else and let a type be added to one half without the other"
+)]
 pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
     // **`json` compares with nothing, including another `json`.** Measured:
     // `'{"a":1}'::json = '{"a":1}'::json` is `42883 operator does not exist: json = json` -- the
@@ -3545,6 +3574,15 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // Its own family: an array compares with an array of the same element, and 85 is the
             // next number nothing else uses — 59 is `floatrange`'s and 77 `xml`'s.
             ColumnType::BoxArray => 85,
+            // **Five families, one per element type**, which is every array's rule: measured,
+            // `'{…}'::circle[] = '{…}'::circle[]` is `42883 could not identify an equality
+            // operator for type circle` on a real server even though the scalar `=` answers, so
+            // sharing a family with anything would answer where PostgreSQL refuses.
+            ColumnType::LsegArray => 87,
+            ColumnType::PathArray => 88,
+            ColumnType::PolygonArray => 89,
+            ColumnType::CircleArray => 90,
+            ColumnType::LineArray => 91,
             // A family each, like every other range: a `floatrange` compares with a
             // `floatrange` and `float_range = '[0.5,0.7]'::numrange` is `42883`, measured.
             ColumnType::FloatRange => 59,
@@ -4000,10 +4038,9 @@ fn retype_subscript(expr: &Expr, ty: ColumnType) -> Expr {
 /// The type a literal already carries, or `None` for the two that carry none.
 ///
 /// `unknown` (a quoted string) is the one that takes a type from its neighbour; NULL has no type
-/// and needs none. The other four are what PostgreSQL calls them, with the two divergences this
-/// node declares: a bare integer constant is `int4` on a real server and `int8` here, and a
-/// decimal constant is `numeric` there and `double precision` here — the same choice
-/// `Literal::Decimal` already makes everywhere else in this crate, `SELECT 1.5` included.
+/// and needs none. The other four are what PostgreSQL calls them, and there is no divergence left
+/// in the list: the `int4` rung (ADR 0087) closed the integer's width and a bare decimal is a
+/// `numeric` here as it is there.
 pub(super) fn literal_type(literal: &Literal) -> Option<ColumnType> {
     match literal {
         // **The one NULL that has a type**, which is why the variant exists: everything that asks
@@ -4020,7 +4057,11 @@ pub(super) fn literal_type(literal: &Literal) -> Option<ColumnType> {
         } else {
             ColumnType::Int8
         }),
-        Literal::Decimal(_) => Some(ColumnType::Double),
+        // **A bare decimal is a `numeric`.** It was a `float8`, which was a wrong *value* and not
+        // only a wrong type — `1.10` printed `1.1`, `0.1 + 0.2` printed `0.30000000000000004` —
+        // and a `float8` beside it still wins, because the promotion table is unchanged and only
+        // the literal's own type moved.
+        Literal::Decimal(_) => Some(ColumnType::Numeric),
         Literal::Bool(_) => Some(ColumnType::Bool),
         Literal::Typed(value) => value.column_type(),
     }
@@ -4868,7 +4909,9 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // latter, the type was gone by the time anything could ask, and the two concatenations
         // were indistinguishable.
         Expr::CatalogFunc(call) => catalog_func_type(call, scope),
-        Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
+        // **A bare decimal is a `numeric`**, which `literal_type` also says — the two must agree or
+        // a client is told one type and sent another's characters.
+        Expr::Literal(Literal::Decimal(_)) => ColumnType::Numeric,
 
         // `abs` is the one scalar function that answers its argument's type rather than `text`.
         //

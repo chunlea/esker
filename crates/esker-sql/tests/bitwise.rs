@@ -67,10 +67,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // its code are the same; only the two type names in the sentence differ.
         (
             "SELECT 1.5 | 2",
-            "An unadorned decimal literal is `double precision` here and `numeric` there, so the \
-             message names `double precision | double precision` where a real server names \
-             `numeric | integer`. Same code, same refusal, two different spellings of the \
-             operands.",
+            "Half of this closed when a bare decimal became a `numeric`: the message reads \
+             `numeric | numeric` where a real server reads `numeric | integer`. This crate \
+             resolves both operands to one type before deciding no operator exists, so a refusal \
+             has one type to name and PostgreSQL names the two it was given. Same code, same \
+             refusal, one word apart.",
             "pg19_bitwise.txt:53",
         ),
         (
@@ -174,14 +175,17 @@ fn the_refusals_tell_a_wrong_type_from_an_ambiguous_one() {
         "operator does not exist: boolean | boolean"
     );
 
-    // **`double precision`, not `numeric`**: an unadorned decimal literal is a `float8` in this
-    // crate. The rule under test is that a non-integer operand is refused at all, which is what
-    // this asserts; the literal's type is a declared divergence of its own (see `DIVERGENCES`).
+    // **`numeric | numeric`, where a real server says `numeric | integer`.** The rule under test
+    // is that a non-integer operand is refused at all, which is what this asserts. The left name
+    // used to read `double precision` and is right since a bare decimal became a `numeric`; what
+    // is left is the *right* one, because this crate resolves both operands to one type before it
+    // decides there is no operator, so a refusal has only that one type to name. Declared in
+    // `DIVERGENCES`.
     let error = node.run("SELECT 1.5 | 2").unwrap_err();
     assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_FUNCTION);
     assert_eq!(
         error.to_string(),
-        "operator does not exist: double precision | double precision"
+        "operator does not exist: numeric | numeric"
     );
 
     // **A real server answers `42725 operator is not unique` here**, because two `unknown`

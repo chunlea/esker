@@ -52,6 +52,12 @@ pub const RECORD_VERSION: u8 = 3;
 
 /// A column's type tag, the frozen vocabulary shared with `esker_sql::catalog::record` and
 /// `esker_columnar::value`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over the whole type vocabulary, and it is a list of numbers rather than \
+              of rules; splitting it would put half the vocabulary somewhere else and let a new \
+              type be added to one half without the other"
+)]
 fn tag_of(ty: ColumnType) -> u8 {
     match ty {
         // **Appended, not inserted**: 89 and 90 were the next two free, and every tag already
@@ -136,6 +142,11 @@ fn tag_of(ty: ColumnType) -> u8 {
         // 95, then 96: the next free tags. Additive, like every one before them.
         ColumnType::BoxArray => 95,
         ColumnType::NameArray => 96,
+        ColumnType::LsegArray => 97,
+        ColumnType::PathArray => 98,
+        ColumnType::PolygonArray => 99,
+        ColumnType::CircleArray => 100,
+        ColumnType::LineArray => 101,
         ColumnType::FloatRange => 60,
         ColumnType::VarcharRange => 61,
         ColumnType::Money => 62,
@@ -164,6 +175,10 @@ fn tag_of(ty: ColumnType) -> u8 {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the reverse of `tag_of`, and it has to stay the same shape as the table it inverts"
+)]
 fn type_of(tag: u8) -> Result<ColumnType, RowError> {
     Ok(match tag {
         1 => ColumnType::Int8,
@@ -231,6 +246,11 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         59 => ColumnType::PointArray,
         95 => ColumnType::BoxArray,
         96 => ColumnType::NameArray,
+        97 => ColumnType::LsegArray,
+        98 => ColumnType::PathArray,
+        99 => ColumnType::PolygonArray,
+        100 => ColumnType::CircleArray,
+        101 => ColumnType::LineArray,
         60 => ColumnType::FloatRange,
         61 => ColumnType::VarcharRange,
         62 => ColumnType::Money,

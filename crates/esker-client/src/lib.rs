@@ -50,6 +50,6 @@ pub use router::Router;
 pub use tcp::TcpStores;
 pub use transport::StoreTransport;
 pub use txn::{
-    CountingOracle, LOCK_TTL_MS, TSO_LOGICAL_BITS, TimestampOracle, Transaction, TxnClient,
-    is_expired, physical_ms, ts_at_ms,
+    Acquired, CountingOracle, LOCK_TTL_MS, TSO_LOGICAL_BITS, TimestampOracle, Transaction,
+    TxnClient, is_expired, physical_ms, ts_at_ms,
 };

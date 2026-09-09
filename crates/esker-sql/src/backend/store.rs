@@ -23,10 +23,10 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use esker_client::{Error as ClientError, TimestampOracle, Transaction, TxnClient};
+use esker_client::{Acquired, Error as ClientError, TimestampOracle, Transaction, TxnClient};
 
 use crate::backend::locks::RowLocks;
-use crate::backend::{Backend, Lock, Txn};
+use crate::backend::{Backend, Lock, Reach, Txn};
 use crate::error::{Result, SqlError};
 
 /// Opens transactions against a real cluster.
@@ -311,7 +311,7 @@ impl Txn for StoreTxn {
     ///
     /// A cluster-wide lock is a store-side operation with a wire and a log change behind it, and
     /// the ADR asks the question rather than half-answering it here.
-    fn lock(&mut self, key: &[u8]) -> Result<Lock> {
+    fn lock(&mut self, key: &[u8], reach: Reach) -> Result<Lock> {
         // A read-only transaction writes nothing, so it needs nothing — and must not take a lock a
         // live writer would then wait behind.
         if self.is_read_only() {
@@ -326,10 +326,38 @@ impl Txn for StoreTxn {
         };
         let taken = locks.take(key, self.id, start_ts, self.session);
         drop(locks);
-        if matches!(taken, Lock::Taken) && !self.held.iter().any(|held| held == key) {
+        if !matches!(taken, Lock::Taken) {
+            // Another session **of this node** holds it, or waiting for it would close a cycle
+            // this node can see on its own. Both answers are this table's to give, and neither
+            // needs the store.
+            return Ok(taken);
+        }
+        if !self.held.iter().any(|held| held == key) {
             self.held.push(key.to_vec());
         }
-        Ok(taken)
+        // **And now the half a second node can see**
+        // ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)). The table above is one
+        // process's, so it excludes the sessions of this node and no others; measured, two nodes
+        // given the crossed sequence that costs one node a `40P01` both committed. The lock that
+        // excludes the other node is a lock on the key, in the store, and it is the same
+        // `Prewrite` a commit sends — sent now instead of at the commit.
+        //
+        // The local lock above is **kept** while this waits: it is this session's place in the
+        // queue for the row, and giving it back would let another session of this node overtake a
+        // waiter that was already in front of it.
+        if reach == Reach::Node {
+            // A write, and Percolator's own prewrite is what excludes the other nodes from it:
+            // first-committer-wins on the key, at commit. A second lock here would be a round trip
+            // per written row for an exclusion that is already there.
+            return Ok(Lock::Taken);
+        }
+        let Some(txn) = self.open_mut() else {
+            return Ok(Lock::Taken);
+        };
+        Ok(match txn.lock(key).map_err(translate)? {
+            Acquired::Taken => Lock::Taken,
+            Acquired::Held { by, lease_ms } => Lock::Held { by, lease_ms },
+        })
     }
 
     /// A fresh read timestamp for the statement beginning now, from the oracle.
@@ -558,6 +586,22 @@ fn translate(error: ClientError) -> SqlError {
             message: format!("a lock from the transaction at {start_ts} could not be cleared"),
             key: Some(key.to_vec()),
         },
+        // **The victim of a wound, told the way PostgreSQL tells one**
+        // ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)). A transaction settled
+        // by somebody else is one whose lock another transaction rolled back to make progress —
+        // the younger of two that wanted each other's rows, or one whose lease ran out under a
+        // waiter. From the client's seat those are the same event and it is the one `40P01`
+        // names: *you were aborted so that someone else could go on*. It was `XX000` here until
+        // eager locks made it reachable, which is an internal error for a routine outcome.
+        //
+        // The imprecision is worth writing down: an expired lease is not a cycle, and this says
+        // `deadlock detected` about it. The alternative is `40001`, which tells a client to retry
+        // and is what a lost race means — and this is not a lost race, it is an abort.
+        //
+        // The sentence and not the detail, which is what `SqlError::Deadlock` already decided:
+        // PostgreSQL's `DETAIL` names two backends and two transactions, and inventing one here
+        // would be inventing it.
+        ClientError::TxnSettled { .. } => SqlError::Deadlock,
         error @ ClientError::AmbiguousResult { .. } => SqlError::OutcomeUnknown(error.to_string()),
         error @ (ClientError::RetriesExhausted { .. }
         | ClientError::DeadlineExceeded { .. }

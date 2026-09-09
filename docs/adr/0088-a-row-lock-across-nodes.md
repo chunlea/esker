@@ -1,7 +1,13 @@
-# 0088 — A row lock that two nodes can see (draft)
+# 0088 — A row lock that two nodes can see
 
-*Status: **draft**, for the coordinator to rule on. No code. Numbered at `9d642ef0`, where 0087 is
-the highest; a later committer renumbers.*
+Status: **accepted** (ruled 2026-09-09) · Date: 2026-09-09 · Phase 9, the locking family ·
+Numbered at `9d642ef0`, where 0087 is the highest; a later committer renumbers ·
+Supersedes [ADR 0057](0057-read-committed-waits-for-the-writer-in-front-of-it.md) §5's *node-local*
+declaration and closes the half [ADR 0067](0067-the-check-mutation-and-the-latest-commit-question.md)
+§2 named as not built · Ruled **(a')**: the row lock becomes a Percolator lock
+
+*The measurement and the options below are the draft this was ruled from, unchanged. The
+[decision](#decision--a-ruled-2026-09-09) follows them.*
 
 ## Context — what happens today, measured
 
@@ -129,32 +135,213 @@ Leave the lock node-local, document that `FOR UPDATE` does not exclude across no
   that sentence. The sentence is *"`SELECT … FOR UPDATE` excludes other sessions of the same node
   and not sessions of another node."*
 
-## Recommendation
+## Decision — (a'), ruled 2026-09-09
 
-**(a'), reusing the Percolator lock, with (c)'s documentation landed first and immediately.**
+**`SELECT … FOR UPDATE` acquires a Percolator lock on each locked row's key, at the moment the
+statement runs**, and the node-local table stops being the whole answer. Deadlock stops being a
+graph question and becomes what it is for every other key in this system: two transactions waiting
+on the same key, which the store and the client already have a mechanism for.
 
-The reasoning is that (b) detects a deadlock that this system does not currently have. There is no
-cycle to find because there is no wait: fixing detection without fixing the lock leaves the measured
-behaviour — both commit — exactly as it is. Detection is the second problem and it is only reachable
-after the first.
+(b) was refused for the reason the measurement gives. It detects a deadlock this system does not
+have — there is no cycle because there is no wait — so detection is the second problem, reachable
+only after the first. And its edges are a sample: a cycle assembled from stale samples is a `40P01`
+for a deadlock that never existed, which is a class of failure this crate has produced twice locally
+where the graph is exact and in one process.
 
-Between (a) and (a'): a row lock and a Percolator lock already answer the same question about the
-same key, and the Percolator lock is already replicated, already moves with a split, and already has
-a lease and a resolver. A second lock with its own lifetime would be a second set of rules for one
-question — the thing `backend/locks.rs`'s own opening paragraph says it avoided when it refused to
-keep two wait-for graphs. `SELECT … FOR UPDATE` becoming a prewrite of a lock-only mutation is the
-shape to price: ADR 0067 already added `Check` and `CheckRange` as mutations for a neighbouring
-reason, so the mechanism exists and the question is cost, not novelty.
+(c) lands regardless and lands first, because the divergence is real today and users meet it today.
+The sentence is not "no cross-node deadlock detection" — it is **"`SELECT … FOR UPDATE` excludes
+other sessions of the same node and not sessions of another node"**, and it goes in `DESIGN.md` §8
+and §13, in `debts-v1.1.md`'s register, and in `phase-9-rails.md`'s divergence table, all of which
+said something else before this ADR.
 
-**What I would want before committing to it**: the cost of a lock-only prewrite for a hundred-row
-`FOR UPDATE`, measured, against the hash lookup it replaces. If it is a round trip per *statement*
-rather than per row, (a') is affordable; if it is per row, the batching has to come first.
+### What it costs on the wire: nothing
 
-**And (c) regardless**: the divergence is real today and users meet it today. It should be written
-down in the same commit that decides anything else.
+The lock this needs is already on the wire, and it is already the user's decision.
+[ADR 0067](0067-the-check-mutation-and-the-latest-commit-question.md) §1 added `TxnMutation::Check`
+as **tag 5**, approved 2026-09-04, and says what it is for in the approved text:
 
-## Consequences of not deciding
+> **The check mutations already provide the lock.** A `Check` written at prewrite leaves a lock
+> record on the checked key by the path prewrite already has, so a concurrent writer meets it and
+> waits.
 
-Two application servers behind two nodes get a lock that does not lock. It is silent, and it is the
-kind of silence that shows up as data that cannot be explained rather than as an error anyone can
-route.
+`Op::Check` commits as `Kind::Lock` — "the record kind this format has always reserved for a key
+held but not written" — and `check_prewrite` gives it the same lock record a `Put` gets. So the
+acquisition is an **ordinary `Prewrite`, sent early**: same method, same tag, same golden bytes, no
+`TxnWrite` variant that does not already exist.
+
+That is worth being exact about, because ADR 0067 §2 refused to smuggle this in and said so:
+
+> **If a cluster-wide pessimistic lock is wanted later** — for `SELECT … FOR UPDATE` across nodes,
+> which ADR 0057 §5 still declares node-local — it is a *different* change with a log entry behind
+> it, and it should be asked for as one rather than smuggled in under this sentence.
+
+It *is* being asked for as one, here, and the answer to the question 0067 raised is that the log
+entry it was worried about already exists: `TxnCommand::Prewrite` is the replicated command, and a
+`Check` mutation inside it is already replicated today under SERIALIZABLE. What changes is **when
+the client sends it**, which is client behaviour and not a format. This ADR supersedes ADR 0057 §5's
+"node-local" declaration and closes the half ADR 0067 named as not built.
+
+**If the build finds a shape that needs a new tag, a new method, or a changed golden, it stops and
+asks the human** — that is the charter's rule and nothing here weakens it.
+
+### What it costs, measured
+
+The draft asked for one number before anything was built — *"the cost of a lock-only prewrite for a
+hundred-row `FOR UPDATE`, measured, against the hash lookup it replaces. If it is a round trip per
+**statement** rather than per row, (a') is affordable; if it is per row, the batching has to come
+first."* `crates/esker-sql/tests/lock_cost.rs` is that measurement, against a real three-store
+cluster, medians of five rounds, and the answer is that **the question was aimed at the wrong cost**.
+
+| | 10 rows | 100 rows | 200 rows |
+|---|---|---|---|
+| lock-only prewrite, one region | 0.6–2.3 ms | 7.1–10.8 ms | 15.0–18.5 ms |
+| the same 100 keys spread over **three** regions | | 10.9–12.6 ms | |
+
+* **It is linear in rows and flat in regions.** A hundred keys in three regions cost what a hundred
+  keys in one region cost, and two hundred keys cost twice what one hundred do — about **0.1 ms per
+  locked row**. So the round trips are not the price: `commit` already groups checked keys by region
+  exactly as it groups writes, which is the batching the draft was asking whether it needed, and it
+  is already written. What is left is the lock **record**, one replicated write per key, and that is
+  inherent — it is what a lock another node can see *is*.
+* **A hundred sequential round trips cost 9.4–11.8 ms**, 0.1 ms each. That is the same order as the
+  batched prewrite of the same hundred keys, which says the same thing from the other side: the
+  network is not where this goes.
+* **The statement goes from ~3.5 ms to ~13 ms.** Today `SELECT … FOR UPDATE` over a hundred rows is
+  3.5–4.2 ms, of which the in-process hash table is 0.0–0.5 ms — at or below the statement's own
+  noise floor. The lock is what stops being free.
+* **And it is about a tenth of the write it precedes.** The `UPDATE` those hundred rows were locked
+  *for* costs 85–100 ms on the same cluster. A lock-only prewrite stages no value, so it is the
+  cheap half of a transaction that was always going to pay the expensive half.
+
+**So: affordable, per statement, and no batching work comes first.** The ADR's condition is met by
+the code that already exists.
+
+Two honesty notes on the numbers. They are a **debug build** — `--release` would move all of them
+and would not change a ratio. And one round in four landed on a busy box and reported three times
+the cost for the same arm (65 ms for 200 keys against 15–18 ms in the other three), which is what
+these numbers are worth: an order of magnitude and a shape, not a precision. The shape is what the
+decision needs, and it was the same in every round.
+
+### The one thing (a') adds that is not free
+
+Today no transaction is ever in the state "holds a lock and waits for another", and that is not an
+accident — `docs/plans/cross-node-deadlock.md` and
+`crates/esker-client/tests/prewrite_ordering.rs` are an argument and a test that it cannot happen:
+locks are taken at commit, in one batch, in ascending key order, and `prewrite_or_roll_back` undoes
+rather than waits.
+
+**An eager lock ends that.** A transaction that locks row 1 at its first statement and row 2 at its
+third holds one lock while asking for another, in the order the *application* named the rows — which
+is the exact state a cycle needs, and the reason PostgreSQL has a detector at all. So (a') does not
+remove the deadlock; it moves it from "cannot happen, and `FOR UPDATE` does not work" to "can
+happen, and something must pick the victim".
+
+The mechanism that catches it today is a waiter's resolution budget, and **on its own it picks the
+wrong number of victims**. `resolve` rolls back another transaction's lock only when
+`is_expired(start_ts, ttl_ms, now)` — a live holder is never rolled back — so two live transactions
+in a cycle each exhaust `max_lock_resolutions` and *both* fail. One node answers `40P01` and kills
+exactly one; PostgreSQL kills exactly one; "both abort" is closer than today's "both commit" and is
+still a divergence.
+
+**The recommendation, to be settled with the build rather than here: the youngest `start_ts` loses.**
+A waiter whose own `start_ts` is *older* than the lock's owner may roll that lock back; a younger
+waiter waits. It is wound-wait, it needs no graph and no second round trip, it is deterministic
+across nodes because `start_ts` comes from the TSO (invariant 6), and it can be built out of the
+rollback path that already exists — what it changes is *when* a resolver is allowed to roll a lock
+back, which is the resolver's rule and not the format. The alternative — leave the budget as it is
+and accept "both abort" — is cheaper and is a worse answer to the same question, so it should be
+measured against, not assumed.
+
+### What building it changed, and the one thing that needs your eye
+
+The lock itself was the small half. Five rules came out of making it work, each found by a test
+going red rather than by reading, and four of them are consequences nobody would have listed in
+advance.
+
+**1. A transaction upgrades its own lock to the write it took the lock for.** `check_prewrite`
+answered `AlreadyLocked` for any lock of our own, which is right for a retry and wrong for
+`SELECT … FOR UPDATE` followed by `UPDATE` of the same row: the `Kind::Lock` record stays, the value
+is never staged, and the row commits as a lock. The first run of the suite found it on the fixture's
+own `INSERT`. Only in that direction — a `Check` arriving over our own `Put` must not downgrade it,
+which would drop the value just as surely.
+
+**2. A reader never blocks on a lock-only lock.** `percolator::read` blocks on any lock at or below
+the snapshot, because it may yet commit a version the reader would have to see. A lock-only record
+promises the opposite — its transaction is holding the key and writing nothing — so the newest
+committed version below is the answer whatever the holder does next. Without this a
+`SELECT … FOR UPDATE` stops the row being *read* for the length of the transaction, which is not
+what any of `FOR UPDATE`'s sentences promise.
+
+**3. A reader never wounds.** Wound-wait is for a transaction that holds locks and wants another;
+a reader holds none. `docs/plans/cross-node-deadlock.md` had already put it exactly — *"a reader
+holds no locks: it can wait and cannot be waited for"* — and the first version of this killed live
+transactions because somebody read a row they were holding. The rule is now a parameter on
+`resolve`, set by the two callers that acquire and cleared by the one that reads.
+
+**4. A transaction that did not commit takes its locks with it.** Percolator leaves a failed
+commit's locks for a later reader to resolve, which is correct and costs every session that wants
+one of those rows a whole TTL. That was bearable while arriving there was rare; a wound makes the
+loser of every cross-node deadlock arrive there holding every key it prewrote. The primary is
+**asked** what happened rather than guessed at — `Rollback` of it answers `Committed` if the commit
+got there first — because the two answers need opposite cleanups and getting it backwards would
+tear a committed transaction in half.
+
+**5. And the one that reverses a decision: a lock-only record is not a conflict.**
+`newest_write_after` deliberately counted a `Kind::Lock` record as a commit — *"a
+`SELECT … FOR UPDATE` that committed is a committer"* — with a test holding the line. That rule was
+written while `Kind::Lock` was reserved and nothing could write one. Now every locked row leaves
+one, and the rule the conflict check exists for is first-committer-wins: *somebody wrote a version
+of this key after my snapshot, so what I computed is stale*. A lock record says its transaction
+wrote **nothing**. No value moved, so nothing is stale.
+
+What it cost while it stood, both measured in `tests/cross_node_deadlock.rs`: every completed
+locking read refused the next write of that row by any transaction older than it — a `40001` for a
+race nobody ran — and a deadlock victim was told it had lost a race rather than that it had been
+killed. It also widens SERIALIZABLE by the same argument: two transactions that merely *read* the
+same key stop refusing each other, which ADR 0062 never needed and never claimed. The test that
+held the old line now states the new one with the reasoning, under the name
+`a_lock_kind_record_is_neither_a_version_nor_a_conflict`.
+
+**It is a semantic change to the conflict surface and not a format change**, so it is inside this
+ADR's ruling rather than a stop — but it is the one line here worth a second reading, because it
+reverses something that was written down on purpose.
+
+### What it does today
+
+```text
+one node:   A: id=1 FOR UPDATE   B: id=2 FOR UPDATE, crossed writes
+            40P01, one victim, one survivor          — unchanged
+
+two nodes:  A: ok                B: 40P01 at COMMIT
+            rows afterwards: (1, 1), (2, 9)          — one transaction's writes, and only one
+```
+
+The victim learns at its commit rather than at the crossed write, which is what wound-wait buys: it
+is not told to wait and then killed, it is killed at the moment an older transaction needs its row
+and finds out when it next asks the store for anything. The assertion is the outcome and not the
+site, for that reason.
+
+**What the TTL still owes.** An eager lock lives `LOCK_TTL_MS` — three seconds — and
+`TxnKv::Heartbeat` is still an RPC with a handler and no sender (`DESIGN.md` §8). A `FOR UPDATE`
+held longer than that can be resolved out from under its holder. It is loud rather than silent: the
+resolver settles the holder's **primary**, so the wounded transaction cannot commit and is told
+`40P01` — but a transaction that sat for four seconds should not lose its rows to a session that
+wanted one of them, and the sender is what closes that. It is the next thing this ADR owes.
+
+## Consequences
+
+* **Until it is built**, two application servers behind two nodes get a lock that does not lock. It
+  is silent, and it is the kind of silence that shows up as data that cannot be explained rather
+  than as an error anyone can route. That is why (c)'s sentence lands first and alone.
+* **A `FOR UPDATE` over a hundred rows costs about 10 ms** where the hash table cost less than the
+  statement's own noise, and the cost is linear in rows rather than in round trips — measured, above.
+  It is a tenth of the `UPDATE` those rows were locked for, and it is the price of a lock a second
+  node can see.
+* **The ordering property stops being a proof.** `prewrite_ordering.rs` keeps its two tests and they
+  keep passing — the primary is still the smallest key of the write set — but the sentence that
+  hangs off them, *"a wait-for chain that only ascends cannot come back to where it started"*, stops
+  covering a transaction that locked before it wrote. `docs/plans/cross-node-deadlock.md` says so
+  now, at its head.
+* **`pg_locks` becomes a partial view.** It reads one node's table; a lock this node holds in the
+  store for another node's benefit is the same fact, and the view has to learn where to look or say
+  which half it is showing.

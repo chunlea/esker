@@ -73,11 +73,18 @@ pub trait TxnSnapshot {
     /// died leaves a record above it that an implementation reading only the timestamp cannot tell
     /// from a commit — and the refusal it produces names a `commit_ts` at which nothing committed.
     ///
-    /// **A `Kind::Lock` record is not stepped past**, which is where this parts company with
-    /// `percolator::newest_version_at`. A read wants a *version* and a lock record has no value;
-    /// this asks who *committed*, and a `SELECT … FOR UPDATE` that committed is a committer. The
-    /// two questions differ on exactly one kind, and `a_lock_kind_record_is_a_conflict_but_not_a_version`
-    /// holds the line.
+    /// **A `Kind::Lock` record is stepped past too**, and it was not until
+    /// [ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md) made one reachable. The rule
+    /// this check exists for is first-committer-wins: *somebody wrote a version of this key after
+    /// my snapshot, so the value I computed is stale*. A lock record is the transaction saying it
+    /// held the key and **wrote nothing to it** — no value moved, so nothing a later writer holds
+    /// is stale against it, and refusing that writer is a `40001` for a race nobody ran.
+    ///
+    /// It was written the other way when `Kind::Lock` was reserved and unreachable, and the
+    /// measurement that changed it is in ADR 0088: with a `FOR UPDATE` leaving one of these on
+    /// every locked row, the old rule made every completed locking read refuse the next write of
+    /// that row by any older transaction — and it told a deadlock victim it had lost a race
+    /// rather than that it had been killed.
     fn newest_write_after(&self, user_key: &[u8], ts: u64) -> Result<Option<Version>>;
 
     /// **Anything committed inside `[start, end)` after `ts`** — the phantom test
@@ -250,13 +257,14 @@ mod memory {
         fn newest_write_after(&self, user_key: &[u8], ts: u64) -> Result<Option<Version>> {
             // Newest first, so the walk ends at the first record at or below `ts`: nothing
             // under it can be above `ts` either. Rollback markers are stepped past on the way
-            // down; a `Lock` record is a commit and stops the walk like any other.
+            // down, and so is a `Lock` record — it changed no value, so no later writer is stale
+            // against it (ADR 0088).
             for version in self.versions(user_key) {
                 let version = version?;
                 if version.commit_ts <= ts {
                     return Ok(None);
                 }
-                if version.record.kind != Kind::Rollback {
+                if !matches!(version.record.kind, Kind::Rollback | Kind::Lock) {
                     return Ok(Some(version));
                 }
             }

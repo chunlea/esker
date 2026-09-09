@@ -2837,6 +2837,12 @@ fn partitioned_relkind(
 
 /// `pg_type.typname`: the internal name, which is not the one this node complains with — a column
 /// is declared `int8` and named `bigint` in an error. Measured against 19beta1, all six.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over the whole type vocabulary, and it is a list of names \
+              rather than of rules; splitting it would put half the vocabulary somewhere \
+              else and let a type be added to one half without the other"
+)]
 pub(crate) fn typname(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::RegType => "regtype",
@@ -2907,6 +2913,11 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Point => "point",
         ColumnType::PointArray => "_point",
         ColumnType::BoxArray => "_box",
+        ColumnType::LsegArray => "_lseg",
+        ColumnType::PathArray => "_path",
+        ColumnType::PolygonArray => "_polygon",
+        ColumnType::CircleArray => "_circle",
+        ColumnType::LineArray => "_line",
         ColumnType::TstzRangeArray => "_tstzrange",
         ColumnType::Int4RangeArray => "_int4range",
         ColumnType::DateRangeArray => "_daterange",
@@ -3042,7 +3053,7 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::HstoreArray
         | ColumnType::TsVectorArray
         | ColumnType::TsQueryArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
         // **`A` for the two vectors too**, measured: `int2vector` and `oidvector` are in
         // PostgreSQL's array category despite not being array types.
         | ColumnType::Int2Vector
@@ -3137,6 +3148,12 @@ fn typdelim(ty: ColumnType) -> &'static str {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over the whole type vocabulary, and it is a list of names \
+              rather than of rules; splitting it would put half the vocabulary somewhere \
+              else and let a type be added to one half without the other"
+)]
 fn typinput(ty: ColumnType) -> &'static str {
     match ty {
         // PostgreSQL's own name; the array's `array_in` is in the group below with every other.
@@ -3164,6 +3181,11 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::Int8RangeArray
         | ColumnType::PointArray
         | ColumnType::BoxArray
+        | ColumnType::LsegArray
+        | ColumnType::PathArray
+        | ColumnType::PolygonArray
+        | ColumnType::CircleArray
+        | ColumnType::LineArray
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray

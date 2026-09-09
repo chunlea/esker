@@ -500,6 +500,22 @@ pub enum ColumnType {
     BpcharArray,
     /// `character varying[]`.
     VarcharArray,
+    /// `lseg[]`, `path[]`, `polygon[]`, `circle[]` and `line[]` — oids 1018, 1019, 1027, 719
+    /// and 629.
+    ///
+    /// The five that were left when `box` took its own: `tests/array_delimiter.rs` carried them as
+    /// one named gap with one reason — no suite test declares an array of one — and r1's wire sweep
+    /// made that reason false for three of them, so all five arrived together
+    /// ([ADR 0091](../../docs/adr/0091-the-five-geometric-shapes-get-their-arrays.md)).
+    LsegArray,
+    /// See [`ColumnType::LsegArray`].
+    PathArray,
+    /// See [`ColumnType::LsegArray`].
+    PolygonArray,
+    /// See [`ColumnType::LsegArray`].
+    CircleArray,
+    /// See [`ColumnType::LsegArray`].
+    LineArray,
     /// `name[]` — oid 1003, `_name`.
     ///
     /// The type `array_agg(enum.enumlabel)` has, which is how `ActiveRecord` reads an enum's
@@ -548,7 +564,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 93] = [
+    pub const ALL: [ColumnType; 98] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -595,6 +611,11 @@ impl ColumnType {
         ColumnType::BpcharArray,
         ColumnType::VarcharArray,
         ColumnType::NameArray,
+        ColumnType::LsegArray,
+        ColumnType::PathArray,
+        ColumnType::PolygonArray,
+        ColumnType::CircleArray,
+        ColumnType::LineArray,
         ColumnType::DateArray,
         ColumnType::TimeArray,
         ColumnType::TimestampArray,

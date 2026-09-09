@@ -1,0 +1,105 @@
+# **An unadorned decimal literal is a `numeric`** — PostgreSQL 19beta1, 2026-09-09. One
+# `BEGIN … ROLLBACK`, `ON_ERROR_ROLLBACK on` so a refusal cannot swallow the statements after it.
+#
+# r1's 349-probe wire sweep filed four rows under "COALESCE/CASE pick a common type wider than
+# PostgreSQL's". Two of the four closed with the literal ladder's `int4` rung (ADR 0087). The other
+# two are one fact and it is not about `CASE` at all: this crate reads `1.5` as a `float8` where a
+# real server reads it as a `numeric`, so the common type of `1` and `1.5` is `double precision`
+# here and `numeric` there.
+#
+# **It is a wrong *value*, not only a wrong type**, which is what separates it from the `int4`
+# rung — a narrowed integer prints the same characters, and a float8 does not:
+#
+#                          node                      pg19
+#     SELECT 1.10          1.1                       1.10          <- a numeric keeps its scale
+#     SELECT 0.1 + 0.2     0.30000000000000004       0.3
+#     SELECT 10.0/3.0      3.3333333333333335        3.3333333333333333
+#
+# ## What is a numeric, and what is not
+#
+#     pg_typeof(1.5)                                  numeric
+#     pg_typeof(1.5e2)          value 150             numeric      <- an exponent too
+#     pg_typeof(-1.5)                                 numeric
+#     pg_typeof(100000000000000000000.5)              numeric      <- past a float8's precision
+#     pg_typeof(1.5::float8)                          double precision
+#
+#     CASE WHEN true THEN 1 ELSE 1.5 END              numeric
+#     COALESCE(1, 1.5) and COALESCE(1.5, 1)           numeric
+#     GREATEST(1, 1.5) / LEAST(1, 1.5)                numeric      values 1.5 / 1
+#     ARRAY[1, 1.5]                                   numeric[]    value {1,1.5}
+#     (VALUES (1.5),(2)) t(x)                         numeric      both rows
+#     CASE WHEN true THEN NULL ELSE 1.5 END           numeric
+#
+#     CASE WHEN true THEN 1 ELSE 1.5::float8 END      double precision
+#     CASE WHEN true THEN 1::numeric ELSE 1.5::float8 END   double precision
+#     COALESCE(1::numeric, 1::float8)                 double precision
+#
+# **A `float8` still wins over a `numeric`** — that half of the promotion is unchanged and is what
+# the last three lines pin. What changed is only which type a bare `1.5` *is*.
+#
+# ## Arithmetic, which is where the scale rules show
+#
+#     1.5 + 1.5    3.0        1.5 - 0.5   1.0        1.5 * 2    3.0
+#     3.0 / 2      1.5000000000000000                7.5 % 2    1.5
+#     1.5 + 1      2.5        1.5 * 3     4.5        0.1 + 0.2  0.3
+#     10.0/3.0     3.3333333333333333
+#     2.0 ^ 3      8.0000000000000000   <- **numeric**, where this crate's `^` is a float8 whatever
+#                                          it is given (`value::arith::result_type`)
+#
+# Multiplication **adds** the scales and division takes `div_scale`'s sixteen significant digits,
+# which is the rule ADR 0045 already built for `numeric` — this literal simply starts reaching it.
+#
+# ## Casts and the rest of the surface
+#
+#     1.5::int4  2       1.5::int8  2       2.5::int4  3      <- half away from zero
+#     abs(-1.5)  1.5     round(1.55, 1)  1.6      1.5 || 'x'  1.5x
+#     1.5 = 1.5  t       1.5 > 1  t        1.5 < 2  t
+#     sum over (1.10),(2.20)   3.30        avg   1.6500000000000000
+#
+# The 44 statements below are the capture itself — `statement`, `\gdesc` types, rows — taken in
+# this session against `127.0.0.1:55432` with no fixture at all.
+
+SELECT CASE WHEN true THEN 1 ELSE 1.5 END	numeric	1
+SELECT CASE WHEN false THEN 1 ELSE 1.5 END	numeric	1.5
+SELECT CASE WHEN true THEN 1 ELSE 2 END	integer	1
+SELECT COALESCE(1, 1.5)	numeric	1
+SELECT COALESCE(1.5, 1)	numeric	1.5
+SELECT COALESCE(a, 1) FROM (VALUES (1)) s(a)	integer	1
+SELECT CASE WHEN false THEN 1 ELSE 0.100000000000000000000001 END	numeric	0.100000000000000000000001
+SELECT CASE WHEN false THEN 1 ELSE 1.10 END	numeric	1.10
+SELECT COALESCE(NULL::int4, 1.10)	numeric	1.10
+SELECT pg_typeof(CASE WHEN true THEN 1 ELSE 1.5 END), pg_typeof(COALESCE(1, 1.5))	regtype,regtype	numeric|numeric
+SELECT pg_typeof(1.5), pg_typeof(1.5::float8), pg_typeof(1e3)	regtype,regtype,regtype	numeric|double precision|numeric
+SELECT pg_typeof(CASE WHEN true THEN 1::int4 ELSE 1.5::float8 END)	regtype	double precision
+SELECT pg_typeof(CASE WHEN true THEN 1.5::numeric ELSE 1.5::float8 END)	regtype	double precision
+SELECT pg_typeof(CASE WHEN true THEN 1::int8 ELSE 1::int4 END)	regtype	bigint
+SELECT pg_typeof(CASE WHEN true THEN 1::int4 ELSE 'x'::text END)	!42804 CASE types text and integer cannot be matched
+SELECT pg_typeof(COALESCE(1::int4, 1::int8))	regtype	bigint
+SELECT pg_typeof(COALESCE(1::numeric, 1::float8))	regtype	double precision
+SELECT pg_typeof(GREATEST(1, 1.5)), pg_typeof(LEAST(1, 1.5))	regtype,regtype	numeric|numeric
+SELECT GREATEST(1, 1.5), LEAST(1, 1.5)	numeric,numeric	1.5|1
+SELECT 1.5 + 1, pg_typeof(1.5 + 1)	numeric,regtype	2.5|numeric
+SELECT 1.5 * 3, pg_typeof(1.5 * 3)	numeric,regtype	4.5|numeric
+SELECT 0.1 + 0.2, pg_typeof(0.1 + 0.2)	numeric,regtype	0.3|numeric
+SELECT 1.10, pg_typeof(1.10)	numeric,regtype	1.10|numeric
+SELECT CASE WHEN true THEN 1.10 ELSE 2 END	numeric	1.10
+SELECT sum(v), pg_typeof(sum(v)) FROM (VALUES (1.10),(2.20)) t(v)	numeric,regtype	3.30|numeric
+SELECT avg(v), pg_typeof(avg(v)) FROM (VALUES (1.10),(2.20)) t(v)	numeric,regtype	1.6500000000000000|numeric
+SELECT 1.5::text, 1.5::float8::text	text,text	1.5|1.5
+SELECT 10.0/3.0, pg_typeof(10.0/3.0)	numeric,regtype	3.3333333333333333|numeric
+SELECT pg_typeof(CASE WHEN true THEN NULL ELSE 1.5 END)	regtype	numeric
+SELECT pg_typeof(COALESCE(NULL, 1.5))	regtype	numeric
+SELECT 1.5 = 1.5, 1.5 > 1, 1.5 < 2	boolean,boolean,boolean	t|t|t
+SELECT 1.5::int4, 1.5::int8, 2.5::int4	integer,bigint,integer	2|2|3
+SELECT -1.5, pg_typeof(-1.5)	numeric,regtype	-1.5|numeric
+SELECT 1.5e2, pg_typeof(1.5e2)	numeric,regtype	150|numeric
+SELECT abs(-1.5), pg_typeof(abs(-1.5))	numeric,regtype	1.5|numeric
+SELECT round(1.55, 1), pg_typeof(round(1.55, 1))	numeric,regtype	1.6|numeric
+SELECT 1.5 || 'x'	text	1.5x
+SELECT CASE WHEN true THEN 1 ELSE 1.5::float8 END, pg_typeof(CASE WHEN true THEN 1 ELSE 1.5::float8 END)	double precision,regtype	1|double precision
+SELECT ARRAY[1, 1.5], pg_typeof(ARRAY[1, 1.5])	numeric[],regtype	{1,1.5}|numeric[]
+SELECT x, pg_typeof(x) FROM (VALUES (1.5),(2)) t(x) ORDER BY x	numeric,regtype	1.5|numeric ; 2|numeric
+SELECT 1.5 + 1.5, 1.5 - 0.5, 1.5 * 2, 3.0 / 2	numeric,numeric,numeric,numeric	3.0|1.0|3.0|1.5000000000000000
+SELECT 7.5 % 2, pg_typeof(7.5 % 2)	numeric,regtype	1.5|numeric
+SELECT 2.0 ^ 3, pg_typeof(2.0 ^ 3)	numeric,regtype	8.0000000000000000|numeric
+SELECT 100000000000000000000.5, pg_typeof(100000000000000000000.5)	numeric,regtype	100000000000000000000.5|numeric

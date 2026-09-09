@@ -322,9 +322,23 @@ pub enum CommitDecision {
 /// A lock with `start_ts <= ts` blocks the read: it may yet commit at a timestamp inside our
 /// snapshot, and no reader may guess which way. A lock above `ts` belongs to a later
 /// transaction and is invisible.
+///
+/// **Except a [`Kind::Lock`] lock, which no reader waits for**
+/// ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)). The reason the other kinds
+/// block is that they *will* become a version, and which side of the reader's snapshot it lands on
+/// is not yet decided. A lock-only record makes no such promise: it says its transaction is holding
+/// the key and writing nothing to it, so the newest committed version below `ts` is the answer
+/// whatever its holder does next, and waiting would only pay for it.
+///
+/// It is the difference between a `SELECT … FOR UPDATE` that excludes other *writers* and one that
+/// stops the table being read. Without this, a locking read blocks every reader of the row for the
+/// length of the transaction, which is not what any of `FOR UPDATE`'s three sentences promise —
+/// and it is measurable: the crossed-lock control's second `UPDATE` spent its whole resolution
+/// budget reading a row somebody was holding, and answered `40001` where a `40P01` was owed.
 pub fn read(snapshot: &impl TxnSnapshot, user_key: &[u8], ts: u64) -> Result<ReadOutcome> {
     if let Some(lock) = snapshot.get_lock(user_key)?
         && lock.start_ts <= ts
+        && lock.kind != Kind::Lock
     {
         return Ok(ReadOutcome::Locked(lock));
     }
@@ -390,7 +404,26 @@ fn value_of(
 pub fn check_prewrite(snapshot: &impl TxnSnapshot, request: &Prewrite) -> Result<PrewriteDecision> {
     let key = &request.key[..];
 
-    // 1. A commit newer than the snapshot **this value was computed from**, which is the
+    // 1. Our own fate, if someone else has already decided it. A rollback marker sits at
+    //    `commit_ts == start_ts`, below the range the conflict check looks at, so it needs its own
+    //    look — and it is **first**, because it is a fact about *this* transaction where the
+    //    conflict below is a fact about somebody else's.
+    //
+    //    The order matters to what a client is told (ADR 0088). A transaction wounded by an older
+    //    one that wanted its row is dead *and* has usually been overtaken on the key, so both
+    //    checks fire; "you were killed so that another transaction could go on" is `40P01` and
+    //    "you lost a race" is `40001`, and only the first is true of a victim. Reading the
+    //    conflict first told every deadlock victim the wrong one.
+    if let Some(ours) = snapshot.write_of_txn(key, request.start_ts)? {
+        return Ok(match ours.record.kind {
+            Kind::Rollback => PrewriteDecision::RolledBack,
+            // Already committed. Nothing to lock, and reporting success is right: the write
+            // this prewrite was going to make is already durable.
+            _ => PrewriteDecision::AlreadyLocked,
+        });
+    }
+
+    // 2. A commit newer than the snapshot **this value was computed from**, which is the
     //    transaction's own unless the statement waited and re-read (ADR 0057 §4).
     //    First-committer-wins, and we are not it.
     if let Some(winner) = snapshot.newest_write_after(key, request.read_ts)? {
@@ -403,25 +436,25 @@ pub fn check_prewrite(snapshot: &impl TxnSnapshot, request: &Prewrite) -> Result
         }
     }
 
-    // 2. Our own fate, if someone else has already decided it. A rollback marker sits at
-    //    `commit_ts == start_ts`, below the range checked above, so it needs its own look.
-    if let Some(ours) = snapshot.write_of_txn(key, request.start_ts)? {
-        return Ok(match ours.record.kind {
-            Kind::Rollback => PrewriteDecision::RolledBack,
-            // Already committed. Nothing to lock, and reporting success is right: the write
-            // this prewrite was going to make is already durable.
-            _ => PrewriteDecision::AlreadyLocked,
-        });
-    }
-
     // 3. Anyone's lock. Ours means an earlier attempt got through; anyone else's is a
     //    conflict the caller resolves rather than an error it reports.
     if let Some(lock) = snapshot.get_lock(key)? {
-        return Ok(if lock.start_ts == request.start_ts {
-            PrewriteDecision::AlreadyLocked
-        } else {
-            PrewriteDecision::Locked(lock)
-        });
+        if lock.start_ts != request.start_ts {
+            return Ok(PrewriteDecision::Locked(lock));
+        }
+        // Ours. Either an earlier attempt got through — nothing to do — or **this transaction is
+        // upgrading a lock it took to the write it took the lock for**
+        // ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)): `SELECT … FOR UPDATE`
+        // leaves a `Kind::Lock` record, and the `UPDATE` that follows it in the same transaction
+        // has to replace that record with the value, or the row is committed as a lock and the
+        // write is silently lost.
+        //
+        // Only in that direction. A `Check` arriving over this transaction's own `Put` — the same
+        // key locked *after* it was written, or a check re-sent at commit beside the write — must
+        // not downgrade it, which would drop the value just as surely.
+        if request.op.kind() == Kind::Lock || lock.kind != Kind::Lock {
+            return Ok(PrewriteDecision::AlreadyLocked);
+        }
     }
 
     let mut mutations = Mutations::new();

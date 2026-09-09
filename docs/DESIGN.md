@@ -780,7 +780,14 @@ each key checks `write` for commit_ts > start_ts and `lock` for any lock, then w
 → commit secondaries asynchronously. Readers that hit a lock inspect the primary: rolled forward if the
 primary is committed, rolled back if its TTL expired, else wait/backoff. The TTL is **not** extended in
 practice: `TxnKv::Heartbeat` is an RPC with a handler and no sender (`docs/plans/cross-node-deadlock.md`),
-so a lock outlives a dead holder by at most one TTL. GC: PD publishes a safepoint;
+so a lock outlives a dead holder by at most one TTL.
+**A row lock is not one of these yet** ([ADR 0088](adr/0088-a-row-lock-across-nodes.md), accepted
+2026-09-09): `SELECT … FOR UPDATE` takes a lock in the `esker-sql` node's own table, so today it
+excludes other sessions of the same node and **not** sessions of another node — two nodes given the
+crossed sequence that deadlocks one node both commit, measured. The accepted fix is (a'): the row
+lock becomes a Percolator lock, acquired by an ordinary prewrite of a `Check` mutation (tag 5) sent
+when the statement runs rather than at `COMMIT`, which is why it costs no new tag and no new
+method. GC: PD publishes a safepoint;
 a `CompactionFilter` drops versions below it (keeping the newest visible one).
 
 ## 9. Wire API (`esker-proto`)
@@ -1065,6 +1072,14 @@ is in its first sentence.
   an **expression** now: lowered like any other and evaluated per row against the row as it was
   before the change (`tests/alter_column_type_using.rs`), with a plain cast still costing what the
   licence did.
+  **A row lock is a node's own, until ADR 0088 is built**
+  ([ADR 0088](adr/0088-a-row-lock-across-nodes.md), accepted 2026-09-09). `SELECT … FOR UPDATE`,
+  `NOWAIT`, `SKIP LOCKED`, `lock_timeout` and the `40P01` a cycle earns are all real and all
+  measured against PostgreSQL 19 — **within one node**. Across two nodes the lock is invisible:
+  measured on a real cluster, two sessions on two nodes given the crossed sequence that costs one
+  node a `40P01` and one victim both wrote and both committed, and `pg_locks` on the first node was
+  empty. Stateless is what makes that possible — the lock lives in the process, and there are many
+  processes — so the fix puts the lock where the row is.
 - **Scale-to-zero:** because SQL nodes are stateless and SSTs can live in object storage, an idle tenant
   costs only its Raft metadata; PD may later hibernate cold regions (ADR).
 - **Multi-tenancy:** tenant id is the first field of every SQL key; RawKV/TxnKV users may adopt the same

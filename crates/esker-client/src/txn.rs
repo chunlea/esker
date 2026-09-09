@@ -412,6 +412,8 @@ impl TxnClient {
             statement_undo: BTreeMap::new(),
             checks: BTreeSet::new(),
             check_ranges: BTreeMap::new(),
+            locked: BTreeSet::new(),
+            pinned: None,
             read_only,
             refused_write: None,
             state: State::Open,
@@ -478,6 +480,20 @@ pub struct Transaction {
     /// **Ranges this transaction scanned**, `start -> end`. The phantom half: a row that did not
     /// exist when the scan ran is in no read set, and only the range can name it.
     check_ranges: BTreeMap<Bytes, Bytes>,
+    /// Keys this transaction has **already prewritten a lock on**, before its commit
+    /// ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)).
+    ///
+    /// A `SELECT … FOR UPDATE` row, and the difference from `checks` is *when*: a check is staged
+    /// and sent at commit, and one of these is on the store from the moment the statement asked for
+    /// it, which is the whole point — a lock nobody can see until commit excludes nobody.
+    locked: BTreeSet<Bytes>,
+    /// The primary, once an eager lock has fixed it.
+    ///
+    /// **Every lock record of one transaction names the same primary**, and a resolver reads that
+    /// primary to decide the fate of all of them. A transaction that locks a row and later writes a
+    /// smaller key would move `primary()` under locks already on the store, so the first eager lock
+    /// pins it and `primary()` answers this from then on.
+    pinned: Option<Bytes>,
     /// What the buffer held for each key **before the statement running now touched it**, so a
     /// statement that has to be re-run can give its writes back.
     ///
@@ -554,7 +570,7 @@ impl Transaction {
     /// picks the same one, and so that a test can name it.
     #[must_use]
     pub fn primary(&self) -> Option<&Bytes> {
-        self.buffer.keys().next()
+        self.pinned.as_ref().or_else(|| self.buffer.keys().next())
     }
 
     /// What this transaction has buffered for `key`, in the three states a buffer really has:
@@ -644,6 +660,190 @@ impl Transaction {
             .filter(|key| !self.buffer.contains_key(key))
             .collect();
         self.check_ranges = ranges.into_iter().collect();
+    }
+
+    /// **Takes a lock on `key` now, that every node can see**
+    /// ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)).
+    ///
+    /// This is `SELECT … FOR UPDATE`'s lock. It prewrites a `Check` mutation — the lock-only
+    /// mutation ADR 0067 added as tag 5 — so the store holds a lock record on the key from this
+    /// moment rather than from the commit, which is the difference between a lock another
+    /// `esker-sql` process is excluded by and one it never sees. No new method and no new tag: the
+    /// request is the `Prewrite` a commit sends, sent earlier.
+    ///
+    /// Idempotent for the holder, like the node-local table it replaces: a key this transaction
+    /// already wrote or already locked answers [`Acquired::Taken`] without a round trip.
+    ///
+    /// **The caller does the waiting.** A live holder comes back as [`Acquired::Held`] and not as
+    /// a resolution loop, because what to do about it is a question this layer cannot answer:
+    /// `NOWAIT` refuses, `SKIP LOCKED` skips, and a plain wait is bounded by the caller's
+    /// `lock_timeout`. What this decides is only the half that must be decided here — whether the
+    /// holder is older than this transaction, in which case it is waited for, or younger, in which
+    /// case it is wounded.
+    ///
+    /// # Errors
+    ///
+    /// Any transport or region failure the router could not retry away, and any fatal verdict the
+    /// prewrite came back with — a conflicting commit is `40001` here as it is at commit time.
+    pub fn lock(&mut self, key: &[u8]) -> Result<Acquired> {
+        let key = Bytes::copy_from_slice(key);
+        if self.buffer.contains_key(&key) || self.locked.contains(&key) {
+            return Ok(Acquired::Taken);
+        }
+        if let Some(held) = self.pin_primary(&key)? {
+            return Ok(held);
+        }
+        let primary = self
+            .pinned
+            .clone()
+            .ok_or_else(|| Error::Internal("an eager lock left no primary".to_owned()))?;
+        if primary == key {
+            self.locked.insert(key);
+            return Ok(Acquired::Taken);
+        }
+        match self.prewrite_once(&primary, &key)? {
+            None => {
+                self.locked.insert(key);
+                Ok(Acquired::Taken)
+            }
+            Some(lock) => self.wound_or_wait(&lock, &key),
+        }
+    }
+
+    /// Fixes the primary and puts its lock on the store, which every later lock of this
+    /// transaction points at.
+    ///
+    /// The primary is the smallest key already buffered, or `candidate` when nothing is — the same
+    /// rule `primary()` had before eager locks existed, taken once instead of on every call.
+    /// Answers `Some` when the primary itself is held by somebody else, which is the caller's
+    /// answer too: there is nothing to hang the rest of the transaction on until it clears.
+    fn pin_primary(&mut self, candidate: &Bytes) -> Result<Option<Acquired>> {
+        if self.pinned.is_some() {
+            return Ok(None);
+        }
+        let primary = self
+            .buffer
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| candidate.clone());
+        match self.prewrite_once(&primary, &primary)? {
+            None => {}
+            Some(lock) => match self.wound_or_wait(&lock, &primary)? {
+                Acquired::Taken => {}
+                held @ Acquired::Held { .. } => return Ok(Some(held)),
+            },
+        }
+        if primary != *candidate {
+            // A buffered write, prewritten early so that it can be the primary. It is already in
+            // the buffer, so `commit` will send it again and the store will answer `AlreadyLocked`.
+            self.locked.insert(primary.clone());
+        }
+        self.pinned = Some(primary);
+        Ok(None)
+    }
+
+    /// One `Prewrite` of one key, with no resolution loop behind it: the lock it met, or `None`.
+    fn prewrite_once(&self, primary: &Bytes, key: &Bytes) -> Result<Option<LockInfo>> {
+        let keys = std::slice::from_ref(key);
+        let request = TxnKvReq::Prewrite {
+            start_ts: self.start_ts,
+            primary: primary.clone(),
+            ttl_ms: self.lock_ttl_ms,
+            mutations: self.mutations_for(keys),
+        };
+        let statuses = match self.call(&request)? {
+            TxnKvResp::Prewrite { keys: statuses } => statuses,
+            other => return Err(unexpected(Method::TxnPrewrite, &other)),
+        };
+        let [status] = &statuses[..] else {
+            return Err(Error::Store(ProtoError::invalid(format!(
+                "a Prewrite of one key was answered with {} statuses",
+                statuses.len()
+            ))));
+        };
+        if status.is_fatal() {
+            self.check(status.clone(), Some(key))?;
+        }
+        Ok(status.lock().cloned())
+    }
+
+    /// **Who dies when two transactions want each other's rows: the younger one.**
+    ///
+    /// An eager lock is what makes a cross-node cycle possible in the first place — before it, no
+    /// transaction here ever held a lock and waited for another, which is the argument
+    /// `docs/plans/cross-node-deadlock.md` makes and `tests/prewrite_ordering.rs` pins. So (a')
+    /// has to answer "one of you has to die" itself, and it answers it without a graph:
+    ///
+    /// * the holder is **settled** — committed, or its lease has run out — so it is resolved and
+    ///   the lock taken, which is what every other waiter in this client already does;
+    /// * the holder is alive and **younger** than this transaction (a larger `start_ts`), so it is
+    ///   wounded: its primary is rolled back, its lock here is resolved, and this transaction takes
+    ///   the key. It finds out at its own commit, which refuses a transaction whose primary carries
+    ///   a rollback marker;
+    /// * the holder is alive and **older**, so this transaction waits, and the caller decides for
+    ///   how long.
+    ///
+    /// Wound-wait, and the reason it is this and not a detector: `start_ts` comes from the TSO
+    /// (`CLAUDE.md` invariant 6), so every node breaks the tie the same way with no round trip and
+    /// no shared state. A cycle needs both sides to wait, and the older side never does.
+    ///
+    /// **The oldest transaction in a cycle always survives**, so this cannot livelock: the victim
+    /// is chosen by an order that does not change while the transactions run.
+    fn wound_or_wait(&self, lock: &LockInfo, key: &Bytes) -> Result<Acquired> {
+        let lease_ms = match self.classify(lock)? {
+            Classified::Settled(verdict) => {
+                self.resolve_keys(lock, verdict, key)?;
+                return self.retake(lock, key);
+            }
+            Classified::Alive { lease_ms } => lease_ms,
+        };
+        if lock.start_ts <= self.start_ts {
+            // Older, or the same transaction reaching the same key by two routes. Wait.
+            return Ok(Acquired::Held {
+                by: lock.start_ts,
+                lease_ms,
+            });
+        }
+        // Younger. Roll its primary back — the primary first and alone, because it is the fact
+        // every other participant reads — and then this key, which follows it.
+        let verdict = self.settle_primary(lock)?;
+        self.resolve_keys(lock, verdict, key)?;
+        self.retake(lock, key)
+    }
+
+    /// Prewrites `key` once more after its holder was settled or wounded.
+    ///
+    /// A second holder that arrived in between is reported rather than wounded in turn: one wound
+    /// per ask keeps this bounded, and the caller is going to come back anyway.
+    fn retake(&self, lock: &LockInfo, key: &Bytes) -> Result<Acquired> {
+        let primary = self
+            .pinned
+            .clone()
+            .unwrap_or_else(|| self.primary().cloned().unwrap_or_else(|| key.clone()));
+        match self.prewrite_once(&primary, key)? {
+            None => Ok(Acquired::Taken),
+            Some(next) => Ok(Acquired::Held {
+                by: next.start_ts,
+                lease_ms: lock.ttl_ms.min(next.ttl_ms),
+            }),
+        }
+    }
+
+    /// Rolls one settled transaction's lock on `key` forward or back, its primary already decided.
+    fn resolve_keys(&self, lock: &LockInfo, verdict: Verdict, key: &Bytes) -> Result<()> {
+        if *key == lock.primary {
+            return Ok(());
+        }
+        let request = TxnKvReq::ResolveLock {
+            start_ts: lock.start_ts,
+            commit_ts: verdict.commit_ts(),
+            keys: vec![key.clone()],
+        };
+        match self.call(&request)? {
+            TxnKvResp::ResolveLock { .. } => Ok(()),
+            other => Err(unexpected(Method::TxnResolveLock, &other)),
+        }
     }
 
     /// Begins a statement: a fresh read timestamp, and the previous statement's undo **discarded**.
@@ -973,12 +1173,19 @@ impl Transaction {
         // transaction, so it groups, commits and rolls back by the machinery already here — which
         // is the whole reason ADR 0067 put the check on the *mutation* rather than inventing a
         // second kind of request (ADR 0062 §2, §4).
+        //
+        // **And a key locked eagerly is one too** (ADR 0088): its lock is already on the store, so
+        // this prewrite answers `AlreadyLocked` for it — the round trip is what buys the uniform
+        // path, where one list of secondaries is committed and rolled back by one piece of code.
         let secondaries: Vec<Bytes> = self
             .buffer
             .keys()
             .chain(self.checks.iter())
+            .chain(self.locked.iter())
             .filter(|key| **key != primary)
             .cloned()
+            .collect::<BTreeSet<Bytes>>()
+            .into_iter()
             .collect();
         self.prewrite_or_roll_back(&primary, &secondaries, std::slice::from_ref(&primary))?;
         // The ranges, which are not keys and so cannot ride that list: each is verified against the
@@ -992,7 +1199,34 @@ impl Transaction {
 
         // 4. and 5. The commit point.
         let commit_ts = self.oracle.timestamp()?;
-        self.commit_keys(commit_ts, std::slice::from_ref(&primary))?;
+        if let Err(error) = self.commit_keys(commit_ts, std::slice::from_ref(&primary)) {
+            // **A transaction that did not commit takes its locks with it**
+            // ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)). Percolator's answer is
+            // that a later reader resolves them, and that answer is one whole TTL long for every
+            // session that wants one of those rows — bearable when reaching here was rare, and it
+            // stopped being rare when a transaction could be *wounded*: the loser of a cross-node
+            // deadlock arrives here every time, having prewritten every key it holds.
+            //
+            // The primary is asked what happened rather than guessed at, because the two answers
+            // need opposite cleanups and getting it backwards would tear a committed transaction
+            // in half. `Rollback` of the primary is the same atomic question a resolver asks: it
+            // answers `Committed` if the commit got there first, and otherwise leaves the marker
+            // that makes this transaction dead for ever.
+            if !matches!(error, Error::AmbiguousResult { .. }) && !secondaries.is_empty() {
+                match self.primary_fate(&primary) {
+                    Ok(Some(committed_at)) => {
+                        let _ = self.commit_grouped(committed_at, &secondaries);
+                    }
+                    Ok(None) => {
+                        let _ = self.rollback_grouped(&secondaries);
+                    }
+                    // The store could not say. Leaving them is what this did before, and a
+                    // resolver still ends them; reporting the original error is what matters.
+                    Err(_) => {}
+                }
+            }
+            return Err(error);
+        }
 
         // 6. Cleanup. A secondary that fails here is not a failed transaction: the primary's
         //    record is written, so the transaction *is* committed and a reader that meets one
@@ -1012,7 +1246,18 @@ impl Transaction {
     /// exactly what makes a late arrival of the second kind fail (`docs/txn-spec.md` §5.4).
     pub fn rollback(mut self) -> Result<()> {
         self.finish()?;
-        let keys: Vec<Bytes> = self.buffer.keys().cloned().collect();
+        // The eagerly locked keys go back too, and the pinned primary with them: a lock this
+        // transaction put on the store at its `SELECT … FOR UPDATE` outlives the transaction by a
+        // whole TTL otherwise, and every other session that wants the row waits it out (ADR 0088).
+        let keys: Vec<Bytes> = self
+            .buffer
+            .keys()
+            .chain(self.locked.iter())
+            .chain(self.pinned.iter())
+            .cloned()
+            .collect::<BTreeSet<Bytes>>()
+            .into_iter()
+            .collect();
         if keys.is_empty() {
             return Ok(());
         }
@@ -1148,7 +1393,7 @@ impl Transaction {
         let groups: Vec<(LockInfo, Vec<Bytes>)> = by_txn.into_values().collect();
         for outcome in fan_out(groups.len(), |index| {
             let (lock, keys) = &groups[index];
-            self.resolve(lock, keys.clone(), attempt, last)
+            self.resolve(lock, keys.clone(), attempt, last, true)
         }) {
             outcome?;
         }
@@ -1430,7 +1675,12 @@ impl Transaction {
             // lease by construction, whatever the schedule adds up to and whatever the budget is
             // set to — a deadline derived from the lease, with the count left to bound the looks.
             let last = attempt + 1 == self.max_lock_resolutions;
-            self.resolve(&lock, vec![lock.key.clone()], attempt, last)?;
+            // **A reader never wounds.** It holds nothing, so it cannot be half of a cycle:
+            // `docs/plans/cross-node-deadlock.md` puts it exactly — *"a reader holds no locks:
+            // it can wait and cannot be waited for"*. Killing a live transaction because
+            // somebody read the row it is holding would abort transactions that are in nobody's
+            // way, which is what the first version of this did.
+            self.resolve(&lock, vec![lock.key.clone()], attempt, last, false)?;
         }
         // The loop above returns on every path; `0..=n` is never empty.
         Err(Error::Internal(
@@ -1451,7 +1701,17 @@ impl Transaction {
     ///
     /// The order is the mirror of the commit's, and for the same reason: **the primary is
     /// settled first**, and everything else follows the fact it leaves behind.
-    fn resolve(&self, lock: &LockInfo, keys: Vec<Bytes>, attempt: u32, last: bool) -> Result<()> {
+    /// `may_wound` is whether the caller is **acquiring**: only a transaction that holds locks
+    /// and wants another can be half of a cycle, and only it may kill a live holder
+    /// ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)).
+    fn resolve(
+        &self,
+        lock: &LockInfo,
+        keys: Vec<Bytes>,
+        attempt: u32,
+        last: bool,
+        may_wound: bool,
+    ) -> Result<()> {
         let verdict = match self.classify(lock)? {
             Classified::Settled(verdict) => verdict,
             // Its owner is inside its lease. Waiting is the whole answer: the caller retries,
@@ -1462,7 +1722,7 @@ impl Transaction {
             // can change: sleeping through it would spend a round of the budget on a lock that
             // had become settleable while this thread was asleep. The backoff is still the
             // ceiling — a long lease is waited on the way any other contended resource is.
-            Classified::Alive { lease_ms } => {
+            Classified::Alive { lease_ms } if !may_wound || lock.start_ts <= self.start_ts => {
                 // On the last look, the whole remaining lease: after it the lock is settleable,
                 // so the refusal above is only ever reported about a lease that has run out or
                 // an owner that extended it. Otherwise a backoff step, capped by the lease for
@@ -1476,6 +1736,22 @@ impl Transaction {
                 self.router.clock().sleep(Duration::from_millis(wait));
                 return Ok(());
             }
+            // **The holder is alive and younger than us, so it loses**
+            // ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)). Waiting it out is what
+            // this did before eager locks existed, and it was right then: no transaction here held
+            // a lock while waiting for another, so a wait always ended. It can now — a
+            // `SELECT … FOR UPDATE` puts a lock on the store and the transaction goes on asking for
+            // more — and two transactions that want each other's rows would both wait out their
+            // budgets and both fail, where one node and PostgreSQL both kill exactly one.
+            //
+            // Wound-wait picks that one without a graph and without a round trip: `start_ts` comes
+            // from the TSO (`CLAUDE.md` invariant 6), so every node breaks the tie the same way,
+            // and the oldest transaction in a cycle never waits — which is why this terminates.
+            // The victim learns at its own commit, which refuses a transaction whose primary
+            // carries a rollback marker.
+            // Alive, younger, and this is a transaction **acquiring** — see the note on
+            // `may_wound`.
+            Classified::Alive { .. } => self.settle_primary(lock)?,
         };
         // The primary is already settled — `classify` settled it — so only the rest is left.
         let rest: Vec<Bytes> = keys
@@ -1540,6 +1816,26 @@ impl Transaction {
         Ok((found.start_ts == lock.start_ts).then_some(found))
     }
 
+    /// What happened to this transaction's own primary: `Some(commit_ts)` if it committed after
+    /// all, `None` if it is dead.
+    ///
+    /// The same atomic question [`Transaction::settle_primary`] asks of somebody else's, asked of
+    /// our own after the commit point refused us — a `Rollback` either finds the commit or leaves
+    /// the marker, with no window between looking and deciding.
+    fn primary_fate(&self, primary: &Bytes) -> Result<Option<u64>> {
+        let request = TxnKvReq::Rollback {
+            start_ts: self.start_ts,
+            keys: vec![primary.clone()],
+        };
+        match self.call(&request)? {
+            TxnKvResp::Rollback { status } => Ok(match status {
+                TxnStatus::Committed { commit_ts } => Some(commit_ts),
+                _ => None,
+            }),
+            other => Err(unexpected(Method::TxnRollback, &other)),
+        }
+    }
+
     /// Settles the primary, and answers with what the transaction turned out to have done.
     ///
     /// A `Rollback` of it is the verdict *and* the act, in one apply: it either leaves a
@@ -1568,6 +1864,26 @@ impl Transaction {
             other => Err(unexpected(Method::TxnRollback, &other)),
         }
     }
+}
+
+/// What [`Transaction::lock`] found.
+///
+/// The two answers a caller has to tell apart: the key is this transaction's, or somebody else's
+/// and they are still alive. There is no third — a settled holder is resolved inside `lock`, and a
+/// younger one is wounded, so neither reaches the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acquired {
+    /// This transaction holds the key now, or held it already.
+    Taken,
+    /// An **older** live transaction holds it. Waiting is the only move that does not abort
+    /// somebody, and how long to wait belongs to the caller.
+    Held {
+        /// The holder's `start_ts`, which is what a wait-for edge is drawn between and what makes
+        /// the holder older than the asker.
+        by: u64,
+        /// What is left of the holder's lease, in milliseconds.
+        lease_ms: u64,
+    },
 }
 
 /// What a resolver found when it looked at a lock's owner.

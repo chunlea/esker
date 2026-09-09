@@ -224,10 +224,14 @@ pub(super) fn enum_literal(literal: &crate::plan::Literal) -> Datum {
         Literal::Null | Literal::TypedNull(_) => Datum::Null,
         Literal::String(text) => Datum::Text(text.clone()),
         Literal::Typed(value) => (**value).clone(),
-        // A bare integer constant is an `int8` here and an `integer` there — the standing
-        // constant-width divergence — and either way it is not a label.
+        // A bare integer constant's datum is an `i64` whatever width it is *declared* — the
+        // ladder narrows types and not values (ADR 0087) — and either way it is not a label.
         Literal::Integer(value) => Datum::Int8(*value),
-        Literal::Decimal(digits) => Datum::Double(digits.parse().unwrap_or(f64::NAN)),
+        // A bare decimal is a `numeric`, scale and all, so its datum is one too.
+        Literal::Decimal(digits) => {
+            <Datum as crate::value::PgDatum>::from_text(ColumnType::Numeric, digits)
+                .unwrap_or(Datum::Null)
+        }
         Literal::Bool(flag) => Datum::Bool(*flag),
     }
 }
