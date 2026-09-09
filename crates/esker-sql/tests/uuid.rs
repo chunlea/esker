@@ -31,14 +31,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // identical, and `::text` on the line above agrees exactly.
     ],
     answers: &[
-        (
-            "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::char(8)",
-            "**An explicit cast to `character(n)` truncates on a real server and raises `22001` \
-             here.** Nothing to do with `uuid` — `::text` and `::varchar` both agree — and the \
-             same divergence `tests/time.rs` records for the same reason: it belongs to \
-             `bpchar`'s cast path, where an explicit cast and an assignment are the same code.",
-            "pg19_uuid.txt:79",
-        ),
+        // `::char(n)` truncating on a cast and raising only on an assignment was declared
+        // here and is closed: `debts-v1.1.md` #36 gave the cast and the row write their own
+        // sides of one seam (`tests/typmod_seam.rs`). It had nothing to do with this type,
+        // which is what every copy of it said — five entries across four files, one cause.
         (
             "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid(10)",
             "Both refuse with `42601`; the text differs. PostgreSQL's *type-name* grammar reads \

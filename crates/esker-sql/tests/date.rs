@@ -26,11 +26,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`format_type(1082, 3)` prints `date(3)` on a real server: it prints the typmod it is handed whether or not the type takes one. A `date` **has** no typmod — `CREATE TABLE t (d date(3))` is a syntax error there — so no column can reach this and only a hand-written oid can.",
             "pg19_date.txt:47",
         ),
-        (
-            "SELECT '2020-01-02'::date::varchar, '2020-01-02'::date::char(4)",
-            "`::char(n)` **truncates** on an explicit cast and raises `22001` only on an assignment; this node raises on both. Older than this unit — it is `value::fit_to_typmod`, and it does the same for a `text` source.",
-            "pg19_date.txt:84",
-        ),
+        // `::char(n)` truncating on a cast and raising only on an assignment was here, and its
+        // reason named the site exactly: "it is `value::fit_to_typmod`, and it does the same for a
+        // `text` source". It was right, it was older than the date unit, and it is closed —
+        // `debts-v1.1.md` #36 gave the cast and the write their own sides of that seam
+        // (`tests/typmod_seam.rs`). An entry that names its cause is an entry somebody can close.
         (
             "SELECT age('2020-01-01'::date, '2019-01-01'::date)",
             "`age` answers an `interval`, which this node does not have.",

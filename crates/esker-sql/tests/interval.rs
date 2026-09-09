@@ -49,11 +49,6 @@ const FUNCTIONS: &str = "A function this node does not implement for any type, n
      `extract` is general, and `pg_typeof` reads the catalog. **`greatest`/`least` left this \
      list**: they are built, and answer an interval like any other ordered type.";
 
-/// The `bpchar` explicit-cast truncation, recorded a third time.
-const BPCHAR: &str = "An explicit cast to `character(n)` truncates on a real server and raises \
-     `22001` here — `tests/time.rs` and `tests/uuid.rs` record the same thing. The `varchar` \
-     half diverges only in its declared type, `text` for `character varying`.";
-
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // **Empty, and three units emptied it.** The `interval(0)` entry left with g1's typmod
@@ -159,11 +154,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             FUNCTIONS,
             "pg19_interval.txt:117",
         ),
-        (
-            "SELECT '1 day'::interval::varchar, '1 day'::interval::char(3)",
-            BPCHAR,
-            "pg19_interval.txt:119",
-        ),
+        // `::char(n)` truncating on a cast and raising only on an assignment was declared
+        // here and is closed: `debts-v1.1.md` #36 gave the cast and the row write their own
+        // sides of one seam (`tests/typmod_seam.rs`). It had nothing to do with this type,
+        // which is what every copy of it said — five entries across four files, one cause.
         (
             "SELECT '1 day'::interval::time",
             ARITHMETIC,
