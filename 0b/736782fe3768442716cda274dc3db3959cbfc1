@@ -1,0 +1,19 @@
+docs/adr/0097-an-oid-is-four-bytes-and-a-derived-one-is-not.md
+  s_6f7019c05b578b::t_dff99bd4842832 53-84,112-116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "0b736782fe3768442716cda274dc3db3959cbfc1",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
