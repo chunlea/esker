@@ -485,6 +485,20 @@ pub enum Expr {
     /// `CASE x WHEN 1 THEN …`, so an index over one desugared into `WHEN x = 1` would store a
     /// definition `ActiveRecord` would not recognise.
     Case {
+        /// The expression after `CASE`, for the **simple** form — `CASE a WHEN 1 THEN …` — or
+        /// `None` for the searched one.
+        ///
+        /// **Kept rather than desugared.** `CASE a WHEN 1 THEN b END` and
+        /// `CASE WHEN a = 1 THEN b END` compute the same value, and a real server still holds them
+        /// apart: its `CaseExpr` has an `arg`, and `pg_get_expr` prints `CASE a` back. Desugaring
+        /// at lowering would store a definition nobody wrote, and `pg_get_indexdef` would answer
+        /// `ActiveRecord` with something it never sent. Measured,
+        /// `tests/corpus/pg19_deparse_census.txt`'s group F.
+        ///
+        /// Each branch's `when` is then the **value to compare**, not a condition: the comparison
+        /// is `operand = when`, with `=`'s own NULL behaviour and not `IS NOT DISTINCT FROM` —
+        /// `CASE NULL WHEN NULL THEN 1 ELSE 2 END` is `2`, measured.
+        operand: Option<Box<Expr>>,
         /// The `WHEN`/`THEN` pairs, in the order written. PostgreSQL's grammar has no empty one.
         branches: Vec<CaseBranch>,
         /// The `ELSE`, or `None` when it was not written — which is a NULL of the resolved type

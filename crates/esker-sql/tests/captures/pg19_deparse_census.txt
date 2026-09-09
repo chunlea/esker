@@ -203,27 +203,19 @@ SELECT pg_get_viewdef('v_case_search'::regclass)		 SELECT\n        CASE\n       
 ROLLBACK TO sp_case_search_v		-
 SAVEPOINT sp_case_simple		-
 CREATE INDEX ix_case_simple ON cen ((CASE a WHEN 1 THEN b ELSE 0 END))		-
-# (the read-back this node cannot reach yet — PostgreSQL's answer, kept as evidence
-#  rather than as a comparison, because the refusal above swallows anything after it)
-# SELECT pg_get_indexdef('ix_case_simple'::regclass)		CREATE INDEX ix_case_simple ON public.cen USING btree ((\nCASE a\n    WHEN 1 THEN b\n    ELSE 0\nEND))
+SELECT pg_get_indexdef('ix_case_simple'::regclass)		CREATE INDEX ix_case_simple ON public.cen USING btree ((\nCASE a\n    WHEN 1 THEN b\n    ELSE 0\nEND))
 ROLLBACK TO sp_case_simple		-
 SAVEPOINT sp_case_simple_e		-
 CREATE INDEX ix_case_simple ON cen ((CASE a WHEN 1 THEN b ELSE 0 END))		-
-# (the read-back this node cannot reach yet — PostgreSQL's answer, kept as evidence
-#  rather than as a comparison, because the refusal above swallows anything after it)
-# SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_simple'::regclass		CASE a\n    WHEN 1 THEN b\n    ELSE 0\nEND
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_simple'::regclass		CASE a\n    WHEN 1 THEN b\n    ELSE 0\nEND
 ROLLBACK TO sp_case_simple_e		-
 SAVEPOINT sp_case_simple_g		-
 ALTER TABLE cen ADD COLUMN g_case_simple text GENERATED ALWAYS AS ((CASE a WHEN 1 THEN b ELSE 0 END)::text) STORED		-
-# (the read-back this node cannot reach yet — PostgreSQL's answer, kept as evidence
-#  rather than as a comparison, because the refusal above swallows anything after it)
-# SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_case_simple'		(\nCASE a\n    WHEN 1 THEN b\n    ELSE 0\nEND)::text
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_case_simple'		(\nCASE a\n    WHEN 1 THEN b\n    ELSE 0\nEND)::text
 ROLLBACK TO sp_case_simple_g		-
 SAVEPOINT sp_case_simple_v		-
 CREATE VIEW v_case_simple AS SELECT CASE a WHEN 1 THEN b ELSE 0 END AS x FROM cen		-
-# (the read-back this node cannot reach yet — PostgreSQL's answer, kept as evidence
-#  rather than as a comparison, because the refusal above swallows anything after it)
-# SELECT pg_get_viewdef('v_case_simple'::regclass)		 SELECT\n        CASE a\n            WHEN 1 THEN b\n            ELSE 0\n        END AS x\n   FROM cen\;
+SELECT pg_get_viewdef('v_case_simple'::regclass)		 SELECT\n        CASE a\n            WHEN 1 THEN b\n            ELSE 0\n        END AS x\n   FROM cen\;
 ROLLBACK TO sp_case_simple_v		-
 SAVEPOINT sp_case_fn		-
 CREATE INDEX ix_case_fn ON cen ((CASE WHEN abs(a) > 0 THEN abs(b) ELSE abs(a) END))		-
@@ -894,4 +886,42 @@ SAVEPOINT sp_cast_default_unknown		-
 ALTER TABLE cenc ALTER COLUMN t SET DEFAULT (('a')::text)		-
 SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cenc'::regclass AND a.attname='t'		'a'::text
 ROLLBACK TO sp_cast_default_unknown		-
+SAVEPOINT sp_case_simple_two		-
+ALTER TABLE cen ADD CONSTRAINT kf2 CHECK (CASE a WHEN 1 THEN b WHEN 2 THEN b + 1 ELSE 0 END > 0)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'kf2'		CHECK ((\nCASE a\n    WHEN 1 THEN b\n    WHEN 2 THEN (b + 1)\n    ELSE 0\nEND > 0))
+ROLLBACK TO sp_case_simple_two		-
+SAVEPOINT sp_case_simple_two_p		-
+ALTER TABLE cen ADD CONSTRAINT kf2 CHECK (CASE a WHEN 1 THEN b WHEN 2 THEN b + 1 ELSE 0 END > 0)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'kf2'		CHECK (\nCASE a\n    WHEN 1 THEN b\n    WHEN 2 THEN b + 1\n    ELSE 0\nEND > 0)
+ROLLBACK TO sp_case_simple_two_p		-
+SAVEPOINT sp_case_simple_noelse		-
+ALTER TABLE cen ADD CONSTRAINT kf3 CHECK (CASE a WHEN 1 THEN b END > 0)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'kf3'		CHECK ((\nCASE a\n    WHEN 1 THEN b\n    ELSE NULL::integer\nEND > 0))
+ROLLBACK TO sp_case_simple_noelse		-
+SAVEPOINT sp_case_simple_noelse_p		-
+ALTER TABLE cen ADD CONSTRAINT kf3 CHECK (CASE a WHEN 1 THEN b END > 0)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'kf3'		CHECK (\nCASE a\n    WHEN 1 THEN b\n    ELSE NULL::integer\nEND > 0)
+ROLLBACK TO sp_case_simple_noelse_p		-
+SAVEPOINT sp_case_simple_expr		-
+ALTER TABLE cen ADD CONSTRAINT kf4 CHECK (CASE a + 1 WHEN 2 THEN b ELSE 0 END > 0)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'kf4'		CHECK ((\nCASE (a + 1)\n    WHEN 2 THEN b\n    ELSE 0\nEND > 0))
+ROLLBACK TO sp_case_simple_expr		-
+SAVEPOINT sp_case_simple_expr_p		-
+ALTER TABLE cen ADD CONSTRAINT kf4 CHECK (CASE a + 1 WHEN 2 THEN b ELSE 0 END > 0)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'kf4'		CHECK (\nCASE a + 1\n    WHEN 2 THEN b\n    ELSE 0\nEND > 0)
+ROLLBACK TO sp_case_simple_expr_p		-
+SAVEPOINT sp_case_simple_text		-
+ALTER TABLE cen ADD CONSTRAINT kf5 CHECK (CASE t WHEN 'x' THEN 1 ELSE 0 END > 0)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'kf5'		CHECK ((\nCASE t\n    WHEN 'x'::text THEN 1\n    ELSE 0\nEND > 0))
+ROLLBACK TO sp_case_simple_text		-
+SAVEPOINT sp_case_simple_text_p		-
+ALTER TABLE cen ADD CONSTRAINT kf5 CHECK (CASE t WHEN 'x' THEN 1 ELSE 0 END > 0)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'kf5'		CHECK (\nCASE t\n    WHEN 'x'::text THEN 1\n    ELSE 0\nEND > 0)
+ROLLBACK TO sp_case_simple_text_p		-
+SAVEPOINT sp_case_simple_badtype		-
+ALTER TABLE cen ADD CONSTRAINT kf6 CHECK (CASE t WHEN 1 THEN true ELSE false END)	!42883 operator does not exist: text = integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+ROLLBACK TO sp_case_simple_badtype		-
+SAVEPOINT sp_case_simple_badvalue		-
+ALTER TABLE cen ADD CONSTRAINT kf7 CHECK (CASE a WHEN 'x' THEN true ELSE false END)	!22P02 invalid input syntax for type integer: "x"
+ROLLBACK TO sp_case_simple_badvalue		-
 ROLLBACK		-

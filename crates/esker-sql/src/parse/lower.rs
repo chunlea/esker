@@ -4567,22 +4567,24 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             compare_op,
             right,
         } => lower_quantified(left, compare_op, right, true),
-        // `CASE WHEN … THEN … [ELSE …] END`. The **simple** form carries an operand after `CASE`
-        // and is refused by name: a real server prints it back as `CASE x WHEN 1 THEN …`, so
-        // desugaring it into `WHEN x = 1` would store a definition that is not the one written and
-        // `pg_get_indexdef` would answer with something `ActiveRecord` never wrote. Nothing in
-        // `schema.rb` uses it.
+        // `CASE WHEN … THEN … [ELSE …] END`, and the **simple** form `CASE x WHEN 1 THEN …`
+        // beside it. The operand is **carried, not desugared**: a real server keeps it in its
+        // `CaseExpr` and prints `CASE x` back, so rewriting it to `WHEN x = 1` here would store a
+        // definition nobody wrote and `pg_get_indexdef` would answer `ActiveRecord` with something
+        // it never sent. The equality is the *evaluator's* business
+        // (`exec::cursor`), and it is `=` rather than `IS NOT DISTINCT FROM`:
+        // `CASE NULL WHEN NULL THEN 1 ELSE 2 END` is `2`, measured.
+        //
+        // This was `0A000 CASE <expression> WHEN ..., the simple form is not supported` until the
+        // deparse census asked what a real server prints for it.
         Expr::Case {
             operand,
             conditions,
             else_result,
             ..
         } => {
-            refuse_if(
-                operand.is_some(),
-                "CASE <expression> WHEN ..., the simple form",
-            )?;
             Ok(plan::Expr::Case {
+                operand: operand.as_deref().map(lower_expr).transpose()?.map(Box::new),
                 branches: conditions
                     .iter()
                     .map(|branch| {

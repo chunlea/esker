@@ -1304,9 +1304,13 @@ fn collect_columns(expr: &Expr, into: &mut Vec<usize>) {
             }
         }
         Expr::Case {
+            operand,
             branches,
             otherwise,
         } => {
+            if let Some(operand) = operand {
+                collect_columns(operand, into);
+            }
             for branch in branches {
                 collect_columns(&branch.when, into);
                 collect_columns(&branch.then, into);

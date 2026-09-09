@@ -3087,9 +3087,10 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             element: attnum_vector_element(operand, scope).unwrap_or(*element),
         },
         Expr::Case {
+            operand,
             branches,
             otherwise,
-        } => resolve_case(branches, otherwise.as_deref(), scope)?,
+        } => resolve_case(operand.as_deref(), branches, otherwise.as_deref(), scope)?,
         Expr::Coalesce(args) => resolve_coalesce(args, scope)?,
         // Its arguments are expressions of the row like a catalog function's — `unnest(tags)` is a
         // column reference — so they resolve the same way. Falling through to the clone below left
@@ -3323,24 +3324,57 @@ fn resolve_in_list(
 /// `CASE types text and bigint cannot be matched` and `THEN name ELSE id` is the same sentence with
 /// the two swapped. Resolving left to right would name them the wrong way round in both.
 fn resolve_case(
+    operand: Option<&Expr>,
     branches: &[crate::plan::CaseBranch],
     otherwise: Option<&Expr>,
     scope: &Scope<'_>,
 ) -> Result<Expr> {
+    // **The simple form's operand decides what a `WHEN` *is*.** With one, a `WHEN` is a value
+    // compared against it and takes the operand's type the way a comparison's other side does —
+    // `CASE t WHEN 'x' THEN …` over a `text` column stores `WHEN 'x'::text`, measured. Without
+    // one, a `WHEN` is a condition and must be boolean. The two are checked apart below, because
+    // running the boolean check over a simple form's values would refuse every one of them.
+    let operand = match operand {
+        Some(expr) => Some(Box::new(resolve(expr, scope)?)),
+        None => None,
+    };
+    let operand_type = operand
+        .as_deref()
+        .and_then(|expr| expr_type(expr, scope).ok());
     let mut otherwise = match otherwise {
         Some(expr) => Some(Box::new(resolve(expr, scope)?)),
         None => None,
     };
     let mut resolved = Vec::with_capacity(branches.len());
     for branch in branches {
-        let when = resolve(&branch.when, scope)?;
+        let mut when = resolve(&branch.when, scope)?;
         // A condition that is not boolean is `42804` here rather than a row that quietly
         // never matches. An **`unknown`** condition is left alone, and that is not a
         // detail: `CASE WHEN NULL THEN 'a' ELSE 'b' END` is `b` on a real server, because
         // a bare NULL takes the type it is used at — and `expr_type` calls a NULL `text`,
         // which would refuse it here. `WHEN 'x'` is left for the same reason, and reaches
         // the evaluator's own `42804`.
-        if !matches!(when, Expr::Literal(Literal::Null | Literal::String(_)))
+        if let Some(ty) = operand_type {
+            // A value, not a condition. An **unknown** literal takes the operand's type, which is
+            // what makes `WHEN 'x'` store `'x'::text` and what raises
+            // `22P02 invalid input syntax for type integer: "x"` when it will not convert —
+            // measured, both.
+            give_type(&mut when, ty)?;
+            // And a value that has a type of its own must be one `=` is defined between, because
+            // that is the operator the branch is: `CASE t WHEN 1 THEN …` over a `text` column is
+            // `42883 operator does not exist: text = integer` on a real server, measured. The same
+            // question `reconcile`'s caller asks for a written comparison, asked here because the
+            // comparison is implied rather than written.
+            if let Ok(value) = expr_type(&when, scope)
+                && !same_family(ty, value)
+            {
+                return Err(SqlError::UndefinedOperator {
+                    left: ty.name().to_owned(),
+                    op: BinaryOp::Eq.symbol(),
+                    right: value.name().to_owned(),
+                });
+            }
+        } else if !matches!(when, Expr::Literal(Literal::Null | Literal::String(_)))
             && let Ok(ty) = expr_type(&when, scope)
             && ty != ColumnType::Bool
         {
@@ -3408,6 +3442,7 @@ fn resolve_case(
         }
     }
     Ok(Expr::Case {
+        operand,
         branches: resolved,
         otherwise,
     })
@@ -4161,7 +4196,11 @@ fn carried_type(expr: &Expr) -> Option<ColumnType> {
         // `select_common_type` fallback, and the reason `COALESCE(NULL, '1')` is `text` too: a
         // NULL carries no type either, so a `COALESCE` of a NULL and an `unknown` is all-unknown.
         Expr::Coalesce(args) => Some(branch_common_type(args.iter())),
+        // **A `CASE`'s type is its branches' and never its operand's**, so the simple
+        // form answers exactly as the searched one does: `CASE a WHEN 1 THEN 'x' END`
+        // is `text` however `a` is typed.
         Expr::Case {
+            operand: _,
             branches,
             otherwise,
         } => Some(branch_common_type(
@@ -5586,7 +5625,11 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::Coalesce(args) => {
             common_branch_type(args.iter().filter_map(|arg| branch_type(arg, scope)))
         }
+        // **A `CASE`'s type is its branches' and never its operand's**, so the simple
+        // form answers exactly as the searched one does: `CASE a WHEN 1 THEN 'x' END`
+        // is `text` however `a` is typed.
         Expr::Case {
+            operand: _,
             branches,
             otherwise,
         } => common_branch_type(
