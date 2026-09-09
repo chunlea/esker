@@ -1,0 +1,23 @@
+crates/esker-raft/src/election/tests.rs
+  s_6f7019c05b578b::t_3aa2e16b54c1f3 543-592
+crates/esker-store/tests/load_arm/mod.rs
+  s_6f7019c05b578b::t_c20fc7fb631ecb 1-120
+crates/esker-store/tests/promotion.rs
+  s_6f7019c05b578b::t_a5cf24735032df 20-22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "56ea4a88d0afe000d911b43f8d3c57ce308e5560",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
