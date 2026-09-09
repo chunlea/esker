@@ -357,11 +357,21 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>, pretty: bo
         // `CHECK ((quantity > 0)) NOT VALID` and `CHECK (quantity > 0) NOT VALID`, always
         // **outside** the parentheses, which is what lets `ActiveRecord`'s greedy
         // `/CHECK \((.+)\)/` stop before it.
+        // **And the plain form parenthesises each operand of a top-level chain, where the pretty
+        // one does not.** `CHECK (a > 0 AND b > 0)` comes back `CHECK (((a > 0) AND (b > 0)))`
+        // plain and `CHECK (a > 0 AND b > 0)` pretty — measured, both. That is the same rule
+        // `pg_get_expr(indpred)` applies (`catalog::parenthesised_operands`, called from
+        // `pg_index::parenthesised`), so the two readers now want the **same stored text** and
+        // `exec::ddl::normalise_checks` can keep giving them one: operands without their own
+        // pairs, each reader adding what it adds.
         let suffix = if check.validated { "" } else { " NOT VALID" };
         return Datum::Text(if pretty {
             format!("CHECK ({}){suffix}", check.expr)
         } else {
-            format!("CHECK (({})){suffix}", check.expr)
+            format!(
+                "CHECK (({})){suffix}",
+                super::parenthesised_operands(&check.expr)
+            )
         });
     }
     // A `FOREIGN KEY`: the oid is the table and the constraint's position in its list.

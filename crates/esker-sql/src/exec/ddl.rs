@@ -6007,10 +6007,18 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
     use crate::plan::Expr;
     let sub = |expr: &Expr| deparse(expr, table, ty);
     match expr {
-        Expr::Ordinal { at, .. } => table
-            .columns
-            .get(*at)
-            .map_or_else(|| format!("<column {at}>"), |column| column.name.clone()),
+        // **A name is quoted the way `quote_ident` quotes it**, which is one call and not a rule
+        // written here: [`catalog::quote_identifier`] carries PostgreSQL 19's own
+        // `pg_get_keywords()` answer. Printing it bare made `CHECK (("primary" > 0))` come back
+        // `CHECK ((primary > 0))`, which is not only a different string — it does not re-parse,
+        // and the index readers only *looked* right because `reads_back` refused the bare form
+        // and the written text survived. `tests/corpus/pg19_quoted_identifier.txt` measures all
+        // five readers, and `value` and `name` are the pair that says this is a measured list
+        // rather than a guess about keywords: both are keywords and both print bare.
+        Expr::Ordinal { at, .. } => table.columns.get(*at).map_or_else(
+            || format!("<column {at}>"),
+            |column| catalog::quote_identifier(&column.name),
+        ),
         Expr::Literal(literal) => deparse_literal(literal, ty),
         Expr::Array { elements, .. } => {
             format!(
@@ -6217,7 +6225,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         // Refused before this is reached: `refuse_unless_immutable` rejects every one of them as
         // an index key, and a column reference has been resolved to an `Ordinal` by then. Printed
         // rather than panicked on, because this is a catalog write and not a place to abort.
-        Expr::Column { name, .. } => name.clone(),
+        Expr::Column { name, .. } => catalog::quote_identifier(name),
         Expr::Parameter(number) => format!("${number}"),
         Expr::CurrentSchema { all: None } => "current_schema()".to_owned(),
         Expr::CurrentDatabase => "current_database()".to_owned(),

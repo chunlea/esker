@@ -1,0 +1,61 @@
+# **How a column's name is quoted in a printed expression**, measured across all five readers.
+#
+# `docs/plans/debts-v1.1.md`: `pg_get_constraintdef` does not quote a reserved word here. The rule
+# itself is already measured and already implemented — `catalog::quote_identifier` carries
+# PostgreSQL 19's own `pg_get_keywords()` answer, every keyword whose `quote_ident(word) <> word`
+# — so this file is not about the rule. It is about **who calls it**.
+#
+# ## One rule, and the oracle applies it identically in all five
+#
+#     "primary"   a reserved word                     quoted
+#     "select"    a reserved word                     quoted
+#     "Foo"       not all-lower-case                  quoted
+#     "a b"       a character an identifier cannot    quoted
+#     value       a keyword `quote_ident` leaves bare bare
+#     name        the same                            bare
+#     plain       an ordinary name                    bare
+#
+# `value` and `name` are the pair that makes this a measured list rather than a guess about
+# keywords: both are keywords, both print bare, and a quoting rule taken from a parser's reserved
+# set would get them wrong (`catalog::quote::QUOTED_KEYWORDS` says so at length).
+#
+# ## The five readers
+#
+# `pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr(indexprs)`, `pg_get_expr(indpred)` and
+# `pg_get_expr(adbin)` — the same five this node routes through one deparser. The **view** is asked
+# a narrower question, `strpos(pg_get_viewdef(...), '"primary"') > 0`, because its layout is a
+# standing divergence of its own (this node returns the stored text where a real server
+# reconstructs the query) and a whole-text comparison would swallow the quoting question. Its
+# fourth column is the control: `"value"` **quoted** does not appear, because `value` is printed
+# bare.
+#
+# ## What it found beyond the quoting
+#
+# **Two of the five printed the name bare and three did not**, before one call was added to one
+# place — which is the shape worth recording: the rule was implemented, the readers were already
+# routed through one deparser, and it still reached only some of them. Whichever way the other
+# three were getting it right, they were not getting it right *from the rule*.
+#
+# And the two CHECK rows found a second thing: `pg_get_constraintdef`'s plain form parenthesises
+# **each operand of a top-level chain** where its pretty form does not —
+# `CHECK (((a > 0) AND (b > 0)))` against `CHECK (a > 0 AND b > 0)`, measured — which is the rule
+# `pg_get_expr(indpred)` was already applying. The two readers now want the same stored text, so
+# `exec::ddl::normalise_checks` can keep giving them one form and each adds what it adds.
+#
+# Captured against esker-pg19 (PostgreSQL 19beta1) with
+# `sesscap.py src/pg19_quoted_identifier.txt.in`, inside one `BEGIN ... ROLLBACK`.
+BEGIN		-
+CREATE TABLE g1q ("primary" integer, "Foo" integer, "a b" integer, "select" integer, value integer, name integer, plain integer)		-
+ALTER TABLE g1q ADD CONSTRAINT k1 CHECK ("primary" > 0)		-
+ALTER TABLE g1q ADD CONSTRAINT k2 CHECK ("Foo" > 0 AND "a b" > 0)		-
+ALTER TABLE g1q ADD CONSTRAINT k3 CHECK ("select" > 0 AND value > 0 AND name > 0 AND plain > 0)		-
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'g1q'::regclass AND contype = 'c' ORDER BY conname		r|k1|CHECK (("primary" > 0)) ; r|k2|CHECK ((("Foo" > 0) AND ("a b" > 0))) ; r|k3|CHECK ((("select" > 0) AND (value > 0) AND (name > 0) AND (plain > 0)))
+CREATE INDEX i1 ON g1q ((("primary" + "Foo"))) WHERE "a b" > 0		-
+SELECT 'r', pg_get_indexdef('i1'::regclass)		r|CREATE INDEX i1 ON public.g1q USING btree ((("primary" + "Foo"))) WHERE ("a b" > 0)
+SELECT 'r', pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'i1'::regclass		r|("primary" + "Foo")
+SELECT 'r', pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'i1'::regclass		r|("a b" > 0)
+ALTER TABLE g1q ADD COLUMN g integer GENERATED ALWAYS AS ("primary" + "select") STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1q'::regclass AND a.attname = 'g'		r|g|("primary" + "select")
+CREATE VIEW g1v AS SELECT "primary", "Foo", "a b", value FROM g1q		-
+SELECT 'r', strpos(pg_get_viewdef('g1v'::regclass), '"primary"') > 0, strpos(pg_get_viewdef('g1v'::regclass), '"Foo"') > 0, strpos(pg_get_viewdef('g1v'::regclass), '"a b"') > 0, strpos(pg_get_viewdef('g1v'::regclass), '"value"') > 0		r|t|t|t|f
+ROLLBACK		-
