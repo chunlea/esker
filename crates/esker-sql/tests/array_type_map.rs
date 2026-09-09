@@ -79,17 +79,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "this node's pg_type holds the types it has, not PostgreSQL's whole catalogue",
             "pg19_array_type_map.txt:51",
         ),
-        // **`box` is not a type here**, and these three exist to say that `typdelim` is not always
-        // a comma — `box` uses `;`, the one exception in a real server's catalogue. Every type
-        // this node has uses `,`, so the rule the capture warns about is recorded and cannot be
-        // demonstrated: a hard-coded comma would be wrong on a server with a `box` and is right
-        // on this one. The day a geometric type lands here, these three become the test for it.
-        (
-            "SELECT 'r', '{(1,1),(0,0);(3,3),(2,2)}'::box[], \
-             array_length('{(1,1),(0,0);(3,3),(2,2)}'::box[], 1)",
-            "box is not a type here",
-            "pg19_array_type_map.txt:56",
-        ),
         // **The standing `varchar`/`text` trade, seen through a subscript.** `pg_typeof(tags)` is
         // `character varying[]` on both, because an array *value* carries its element type; an
         // element pulled out of one is a `Datum::Text`, and a `Datum` has no `Varchar` variant —
