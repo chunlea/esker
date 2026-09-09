@@ -1361,6 +1361,53 @@ fn timed_engine(
     (answer, samples[samples.len() / 2], plan)
 }
 
+/// **Which part of the per-region cost grows with the table.**
+///
+/// `docs/plans/phase-16-mpp.md` §10 has the region axis at three thousand rows and the group axis
+/// at ten thousand, and between them sits a number nothing explains: the dispatch slope is
+/// **1.21 ms a region** on the first and **8.07 ms a region** on the second. A round trip does not
+/// know how many rows a table has, so something a fragment does is growing — and the two runs
+/// differ in *rows per region* (61 against 238) as well as in region count.
+///
+/// So this holds the split threshold fixed and moves only the row count, and prints what the store
+/// says it did: `EXPLAIN ANALYZE`'s `Fragments`, `Stripes`, `Chunks` and `Rows` lines are per-query
+/// totals summed over every fragment, so they separate "each fragment read past its region" from
+/// "each fragment read more because its region holds more".
+///
+/// Deliberately a measurement and not an assertion: what it produces is a paragraph in §10.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a §10 measurement: two clusters, minutes, and it wants a quiet box"]
+async fn what_grows_in_a_fragment_when_the_table_grows() {
+    const ROUNDS: usize = 5;
+    println!("\n  split 16 KB, medians of {ROUNDS}, count(*) — the dispatch-only query\n");
+    println!("  rows    regions  rows/region  routed        per region   the store's own account");
+    for rows_in_table in [3_000_i64, 10_000] {
+        let gate = Gate::start_splitting(16 * 1024).await;
+        gate.fill_grouped(rows_in_table).await;
+        let regions = gate.regions();
+        tokio::task::block_in_place(|| {
+            let mut session = gate.session();
+            let (_, at, plan) =
+                timed_engine(&mut session, "auto", "SELECT count(*) FROM t", ROUNDS);
+            let ms = at.as_secs_f64() * 1000.0;
+            // One line of the plan carries the counts, and the fragment line carries the fan-out.
+            let account: Vec<&str> = plan
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("Fragments:") || line.starts_with("Stripes:"))
+                .collect();
+            println!(
+                "  {rows_in_table:<6}  {regions:>7}  {:>11.1}  {ms:>8.2} ms  {:>8.2} ms   {}",
+                f64::from(u32::try_from(rows_in_table).unwrap_or(u32::MAX))
+                    / f64::from(u32::try_from(regions).unwrap_or(1).max(1)),
+                ms / f64::from(u32::try_from(regions).unwrap_or(1).max(1)),
+                account.join("  |  ")
+            );
+        });
+        gate.stop().await;
+    }
+}
+
 /// **The §10 re-measure: what a fragment costs per region, and what a finish costs per group.**
 ///
 /// `docs/plans/phase-16-mpp.md` §10's table, arms 1 to 4. The verdict there is single-region and
