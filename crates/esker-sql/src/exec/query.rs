@@ -886,10 +886,19 @@ pub(super) fn unify(left: ColumnType, right: ColumnType) -> Result<ColumnType> {
             right: right.name(),
         });
     }
-    if is_preferred(left) {
-        return Ok(left);
-    }
-    if implicit_cast(left, right) && !implicit_cast(right, left) {
+    // **PostgreSQL's `select_common_type`, and it is asymmetric.** The running candidate keeps the
+    // answer unless it is *not* its category's preferred type **and** it can be implicitly cast to
+    // the other while the other cannot be cast back. Measured, and the asymmetry is visible in one
+    // pair: `name` and `text` cast implicitly **both** ways, so neither displaces the other and the
+    // arm that came first wins — `coalesce(name, text)` is `name` and `coalesce(text, name)` is
+    // `text`. Every other pair here is order-free, because only one direction is implicit:
+    // `numeric` beside `real` is `real` in both orders, since `numeric -> float4` is implicit and
+    // `float4 -> numeric` is only an assignment.
+    //
+    // Written symmetrically once, and that was wrong in exactly that pair: it made
+    // `coalesce(name, text)` a `text`, because `text` is preferred and a symmetric rule lets the
+    // *right* side's preference win a tie the left had already taken.
+    if !is_preferred(left) && implicit_cast(left, right) && !implicit_cast(right, left) {
         return Ok(right);
     }
     Ok(left)
@@ -5034,14 +5043,26 @@ fn date_trunc_type(args: &[Expr], scope: &Scope<'_>) -> ColumnType {
 fn greatest_type(args: &[Expr], scope: &Scope<'_>) -> ColumnType {
     let mut found: Option<ColumnType> = None;
     for arg in args {
+        // **An unadorned literal does not vote.** It is `unknown` to a real server's resolver and
+        // takes whatever the known arguments settle on: `greatest(c, 'x')` over a `character(4)`
+        // column is a `bpchar` there, and letting the literal in as the `text` this crate resolves
+        // it to made it a `text` — the preferred type winning a vote it should not have had.
+        if matches!(arg, Expr::Literal(Literal::String(_))) {
+            continue;
+        }
         let Ok(ty) = expr_type(arg, scope) else {
             continue;
         };
         found = Some(match found {
             None => ty,
             Some(sofar) if sofar == ty => sofar,
-            Some(sofar) => crate::value::arith::result_type(crate::plan::ArithOp::Add, sofar, ty)
-                .unwrap_or(sofar),
+            // **The common type, not arithmetic's.** These took `+`'s promotion, which is a
+            // different ladder and a right one for a different question: `int2 + float4` really is
+            // a `double precision`, because adding them needs the wider float. `GREATEST` picks
+            // one of the values, so it takes the type the pair *resolves* to —
+            // `GREATEST(int2, float4)` is `real` on a real server, measured, and the same
+            // `unify` a `UNION` over the two arms uses.
+            Some(sofar) => unify(sofar, ty).unwrap_or(sofar),
         });
     }
     found.unwrap_or(ColumnType::Text)
