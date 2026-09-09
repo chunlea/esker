@@ -26,8 +26,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
-        "SELECT '{1,2,3}'::int[], ARRAY[1,2,3], ARRAY[1,2,3]::int[]",
-        "SELECT '{1,NULL,3}'::int[], ARRAY[1,NULL,3]",
+        // `pg_typeof`'s own `regtype`/`text` trade (ADR 0077), and nothing else: the two array
+        // types it names agree since the `int4` rung, and both `format_type` calls always did.
+        "SELECT pg_typeof('{1,2}'::int[]), pg_typeof(ARRAY[1,2]), format_type(1007, -1), \
+         format_type(1009, -1)",
         // These two used to be listed below as refusals: a bare `VALUES` list was not a relation
         // and the statement could not run. It runs now and the **rows are right**; what is left is
         // that `array_agg` declares `text` whatever it collects, where a real server declares the
@@ -36,17 +38,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `SELECT array_agg(x) FROM (VALUES (NULL::int)) v(x)`, left with `Literal::TypedNull`:
         // the cast survives lowering, so the column is `integer` and the aggregate declares
         // `integer[]` — one of ADR 0047's four.
-        "SELECT array_agg(x) FROM (VALUES (1),(2)) v(x)",
-        "SELECT array_agg(x ORDER BY x DESC) FROM (VALUES (1),(2)) v(x)",
         "SELECT oid, typname, typlen, typinput, typelem, typdelim, typcategory FROM pg_type WHERE \
          typname IN ('_int4','_text') ORDER BY oid",
     ],
     answers: &[
-        (
-            "SELECT pg_typeof('{1,2}'::int[]), pg_typeof(ARRAY[1,2]), format_type(1007, -1), format_type(1009, -1)",
-            "`pg_typeof` is not built. What it would report is asserted directly instead: the four array types' OIDs and names are pinned in `crate::value`'s own tests and in `tests/pg_catalog.rs`, where `ActiveRecord`'s array type-map query now answers with all four.",
-            "pg19_array.txt:73",
-        ),
         (
             "SELECT id FROM ar WHERE n @> '{1}' ORDER BY id",
             "The array **operators** — `@>`, `<@`, `&&`, `||` — which are the slice after the constructor. Nothing here is approximated in the meantime: each is `0A000` naming itself.",

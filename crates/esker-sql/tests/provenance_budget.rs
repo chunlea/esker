@@ -17,13 +17,18 @@
 ///
 /// 207 → 186 when the catalog's identifier columns became `name`: twenty-one entries stopped being
 /// divergences at all, because what they recorded was a *declared type* — `text` here where a real
-/// server says `name` — and the rows underneath had always agreed.
+/// server says `name` — and the rows underneath had always agreed. Then 186 → 167 with the
+/// divergence-table scan behind parity rule 4: every one of those nineteen was an entry whose
+/// *reason* described an answer that had started agreeing, standing on a declared type in front of
+/// it — UNMEASURED reasons about closed features, which is the worst kind of number to keep.
 ///
-/// 186 → 167 with the divergence-table scan behind parity rule 4. Every one of those nineteen was
-/// an entry whose *reason* described an answer that had started agreeing, standing on a declared
-/// type in front of it — so they were UNMEASURED reasons about closed features, which is the worst
-/// kind of number to keep.
-const BUDGET: usize = 167;
+/// Then 167 → the number below, twice over in one branch. The literal ladder's `int4` rung
+/// (ADR 0087) deleted 115 entries across 22 files, all of them saying that an unadorned `1` was a
+/// `bigint` here against a real server's `integer`; and `name[]` with the folded cast that keeps
+/// its type (ADR 0086) deleted 61 more across sixteen — and then g1's rule-4 table and these two
+/// units met in a merge, which moved another sixteen `UNMEASURED` reasons out of `answers`
+/// entirely. Set from what the scan reports, never chosen.
+const BUDGET: usize = 147;
 
 #[test]
 fn unmeasured_divergences_do_not_grow() {

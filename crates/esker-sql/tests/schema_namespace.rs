@@ -22,8 +22,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // The standing catalog trade: `nspname` and `relname` are a `name` on a real server and
     // `text` here, `current_schemas(false)` a `name[]`. Every row agrees, `test_schema` included.
     types: &[
-        "SELECT 'r', current_schema",
-        "SELECT 'r', current_schemas(false)",
         "SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname LIKE 'test_schema%' ORDER BY n.nspname, c.relname",
     ],
     answers: &[

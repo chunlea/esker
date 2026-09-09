@@ -143,9 +143,6 @@ fn every_base_type_has_an_array_or_is_listed() {
     //                                        `box[]` left this list when `type_lookup_test.rb`
     //                                        turned out to look `_box` up by oid (ADR 0084's
     //                                        sibling unit)
-    //   name                                 a real server pairs it with `_name` (1003); this
-    //                                        node has no `NameArray` for that row to describe
-    //                                        (ADR 0084)
     //   regclass, int2vector, oidvector      catalog types a client reads and never stores an
     //                                        array of
     //   lquery                               `ltree`'s *pattern* type: it appears in a `WHERE`
@@ -153,14 +150,15 @@ fn every_base_type_has_an_array_or_is_listed() {
     //                                        one has no writer. `ltree` itself has `_ltree`.
     //
     // This list is the test. Writing it out found `lquery`, which had inherited a `0` rather than
-    // being decided — nine names were expected and the node answered ten.
+    // being decided — nine names were expected and the node answered ten. **`name` left the list**
+    // when `_name` (1003) was built: run 106 lost ten tests because `array_agg` over a `name`
+    // column had no array type to answer with (`tests/name_array.rs`).
     let expected = [
         "circle",
         "int2vector",
         "line",
         "lquery",
         "lseg",
-        "name",
         "oidvector",
         "path",
         "polygon",

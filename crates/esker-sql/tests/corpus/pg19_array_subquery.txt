@@ -60,19 +60,45 @@
 #     `obj_description` on an index with no comment is NULL in the same result set as one that has
 #     a comment.
 BEGIN		-
+SAVEPOINT g3		-
 SELECT 'r', ARRAY(SELECT 1), pg_typeof(ARRAY(SELECT 1))	text,integer[],regtype	r|{1}|integer[]
+ROLLBACK TO g3		-
+SAVEPOINT g4		-
 SELECT 'r', ARRAY(SELECT generate_series(1,3)), pg_typeof(ARRAY(SELECT generate_series(1,3)))	text,integer[],regtype	r|{1,2,3}|integer[]
+ROLLBACK TO g4		-
+SAVEPOINT g5		-
 SELECT 'r', ARRAY(SELECT 'a'::text), pg_typeof(ARRAY(SELECT 'a'::text))	text,text[],regtype	r|{a}|text[]
+ROLLBACK TO g5		-
+SAVEPOINT g6		-
 SELECT 'r', ARRAY(SELECT 1 WHERE false), pg_typeof(ARRAY(SELECT 1 WHERE false))	text,integer[],regtype	r|{}|integer[]
+ROLLBACK TO g6		-
+SAVEPOINT g7		-
 SELECT 'r', ARRAY(SELECT 1 WHERE false) IS NULL, array_length(ARRAY(SELECT 1 WHERE false), 1)	text,boolean,integer	r|f|\N
+ROLLBACK TO g7		-
+SAVEPOINT g8		-
 SELECT 'r', array_agg(x) IS NULL, ARRAY(SELECT x FROM generate_series(1,0) AS x) IS NULL FROM generate_series(1,0) AS x	text,boolean,boolean	r|t|f
+ROLLBACK TO g8		-
+SAVEPOINT g9		-
 SELECT 'r', ARRAY(SELECT NULL::int4), ARRAY(SELECT x FROM (VALUES (1),(NULL),(3)) AS t(x))	text,integer[],integer[]	r|{NULL}|{1,NULL,3}
+ROLLBACK TO g9		-
+SAVEPOINT g10		-
 SELECT 'r', ARRAY(SELECT x FROM generate_series(1,3) AS x ORDER BY x DESC)	text,integer[]	r|{3,2,1}
+ROLLBACK TO g10		-
+SAVEPOINT g11		-
 SELECT 'r', ARRAY(SELECT x FROM generate_series(1,5) AS x ORDER BY x LIMIT 2)	text,integer[]	r|{1,2}
+ROLLBACK TO g11		-
+SAVEPOINT g12		-
 SELECT 'r', ARRAY(SELECT x FROM generate_series(1,3) AS x), array_agg(x ORDER BY x) FROM generate_series(1,3) AS x	text,integer[],integer[]	r|{1,2,3}|{1,2,3}
+ROLLBACK TO g12		-
+SAVEPOINT g13		-
 SELECT 'r', ARRAY(SELECT 1)::int8[], pg_typeof(ARRAY(SELECT 1)::int8[])	text,bigint[],regtype	r|{1}|bigint[]
+ROLLBACK TO g13		-
+SAVEPOINT g14		-
 SELECT 'r', ARRAY(VALUES (1),(2))	text,integer[]	r|{1,2}
+ROLLBACK TO g14		-
+SAVEPOINT g15		-
 SELECT 'r', ARRAY(SELECT ARRAY(SELECT 1))	text,integer[]	r|{{1}}
+ROLLBACK TO g15		-
 SAVEPOINT s1		-
 SELECT ARRAY(SELECT 1, 2)	!42601 subquery must return only one column
 ROLLBACK TO s1		-

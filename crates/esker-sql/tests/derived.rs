@@ -58,9 +58,6 @@ const FIXTURE: &[&str] = &[
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         // A bare integer constant is `integer` on a real server and `int8` here. The rows agree.
-        "SELECT * FROM (SELECT 1) AS t",
-        "SELECT * FROM (SELECT 1 AS a) AS t",
-        "SELECT * FROM (SELECT 1 AS a, 2 AS a) AS t",
         // `sum(bigint)` is `numeric` there and `int8` here — ADR 0031, because the text agrees for
         // every input that does not overflow.
     ],

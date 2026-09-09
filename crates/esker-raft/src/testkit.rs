@@ -41,6 +41,88 @@ impl Harness {
     }
 
     /// A group whose nodes are configured by `tweak` before they are built.
+    /// A group of `voters` with `learners` beside them, every node built from the same
+    /// configuration.
+    ///
+    /// **The learners are in everyone's `ConfState`**, which is the shape a real cluster has and
+    /// the one an all-voter harness cannot make: a learner that campaigns, or that is granted a
+    /// vote, is a question about what the *voters* do, and it cannot be asked of a group where
+    /// nobody is a learner.
+    pub(crate) fn with_learners(voters: &[NodeId], learners: &[NodeId], seed: u64) -> Self {
+        let mut conf = ConfState::from_voters(voters.to_vec());
+        conf.learners = learners.to_vec();
+        let nodes = voters
+            .iter()
+            .chain(learners)
+            .map(|id| {
+                let mut config = Config::new(*id, voters.to_vec(), seed);
+                config.learners = learners.to_vec();
+                let storage = MemStorage::with_conf_state(conf.clone());
+                (
+                    *id,
+                    RawNode::new(config, storage).expect("valid test configuration"),
+                )
+            })
+            .collect();
+        Self {
+            nodes,
+            queue: Vec::new(),
+            severed: Vec::new(),
+            reads: Vec::new(),
+            elected: Vec::new(),
+        }
+    }
+
+    /// A group where one node's **own** configuration disagrees with everyone else's about it.
+    ///
+    /// `confused` believes it is a voter; every other node holds it as a learner. That is not a
+    /// contrived shape — it is the state a stalling cluster was found in, where the placement
+    /// driver and one store held a peer as a `Learner` while the peer's own core had itself among
+    /// the voters, so `Raft::campaign`'s guard let it campaign
+    /// ([ADR 0085](../../../docs/adr/0085-a-vote-is-not-granted-to-a-learner.md)).
+    ///
+    /// A group where the learner's configuration is *correct* cannot ask the question at all: the
+    /// guard stops it campaigning, so it never asks for a vote and no property about granting one
+    /// can fail. That is what made the first version of this file's learner property vacuous.
+    pub(crate) fn with_confused_learner(voters: &[NodeId], confused: NodeId, seed: u64) -> Self {
+        let mut theirs = ConfState::from_voters(voters.to_vec());
+        theirs.learners = vec![confused];
+        // What the confused node itself believes: everybody is a voter, including itself.
+        let mut all = voters.to_vec();
+        all.push(confused);
+        let mine = ConfState::from_voters(all.clone());
+
+        let nodes = all
+            .iter()
+            .map(|id| {
+                let believes_itself_a_voter = *id == confused;
+                let mut config = Config::new(*id, voters.to_vec(), seed);
+                if believes_itself_a_voter {
+                    config.voters = all.clone();
+                } else {
+                    config.learners = vec![confused];
+                }
+                let conf = if believes_itself_a_voter {
+                    mine.clone()
+                } else {
+                    theirs.clone()
+                };
+                let storage = MemStorage::with_conf_state(conf);
+                (
+                    *id,
+                    RawNode::new(config, storage).expect("valid test configuration"),
+                )
+            })
+            .collect();
+        Self {
+            nodes,
+            queue: Vec::new(),
+            severed: Vec::new(),
+            reads: Vec::new(),
+            elected: Vec::new(),
+        }
+    }
+
     pub(crate) fn with_config(ids: &[NodeId], seed: u64, tweak: impl Fn(&mut Config)) -> Self {
         let conf = ConfState::from_voters(ids.to_vec());
         let nodes = ids

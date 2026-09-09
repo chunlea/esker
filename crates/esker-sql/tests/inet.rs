@@ -28,7 +28,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', pg_typeof('192.168.1.1'::inet), pg_typeof('192.168.1.0/24'::cidr), \
          pg_typeof('ff:ff:ff:ff:ff:ff'::macaddr)",
         "SELECT 'r', '{192.168.1.1,10.0.0.1}'::inet[], pg_typeof('{192.168.1.1}'::inet[])",
-        "SELECT 'r', 'ff:ff:ff:ff:ff:ff'::macaddr::text, '01:23:45:67:89:0a'::macaddr::varchar",
     ],
     answers: &[
         // **The network functions and operators are a unit of their own, and none of them is in

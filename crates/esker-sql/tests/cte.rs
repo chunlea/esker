@@ -37,17 +37,9 @@ const FIXTURE: &[&str] = &[
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
-        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
-        // differs is one of the standing declared-type families listed on
-        // `parity::Divergences::types`. The reason each one used to carry described an answer
-        // that had stopped differing.
-        "WITH RECURSIVE t AS (SELECT 1 AS n) SELECT * FROM t",
-        "WITH RECURSIVE t (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT * FROM t",
-        // A bare integer constant is `integer` on a real server and `int8` here. The rows agree.
-        "WITH ct_a AS (SELECT 99 AS id) SELECT * FROM ct_a",
-        "WITH ct_a AS (SELECT 99 AS id) SELECT id FROM ct_a",
-        "WITH t AS (SELECT 1 AS a, 2 AS a) SELECT * FROM t",
-        "WITH t AS (SELECT id FROM ct_a) SELECT 1",
+        // **Empty, and it was not always.** A bare integer constant was `int8` here against a real
+        // server's `integer`; the literal ladder gained its `int4` rung and every row in this file
+        // agrees on its declared types as well as its values.
     ],
     answers: &[
         (

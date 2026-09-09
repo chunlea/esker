@@ -28,7 +28,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', relpersistence FROM pg_class WHERE relname = 'tt_things' AND relpersistence = 'p'",
         "SELECT 'r', relpersistence FROM pg_class WHERE relname = 'tt_temp'",
         "SELECT 'r', relkind FROM pg_class WHERE relname = 'tt_temp'",
-        "SELECT 'r', current_schema() AS current_schema_is_still_public",
         "SELECT 'r', (n.nspname LIKE 'pg_temp%') AS in_a_temp_schema, c.relname, c.relpersistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'tt_things' ORDER BY in_a_temp_schema",
         "SELECT 'r', (n.nspname LIKE 'pg_temp%') AS sequence_is_temp_too, c.relkind, c.relpersistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'tt_temp_id_seq'",
         "SELECT 'r', (n.nspname LIKE 'pg_temp%') AS index_is_temp_too, c.relpersistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'tt_temp_note_idx'",

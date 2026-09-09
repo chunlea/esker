@@ -273,7 +273,11 @@ pub(crate) fn render_row(row: &[Option<Vec<u8>>]) -> Vec<String> {
 /// The letter a `query` line uses for a type OID.
 pub(crate) fn type_letter(oid: u32) -> char {
     match oid {
-        20 => 'I',
+        // **All three integer widths are `I`**: the letter is the shape of the printed value, and
+        // `smallint`, `integer` and `bigint` print the same characters. `23` arrived with the
+        // literal ladder's `int4` rung — `SELECT 1` is an `integer` now — and the file's `I` was
+        // always describing that column correctly.
+        20 | 21 | 23 => 'I',
         // **`name` is a `T` like `text`**, which is what a `.slt` file's letter is about: the
         // shape of the value, not the type's identity. `pg_indexes.indexname` and every other
         // identifier column of the catalog is a `name` since the catalog's own columns took the

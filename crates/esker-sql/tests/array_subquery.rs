@@ -23,11 +23,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
         "SELECT 'r', ARRAY(SELECT 1)::int8[], pg_typeof(ARRAY(SELECT 1)::int8[])",
-        "SELECT 'r', ARRAY(SELECT NULL::int4), ARRAY(SELECT x FROM (VALUES (1),(NULL),(3)) AS t(x))",
+        // These two moved up from `answers` with the literal ladder's `int4` rung (ADR 0087):
+        // `ARRAY(SELECT 1)` is an `integer[]` on both now, and `pg_typeof`'s own answer is all
+        // that is left of a reason that used to be about the constant's width.
+        "SELECT 'r', ARRAY(SELECT 1), pg_typeof(ARRAY(SELECT 1))",
+        "SELECT 'r', ARRAY(SELECT 1 WHERE false), pg_typeof(ARRAY(SELECT 1 WHERE false))",
         // Surfaced with the two below it when the runtime cast stopped aborting this file. The
         // rows agree; what differs is the standing integer-width trade — a small constant is
         // `integer` on a real server and `bigint` here — seen through `ARRAY(VALUES …)`.
-        "SELECT 'r', ARRAY(VALUES (1),(2))",
         "SELECT 'r', ARRAY(SELECT 'a'::text), pg_typeof(ARRAY(SELECT 'a'::text))",
         // The three below are reached for the first time now that a bare `VALUES` list runs; they
         // were swallowed by the aborted block before. Their rows are right and two facts show in
@@ -61,19 +64,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // for a **per-row** cast — a cast of anything but a constant has only `text` as a target —
         // and not something about arrays: `ARRAY(SELECT 1)` itself answers on the line above.
         (
-            "SELECT 'r', ARRAY(SELECT 1), pg_typeof(ARRAY(SELECT 1))",
-            "**The rows agree and the constant's width does not.** `ARRAY(SELECT 1)` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here (`tests/unknown_literal.rs`); `generate_series`' column follows its arguments, so it inherits the same difference. `pg_typeof` reports `regtype` there and `text` here, which is the trade `'x'::regtype` already makes. Every value is identical.",
-            "pg19_array_subquery.txt:63",
-        ),
-        (
             "SELECT 'r', ARRAY(SELECT generate_series(1,3)), pg_typeof(ARRAY(SELECT generate_series(1,3)))",
             "**The rows agree and the constant's width does not.** `ARRAY(SELECT 1)` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here (`tests/unknown_literal.rs`); `generate_series`' column follows its arguments, so it inherits the same difference. `pg_typeof` reports `regtype` there and `text` here, which is the trade `'x'::regtype` already makes. Every value is identical.",
             "pg19_array_subquery.txt:64",
-        ),
-        (
-            "SELECT 'r', ARRAY(SELECT 1 WHERE false), pg_typeof(ARRAY(SELECT 1 WHERE false))",
-            "**The rows agree and the constant's width does not.** `ARRAY(SELECT 1)` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here (`tests/unknown_literal.rs`); `generate_series`' column follows its arguments, so it inherits the same difference. `pg_typeof` reports `regtype` there and `text` here, which is the trade `'x'::regtype` already makes. Every value is identical.",
-            "pg19_array_subquery.txt:66",
         ),
     ],
 };

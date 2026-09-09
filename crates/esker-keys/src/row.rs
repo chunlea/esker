@@ -517,7 +517,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
-        | ColumnType::VarcharArray
+        | ColumnType::VarcharArray | ColumnType::NameArray
         | ColumnType::DateArray
         | ColumnType::TimeArray
         | ColumnType::TimestampArray
@@ -1264,7 +1264,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
-        | ColumnType::VarcharArray
+        | ColumnType::VarcharArray | ColumnType::NameArray
         | ColumnType::DateArray
         | ColumnType::TimeArray
         | ColumnType::TimestampArray
@@ -2154,6 +2154,7 @@ mod tests {
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
             | ColumnType::VarcharArray
+            | ColumnType::NameArray
             | ColumnType::DateArray
             | ColumnType::TimeArray
             | ColumnType::TimestampArray

@@ -239,7 +239,12 @@ impl Aggregation {
                 // borrows `text`'s — and that asymmetry is captured rather than smoothed over
                 // (`tests/corpus/pg19_typmod.txt`). The value does not change either way; the
                 // declared type does.
-                ColumnType::Varchar => Ok(ColumnType::Text),
+                // **And a `name`, which borrows `text`'s the way `varchar` does** — measured,
+                // `min('x'::name)` is a `text` on a real server. It is the one rule in the `name`
+                // unit that runs *away* from the type: every other derivation keeps `name` and
+                // this one drops it, because a real server has no `min(name)` and coerces the
+                // argument (`tests/captures/pg19_name_array.txt`).
+                ColumnType::Varchar | ColumnType::Name => Ok(ColumnType::Text),
                 _ => Ok(arg),
             },
             // **Every integer width averages to `numeric`**, and so does a `numeric`. The
@@ -1109,6 +1114,25 @@ fn fold_interval(
     Ok(())
 }
 
+/// The `numeric` an exact-typed value adds into an average.
+///
+/// Every width, because `avg` is chosen from the *declared* type and the datum beside it may be any
+/// integer this crate holds — an `int4`-declared literal arrives as an `Int8` (ADR 0087), and an
+/// `int2` column as an `Int2`.
+fn exact_addend(value: &Datum) -> Result<esker_keys::numeric::Numeric> {
+    Ok(match value {
+        Datum::Int2(value) => crate::value::numeric::of_i64(i64::from(*value)),
+        Datum::Int4(value) => crate::value::numeric::of_i64(i64::from(*value)),
+        Datum::Int8(value) => crate::value::numeric::of_i64(*value),
+        Datum::Numeric(value) => value.clone(),
+        other => {
+            return Err(SqlError::Internal(format!(
+                "avg accumulated a {other:?}, which its type check refuses"
+            )));
+        }
+    })
+}
+
 impl Accumulator {
     /// A fresh accumulator for one group.
     pub(super) fn new(spec: &AggregateSpec) -> Self {
@@ -1187,6 +1211,19 @@ impl Accumulator {
             (State::SumWide(total), Datum::Int4(value)) => {
                 *total = Some(total.unwrap_or(0) + i64::from(*value));
             }
+            // **An `int4` by declaration whose datum is still an `i64`.** The literal ladder
+            // narrowed *types* and not values — ADR 0030's six stored types are unchanged — so
+            // `sum(1)` now resolves as `sum(int4)`, which is the `bigint` a real server answers,
+            // while the datum arriving here is an `Int8`. Checked rather than bare, because the
+            // bound above is an argument about `i32`s and does not cover this one.
+            (State::SumWide(total), Datum::Int8(value)) => {
+                *total = Some(
+                    total
+                        .unwrap_or(0)
+                        .checked_add(*value)
+                        .ok_or(SqlError::BigintOutOfRange)?,
+                );
+            }
             // **`sum(int8)` is a `numeric` and cannot overflow**, which is the whole reason
             // PostgreSQL widens it — `9223372036854775807 + 1` is a value there, not `22003`.
             (State::SumNumeric(total), Datum::Int8(value)) => {
@@ -1215,18 +1252,7 @@ impl Accumulator {
                 fold_interval(total, seen, 0, 0, *micros)?;
             }
             (State::AvgNumeric { sum, seen }, value) => {
-                let addend = match value {
-                    Datum::Int2(value) => crate::value::numeric::of_i64(i64::from(*value)),
-                    Datum::Int4(value) => crate::value::numeric::of_i64(i64::from(*value)),
-                    Datum::Int8(value) => crate::value::numeric::of_i64(*value),
-                    Datum::Numeric(value) => value.clone(),
-                    other => {
-                        return Err(SqlError::Internal(format!(
-                            "avg accumulated a {other:?}, which its type check refuses"
-                        )));
-                    }
-                };
-                *sum = Some(add_numeric(sum.as_ref(), &addend));
+                *sum = Some(add_numeric(sum.as_ref(), &exact_addend(value)?));
                 *seen += 1;
             }
             (State::SumFloat(total), Datum::Double(value)) => {

@@ -1,0 +1,122 @@
+# **`name[]`, and what `name` is not** — PostgreSQL 19beta1, 2026-09-09. One `BEGIN … ROLLBACK`,
+# `ON_ERROR_ROLLBACK on` so a refusal cannot swallow the statements after it.
+#
+# Run 106 lost ten tests to one type alias. `ActiveRecord`'s enum-labels query
+# (`postgresql_adapter.rb:539`) ends `array_agg(enum.enumlabel ORDER BY enum.enumsortorder)`, and
+# `pg_enum.enumlabel` is a `name` column, so a real server declares that column `name[]` — OID
+# 1003. This node aliased `name` to `text` in every derivation, and `array_agg` over it came back
+# as a **scalar `text`**, OID 25. Identical bytes; `ActiveRecord` decodes by the declared OID, so a
+# `text` stays a Ruby string and `create_enum "mood", "{sad,okay,happy}"` is dumped where
+# `["sad", "okay", "happy"]` is expected.
+#
+# ## The two catalog rows
+#
+#     oid   typname  typlen  typtype  typcategory  typdelim  typelem  typarray  typinput
+#     19    name     64      b        S            ,         18       1003      namein
+#     1003  _name    -1      b        A            ,         19       0         array_in
+#
+# **`name`'s `typelem` is 18** — `"char"` — which is a real server saying that a `name` is an array
+# of characters at the storage level. It is not an array type: `typinput` is `namein`, not
+# `array_in`, which is the test `tests/array_delimiter.rs` already uses to tell the two apart.
+# `_name`'s delimiter is a comma like every array but `_box`'s.
+#
+# ## What derives to `name`, and what does not
+#
+#     pg_typeof('x'::name)                                    name
+#     pg_typeof(array_agg(c::name))                            name[]
+#     pg_typeof(ARRAY[c::name])                                name[]
+#     pg_typeof(ARRAY['a'::name,'b'::name])                    name[]
+#     pg_typeof('{a,b}'::name[])                               name[]
+#     pg_typeof(unnest('{a,b}'::name[]))                       name
+#     pg_typeof('{a,b}'::name[] || 'c'::name)                  name[]
+#     pg_typeof(array_agg(relname))    (pg_class)              name[]
+#     pg_typeof(array_agg(attname))    (pg_attribute)          name[]
+#     pg_typeof(array_agg(enumlabel))  (pg_enum)               name[]
+#     pg_typeof(array_agg(nspname))    (pg_namespace)          name[]
+#     pg_typeof(current_schemas(false))                        name[]
+#
+#     pg_typeof(min(c::name))                                  text     <- NOT name
+#     pg_typeof(max(c::name))                                  text     <- NOT name
+#     array_to_string('{a,b}'::name[], '-')                    text
+#     array_dims/array_length/cardinality over a name[]        text, integer, integer
+#     array_position('{a,b}'::name[], 'b'::name)               integer
+#
+# **`min`/`max` of a `name` is a `text`.** A real server has no `min(name)`; the argument is
+# coerced and the aggregate answers `text`. This node had it the other way round — it answered
+# `name` — which is a divergence in the opposite direction from all the others here.
+#
+#     pg_typeof(array_agg(table_name)) (information_schema)    information_schema.sql_identifier[]
+#
+# The one that is a domain rather than `name[]`: `information_schema.tables.table_name` is the
+# `sql_identifier` domain over `name`, and an array of a domain is an array of that domain. This
+# node has no domain there and answers `name[]`; declared.
+#
+# ## COALESCE and CASE do not agree, and that is measured rather than reasoned
+#
+#     pg_typeof(coalesce('a'::name, 'b'::name))                name
+#     pg_typeof(coalesce('a'::name, 'b'::text))                name
+#     pg_typeof(CASE WHEN true THEN 'a'::name ELSE 'b'::name END)   name
+#     pg_typeof(CASE WHEN true THEN 'a'::name ELSE 'b'::text END)   text
+#
+# The `name`/`text` pair resolves to `name` under `COALESCE` and to `text` under `CASE`. Both go
+# through the same common-type resolution in PostgreSQL and they still answer differently; written
+# down here because a reader will otherwise assume one of the two lines is a typo.
+#
+# ## Values, and the comparisons that do and do not exist
+#
+#     array_agg(c::name) over ('a'),('b')                      {a,b}
+#     array_agg(c::name ORDER BY c::name DESC)                 {b,a}
+#     ARRAY['a'::name,'b'::name]                               {a,b}
+#     unnest('{a,b}'::name[])                                  a ; b
+#     'x'::name = ANY('{x,y}'::name[])                         t
+#     'x'::text = ANY('{x,y}'::name[])                         t
+#     '{a,b}'::name[] = '{a,b}'::text[]                        42883 operator does not exist:
+#                                                              name[] = text[]
+#
+# A scalar `text` compares against a `name[]`'s elements and a whole `text[]` does not compare
+# against a whole `name[]`: the element comparison resolves through `name = text`, the array one
+# needs a `name[] = text[]` operator and there is none.
+#
+# The 40 statements below are the capture itself — `statement`, `\gdesc` types, rows — taken in
+# this session against `127.0.0.1:55432` with the `b4_nm` fixture `tests/name_type.rs` uses.
+# `tests/corpus/pg19_name_array.txt` is the same rows, replayed by the harness.
+
+SELECT oid, typname, typlen, typtype, typcategory, typdelim, typelem, typarray, typinput FROM pg_type WHERE oid IN (19, 1003) ORDER BY oid	oid,name,smallint,"char","char","char",oid,oid,regproc	19|name|64|b|S|,|18|1003|namein ; 1003|_name|-1|b|A|,|19|0|array_in
+SELECT pg_typeof('x'::name)	regtype	name
+SELECT pg_typeof(array_agg(c::name)) FROM (VALUES ('x')) s(c)	regtype	name[]
+SELECT pg_typeof(ARRAY[c::name]) FROM (VALUES ('x')) s(c)	regtype	name[]
+SELECT pg_typeof(ARRAY['a'::name,'b'::name])	regtype	name[]
+SELECT pg_typeof(min(c::name)) FROM (VALUES ('x')) s(c)	regtype	text
+SELECT pg_typeof(max(c::name)) FROM (VALUES ('x')) s(c)	regtype	text
+SELECT min(c::name), max(c::name) FROM (VALUES ('b'),('a')) s(c)	text,text	a|b
+SELECT array_agg(c::name) FROM (VALUES ('a'),('b')) s(c)	name[]	{a,b}
+SELECT array_agg(c::name ORDER BY c::name DESC) FROM (VALUES ('a'),('b')) s(c)	name[]	{b,a}
+SELECT ARRAY['a'::name,'b'::name]	name[]	{a,b}
+SELECT pg_typeof(array_agg(relname)) FROM (SELECT relname FROM pg_class LIMIT 2) s	regtype	name[]
+SELECT pg_typeof(array_agg(attname)) FROM (SELECT attname FROM pg_attribute LIMIT 2) s	regtype	name[]
+SELECT pg_typeof(array_agg(enumlabel)) FROM pg_enum	regtype	name[]
+SELECT pg_typeof(array_agg(table_name)) FROM (SELECT table_name FROM information_schema.tables LIMIT 2) s	regtype	information_schema.sql_identifier[]
+SELECT pg_typeof(current_schemas(false))	regtype	name[]
+SELECT pg_typeof(array_agg(data)) FROM b4_nm	regtype	name[]
+SELECT array_agg(data ORDER BY id) FROM b4_nm	name[]	{plain,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,"",MiXeD,apple,Apple}
+SELECT '{a,b}'::name[]	name[]	{a,b}
+SELECT pg_typeof('{a,b}'::name[])	regtype	name[]
+SELECT array_dims('{a,b}'::name[]), array_length('{a,b}'::name[], 1), cardinality('{a,b}'::name[])	text,integer,integer	[1:2]|2|2
+SELECT pg_typeof(unnest('{a,b}'::name[]))	regtype	name ; name
+SELECT unnest('{a,b}'::name[])	name	a ; b
+SELECT array_to_string('{a,b}'::name[], '-')	text	a-b
+SELECT 'x'::name = ANY('{x,y}'::name[])	boolean	t
+SELECT 'x'::name = ANY(ARRAY['x'::name])	boolean	t
+SELECT 'x'::text = ANY('{x,y}'::name[])	boolean	t
+SELECT '{a,b}'::name[] = '{a,b}'::text[]	!42883 operator does not exist: name[] = text[] DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT pg_typeof('{a,b}'::name[] || 'c'::name)	regtype	name[]
+SELECT pg_typeof(coalesce('a'::name, 'b'::name))	regtype	name
+SELECT pg_typeof(coalesce('a'::name, 'b'::text))	regtype	name
+SELECT pg_typeof(CASE WHEN true THEN 'a'::name ELSE 'b'::name END)	regtype	name
+SELECT pg_typeof(CASE WHEN true THEN 'a'::name ELSE 'b'::text END)	regtype	text
+SELECT array_position('{a,b}'::name[], 'b'::name)	integer	2
+SELECT typname AS name, oid, array_agg(oid) FROM pg_type WHERE typname = 'name' GROUP BY typname, oid	name,oid,oid[]	name|19|{19}
+SELECT n.nspname FROM pg_namespace n WHERE n.nspname = ANY (current_schemas(false)) ORDER BY 1	name	public
+SELECT pg_typeof(array_agg(nspname)) FROM pg_namespace	regtype	name[]
+SELECT array_agg(x) FROM unnest('{a,b}'::name[]) AS x	name[]	{a,b}
+SELECT pg_typeof(x) FROM unnest('{a,b}'::name[]) AS x LIMIT 1	regtype	name

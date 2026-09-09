@@ -11,17 +11,12 @@ mod bind;
 
 /// What this node answers differently, and why.
 const DIVERGENCES: bind::Divergences = bind::Divergences {
-    // **The standing constant-width trade, and it is the projected `1` rather than the
-    // parameter.** A bare integer constant is `int4` on a real server and `int8` here
-    // (`tests/unknown_literal.rs`), so `SELECT 1` is described as `integer` there and `bigint`
-    // here — in these five it is the *first* column that differs and the parameter beside it that
-    // is the point. Every row agrees, and the parameter resolves to a number on both.
-    types: &[
-        "SELECT 'r', 1 WHERE (1 = $1)",
-        "SELECT 'r', 1 WHERE ($1 = 1)",
-        "SELECT 'r', 1 WHERE ('a' = $1)",
-        "SELECT 'r', 1 WHERE (true = $1)",
-    ],
+    // **Empty, and it was five entries long.** Each said the same thing and none was about the
+    // parameter: a bare integer constant was an `int8` here against a real server's `int4`, so the
+    // projected `1` beside every bind was described as `bigint`. The literal ladder gained its
+    // `int4` rung and the first column agrees too, which leaves nothing here — the parameters
+    // always resolved the same way on both.
+    types: &[],
     answers: &[],
 };
 

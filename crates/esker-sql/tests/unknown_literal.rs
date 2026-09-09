@@ -51,78 +51,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
         // --- `int4`: the type a bare integer constant is ------------------------------------
-        (
-            "SELECT 1 = '2147483648'",
-            "**the `int4` divergence, in the direction that answers rather than raises.** \
-             `pg_typeof(1)` is `integer` on a real server, so the `unknown` is read by `int4in` \
-             and 2147483648 is `22003 value \"2147483648\" is out of range for type integer`. \
-             This node's bare constant is `int8`, so the string reads and the comparison answers \
-             `f`. Nothing here is wrong about `unknown` — it is the width of the constant it \
-             resolves against, and it closes when `int4` exists.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 1 = '9223372036854775808'",
-            "the same, one width further out: both raise `22003`, and PostgreSQL names `integer` \
-             where this node names `bigint`.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 1 = 'x'",
-            "the same `22P02` for the same input, naming `bigint` where a real server names \
-             `integer` — the constant on the left is `int4` there and `int8` here. Five \
-             statements below differ in exactly this word and nothing else.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 1 = ''",
-            "the `int4` naming, as above. The empty string is not a zero on either server.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'x' = 1",
-            "the `int4` naming, with the sides swapped.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 1 = '1.5'",
-            "the `int4` naming. `int4in` and `int8in` both refuse a fractional part; only the \
-             word differs.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 1 = ' '",
-            "the `int4` naming. Whitespace is trimmed by both input functions and what is left \
-             is empty.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 1 = '1e0'",
-            "the `int4` naming. Neither integer input function takes an exponent — that is \
-             `numeric`'s syntax, and `1.5 = '1.5e0'` above shows it accepted where the type has \
-             it.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 1 IN ('x')",
-            "the `int4` naming, reached through the list rather than through `=`. That it is the \
-             same message is the point: `IN` types its list by the same rule and inherits the \
-             same divergence, exactly as it inherited the bug.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'a' IN ('a', 1)",
-            "the `int4` naming, in the case where the **operand** is the `unknown` the list \
-             types. The rule under test is working — `'a'` is being read as an integer because \
-             the `1` is in the list — and only the width of that integer differs.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 1 IN (NULL, 'x')",
-            "the `int4` naming. What this line is really pinning is that the coercion runs at \
-             **plan time**: both servers raise rather than letting the NULL decide the answer.",
-            "UNMEASURED",
-        ),
         // --- `numeric`: the type a decimal constant is ----------------------------------------
         (
             "SELECT 0.1 = '0.1000000000000000000001'",
@@ -158,22 +86,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ),
         // --- a cast of a *number*, which now runs ----------------------------------------------
         //
-        // Twelve entries stood here and have gone. A cast of a **string** literal runs since the
+        // Thirteen entries stood here and have gone. A cast of a **string** literal runs since the
         // json unit, which needed `'{"a":1}'::jsonb`; a cast of a **numeric** literal runs since
         // the numeric unit, which needed `1.5::numeric` and taught `cast_literal_text` to read a
-        // number and a leading sign. Both times the harness failed until the entries were
-        // deleted, which is the point of listing a divergence rather than describing one.
-        //
-        // What is left is the pair below, and it is not about casting a number at all.
-        (
-            "SELECT 1 = '1'::text",
-            "**a cast of a number is `0A000` naming itself.** These lines are the corpus's \
-             evidence for case 3 — that an explicit type is *not* `unknown`, so `1 = '1'::text` \
-             is `42883` where `1 = '1'` is `t`. This node cannot express the distinction on the \
-             numeric side and so cannot get it wrong there: the quoted string is `unknown`.",
-            "UNMEASURED",
-        ),
-        ("SELECT '1'::text = 1", "a cast, as above.", "UNMEASURED"),
+        // number and a leading sign. The last of them, `SELECT '1'::text = 1`, went with the
+        // literal ladder's `int4` rung — the refusal it recorded named `bigint` where a real
+        // server named `integer`, and nothing else about it differed. Each time the harness failed
+        // until the entries were deleted, which is the point of listing a divergence rather than
+        // describing one.
         // --- the collation, already declared ---------------------------------------------------
         (
             "SELECT 'B' < 'a'",
@@ -231,7 +151,7 @@ fn an_untyped_literal_takes_the_other_operand_s_type() {
     );
     assert_eq!(
         error.to_string(),
-        "invalid input syntax for type bigint: \"x\""
+        "invalid input syntax for type integer: \"x\""
     );
 
     // Case 2, which is what says the rule is `unknown` resolution and not "compare as text":

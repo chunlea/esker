@@ -18,7 +18,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'se_multi' ORDER BY c.relname",
         "SELECT 'r', pg_typeof(current_schema()), pg_typeof(nspname) FROM pg_namespace LIMIT 1",
         "SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'test_schema' ORDER BY c.relname",
-        "SELECT 'r', current_schema()",
         "SELECT 'r', c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'se_idx' ORDER BY c.relname",
     ],
     answers: &[

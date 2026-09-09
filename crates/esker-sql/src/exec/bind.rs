@@ -1548,7 +1548,7 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
-        | ColumnType::VarcharArray
+        | ColumnType::VarcharArray | ColumnType::NameArray
         | ColumnType::DateArray
         | ColumnType::TimeArray
         | ColumnType::TimestampArray

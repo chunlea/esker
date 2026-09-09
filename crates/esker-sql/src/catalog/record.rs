@@ -338,6 +338,8 @@ const TAG_OIDVECTOR: u8 = 92;
 const TAG_NAME: u8 = 93;
 /// `box[]`, whose elements are separated by `;`. Append-only: 94 was the next free tag.
 const TAG_BOX_ARRAY: u8 = 94;
+/// `name[]`, additive like every tag before it.
+const TAG_NAME_ARRAY: u8 = 95;
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
 const TAG_BIT_ARRAY: u8 = 71;
@@ -467,6 +469,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Point => TAG_POINT,
         ColumnType::PointArray => TAG_POINT_ARRAY,
         ColumnType::BoxArray => TAG_BOX_ARRAY,
+        ColumnType::NameArray => TAG_NAME_ARRAY,
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
         ColumnType::Time => TAG_TIME,
@@ -609,6 +612,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_POINT => ColumnType::Point,
         TAG_POINT_ARRAY => ColumnType::PointArray,
         TAG_BOX_ARRAY => ColumnType::BoxArray,
+        TAG_NAME_ARRAY => ColumnType::NameArray,
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,
         TAG_TIME => ColumnType::Time,

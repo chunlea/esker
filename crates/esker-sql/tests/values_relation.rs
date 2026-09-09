@@ -14,52 +14,20 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **One fact, twenty-five times.** A bare integer constant is `int8` here and `int4` on a real
-    // server, so every column a `VALUES` list builds from one is `bigint` where PostgreSQL says
-    // `integer` — and an array of them is `bigint[]`. The rows agree everywhere; only the declared
-    // type differs. Listing them one by one rather than dropping the type column is what makes the
-    // day this is fixed a *failing* test rather than a silent improvement.
+    // **One entry, and it was twenty-six.** Twenty-five of them said that a bare integer constant
+    // was an `int8` here where a real server's is an `int4`, so every column a `VALUES` list built
+    // from one was `bigint`; listing them one by one rather than dropping the type column is what
+    // made the day the ladder gained its `int4` rung (ADR 0087) a *failing* test rather than a
+    // silent improvement, and all twenty-five went at once. What is left is `pg_typeof`'s own
+    // `regtype`/`text` trade (ADR 0077), whose two answers are now right.
     types: &[
-        // **Moved from `answers` by parity rule 4.** Its reason was that a comma-separated `FROM`
-        // list is refused for every relation; it runs now, and the projected `1` is an
-        // `integer` there and a `bigint` here — the standing constant-width trade.
-        "SELECT 'r', 1 FROM (VALUES (1),(2)) AS t(x), (VALUES (3)) AS u(y)",
-        "SELECT 'r', * FROM (VALUES (1),(2),(3)) AS t(x) ORDER BY x",
-        "SELECT 'r', a, b FROM (VALUES (1,'x'),(2,'y')) AS t(a,b) ORDER BY a",
-        "SELECT 'r', column1, column2 FROM (VALUES (1,'x'),(2,'y')) AS t ORDER BY column1",
-        "SELECT 'r', * FROM (VALUES (1),(NULL),(3)) AS t(x) ORDER BY x",
-        "SELECT 'r', array_agg(x ORDER BY x) FROM (VALUES (1),(2)) AS t(x)",
-        "SELECT 'r', ARRAY(SELECT x FROM (VALUES (1),(NULL),(3)) AS t(x))",
-        "SELECT 'r', ARRAY(VALUES (1),(2))",
-        "SELECT 'r', x FROM (VALUES (1),(2)) AS t(x) WHERE x > 1",
-        "SELECT 'r', * FROM (VALUES (1,2),(3,4)) AS t(a,b) ORDER BY a DESC",
-        "SELECT 'r', v.x FROM (VALUES (1)) AS v(x)",
-        "VALUES (1),(2),(3)",
-        "VALUES (1,'a'),(2,'b')",
-        "VALUES (1)",
-        "VALUES (1),(2) ORDER BY column1 DESC",
-        "VALUES (1),(2),(3) LIMIT 2",
-        "VALUES (1),(2),(3) OFFSET 1",
-        "VALUES (1),(NULL)",
-        "SELECT 'r', * FROM (VALUES (1,2)) AS t(a)",
-        "SELECT 'r', * FROM (VALUES (1)) t(x)",
-        "SELECT 'r', * FROM (VALUES (1))",
-        "SELECT 'r', 1 FROM (VALUES (1),(2)) AS t(x) CROSS JOIN (VALUES (3)) AS u(y)",
-        "SELECT 'r', t.x, u.y FROM (VALUES (1),(2)) AS t(x) JOIN (VALUES (2)) AS u(y) ON t.x = u.y",
-        "SELECT 'r', x FROM (VALUES (3),(1),(2)) AS t(x)",
-        "SELECT 'r', * FROM (VALUES (1),(2)) AS t(x) WHERE x = 2",
-        "VALUES (1),(2) ORDER BY 1 DESC",
+        "SELECT 'r', pg_typeof(x), pg_typeof(y) FROM (VALUES (1,'a'),(2,'b')) AS t(x,y) LIMIT 1",
     ],
     answers: &[
         // The standing constant-width divergence, showing through the one function that reports a
         // type as a value: a bare integer constant is `int8` here and `int4` on a real server, so
         // a `VALUES` column built from one is `bigint`. `pg_typeof` itself answers `text` rather
         // than `regtype` here, which is why the declared types differ too.
-        (
-            "SELECT 'r', pg_typeof(x), pg_typeof(y) FROM (VALUES (1,'a'),(2,'b')) AS t(x,y) LIMIT 1",
-            "a bare integer constant is int8 here and int4 there, and pg_typeof answers text",
-            "UNMEASURED",
-        ),
         // The same divergence for the other constant: a decimal constant is `double precision`
         // here and `numeric` there, which `Literal::Decimal` already chooses everywhere else.
         (
@@ -70,11 +38,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // The rule is right and the type in the message is the constant-width divergence: the
         // second row is read as the first row's type and fails to parse as it, which is the whole
         // point of the line.
-        (
-            "VALUES (1),('a')",
-            "the type named in the message is bigint here and integer there",
-            "UNMEASURED",
-        ),
         // **Not a `VALUES` gap.** A comma-separated `FROM` list is refused for every relation in
         // this crate; the `CROSS JOIN` spelling of this same statement is the line above it and it
         // answers.

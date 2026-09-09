@@ -25,56 +25,45 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 
 /// Statements whose **rows** are right and whose declared type is not.
 ///
-/// One reason for all of them: a `json` or `jsonb` value is a `Datum::Text`, so `RowDescription`
-/// carries `text`'s OID where a real server carries `json`'s or `jsonb`'s. That is the same fact
-/// the `COMPARISON` divergence turns on, seen from the wire instead of from the comparison — these
-/// types share `text`'s representation and `Datum` has no variant to tell them apart. A **column**
-/// of either type reports correctly, because a column's type comes from the catalog rather than
-/// from its values; it is only a bare literal or cast that loses it. Giving `jsonb` a `Datum` of
-/// its own closes both at once.
+/// Statements whose **rows** are right and whose declared type is not.
+///
+/// **One entry, and it was eighteen.** Seventeen of them said the same thing: a `json` or `jsonb`
+/// value is a `Datum::Text`, so a folded cast threw the declared type away and `RowDescription`
+/// carried `text`'s OID where a real server carries `json`'s or `jsonb`'s. A **column** of either
+/// type always reported correctly — a column's type comes from the catalog rather than from its
+/// values — and only a bare literal or cast lost it, which is why no test but this list saw it.
+/// The `name` unit closed it for every shared representation at once (ADR 0086): a folded cast
+/// keeps its `Expr::Cast` node when the value cannot speak for itself, and that node is what
+/// `expr_type` reads.
+///
+/// `Datum` still has no `jsonb` variant, and the `COMPARISON` divergence below is still that fact
+/// — this half of it never needed one.
 const TYPES: &[&str] = &[
-    // **Moved here from `answers` by parity rule 4**: the rows agree and what
-    // still differs is the declared type, which is one of the standing
-    // families — see `parity::Divergences::types`.
-    "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN ('json','jsonb') ORDER BY oid",
-    "SELECT '{\"b\":1, \"a\":2}'::json, '{\"b\":1, \"a\":2}'::jsonb",
-    "SELECT '{\"a\":1,\"a\":2}'::json, '{\"a\":1,\"a\":2}'::jsonb",
-    "SELECT '{  \"a\"  :  1  }'::json, '{  \"a\"  :  1  }'::jsonb",
-    "SELECT '{\"bb\":1,\"a\":2,\"ccc\":3}'::jsonb",
-    "SELECT '{\"ab\":1,\"ba\":2,\"aa\":3}'::jsonb",
-    "SELECT '{\"\":1,\"a\":2}'::jsonb",
-    "SELECT '{\"a\":{\"z\":1,\"b\":{\"y\":1,\"a\":2}}}'::jsonb",
-    "SELECT '1.0'::json, '1.0'::jsonb, '1.00'::jsonb, '1e2'::jsonb",
-    "SELECT '1E400'::jsonb",
-    "SELECT '1E400'::json",
-    "SELECT '[1,2,3]'::json, '[1,2,3]'::jsonb, 'null'::json, 'true'::jsonb, \
-         '\"s\"'::jsonb",
-    "SELECT '[]'::jsonb, '{}'::jsonb",
-    "SELECT '\"\\u0041\"'::jsonb",
-    "SELECT '\"\\u00e9\"'::jsonb",
-    "SELECT '\"\\u0000\"'::json",
-    "SELECT '{\"a\":1}'::json::jsonb, '{\"b\":1,\"a\":2}'::jsonb::json",
-    "SELECT '{\"a\":1}'::json::text, '{\"a\":1}'::text::json",
+    // **Moved here from `answers` by parity rule 4**: the rows agree and what still differs is the
+    // declared type, which is one of the standing families — see `parity::Divergences::types`.
+    // `typlen`, `typinput` and `typcategory` are a `smallint`, a `regproc` and a `"char"` on a real
+    // server and `text` here; the catalog's own columns are their own units.
+    "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN \
+     ('json','jsonb') ORDER BY oid",
+    // `pg_typeof`'s own `regtype`/`text` trade (ADR 0077). The two type names it answers are right
+    // since a folded cast started keeping the type it named (ADR 0086), and both `format_type`
+    // calls always were.
+    "SELECT pg_typeof('{}'::json), pg_typeof('{}'::jsonb), format_type(114, -1), \
+     format_type(3802, -1)",
 ];
 
-/// One of `DIVERGENCES`' eight reasons.
-const CATALOG: &str = "`typlen`, `typcategory` and `pg_typeof` are columns and a function this node's \
-     `pg_type` does not have — it carries exactly what `ActiveRecord` reads \
-     (`catalog/pg_catalog.rs`), and another name is `42703`, the same answer a real \
-     server gives for a column that is not there. `format_type` is a function this node \
-     does not have.";
-/// One of `DIVERGENCES`' eight reasons.
+/// One of `DIVERGENCES`' seven reasons.
 const ORDER: &str = "The same refusal for the same reason: a byte sort is not `jsonb`'s order, which puts \
      `null` below `1.00` where the bytes put it above.";
-/// One of `DIVERGENCES`' eight reasons.
+/// One of `DIVERGENCES`' seven reasons.
 const CONTAINMENT: &str = "Containment and the editing operators, likewise not built. `@>` is named in this \
      unit's scope and lands with the extraction operators; the rest are a later unit. \
      Each is `0A000` naming itself.";
-/// One of `DIVERGENCES`' eight reasons.
+/// One of `DIVERGENCES`' seven reasons.
 const MESSAGES: &str = "The refusal is the right one and its **text** differs: PostgreSQL adds a `DETAIL` \
      naming the position or the token, which this node does not carry for these two \
      SQLSTATEs. The SQLSTATE and the sentence agree; the detail line does not.";
-/// One of `DIVERGENCES`' eight reasons.
+/// One of `DIVERGENCES`' seven reasons.
 const COMPARISON: &str = "**Comparison over `json` or `jsonb` is refused rather than answered from the \
      bytes**, which is what ADR 0042 turns on: `'1.0'::jsonb = '1.00'::jsonb` is `t` on a \
      real server and byte equality says `f`, and `jsonb` sorts by *kind* before value. \
@@ -84,18 +73,18 @@ const COMPARISON: &str = "**Comparison over `json` or `jsonb` is refused rather 
      the `real` unit's lesson one layer up: a type may share another's representation \
      only if it shares its comparison. `json` has no comparison operators at all on a \
      real server, so refusing there is closer still than refusing `jsonb`.";
-/// One of `DIVERGENCES`' eight reasons.
+/// One of `DIVERGENCES`' seven reasons.
 const OPERATORS: &str = "**`#>` and `#>>` are what is left of this reason.** `->` and `->>` were \
      here too and are built now, and the nine lines that declared them agreed the moment they \
      were — which is what these rows are for: they were written as the specification of a unit \
      that had not happened, and the ratchet said when it had. The path operators take an array of \
      keys rather than one, so they are their own unit; `0A000` naming the operator is contract \
      C2's answer for a construct that parses and does not run.";
-/// One of `DIVERGENCES`' eight reasons.
+/// One of `DIVERGENCES`' seven reasons.
 const FUNCTIONS: &str = "A `json` function this node does not have, named under contract C2. None is in this \
      unit's scope; the corpus carries them so the unit that adds them starts from the \
      measurement.";
-/// One of `DIVERGENCES`' eight reasons.
+/// One of `DIVERGENCES`' seven reasons.
 const CASTS: &str = "**Both refuse a `jsonb` *object* cast to a scalar; the code and the \
      message differ.** PostgreSQL rejects it in the cast itself, `22023 cannot cast jsonb \
      object to type integer`, where this node renders the object to its text and hands that \
@@ -106,12 +95,6 @@ const CASTS: &str = "**Both refuse a `jsonb` *object* cast to a scalar; the code
      with this one.";
 /// Every statement this node answers differently, each pointing at one reason above.
 const ANSWERS: &[(&str, &str, &str)] = &[
-    (
-        "SELECT pg_typeof('{}'::json), pg_typeof('{}'::jsonb), format_type(114, -1), \
-             format_type(3802, -1)",
-        CATALOG,
-        "pg19_json.txt:60",
-    ),
     ("SELECT id, b FROM js ORDER BY b", ORDER, "pg19_json.txt:69"),
     (
         "SELECT id FROM js WHERE b @> '{\"a\":2}'",
