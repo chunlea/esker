@@ -1,0 +1,39 @@
+# **A `regclass[]` column resolves its names element by element** — PostgreSQL 19beta1, 2026-09-09.
+# `ON_ERROR_ROLLBACK on`, one `BEGIN … ROLLBACK`, three tables as the fixture.
+#
+# `debts-v1.1.md` #38, the array half of #35. Every answer here is the scalar's answer applied to
+# each element: the row holds the numbers, and the names are put back when the value is printed.
+#
+# **On the node the same rows are written with an explicit `'{…}'::regclass[]` cast** rather than
+# the bare literal used below. That is not this row's gap: assigning a bare *name* literal to a
+# `regclass` target needs the catalog at a point that has none, and it is the same for the scalar
+# — recorded as its own row rather than hidden in this one.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **A rename reaches inside the array.** `{ra,rb}` becomes `{rz,rb}` after
+#     `ALTER TABLE ra RENAME TO rz`, with no rewrite of the row — the same fact the scalar makes,
+#     one level in, and the reason an element cannot carry its name either.
+#   * **A dropped relation leaves its number inside the array**: `{303412}`, and `unnest` of a row
+#     holding one dropped and one live relation gives `303412` and `rb`. Not NULL and not an error.
+#   * **A NULL element is not the array being NULL**, and survives the rename beside a live one:
+#     `{ra,NULL}` becomes `{rz,NULL}`.
+#   * **A name that answers to nothing fails at the cast**, before a row is written — the
+#     *element's* `42P01`, in the element's own words.
+#
+# ## The measurements
+#
+CREATE TABLE ra (id int8)		-
+CREATE TABLE rb (id int8)		-
+CREATE TABLE rj (id int8, rs regclass[])		-
+INSERT INTO rj VALUES (1, '{ra,rb}'), (2, ARRAY['ra'::regclass]), (3, NULL), (4, '{ra,NULL}')		-
+SELECT id, rs FROM rj ORDER BY id	bigint,regclass[]	1|{ra,rb} ; 2|{ra} ; 3|\N ; 4|{ra,NULL}
+ALTER TABLE ra RENAME TO rz		-
+SELECT id, rs FROM rj ORDER BY id	bigint,regclass[]	1|{rz,rb} ; 2|{rz} ; 3|\N ; 4|{rz,NULL}
+SELECT rs[1], array_length(rs, 1), rs::text FROM rj WHERE id = 1	regclass,integer,text	rz|2|{rz,rb}
+SELECT attname, atttypid, atttypmod FROM pg_attribute WHERE attrelid = 'rj'::regclass AND attnum > 0 ORDER BY attnum	name,oid,integer	id|20|-1 ; rs|2210|-1
+SELECT pg_typeof(rs) FROM rj LIMIT 1	regtype	regclass[]
+INSERT INTO rj VALUES (5, '{nosuchrel}')	!42P01 relation "nosuchrel" does not exist
+DROP TABLE rz CASCADE		-
+SELECT id, rs FROM rj WHERE id = 2	bigint,regclass[]	2|{303412}
+SELECT unnest(rs) FROM rj WHERE id = 1	regclass	303412 ; rb
