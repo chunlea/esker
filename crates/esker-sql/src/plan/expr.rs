@@ -804,6 +804,10 @@ impl CatalogFuncCall {
             | CatalogFunc::Rtrim
             | CatalogFunc::Greatest
             | CatalogFunc::Least
+            // `NULLIF` is a comparison, and a comparison between two immutable operands is one:
+            // measured, `CREATE INDEX i ON t ((nullif(t, 'x')))` is built by a real server and
+            // `pg_get_indexdef` prints `btree (NULLIF(t, 'x'::text))`.
+            | CatalogFunc::NullIf
             | CatalogFunc::Substr
             | CatalogFunc::Substring
             // **The JSON accessors, `i` on a real server** — measured through `pg_operator`
@@ -1329,6 +1333,31 @@ pub enum CatalogFunc {
     Greatest,
     /// `least(...)`, which is [`CatalogFunc::Greatest`] with the comparison turned round.
     Least,
+    /// `nullif(a, b)`: `a`, or NULL when the two are equal.
+    ///
+    /// **The third of PostgreSQL's four comparison productions to live in this enum**, beside
+    /// `GREATEST` and `LEAST` -- `COALESCE` is [`Expr::Coalesce`] because it is variadic and
+    /// branches. Like them it is a grammar production and not a `pg_proc` row, so its arity is
+    /// enforced by the grammar there: `nullif(1)` and `nullif(1, 2, 3)` are
+    /// `42601 syntax error at or near ")"` on a real server, where this node answers the `42883`
+    /// its arity table gives -- one sqlstate apart on a statement nothing sends, recorded rather
+    /// than special-cased in the parser.
+    ///
+    /// **Its result type is the comparison's *left* input type, which is not always the common
+    /// type.** Measured on 19beta1, and the pair that says so is `nullif(int4, int8)` ->
+    /// `integer` where `GREATEST(int4, int8)` is `bigint`: PostgreSQL resolves `=` between the
+    /// two, finds `int48eq(int4, int8)`, and the left side keeps its own type. Where no cross-type
+    /// operator exists both sides coerce and the answer *is* the common type --
+    /// `nullif(int4, numeric)` is `numeric`, `nullif(int4, float8)` is `double precision`. And a
+    /// `varchar` operand has no `=` of its own, so it resolves through `texteq` and the answer is
+    /// `text`: `nullif(v, 'x')` on a `varchar(10)` column is `text`, and prints
+    /// `NULLIF((v)::text, 'x'::text)`. `exec::query::nullif_type` is that rule and
+    /// `tests/nullif.rs` is the twelve measurements behind it.
+    ///
+    /// **Not strict, and in the other direction from `GREATEST`**: `nullif(NULL, 1)` is NULL and
+    /// `nullif(1, NULL)` is `1` -- the comparison against NULL is unknown, which is not equal, so
+    /// the first argument comes back.
+    NullIf,
     /// `substr(text, from[, count])`: the substring, 1-based and clamped.
     ///
     /// **`from` may be zero or negative**, and the clamp is what makes those work: the result is
@@ -1458,6 +1487,7 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("ltrim") => Some(CatalogFunc::Ltrim),
             () if name.eq_ignore_ascii_case("rtrim") => Some(CatalogFunc::Rtrim),
             () if name.eq_ignore_ascii_case("greatest") => Some(CatalogFunc::Greatest),
+            () if name.eq_ignore_ascii_case("nullif") => Some(CatalogFunc::NullIf),
             () if name.eq_ignore_ascii_case("least") => Some(CatalogFunc::Least),
             () if name.eq_ignore_ascii_case("substr") => Some(CatalogFunc::Substr),
             () if name.eq_ignore_ascii_case("substring") => Some(CatalogFunc::Substring),
@@ -1586,6 +1616,7 @@ impl CatalogFunc {
             CatalogFunc::Ltrim => "ltrim",
             CatalogFunc::Rtrim => "rtrim",
             CatalogFunc::Greatest => "greatest",
+            CatalogFunc::NullIf => "nullif",
             CatalogFunc::Least => "least",
             CatalogFunc::Substr => "substr",
             CatalogFunc::Substring => "substring",
@@ -1612,6 +1643,11 @@ impl CatalogFunc {
             | CatalogFunc::PgGetSerialSequence
             | CatalogFunc::ColDescription
             | CatalogFunc::ArrayPosition
+            // Two, exactly, and on a real server it is the **grammar** that says so: `nullif(1)`
+            // is `42601 syntax error at or near ")"` there where the arity table answers the
+            // `42883` this set gives everything else. One sqlstate apart, on a statement nothing
+            // sends; the variant's doc records it rather than the parser special-casing it.
+            | CatalogFunc::NullIf
             // The type's name, then the operand.
             | CatalogFunc::UserCast
             | CatalogFunc::ArrayLower
@@ -1728,6 +1764,7 @@ impl CatalogFunc {
             // see, and there is no such caller.
             CatalogFunc::Greatest
             | CatalogFunc::Least
+            | CatalogFunc::NullIf
             | CatalogFunc::Btrim
             | CatalogFunc::Ltrim
             | CatalogFunc::Rtrim
