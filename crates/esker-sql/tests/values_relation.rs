@@ -19,33 +19,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `integer` — and an array of them is `bigint[]`. The rows agree everywhere; only the declared
     // type differs. Listing them one by one rather than dropping the type column is what makes the
     // day this is fixed a *failing* test rather than a silent improvement.
-    types: &[
-        "SELECT 'r', * FROM (VALUES (1),(2),(3)) AS t(x) ORDER BY x",
-        "SELECT 'r', a, b FROM (VALUES (1,'x'),(2,'y')) AS t(a,b) ORDER BY a",
-        "SELECT 'r', column1, column2 FROM (VALUES (1,'x'),(2,'y')) AS t ORDER BY column1",
-        "SELECT 'r', * FROM (VALUES (1),(NULL),(3)) AS t(x) ORDER BY x",
-        "SELECT 'r', array_agg(x ORDER BY x) FROM (VALUES (1),(2)) AS t(x)",
-        "SELECT 'r', ARRAY(SELECT x FROM (VALUES (1),(NULL),(3)) AS t(x))",
-        "SELECT 'r', ARRAY(VALUES (1),(2))",
-        "SELECT 'r', x FROM (VALUES (1),(2)) AS t(x) WHERE x > 1",
-        "SELECT 'r', * FROM (VALUES (1,2),(3,4)) AS t(a,b) ORDER BY a DESC",
-        "SELECT 'r', v.x FROM (VALUES (1)) AS v(x)",
-        "VALUES (1),(2),(3)",
-        "VALUES (1,'a'),(2,'b')",
-        "VALUES (1)",
-        "VALUES (1),(2) ORDER BY column1 DESC",
-        "VALUES (1),(2),(3) LIMIT 2",
-        "VALUES (1),(2),(3) OFFSET 1",
-        "VALUES (1),(NULL)",
-        "SELECT 'r', * FROM (VALUES (1,2)) AS t(a)",
-        "SELECT 'r', * FROM (VALUES (1)) t(x)",
-        "SELECT 'r', * FROM (VALUES (1))",
-        "SELECT 'r', 1 FROM (VALUES (1),(2)) AS t(x) CROSS JOIN (VALUES (3)) AS u(y)",
-        "SELECT 'r', t.x, u.y FROM (VALUES (1),(2)) AS t(x) JOIN (VALUES (2)) AS u(y) ON t.x = u.y",
-        "SELECT 'r', x FROM (VALUES (3),(1),(2)) AS t(x)",
-        "SELECT 'r', * FROM (VALUES (1),(2)) AS t(x) WHERE x = 2",
-        "VALUES (1),(2) ORDER BY 1 DESC",
-    ],
+    types: &[],
     answers: &[
         // The standing constant-width divergence, showing through the one function that reports a
         // type as a value: a bare integer constant is `int8` here and `int4` on a real server, so
@@ -66,19 +40,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // The rule is right and the type in the message is the constant-width divergence: the
         // second row is read as the first row's type and fails to parse as it, which is the whole
         // point of the line.
-        (
-            "VALUES (1),('a')",
-            "the type named in the message is bigint here and integer there",
-            "UNMEASURED",
-        ),
         // **Not a `VALUES` gap.** A comma-separated `FROM` list is refused for every relation in
         // this crate; the `CROSS JOIN` spelling of this same statement is the line above it and it
         // answers.
-        (
-            "SELECT 'r', 1 FROM (VALUES (1),(2)) AS t(x), (VALUES (3)) AS u(y)",
-            "a comma-separated FROM list is refused for every relation, not only for VALUES",
-            "UNMEASURED",
-        ),
     ],
 };
 

@@ -28,28 +28,22 @@ mod parity;
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **One fact, several times, and it is not about these operators**: an unadorned integer
-    // literal is an `int8` in this crate and an `integer` to PostgreSQL's resolver, so every row
-    // whose operands are bare literals is declared `bigint` here. The values are identical.
+    // **One fact, seven times, and it is not about these operators**: `pg_typeof` answers a
+    // `regtype` on a real server and `text` here, the trade `'x'::regtype` makes everywhere in
+    // this crate (ADR 0077). The rows are identical — these seven pin the operators' own typing
+    // rules, and nine more stood beside them until the literal ladder's `int4` rung made a bare
+    // operand `integer` on both sides.
     types: &[
-        "SELECT 12 | 10",
-        "SELECT 12 & 10",
-        "SELECT 12 # 10",
-        "SELECT 1 << 4",
-        "SELECT 256 >> 4",
-        "SELECT 5 | NULL",
-        "SELECT 12 | 10 | 3",
-        "SELECT 2 | 3 & 1",
-        "SELECT 1 << 2 | 1",
-        // And one more fact, six times: `pg_typeof` answers a `regtype` on a real server and
-        // `text` here, the trade `'x'::regtype` makes everywhere in this crate (ADR 0077). The
-        // rows are identical — these are the six that pin the operators' own typing rules.
         "SELECT pg_typeof((3::bigint << 32) | 5::bigint)",
         "SELECT pg_typeof(12::int2 | 10::int2)",
         "SELECT pg_typeof(12::int4 | 10::int8)",
         "SELECT pg_typeof(12::int2 | 10::int4)",
         "SELECT pg_typeof(1::int8 << 4)",
         "SELECT pg_typeof(1::int2 << 4)",
+        // **This one moved here from `answers`** when the `int4` rung landed: it used to read
+        // `bigint` against a real server's `integer` and now the row agrees, leaving only the
+        // `regtype`/`text` trade the six above make.
+        "SELECT pg_typeof(12 | 10)",
     ],
     answers: &[
         // **`~` is refused by name.** Unary bitwise NOT needs an expression variant of its own —
@@ -78,13 +72,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              `numeric | integer`. Same code, same refusal, two different spellings of the \
              operands.",
             "pg19_bitwise.txt:53",
-        ),
-        (
-            "SELECT pg_typeof(12 | 10)",
-            "Two facts at once, neither about these operators: `pg_typeof` answers a `regtype` \
-             there and `text` here (ADR 0077), and an unadorned integer literal is an `int8` \
-             here, so the row reads `bigint` where a real server reads `integer`.",
-            "pg19_bitwise.txt:32",
         ),
         (
             "SELECT 'a' | 'b'",

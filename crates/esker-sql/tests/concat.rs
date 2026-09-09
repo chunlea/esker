@@ -18,14 +18,19 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
-        // **The standing integer-literal trade.** An unadorned `1` is an `int8` here and an
-        // `integer` there, so the operator that does not exist is named `bigint || bigint` rather
-        // than `integer || integer`. The sqlstate, the sentence, the `DETAIL` and the `HINT` are
-        // identical, and what the statement is *for* — that `||` is not integer concatenation —
-        // is answered the same way on both.
+        // **What the literal ladder did not reach.** An unadorned `1` is declared `integer` here
+        // since the `int4` rung — `SELECT 1` describes as `integer` and `SELECT i4 || 2` names
+        // `integer || bigint` — but this refusal is raised by the *evaluator*, from the datums it
+        // was handed, and the rung narrowed declared types rather than values: a literal's datum
+        // is still an `i64`. So the operator that does not exist is named `bigint || bigint` where
+        // a real server names `integer || integer`. The sqlstate, the sentence, the `DETAIL` and
+        // the `HINT` are identical, and what the statement is *for* — that `||` is not integer
+        // concatenation — is answered the same way on both. Closing it means narrowing the datum,
+        // which is a change to what a bare integer *is* rather than to what it is called.
         (
             "SELECT 1 || 2",
-            "an unadorned integer literal is int8 here, so the message names bigint",
+            "the refusal is raised from the datums, and a literal's datum is still an i64, so the \
+             message names bigint where the declared type is already integer",
             "pg19_concat.txt:22",
         ),
         // **`||` over arrays is a family of its own and is not built** — `42883 operator does not

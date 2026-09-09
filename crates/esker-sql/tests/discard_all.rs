@@ -15,9 +15,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // An integer literal is `int4` there and `int8` here — the standing width trade every
-    // untyped number makes (ADR 0030's six stored types), and nothing to do with `DISCARD`.
-    types: &["SELECT 'r', 1 AS in_a_transaction"],
+    // **Nothing.** The one entry that stood here was `SELECT 'r', 1 AS in_a_transaction`, declared
+    // `bigint` against a real server's `integer` — the standing width trade every untyped number
+    // used to make. The literal ladder gained its `int4` rung and the row agrees, so it is gone.
+    types: &[],
     answers: &[
         // **Every `DISCARD` in this file agrees.** What is listed below is the state a real server
         // has and this node does not, so there is nothing for the statement to reset — the

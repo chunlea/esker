@@ -21,7 +21,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // Surfaced with the two below it when the runtime cast stopped aborting this file. The
         // rows agree; what differs is the standing integer-width trade — a small constant is
         // `integer` on a real server and `bigint` here — seen through `ARRAY(VALUES …)`.
-        "SELECT 'r', ARRAY(VALUES (1),(2))",
         "SELECT 'r', ARRAY(SELECT 'a'::text), pg_typeof(ARRAY(SELECT 'a'::text))",
         // The three below are reached for the first time now that a bare `VALUES` list runs; they
         // were swallowed by the aborted block before. Their rows are right and two facts show in
@@ -73,11 +72,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', ARRAY(SELECT 1 WHERE false), pg_typeof(ARRAY(SELECT 1 WHERE false))",
             "**The rows agree and the constant's width does not.** `ARRAY(SELECT 1)` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here (`tests/unknown_literal.rs`); `generate_series`' column follows its arguments, so it inherits the same difference. `pg_typeof` reports `regtype` there and `text` here, which is the trade `'x'::regtype` already makes. Every value is identical.",
             "pg19_array_subquery.txt:66",
-        ),
-        (
-            "SELECT 'r', ARRAY(SELECT NULL::int4), ARRAY(SELECT x FROM (VALUES (1),(NULL),(3)) AS t(x))",
-            "**`VALUES` as a query** — a relation made of constant rows — which this node does not have in either spelling: as a derived table (`(VALUES …) AS t(x)`) or as the argument of this constructor. It is a feature of its own and not an array one, and it is the **last blocker on this corpus**: the capture runs inside one transaction, so the statements after these two are swallowed by the abort rather than checked. What they cover is asserted directly in this file instead, so nothing here rests on a statement that did not run.",
-            "pg19_array_subquery.txt:69",
         ),
     ],
 };

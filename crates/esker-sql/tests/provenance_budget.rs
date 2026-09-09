@@ -18,7 +18,11 @@
 /// 207 → 186 when the catalog's identifier columns became `name`: twenty-one entries stopped being
 /// divergences at all, because what they recorded was a *declared type* — `text` here where a real
 /// server says `name` — and the rows underneath had always agreed.
-const BUDGET: usize = 186;
+///
+/// 186 → 163 with the literal ladder's `int4` rung (ADR 0085), and for the same reason twice over:
+/// an unadorned `1` was a `bigint` here against a real server's `integer`, so 115 entries across 22
+/// files recorded a width rather than an answer. Twenty-three of them were `UNMEASURED`.
+const BUDGET: usize = 163;
 
 #[test]
 fn unmeasured_divergences_do_not_grow() {

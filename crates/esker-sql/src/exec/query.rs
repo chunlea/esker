@@ -3843,16 +3843,28 @@ fn carried_type(expr: &Expr) -> Option<ColumnType> {
 /// **`text` is the answer and not `None`**, which is the whole point of asking: an all-`unknown`
 /// constructor is a `text` value on a real server, so a comparison against a number is `42883`
 /// rather than a silent no-match.
+/// The type a set of `CASE` or `COALESCE` branches settles on, folded with the promotion
+/// arithmetic uses. A pair with no common type keeps what it had: this answers a type rather than
+/// a `Result`, and the refusal for a genuinely mismatched `CASE` belongs where the branches are
+/// checked against each other.
+fn common_branch_type(types: impl Iterator<Item = ColumnType>) -> ColumnType {
+    let mut common: Option<ColumnType> = None;
+    for ty in types {
+        common = Some(match common {
+            None => ty,
+            Some(so_far) => unify(so_far, ty).unwrap_or(so_far),
+        });
+    }
+    common.unwrap_or(ColumnType::Text)
+}
+
 fn branch_common_type<'a>(branches: impl Iterator<Item = &'a Expr>) -> ColumnType {
-    for branch in branches {
-        if let Some(ty) = carried_type(branch).or_else(|| match branch {
+    common_branch_type(branches.filter_map(|branch| {
+        carried_type(branch).or_else(|| match branch {
             Expr::Literal(literal) => literal_type(literal),
             _ => None,
-        }) {
-            return ty;
-        }
-    }
-    ColumnType::Text
+        })
+    }))
 }
 
 fn retype_subscript(expr: &Expr, ty: ColumnType) -> Expr {
@@ -3880,7 +3892,15 @@ pub(super) fn literal_type(literal: &Literal) -> Option<ColumnType> {
         // unification — gets the cast's answer instead of `None`.
         Literal::TypedNull(ty) => Some(*ty),
         Literal::Null | Literal::String(_) => None,
-        Literal::Integer(_) => Some(ColumnType::Int8),
+        // **The `int4` rung.** An unadorned integer takes the smallest type that holds it:
+        // `pg_typeof(1)` is `integer`, `pg_typeof(2147483648)` is `bigint`, and past `int8` the
+        // parser has already made it a `numeric` before this is asked
+        // (`tests/integer_literal_type.rs` carries the ladder in both signs).
+        Literal::Integer(value) => Some(if i32::try_from(*value).is_ok() {
+            ColumnType::Int4
+        } else {
+            ColumnType::Int8
+        }),
         Literal::Decimal(_) => Some(ColumnType::Double),
         Literal::Bool(_) => Some(ColumnType::Bool),
         Literal::Typed(value) => value.column_type(),
@@ -4416,10 +4436,26 @@ fn arithmetic_type(
                 (known, ColumnType::Int8)
             }
         }
-        // Two constants, or a constant beside a NULL: this node's own literal type, which is
-        // `int8` where a real server's is `int4` — the divergence `tests/unknown_literal.rs`
-        // holds, visible here as a `bigint` where PostgreSQL reports an `integer`.
-        (Operand::Integer(_), _) | (_, Operand::Integer(_)) => (ColumnType::Int8, ColumnType::Int8),
+        // **Two constants, or a constant beside a NULL: the ladder decides.** This read `int8`
+        // for both and said so in its own comment. Now `1 + 1` is `integer + integer`, and
+        // `2147483647 + 1` is `22003 integer out of range` rather than a silent widening —
+        // PostgreSQL does not widen to avoid an overflow, measured.
+        (Operand::Integer(a), Operand::Integer(b)) => {
+            let width = if fits(a, ColumnType::Int4) && fits(b, ColumnType::Int4) {
+                ColumnType::Int4
+            } else {
+                ColumnType::Int8
+            };
+            (width, width)
+        }
+        (Operand::Integer(value), _) | (_, Operand::Integer(value)) => {
+            let width = if fits(value, ColumnType::Int4) {
+                ColumnType::Int4
+            } else {
+                ColumnType::Int8
+            };
+            (width, width)
+        }
         // Both are `unknown`. PostgreSQL answers `operator is not unique: unknown + unknown`;
         // this node reports the `42883` its own resolution gives, naming the same missing
         // operator.
@@ -4641,6 +4677,34 @@ fn arrow_fetch(func: CatalogFunc, args: &[Expr], scope: &Scope<'_>) -> CatalogFu
     }
 }
 
+/// The type a catalog function answers, for the four that cannot answer without their arguments.
+///
+/// Split out of [`expr_type`] so that neither is over a hundred lines; the arms are in the order
+/// they were written and each says why it is not `CatalogFunc::result_type`.
+fn catalog_func_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> ColumnType {
+    match call.func {
+        CatalogFunc::HstoreConcat => concat_type(call, scope),
+        // **`->` is the same shape as `||` above** — one symbol over several types, told apart by
+        // the operand — and it needs the same arm here for the same reason that one gives: the
+        // rows were already right and it was the *declared* type that said `text`, which a client
+        // binds against.
+        CatalogFunc::HstoreFetch => arrow_fetch(call.func, &call.args, scope).result_type(),
+        // **`date_trunc` answers the type of the value it cut**, and two of the four arms are not
+        // the type they look like: a `date` argument resolves to the `timestamptz` overload, and
+        // so does the three-argument form even when its value is an unzoned `timestamp`. This is
+        // the half of the function that `timestamp_test.rb` reads — `assert_kind_of Time` over the
+        // grouped keys is a String and a failure if the column is described as `text`.
+        CatalogFunc::DateTrunc => date_trunc_type(&call.args, scope),
+        // **The common type of the arguments**, which is what a real server resolves and what
+        // `CatalogFunc::result_type` cannot answer without them. Measured: `int2` beside `int8`
+        // is `bigint`, an integer beside a decimal is `numeric`, and one beside a `float8` is
+        // `double precision` — the same promotion arithmetic makes, so it is folded through that
+        // rule rather than written a second time.
+        CatalogFunc::Greatest | CatalogFunc::Least => greatest_type(&call.args, scope),
+        _ => call.func.result_type(),
+    }
+}
+
 pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     Ok(match expr {
         // The type the cast named. Settled at lowering, where the permission was checked too.
@@ -4666,8 +4730,17 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::Ordinal { ty, .. }
         | Expr::Outer { ty, .. }
         | Expr::Literal(Literal::TypedNull(ty)) => *ty,
-        // A sequence function answers `bigint` on a real server, all four of them.
-        Expr::Literal(Literal::Integer(_)) | Expr::Sequence(_) => ColumnType::Int8,
+        // A sequence function answers `bigint` on a real server, all four of them — and it no
+        // longer shares this arm with an integer literal, which is a different question with a
+        // different answer since the ladder gained its `int4` rung.
+        Expr::Sequence(_) => ColumnType::Int8,
+        Expr::Literal(Literal::Integer(value)) => {
+            if i32::try_from(*value).is_ok() {
+                ColumnType::Int4
+            } else {
+                ColumnType::Int8
+            }
+        }
         // Every catalog function returns `text`, which is what makes them one variant.
         // **`||` is spelled the same for three types**, and its result is its operands': an
         // hstore concatenation is an hstore and everything else is `text` — measured,
@@ -4675,35 +4748,7 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // `'a=>b'::hstore` constant is a `Datum::Hstore` and not a `Datum::Text`; while it was the
         // latter, the type was gone by the time anything could ask, and the two concatenations
         // were indistinguishable.
-        Expr::CatalogFunc(call) if call.func == CatalogFunc::HstoreConcat => {
-            concat_type(call, scope)
-        }
-        // **`->` is the same shape as `||` above** — one symbol over several types, told apart by
-        // the operand — and it needs the same arm here for the same reason that one gives: the
-        // rows were already right and it was the *declared* type that said `text`, which a client
-        // binds against.
-        Expr::CatalogFunc(call) if call.func == CatalogFunc::HstoreFetch => {
-            arrow_fetch(call.func, &call.args, scope).result_type()
-        }
-        // **`date_trunc` answers the type of the value it cut**, and two of the four arms are not
-        // the type they look like: a `date` argument resolves to the `timestamptz` overload, and
-        // so does the three-argument form even when its value is an unzoned `timestamp`. This is
-        // the half of the function that `timestamp_test.rb` reads — `assert_kind_of Time` over the
-        // grouped keys is a String and a failure if the column is described as `text`.
-        Expr::CatalogFunc(call) if call.func == CatalogFunc::DateTrunc => {
-            date_trunc_type(&call.args, scope)
-        }
-        // **The common type of the arguments**, which is what a real server resolves and what
-        // `CatalogFunc::result_type` cannot answer without them. Measured: `int2` beside `int8`
-        // is `bigint`, an integer beside a decimal is `numeric`, and one beside a `float8` is
-        // `double precision` — the same promotion arithmetic makes, so it is folded through that
-        // rule rather than written a second time.
-        Expr::CatalogFunc(call)
-            if matches!(call.func, CatalogFunc::Greatest | CatalogFunc::Least) =>
-        {
-            greatest_type(&call.args, scope)
-        }
-        Expr::CatalogFunc(call) => call.func.result_type(),
+        Expr::CatalogFunc(call) => catalog_func_type(call, scope),
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
 
         // `abs` is the one scalar function that answers its argument's type rather than `text`.
@@ -4780,19 +4825,25 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // One generated **value**, not the set: the column a client is described is the element
         // type. `unnest` answers its array's element type and the two generators answer their own.
         Expr::SetFunc(call) => super::table_function::result_type(call, scope),
-        Expr::Coalesce(args) => args
-            .iter()
-            .find_map(|arg| branch_type(arg, scope))
-            .unwrap_or(ColumnType::Text),
+        // **The branches are unified, not raced.** `COALESCE(bigint_column, 0)` is a `bigint` on
+        // a real server, and so is `CASE WHEN flag THEN id ELSE 0 END`. This took the first branch
+        // that carried a type, with the `ELSE` read first — and while every integer literal was
+        // an `int8` the two rules agreed on every statement in every corpus here. The `int4` rung
+        // is what made the difference observable, and the two cannot land apart: unifying alone
+        // makes `COALESCE(NULL::integer, 0)` a `bigint`, and the rung alone makes the `ELSE` win.
+        Expr::Coalesce(args) => {
+            common_branch_type(args.iter().filter_map(|arg| branch_type(arg, scope)))
+        }
         Expr::Case {
             branches,
             otherwise,
-        } => otherwise
-            .iter()
-            .map(AsRef::as_ref)
-            .chain(branches.iter().map(|branch| &branch.then))
-            .find_map(|result| branch_type(result, scope))
-            .unwrap_or(ColumnType::Text),
+        } => common_branch_type(
+            otherwise
+                .iter()
+                .map(AsRef::as_ref)
+                .chain(branches.iter().map(|branch| &branch.then))
+                .filter_map(|result| branch_type(result, scope)),
+        ),
         Expr::Parameter(number) => return Err(SqlError::UndefinedParameter(*number)),
         // **An aggregate is typed from its argument**, by the same table the aggregation itself
         // uses — because this is asked *before* the aggregation exists.

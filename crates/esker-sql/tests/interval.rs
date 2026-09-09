@@ -54,11 +54,6 @@ const BPCHAR: &str = "An explicit cast to `character(n)` truncates on a real ser
      `22001` here — `tests/time.rs` and `tests/uuid.rs` record the same thing. The `varchar` \
      half diverges only in its declared type, `text` for `character varying`.";
 
-/// A bare integer literal is an `int8` here.
-const LITERAL: &str = "Both refuse with `42883` and name a different integer: PostgreSQL says \
-     `integer` because a bare `1` is an `int4` there, and this node says `bigint`. A divergence \
-     of the literal, not of this type.";
-
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
@@ -188,11 +183,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT '1 day'::interval::time",
             ARITHMETIC,
             "pg19_interval.txt:120",
-        ),
-        (
-            "SELECT '1 day'::interval = 1",
-            LITERAL,
-            "pg19_interval.txt:123",
         ),
     ],
 };

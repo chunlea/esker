@@ -37,27 +37,11 @@ const FIXTURE: &[&str] = &[
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
-        // A bare integer constant is `integer` on a real server and `int8` here. The rows agree.
-        "WITH ct_a AS (SELECT 99 AS id) SELECT * FROM ct_a",
-        "WITH ct_a AS (SELECT 99 AS id) SELECT id FROM ct_a",
-        "WITH t AS (SELECT 1 AS a, 2 AS a) SELECT * FROM t",
-        "WITH t AS (SELECT id FROM ct_a) SELECT 1",
+        // **Empty, and it was not always.** A bare integer constant was `int8` here against a real
+        // server's `integer`; the literal ladder gained its `int4` rung and every row in this file
+        // agrees on its declared types as well as its values.
     ],
     answers: &[
-        (
-            "WITH RECURSIVE t AS (SELECT 1 AS n) SELECT * FROM t",
-            "`WITH RECURSIVE` is `0A000` naming itself — and this line is the reason the refusal \
-             is on the keyword rather than on a recursive *body*: a real server runs this one, \
-             because the body does not recurse. A second evaluation model is a phase, not a unit \
-             (`docs/plans/phase-12-subquery.md` §4).",
-            "UNMEASURED",
-        ),
-        (
-            "WITH RECURSIVE t (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
-             SELECT * FROM t",
-            "`WITH RECURSIVE`, and `UNION ALL` under it, both `0A000` by name.",
-            "UNMEASURED",
-        ),
         (
             "WITH t AS (DELETE FROM ct_b WHERE id = 12 RETURNING id) SELECT * FROM t",
             "a data-modifying `WITH` item is `0A000` naming itself: the read path is this phase \

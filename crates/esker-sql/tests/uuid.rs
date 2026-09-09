@@ -60,14 +60,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             FUNCTIONS,
             "pg19_uuid.txt:87",
         ),
-        (
-            "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid = 1",
-            "Both refuse with `42883` and name a different integer: PostgreSQL says `integer` \
-             because a bare `1` is an `int4` there, and this node says `bigint` because it types \
-             an unsuffixed integer literal as `int8`. A divergence of the literal, not of this \
-             type — every type's `= 1` says it.",
-            "pg19_uuid.txt:88",
-        ),
         // **This line used to be here** and now agrees, deleted under ADR 0031 rule 2. What kept
         // it diverging was `length`'s **declared type** — `text` where a real server says
         // `integer` — and not the uuid functions, which have answered for a while. The sibling

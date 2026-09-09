@@ -18,20 +18,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // kept rather than dropped because they are the oracle's own proof that a `CASE`
     // short-circuits, and the property they prove is asserted against this node in
     // `only_the_chosen_branch_is_evaluated` with the per-row error it does have.
-    answers: &[
-        (
-            "SELECT CASE WHEN true THEN 1 ELSE 1/0 END",
-            "PostgreSQL answers 1: the ELSE is not evaluated. This node has no `/` operator, so \
-             the statement stops at `0A000 the operator / is not supported` — the short-circuit \
-             is not what is missing",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT CASE WHEN false THEN 1/0 ELSE 2 END",
-            "The mirror of the line above, and the same refusal for the same reason",
-            "UNMEASURED",
-        ),
-    ],
+    answers: &[],
 };
 
 #[test]

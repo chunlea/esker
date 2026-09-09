@@ -3302,6 +3302,21 @@ fn catalog_function(
         CatalogFunc::ConvertTo => convert_to(args.first(), args.get(1))?,
         // The value's own type. An untyped NULL has none and is `text`, which is what it is
         // everywhere else in this crate.
+        // **An integer literal answers the width it was *declared*, not the width it is held
+        // in.** The datum stays an `i64` whatever rung the literal is on — narrowing it re-types
+        // every function argument — so without this `pg_typeof(1)` reads `bigint` while the
+        // `RowDescription` for the same expression says `integer`. One expression with two
+        // answers is the shape the enum unit removed from this crate, and this is where it would
+        // have come straight back in.
+        CatalogFunc::PgTypeof
+            if matches!(
+                call.args.first(),
+                Some(Expr::Literal(crate::plan::Literal::Integer(v)))
+                    if i32::try_from(*v).is_ok()
+            ) =>
+        {
+            Datum::Text(ColumnType::Int4.name().to_owned())
+        }
         CatalogFunc::PgTypeof => Datum::Text(
             args.first()
                 .and_then(Datum::column_type)

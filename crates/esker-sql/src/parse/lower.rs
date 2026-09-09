@@ -5440,7 +5440,18 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             Value::Number(digits, _) if digits.contains('.') => {
                 (Some(digits.clone()), Some(ColumnType::Numeric))
             }
-            Value::Number(digits, _) => (Some(digits.clone()), Some(ColumnType::Int8)),
+            // **The literal ladder, inside the constructor** (ADR 0085): an integer element is an
+            // `int4` when it fits one, so `ARRAY[1,2,3]` is an `integer[]` as it is on a real
+            // server, and `ARRAY[1,3000000000]` is a `bigint[]` because the widening below settles
+            // on the wider of the two. A number too large for either is left to `from_text`, which
+            // raises the `22003` a real server raises.
+            Value::Number(digits, _) => (
+                Some(digits.clone()),
+                Some(match digits.parse::<i32>() {
+                    Ok(_) => ColumnType::Int4,
+                    Err(_) => ColumnType::Int8,
+                }),
+            ),
             Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
                 (Some(text.clone()), Some(ColumnType::Text))
             }
@@ -5462,6 +5473,11 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             (Some(ColumnType::Numeric), _) | (_, Some(ColumnType::Numeric)) => {
                 Some(ColumnType::Numeric)
             }
+            // **The wider integer wins**, which the first-wins arm below cannot do: without this
+            // `ARRAY[1,3000000000]` would settle on the `int4` its first element asked for and
+            // then refuse its second with a `22003` that a real server does not raise.
+            (Some(ColumnType::Int8), Some(ColumnType::Int4))
+            | (Some(ColumnType::Int4), Some(ColumnType::Int8)) => Some(ColumnType::Int8),
             (known, None) => known,
             (None, wanted) => wanted,
             (known, _) => known,

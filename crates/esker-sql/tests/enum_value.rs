@@ -136,11 +136,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "a bare integer constant is int8 here and int4 there",
             "UNMEASURED",
         ),
-        (
-            "SELECT 'r', id FROM postgresql_enums WHERE current_mood = 1",
-            "a bare integer constant is int8 here and int4 there",
-            "UNMEASURED",
-        ),
         // `DO $$ … $$` was here, refused by name. This entry predicted its own unit would be
         // "a large one — it is a language, not a statement"; the measurement said otherwise.
         // All 36 `DO` statements the suite sends are `create_enum`'s one template, so the block

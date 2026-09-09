@@ -30,8 +30,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `SELECT array_agg(x) FROM (VALUES (NULL::int)) v(x)`, left with `Literal::TypedNull`:
         // the cast survives lowering, so the column is `integer` and the aggregate declares
         // `integer[]` — one of ADR 0047's four.
-        "SELECT array_agg(x) FROM (VALUES (1),(2)) v(x)",
-        "SELECT array_agg(x ORDER BY x DESC) FROM (VALUES (1),(2)) v(x)",
         "SELECT oid, typname, typlen, typinput, typelem, typdelim, typcategory FROM pg_type WHERE \
          typname IN ('_int4','_text') ORDER BY oid",
     ],
@@ -45,16 +43,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT id FROM ar WHERE n @> '{1}' ORDER BY id",
             "The array **operators** — `@>`, `<@`, `&&`, `||` — which are the slice after the constructor. Nothing here is approximated in the meantime: each is `0A000` naming itself.",
             "pg19_array.txt:86",
-        ),
-        (
-            "SELECT '{1,2,3}'::int[], ARRAY[1,2,3], ARRAY[1,2,3]::int[]",
-            "**The rows agree and the element's width does not.** `ARRAY[1,2,3]` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here — `tests/unknown_literal.rs`'s standing divergence, showing through the constructor. The values are identical and the same statement written `'{1,2,3}'::int[]` agrees on the type as well, which is the line beside each of these.",
-            "pg19_array.txt:96",
-        ),
-        (
-            "SELECT '{1,NULL,3}'::int[], ARRAY[1,NULL,3]",
-            "**The rows agree and the element's width does not.** `ARRAY[1,2,3]` is an `integer[]` on a real server and a `bigint[]` here, because a bare integer constant is `int4` there and `int8` here — `tests/unknown_literal.rs`'s standing divergence, showing through the constructor. The values are identical and the same statement written `'{1,2,3}'::int[]` agrees on the type as well, which is the line beside each of these.",
-            "pg19_array.txt:99",
         ),
         (
             "SELECT array_length('{}'::int[], 1), array_ndims('{}'::int[]), array_dims('{}'::int[]), cardinality('{}'::int[])",
