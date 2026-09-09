@@ -85,11 +85,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_array.txt:147",
         ),
         (
-            "SELECT '{1,2}'::int[] || '{3}'::int[], 3 || '{1,2}'::int[], '{1,2}'::int[] || 3",
-            "The array **operators** — `@>`, `<@`, `&&`, `||` — which are the slice after the constructor. Nothing here is approximated in the meantime: each is `0A000` naming itself.",
-            "pg19_array.txt:148",
-        ),
-        (
             "SELECT array_position('{a,b,c}'::text[], 'b'), array_remove('{1,2,1}'::int[], 1)",
             "`array_ndims`, `array_dims`, `array_remove`, `array_to_string`, `string_to_array` and `unnest`: more of the array function surface, none of which the schema files call. `array_length`, `array_lower`, `array_upper`, `array_position` and `cardinality` answer now, including over a two-dimensional array, which is what the shape is for.",
             "pg19_array.txt:149",

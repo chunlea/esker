@@ -33,15 +33,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              message names bigint where the declared type is already integer",
             "pg19_concat.txt:22",
         ),
-        // **`||` over arrays is a family of its own and is not built** — `42883 operator does not
-        // exist: bigint[] || bigint[]` where a real server appends. A gap, and named as one: the
-        // operator refuses rather than guessing, which is what `text_concat` checks for before it
-        // will concatenate anything.
-        (
-            "SELECT 'r', ARRAY[1,2] || ARRAY[3], ARRAY[1,2] || 3, pg_typeof(ARRAY[1,2] || 3)",
-            "|| over arrays is not built; it refuses rather than answering",
-            "pg19_concat.txt:25",
-        ),
+        // **`||` over arrays is built now**, and the entry that stood here for it is gone: three
+        // shapes and the two NULL rules, measured in `tests/captures/pg19_array_families.txt`.
+        // What was named a family of its own turned out to be the whole operator — `text[] ||
+        // text[]` was refused too — and the refusal above is still the refusal above, because
+        // `1 || 2` is not an array on either server.
     ],
 };
 

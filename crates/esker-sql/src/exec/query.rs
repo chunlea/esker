@@ -886,10 +886,19 @@ pub(super) fn unify(left: ColumnType, right: ColumnType) -> Result<ColumnType> {
             right: right.name(),
         });
     }
-    if is_preferred(left) {
-        return Ok(left);
-    }
-    if implicit_cast(left, right) && !implicit_cast(right, left) {
+    // **PostgreSQL's `select_common_type`, and it is asymmetric.** The running candidate keeps the
+    // answer unless it is *not* its category's preferred type **and** it can be implicitly cast to
+    // the other while the other cannot be cast back. Measured, and the asymmetry is visible in one
+    // pair: `name` and `text` cast implicitly **both** ways, so neither displaces the other and the
+    // arm that came first wins — `coalesce(name, text)` is `name` and `coalesce(text, name)` is
+    // `text`. Every other pair here is order-free, because only one direction is implicit:
+    // `numeric` beside `real` is `real` in both orders, since `numeric -> float4` is implicit and
+    // `float4 -> numeric` is only an assignment.
+    //
+    // Written symmetrically once, and that was wrong in exactly that pair: it made
+    // `coalesce(name, text)` a `text`, because `text` is preferred and a symmetric rule lets the
+    // *right* side's preference win a tie the left had already taken.
+    if !is_preferred(left) && implicit_cast(left, right) && !implicit_cast(right, left) {
         return Ok(right);
     }
     Ok(left)
@@ -3142,6 +3151,31 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 // has a candidate at every string width and category `Z` picks none of them, so it
                 // is `42725` and not the `42883` a wrong type gets — measured. Decided here
                 // because the evaluator sees a `Datum::Text` for a `"char"` and cannot tell.
+                // **An element beside an array is wrapped into a one-element array**, which is
+                // what makes the two NULL rules one rule. Measured: `ARRAY[1,2] || NULL::int4` is
+                // `{1,2,NULL}` and `NULL::int4[] || ARRAY[1]` is `{1}` — the same NULL is a value
+                // on one side of the operator and an absence on the other, and the evaluator
+                // cannot tell them apart, because a NULL datum carries no type. Decided here,
+                // where the declared types are, so that the evaluator has one rule: a NULL array
+                // contributes nothing.
+                (CatalogFunc::HstoreConcat, Some(_))
+                    if args.len() == 2 && concat_element_side(&args, scope).is_some() =>
+                {
+                    let at = concat_element_side(&args, scope).unwrap_or(0);
+                    let element = expr_type(&args[1 - at], scope)
+                        .ok()
+                        .and_then(esker_keys::array::ArrayValue::element_of);
+                    let mut args = args;
+                    let operand = args[at].clone();
+                    args[at] = Expr::Array {
+                        elements: vec![operand],
+                        element,
+                    };
+                    Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                        func: call.func,
+                        args,
+                    }))
+                }
                 (CatalogFunc::HstoreConcat, Some(_))
                     if args
                         .iter()
@@ -4031,10 +4065,19 @@ fn attnum_vector_element(operand: &Expr, scope: &Scope<'_>) -> Option<ColumnType
     // **A real array knows its own element type**, so a subscript of one needs no rule: the
     // catalog's text vectors below are the case that does, because their element type is a fact
     // about the relation rather than about the value.
-    if let Ok(ty) = expr_type(operand, scope)
-        && let Some(element) = esker_keys::array::ArrayValue::element_of(ty)
-    {
-        return Some(element);
+    if let Ok(ty) = expr_type(operand, scope) {
+        if let Some(element) = esker_keys::array::ArrayValue::element_of(ty) {
+            return Some(element);
+        }
+        // **A vector's element is a property of the type**, which is what `pg_type.typelem` says:
+        // 21 for an `int2vector` and 26 for an `oidvector`, measured. Asked before the column
+        // names below, because a vector that is not a catalog column has the same element —
+        // `('23 25'::oidvector)[0]` is an `oid` on a real server and was `text` here.
+        match ty {
+            ColumnType::Int2Vector => return Some(ColumnType::Int2),
+            ColumnType::OidVector => return Some(ColumnType::Oid),
+            _ => {}
+        }
     }
     let Expr::Column { table, name } = operand else {
         return None;
@@ -5000,14 +5043,26 @@ fn date_trunc_type(args: &[Expr], scope: &Scope<'_>) -> ColumnType {
 fn greatest_type(args: &[Expr], scope: &Scope<'_>) -> ColumnType {
     let mut found: Option<ColumnType> = None;
     for arg in args {
+        // **An unadorned literal does not vote.** It is `unknown` to a real server's resolver and
+        // takes whatever the known arguments settle on: `greatest(c, 'x')` over a `character(4)`
+        // column is a `bpchar` there, and letting the literal in as the `text` this crate resolves
+        // it to made it a `text` — the preferred type winning a vote it should not have had.
+        if matches!(arg, Expr::Literal(Literal::String(_))) {
+            continue;
+        }
         let Ok(ty) = expr_type(arg, scope) else {
             continue;
         };
         found = Some(match found {
             None => ty,
             Some(sofar) if sofar == ty => sofar,
-            Some(sofar) => crate::value::arith::result_type(crate::plan::ArithOp::Add, sofar, ty)
-                .unwrap_or(sofar),
+            // **The common type, not arithmetic's.** These took `+`'s promotion, which is a
+            // different ladder and a right one for a different question: `int2 + float4` really is
+            // a `double precision`, because adding them needs the wider float. `GREATEST` picks
+            // one of the values, so it takes the type the pair *resolves* to —
+            // `GREATEST(int2, float4)` is `real` on a real server, measured, and the same
+            // `unify` a `UNION` over the two arms uses.
+            Some(sofar) => unify(sofar, ty).unwrap_or(sofar),
         });
     }
     found.unwrap_or(ColumnType::Text)
@@ -5121,6 +5176,20 @@ fn concat_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> Column
     // **A fourth spelling.** A tsvector operand makes it a tsvector, and the rows were
     // already right — it was only the *declared* type that said `text`, which a client
     // binds against.
+    // **A sixth spelling: an array operand makes it array concatenation**, and the result is that
+    // array's type — `ARRAY[1,2] || 3` is `integer[]`, measured. Asked first because an array of
+    // `text` would otherwise fall through to the string arm and be declared `text`, which is the
+    // wrong-declaration bug this function has now been the site of four times.
+    if let Some(array) = call
+        .args
+        .iter()
+        .find_map(|arg| match expr_type(arg, scope) {
+            Ok(ty) if esker_keys::array::ArrayValue::element_of(ty).is_some() => Some(ty),
+            _ => None,
+        })
+    {
+        return array;
+    }
     if all_jsonb {
         ColumnType::Jsonb
     } else if of(ColumnType::Hstore) {
@@ -5216,6 +5285,22 @@ fn range_bound_type(
 /// to `text` before anything asks — so the name comes from the *expression* rather than from its
 /// resolved type. That is the one place in this message where the two differ, and it is why
 /// `'r'::"char" || 'x'` reads `"char" || unknown` on both.
+/// Which side of an array `||` is the **element**, or `None` when both or neither is an array.
+///
+/// The wrapping this decides is what makes the operator's two NULL rules one rule; see the arm in
+/// [`resolve`] that calls it.
+fn concat_element_side(args: &[Expr], scope: &Scope<'_>) -> Option<usize> {
+    let is_array = |at: usize| {
+        matches!(expr_type(&args[at], scope), Ok(ty)
+            if esker_keys::array::ArrayValue::element_of(ty).is_some())
+    };
+    match (is_array(0), is_array(1)) {
+        (true, false) => Some(1),
+        (false, true) => Some(0),
+        _ => None,
+    }
+}
+
 fn concat_operand_name(expr: Option<&Expr>, scope: &Scope<'_>) -> String {
     match expr {
         None | Some(Expr::Literal(Literal::String(_) | Literal::Null)) => "unknown".to_owned(),
@@ -5427,12 +5512,16 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // filled where the expression is lowered, before anything knows what it is subscripting;
         // a real array carries its element type in the value, so it answers for itself and the
         // stored field is the fallback for the catalog's text vectors.
+        // **One reader for a subscript's element type, not two.** This asked the operand's array
+        // element and fell back to the `element` the node carries; `resolve` set that field from
+        // [`attnum_vector_element`], which also knows the catalog's text vectors. So the two
+        // agreed only *after* resolution — and `output_columns` types a projection **before** it,
+        // which is why `indkey[0]` was described `text` (25) while `pg_typeof(indkey[0])` answered
+        // `smallint`. The wire and the function disagreed about the same expression, and only a
+        // `Describe` could see it.
         Expr::Subscript {
             operand, element, ..
-        } => expr_type(operand, scope)
-            .ok()
-            .and_then(esker_keys::array::ArrayValue::element_of)
-            .unwrap_or(*element),
+        } => attnum_vector_element(operand, scope).unwrap_or(*element),
         Expr::Uuid(_) => ColumnType::Uuid,
         // Resolution has already given every argument the common type, so the first one that
         // **carries** a type is the answer. `branch_type` rather than `expr_type` is the whole of

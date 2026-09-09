@@ -74,11 +74,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_numeric.txt:115",
         ),
         (
-            "SELECT (2147483647::numeric + 1)::int4",
-            "Arithmetic. This crate has **no arithmetic operators at all** for any type, so the `22003` PostgreSQL raises after adding is never reached. The cast itself is built: a `numeric` past `int4` **is** `22003 integer out of range` here, reached by a literal instead.",
-            "pg19_numeric.txt:124",
-        ),
-        (
             "SELECT numeric_send(1.5::numeric)",
             "`numeric_send` is `0A000` naming itself, and so is the binary format underneath it — a `numeric`'s wire form is a four-`i16` header plus base-10000 digit groups that nothing here has ever sent or read. The capture records the bytes (`\\x000200000000000100011388`) so the day that path is built it has an oracle.",
             "pg19_numeric.txt:125",

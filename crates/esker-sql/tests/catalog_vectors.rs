@@ -15,13 +15,24 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **The `int2vector` half.** Every one of these has the right rows and a `text` where a real
-    // server says `int2vector` or `smallint`: `indkey` is text here, so its elements are too. The
-    // `conkey` half of the same file is not in this list any more, which is the unit.
-    types: &[
-        "SELECT 'r', indkey[0], indkey[1], array_length(indkey, 1) FROM pg_index WHERE indexrelid = 'vt_ab'::regclass",
-    ],
-    answers: &[],
+    // **Empty.** The one entry read `indkey[0]` and `indkey[1]` and said they were `text` here
+    // where a real server says `smallint`. They are `smallint` now, and the fix was not a type
+    // but a **second reader**: `output_columns` types a projection *before* resolution and asked
+    // the `element` the node carries, while `pg_typeof` folds *after* it and asked
+    // `attnum_vector_element`. The two agreed wherever resolution had already run, so only a
+    // `Describe` could see the difference.
+    types: &[],
+    answers: &[(
+        "SELECT 'r', oid, typname, typlen, typtype, typcategory, typdelim, typinput, typelem, \
+         typarray FROM pg_type WHERE typname IN ('int2vector','oidvector') ORDER BY oid",
+        "**`typarray` is 1006 and 1013 there and 0 here, and that is a decision.** Both vectors \
+         are on `array_delimiter.rs::every_base_type_has_an_array_or_is_listed`'s named-gap list: \
+         they are catalog types a client reads and never stores an array of, so `_int2vector` and \
+         `_oidvector` would be two types nothing writes and nothing reads. Every other column of \
+         both rows agrees — including `typcategory` **A** and the `typelem` that says a vector is \
+         made of its element, which is the fact this unit's input functions are built on.",
+        "pg19_catalog_vectors.txt:44",
+    )],
 };
 
 #[test]
