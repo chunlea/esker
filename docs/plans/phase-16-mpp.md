@@ -710,19 +710,71 @@ introduced it (`68bfdf02`) names 0073 in its message and that is now wrong; it i
 rather than rewritten, because the history is what a reader greps and a message that silently
 disagreed with the file would be worse than one that is corrected in the open.
 
-### J11. What is left, and the one thing it needs
+### J11. What was left — **built 2026-09-05, and this section did not say so**
 
-Built: the red differential, `Expr::In` with its ADR, and `EXPLAIN` naming an engine for every join
-with the rule that refused it. Left: the rewrite itself — collect the inner side's key set at
-resolve time, in the same transaction at the same snapshot, and put it into the outer fragment's
-filter as an `In`.
+> **Corrected 2026-09-09.** What follows described the state before `2e368a98`, and stayed after it.
+> The cost of that is on the record: the unit was ruled on again four days later, and it was one
+> `git log -S` away from being built twice. A plan section that names something as *left* is a
+> request for work, so it has to be closed by the commit that answers it.
 
-That needs the plan to carry **which inner table and column to read**, and the node that carries a
-routing decision is `routing::Columnar` in `crates/esker-sql/src/plan/routing.rs` — one field, in a
-directory this lane was told to stay out of. The seam itself has a precedent in the same call site:
-`subquery::resolve(&mut planned.node, &*txn, tenant)` already does exactly this shape of work with a
-transaction in hand. Asked of the coordinator and not yet answered; until it is, this file is the
-specification and the red test is the acceptance.
+Built on 2026-09-05 by `2e368a98`, all of it:
+
+* **the field** — `routing::Columnar::semi_join`, carrying the inner key plan, the outer fragment
+  slot and the inner table's name. The commit records the grant in its own words: *"the one field
+  this lane was granted in `src/plan`"*, so the permission this section asks for had already been
+  given when it was written;
+* **the rewrite** — `exec::fragment::push_the_semi_join_down`, called from `resolve` at exactly the
+  seam this section names, reading the key set through `Cursor::open` in the same transaction at
+  the same snapshot as both the fragment and the fallback, folding it into the filter as an
+  `Expr::In` and `And`-ing it with whatever filter was already there;
+* **the edges** — a NULL key dropped (it matches nothing, and `Expr::In` refuses a list holding
+  one), an inner side with no rows expressed as a literal `false` rather than an empty `IN`, the
+  values sorted and deduplicated into the strictly ascending order the decoder requires, and a key
+  of a type no fragment carries refused rather than silently turned into a NULL;
+* **the cap and the fallback** — more than `MAX_IN_VALUES` keys refuses with a reason and the row
+  plan answers, at the same snapshot;
+* **`EXPLAIN`** — `Semi Join Filter: dk in d  (2 keys)`, the inner table and the key count;
+* **the acceptance** — `a_join_over_columnar_tables_answers_what_the_row_engine_answers`, which
+  asserts its own denominator, plus `explain_shows_the_join_it_absorbed`,
+  `a_join_whose_inner_side_is_empty_answers_zero_on_both_engines` and
+  `a_join_the_rewrite_cannot_express_stays_on_the_rows`. Green in the tree.
+
+**What is actually left is the number.** `MAX_IN_VALUES` is 4,096 and it is a *format* limit — the
+most keys a fragment can carry — which is not the same question as the most keys it is *worth*
+carrying. Nothing has measured where an `In` of N keys pushed to every region stops beating a
+nested loop on the row path, and a planner-side threshold below the format's ceiling is what that
+measurement would buy. Until it is measured the cap is the format's, which is safe and possibly
+generous.
+
+### The number: what is being asked, and what the answer will be worth
+
+`MAX_IN_VALUES` is a **format** ceiling — the most keys a fragment can carry, checked by the codec
+and enforced again in `push_the_semi_join_down`. The planner has no threshold of its own, so today
+every join the rewrite can express is pushed down, up to 4,096 keys.
+
+**The two costs move in opposite directions**, which is why a crossover should exist at all:
+
+* the **pushdown** grows with N — N values encoded into the fragment, shipped to *every* region of
+  the outer table, and a binary search per scanned row over an N-value list. And the larger N is,
+  the *less* the filter removes: at the extreme it matches nearly every row, so the membership test
+  is paid on all of them and buys nothing;
+* the **nested loop** is roughly flat in N — it scans the outer table and probes the inner one per
+  row, and the inner side being narrower changes how many rows *survive*, not how many are probed.
+
+So the question is where the growing line crosses the flat one, and the answer is a planner-side
+threshold: above it, refuse the rewrite with a reason and let the row plan answer — the fallback
+that already exists, at the same snapshot, with `EXPLAIN` naming the refusal.
+
+**What the measurement will be worth, stated before it is taken.** The fixture is one region's
+worth of outer rows, so the shipping cost is paid **once**. A table spread over R regions pays it R
+times, and the per-row binary search is paid on each region's own rows — so a threshold measured
+here is an **upper bound**: the real crossover on a split table is at a *smaller* N, never a larger
+one. If the curve says "no crossover below the ceiling", that is an answer too, and it means the
+ceiling is the right place to stop for a single-region table and an open question for a wide one.
+
+The other thing recorded per row is whether the columns **actually answered**. A pushdown that
+refused and fell back is the row path timed twice, and a curve made of that would show the two paths
+identical everywhere — §10's free agreement, wearing a stopwatch.
 
 ## J12. `08006 … key is not in region 0`, and what a fragment may do about it
 
@@ -1112,3 +1164,121 @@ It watches `Backend::schema_lease_remaining()` — literally the value the write
 `25006` — rather than any proxy for it. The slow-report wrapper forwards `schema_lease_remaining`
 and `schema_step_interval` explicitly: both have trait defaults, and a wrapper that inherited them
 would answer "this node may always write" from the very object the test uses to watch a lease lapse.
+
+## J14. The two engines disagreed once — 2026-09-09, not reproduced, and what will say so next time
+
+`esker-sql::routing_differential the_two_engines_agree_while_a_writer_keeps_committing` failed once
+in the gate for `76001434` at 03:18, at load 8–10:
+
+```text
+the two engines disagree (under a writer) on
+`SELECT region, count(*) FROM t GROUP BY region ORDER BY region` at 468962246262784000
+routed: [[north 711], [south 8]]
+```
+
+The row engine's answer is not in the record — the gate log keeps the first lines of a failure and
+the diagnosis was cut one line short of it, which is the first thing this section is here to stop
+happening again.
+
+### What it cannot be
+
+**Two different moments.** `compare` pins both runs to one instant with
+`SET TRANSACTION SNAPSHOT 'esker-<16 hex>'` — by token rather than by `read_as_of`, because a TSO
+timestamp's logical half is what separates two commits inside one millisecond and no time a user can
+write carries it. And the contract is explicit that the instant is enough: `FragmentReq::ts` is
+**one number with two jobs**, the snapshot the request is made under *and* the MVCC visibility the
+evaluator applies while it scans, deliberately separate from `min_apply_index` because *"they fail
+differently — one refuses with `TooFarBehind`, the other silently returns older data"*.
+
+So at one pinned `ts`, two answers is a wrong answer. What it does **not** say is which side, and
+that is exactly what the record could not settle.
+
+### Ten rounds, and they do not reproduce it
+
+`the_two_engines_agree_while_a_writer_keeps_committing`, alone, ten times, 2026-09-09:
+
+| rounds | one-minute load | result |
+|---|---|---|
+| 1–2 | 4.6 – 4.9 (quiet) | green, 11–25 s |
+| 3–5 | 10.0 – 15.2 | green, 25–58 s |
+| 6–8 | 16.3 – 16.7 | green, 22–86 s |
+| 9–10 | 13.6 – 14.4 | green, 22–24 s |
+
+The load was ambient — other lanes building and a gate running — rather than an arm, and it is
+recorded because it happens to span the band the sighting fell in and four rounds above it. Ten
+green says the window is narrow, and nothing else. *(The controlled six-thread arm is a separate
+row; see the handover for its numbers.)*
+
+### The other red this test has, and why it must not be read as this one
+
+Under a **six-thread arm on a box already at 31**, round 3 of five failed — and not as a
+disagreement:
+
+```text
+the snapshot imports: StoreUnavailable("gave up after 9 attempts: peer is not the leader of region 1")
+```
+
+That is the three-store cluster losing its leader while the box is starved, caught at
+`SET TRANSACTION SNAPSHOT` before either engine answered anything. It is an **availability**
+failure of the harness, it happens at a load band far above the one the sighting fell in (8–10),
+and in a gate log it appears under the same test name as the thing being hunted.
+
+Worth stating because the two want opposite readings: a disagreement is a wrong answer and a
+`not the leader` is a machine with nothing left. A red on this test is not evidence of the first
+until its message has been looked at.
+
+### The instrument, so the next sighting is self-diagnosing
+
+Three things are printed on a disagreement now, and one of the three the investigation asked for
+turns out not to exist.
+
+1. **Ask again, at the same instant, in the reverse order.** A snapshot is a function: one `ts`
+   must answer the same rows for ever, on either engine. So the second pair separates two
+   investigations that want opposite work — *disagreeing again* is a **deterministic wrong answer**
+   (go to the runs), *agreeing the second time* means the read was **never pinned** (go to the read
+   path). Reversing the order distinguishes "it follows the engine" from "it follows which ran
+   first".
+2. **Every store's applied index**, taken in process from the harness's own stores.
+3. **A run's `[lo, hi]` window does not exist**, and asking for one is the wrong question here:
+   runs hold **every version** and visibility is resolved at read time — *"the newest version of
+   each key with `commit_ts <= ts`"* — so a run is bounded by an **apply index**, not by a time.
+   Point 2 is what stands in for it. Putting an apply index on `FragmentResp` would be a format
+   change for a diagnostic, and it is not made for one.
+
+### What a deterministic probe now rules out
+
+`a_pinned_snapshot_does_not_move_when_later_rows_commit` asks the sequential half of the same
+question and **passes**: take an instant, answer it on both engines, commit a hundred rows, answer
+the same instant again — nothing moves on either side, and the columns did answer (the test fails if
+they refused both times, which would have been the row engine compared with itself).
+
+So visibility at a pinned `ts` is sound when the commits are *between* the reads. Whatever the
+window is, it needs a commit landing **while** a fragment is being evaluated. That is a narrowing
+worth having: it is measured rather than argued, it is permanent, and it costs 1.7 s.
+
+It also removes the asymmetry the concurrent test cannot control. There the routed run goes first
+and the row run second, so **whichever engine fails to pin sees more commits by the time it runs** —
+one number cannot say which failed. The probe asks each engine to agree with *itself* across a
+hundred commits, and the instrument above re-asks in the reverse order for the same reason.
+
+### The nearest prior, and what would tell them apart
+
+[J13](#j13-a-fragment-answered-from-a-copy-that-did-not-have-the-row--2026-09-05) is the same family
+of question and was closed on 2026-09-05: a columnar copy that missed one Raft entry after a
+snapshot install answered **four rows where the scan had five**. Its fix — `ColumnarSlot::saw(index)`
+dropping an open copy the moment an entry does not follow the last one it saw — is a gap detector,
+and a gap of that kind should no longer be reachable.
+
+So the direction of the error is what separates them, and it is the number the record lost:
+
+* the columnar side **lower** than the rows is J13's shape — a copy missing versions — and would
+  mean the detector has a hole;
+* the columnar side **higher** is not J13's shape at all. Nothing in a missing-entry story adds
+  rows. It would point instead at version resolution: `scan::visible`'s resolver carries **one**
+  settled key, which is sound only while the merged stream is globally ordered by key, and
+  `scan::merged::order` skips a key column it cannot read on either side rather than treating the
+  rows as incomparable.
+
+That second sentence is a place to look, **not a finding** — no measurement here supports it, and
+the ten rounds say nothing about it either way. It is written down so the next sighting is read
+against something rather than from scratch.
