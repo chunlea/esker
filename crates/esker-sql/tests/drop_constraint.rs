@@ -20,10 +20,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `pg_indexes.indexname` is a `name` on a real server and `text` here, with the same
     // characters — the standing trade every `pg_catalog` column makes. Three occurrences.
-    types: &[
-        "SELECT 'r', indexname FROM pg_indexes WHERE tablename IN ('dcp','dcc') ORDER BY indexname",
-        "SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'dcp' ORDER BY indexname",
-    ],
+    types: &[],
     answers: &[
         // `ALTER COLUMN … SET NOT NULL` was here, refused because it has to check every row.
         // It now runs the scan and is gone from this list (ADR 0031 rule 2) —

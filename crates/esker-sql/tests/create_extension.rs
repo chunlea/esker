@@ -11,11 +11,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `extname` and `name` are `name` on a real server and `text` here — the standing trade.
-    types: &[
-        "SELECT extname, extversion FROM pg_extension ORDER BY extname",
-        "SELECT extname, extversion FROM pg_extension WHERE extname IN ('uuid-ossp','pgcrypto') ORDER BY extname",
-        "SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name IN ('uuid-ossp','pgcrypto') ORDER BY name",
-    ],
+    types: &[],
     // **This list was one entry and is now none.** It held `uuid_generate_v4()`, on the argument
     // that `CREATE EXTENSION` records an install and does not bring the functions — and the user
     // ruled the other way: the allowlist means the extension *and* what it promises, because a

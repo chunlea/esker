@@ -21,9 +21,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `pg_indexes.indexname` is a `name` there and `text` here — the standing catalog trade. Three
     // occurrences of the one statement.
     types: &[
-        "SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'ai' ORDER BY indexname",
         "SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = 'ai'::regclass AND contype = 'p'",
-        "SELECT 'r', conname FROM pg_constraint WHERE conrelid = 'ai'::regclass AND contype = 'u'",
     ],
     answers: &[
         // **The four forms `sqlparser` 0.62.0 cannot read.** It parses `RENAME TO` and no other

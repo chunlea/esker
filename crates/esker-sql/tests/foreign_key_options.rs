@@ -22,11 +22,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // characters agree in every case — these lines differ in the type OID alone, which is why they
     // are listed here rather than fixed: the column's values are what `ActiveRecord` reads.
     types: &[
-        "SELECT conname, convalidated, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'fk_notvalid';",
         "SELECT conname, confdeltype, confupdtype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'fk_setnull';",
         "SELECT conname, confdeltype, confupdtype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'fk_setnull_u';",
-        "SELECT conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'fk_deferred';",
-        "SELECT conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'fk_immediate';",
         "SELECT t2.oid::regclass::text AS to_table, c.conname AS name, c.confupdtype AS on_update, c.confdeltype AS on_delete, c.convalidated AS valid, c.condeferrable AS deferrable, c.condeferred AS deferred, ( SELECT array_agg(a.attname ORDER BY idx) FROM ( SELECT idx, c.conkey[idx] AS conkey_elem FROM generate_subscripts(c.conkey, 1) AS idx ) indexed_conkeys JOIN pg_attribute a ON a.attrelid = t1.oid AND a.attnum = indexed_conkeys.conkey_elem ) AS conkey_names, ( SELECT array_agg(a.attname ORDER BY idx) FROM ( SELECT idx, c.confkey[idx] AS confkey_elem FROM generate_subscripts(c.confkey, 1) AS idx ) indexed_confkeys JOIN pg_attribute a ON a.attrelid = t2.oid AND a.attnum = indexed_confkeys.confkey_elem ) AS confkey_names FROM pg_constraint c JOIN pg_class t1 ON c.conrelid = t1.oid JOIN pg_class t2 ON c.confrelid = t2.oid JOIN pg_namespace n ON c.connamespace = n.oid WHERE c.contype = 'f' AND t1.relname = 'fko_child' AND n.nspname = ANY (current_schemas(false)) ORDER BY c.conname;",
     ],
     answers: &[],

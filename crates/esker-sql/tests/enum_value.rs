@@ -44,11 +44,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // and `text` here, which is the trade `'x'::regtype` already makes. `enumsortorder` is a
         // `real` on **both**, which is the one column of this view that had to be got right
         // rather than traded: it is not the label's index.
-        "SELECT 'r', t.typname, e.enumlabel, e.enumsortorder FROM pg_enum e JOIN pg_type t ON \
-         t.oid = e.enumtypid WHERE t.typname IN ('mood','tense','emptymood') ORDER BY t.typname, \
-         e.enumsortorder",
-        "SELECT 'r', t.typname, count(*) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid \
-         WHERE t.typname IN ('mood','tense','emptymood') GROUP BY t.typname ORDER BY t.typname",
         "SELECT 'r', e.enumsortorder, pg_typeof(e.enumsortorder) FROM pg_enum e JOIN pg_type t ON \
          t.oid = e.enumtypid WHERE t.typname = 'mood' ORDER BY e.enumsortorder",
         "SELECT 'r', t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_enum e \

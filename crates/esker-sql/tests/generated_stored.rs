@@ -15,7 +15,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // all of them are `text` here. **Every row agrees**, `s` and `ALWAYS` included.
     types: &[
         "SELECT attname, attgenerated, attnotnull FROM pg_attribute WHERE attrelid = 'gen'::regclass AND attnum > 0 ORDER BY attnum",
-        "SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'gen'::regclass",
         "SELECT column_name, column_default, is_generated, generation_expression FROM information_schema.columns WHERE table_name = 'gen' AND column_name = 'upper_name'",
     ],
     answers: &[],

@@ -34,40 +34,19 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // and `bigint`. `atttypmod` is an `int4` and `ordinal_position` an `integer` on both. Every
     // value is identical — the harness only reaches this list when the rows already agree.
     types: &[
-        "SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relkind IN ('r','v','m','p','f') AND c.relname IN ('dumpy','dumpz') ORDER BY c.relname",
-        "SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relname = 'dumpy' AND c.relkind IN ('r','p')",
         "SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '\"dumpy\"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
         "SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod, attidentity, attgenerated FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '\"dumpz\"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
-        "SELECT c.collname FROM pg_attribute a LEFT JOIN pg_type t ON a.atttypid = t.oid LEFT JOIN pg_collation c ON a.attcollation = c.oid AND a.attcollation <> t.typcollation WHERE a.attrelid = '\"dumpy\"'::regclass AND a.attnum > 0 ORDER BY a.attnum",
-        "SELECT distinct i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), d.indisvalid FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i','I') AND d.indisprimary = 'f' AND t.relname = 'dumpy' AND n.nspname = ANY (current_schemas(false)) ORDER BY i.relname",
-        "SELECT conname, pg_get_constraintdef(c.oid, true) AS constraintdef, c.convalidated AS valid FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'c' AND t.relname = 'dumpy' AND n.nspname = ANY (current_schemas(false))",
-        "SELECT conname, pg_get_constraintdef(c.oid) AS constraintdef, c.condeferrable, c.condeferred FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'x' AND t.relname = 'dumpy' AND n.nspname = ANY (current_schemas(false))",
         "SELECT conname, contype, pg_get_constraintdef(c.oid) FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'p' AND t.relname = 'dumpz' AND n.nspname = ANY (current_schemas(false))",
-        "SELECT column_name, ordinal_position FROM information_schema.key_column_usage WHERE table_name = 'dumpz' ORDER BY ordinal_position",
-        "SELECT column_name, ordinal_position FROM information_schema.key_column_usage WHERE table_name = 'dumpy' ORDER BY ordinal_position",
         "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = 'dumpy' ORDER BY ordinal_position",
     ],
     answers: &[
-        (
-            "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = '\"dumpy\"'::regclass AND i.indisprimary",
-            "**`primary_keys()`, and the clause is `= ANY(i.indkey)`** — a quantified comparison \
-             over an *array value*, where this node has `= ANY (SELECT …)` over a subquery and no \
-             array types at all. Refused with `0A000` naming the array, ADR 0031 (c), and the \
-             array lane's to close. Every row it would have read is here and agrees, and \
-             `information_schema.key_column_usage` answers the same question in a shape this node \
-             has — `SELECT column_name, ordinal_position … WHERE table_name = 'dumpy'` is `id|1`, \
-             three lines above this one in the corpus.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT t2.oid::regclass::text AS to_table, c.conname AS name FROM pg_constraint c JOIN pg_class t1 ON c.conrelid = t1.oid JOIN pg_class t2 ON c.confrelid = t2.oid JOIN pg_namespace n ON c.connamespace = n.oid WHERE c.contype = 'f' AND t1.relname = 'dumpy' AND n.nspname = ANY (current_schemas(false)) ORDER BY c.conname",
-            "**`foreign_keys()`, and the clause is `t2.oid::regclass::text`** — a cast of a \
-             *column* to `regclass`, where this node resolves `'name'::regclass` from a literal \
-             before the plan is built and has no per-row form of it. Refused by name. The answer \
-             underneath is no rows on both servers, because neither schema has a foreign key — so \
-             this is a missing clause in front of an answer that already agrees.",
-            "UNMEASURED",
-        ),
+        // **Two entries left this list with the `name` columns, and their reasons had gone stale
+        // behind the type difference.** They said `= ANY(i.indkey)` over an array value and a
+        // per-row `t2.oid::regclass::text` were refused `0A000`; both answer now — `id`, and no
+        // rows, which is what the oracle says — and what had kept the *rows* half from being
+        // compared was the declared type: `attname` and `conname` were `text` here and `name`
+        // there. A type divergence standing in front of an answer divergence hides the day the
+        // answer stops diverging, which is the one thing ADR 0031 rule 2 exists to catch.
     ],
 };
 

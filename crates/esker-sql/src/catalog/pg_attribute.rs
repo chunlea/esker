@@ -577,7 +577,7 @@ pub fn default_expression(
 /// The columns of `pg_attribute`, in PostgreSQL's own order.
 pub const ATTRIBUTE_COLUMNS: &[(&str, ColumnType)] = &[
     ("attrelid", ColumnType::Int8),
-    ("attname", ColumnType::Text),
+    ("attname", ColumnType::Name),
     ("atttypid", ColumnType::Int8),
     ("attnum", ColumnType::Int2),
     ("atttypmod", ColumnType::Int4),

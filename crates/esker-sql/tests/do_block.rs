@@ -25,12 +25,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `"char"` — the standing `pg_catalog` trade, with the characters identical.
     types: &[
         "SELECT typname, typtype, typcategory FROM pg_type WHERE typname = 'mood';",
-        "SELECT n.nspname, t.typname FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid \
-         WHERE t.typname = 'test_enum_in_test_schema';",
-        "SELECT n.nspname, t.typname FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid \
-         WHERE t.typname = 'mood_in_other_schema';",
         "SELECT typname, typtype FROM pg_type WHERE typname = 'unused';",
-        "SELECT typname FROM pg_type WHERE typname = 'feeling';",
     ],
     // **A wrong answer, and named as one** (ADR 0031 rule 3) — and it is not this unit's.
     // `'mood'::regtype` answers `42704 type "mood" does not exist` for a type that **is** there:

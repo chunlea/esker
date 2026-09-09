@@ -22,7 +22,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // trade, and the same one `tests/create_extension.rs` records for its own lines.
     types: &[
         "SELECT 'r', name, default_version, installed_version FROM pg_available_extensions WHERE name IN ('hstore','citext','ltree','postgres_fdw') ORDER BY name",
-        "SELECT 'r', extname, extversion FROM pg_extension WHERE extname = 'hstore'",
     ],
     answers: &[
         // **The allowlist is deliberate and is the user's call**, not an oversight: this node

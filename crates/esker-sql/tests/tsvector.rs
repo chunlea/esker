@@ -43,13 +43,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT 'r', cfgname, nspname FROM pg_ts_config c JOIN pg_namespace n ON n.oid = c.cfgnamespace ORDER BY cfgname",
         "SELECT 'r', typname, typtype, typcategory, typdelim, typlen FROM pg_type WHERE typname IN ('tsvector','tsquery','_tsvector','regconfig') ORDER BY typname",
-        "SELECT 'r', a.typname AS array_of_tsvector FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname = 'tsvector'",
-        "SELECT 'r', c.relname, a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE c.relname = 'tsv' AND a.attnum > 0 ORDER BY a.attnum",
         // Part 3's catalog readback. `nspname`, `relname` and `amname` are all three of them
         // `name` on a real server; the **rows** agree, which is what says both indexes were
         // recorded with the access method the statement asked for and that the expression one
         // reads `indkey` 0 with `indexprs` set.
-        "SELECT 'r', n.nspname, c.relname AS index_name, am.amname, i.indnatts, i.indkey::text, i.indexprs IS NOT NULL AS is_expression FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_am am ON am.oid = c.relam WHERE c.relname IN ('c_index_full_text_search','e_index_things_on_name_vector') ORDER BY n.nspname, c.relname",
     ],
     // **The corpus format cannot express this row, and the answer is right.** A row's columns are
     // separated by `|` and a `tsquery`'s *or* operator **is** `|`, so the expected side parses

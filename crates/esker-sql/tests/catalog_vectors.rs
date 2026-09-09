@@ -20,8 +20,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `conkey` half of the same file is not in this list any more, which is the unit.
     types: &[
         "SELECT 'r', indkey[0], indkey[1], array_length(indkey, 1) FROM pg_index WHERE indexrelid = 'vt_ab'::regclass",
-        "SELECT 'r', a.attname FROM pg_attribute a, pg_constraint c WHERE c.conname = 'vt_pkey' AND a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey) ORDER BY a.attname",
-        "SELECT 'r', a.attname FROM pg_attribute a, pg_constraint c WHERE c.conname = 'vt_pkey' AND a.attrelid = c.conrelid AND a.attnum = c.conkey[1]",
         "SELECT 'r', pg_typeof(c.conkey[1]), pg_typeof(i.indkey[0]) FROM pg_constraint c, pg_index i WHERE c.conname = 'vt_pkey' AND i.indexrelid = 'vt_ab'::regclass",
     ],
     answers: &[
@@ -53,14 +51,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // table to its left on a real server — `generate_subscripts(c.conkey, 1)` after
         // `pg_constraint c` — and here the entries are independent, so `c` is not in scope. The
         // same query with the function first is what `tests/generate_subscripts.rs` runs.
-        (
-            "SELECT 'r', a.attname FROM (SELECT idx, c.conkey[idx] AS elem FROM pg_constraint c, \
-             generate_subscripts(c.conkey, 1) AS idx WHERE c.conname = 'vt_pkey') k JOIN \
-             pg_attribute a ON a.attnum = k.elem AND a.attrelid = 'vt'::regclass ORDER BY idx",
-            "a set-returning function in a comma FROM list cannot see the entry to its left \
-             (implicit LATERAL)",
-            "UNMEASURED",
-        ),
     ],
 };
 

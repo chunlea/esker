@@ -524,7 +524,7 @@ impl CatalogView {
         match self {
             CatalogView::PgType => &[
                 ("oid", ColumnType::Int8),
-                ("typname", ColumnType::Text),
+                ("typname", ColumnType::Name),
                 ("typelem", ColumnType::Int8),
                 ("typdelim", ColumnType::Text),
                 ("typinput", ColumnType::Text),
@@ -572,7 +572,7 @@ impl CatalogView {
             // server — the 64-byte identifier type — and `text` here, which compares identically.
             CatalogView::PgClass => &[
                 ("oid", ColumnType::Int8),
-                ("relname", ColumnType::Text),
+                ("relname", ColumnType::Name),
                 ("relnamespace", ColumnType::Int8),
                 ("relkind", ColumnType::Text),
                 ("relhastriggers", ColumnType::Bool),
@@ -602,7 +602,7 @@ impl CatalogView {
             // a `"char"`; both are `text` here, the trade every `pg_catalog` column makes.
             CatalogView::PgAm => &[
                 ("oid", ColumnType::Int8),
-                ("amname", ColumnType::Text),
+                ("amname", ColumnType::Name),
                 ("amtype", ColumnType::Text),
             ],
             // Exactly the five a client reads of it. `opcname` is a `name` on a real server and
@@ -622,7 +622,7 @@ impl CatalogView {
             ],
             CatalogView::PgOpclass => &[
                 ("oid", ColumnType::Int8),
-                ("opcname", ColumnType::Text),
+                ("opcname", ColumnType::Name),
                 ("opcmethod", ColumnType::Int8),
                 ("opcintype", ColumnType::Int8),
                 ("opcdefault", ColumnType::Bool),
@@ -632,10 +632,10 @@ impl CatalogView {
             // exactly what the capture's query does.
             CatalogView::PgTsConfig => &[
                 ("oid", ColumnType::Int8),
-                ("cfgname", ColumnType::Text),
+                ("cfgname", ColumnType::Name),
                 ("cfgnamespace", ColumnType::Int8),
             ],
-            CatalogView::PgNamespace => &[("oid", ColumnType::Int8), ("nspname", ColumnType::Text)],
+            CatalogView::PgNamespace => &[("oid", ColumnType::Int8), ("nspname", ColumnType::Name)],
             // In PostgreSQL's own order, restricted to what this node has — `SELECT *` expands in
             // that order and a client reading by position would otherwise read the wrong column.
             // `attnum` is an `int2` and `atttypmod` an `int4` on both servers, which is two fewer
@@ -645,14 +645,14 @@ impl CatalogView {
             CatalogView::PgIndex => super::pg_index::INDEX_COLUMNS,
             CatalogView::PgConstraint => super::pg_constraint::CONSTRAINT_COLUMNS,
             CatalogView::PgCollation => {
-                &[("oid", ColumnType::Int8), ("collname", ColumnType::Text)]
+                &[("oid", ColumnType::Int8), ("collname", ColumnType::Name)]
             }
             // Exactly the two `ActiveRecord` reads of each, which is this module's standing rule:
             // a column it does not read is `42703`, the answer a real server gives for a name that
             // is not a column at all, rather than a value nobody measured. `extname` is a `name`
             // and the three oids are `oid` on a real server; all four are this node's own types.
             CatalogView::PgExtension => &[
-                ("extname", ColumnType::Text),
+                ("extname", ColumnType::Name),
                 ("extnamespace", ColumnType::Int8),
                 // Added for `CREATE EXTENSION`, which is where a version comes from: the one the
                 // build offers as `default_version`, not one the statement chooses.
@@ -670,12 +670,12 @@ impl CatalogView {
             // server and `text` here.
             CatalogView::PgLanguage => &[
                 ("oid", ColumnType::Int8),
-                ("lanname", ColumnType::Text),
+                ("lanname", ColumnType::Name),
                 ("lanpltrusted", ColumnType::Bool),
             ],
             CatalogView::PgProc => &[
                 ("oid", ColumnType::Int8),
-                ("proname", ColumnType::Text),
+                ("proname", ColumnType::Name),
                 ("pronamespace", ColumnType::Int8),
                 ("prokind", ColumnType::Text),
                 ("pronargs", ColumnType::Int2),
@@ -704,7 +704,7 @@ impl CatalogView {
             CatalogView::PgTrigger => &[
                 ("oid", ColumnType::Int8),
                 ("tgrelid", ColumnType::Int8),
-                ("tgname", ColumnType::Text),
+                ("tgname", ColumnType::Name),
                 ("tgenabled", ColumnType::Text),
                 ("tgtype", ColumnType::Int2),
                 ("tgnargs", ColumnType::Int2),
@@ -715,19 +715,19 @@ impl CatalogView {
             // neither concept: one schema, and no tablespaces — `public` and NULL, which is what
             // a real server answers for an index in the default tablespace too.
             CatalogView::PgIndexes => &[
-                ("schemaname", ColumnType::Text),
-                ("tablename", ColumnType::Text),
-                ("indexname", ColumnType::Text),
-                ("tablespace", ColumnType::Text),
+                ("schemaname", ColumnType::Name),
+                ("tablename", ColumnType::Name),
+                ("indexname", ColumnType::Name),
+                ("tablespace", ColumnType::Name),
                 ("indexdef", ColumnType::Text),
             ],
             // **`viewowner` is here and is empty**, because this node has no roles: the column has
             // to exist for `SELECT * FROM pg_views` to have PostgreSQL's shape, and a name
             // invented for it would be a user nobody created.
             CatalogView::PgViews => &[
-                ("schemaname", ColumnType::Text),
-                ("viewname", ColumnType::Text),
-                ("viewowner", ColumnType::Text),
+                ("schemaname", ColumnType::Name),
+                ("viewname", ColumnType::Name),
+                ("viewowner", ColumnType::Name),
                 ("definition", ColumnType::Text),
             ],
             // A real server's order, so `SELECT *` expands the way a client expects.
@@ -735,10 +735,10 @@ impl CatalogView {
             // this node has neither roles nor tablespaces, and a name invented for one would be an
             // object nobody created.
             CatalogView::PgMatviews => &[
-                ("schemaname", ColumnType::Text),
-                ("matviewname", ColumnType::Text),
-                ("matviewowner", ColumnType::Text),
-                ("tablespace", ColumnType::Text),
+                ("schemaname", ColumnType::Name),
+                ("matviewname", ColumnType::Name),
+                ("matviewowner", ColumnType::Name),
+                ("tablespace", ColumnType::Name),
                 ("hasindexes", ColumnType::Bool),
                 ("ispopulated", ColumnType::Bool),
                 ("definition", ColumnType::Text),
@@ -778,7 +778,7 @@ impl CatalogView {
             // rather than lazy: `rolpassword` is NULL here either way.
             CatalogView::PgRoles | CatalogView::PgAuthid => &[
                 ("oid", ColumnType::Oid),
-                ("rolname", ColumnType::Text),
+                ("rolname", ColumnType::Name),
                 ("rolsuper", ColumnType::Bool),
                 ("rolinherit", ColumnType::Bool),
                 ("rolcreaterole", ColumnType::Bool),
@@ -796,6 +796,10 @@ impl CatalogView {
             // one that returns no rows has **NULL** — measured side by side on an `INSERT` with no
             // `RETURNING`, whose `parameter_types` is `{integer}` and whose `result_types` is NULL.
             CatalogView::PgPreparedStatements => &[
+                // **`text`, not `name`** — the one column in the catalog called `name` that is not
+                // one, measured off `pg_type` rather than read off the column's spelling. A
+                // prepared statement's name is a client's string and not an identifier: it can be
+                // longer than 63 characters and is not truncated.
                 ("name", ColumnType::Text),
                 ("statement", ColumnType::Text),
                 ("prepare_time", ColumnType::TimestampTz),
@@ -807,11 +811,11 @@ impl CatalogView {
             ],
             CatalogView::PgStatActivity => &[
                 ("datid", ColumnType::Oid),
-                ("datname", ColumnType::Text),
+                ("datname", ColumnType::Name),
                 ("pid", ColumnType::Int4),
                 ("leader_pid", ColumnType::Int4),
                 ("usesysid", ColumnType::Oid),
-                ("usename", ColumnType::Text),
+                ("usename", ColumnType::Name),
                 ("application_name", ColumnType::Text),
                 ("client_addr", ColumnType::Text),
                 ("client_hostname", ColumnType::Text),
@@ -841,7 +845,7 @@ impl CatalogView {
             // four others are `text`; this node has one string type and answers `text` for all
             // five, which is the same trade every `pg_catalog` column makes.
             CatalogView::PgAvailableExtensions => &[
-                ("name", ColumnType::Text),
+                ("name", ColumnType::Name),
                 ("default_version", ColumnType::Text),
                 ("installed_version", ColumnType::Text),
                 ("location", ColumnType::Text),
@@ -853,7 +857,7 @@ impl CatalogView {
             // The four the adapter reads, plus the `oid` every catalog relation carries.
             CatalogView::PgDatabase => &[
                 ("oid", ColumnType::Int8),
-                ("datname", ColumnType::Text),
+                ("datname", ColumnType::Name),
                 ("encoding", ColumnType::Int4),
                 ("datcollate", ColumnType::Text),
                 ("datctype", ColumnType::Text),
@@ -888,7 +892,7 @@ impl CatalogView {
             // beside one is not (ADR 0077).
             CatalogView::PgEnum => &[
                 ("enumtypid", ColumnType::Oid),
-                ("enumlabel", ColumnType::Text),
+                ("enumlabel", ColumnType::Name),
                 ("enumsortorder", ColumnType::Real),
             ],
             CatalogView::InformationSchemaTables => super::information_schema::TABLES_COLUMNS,

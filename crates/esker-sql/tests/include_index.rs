@@ -13,9 +13,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // The standing catalog trade: `pg_indexes.indexname` is a `name` on a real server and `text`
     // here, with the same characters in it. The rows agree, `INCLUDE (…)` in the definition
     // included.
-    types: &[
-        "SELECT 'r', indexname, indexdef FROM pg_indexes WHERE tablename = 'companies' ORDER BY indexname",
-    ],
+    types: &[],
     answers: &[
         (
             "CREATE INDEX \"ci_desc\" ON \"companies\" (\"firm_id\") INCLUDE (\"name\" DESC)",

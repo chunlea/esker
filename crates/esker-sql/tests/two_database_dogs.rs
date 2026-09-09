@@ -20,10 +20,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // **`name` there, `text` here** — PostgreSQL's 63-byte identifier type, which compares
     // identically and is the standing choice every catalog view in this crate makes
     // (`tests/coalesce.rs` declares the same fact about the same function).
-    types: &[
-        "SELECT 'r', current_database()",
-        "SELECT 'r', datname FROM pg_database WHERE datname = current_database()",
-    ],
+    types: &["SELECT 'r', current_database()"],
     // **This list is empty now.** It held `'a'::name = 'a'::name`, declared because `name` was
     // "not one of the stored types and has no spelling here at all". It is a stored type as of
     // ADR 0084, the cast answers, and rule 2 says the entry goes rather than becoming a comment

@@ -26,16 +26,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname",
         "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'kc'::regclass ORDER BY conname",
         "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'kb'::regclass ORDER BY conname",
-        "SELECT conname, conindid = 'ka_pkey'::regclass FROM pg_constraint WHERE conrelid = 'ka'::regclass AND contype = 'p'",
         "SELECT conname, conrelid = 'ka'::regclass, confrelid FROM pg_constraint WHERE conrelid = 'ka'::regclass AND contype = 'p'",
         "SELECT conname, confupdtype = ' ', confdeltype = ' ', confrelid, conindid = 0 FROM pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname",
-        "SELECT c.conname FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'p' AND t.relname = 'ka' AND n.nspname = 'public'",
-        "SELECT conname, pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conrelid = 'ka'::regclass AND contype = 'p'",
-        "SELECT conname FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'c' AND t.relname = 'ka' AND n.nspname = 'public'",
-        "SELECT conname FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'f' AND t.relname = 'ka' AND n.nspname = 'public'",
-        "SELECT conname FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'u' AND t.relname = 'ka' AND n.nspname = 'public'",
-        "SELECT conname FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'x' AND t.relname = 'ka' AND n.nspname = 'public'",
-        "SELECT i.relname, x.indisunique, x.indisprimary, x.indkey FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'kd'::regclass ORDER BY i.relname",
     ],
     answers: &[
         (
@@ -51,12 +43,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              (`CLAUDE.md`, \"Ask before doing\"). Until then `schema_dumper` writes \
              `t.index …, unique: true` where a real server writes `t.unique_constraint …`, and \
              the schema that round-trips is the same schema.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT c.conname, c.conindid = i.oid FROM pg_constraint c JOIN pg_class i ON i.oid = c.conindid WHERE c.conrelid = 'kd'::regclass AND c.contype = 'u' ORDER BY c.conname",
-            "the same fact through the join `unique_constraints()` writes: two rows there, none \
-             here.",
             "UNMEASURED",
         ),
         (

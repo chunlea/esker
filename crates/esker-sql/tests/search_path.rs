@@ -19,7 +19,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', current_schemas(false)",
         "SELECT 'r', current_schema()",
         "SELECT 'r', current_schemas(false), current_schemas(true)",
-        "SELECT 'r', n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'made_here'",
     ],
     answers: &[(
         "SELECT 'r', pg_typeof(current_schema()), pg_typeof(current_schemas(false))",

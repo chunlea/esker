@@ -24,7 +24,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `pg_indexes.indexname` is a `name` on a real server and `text` here, with the same
     // characters in it — the standing trade every `pg_catalog` column makes. Both occurrences of
     // the statement, because the entry is per statement text and the capture asks it twice.
-    types: &["SELECT 'r', indexname FROM pg_indexes WHERE tablename = 'dc' ORDER BY indexname"],
+    types: &[],
     answers: &[
         // **`CREATE VIEW` landed (`tests/view.rs`) and deleted the three entries that used to be
         // here** — the view is created, and `pg_class` reports it. What replaces them is the gap

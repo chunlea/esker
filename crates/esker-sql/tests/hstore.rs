@@ -20,13 +20,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // queries, and what it reads out of them is the typname and the typinput, both of which are
     // right.
     types: &[
-        "SELECT 'r', extname, extversion FROM pg_extension WHERE extname IN ('hstore') ORDER BY \
-         extname",
         "SELECT 'r', t.typname, t.typelem, t.typdelim, t.typinput, t.typtype, t.typbasetype, \
          t.typcategory, t.typlen FROM pg_type as t WHERE t.typname IN ('hstore') ORDER BY \
          t.typname",
-        "SELECT 'r', t.typname, t.oid = 0 AS oid_is_zero, t.typarray = 0 AS no_array_type FROM \
-         pg_type t WHERE t.typname IN ('hstore') ORDER BY t.typname",
     ],
     answers: &[
         // **Two operators this unit did not build**, and they are the two nothing in the suite

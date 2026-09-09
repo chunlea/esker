@@ -15,7 +15,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // which is what an array is on this node (`crate::value::vector`). Every row is
     // byte-identical, `{10,20,30,NULL}` and the NULL-first descending form included.
     types: &[
-        "SELECT enumlabel, enumtypid, enumsortorder FROM pg_enum",
         "SELECT type.typname AS name, type.OID AS oid, n.nspname AS schema, array_agg(enum.enumlabel ORDER BY enum.enumsortorder) AS value FROM pg_enum AS enum JOIN pg_type AS type ON (type.oid = enum.enumtypid) JOIN pg_namespace n ON type.typnamespace = n.oid WHERE n.nspname = ANY (current_schemas(false)) GROUP BY type.OID, n.nspname, type.typname",
     ],
     answers: &[],

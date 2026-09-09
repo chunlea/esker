@@ -17,13 +17,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // adapter's own boot queries and what it reads out of them is the typname, the typcategory and
     // the typinput: `citext`, `S`, `citextin`, all right.
     types: &[
-        "SELECT 'r', extname, extversion FROM pg_extension WHERE extname IN ('citext') ORDER BY \
-         extname",
         "SELECT 'r', t.typname, t.typelem, t.typdelim, t.typinput, t.typtype, t.typbasetype, \
          t.typcategory, t.typlen FROM pg_type as t WHERE t.typname IN ('citext') ORDER BY \
          t.typname",
-        "SELECT 'r', t.typname, t.oid = 0 AS oid_is_zero, t.typarray = 0 AS no_array_type FROM \
-         pg_type t WHERE t.typname IN ('citext') ORDER BY t.typname",
     ],
     answers: &[
         // **The standing `text` collation divergence, and the citext answers beside it are

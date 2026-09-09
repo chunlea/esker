@@ -12,27 +12,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `relname` is a `name` on a real server and `text` here, with identical characters — the
     // standing trade every `pg_catalog` column makes.
-    types: &[
-        "SELECT c.relname, p.relname, i.inhseqno FROM pg_inherits i JOIN pg_class c ON c.oid = \
-         i.inhrelid JOIN pg_class p ON p.oid = i.inhparent WHERE c.relname = 'ic'",
-        "SELECT attname FROM pg_attribute WHERE attrelid = 'ic2'::regclass AND attnum > 0 ORDER \
-         BY attnum",
-    ],
-    answers: &[
-        (
-            "SELECT attname, atttypid::regtype::text, attnotnull FROM pg_attribute WHERE attrelid \
-             = 'ic'::regclass AND attnum > 0 ORDER BY attnum",
-            "`atttypid::regtype` is not implemented — contract C2, and it is the *forward* cast: \
-             `'integer'::regtype::oid` runs here because `ActiveRecord` sends it, and reading an \
-             oid back as a type name does not. The fact this line is here for — that a child's \
-             columns are the parent's, with their types and their `NOT NULL` — is asserted \
-             directly in the test below, and the plain `attname` form of the same query agrees \
-             two lines further down.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT tag FROM ONLY ip ORDER BY tag",
-            "**`ONLY` is a contract C1 gap, and it is in the parser rather than here.** \
+    types: &[],
+    answers: &[(
+        "SELECT tag FROM ONLY ip ORDER BY tag",
+        "**`ONLY` is a contract C1 gap, and it is in the parser rather than here.** \
              `sqlparser` 0.62.0 takes the word for `ALTER TABLE` and `LOCK TABLE` and not in a \
              `FROM` clause, so `FROM ONLY ip` parses as the relation `only` aliased `ip` — which \
              is why the answer is `42P01` about a table nobody wrote. It **errors rather than \
@@ -41,9 +24,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              them, and nothing would report it. Registered in the plan's C1 register with \
              `GENERATED … VIRTUAL` and `DROP INDEX CONCURRENTLY`; the fix is the same rewrite \
              mechanism `CONCURRENTLY` already uses.",
-            "UNMEASURED",
-        ),
-    ],
+        "UNMEASURED",
+    )],
 };
 
 #[test]

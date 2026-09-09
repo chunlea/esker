@@ -17,9 +17,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', relkind, relispartition, relhassubclass FROM pg_class WHERE relname = 'measurements'",
         "SELECT 'r', relkind, relispartition FROM pg_class WHERE relname = 'index_measurements_on_logdate_and_city_id'",
         "SELECT 'r', c.relname, c.relkind, c.relispartition FROM pg_class c WHERE c.relname LIKE 'measurements%' ORDER BY c.relname",
-        "SELECT 'r', c.relname, pg_get_expr(c.relpartbound, c.oid) FROM pg_class c WHERE c.relispartition AND c.relname LIKE 'measurements%' ORDER BY c.relname",
-        "SELECT 'r', p.relname AS parent, ch.relname AS child, i.inhseqno FROM pg_inherits i JOIN pg_class p ON p.oid = i.inhparent JOIN pg_class ch ON ch.oid = i.inhrelid WHERE p.relname = 'measurements' ORDER BY ch.relname",
-        "SELECT 'r', c.relname FROM pg_class c WHERE c.relname LIKE 'index_measurements%' ORDER BY c.relname",
     ],
     answers: &[
         (

@@ -21,33 +21,15 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // Every *value* is identical — the harness only reaches this list when the rows agree — and
     // `indkey`'s characters are the ones `ActiveRecord` splits on.
     types: &[
-        "SELECT i.relname, x.indisprimary, x.indisunique, x.indkey, x.indnatts, x.indisvalid, x.indpred IS NULL, x.indexprs IS NULL, x.indnullsnotdistinct FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ia'::regclass ORDER BY i.relname",
-        "SELECT i.relname, x.indisprimary, x.indisunique, x.indkey FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ic'::regclass ORDER BY i.relname",
-        "SELECT i.relname, x.indisprimary, x.indisunique, x.indkey FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ib'::regclass ORDER BY i.relname",
-        "SELECT c.relname FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class c ON d.indexrelid = c.oid WHERE c.relkind IN ('i','I') AND d.indisprimary = 'f' AND t.relname = 'ia' ORDER BY c.relname",
-        "SELECT DISTINCT i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), d.indisvalid FROM pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i','I') AND d.indisprimary = 'f' AND t.relname = 'ia' AND n.nspname = 'public' ORDER BY i.relname",
         "SELECT pg_typeof(indkey), pg_typeof(indisunique), pg_typeof(indnatts) FROM pg_index WHERE indexrelid = 'ia_pkey'::regclass",
     ],
-    answers: &[
-        (
-            "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = '\"ic\"'::regclass AND i.indisprimary",
-            "**`primary_keys()`, and the one statement of it this node cannot answer**: \
-             `attnum = ANY(i.indkey)` is a quantified comparison over an *array value*, where this \
-             node has `= ANY (SELECT …)` over a subquery and no array types at all \
-             (`docs/plans/phase-12-subquery.md` §4). It is refused with `0A000` naming the array, \
-             counted under ADR 0031 (c), and it is the array lane's to close — the rows behind it \
-             are all here and agree. `information_schema.key_column_usage` answers the same \
-             question in a shape this node has, and unit 4 provides it.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT pg_typeof(indkey), pg_typeof(indisunique), pg_typeof(indnatts) FROM pg_index WHERE indexrelid = 'ia_pkey'::regclass",
-            "`pg_typeof` is a function this node does not have, so the statement is `0A000` \
+    answers: &[(
+        "SELECT pg_typeof(indkey), pg_typeof(indisunique), pg_typeof(indnatts) FROM pg_index WHERE indexrelid = 'ia_pkey'::regclass",
+        "`pg_typeof` is a function this node does not have, so the statement is `0A000` \
              naming it rather than answering `int2vector`. What it would have said is the type \
              divergence above, which is declared there.",
-            "UNMEASURED",
-        ),
-    ],
+        "UNMEASURED",
+    )],
 };
 
 #[test]

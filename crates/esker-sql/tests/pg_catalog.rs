@@ -45,18 +45,19 @@ const CORPUS_FIXTURE: &[&str] = &[];
 ///   can see it.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
+        // **Seven rows left this list when `typname` became `name`.** Every one of them projected
+        // `typname` alone, so the only thing that differed was the column's declared type — and
+        // `pg_type.typname` is a `name` on a real server (ADR 0084's sibling unit, g1's catalog
+        // columns). The rows that remain project an `oid` beside it, which is an `oid` there and a
+        // `bigint` here, or a `"char"` column — two types this node does not have.
         "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'int8'",
         "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'text'",
         "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'bool'",
         "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'bytea'",
         "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'float8'",
         "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'timestamptz'",
-        "SELECT typname FROM pg_type WHERE typname IN ('int8', 'text', 'bool', 'bytea', 'float8', 'timestamptz') ORDER BY oid",
         "SELECT oid FROM pg_type WHERE typname IN ('int8', 'text', 'bool', 'bytea', 'float8', 'timestamptz') ORDER BY oid",
-        "SELECT typname FROM pg_type WHERE typname = 'nosuchtype'",
         "SELECT t.oid FROM pg_type AS t WHERE t.typname = 'int8'",
-        "SELECT t.typname FROM pg_type t WHERE t.oid = 20",
-        "SELECT typname FROM pg_type WHERE oid = 20",
         "SELECT typtype FROM pg_type WHERE typname = 'int8'",
         "SELECT typdelim FROM pg_type WHERE typname = 'int8'",
         "SELECT typinput FROM pg_type WHERE typname = 'bool'",
@@ -65,31 +66,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT oid FROM pg_type WHERE typname = 'int8' AND typtype = 'b'",
         "SELECT oid FROM pg_type WHERE typtype IN ('r', 'e', 'd') AND typname IN ('int8', 'text')",
         "SELECT oid FROM pg_type WHERE typelem IN (16, 17) AND typname IN ('int8', 'text')",
-        "SELECT typname FROM pg_type WHERE typname IN ('int8', 'text') ORDER BY typname DESC",
         "SELECT DISTINCT typtype FROM pg_type WHERE typname IN ('int8', 'text', 'bool')",
         "SELECT typtype, count(*) FROM pg_type WHERE typname IN ('int8', 'text', 'bool') GROUP BY typtype",
         "SELECT rngsubtype FROM pg_range WHERE rngtypid = 20",
         "SELECT t.typname, r.rngsubtype FROM pg_type AS t LEFT JOIN pg_range AS r ON t.oid = r.rngtypid WHERE t.typname = 'int8'",
         "SELECT t.typname, r.rngsubtype FROM pg_type AS t LEFT JOIN pg_range AS r ON oid = rngtypid WHERE t.typname IN ('int8', 'text') ORDER BY t.oid",
-        "SELECT t.typname FROM pg_type AS t JOIN pg_range AS r ON oid = rngtypid WHERE t.typname = 'int8'",
-        "SELECT typname FROM pg_type WHERE typname = 'int8'",
     ],
     answers: &[
-        (
-            "SELECT typname FROM pg_type WHERE typname IN ('int8', 'numeric') ORDER BY typname",
-            "**this server's `pg_type` lists this server's types.** A real server answers `int8` \
-             and `numeric`; this one answers `int8`, because `numeric` is a type it refuses by \
-             name. Listing PostgreSQL's standard OIDs instead would tell a client this node has \
-             `numeric` and `int4`, which is a wrong answer rather than a short one. It closes one \
-             type at a time as types arrive.",
-            "pg19_pg_catalog.txt:59",
-        ),
-        (
-            "SELECT typname FROM pg_type WHERE typname = 'numeric'",
-            "the same, on its own and in the shape a client actually asks it: one row there, no \
-             rows here.",
-            "pg19_pg_catalog.txt:60",
-        ),
         (
             "INSERT INTO pg_type (oid, typname) VALUES (99, 'nope')",
             "**every write to a catalog relation is `42501` here.** A real server refuses the \

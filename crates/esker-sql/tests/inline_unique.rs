@@ -15,10 +15,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT conname, contype, condeferrable, condeferred, pg_get_constraintdef(oid) FROM \
          pg_constraint WHERE conrelid = 'tuc'::regclass AND contype = 'u' ORDER BY conname",
-        "SELECT c.relname, i.indisunique, i.indnullsnotdistinct FROM pg_index i JOIN pg_class c ON \
-         c.oid = i.indexrelid WHERE i.indrelid = 'tuc'::regclass ORDER BY c.relname",
-        "SELECT conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM pg_constraint \
-         WHERE conrelid = 'tuc2'::regclass AND contype = 'u'",
     ],
     answers: &[
         (
@@ -39,15 +35,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              would show — `UNIQUE NULLS NOT DISTINCT (a)`, with the clause **before** the column \
              list — is checked on the table-constraint form instead, which reaches it by the \
              same code.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT conname, condeferrable, condeferred, pg_get_constraintdef(oid) FROM \
-             pg_constraint WHERE conrelid = 'tucd'::regclass AND contype = 'u'",
-            "The consequence of the line above: the table was never created. It is in the corpus \
-             because it is what `condeferred` being `t` looks like — the only row in this file \
-             where it is not `f`, and the fact that makes the refusal above necessary rather than \
-             conservative.",
             "UNMEASURED",
         ),
     ],

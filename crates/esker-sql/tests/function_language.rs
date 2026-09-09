@@ -26,9 +26,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `lanname` and `proname` are `name` on a real server and `text` here, with identical
     // characters — the standing trade every `pg_catalog` column makes.
     types: &[
-        "SELECT 'r', lanname, lanpltrusted FROM pg_language ORDER BY lanname",
-        "SELECT 'r', p.proname, l.lanname FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE p.proname = 'fl_gen'",
-        "SELECT 'r', proname FROM pg_proc WHERE proname = 'fl_pl'",
         "SELECT 'r', column_name, column_default FROM information_schema.columns WHERE table_name = 'fl_t' AND column_name = 'id'",
     ],
     answers: &[

@@ -23,12 +23,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     //
     // **Every row still agrees**: `int2vectorout` is the space-separated numbers this column
     // already held, and `ActiveRecord` reads it with `String#split(" ")`.
-    types: &[
-        "SELECT i.relname, x.indkey FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'ak'::regclass ORDER BY i.relname",
-        "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = 'ak'::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)",
-        "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indrelid = 'ak2'::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)",
-        "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE i.indexrelid = 'ak_ab'::regclass ORDER BY array_position(i.indkey, a.attnum)",
-    ],
+    types: &[],
     answers: &[],
 };
 

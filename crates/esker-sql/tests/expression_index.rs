@@ -13,10 +13,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `pg_class.relname` is a `name` on a real server and `text` here — the type this node does
     // not have, provided where the client's use of it is text-shaped (`catalog::pg_index`). The
     // rows agree; only the declared type does not.
-    types: &[
-        "SELECT i.relname, x.indnatts, x.indisunique, x.indkey::text, pg_get_expr(x.indexprs, x.indrelid), pg_get_expr(x.indpred, x.indrelid) FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'xidx'::regclass ORDER BY i.relname",
-        "SELECT a.attnum, a.attname FROM pg_attribute a WHERE a.attrelid = 'xidx_mixed'::regclass ORDER BY a.attnum",
-    ],
+    types: &[],
     // Three, all of them `pg_get_indexdef`'s **text** and none of them the index's behaviour:
     // this node stores the expression as its parser renders it and PostgreSQL re-prints a parsed
     // tree, so the two agree wherever sqlparser's rendering is PostgreSQL's and differ where it

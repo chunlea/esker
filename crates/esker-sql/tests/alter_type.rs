@@ -34,8 +34,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // characters — the standing trade every `pg_catalog` column makes.
     types: &[
         "SELECT 'r', enumlabel, enumsortorder FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'at_mood' ORDER BY enumsortorder",
-        "SELECT 'r', enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'at_mood' ORDER BY enumsortorder",
-        "SELECT 'r', typname FROM pg_type WHERE typname IN ('at_mood','at_feeling')",
     ],
     answers: &[(
         "SELECT 'r', enumlabel, enumsortorder FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'at_mood' ORDER BY enumsortorder",

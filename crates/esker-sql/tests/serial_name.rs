@@ -35,10 +35,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // produced.
         "SELECT 'r', c.relname, c.relkind FROM pg_class c WHERE c.relname LIKE \
          'postgresql_serials%' ORDER BY c.relname",
-        "SELECT 'r', c.relname FROM pg_class c WHERE c.relkind = 'S' AND (c.relname LIKE 'foo%') \
-         ORDER BY c.relname",
-        "SELECT 'r', c.relname, length(c.relname) AS name_length FROM pg_class c WHERE c.relkind \
-         = 'S' AND c.relname LIKE 'long_table_name%' ORDER BY c.relname",
     ],
     answers: &[
         (

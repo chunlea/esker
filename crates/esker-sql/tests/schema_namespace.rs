@@ -24,12 +24,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT 'r', current_schema",
         "SELECT 'r', current_schemas(false)",
-        "SELECT 'r', nspname FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN ('information_schema') ORDER by nspname",
-        "SELECT 'r', nspname FROM pg_namespace WHERE nspname !~ '^pg_.*' AND nspname NOT IN ('information_schema') ORDER by nspname",
-        "SELECT 'r', c.relname, n.nspname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'things' AND c.relkind IN ('r','v','m','p','f') ORDER BY n.nspname",
-        "SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'test_schema' AND c.relname = 'things' AND c.relkind IN ('r','v','m','p','f')",
-        "SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ANY (current_schemas(false)) AND c.relname = 'things' AND c.relkind IN ('r','v','m','p','f')",
-        "SELECT 'r', nspname FROM pg_namespace WHERE nspname LIKE 'test_schema%' ORDER BY nspname",
         "SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname LIKE 'test_schema%' ORDER BY n.nspname, c.relname",
     ],
     answers: &[

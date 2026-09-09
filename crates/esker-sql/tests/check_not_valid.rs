@@ -25,10 +25,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `conname` is a `name` on a real server and `text` here, with identical characters — the
     // standing trade every `pg_catalog` column makes.
-    types: &[
-        "SELECT 'r', conname, convalidated FROM pg_constraint WHERE conname = 'quantity_check'",
-        "SELECT 'r', conname, convalidated FROM pg_constraint WHERE conname = 'u_check'",
-    ],
+    types: &[],
     answers: &[],
 };
 

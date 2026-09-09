@@ -15,7 +15,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `column_default` is a `character varying`; all three are `text` here. **Every row agrees**,
     // `gen_random_uuid()` and `uuid_generate_v4()` printed byte for byte.
     types: &[
-        "SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'du'::regclass ORDER BY a.attnum",
         "SELECT column_name, column_default FROM information_schema.columns WHERE table_name = 'du' ORDER BY ordinal_position",
     ],
     answers: &[],

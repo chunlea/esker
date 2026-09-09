@@ -26,10 +26,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT 'r', t.typname, t.typelem::regtype, t.typcategory, t.typinput FROM pg_type t \
          WHERE t.typname IN ('_tsrange','_tstzrange') ORDER BY t.typname",
-        "SELECT 'r', b.typname, a.typname AS array_name, a.typelem = b.oid AS points_back FROM \
-         pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname IN \
-         ('tsrange','tstzrange','daterange','numrange','int4range','int8range') ORDER BY \
-         b.typname",
         "SELECT 'r', pg_typeof(ARRAY['[1,10]']::int4range[]), \
          pg_typeof((ARRAY['[1,10]']::int4range[])[1])",
         "SELECT 'r', typname, typtype, typcategory FROM pg_type WHERE typname IN \

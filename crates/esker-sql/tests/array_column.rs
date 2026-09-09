@@ -18,10 +18,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // identical — the trade every `pg_catalog` column makes. **Every row in this corpus agrees**,
     // this one included; what differs is the OID a client is told for one column of one catalog
     // query, and `format_type`'s own answer beside it is right.
-    types: &[
-        "SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE \
-         a.attrelid = 'bigint_array'::regclass AND a.attnum > 0 ORDER BY a.attnum",
-    ],
+    types: &[],
     answers: &[],
 };
 

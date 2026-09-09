@@ -28,10 +28,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // here — the trade `'x'::regtype` already makes. The `pg_typeof` line's *values* are the
         // point and they are right: `daterange` and `boolean`, which is what says the constructor
         // answers a range and not a string.
-        "SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = \
-         'tec_gist_x'",
-        "SELECT 'r', am.amname, x.indisexclusion FROM pg_class i JOIN pg_am am ON am.oid = \
-         i.relam JOIN pg_index x ON x.indexrelid = i.oid WHERE i.relname = 'tec_gist_x'",
         "SELECT 'r', pg_typeof(daterange('2026-01-01','2026-02-01')), \
          pg_typeof(daterange('2026-01-01','2026-02-01') && daterange('2026-01-01','2026-02-01'))",
     ],

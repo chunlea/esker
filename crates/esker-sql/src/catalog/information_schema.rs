@@ -83,8 +83,8 @@ pub fn tables(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
 /// node has no database name to report and a constant would be a value nobody measured. What is
 /// left is what the capture reads — a domain described the way a column of its base type would be.
 pub const DOMAINS_COLUMNS: &[(&str, ColumnType)] = &[
-    ("domain_schema", ColumnType::Text),
-    ("domain_name", ColumnType::Text),
+    ("domain_schema", ColumnType::Name),
+    ("domain_name", ColumnType::Name),
     ("data_type", ColumnType::Text),
     ("numeric_precision", ColumnType::Int4),
     ("numeric_scale", ColumnType::Int4),
@@ -119,8 +119,8 @@ pub fn domains(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
 
 /// The columns of `information_schema.views`, in the standard's order.
 pub const VIEWS_COLUMNS: &[(&str, ColumnType)] = &[
-    ("table_schema", ColumnType::Text),
-    ("table_name", ColumnType::Text),
+    ("table_schema", ColumnType::Name),
+    ("table_name", ColumnType::Name),
     ("view_definition", ColumnType::Text),
     ("is_updatable", ColumnType::Text),
     ("is_insertable_into", ColumnType::Text),
@@ -536,16 +536,16 @@ fn datetime_precision(column: &ColumnDef) -> Datum {
 /// the executor — so there is no name to report and a constant would be a value nobody measured.
 /// `42703`, the same answer `pg_range` gives for `oid`.
 pub const TABLES_COLUMNS: &[(&str, ColumnType)] = &[
-    ("table_schema", ColumnType::Text),
-    ("table_name", ColumnType::Text),
+    ("table_schema", ColumnType::Name),
+    ("table_name", ColumnType::Name),
     ("table_type", ColumnType::Text),
 ];
 
 /// The columns of `information_schema.columns`, in the standard's order.
 pub const COLUMNS_COLUMNS: &[(&str, ColumnType)] = &[
-    ("table_schema", ColumnType::Text),
-    ("table_name", ColumnType::Text),
-    ("column_name", ColumnType::Text),
+    ("table_schema", ColumnType::Name),
+    ("table_name", ColumnType::Name),
+    ("column_name", ColumnType::Name),
     ("ordinal_position", ColumnType::Int4),
     ("column_default", ColumnType::Text),
     ("is_nullable", ColumnType::Text),
@@ -554,7 +554,7 @@ pub const COLUMNS_COLUMNS: &[(&str, ColumnType)] = &[
     ("numeric_precision", ColumnType::Int4),
     ("numeric_scale", ColumnType::Int4),
     ("datetime_precision", ColumnType::Int4),
-    ("udt_name", ColumnType::Text),
+    ("udt_name", ColumnType::Name),
     ("is_identity", ColumnType::Text),
     ("identity_generation", ColumnType::Text),
     ("is_generated", ColumnType::Text),
@@ -565,20 +565,20 @@ pub const COLUMNS_COLUMNS: &[(&str, ColumnType)] = &[
     // declared as an ordinary type (ADR 0065). This is the one column that tells the two apart
     // here: `data_type` and `udt_name` both report the *base* type — measured, a `custom_money`
     // column over `numeric(8,2)` says `numeric` for both and `dm_money` only here.
-    ("domain_name", ColumnType::Text),
+    ("domain_name", ColumnType::Name),
     // **Last again.** The schema the `udt_name` type lives in — `pg_catalog` for every built-in,
     // which is what a column of a domain over one reports too, because `udt_name` is the *base*
     // type's. A client that qualifies a type name reads it, and asking for a column this view
     // does not have is `42703`.
-    ("udt_schema", ColumnType::Text),
+    ("udt_schema", ColumnType::Name),
 ];
 
 /// The columns of `information_schema.table_constraints`, in the standard's order.
 pub const TABLE_CONSTRAINTS_COLUMNS: &[(&str, ColumnType)] = &[
-    ("constraint_schema", ColumnType::Text),
-    ("constraint_name", ColumnType::Text),
-    ("table_schema", ColumnType::Text),
-    ("table_name", ColumnType::Text),
+    ("constraint_schema", ColumnType::Name),
+    ("constraint_name", ColumnType::Name),
+    ("table_schema", ColumnType::Name),
+    ("table_name", ColumnType::Name),
     ("constraint_type", ColumnType::Text),
     ("is_deferrable", ColumnType::Text),
     ("initially_deferred", ColumnType::Text),
@@ -586,21 +586,21 @@ pub const TABLE_CONSTRAINTS_COLUMNS: &[(&str, ColumnType)] = &[
 
 /// The columns of `information_schema.key_column_usage`, in the standard's order.
 pub const KEY_COLUMN_USAGE_COLUMNS: &[(&str, ColumnType)] = &[
-    ("constraint_schema", ColumnType::Text),
-    ("constraint_name", ColumnType::Text),
-    ("table_schema", ColumnType::Text),
-    ("table_name", ColumnType::Text),
-    ("column_name", ColumnType::Text),
+    ("constraint_schema", ColumnType::Name),
+    ("constraint_name", ColumnType::Name),
+    ("table_schema", ColumnType::Name),
+    ("table_name", ColumnType::Name),
+    ("column_name", ColumnType::Name),
     ("ordinal_position", ColumnType::Int4),
     ("position_in_unique_constraint", ColumnType::Int4),
 ];
 
 /// The columns of `information_schema.referential_constraints`, which has no rows.
 pub const REFERENTIAL_CONSTRAINTS_COLUMNS: &[(&str, ColumnType)] = &[
-    ("constraint_schema", ColumnType::Text),
-    ("constraint_name", ColumnType::Text),
-    ("unique_constraint_schema", ColumnType::Text),
-    ("unique_constraint_name", ColumnType::Text),
+    ("constraint_schema", ColumnType::Name),
+    ("constraint_name", ColumnType::Name),
+    ("unique_constraint_schema", ColumnType::Name),
+    ("unique_constraint_name", ColumnType::Name),
     ("match_option", ColumnType::Text),
     ("update_rule", ColumnType::Text),
     ("delete_rule", ColumnType::Text),

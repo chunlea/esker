@@ -762,7 +762,7 @@ fn not_null_of(oid: i64) -> Option<(u64, i16)> {
 /// The columns of `pg_constraint`, in PostgreSQL's own order.
 pub const CONSTRAINT_COLUMNS: &[(&str, ColumnType)] = &[
     ("oid", ColumnType::Int8),
-    ("conname", ColumnType::Text),
+    ("conname", ColumnType::Name),
     ("connamespace", ColumnType::Int8),
     ("contype", ColumnType::Text),
     ("condeferrable", ColumnType::Bool),

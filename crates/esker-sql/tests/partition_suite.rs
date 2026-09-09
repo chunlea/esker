@@ -20,41 +20,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // agrees** — including the `ON ONLY`, the `int2vector`\u{2019}s `2 1`, and the partition\u{2019}s own
     // `pk_part_1_pkey`.
     types: &[
-        "SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE \
-         n.nspname = ANY (current_schemas(false)) AND c.relname = 'partitioned_events' AND c.relkind IN \
-         ('r','v','m','p','f')",
         "SELECT 'r', relkind, relhassubclass FROM pg_class WHERE relname = 'partitioned_events'",
-        "SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE \
-         n.nspname = ANY (current_schemas(false)) AND c.relname = 'measurements' AND c.relkind IN \
-         ('r','v','m','p','f')",
-        "SELECT 'r', c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace WHERE \
-         n.nspname = ANY (current_schemas(false)) AND c.relname = 'measurements_toronto' AND c.relkind IN \
-         ('r','v','m','p','f')",
-        "SELECT 'r', i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), d.indisvalid FROM \
-         pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = \
-         i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i', 'I') AND \
-         d.indisprimary = 'f' AND t.relname = 'measurements' AND n.nspname = ANY (current_schemas(false)) \
-         ORDER BY i.relname",
-        "SELECT 'r', i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), d.indisvalid FROM \
-         pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON d.indexrelid = \
-         i.oid LEFT JOIN pg_namespace n ON n.oid = t.relnamespace WHERE i.relkind IN ('i', 'I') AND \
-         d.indisprimary = 'f' AND t.relname = 'measurements_toronto' AND n.nspname = ANY \
-         (current_schemas(false)) ORDER BY i.relname",
-        "SELECT 'r', parent.relname FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class child ON \
-         i.inhrelid = child.oid JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid LEFT JOIN \
-         pg_namespace n ON n.oid = child.relnamespace WHERE child.relname = 'measurements_toronto' AND \
-         child.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))",
-        "SELECT 'r', parent.relname FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class child ON \
-         i.inhrelid = child.oid JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid LEFT JOIN \
-         pg_namespace n ON n.oid = child.relnamespace WHERE child.relname = 'trains' AND child.relkind IN \
-         ('r','p') AND n.nspname = ANY (current_schemas(false))",
         "SELECT 'r', relkind, relhassubclass FROM pg_class WHERE relname = 'pk_part'",
         "SELECT 'r', conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = \
          'pk_part'::regclass",
-        "SELECT 'r', i.relname, x.indisprimary, x.indisunique FROM pg_index x JOIN pg_class i ON i.oid = \
-         x.indexrelid WHERE x.indrelid = 'pk_part'::regclass",
-        "SELECT 'r', i.relname, x.indisprimary FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid \
-         WHERE x.indrelid = 'pk_part_1'::regclass",
         "SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = 'pk_part_1'::regclass",
     ],
     answers: &[(

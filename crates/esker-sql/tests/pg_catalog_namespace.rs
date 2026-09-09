@@ -25,8 +25,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // which compare identically and are the standing choice every catalog view in this crate
     // makes. Every row below has the right *rows*.
     types: &[
-        "SELECT 'r', nspname FROM pg_namespace WHERE nspname IN \
-         ('public','pg_catalog','information_schema') ORDER BY nspname",
         "SELECT 'r', current_schema(), current_schemas(false), current_schemas(true)",
         "SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid \
          = c.relnamespace WHERE c.relname IN \
@@ -39,16 +37,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE \
          a.attrelid = 'pg_namespace'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY \
          a.attnum",
-        "SELECT 'r', a.attname FROM pg_attribute a WHERE a.attrelid = 'pg_views'::regclass AND \
-         a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
         "SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE \
          a.attrelid = 'pg_sequence'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY \
          a.attnum",
         "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND \
          a.attnum = ANY(i.indkey) WHERE i.indrelid = '\"pg_type\"'::regclass AND i.indisprimary \
          ORDER BY array_position(i.indkey, a.attnum)",
-        "SELECT 'r', table_schema, table_name FROM information_schema.tables WHERE table_name = \
-         'ns_books'",
     ],
     answers: &[
         (

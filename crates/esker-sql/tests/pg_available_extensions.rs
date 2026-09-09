@@ -21,8 +21,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT relkind, relname FROM pg_class WHERE relname = 'pg_available_extensions'",
         // `name` is of type `name` there and `text` here, so the first column's declared type
         // differs while every value agrees.
-        "SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name \
-         = 'plpgsql'",
     ],
     answers: &[
         // **`hstore` was three entries here and is now one.** The `CREATE EXTENSION` unit had
@@ -31,12 +29,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // the type, and two of the three started agreeing. The one left is the *version*: a real
         // server's hstore is 1.8 and so is this build's, but `default_version` and
         // `installed_version` are read together and the second is NULL here until an install.
-        (
-            "SELECT name, default_version, installed_version FROM pg_available_extensions WHERE \
-             name = 'hstore'",
-            "read directly, `installed_version` differs from the two probes above it",
-            "pg19_pg_available_extensions.txt:49",
-        ),
         (
             "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = \
              'pg_available_extensions' ORDER BY ordinal_position",
@@ -47,17 +39,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              every column here would report `text` where a real server reports `name` for the \
              first. Nothing reads it; the two methods this view exists for read the view itself.",
             "pg19_pg_available_extensions.txt:39",
-        ),
-        (
-            "SELECT extname, extversion FROM pg_extension ORDER BY extname",
-            "**`pg_extension` is empty here and has no `extversion` column**, which is a standing \
-             decision of its own unit: a row there would tell a client `CREATE FUNCTION … \
-             LANGUAGE plpgsql` will work, and there is no procedural language on this node. It \
-             sits uneasily beside this view, which reports `plpgsql` as *installed* because \
-             `ActiveRecord`'s `extension_enabled?` gates the whole suite on it — the two catalogs \
-             disagree about `plpgsql`, deliberately, and the disagreement is recorded here rather \
-             than resolved by inventing a `pg_extension` row nothing else could honour.",
-            "pg19_pg_available_extensions.txt:50",
         ),
         (
             "SELECT 'g', pg_typeof(name), pg_typeof(default_version), pg_typeof(installed_version) \

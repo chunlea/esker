@@ -32,16 +32,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT column_name, ordinal_position, is_nullable, data_type, column_default FROM information_schema.columns WHERE table_name = 'sb' ORDER BY ordinal_position",
         "SELECT column_name, is_identity, identity_generation, is_generated FROM information_schema.columns WHERE table_name = 'sb' ORDER BY ordinal_position",
         "SELECT constraint_name, constraint_type, table_name, is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE table_name IN ('sa','sb','sc') ORDER BY constraint_name",
-        "SELECT constraint_name, table_name, column_name, ordinal_position, position_in_unique_constraint FROM information_schema.key_column_usage WHERE table_name IN ('sa','sb','sc') ORDER BY constraint_name, ordinal_position",
         "SELECT constraint_catalog, constraint_schema, table_catalog, table_schema FROM information_schema.key_column_usage WHERE table_name = 'sb'",
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('sa','sb') ORDER BY table_name",
         "SELECT c.column_name, c.data_type FROM information_schema.columns c WHERE c.table_name = 'sb' AND c.column_name = 'x'",
-        "SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 'sb' AND constraint_type = 'PRIMARY KEY'",
-        "SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 'sb' AND constraint_type = 'CHECK' ORDER BY constraint_name",
-        "SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 'sb' AND constraint_type = 'FOREIGN KEY'",
-        "SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = 'sb' AND constraint_type = 'UNIQUE'",
-        "SELECT column_name FROM information_schema.columns WHERE table_name = 'sc' ORDER BY ordinal_position",
-        "SELECT column_name, character_maximum_length, numeric_precision, numeric_scale, datetime_precision FROM information_schema.columns WHERE table_name = 'sa' ORDER BY ordinal_position",
     ],
     answers: &[
         (

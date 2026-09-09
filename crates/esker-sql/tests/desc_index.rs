@@ -12,9 +12,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `pg_class.relname` is a `name` on a real server and `text` here — the type this node does
     // not have, provided where the client's use of it is text-shaped. The rows agree.
-    types: &[
-        "SELECT i.relname, x.indkey::text, x.indoption::text FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'xdsc'::regclass ORDER BY i.relname",
-    ],
+    types: &[],
     // Two, both **refusals with a different code** — this node refuses everything PostgreSQL
     // refuses, and reaches the refusal by a different road. Neither is an answer where a real
     // server raises, which is the class ADR 0031 ranks worst.

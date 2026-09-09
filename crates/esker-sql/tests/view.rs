@@ -36,7 +36,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // agree in every case; it is the declared type that differs.
         "SELECT 'r', is_updatable, is_insertable_into FROM information_schema.views WHERE table_name = 'ebooks_distinct'",
         "SELECT 'r', relname, relkind FROM pg_class WHERE relname = 'ebooks_mat'",
-        "SELECT 'r', matviewname FROM pg_matviews WHERE matviewname = 'ebooks_mat'",
     ],
     answers: &[
         (

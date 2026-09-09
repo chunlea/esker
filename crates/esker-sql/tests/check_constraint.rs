@@ -17,13 +17,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // whose values are identical. The same trade every `pg_catalog` column makes.
         "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = \
          'ck'::regclass AND contype = 'c' ORDER BY conname",
-        "SELECT conname FROM pg_constraint WHERE conrelid = 'ck'::regclass ORDER BY conname",
     ],
-    answers: &[
-        (
-            "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE \
+    answers: &[(
+        "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE \
              conrelid = 'ck'::regclass AND contype = 'c' ORDER BY conname",
-            "**The predicate is printed as written, where PostgreSQL prints its deparsed tree.** \
+        "**The predicate is printed as written, where PostgreSQL prints its deparsed tree.** \
              A real server answers `CHECK ((q <> 'no'::text))` and this node `CHECK ((q <> \
              'no'))` — the doubled parentheses agree and the `::text` does not, because \
              PostgreSQL annotates each literal with the type it resolved to and this node stores \
@@ -31,16 +29,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              keeping the text, which would also mean the catalog holds a serialised tree; the \
              text is what `pg_get_constraintdef` needs anyway, so the trade was made deliberately \
              (`catalog::CheckDef`). Semantics and values are identical; one string differs.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT conname FROM pg_constraint WHERE conrelid = 'ck'::regclass ORDER BY conname",
-            "The same statement without the `contype` filter, so it also lists the `NOT NULL` and \
-             primary-key rows. Those are e2-catalog's and already agree; it is here only because \
-             the `CHECK` rows had to join them in one ordering.",
-            "UNMEASURED",
-        ),
-    ],
+        "UNMEASURED",
+    )],
 };
 
 #[test]

@@ -19,7 +19,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // whose values are identical and which every comparison against one already assumes.
         "SELECT current_schema",
         "SELECT current_schema()",
-        "SELECT n.nspname FROM pg_namespace n WHERE n.nspname = ANY(current_schemas(false))",
     ],
     answers: &[
         // **The reason changed under these two and the entry has to say so.** Selecting the

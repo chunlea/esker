@@ -36,16 +36,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          WHERE typname IN ('_int4','_varchar','int4','varchar') ORDER BY typname",
         "SELECT 'r', pg_typeof(ARRAY['a','b']::varchar[]), pg_typeof(ARRAY[1.5]::numeric[]), \
          pg_typeof(ARRAY[true])",
-        "SELECT 'r', b.typname, b.typarray <> 0 AS has_array, a.typname AS array_name, a.typelem \
-         = b.oid AS points_back FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE \
-         b.typname IN ('hstore','citext') ORDER BY b.typname",
-        "SELECT 'r', b.typname, b.oid < 10000 AS oid_is_builtin, a.oid < 10000 AS \
-         array_oid_is_builtin FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname \
-         IN ('hstore','citext','varchar') ORDER BY b.typname",
-        "SELECT 'r', t.typname, t.typelem::regtype::text AS element, t.typlen FROM pg_type t \
-         WHERE t.typname IN \
-         ('_varchar','_timestamp','_bool','_date','_uuid','_jsonb','_float8','_bytea') ORDER BY \
-         t.typname",
         "SELECT 'r', b.typname, b.typarray, a.typname AS array_name FROM pg_type b JOIN pg_type a \
          ON a.oid = b.typarray WHERE b.typname IN \
          ('bytea','bpchar','float4','float8','interval','json','oid','time') ORDER BY b.typname",

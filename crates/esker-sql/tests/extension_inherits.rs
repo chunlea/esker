@@ -13,11 +13,7 @@ const CORPUS_FIXTURE: &[&str] = &["CREATE TABLE ak (id int8 PRIMARY KEY)"];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // The standing `pg_catalog` trade: an `oid` is a `bigint` here for the reason `pg_class.oid`
     // is one, and a `name` is `text`. The rows agree — all three are empty.
-    types: &[
-        "SELECT inhrelid, inhparent FROM pg_inherits",
-        "SELECT parent.relname FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class child ON i.inhrelid = child.oid JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid LEFT JOIN pg_namespace n ON n.oid = child.relnamespace WHERE child.relname = 'ak' AND child.relkind IN ('r','p') AND n.nspname = ANY (current_schemas(false))",
-        "SELECT extname FROM pg_extension WHERE extname = 'nope'",
-    ],
+    types: &["SELECT inhrelid, inhparent FROM pg_inherits"],
     // **Two, and `plpgsql` is no longer one of them.** This file used to declare `pg_extension`
     // empty — a row would have claimed `CREATE FUNCTION … LANGUAGE plpgsql` works — and the
     // `CREATE EXTENSION` unit made the claim true in the only sense that matters here: `plpgsql`
@@ -30,19 +26,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // fresh database is in on both.
     //
     // `pg_inherits` agrees on every line, because nothing inherits on either side.
-    answers: &[
-        (
-            "SELECT pg_extension.extname, n.nspname AS schema FROM pg_extension JOIN pg_namespace n ON pg_extension.extnamespace = n.oid",
-            "Boot statement 23. One row on a real server — `plpgsql` in `pg_catalog` — and none \
-             here, because this node has no extensions to name.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT extname, extnamespace FROM pg_extension",
-            "The same row, read directly.",
-            "UNMEASURED",
-        ),
-    ],
+    answers: &[(
+        "SELECT extname, extnamespace FROM pg_extension",
+        "The same row, read directly.",
+        "UNMEASURED",
+    )],
 };
 
 #[test]

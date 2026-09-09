@@ -17,14 +17,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `pg_attribute.attname` is the 64-byte `name` type on a real server and `text` here, which
     // compares identically and is the standing choice every catalog view in this crate makes. The
     // rows agree; only the declared type differs.
-    types: &[
-        "SELECT 'r', a.attname, col_description(a.attrelid, a.attnum) FROM pg_attribute a WHERE \
-         a.attrelid = 'cm3'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
-        "SELECT 'r', i.relname, pg_catalog.obj_description(i.oid, 'pg_class') AS comment FROM \
-         pg_class t INNER JOIN pg_index d ON t.oid = d.indrelid INNER JOIN pg_class i ON \
-         d.indexrelid = i.oid WHERE i.relkind IN ('i','I') AND d.indisprimary = 'f' AND t.relname \
-         = 'cm' ORDER BY i.relname",
-    ],
+    types: &[],
     answers: &[
         // **The six entries that stood here are deleted, and that deletion is the point.** They
         // covered `ALTER TABLE … RENAME TO`, `RENAME COLUMN` and `DROP COLUMN` and the three reads

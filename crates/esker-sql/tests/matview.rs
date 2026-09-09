@@ -28,8 +28,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // makes.
     types: &[
         "SELECT 'r', relname, relkind, relispopulated FROM pg_class WHERE relname = 'mv_ebooks'",
-        "SELECT 'r', matviewname, hasindexes, ispopulated FROM pg_matviews WHERE matviewname = 'mv_ebooks'",
-        "SELECT 'r', matviewname, hasindexes FROM pg_matviews WHERE matviewname = 'mv_ebooks'",
         "SELECT 'r', table_name, table_type FROM information_schema.tables WHERE table_name = 'mv_ebooks'",
         "SELECT 'r', table_name, table_type FROM information_schema.tables WHERE table_name = 'mg_view'",
     ],

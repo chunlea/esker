@@ -18,7 +18,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT conname, contype, condeferrable, condeferred, convalidated, confupdtype, confdeltype, pg_get_constraintdef(c.oid), c.conkey::text, c.confkey::text, t2.relname FROM pg_constraint c JOIN pg_class t2 ON t2.oid = c.confrelid WHERE c.conrelid = 'fxc'::regclass ORDER BY conname",
         "SELECT conname, pg_get_constraintdef(oid), confupdtype, confdeltype FROM pg_constraint WHERE conrelid = 'fxd'::regclass AND contype = 'f' ORDER BY conname",
-        "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fxe'::regclass AND contype = 'f'",
         "SELECT conname, pg_get_constraintdef(oid), confupdtype, confdeltype FROM pg_constraint WHERE conrelid = 'fxc'::regclass AND contype = 'f' ORDER BY conname",
     ],
     answers: &[],

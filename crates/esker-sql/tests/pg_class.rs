@@ -24,13 +24,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // trade `pg_type`'s columns make, declared in `tests/pg_catalog.rs`.
         "SELECT c.relname, c.relkind FROM pg_class c WHERE c.relname IN ('r4a','r4b') ORDER BY \
          c.relname",
-        "SELECT n.nspname FROM pg_namespace n WHERE n.nspname = 'public'",
-        "SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = ANY(current_schemas(false)) AND c.relname IN ('r4a','r4b') AND \
-         c.relkind IN ('r','v','m','p','f') ORDER BY c.relname",
-        "SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = ANY(current_schemas(false)) AND c.relname = 'r4a' AND c.relkind IN \
-         ('r','p')",
         "SELECT c.relkind FROM pg_class c WHERE c.relname = 'r4a_pkey'",
     ],
     answers: &[],

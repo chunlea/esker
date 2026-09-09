@@ -28,10 +28,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          o.opcname, am.amname",
         "SELECT 'r', amname, amtype FROM pg_am WHERE amname IN ('btree','gin','gist') ORDER BY \
          amname",
-        "SELECT 'r', extname, extversion FROM pg_extension WHERE extname = 'pg_trgm'",
-        "SELECT 'r', name, default_version FROM pg_available_extensions WHERE name = 'pg_trgm'",
-        "SELECT 'r', c.relname, am.amname FROM pg_class c JOIN pg_am am ON am.oid = c.relam \
-         WHERE c.relname LIKE 'trains_%' ORDER BY 1",
     ],
     answers: &[
         // **Four rows here and six there**, and the two that are missing are the `hash` halves of

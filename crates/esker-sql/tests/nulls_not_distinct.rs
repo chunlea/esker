@@ -12,9 +12,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `pg_class.relname` is a `name` on a real server and `text` here — the standing trade every
     // `pg_catalog` column makes. The rows agree, `indnullsnotdistinct` included.
-    types: &[
-        "SELECT i.relname, x.indisunique, x.indnullsnotdistinct FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE x.indrelid = 'nd'::regclass ORDER BY i.relname",
-    ],
+    types: &[],
     // The one entry here recorded that `ALTER TABLE … ADD CONSTRAINT … UNIQUE` did not exist and
     // so "both refuse" — which stopped being true twice over. The action was built, and then it
     // learned to scan the rows already there, so the line now fails on the *data* the way

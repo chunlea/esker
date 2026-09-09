@@ -14,7 +14,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 /// What the sweep found when the rule landed. **Lower this when you measure one; do not raise it.**
-const BUDGET: usize = 207;
+///
+/// 207 → 186 when the catalog's identifier columns became `name`: twenty-one entries stopped being
+/// divergences at all, because what they recorded was a *declared type* — `text` here where a real
+/// server says `name` — and the rows underneath had always agreed.
+const BUDGET: usize = 186;
 
 #[test]
 fn unmeasured_divergences_do_not_grow() {

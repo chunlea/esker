@@ -18,9 +18,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // **`name` there, `text` here** — the standing choice every `pg_catalog` column in this crate
     // makes. Newly compared: the line sits below the `CREATE VIEW` that used to abort the capture.
-    types: &[
-        "SELECT 'r', indexname, indexdef FROM pg_indexes WHERE tablename = 'rc' ORDER BY indexname",
-    ],
+    types: &[],
     answers: &[
         // **`CREATE VIEW` landed (`tests/view.rs`)**, so the view is created, read and dropped
         // here and those three entries are gone. `pg_get_viewdef` is the one that stays — it is

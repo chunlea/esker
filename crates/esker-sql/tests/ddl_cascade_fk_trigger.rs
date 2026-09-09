@@ -16,10 +16,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // here, which compares identically. **Every row agrees**, on all thirty-five statements.
     types: &[
         "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fkc'::regclass ORDER BY conname",
-        "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fkc2'::regclass AND contype = 'f' ORDER BY conname",
-        "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fkc3'::regclass AND contype = 'f'",
-        "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fkself'::regclass AND contype = 'f'",
-        "SELECT relname, relhastriggers FROM pg_class WHERE relname IN ('fkc','fkself') ORDER BY relname",
     ],
     answers: &[],
 };

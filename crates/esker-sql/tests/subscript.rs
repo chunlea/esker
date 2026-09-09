@@ -16,9 +16,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // it is an `int2` column matched against a subscript, and it finds the column.
     types: &[
         "SELECT d.indkey[0], d.indkey[1], d.indkey[2] FROM pg_index d WHERE d.indexrelid = 'sb_ab'::regclass",
-        "SELECT a.attname FROM pg_index d JOIN pg_attribute a ON a.attrelid = d.indrelid AND a.attnum = d.indkey[0] WHERE d.indexrelid = 'sb_ab'::regclass",
-        "SELECT a.attname FROM pg_index d JOIN pg_attribute a ON a.attrelid = d.indrelid AND a.attnum = d.indkey[1] WHERE d.indexrelid = 'sb_ab'::regclass",
-        "SELECT a.attname FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1] WHERE c.conrelid = 'sbc'::regclass AND c.contype = 'f'",
     ],
     // One, and it is **not the subscript**: `pg_constraint.conkey` is filled here only for a
     // foreign key, where a real server fills it for every constraint that has columns — a primary

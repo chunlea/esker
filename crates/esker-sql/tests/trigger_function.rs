@@ -22,7 +22,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `lanname` is a `name` on a real server and `text` here, with identical characters — the
     // standing trade every `pg_catalog` column makes.
-    types: &["SELECT 'r', lanname, lanpltrusted FROM pg_language WHERE lanname = 'plpgsql'"],
+    types: &[],
     answers: &[(
         "SELECT 'r', proname, prokind, prorettype::regtype::text, l.lanname, pronargs, \
          provolatile FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE proname = \
