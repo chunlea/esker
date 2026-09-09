@@ -561,6 +561,14 @@ struct Node {
 
 impl Gate {
     async fn start() -> Self {
+        // Never splits, which is every existing test in this file: they are about which engine
+        // answers and what it answers, and one region is enough to ask that.
+        Self::start_splitting(u64::MAX).await
+    }
+
+    /// A cluster whose regions **split at `split_size` bytes**, for the §10 re-measure: the
+    /// fragment-count axis §9 could not produce needs a table that occupies more than one region.
+    async fn start_splitting(split_size: u64) -> Self {
         let pd_listener = reserve();
         let pd_address = pd_listener.local_addr().unwrap();
         let listeners: Vec<std::net::TcpListener> = (0..STORES).map(|_| reserve()).collect();
@@ -607,7 +615,7 @@ impl Gate {
         let mut nodes = Vec::new();
         for (at, address) in addresses.iter().enumerate() {
             drop(listeners.next());
-            nodes.push(open_store(*address, at as u64 + 1, pd_address, &peers).await);
+            nodes.push(open_store(*address, at as u64 + 1, pd_address, &peers, split_size).await);
         }
         wait_for("the region to reach three voters", 60, || {
             pd.regions().is_ok_and(|regions| {
@@ -747,6 +755,82 @@ impl Gate {
             }
         });
         self.wait_for_a_learner_that_answers("f").await;
+    }
+
+    /// How many regions the cluster has, as PD sees them.
+    fn regions(&self) -> usize {
+        self.pd.regions().map_or(0, |regions| regions.len())
+    }
+
+    /// **The distinct stores holding a columnar learner**, which is the number §10 item 2 says a
+    /// verdict must read instead of the region count: an exchange's parallelism is the number of
+    /// *nodes* holding fragments, and PD places a learner on the healthiest store without a peer of
+    /// that region — so with three voters and four stores, learners cluster. Five regions on two
+    /// stores is what the only multi-region cluster anyone had run turned out to be.
+    fn learner_stores(&self) -> usize {
+        let Ok(regions) = self.pd.regions() else {
+            return 0;
+        };
+        let mut stores: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for record in regions {
+            for peer in &record.region.peers {
+                if peer.role == PeerRole::ColumnarLearner {
+                    stores.insert(peer.store_id);
+                }
+            }
+        }
+        stores.len()
+    }
+
+    /// A table with three grouping columns of very different cardinality, so the **finish** can be
+    /// varied without touching the row count or the region count.
+    async fn fill_grouped(&self, rows: i64) {
+        tokio::task::block_in_place(|| {
+            let mut session = self.session();
+            settle(
+                &mut session,
+                "CREATE TABLE t (id int8 PRIMARY KEY, g1 int8, g100 int8, gmax int8, amount int8)",
+            );
+            settle(&mut session, "ALTER TABLE t SET (columnar_replicas = 1)");
+            for chunk in (1..=rows).collect::<Vec<i64>>().chunks(500) {
+                let values: Vec<String> = chunk
+                    .iter()
+                    .map(|id| format!("({id}, 1, {}, {id}, {id})", id % 100))
+                    .collect();
+                settle(
+                    &mut session,
+                    &format!("INSERT INTO t VALUES {}", values.join(", ")),
+                );
+            }
+        });
+        self.wait_until_the_columns_answer("t").await;
+    }
+
+    /// Waits until a routed plan over `table` says the columns answered.
+    ///
+    /// **Not "1 asked, 1 answered"**, which is what `wait_for_a_learner_that_answers` checks and
+    /// which is only true on a cluster of one region. Here the count is the region count and the
+    /// point is to be indifferent to it.
+    async fn wait_until_the_columns_answer(&self, table: &str) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let answered = tokio::task::block_in_place(|| {
+                let mut session = self.session();
+                explain(
+                    &mut session,
+                    &format!("EXPLAIN ANALYZE SELECT count(*) FROM {table}"),
+                )
+                .contains("Engine: columnar")
+            });
+            if answered {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no routed plan over {table} was answered by the columns"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     async fn fill(&self) {
@@ -935,6 +1019,7 @@ async fn open_store(
     store_id: u64,
     pd_address: SocketAddr,
     peers: &[PeerAddress],
+    split_size: u64,
 ) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let mut raft = RaftOptions::new(peers.to_vec(), 20_260_901);
@@ -953,6 +1038,10 @@ async fn open_store(
             raft: Some(raft),
             pd: Some(Arc::new(RemotePd::connect(pd_address).unwrap())),
             address: address.to_string(),
+            split: esker_store::SplitOptions {
+                region_split_size: split_size,
+                ..esker_store::SplitOptions::default()
+            },
             heartbeat_tick: Duration::from_millis(5),
             store_heartbeat: Duration::from_millis(20),
             region_heartbeat: Duration::from_millis(20),
@@ -1269,4 +1358,215 @@ fn timed_engine(
         .run("RESET esker.engine")
         .expect("the override clears");
     (answer, samples[samples.len() / 2], plan)
+}
+
+/// **The §10 re-measure: what a fragment costs per region, and what a finish costs per group.**
+///
+/// `docs/plans/phase-16-mpp.md` §10's table, arms 1 to 4. The verdict there is single-region and
+/// says so, and the one fact that shapes this is §10 item 4: **dispatch is still serial**, so R
+/// regions cost R sequential round trips before any merging happens. A single number at R regions
+/// would measure that and be read as the exchange's verdict.
+///
+/// So the two costs are varied independently, which needs none of §9a's four missing instruments:
+///
+/// * **R varies at a fixed row count**, by giving each cluster a different split threshold over the
+///   same data — not by growing the table, which would move the scan cost with it;
+/// * **the finish varies at a fixed R**, by grouping on one of three columns whose cardinalities
+///   are 1, 100 and one-per-row.
+///
+/// It also prints the **distinct stores holding learners** beside the region count, because §10
+/// item 2 says an exchange's parallelism is nodes and not regions, and the only multi-region
+/// cluster anyone had run put five regions on two stores.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "the §10 re-measure: four clusters, minutes, and it wants a quiet box"]
+async fn what_a_fragment_costs_per_region_and_per_group() {
+    // **Ten thousand, for the group axis.** The three-thousand-row run is in §10: it walked the
+    // region axis to 95 and the finish never came near the dispatch. What it could not reach is
+    // `regions × groups`, which §10 item 3 names as the shape that would flip the verdict — so this
+    // raises the group count with the rows and lets the region count follow the split threshold.
+    const ROWS: i64 = 10_000;
+    const ROUNDS: usize = 5;
+    let queries = [
+        ("count(*)          ", "SELECT count(*) FROM t"),
+        (
+            "group by g1    (1)",
+            "SELECT g1, count(*) FROM t GROUP BY g1 ORDER BY g1",
+        ),
+        (
+            "group by g100(100)",
+            "SELECT g100, count(*) FROM t GROUP BY g100 ORDER BY g100",
+        ),
+        (
+            "group by gmax(=rows)",
+            "SELECT gmax, count(*) FROM t GROUP BY gmax ORDER BY gmax",
+        ),
+    ];
+
+    println!("\n  {ROWS} rows, medians of {ROUNDS}, one row per (split threshold, query)\n");
+    println!("  split      regions  stores   query                 routed        rows");
+    // 8 KB is left out at this row count: three thousand rows put 95 regions on it, so ten
+    // thousand would be past three hundred in-process Raft groups over four stores, and the
+    // measurement would be of the harness.
+    for split in [u64::MAX, 64 * 1024, 16 * 1024] {
+        let gate = Gate::start_splitting(split).await;
+        gate.fill_grouped(ROWS).await;
+        let regions = gate.regions();
+        let stores = gate.learner_stores();
+        tokio::task::block_in_place(|| {
+            let mut session = gate.session();
+            for (label, query) in queries {
+                let (routed, routed_at, plan) = timed_engine(&mut session, "auto", query, ROUNDS);
+                let (by_rows, rows_at, _) = timed_engine(&mut session, "row", query, ROUNDS);
+                assert_eq!(
+                    routed, by_rows,
+                    "the two engines disagree on `{query}` at {regions} regions"
+                );
+                let name = if split == u64::MAX {
+                    "none  ".to_owned()
+                } else {
+                    format!("{:>4} KB", split / 1024)
+                };
+                println!(
+                    "  {name}   {regions:>7}  {stores:>6}   {label}  {:>8.2} ms  {:>8.2} ms{}",
+                    routed_at.as_secs_f64() * 1000.0,
+                    rows_at.as_secs_f64() * 1000.0,
+                    if plan.contains("Engine: columnar") {
+                        ""
+                    } else {
+                        "   <- FELL BACK"
+                    },
+                );
+            }
+        });
+        gate.stop().await;
+    }
+}
+
+/// **Where a bulk load into a table splitting under itself starts failing** — the first of the two
+/// things `docs/plans/phase-16-mpp.md` §10's re-measure left unsmoothed.
+///
+/// Loading ten thousand rows across the ~160 regions a 16 KB threshold produces failed with
+/// `a lock from the transaction at … could not be cleared`, which is `Error::LockNotCleared`
+/// mapped to `40001`: a client that met somebody's lock, spent its resolution budget and gave up.
+///
+/// **The loader is sequential and its transactions share no keys**, so the lock it meets is not a
+/// concurrent writer's. The candidate this exists to confirm or kill is the one the commit path
+/// names itself: `Transaction::commit` finishes its secondaries with `let _ = self.commit_grouped(…)`
+/// — *"a secondary that fails here is not a failed transaction"*, which is right — and a region that
+/// splits between the prewrite and that call is exactly how it fails. The lock left behind belongs
+/// to a **committed** transaction, and the next writer of that key has to roll it forward through a
+/// region that has moved under both of them.
+///
+/// This prints the region count at each step and stops at the first failure, so the answer is a
+/// number of splits rather than an anecdote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "an investigation: loads until it breaks and prints where"]
+async fn where_a_bulk_load_into_a_splitting_table_breaks() {
+    const BATCH: i64 = 250;
+    const UP_TO: i64 = 6_000;
+
+    let gate = Gate::start_splitting(8 * 1024).await;
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, pad text)",
+        );
+        println!("\n  rows    regions   outcome");
+        let mut at = 1_i64;
+        while at <= UP_TO {
+            let values: Vec<String> = (at..at + BATCH)
+                .map(|id| format!("({id}, 'pad-{id}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')"))
+                .collect();
+            // **`run`, not `settle`.** The helper retries for thirty seconds and would turn the
+            // thing being measured into a pause; what this wants is the first refusal, with its
+            // own words.
+            let outcome = session.run(&format!("INSERT INTO t VALUES {}", values.join(", ")));
+            let regions = gate.regions();
+            match outcome {
+                Ok(_) => println!("  {:<6}  {regions:>7}   ok", at + BATCH - 1),
+                Err(error) => {
+                    println!(
+                        "  {:<6}  {regions:>7}   {error} [{}]",
+                        at + BATCH - 1,
+                        error.sqlstate()
+                    );
+                    println!(
+                        "\n  first refusal at {} rows and {regions} regions\n",
+                        at + BATCH - 1
+                    );
+
+                    // **Does it clear, or is it stuck?** `settle`'s own comment says a retry
+                    // collides with its first attempt's lock and that waiting is the answer; the
+                    // §10 load waited thirty seconds and gave up. So keep asking, and report the
+                    // time and every *distinct* thing it says on the way — a lock that clears in
+                    // forty seconds is a slow cluster, and one that never clears is a defect.
+                    let began = Instant::now();
+                    let mut seen: Vec<String> = Vec::new();
+                    loop {
+                        match session.run(&format!("INSERT INTO t VALUES {}", values.join(", "))) {
+                            Ok(_) => {
+                                println!(
+                                    "  the retry settled after {:.1} s",
+                                    began.elapsed().as_secs_f64()
+                                );
+                                break;
+                            }
+                            Err(esker_sql::SqlError::UniqueViolation { .. }) => {
+                                println!(
+                                    "  the first attempt had committed after all, seen after \
+                                     {:.1} s",
+                                    began.elapsed().as_secs_f64()
+                                );
+                                break;
+                            }
+                            Err(error) => {
+                                let said = format!("[{}] {error}", error.sqlstate());
+                                if !seen.contains(&said) {
+                                    println!("  +{:>5.1} s  {said}", began.elapsed().as_secs_f64());
+                                    seen.push(said);
+                                }
+                                if began.elapsed() > Duration::from_secs(120) {
+                                    println!("  STILL REFUSING after 120 s");
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(200));
+                            }
+                        }
+                    }
+
+                    // **And the harness hypothesis**: a 250-row INSERT across 37 regions is one
+                    // prewrite over 37 regions. One row at a time touches one.
+                    println!("\n  now one row per statement, from {}", at + BATCH);
+                    let mut singles = 0;
+                    for id in at + BATCH..at + BATCH + 250 {
+                        match session.run(&format!("INSERT INTO t VALUES ({id}, 'pad-{id}')")) {
+                            Ok(_) => singles += 1,
+                            Err(error) => {
+                                println!(
+                                    "  single-row insert refused after {singles} of 250: \
+                                     {error} [{}]",
+                                    error.sqlstate()
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    if singles == 250 {
+                        println!(
+                            "  250 single-row inserts all committed, at {} regions",
+                            gate.regions()
+                        );
+                    }
+                    return;
+                }
+            }
+            at += BATCH;
+        }
+        println!(
+            "\n  no refusal up to {UP_TO} rows and {} regions",
+            gate.regions()
+        );
+    });
+    gate.stop().await;
 }
