@@ -890,7 +890,7 @@ impl Transaction {
         // The first lookup is repaired too: `Router::route` raises its own `KeyNotInRegion` with
         // `region_id == 0` when the driver does not yet know the key, and under load that is the
         // driver being behind rather than an answer about the cluster.
-        let mut boundary = match self.router.route(cursor) {
+        let mut boundary = match self.router.route(cursor, None) {
             Ok(route) => route.region.end_key,
             Err(refusal) => repair_route(&self.router, cursor, &refusal)?.region.end_key,
         };
