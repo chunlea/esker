@@ -17,6 +17,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "load_arm/mod.rs"]
+mod load_arm;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

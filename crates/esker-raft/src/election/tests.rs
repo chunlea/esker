@@ -540,3 +540,193 @@ fn a_recorded_vote_survives_a_restart_and_is_not_cast_twice() {
         }]
     ));
 }
+
+/// **A node that is not a voter here does not get a vote from here.**
+///
+/// Found by counters on a stalling three-store cluster: a peer the placement driver held as a
+/// `Learner` had campaigned 404 times and adopted a term 81 times, while the region's one voter
+/// answered 478 vote requests and **granted 477** of them. The campaigner's own configuration said
+/// it was a voter — that half is the store's to explain — but the disruption needed the other half
+/// as well, and this is it: a grant costs the granter its term and its leader, and it was being
+/// given to a node the granter's own configuration does not admit as a voter.
+///
+/// Refusing is right even when the asker is correct and this node is behind: it will be added here
+/// too, and it can ask again. A vote is not owed to a stranger.
+#[test]
+fn a_vote_is_not_granted_to_a_node_this_configuration_does_not_admit() {
+    let mut group = Harness::new(&[1, 2, 3], 7);
+    while group.leaders().is_empty() {
+        group.tick_and_settle(1);
+    }
+    let leader = group.leader();
+    let term_before = group.node(leader).term();
+
+    // Node 9 is in nobody's configuration. It asks for a real vote in a much later term, which is
+    // the shape that would depose a healthy leader.
+    for id in [1, 2, 3] {
+        group
+            .node_mut(id)
+            .step(Message::RequestVote {
+                from: 9,
+                to: id,
+                term: term_before + 20,
+                last_log_index: u64::MAX,
+                last_log_term: term_before + 20,
+                pre_vote: false,
+                force: false,
+            })
+            .unwrap();
+    }
+    group.settle();
+
+    assert_eq!(
+        group.leader(),
+        leader,
+        "a stranger's vote request unseated the leader"
+    );
+    assert_eq!(
+        group.node(leader).term(),
+        term_before,
+        "a stranger's vote request moved the term"
+    );
+}
+
+/// **A learner's vote request is refused by the voters, whatever the learner believes.**
+///
+/// The mechanism behind the promotion stall, from the counters that named it: a peer the placement
+/// driver held as a `Learner` had campaigned 404 times and adopted a term 81 times, while the
+/// region's one voter answered 478 vote requests and **granted 477**. `Raft::campaign` already
+/// refuses a node that is not a voter *in its own* configuration, so the campaigner's view of
+/// itself was wrong — that half is the store's. This is the other half, and it is the one that
+/// makes the mistake harmless: a learner cannot reach a quorum, so a vote given to one buys nothing
+/// and costs the granter its own vote for the term, and — for a real vote — its leader.
+///
+/// A node being promoted is not harmed by this. Its promotion reaches the others as a
+/// configuration change, and it can ask again once it has; a vote is not owed to a peer this
+/// configuration does not admit as a voter.
+#[test]
+fn a_learner_is_not_granted_a_vote_by_the_voters() {
+    let mut group = Harness::with_learners(&[1, 2, 3], &[4], 11);
+    while group.leaders().is_empty() {
+        group.tick_and_settle(1);
+    }
+    let leader = group.leader();
+    let term_before = group.node(leader).term();
+
+    // The learner asks, in a term far ahead — the shape a peer with a wrong idea of itself sends.
+    for id in [1, 2, 3] {
+        group
+            .node_mut(id)
+            .step(Message::RequestVote {
+                from: 4,
+                to: id,
+                term: term_before + 5,
+                last_log_index: u64::MAX,
+                last_log_term: term_before + 5,
+                pre_vote: true,
+                force: false,
+            })
+            .unwrap();
+    }
+    group.settle();
+
+    assert_eq!(
+        group.leader(),
+        leader,
+        "a learner's pre-vote unseated the leader"
+    );
+    assert_eq!(
+        group.node(leader).term(),
+        term_before,
+        "a learner's pre-vote moved the term"
+    );
+    // And the real form, which is what actually costs a term.
+    for id in [1, 2, 3] {
+        group
+            .node_mut(id)
+            .step(Message::RequestVote {
+                from: 4,
+                to: id,
+                term: term_before + 6,
+                last_log_index: u64::MAX,
+                last_log_term: term_before + 6,
+                pre_vote: false,
+                force: false,
+            })
+            .unwrap();
+    }
+    group.settle();
+    assert_eq!(
+        group.node(leader).term(),
+        term_before,
+        "a learner's real vote request moved the term"
+    );
+    assert_eq!(
+        group.leader(),
+        leader,
+        "a learner's vote request unseated the leader"
+    );
+}
+
+/// **And it is refused by a voter that is not hearing a leader**, which is the state the stall
+/// lives in.
+///
+/// The test above passes on a healthy group because §6.2's lease vetoes a higher-term vote request
+/// while this node can still hear a leader. A node that is *campaigning* has `leader = None`, so
+/// the veto does not apply and the request is answered on its merits — and a learner's merits are
+/// good, since its log is up to date.
+///
+/// That closes a loop the counters caught running: the voter loses its leader and pre-campaigns;
+/// the learner's pre-vote is now granted; the learner adopts a term and campaigns for real; the
+/// voter steps down to that term and pre-campaigns again. The learner can never win, so the region
+/// never gets a leader — 415 pre-campaigns against 2 real ones on the voter, and 404 against 81 on
+/// the learner, in the run that produced this.
+///
+/// A vote is not owed to a peer this configuration does not admit as a voter, and least of all when
+/// this node is between leaders.
+#[test]
+fn a_campaigning_voter_still_refuses_a_learner() {
+    let mut group = Harness::with_learners(&[1, 2], &[4], 13);
+    // Node 1 alone, so it pre-campaigns and never hears a leader: `leader = None`, which is what
+    // takes §6.2's veto out of the way.
+    group.isolate(2);
+    group.tick(1, 40);
+    group.drain_ready();
+    assert_eq!(
+        group.node(1).role(),
+        Role::PreCandidate,
+        "the setup did not reach the state this is about"
+    );
+
+    let before = group.pending_messages().len();
+    let asked = group.node(1).term() + 3;
+    group
+        .node_mut(1)
+        .step(Message::RequestVote {
+            from: 4,
+            to: 1,
+            term: asked,
+            last_log_index: u64::MAX,
+            last_log_term: asked,
+            pre_vote: true,
+            force: false,
+        })
+        .unwrap();
+    group.drain_ready();
+
+    let granted = group.pending_messages()[before..].iter().any(|message| {
+        matches!(
+            message,
+            Message::RequestVoteResponse {
+                to: 4,
+                granted: true,
+                ..
+            }
+        )
+    });
+    assert!(
+        !granted,
+        "a voter between leaders granted a learner's pre-vote: {:?}",
+        &group.pending_messages()[before..]
+    );
+}
