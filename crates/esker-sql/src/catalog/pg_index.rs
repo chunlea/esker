@@ -38,6 +38,7 @@
 //!   `(oid, n, …)` for `n >= 1` is the *column name alone*; and past the last column it is the
 //!   **empty string**, not NULL and not an error.
 
+use super::NO_LENGTH;
 use std::borrow::Cow;
 
 use crate::backend::Txn;
@@ -478,29 +479,29 @@ fn oid_of_table(relations: &Relations, table_id: u64) -> i64 {
 }
 
 /// The columns of `pg_index`, in PostgreSQL's own order.
-pub const INDEX_COLUMNS: &[(&str, ColumnType)] = &[
-    ("indexrelid", ColumnType::Int8),
-    ("indrelid", ColumnType::Int8),
-    ("indnatts", ColumnType::Int2),
+pub const INDEX_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    ("indexrelid", ColumnType::Int8, NO_LENGTH),
+    ("indrelid", ColumnType::Int8, NO_LENGTH),
+    ("indnatts", ColumnType::Int2, NO_LENGTH),
     // **The column that separates the key from the payload**, and PostgreSQL puts it right here,
     // straight after the total. `smallint` like its neighbour.
-    ("indnkeyatts", ColumnType::Int2),
-    ("indisunique", ColumnType::Bool),
-    ("indnullsnotdistinct", ColumnType::Bool),
-    ("indisprimary", ColumnType::Bool),
-    ("indisvalid", ColumnType::Bool),
+    ("indnkeyatts", ColumnType::Int2, NO_LENGTH),
+    ("indisunique", ColumnType::Bool, NO_LENGTH),
+    ("indnullsnotdistinct", ColumnType::Bool, NO_LENGTH),
+    ("indisprimary", ColumnType::Bool, NO_LENGTH),
+    ("indisvalid", ColumnType::Bool, NO_LENGTH),
     // **`int2vector`, not `text`** — measured, and the two columns beside it are `oidvector`.
     // The value is the same space-separated numbers either way; what a client reads is the
     // declared type (`tests/captures/pg19_indkey.txt`).
-    ("indkey", ColumnType::Int2Vector),
+    ("indkey", ColumnType::Int2Vector, NO_LENGTH),
     // Like `indkey` an `int2vector` on a real server, and text here for the same reason: the way
     // a client uses it is text-shaped. `ActiveRecord` reads the ordering out of
     // `pg_get_indexdef`'s string rather than from here, so this is the honest record of a fact
     // rather than a column anything depends on.
     // `indoption` is an `int2vector` too, and `0 0` for an index with no DESC or NULLS FIRST.
-    ("indoption", ColumnType::Int2Vector),
-    ("indexprs", ColumnType::Text),
-    ("indpred", ColumnType::Text),
+    ("indoption", ColumnType::Int2Vector, NO_LENGTH),
+    ("indexprs", ColumnType::Text, NO_LENGTH),
+    ("indpred", ColumnType::Text, NO_LENGTH),
     // **Last**, see the row it fills.
-    ("indisexclusion", ColumnType::Bool),
+    ("indisexclusion", ColumnType::Bool, NO_LENGTH),
 ];

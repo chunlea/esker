@@ -32,6 +32,7 @@
 //! * **`referential_constraints` is empty**, which is a correct answer: this node has no foreign
 //!   keys, so there is nothing referential to constrain.
 
+use super::NO_LENGTH;
 use crate::backend::Txn;
 use crate::catalog::pg_relations::{RelKind, Relations};
 use crate::catalog::{ColumnDef, Identity};
@@ -82,12 +83,12 @@ pub fn tables(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
 /// **No `domain_catalog`**, for the reason [`TABLES_COLUMNS`] gives about `table_catalog`: this
 /// node has no database name to report and a constant would be a value nobody measured. What is
 /// left is what the capture reads — a domain described the way a column of its base type would be.
-pub const DOMAINS_COLUMNS: &[(&str, ColumnType)] = &[
-    ("domain_schema", ColumnType::Name),
-    ("domain_name", ColumnType::Name),
-    ("data_type", ColumnType::Varchar),
-    ("numeric_precision", ColumnType::Int4),
-    ("numeric_scale", ColumnType::Int4),
+pub const DOMAINS_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    ("domain_schema", ColumnType::Name, NO_LENGTH),
+    ("domain_name", ColumnType::Name, NO_LENGTH),
+    ("data_type", ColumnType::Varchar, NO_LENGTH),
+    ("numeric_precision", ColumnType::Int4, NO_LENGTH),
+    ("numeric_scale", ColumnType::Int4, NO_LENGTH),
 ];
 
 /// Every `information_schema.domains` row: one per domain, and nothing else.
@@ -117,13 +118,30 @@ pub fn domains(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
     Ok(rows)
 }
 
+/// **`yes_or_no`'s length**: a domain over `character varying(3)`, so `3 + 4`.
+///
+/// Measured, and it is the only length anywhere in this node's catalog: no `pg_catalog` column has
+/// a typmod at all on a real server (`atttypmod` is `-1` for every one of them), and of
+/// `information_schema`'s five domains only this one and `time_stamp` — which none of the views
+/// here serves — carry a modifier. `sql_identifier`, `character_data` and `cardinal_number` are
+/// `name`, `character varying` and `integer` with no length.
+///
+/// It reaches a client twice: in `RowDescription`, which is what makes `\gdesc` say
+/// `character varying(3)`, and in `pg_attribute.atttypmod` for the view's own column.
+///
+/// **The number and not the arithmetic**, because a column list is a `const` and
+/// [`value::typmod_of_length`] is not a `const fn` — and that function's own doc asks that nothing
+/// else in this crate know the number is `n + 4`. So the literal is tied back to it by
+/// `a_yes_or_no_column_declares_three_characters` below rather than by a reader's memory.
+const YES_OR_NO: i32 = 7;
+
 /// The columns of `information_schema.views`, in the standard's order.
-pub const VIEWS_COLUMNS: &[(&str, ColumnType)] = &[
-    ("table_schema", ColumnType::Name),
-    ("table_name", ColumnType::Name),
-    ("view_definition", ColumnType::Varchar),
-    ("is_updatable", ColumnType::Varchar),
-    ("is_insertable_into", ColumnType::Varchar),
+pub const VIEWS_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    ("table_schema", ColumnType::Name, NO_LENGTH),
+    ("table_name", ColumnType::Name, NO_LENGTH),
+    ("view_definition", ColumnType::Varchar, NO_LENGTH),
+    ("is_updatable", ColumnType::Varchar, YES_OR_NO),
+    ("is_insertable_into", ColumnType::Varchar, YES_OR_NO),
 ];
 
 /// Whether PostgreSQL would treat this view's query as **automatically updatable**.
@@ -535,73 +553,95 @@ fn datetime_precision(column: &ColumnDef) -> Datum {
 /// no database concept at all — no `current_database()`, and the startup parameter never reaches
 /// the executor — so there is no name to report and a constant would be a value nobody measured.
 /// `42703`, the same answer `pg_range` gives for `oid`.
-pub const TABLES_COLUMNS: &[(&str, ColumnType)] = &[
-    ("table_schema", ColumnType::Name),
-    ("table_name", ColumnType::Name),
-    ("table_type", ColumnType::Varchar),
+pub const TABLES_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    ("table_schema", ColumnType::Name, NO_LENGTH),
+    ("table_name", ColumnType::Name, NO_LENGTH),
+    ("table_type", ColumnType::Varchar, NO_LENGTH),
 ];
 
 /// The columns of `information_schema.columns`, in the standard's order.
-pub const COLUMNS_COLUMNS: &[(&str, ColumnType)] = &[
-    ("table_schema", ColumnType::Name),
-    ("table_name", ColumnType::Name),
-    ("column_name", ColumnType::Name),
-    ("ordinal_position", ColumnType::Int4),
-    ("column_default", ColumnType::Varchar),
-    ("is_nullable", ColumnType::Varchar),
-    ("data_type", ColumnType::Varchar),
-    ("character_maximum_length", ColumnType::Int4),
-    ("numeric_precision", ColumnType::Int4),
-    ("numeric_scale", ColumnType::Int4),
-    ("datetime_precision", ColumnType::Int4),
-    ("udt_name", ColumnType::Name),
-    ("is_identity", ColumnType::Varchar),
-    ("identity_generation", ColumnType::Varchar),
-    ("is_generated", ColumnType::Varchar),
+pub const COLUMNS_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    ("table_schema", ColumnType::Name, NO_LENGTH),
+    ("table_name", ColumnType::Name, NO_LENGTH),
+    ("column_name", ColumnType::Name, NO_LENGTH),
+    ("ordinal_position", ColumnType::Int4, NO_LENGTH),
+    ("column_default", ColumnType::Varchar, NO_LENGTH),
+    ("is_nullable", ColumnType::Varchar, YES_OR_NO),
+    ("data_type", ColumnType::Varchar, NO_LENGTH),
+    ("character_maximum_length", ColumnType::Int4, NO_LENGTH),
+    ("numeric_precision", ColumnType::Int4, NO_LENGTH),
+    ("numeric_scale", ColumnType::Int4, NO_LENGTH),
+    ("datetime_precision", ColumnType::Int4, NO_LENGTH),
+    ("udt_name", ColumnType::Name, NO_LENGTH),
+    ("is_identity", ColumnType::Varchar, YES_OR_NO),
+    ("identity_generation", ColumnType::Varchar, NO_LENGTH),
+    ("is_generated", ColumnType::Varchar, NO_LENGTH),
     // **Last**, the rule `pg_type`'s columns follow: `SELECT *` expands in declared order, so a
     // column added anywhere else moves every one after it.
-    ("generation_expression", ColumnType::Varchar),
+    ("generation_expression", ColumnType::Varchar, NO_LENGTH),
     // **Last again**, same rule. The **domain** a column was declared as, and NULL for a column
     // declared as an ordinary type (ADR 0065). This is the one column that tells the two apart
     // here: `data_type` and `udt_name` both report the *base* type — measured, a `custom_money`
     // column over `numeric(8,2)` says `numeric` for both and `dm_money` only here.
-    ("domain_name", ColumnType::Name),
+    ("domain_name", ColumnType::Name, NO_LENGTH),
     // **Last again.** The schema the `udt_name` type lives in — `pg_catalog` for every built-in,
     // which is what a column of a domain over one reports too, because `udt_name` is the *base*
     // type's. A client that qualifies a type name reads it, and asking for a column this view
     // does not have is `42703`.
-    ("udt_schema", ColumnType::Name),
+    ("udt_schema", ColumnType::Name, NO_LENGTH),
 ];
 
 /// The columns of `information_schema.table_constraints`, in the standard's order.
-pub const TABLE_CONSTRAINTS_COLUMNS: &[(&str, ColumnType)] = &[
-    ("constraint_schema", ColumnType::Name),
-    ("constraint_name", ColumnType::Name),
-    ("table_schema", ColumnType::Name),
-    ("table_name", ColumnType::Name),
-    ("constraint_type", ColumnType::Varchar),
-    ("is_deferrable", ColumnType::Varchar),
-    ("initially_deferred", ColumnType::Varchar),
+pub const TABLE_CONSTRAINTS_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    ("constraint_schema", ColumnType::Name, NO_LENGTH),
+    ("constraint_name", ColumnType::Name, NO_LENGTH),
+    ("table_schema", ColumnType::Name, NO_LENGTH),
+    ("table_name", ColumnType::Name, NO_LENGTH),
+    ("constraint_type", ColumnType::Varchar, NO_LENGTH),
+    ("is_deferrable", ColumnType::Varchar, YES_OR_NO),
+    ("initially_deferred", ColumnType::Varchar, YES_OR_NO),
 ];
 
 /// The columns of `information_schema.key_column_usage`, in the standard's order.
-pub const KEY_COLUMN_USAGE_COLUMNS: &[(&str, ColumnType)] = &[
-    ("constraint_schema", ColumnType::Name),
-    ("constraint_name", ColumnType::Name),
-    ("table_schema", ColumnType::Name),
-    ("table_name", ColumnType::Name),
-    ("column_name", ColumnType::Name),
-    ("ordinal_position", ColumnType::Int4),
-    ("position_in_unique_constraint", ColumnType::Int4),
+pub const KEY_COLUMN_USAGE_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    ("constraint_schema", ColumnType::Name, NO_LENGTH),
+    ("constraint_name", ColumnType::Name, NO_LENGTH),
+    ("table_schema", ColumnType::Name, NO_LENGTH),
+    ("table_name", ColumnType::Name, NO_LENGTH),
+    ("column_name", ColumnType::Name, NO_LENGTH),
+    ("ordinal_position", ColumnType::Int4, NO_LENGTH),
+    ("position_in_unique_constraint", ColumnType::Int4, NO_LENGTH),
 ];
 
 /// The columns of `information_schema.referential_constraints`, which has no rows.
-pub const REFERENTIAL_CONSTRAINTS_COLUMNS: &[(&str, ColumnType)] = &[
-    ("constraint_schema", ColumnType::Name),
-    ("constraint_name", ColumnType::Name),
-    ("unique_constraint_schema", ColumnType::Name),
-    ("unique_constraint_name", ColumnType::Name),
-    ("match_option", ColumnType::Varchar),
-    ("update_rule", ColumnType::Varchar),
-    ("delete_rule", ColumnType::Varchar),
+pub const REFERENTIAL_CONSTRAINTS_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    ("constraint_schema", ColumnType::Name, NO_LENGTH),
+    ("constraint_name", ColumnType::Name, NO_LENGTH),
+    ("unique_constraint_schema", ColumnType::Name, NO_LENGTH),
+    ("unique_constraint_name", ColumnType::Name, NO_LENGTH),
+    ("match_option", ColumnType::Varchar, NO_LENGTH),
+    ("update_rule", ColumnType::Varchar, NO_LENGTH),
+    ("delete_rule", ColumnType::Varchar, NO_LENGTH),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{COLUMNS_COLUMNS, YES_OR_NO};
+    use crate::value::{self, ColumnType};
+
+    /// The literal above is `typmod_of_length(3)`, and this is what says so.
+    #[test]
+    fn a_yes_or_no_column_declares_three_characters() {
+        assert_eq!(YES_OR_NO, value::typmod_of_length(3));
+        assert_eq!(value::length_of_typmod(YES_OR_NO), Some(3));
+        // And it is on the column a client reads it from.
+        let is_nullable = COLUMNS_COLUMNS
+            .iter()
+            .find(|(name, ..)| *name == "is_nullable")
+            .expect("information_schema.columns declares is_nullable");
+        assert_eq!(
+            (is_nullable.1, is_nullable.2),
+            (ColumnType::Varchar, YES_OR_NO)
+        );
+    }
+}

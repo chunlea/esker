@@ -43,6 +43,7 @@
 //! none that `ActiveRecord` writes, because the only way it ever reads the column is through
 //! `pg_get_expr(d.adbin, d.adrelid)`.
 
+use super::NO_LENGTH;
 use std::borrow::Cow;
 
 use crate::backend::Txn;
@@ -155,15 +156,19 @@ fn catalog_rows() -> Vec<Vec<Datum>> {
     let mut rows = Vec::new();
     for view in super::pg_catalog::CatalogView::ALL {
         let oid = i64::try_from(view.table_def().id).unwrap_or(i64::MAX);
-        for (attnum, (name, ty)) in (1..).zip(view.columns()) {
+        for (attnum, (name, ty, typmod)) in (1..).zip(view.columns()) {
             rows.push(vec![
                 Datum::Int8(oid),
                 Datum::Text((*name).to_owned()),
                 Datum::Int8(i64::from(ty.oid())),
                 Datum::Int2(attnum),
-                // No typmod: every column of every catalog view here is declared at its type's
-                // own width, which is what `-1` says.
-                Datum::Int4(-1),
+                // **The length the view's column list declares**, which is `-1` for all but one
+                // family: `information_schema`'s `yes_or_no` columns are a domain over
+                // `character varying(3)`, and a real server reports the domain's own typmod for
+                // them. The comment here used to say every catalog column is declared at its
+                // type's own width, and that was true only while the list had nowhere to say
+                // otherwise.
+                Datum::Int4(*typmod),
                 Datum::Bool(false),
                 Datum::Bool(false),
                 // No catalog column was ever added by an `ALTER`, so none pads.
@@ -575,30 +580,30 @@ pub fn default_expression(
 }
 
 /// The columns of `pg_attribute`, in PostgreSQL's own order.
-pub const ATTRIBUTE_COLUMNS: &[(&str, ColumnType)] = &[
-    ("attrelid", ColumnType::Int8),
-    ("attname", ColumnType::Name),
-    ("atttypid", ColumnType::Int8),
-    ("attnum", ColumnType::Int2),
-    ("atttypmod", ColumnType::Int4),
-    ("attnotnull", ColumnType::Bool),
-    ("atthasdef", ColumnType::Bool),
+pub const ATTRIBUTE_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    ("attrelid", ColumnType::Int8, NO_LENGTH),
+    ("attname", ColumnType::Name, NO_LENGTH),
+    ("atttypid", ColumnType::Int8, NO_LENGTH),
+    ("attnum", ColumnType::Int2, NO_LENGTH),
+    ("atttypmod", ColumnType::Int4, NO_LENGTH),
+    ("attnotnull", ColumnType::Bool, NO_LENGTH),
+    ("atthasdef", ColumnType::Bool, NO_LENGTH),
     // **Whether the column has a *missing value*, which is not whether it has a default.** A
     // default written at `CREATE TABLE` applies to rows written after it and there are no earlier
     // rows to stand in for, so `atthasdef` is `t` and this is `f`; a constant default added by
     // `ALTER TABLE … ADD COLUMN` is stored on the column and padded with, and both are `t`. It is
     // the only way a client can ask whether that `ALTER` rewrote the table.
-    ("atthasmissing", ColumnType::Bool),
-    ("attidentity", ColumnType::Text),
-    ("attgenerated", ColumnType::Text),
-    ("attisdropped", ColumnType::Bool),
-    ("attcollation", ColumnType::Int8),
+    ("atthasmissing", ColumnType::Bool, NO_LENGTH),
+    ("attidentity", ColumnType::Text, NO_LENGTH),
+    ("attgenerated", ColumnType::Text, NO_LENGTH),
+    ("attisdropped", ColumnType::Bool, NO_LENGTH),
+    ("attcollation", ColumnType::Int8, NO_LENGTH),
 ];
 
 /// The columns of `pg_attrdef`, in PostgreSQL's own order.
-pub const ATTRDEF_COLUMNS: &[(&str, ColumnType)] = &[
-    ("oid", ColumnType::Int8),
-    ("adrelid", ColumnType::Int8),
-    ("adnum", ColumnType::Int2),
-    ("adbin", ColumnType::Text),
+pub const ATTRDEF_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    ("oid", ColumnType::Int8, NO_LENGTH),
+    ("adrelid", ColumnType::Int8, NO_LENGTH),
+    ("adnum", ColumnType::Int2, NO_LENGTH),
+    ("adbin", ColumnType::Text, NO_LENGTH),
 ];

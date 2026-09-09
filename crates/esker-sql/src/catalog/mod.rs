@@ -462,6 +462,15 @@ impl ExprShape {
     }
 }
 
+/// **What a catalog column declares when it declares no length**, which is almost all of them.
+///
+/// A `pg_type` name and a spelling of `crate::value::NO_TYPMOD`, so that a column list reads as a
+/// list of *declarations*: a column either names a length or says it has none. The one catalog
+/// column family with a length is `information_schema`'s `yes_or_no` — a domain over
+/// `character varying(3)` — and the list is where it says so
+/// (`crate::catalog::pg_catalog::CatalogView::columns`).
+pub(crate) const NO_LENGTH: i32 = value::NO_TYPMOD;
+
 /// [`ExprShape::printed`]'s pair taken back off — the **pretty** form of a printed expression.
 ///
 /// `pg_get_expr(adbin, adrelid)` prints an operator expression in one pair and
