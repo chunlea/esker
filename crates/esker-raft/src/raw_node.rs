@@ -362,6 +362,15 @@ impl<S: LogStorage> RawNode<S> {
         self.raft.status()
     }
 
+    /// What this node's elections have done, monotonic over its whole life.
+    ///
+    /// A counter rather than a log line, because the races this exists to explain are small enough
+    /// that per-event tracing displaces them. See [`crate::Counters`].
+    #[must_use]
+    pub fn counters(&self) -> crate::types::Counters {
+        self.raft.counters
+    }
+
     /// What it believes it is.
     pub fn role(&self) -> Role {
         self.raft.role
