@@ -116,21 +116,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "The same missing overload as line 91, over the empty bit string — kept because it is the one value that would let a wrong implementation look right: `''` has length 0 whether it is read as bits or as characters.",
             "pg19_varbit.txt:114",
         ),
-        (
-            "INSERT INTO vb3 VALUES ('10101')",
-            "**A cast pads and truncates; an assignment refuses — and this node has only the cast's half.** `value::fit_to_typmod` serves both the cast fold and the row write, and what it holds is the cast's answer, because a refusal where a real server pads would be the worse of the two. So five bits into a `bit varying(3)` column are truncated here and `22001` there. `value::bit::fit_to_column` is the assignment's rule, already written and not yet wired to a caller; the two string types have the same seam in `value::truncate_to_typmod`, which is where this one goes.",
-            "pg19_varbit.txt:150",
-        ),
-        (
-            "INSERT INTO vb4 VALUES ('10101')",
-            "The same seam over a `bit(n)`, whose refusal is a different one: `22026 bit string length 5 does not match type bit(3)`, not `22001`. A `bit(n)` is an exact width and a `bit varying(n)` a maximum, which is the distinction the two codes carry.",
-            "pg19_varbit.txt:152",
-        ),
-        (
-            "INSERT INTO vb4 VALUES ('1')",
-            "And the same rule in the other direction, which is what says a `bit(n)` is exact: **too short is refused too**, with the same `22026`. A cast pads it on the right instead.",
-            "pg19_varbit.txt:153",
-        ),
+        // **The three assignment rows are gone**, closed by `debts-v1.1.md` #36 with the unit
+        // this file opened. They said one function held the *cast's* answer for both callers, and
+        // that turned out to be half the story: the string types were wired the opposite way
+        // round, so `'abcdef'::varchar(3)` was a `22001` where a real server truncates. One seam,
+        // four types, and each had been wired to whichever caller it was written for
+        // (`tests/typmod_seam.rs`).
     ],
 };
 
@@ -185,20 +176,24 @@ fn the_one_word_spelling_reaches_the_same_type_as_the_two() {
     );
 }
 
-/// **A cast truncates**, which is the half of the length rule this node has.
+/// **A cast truncates and an assignment refuses**, which is one rule with two callers.
 ///
-/// The other half is an *assignment*, which a real server refuses — `22001` for a
-/// `bit varying(n)` and `22026` for a `bit(n)`, too short as well as too long — and this node
-/// truncates instead, because one function holds both answers and what it holds is the cast's.
-/// Declared in `DIVERGENCES` with the three measured rows; asserted here as what this node
-/// actually does, so the day the seam is split this line reddens rather than going quiet.
+/// This test asserted the second half was missing, and it was the reason `debts-v1.1.md` #36 was
+/// written: one function held the cast's answer for both callers, so five bits went into a
+/// `bit varying(3)` column and came back three. Closing it found the string types wired the
+/// opposite way round — the whole seam is `tests/typmod_seam.rs` now, and this keeps the bit half
+/// beside the type it belongs to.
 #[test]
-fn a_cast_truncates_and_an_assignment_does_not_yet_refuse() {
+fn a_cast_truncates_where_an_assignment_refuses() {
     let mut node = parity::Node::new(&["CREATE TABLE vb (b varbit(3))"]);
     assert_eq!(node.rows("SELECT '10101'::varbit(3)"), vec![vec!["101"]]);
-    // A real server raises `22001 bit string too long for type bit varying(3)` here.
-    node.run("INSERT INTO vb VALUES ('10101')").unwrap();
-    assert_eq!(node.rows("SELECT b FROM vb"), vec![vec!["101"]]);
+    let error = node.run("INSERT INTO vb VALUES ('10101')").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::STRING_DATA_RIGHT_TRUNCATION);
+    assert_eq!(
+        error.to_string(),
+        "bit string too long for type bit varying(3)"
+    );
+    assert_eq!(node.rows("SELECT count(*) FROM vb"), vec![vec!["0"]]);
 }
 
 /// **The input function reads a base prefix**, which is not the literal syntax beside it.

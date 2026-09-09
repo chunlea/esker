@@ -6381,7 +6381,12 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 // where a real server rounds to `.123`. Same function the write path uses, so a
                 // cast and an `INSERT` cannot disagree about what `(3)` means.
                 let (ty, typmod) = lower_type(data_type)?;
-                let value = value::fit_to_typmod(Datum::from_text(ty, &text)?, ty, typmod)?;
+                // **A cast, so the cast's rule** — `truncate_to_typmod` and not
+                // `fit_to_typmod`, which is the row write's. Asking the wrong one made
+                // `'abcdef'::varchar(3)` a `22001` where a real server answers `abc`, and it was
+                // invisible from the *other* side of the same seam, where `bit` was wired the
+                // opposite way round (`debts-v1.1.md` #36).
+                let value = value::truncate_to_typmod(Datum::from_text(ty, &text)?, ty, typmod)?;
                 // **A folded cast still carries the type it named.** Several types share one
                 // `Datum` — `text`, `varchar`, `bpchar` and `name` are all a `Datum::Text` — so
                 // folding `'x'::name` to its value alone threw the *declared* type away and the

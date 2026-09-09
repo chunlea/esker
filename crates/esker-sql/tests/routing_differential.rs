@@ -570,6 +570,12 @@ impl Gate {
     /// A cluster whose regions **split at `split_size` bytes**, for the §10 re-measure: the
     /// fragment-count axis §9 could not produce needs a table that occupies more than one region.
     async fn start_splitting(split_size: u64) -> Self {
+        Self::start_with(split_size, Duration::from_millis(5), 4).await
+    }
+
+    /// [`Gate::start_splitting`], with the two numbers that decide how much Raft one process is
+    /// driving: the tick every group counts in, and how many threads the pool spreads them over.
+    async fn start_with(split_size: u64, tick: Duration, workers: usize) -> Self {
         let pd_listener = reserve();
         let pd_address = pd_listener.local_addr().unwrap();
         let listeners: Vec<std::net::TcpListener> = (0..STORES).map(|_| reserve()).collect();
@@ -616,7 +622,18 @@ impl Gate {
         let mut nodes = Vec::new();
         for (at, address) in addresses.iter().enumerate() {
             drop(listeners.next());
-            nodes.push(open_store(*address, at as u64 + 1, pd_address, &peers, split_size).await);
+            nodes.push(
+                open_store(
+                    *address,
+                    at as u64 + 1,
+                    pd_address,
+                    &peers,
+                    split_size,
+                    tick,
+                    workers,
+                )
+                .await,
+            );
         }
         wait_for("the region to reach three voters", 60, || {
             pd.regions().is_ok_and(|regions| {
@@ -759,6 +776,10 @@ impl Gate {
     }
 
     /// How many regions the cluster has, as PD sees them.
+    fn nodes(&self) -> &[Node] {
+        &self.nodes
+    }
+
     fn regions(&self) -> usize {
         self.pd.regions().map_or(0, |regions| regions.len())
     }
@@ -1021,10 +1042,13 @@ async fn open_store(
     pd_address: SocketAddr,
     peers: &[PeerAddress],
     split_size: u64,
+    tick: Duration,
+    workers: usize,
 ) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let mut raft = RaftOptions::new(peers.to_vec(), 20_260_901);
-    raft.tick = Duration::from_millis(5);
+    raft.tick = tick;
+    raft.driver_workers = workers;
     raft.compaction = LogCompaction {
         threshold: 64,
         keep: 16,
@@ -1416,6 +1440,129 @@ async fn a_splitting_bulk_load_never_fails_for_want_of_attempts() {
     );
 }
 
+/// **Does the leaderless window move with what the process is driving?** — `docs/plans/debts-v1.1.md`
+/// #34's first question, which is not the fix.
+///
+/// Four stores in one process driving three hundred Raft groups at a five-millisecond tick is its
+/// own explanation for a region that cannot hold an election, and nothing has ruled it out. The two
+/// numbers that decide how much Raft a process is driving are the **tick** every group counts in
+/// and the **driver threads** the pool spreads them over, so this sweeps both and measures the same
+/// thing each time.
+///
+/// If the window shrinks when the tick lengthens or the pool widens, the stall is the harness's
+/// capacity and not the system's. If it does not move at all, the harness is not what is holding
+/// the election up, and the next arm — the same load on four real store processes — is what
+/// separates the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "debts #34, arm (b): two clusters, minutes, and it wants a quiet box"]
+async fn how_the_leaderless_window_moves_with_the_drivers() {
+    const GIVE_UP_AFTER: Duration = Duration::from_secs(20);
+    for (tick_ms, workers) in [(5_u64, 4_usize), (20, 8)] {
+        let gate = Gate::start_with(8 * 1024, Duration::from_millis(tick_ms), workers).await;
+        let mut met = 0_usize;
+        let mut cleared: Vec<Duration> = Vec::new();
+        println!("\n  tick {tick_ms} ms, {workers} driver threads");
+        tokio::task::block_in_place(|| {
+            let mut session = gate.session();
+            settle(
+                &mut session,
+                "CREATE TABLE t (id int8 PRIMARY KEY, filler text)",
+            );
+            let filler = "x".repeat(256);
+            for at in (1..=4_000_i64).step_by(250) {
+                if met >= 4 {
+                    break;
+                }
+                let values: Vec<String> = (at..at + 250)
+                    .map(|id| format!("({id}, '{filler}')"))
+                    .collect();
+                let statement = format!("INSERT INTO t VALUES {}", values.join(", "));
+                let Err(first) = session.run(&statement) else {
+                    continue;
+                };
+                if !first.to_string().contains("not the leader") {
+                    continue;
+                }
+                met += 1;
+                let regions = gate.regions();
+                let began = Instant::now();
+                loop {
+                    match session.run(&statement) {
+                        Ok(_) => {
+                            println!(
+                                "    row {at:<6} {regions:>4} regions   cleared in {:>8.1} ms",
+                                began.elapsed().as_secs_f64() * 1000.0
+                            );
+                            cleared.push(began.elapsed());
+                            break;
+                        }
+                        Err(_) if began.elapsed() >= GIVE_UP_AFTER => {
+                            println!(
+                                "    row {at:<6} {regions:>4} regions   still refused after {:?}",
+                                began.elapsed()
+                            );
+                            break;
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                    }
+                }
+            }
+        });
+        println!(
+            "  tick {tick_ms} ms, {workers} threads: {met} met, {} cleared inside \
+             {GIVE_UP_AFTER:?}, load finished at {} regions",
+            cleared.len(),
+            gate.regions()
+        );
+        gate.stop().await;
+    }
+}
+
+/// **Whether the region nobody leads is one whose handle lost its core** — ADR 0099's state,
+/// asked while the stall is happening rather than after it.
+///
+/// Two facts per store, printed for the region that is refusing: what its handle publishes and
+/// what the core answering for it says. They are the same peer or the store is in the state
+/// [ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md) closes — and asking during
+/// the window is the only time the answer means anything, because a displaced core never
+/// un-displaces and a real election ends.
+fn refused_region(error: &impl std::fmt::Display) -> u64 {
+    let text = error.to_string();
+    text.rsplit_once("region ")
+        .and_then(|(_, tail)| {
+            let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .unwrap_or(1)
+}
+
+async fn who_answers_for(nodes: &[Node], region_id: u64) -> String {
+    let mut said = Vec::new();
+    for node in nodes {
+        let store = &node.store;
+        let Some(peer) = store.peer_of(region_id) else {
+            said.push(format!("store {}: does not host it", store.store_id()));
+            continue;
+        };
+        let status = peer.status().await.ok();
+        said.push(format!(
+            "store {}: handle is peer {} · published leader {:?} term {} · core says {}",
+            store.store_id(),
+            peer.peer_id(),
+            peer.leader(),
+            peer.term(),
+            status.map_or_else(
+                || "unavailable".to_owned(),
+                |status| format!(
+                    "peer {} {:?} term {} leader {:?}",
+                    status.id, status.role, status.term, status.leader
+                )
+            )
+        ));
+    }
+    said.join("\n      ")
+}
+
 /// **How long a writer has to wait when it meets a region between leaders** — the measurement
 /// [ADR 0100](../../../docs/adr/0100-a-region-between-leaders-waits-on-the-callers-deadline.md)
 /// defers its decision on.
@@ -1481,8 +1628,11 @@ async fn how_long_a_writer_waits_for_a_region_between_leaders() {
                         break;
                     }
                     Err(error) if began.elapsed() >= GIVE_UP_AFTER => {
+                        // **Asked during the stall, which is the only time it means anything.**
+                        let who = tokio::runtime::Handle::current()
+                            .block_on(who_answers_for(gate.nodes(), refused_region(&error)));
                         never.push(format!(
-                            "row {at} at {regions} regions: still refused after {:?}: {error}",
+                            "row {at} at {regions} regions: still refused after {:?}: {error}\n      {who}",
                             began.elapsed()
                         ));
                         break;
