@@ -1,0 +1,54 @@
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 1655-1718,1734-1746,1752-1755
+crates/esker-sql/src/catalog/pg_constraint.rs
+  h_44076b318daf9c 360-366,369,371-388
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 3369-3384
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 5960,6016-6027,6213-6217,6239,6360-6371
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 5368-5378
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 4880,4882-4889,4898-4901
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 811-812,1338-1352,1508,1638,1670,1788
+crates/esker-sql/tests/captures/pg19_case_printed.txt
+  h_44076b318daf9c 1-47
+crates/esker-sql/tests/captures/pg19_mod_spelling.txt
+  h_44076b318daf9c 1-49
+crates/esker-sql/tests/captures/pg19_quoted_identifier.txt
+  h_44076b318daf9c 1-61
+crates/esker-sql/tests/case_printed.rs
+  h_44076b318daf9c 1-62
+crates/esker-sql/tests/corpus/pg19_case_printed.txt
+  h_44076b318daf9c 1-47
+crates/esker-sql/tests/corpus/pg19_mod_spelling.txt
+  h_44076b318daf9c 1-49
+crates/esker-sql/tests/corpus/pg19_quoted_identifier.txt
+  h_44076b318daf9c 1-61
+crates/esker-sql/tests/corpus_format.rs
+  h_44076b318daf9c 15-18
+crates/esker-sql/tests/mod_spelling.rs
+  h_44076b318daf9c 1-48
+crates/esker-sql/tests/parity_harness/mod.rs
+  h_44076b318daf9c 679-697,702,813-817,967-972
+crates/esker-sql/tests/quoted_identifier.rs
+  h_44076b318daf9c 1-49
+docs/DESIGN.md
+  h_44076b318daf9c 380-384,430-434,1038-1055,1167-1171
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,50-56,63,82,85,89-91
+docs/plans/phase-9-rails.md
+  h_44076b318daf9c 1278-1279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "d563a2760c87ee846ec626dab94a4d386ffac77b",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
