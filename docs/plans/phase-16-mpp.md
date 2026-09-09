@@ -533,6 +533,53 @@ traffic grows, the learner's own catch-up, PD's routing lookups — and none of 
 which is the term this section is about. **It does not move the verdict**: at both row counts the
 dispatch-shaped term is three times the finish, and it is the term an exchange does not remove.
 
+### The bulk-load failure, run down — it is `40003`, and the lock clears in 1.4 s
+
+The re-measure's ~160-region rung failed with `a lock from the transaction at … could not be
+cleared`, and that reading was wrong about which failure it was. `where_a_bulk_load_into_a_splitting_
+table_breaks` loads in batches at an 8 KB threshold and stops at the first refusal, and the first
+refusal is not a lock:
+
+```text
+2750 rows, 76 regions:
+  the transaction's outcome is unknown: the TxnPrewrite may or may not have been applied:
+  connection closed: region 307 stopped leading with this proposal in its log; it may still commit
+  [40003]
+```
+
+**A leadership change with a proposal in the log, answered honestly.** The client cannot know
+whether it applied, and `40003` is the code for exactly that. Three measurements decide the rest:
+
+1. **The lock clears in 1.4 seconds.** The retry after the ambiguous answer meets its own first
+   attempt's Percolator lock — which is what `settle`'s comment predicts — and asking again settles
+   it in 1.4 s. It is not an unclearable lock; there is no resolver race here to fix.
+2. **It is not the batch size.** One row per statement fails the same way, 150 statements later,
+   with the same `40003` at the commit rather than the prewrite. A 250-row `INSERT` across 76
+   regions is one prewrite over 76 regions, and shrinking it to one region changes nothing — so the
+   *"single transaction too wide"* hypothesis is dead by measurement rather than by argument.
+3. **It is not a fixed number of splits.** Two runs of the same test put the first refusal at 37
+   regions and at 76. What varies between them is when a region happens to change leader, which is
+   what a splitting table does while a hundred-odd Raft groups share four in-process stores with a
+   five-millisecond heartbeat tick.
+
+**So the §10 rung's failure is the harness's**, and precisely: `settle` retries an ambiguous write
+for thirty seconds, each retry can meet the previous attempt's live lock, and under a split rate
+this high the thirty seconds are spent on *fresh* churn rather than on one lock. The fix, if that
+rung is wanted, is a longer deadline or a slower load — not a change to the resolver.
+
+**What is not settled, and is not chased**: whether a split *should* cost a leadership change at
+all. The message says a region stopped leading with a proposal in its log, which under this harness
+is as likely to be election churn from a hundred Raft groups on a loaded box as anything about
+splitting. It is also the best candidate for §10's other unsmoothed number — the per-region cost
+that is 1.2 ms at three thousand rows and 7.9 ms at ten thousand — because a `ReadIndex` round per
+fragment gets slower when leadership is moving. **Both are recorded as candidates with no
+measurement behind them**, which is what they are.
+
+**(a') is unaffected, and the reason is worth stating.** The retry is *younger* than the attempt
+whose lock it meets, so wound-wait sends it to wait rather than to kill — which is the right
+answer, because the older transaction may still commit. A rule that let the retry wound its own
+predecessor would roll back a transaction whose proposal was on its way to being applied.
+
 ### Agreement is not correctness
 
 The sentence this whole thread reduces to, kept here because it was learned three times in one

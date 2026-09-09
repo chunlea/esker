@@ -1441,3 +1441,132 @@ async fn what_a_fragment_costs_per_region_and_per_group() {
         gate.stop().await;
     }
 }
+
+/// **Where a bulk load into a table splitting under itself starts failing** — the first of the two
+/// things `docs/plans/phase-16-mpp.md` §10's re-measure left unsmoothed.
+///
+/// Loading ten thousand rows across the ~160 regions a 16 KB threshold produces failed with
+/// `a lock from the transaction at … could not be cleared`, which is `Error::LockNotCleared`
+/// mapped to `40001`: a client that met somebody's lock, spent its resolution budget and gave up.
+///
+/// **The loader is sequential and its transactions share no keys**, so the lock it meets is not a
+/// concurrent writer's. The candidate this exists to confirm or kill is the one the commit path
+/// names itself: `Transaction::commit` finishes its secondaries with `let _ = self.commit_grouped(…)`
+/// — *"a secondary that fails here is not a failed transaction"*, which is right — and a region that
+/// splits between the prewrite and that call is exactly how it fails. The lock left behind belongs
+/// to a **committed** transaction, and the next writer of that key has to roll it forward through a
+/// region that has moved under both of them.
+///
+/// This prints the region count at each step and stops at the first failure, so the answer is a
+/// number of splits rather than an anecdote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "an investigation: loads until it breaks and prints where"]
+async fn where_a_bulk_load_into_a_splitting_table_breaks() {
+    const BATCH: i64 = 250;
+    const UP_TO: i64 = 6_000;
+
+    let gate = Gate::start_splitting(8 * 1024).await;
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, pad text)",
+        );
+        println!("\n  rows    regions   outcome");
+        let mut at = 1_i64;
+        while at <= UP_TO {
+            let values: Vec<String> = (at..at + BATCH)
+                .map(|id| format!("({id}, 'pad-{id}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')"))
+                .collect();
+            // **`run`, not `settle`.** The helper retries for thirty seconds and would turn the
+            // thing being measured into a pause; what this wants is the first refusal, with its
+            // own words.
+            let outcome = session.run(&format!("INSERT INTO t VALUES {}", values.join(", ")));
+            let regions = gate.regions();
+            match outcome {
+                Ok(_) => println!("  {:<6}  {regions:>7}   ok", at + BATCH - 1),
+                Err(error) => {
+                    println!(
+                        "  {:<6}  {regions:>7}   {error} [{}]",
+                        at + BATCH - 1,
+                        error.sqlstate()
+                    );
+                    println!(
+                        "\n  first refusal at {} rows and {regions} regions\n",
+                        at + BATCH - 1
+                    );
+
+                    // **Does it clear, or is it stuck?** `settle`'s own comment says a retry
+                    // collides with its first attempt's lock and that waiting is the answer; the
+                    // §10 load waited thirty seconds and gave up. So keep asking, and report the
+                    // time and every *distinct* thing it says on the way — a lock that clears in
+                    // forty seconds is a slow cluster, and one that never clears is a defect.
+                    let began = Instant::now();
+                    let mut seen: Vec<String> = Vec::new();
+                    loop {
+                        match session.run(&format!("INSERT INTO t VALUES {}", values.join(", "))) {
+                            Ok(_) => {
+                                println!(
+                                    "  the retry settled after {:.1} s",
+                                    began.elapsed().as_secs_f64()
+                                );
+                                break;
+                            }
+                            Err(esker_sql::SqlError::UniqueViolation { .. }) => {
+                                println!(
+                                    "  the first attempt had committed after all, seen after \
+                                     {:.1} s",
+                                    began.elapsed().as_secs_f64()
+                                );
+                                break;
+                            }
+                            Err(error) => {
+                                let said = format!("[{}] {error}", error.sqlstate());
+                                if !seen.contains(&said) {
+                                    println!("  +{:>5.1} s  {said}", began.elapsed().as_secs_f64());
+                                    seen.push(said);
+                                }
+                                if began.elapsed() > Duration::from_secs(120) {
+                                    println!("  STILL REFUSING after 120 s");
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(200));
+                            }
+                        }
+                    }
+
+                    // **And the harness hypothesis**: a 250-row INSERT across 37 regions is one
+                    // prewrite over 37 regions. One row at a time touches one.
+                    println!("\n  now one row per statement, from {}", at + BATCH);
+                    let mut singles = 0;
+                    for id in at + BATCH..at + BATCH + 250 {
+                        match session.run(&format!("INSERT INTO t VALUES ({id}, 'pad-{id}')")) {
+                            Ok(_) => singles += 1,
+                            Err(error) => {
+                                println!(
+                                    "  single-row insert refused after {singles} of 250: \
+                                     {error} [{}]",
+                                    error.sqlstate()
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    if singles == 250 {
+                        println!(
+                            "  250 single-row inserts all committed, at {} regions",
+                            gate.regions()
+                        );
+                    }
+                    return;
+                }
+            }
+            at += BATCH;
+        }
+        println!(
+            "\n  no refusal up to {UP_TO} rows and {} regions",
+            gate.regions()
+        );
+    });
+    gate.stop().await;
+}
