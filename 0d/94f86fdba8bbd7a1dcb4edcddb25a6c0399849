@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/mod.rs
+  s_6f7019c05b578b::t_6f20bf7f836867 2529,2715-2786,4649-4652
+crates/esker-sql/tests/functional_notation.rs
+  s_6f7019c05b578b::t_b72074ececd164 1-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "0d94f86fdba8bbd7a1dcb4edcddb25a6c0399849",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
