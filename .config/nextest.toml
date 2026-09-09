@@ -16,6 +16,16 @@
 # What is NOT here is a global concurrency limit. Every other test in this workspace is a unit
 # test that finishes in milliseconds, and slowing 470 of them down to protect ten would be paying
 # the wrong cost.
+#
+# **EVERY GROUP IN THIS FILE ONLY BINDS `cargo nextest`.** `just check` and the gate run
+# `cargo nextest run --workspace --all-features --no-fail-fast`, which reads this file; plain
+# `cargo test` does not read it and never has. Under `cargo test` a binary's tests are threads in
+# one process rather than processes, all of them at once, and nothing here slows them down. So a
+# test whose correctness needs the serialisation must also carry it in its own code — that is what
+# `statement_cancellation`'s `static CLOCK: Mutex<()>` is for, and its override below says so at
+# length. For the cluster binaries the serialisation is not a correctness requirement but a
+# *contention* one: run 20 clusters at once under `cargo test` and you get the flake this file
+# exists to remove, which is the standing reason the gate runs nextest and not `cargo test`.
 
 [test-groups.cluster]
 # One cluster at a time. Not two: the point is the absence of contention between them, and a
@@ -64,11 +74,36 @@ max-threads = 1
 # So the membership question was asked of the whole directory rather than of the one that broke:
 #
 # ```sh
-# grep -l 'cluster::Cluster' crates/esker-sql/tests/*.rs
+# grep -l '^mod cluster;' crates/esker-sql/tests/*.rs
 # ```
 #
-# Fifteen binaries; six were listed. The eight added here are the rest (`store_locking` is the
-# ninth and has its own by-test override at the bottom of this file). And a non-member does
+# **That grep is the corrected one, and the correction is the third leak this file has recorded.**
+# It used to read `grep -l 'cluster::Cluster'`, which is a *use site* and not the mechanism: three
+# binaries take the harness apart instead of taking its type — `use cluster::{Session, TENANT}` —
+# and were invisible to it. `joint_gate` and `routing_differential` were in the filter anyway,
+# having been added by hand before the census existed, so the miss was silent until h1 added
+# `multi_region_rows`, which the census could not see and nobody added by hand. It reddened a gate
+# at **21.0 s** on `OutcomeUnknown` from a `TxnPrewrite` deadline and passed alone, which is the
+# same signature, on the same mechanism, as `composite` one paragraph above. What identifies a
+# member is *sharing `tests/cluster/mod.rs`* — three stores with real Raft groups over real
+# sockets — so the census asks for the `mod` and not for a name inside it.
+#
+# Seventeen binaries today, all seventeen listed. `view_bind_real_stores` joins in the same pass:
+# it holds the same three stores, was equally invisible, and had no sighting only because it holds
+# them briefly. `store_locking` joins too, and its exclusion is a mistake this file argued itself
+# into: its own override at the bottom takes the whole runner for the one test that *measures*
+# contention, and that was read as settling the binary. It does not — the other eight hold three
+# real stores each and were load on every member of this group while staying outside it, which is
+# exactly the "a non-member causes the contention" paragraph below. Both settings apply to it now:
+# `test-group` from here, `threads-required` from there.
+#
+# **A name is not the membership rule, in the other direction too.** `fragment_route_repair` looks
+# like a member and is not one: it drives a `MemoryBackend` and a hand-written `FragmentSource`, so
+# it starts no store, holds no region and costs no tick. Same for `esker-store::multi_region` and
+# `retire_crash_kill`, which serve no RPC at all. Do not add a test to this group because its name
+# says cluster; run the grep.
+#
+# And a non-member does
 # not only suffer the contention — it **causes** it, because this group bounds its members
 # against each other and not against the rest of the run, so each one left out is load on the
 # ones that are in. Only `composite` has a
@@ -83,6 +118,42 @@ max-threads = 1
 #
 # A third of a second of serial time against a 21-second red. Run that `grep` when adding a test
 # that starts a cluster.
+#
+# **`priority` is the other half, and it is the half that grouping cannot do.** `max-threads = 1`
+# bounds these binaries against *each other* and against nothing else, which the paragraph above
+# says out loud — so a member still runs beside whatever else the runner has scheduled, and on this
+# machine that is up to four thousand other tests. The evidence is that most of this group's reds
+# happened *inside* it: `promotion`'s `under_load`, `multi_region_differential`, `snapshot`'s two,
+# `composite` — all members when they failed. Serialising them was necessary and is not sufficient.
+#
+# A negative priority puts them at the back of the queue, so the chain of clusters runs on a
+# machine the rest of the suite has already left. It costs wall clock — the chain no longer
+# overlaps the fast tests, so the run is the rest *plus* the chain rather than the longer of the
+# two — and buys the thing that costs more: a rerun. Every gate tonight lost 5-8 minutes to one,
+# and a rerun is not only its own wall clock, it is a gate whose red nobody trusts.
+#
+# **What is verified, and what is not.** `cargo nextest show-config test-groups` was run against
+# this file in the Linux container and reports what nextest itself computed, which is the check
+# that a filter of thirty `binary()` predicates needs:
+#
+# ```text
+# group: cluster (max threads = 1)     29 binaries, 122 tests
+# group: timed   (max threads = 1)      1 binary,     8 tests
+# ```
+#
+# (`esker-cli::columnar_cluster` is the thirtieth name in the filter and lists no test because its
+# one test is `#[ignore]`d — a member, not a stale name.) The **wall-clock cost of `priority` is
+# not measured**, and deliberately: the box was at load 16 with another lane's container on it, so
+# a serial run there would have measured the box. That is the same reason the `esker-store` note
+# above gives for not running a load experiment, and the same answer — the next gate's wall clock
+# is the measurement. The two halves are independent, so if that number is worse than a rerun is,
+# delete this one line and the membership above still stands on its own.
+#
+# **A typo in a key here is a warning and not an error**, which is worth knowing before trusting
+# any of the above: nextest rejects an out-of-range value (`priority = -2000` fails to parse,
+# "expected a signed 8 bit integer") but only *warns* on a key it does not know
+# ("ignoring unknown configuration key"). So `priority` was proved to be read by giving it a value
+# it must reject, not by the run being green. Do that for any key added here.
 #
 # **`esker-store::snapshot` joined on the same argument, and on two sightings rather than one.** It
 # holds regions like its neighbours `promotion` and `balance`, and it was the only member of that
@@ -100,16 +171,45 @@ max-threads = 1
 # it measures nothing (that was learned the expensive way in v47). The proof is later gates
 # staying green.
 #
+# **Then the same census was run on `esker-store`, and it found the textbook member missing.**
+# `promotion`, `balance` and `snapshot` were listed because each had a sighting; nobody had asked
+# which *other* binaries in that crate hold regions. Four do, and their own headlines are the
+# argument — this rule is not read off the code, it is read off the first line of each file:
+#
+# ```text
+# esker-store::cluster    "Three stores, one region, real TCP … three real servers on ephemeral
+#                          ports, and Raft electing a leader among them with no help."
+# esker-store::retire      region data after RemovePeer: 5 stores across 4 tests, 13 peer sites
+# esker-store::pd_wire    "a real server on a real port" for PD, reaching a Raft proposal
+# esker-store::sim_sweep  "replays each case against a real two-store cluster"
+# ```
+#
+# `esker-store::cluster` is the plainest cluster test in the workspace and was in no group at all,
+# which is worth stating because of what it implies about the census: the reason it never appeared
+# is that it never failed, and a member is identified by what it *starts*, not by whether it has
+# reddened yet. The four have no sightings and join on the mechanism, at a measured cost recorded
+# below.
+#
+# **Deliberately still out, so the next census does not churn on them.** `server`, `txnkv`,
+# `reclaim_range` and `schema_fetch` each hold one store on one socket: the sockets cost nothing
+# and there is no consensus among peers to starve, which is the whole mechanism. `sim_snapshot_ask`
+# holds one store too, but note that its subject is *when* an answer arrives — "not a member, on
+# sight" against "not applied here, after the wait" — so if it ever reds it belongs in `timed`
+# below and not here.
+#
 filter = """
     (package(esker-sql) and (binary(joint_gate) or binary(routing_differential) or binary(pd_wiring)
         or binary(real_backend) or binary(real_corpus) or binary(redrive_live)
         or binary(case_insensitive_probe) or binary(collation) or binary(composite)
         or binary(derived_name_in_a_schema) or binary(enum_default) or binary(jsonb_concat)
-        or binary(psql_smoke) or binary(regtype_user_probe)))
-    or (package(esker-store) and (binary(promotion) or binary(balance) or binary(snapshot)))
+        or binary(psql_smoke) or binary(regtype_user_probe)
+        or binary(multi_region_rows) or binary(view_bind_real_stores) or binary(store_locking)))
+    or (package(esker-store) and (binary(promotion) or binary(balance) or binary(snapshot)
+        or binary(cluster) or binary(retire) or binary(pd_wire) or binary(sim_sweep)))
     or (package(esker-cli) and (binary(cluster_start) or binary(cluster_chaos) or binary(columnar_cluster) or binary(pgwire_cluster) or binary(cross_region_scan) or binary(multi_region_differential)))
 """
 test-group = 'cluster'
+priority = -20
 
 [[profile.default.overrides]]
 # **The real-process ones run alone against the whole workspace, not just against each other.**
