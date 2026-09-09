@@ -19,9 +19,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // An array is `text` here and `name[]` there, with the same characters in it — the standing
-    // trade every `pg_catalog` column makes, and the reason `crate::value::vector` exists.
-    types: &["SELECT 'r', current_schemas(false)"],
+    // **Empty.** `current_schemas(false)` was a `text` here against a real server's `name[]`, with
+    // the same characters in it; `name[]` is a type this node has now (`tests/name_array.rs`) and
+    // the row agrees on its declared type too.
+    types: &[],
     answers: &[
         // **A property of the oracle's container, not of PostgreSQL** — the capture's own header
         // says so. `esker-pg19` boots `lc_monetary` at `en_US.utf8`; this node has no locale

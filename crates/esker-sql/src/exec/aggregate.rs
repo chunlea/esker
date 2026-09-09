@@ -239,7 +239,12 @@ impl Aggregation {
                 // borrows `text`'s — and that asymmetry is captured rather than smoothed over
                 // (`tests/corpus/pg19_typmod.txt`). The value does not change either way; the
                 // declared type does.
-                ColumnType::Varchar => Ok(ColumnType::Text),
+                // **And a `name`, which borrows `text`'s the way `varchar` does** — measured,
+                // `min('x'::name)` is a `text` on a real server. It is the one rule in the `name`
+                // unit that runs *away* from the type: every other derivation keeps `name` and
+                // this one drops it, because a real server has no `min(name)` and coerces the
+                // argument (`tests/captures/pg19_name_array.txt`).
+                ColumnType::Varchar | ColumnType::Name => Ok(ColumnType::Text),
                 _ => Ok(arg),
             },
             // **Every integer width averages to `numeric`**, and so does a `numeric`. The

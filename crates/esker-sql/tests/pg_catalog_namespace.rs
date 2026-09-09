@@ -25,7 +25,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // which compare identically and are the standing choice every catalog view in this crate
     // makes. Every row below has the right *rows*.
     types: &[
-        "SELECT 'r', current_schema(), current_schemas(false), current_schemas(true)",
         "SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid \
          = c.relnamespace WHERE c.relname IN \
          ('pg_type','pg_range','pg_class','pg_namespace','pg_attribute','pg_attrdef','pg_index','pg_constraint','pg_collation','pg_extension','pg_available_extensions','pg_inherits','pg_am','pg_proc','pg_trigger','pg_language','pg_partitioned_table','pg_indexes','pg_views','pg_stat_activity','pg_database','pg_depend','pg_sequence','pg_enum') \

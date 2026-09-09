@@ -26,7 +26,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // A cast **to** `varchar` reports `text` here: the two are one representation told apart
         // by OID, and a cast with no length has nothing to carry the distinction. The value is
         // identical, and `::text` on the line above agrees exactly.
-        "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid::varchar",
     ],
     answers: &[
         (

@@ -13,13 +13,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // The standing catalog trade: `current_schema()` is a `name` and `current_schemas` a `name[]`
     // on a real server, `text` here, with the same characters in them.
-    types: &[
-        "SELECT 'r', current_schema(), current_schemas(false), current_schemas(true)",
-        "SELECT 'r', current_schema(), current_schemas(false)",
-        "SELECT 'r', current_schemas(false)",
-        "SELECT 'r', current_schema()",
-        "SELECT 'r', current_schemas(false), current_schemas(true)",
-    ],
+    types: &[],
     answers: &[(
         "SELECT 'r', pg_typeof(current_schema()), pg_typeof(current_schemas(false))",
         "The standing catalog trade made visible as a **row**, because `pg_typeof` returns the \

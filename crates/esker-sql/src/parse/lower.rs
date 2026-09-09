@@ -6137,7 +6137,24 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 // cast and an `INSERT` cannot disagree about what `(3)` means.
                 let (ty, typmod) = lower_type(data_type)?;
                 let value = value::fit_to_typmod(Datum::from_text(ty, &text)?, ty, typmod)?;
-                Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(value))))
+                // **A folded cast still carries the type it named.** Several types share one
+                // `Datum` — `text`, `varchar`, `bpchar` and `name` are all a `Datum::Text` — so
+                // folding `'x'::name` to its value alone threw the *declared* type away and the
+                // `RowDescription` said `text`, OID 25, where a real server says 19. A column of
+                // the type answered correctly all along; it was the bare cast that could not,
+                // which is why no corpus saw it (`tests/captures/pg19_name_array.txt`).
+                //
+                // The `Cast` node is kept only when the value cannot speak for itself. It is a
+                // no-op on the value — the datum below it is already this type's — and it is what
+                // `expr_type` reads.
+                if value.column_type() == Some(ty) {
+                    return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(value))));
+                }
+                Ok(plan::Expr::Cast {
+                    operand: Box::new(plan::Expr::Literal(plan::Literal::Typed(Box::new(value)))),
+                    to: ty,
+                    typmod,
+                })
             }
             // Not a literal, so the cast happens **per row**. Only `text` is a target: a cast to
             // `text` is the operand's own output function and needs nothing of the operand but

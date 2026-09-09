@@ -3395,6 +3395,11 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::ByteaArray => 34,
             ColumnType::BpcharArray => 35,
             ColumnType::VarcharArray => 36,
+            // **`name[]`'s own family, not `text[]`'s**, which is the same rule as every other
+            // array: measured, `'{a,b}'::name[] = '{a,b}'::text[]` is `42883` on a real server
+            // even though `'x'::text = ANY('{x,y}'::name[])` is `t`. An array's comparison is its
+            // element type's and two element types are two operators.
+            ColumnType::NameArray => 86,
             ColumnType::DateArray => 37,
             ColumnType::TimeArray => 38,
             ColumnType::TimestampArray => 39,
@@ -4776,15 +4781,20 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
                 | crate::plan::ScalarFunc::Ascii,
             ..
         } => ColumnType::Int4,
+        // **The session functions answer `name`, and the plural answers `name[]`.** Measured:
+        // `current_schema()`, `current_database()` and `current_user` are `name` on a real server
+        // and `current_schemas(bool)` is `name[]`, where `current_setting()` is a `text` and stays
+        // below with the rest. They were all `text` here while the node had no array of `name` to
+        // name — `n.nspname = ANY (current_schemas(false))` is the predicate every catalog query
+        // `ActiveRecord` sends is built on (`tests/captures/pg19_name_array.txt`).
+        Expr::CurrentSchema { all: Some(_) } => ColumnType::NameArray,
+        Expr::CurrentSchema { all: None } | Expr::CurrentDatabase | Expr::CurrentUser => {
+            ColumnType::Name
+        }
         // Whatever the operand is, a cast to `text` answers `text` — that is what it is for.
         // The two text functions take text and answer text.
         Expr::Scalar { .. }
         | Expr::ToText { .. }
-        // `name` on a real server and `text` here — the standing catalog trade; the array
-        // spelling is `text` too, because this node has no array *value* to type.
-        | Expr::CurrentSchema { .. }
-        | Expr::CurrentDatabase
-        | Expr::CurrentUser
         | Expr::CurrentSetting { .. }
         | Expr::Advisory { .. }
         | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,

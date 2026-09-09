@@ -21,25 +21,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // one already does. The array form never reaches a client at all: `current_schemas` is
         // legal here only as an `ANY` operand, where it becomes an `IN` list before the planner
         // sees it, so there is no array value for a `RowDescription` to describe.
-        "SELECT current_schema()",
     ],
-    answers: &[
-        (
-            "SELECT current_schemas(false)",
-            "`{public}` on a real server, and `0A000` here: selecting it **returns an array**, and \
-         this node has array *expressions* only — no array `Datum`, no array column, nothing a \
-         `RowDescription` could type. Inside an `= ANY` it is a list of names and answers exactly; \
-         on its own it would need the stored-array unit that ADR 0033's roadmap puts in tier 2. \
-         Refusing by name is the honest half: `ActiveRecord` only ever writes it inside an `ANY`.",
-            "pg19_current_schemas.txt:50",
-        ),
-        (
-            "SELECT current_schemas(true)",
-            "The same refusal for the same reason: it is the form that also lists `pg_catalog`, \
-             and selecting either returns an array.",
-            "pg19_current_schemas.txt:51",
-        ),
-    ],
+    answers: &[],
 };
 
 #[test]

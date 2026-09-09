@@ -25,33 +25,18 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 
 /// Statements whose **rows** are right and whose declared type is not.
 ///
-/// One reason for all of them: a `json` or `jsonb` value is a `Datum::Text`, so `RowDescription`
-/// carries `text`'s OID where a real server carries `json`'s or `jsonb`'s. That is the same fact
-/// the `COMPARISON` divergence turns on, seen from the wire instead of from the comparison — these
-/// types share `text`'s representation and `Datum` has no variant to tell them apart. A **column**
-/// of either type reports correctly, because a column's type comes from the catalog rather than
-/// from its values; it is only a bare literal or cast that loses it. Giving `jsonb` a `Datum` of
-/// its own closes both at once.
-const TYPES: &[&str] = &[
-    "SELECT '{\"b\":1, \"a\":2}'::json, '{\"b\":1, \"a\":2}'::jsonb",
-    "SELECT '{\"a\":1,\"a\":2}'::json, '{\"a\":1,\"a\":2}'::jsonb",
-    "SELECT '{  \"a\"  :  1  }'::json, '{  \"a\"  :  1  }'::jsonb",
-    "SELECT '{\"bb\":1,\"a\":2,\"ccc\":3}'::jsonb",
-    "SELECT '{\"ab\":1,\"ba\":2,\"aa\":3}'::jsonb",
-    "SELECT '{\"\":1,\"a\":2}'::jsonb",
-    "SELECT '{\"a\":{\"z\":1,\"b\":{\"y\":1,\"a\":2}}}'::jsonb",
-    "SELECT '1.0'::json, '1.0'::jsonb, '1.00'::jsonb, '1e2'::jsonb",
-    "SELECT '1E400'::jsonb",
-    "SELECT '1E400'::json",
-    "SELECT '[1,2,3]'::json, '[1,2,3]'::jsonb, 'null'::json, 'true'::jsonb, \
-         '\"s\"'::jsonb",
-    "SELECT '[]'::jsonb, '{}'::jsonb",
-    "SELECT '\"\\u0041\"'::jsonb",
-    "SELECT '\"\\u00e9\"'::jsonb",
-    "SELECT '\"\\u0000\"'::json",
-    "SELECT '{\"a\":1}'::json::jsonb, '{\"b\":1,\"a\":2}'::jsonb::json",
-    "SELECT '{\"a\":1}'::json::text, '{\"a\":1}'::text::json",
-];
+/// **Empty, and it was seventeen.** One reason for all of them: a `json` or `jsonb` value is a
+/// `Datum::Text`, so a folded cast threw the declared type away and `RowDescription` carried
+/// `text`'s OID where a real server carries `json`'s or `jsonb`'s. A **column** of either type
+/// always reported correctly — a column's type comes from the catalog rather than from its values
+/// — and it was only a bare literal or cast that lost it, which is why no test but this list saw
+/// it. The `name` unit closed it for every shared representation at once: a folded cast keeps the
+/// `Expr::Cast` node when its value cannot speak for itself, and that node is what `expr_type`
+/// reads (`tests/name_array.rs`).
+///
+/// `Datum` still has no `jsonb` variant, and the `COMPARISON` divergence below is still that fact
+/// — this half of it never needed one.
+const TYPES: &[&str] = &[];
 
 /// One of `DIVERGENCES`' eight reasons.
 const CATALOG: &str = "`typlen`, `typcategory` and `pg_typeof` are columns and a function this node's \

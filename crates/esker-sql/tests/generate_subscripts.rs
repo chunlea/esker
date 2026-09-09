@@ -16,7 +16,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // 0033's third tier rather than anything this unit could do.
     types: &[
         "SELECT conname, contype, conkey FROM pg_constraint WHERE conrelid = 'gsc'::regclass ORDER BY conname",
-        "SELECT c.conname, (SELECT array_agg(a.attname ORDER BY idx) FROM (SELECT idx, c.conkey[idx] AS conkey_elem FROM generate_subscripts(c.conkey, 1) AS idx) indexed_conkeys JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = indexed_conkeys.conkey_elem) AS cols FROM pg_constraint c WHERE c.conrelid = 'gsc'::regclass AND c.contype IN ('p','f') ORDER BY c.conname",
     ],
     answers: &[
         (
