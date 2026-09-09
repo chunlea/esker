@@ -5488,6 +5488,11 @@ fn deparse_default(table: &TableDef, expr: &str) -> Option<String> {
 /// Total over the expression type, like [`deparse`] itself and for the same reason: a new node has
 /// to decide before it compiles. The `false` arms are not a backlog — each is a shape whose
 /// written text already agrees, and several of them agree *because* they are not deparsed.
+///
+/// It has to be **exhaustive and not a list beside a wildcard**, and clippy is what says so:
+/// `match_same_arms` rejects an explicit group and a `_` arm that return the same value, so the
+/// choice is between listing every variant and listing none. Listing every variant is the one that
+/// keeps the promise of the sentence above, and the grouping below is where the reasons live.
 fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
     use crate::plan::Expr;
     match expr {
@@ -5498,32 +5503,56 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
         | Expr::Not(_)
         | Expr::IsNull { .. }
         | Expr::Like { .. }
+        | Expr::RegexMatch { .. }
         | Expr::InList { .. }
+        | Expr::AnyArray { .. }
         | Expr::Cast { .. }
+        | Expr::ToText { .. }
         | Expr::Scalar { .. }
         | Expr::Coalesce(_)
         | Expr::Case { .. } => true,
-        // **A value, and the functions whose spelling is the thing being preserved.** A bare
-        // literal is stored as a *value* rather than as text and never reaches here at all
-        // (`parse::lower::column_default` folds it); the rest are listed because being listed is
-        // what keeps them out.
         // **A catalog function whose name is an operator**, which today is `||` and which
         // [`deparse`] prints as one. Gated on the same condition `deparse`'s own arm uses, because
         // every other `CatalogFunc` deparses to a `name(...)` placeholder that must never be
         // stored: `DEFAULT ('a' || 'b')` prints `('a'::text || 'b'::text)`, measured.
         Expr::CatalogFunc(call) => call.func.name() == "||" && call.args.len() == 2,
-        Expr::Literal(_)
-        | Expr::Sequence(_)
+        // **Everything else keeps the text it was written with, and is listed rather than
+        // wildcarded** so that a new expression node has to decide before it compiles — the same
+        // reason [`deparse`] is total. One arm, because `match_same_arms` will not have two, and
+        // three reasons, which is what the comments inside it are for.
+        //
+        // *The spelling is the thing being preserved.* PostgreSQL keeps `CURRENT_TIMESTAMP` and
+        // `now()` apart in its own tree and prints each back as written; this node lowers both to
+        // one node and could only print one of them, so deparsing here would lose an agreement.
+        // `Sequence` is the same case with a stronger reason: `nextval('s'::regclass)` is
+        // assembled by `parse::lower` and `deparse` prints `nextval()`.
+        Expr::Sequence(_)
         | Expr::Uuid(_)
         | Expr::CurrentUser
         | Expr::CurrentSchema { .. }
         | Expr::CurrentDatabase
         | Expr::CurrentSetting { .. }
-        | Expr::Negate(_) => false,
-        // Everything else cannot be a default: a column reference, a subquery and a
-        // set-returning function are the three `parse::lower::refuse_default_shapes` refuses, and
-        // an aggregate, a parameter and a plan-internal node cannot be written in one.
-        _ => false,
+        | Expr::Advisory { .. }
+        // *There is nothing to reprint.* A bare literal is stored as a **value** and never reaches
+        // here (`parse::lower::column_default` folds it), and a folded negative literal is the
+        // same case — `DEFAULT - 1` is the `Datum` `-1`, which is why `Negate` is here and not
+        // above with the operators.
+        | Expr::Literal(_)
+        | Expr::Negate(_)
+        | Expr::Array { .. }
+        | Expr::Subscript { .. }
+        // *It cannot be written in a `DEFAULT` at all.* A column reference, a subquery and a
+        // set-returning function are the three `parse::lower::refuse_default_shapes` refuses, by
+        // PostgreSQL's own rule that a default is evaluated with no row in scope and one value
+        // out; an aggregate, a parameter and the plan-internal nodes have nowhere to come from.
+        | Expr::Column { .. }
+        | Expr::Ordinal { .. }
+        | Expr::Outer { .. }
+        | Expr::Subquery(_)
+        | Expr::Aggregate(_)
+        | Expr::SetFunc(_)
+        | Expr::Parameter(_)
+        | Expr::Default => false,
     }
 }
 
