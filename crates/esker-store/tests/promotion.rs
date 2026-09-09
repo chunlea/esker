@@ -465,8 +465,25 @@ fn one_peer_per_store(region: &Region) {
 /// **Watched, not sampled**, which is the rule this file already lives by for learners. The driver
 /// learns of a conf change from the *leader's* region heartbeat, so between a core applying a
 /// promotion and PD hearing about it every core is ahead of the driver — a window, and a normal
-/// one at 20 ms a heartbeat. Two hundred and fifty of them is not.
-const DISAGREEMENT_ALLOWED: Duration = Duration::from_secs(5);
+/// one at 20 ms a heartbeat.
+///
+/// **Measured, since it used to be a guess.** The five seconds here were "two hundred and fifty
+/// heartbeats is not a window", written without measuring one. So the run below now records how
+/// long each disagreement it sees actually lasted, and five rounds gave:
+///
+/// ```text
+/// round 1  1.319065217s      rounds 2-5  0ns (no disagreement arose at all)
+/// ```
+///
+/// One appearance in five rounds, and it cleared in a third of the old bar's *first* second — so
+/// the bar is **two** seconds: comfortably above the only window ever seen, and no longer a number
+/// that would sit through a quarter of a minute of one.
+///
+/// The path by which a disagreement could have been *permanent* is closed separately, by
+/// [ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md): a store whose handle for a
+/// region had been orphaned never sent that region's leader-side heartbeat again, so PD's record
+/// froze and every later membership change was a disagreement nothing could resolve.
+const DISAGREEMENT_ALLOWED: Duration = Duration::from_secs(2);
 
 /// **No peer's own core calls itself a voter that `region` calls a learner — for long.**
 ///
