@@ -1209,6 +1209,7 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::Jsonb
             | ColumnType::RegType
             | ColumnType::RegTypeArray
+            | ColumnType::RegProc
             | ColumnType::RegProcArray
             | ColumnType::RegClass
             // **A pseudo-type is not a key because it is not a column.** Nothing is ever stored as

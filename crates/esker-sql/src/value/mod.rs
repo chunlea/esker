@@ -2651,6 +2651,13 @@ impl PgDatum for Datum {
         clippy::too_many_lines,
         reason = "one arm per comparable pair of variants; the list is the vocabulary"
     )]
+    #[expect(
+        clippy::match_same_arms,
+        reason = "two pairs compare the same way and are not the same pair: a `regclass` holds an \
+                  i64 oid and a `regtype`/`regproc` a u32, and merging their arms would license \
+                  `regclass = regtype`, which a real server answers 42883. The bodies matching is \
+                  a fact about the widths, not about the operators."
+    )]
     fn pg_cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Datum::Null, Datum::Null) => Ordering::Equal,

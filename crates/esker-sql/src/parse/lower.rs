@@ -6373,7 +6373,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 return Ok(plan::Expr::Cast {
                     operand: Box::new(lower_expr(expr)?),
                     to: ColumnType::Oid,
-                    typmod: value::NO_TYPMOD,
+                    typmod: NO_TYPMOD,
                 });
             };
             Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(

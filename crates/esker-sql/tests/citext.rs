@@ -12,16 +12,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog type trade, down to `oid` answered as a `bigint` and `regproc` as
-    // `text` — `name` (ADR 0084) and `"char"` (ADR 0095) were the other two and are types here
-    // now. The *values* are identical, which is why all three rows agree. These are the
-    // adapter's own boot queries and what it reads out of them is the typname, the typcategory and
-    // the typinput: `citext`, `S`, `citextin`, all right.
-    types: &[
-        "SELECT 'r', t.typname, t.typelem, t.typdelim, t.typinput, t.typtype, t.typbasetype, \
-         t.typcategory, t.typlen FROM pg_type as t WHERE t.typname IN ('citext') ORDER BY \
-         t.typname",
-    ],
+    // **Empty.** The four catalog type families closed it — `name` (ADR 0084), `"char"`
+    // (ADR 0095), `oid` (ADR 0097) and `regproc` (ADR 0098) — and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). The *values* never changed a character.
+    // These are the adapter's own boot queries and what it reads out of them is the typname, the
+    // typcategory and the typinput: `citext`, `S`, `citextin`, all right.
+    types: &[],
     answers: &[
         // **The standing `text` collation divergence, and the citext answers beside it are
         // right.** `'B' < 'a'` over plain `text` is `f` on the oracle, whose database collation is

@@ -29,15 +29,10 @@ mod parity;
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The catalog's own columns, and none of the three is about `"char"` itself: `oid` and
-    // `regproc` are `bigint` and `text` here — each its own unit on the type-surface queue — and
-    // `'r'::"char"::int4` differs only in `int4`'s own width, which the literal ladder settled
-    // (ADR 0087). Every row agrees.
-    types: &[
-        "SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput, typarray FROM \
-         pg_type WHERE oid IN (18, 1002) ORDER BY oid",
-        "SELECT 'r'::\"char\"::text, 'r'::\"char\"::int4, 65::int4::\"char\"",
-    ],
+    // What is left is not about `"char"` at all: `'r'::"char"::int4` differs only in `int4`'s own
+    // width, which the literal ladder settled (ADR 0087). The `oid` and `regproc` halves of this
+    // sentence closed with their own units (ADR 0097, ADR 0098). Every row agrees.
+    types: &["SELECT 'r'::\"char\"::text, 'r'::\"char\"::int4, 65::int4::\"char\""],
     answers: &[
         // The oracle's catalog and this node's are different databases, so a count over `pg_class`
         // is each server's own. They are in the corpus because they are how a client *uses* the

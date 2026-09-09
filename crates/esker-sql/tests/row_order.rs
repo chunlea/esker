@@ -164,6 +164,12 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 // ([ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
                 | ColumnType::RegType
                 | ColumnType::RegTypeArray
+                // **And a `regproc` for exactly the same reason one catalog over**: its value is
+                // an oid and its name is only how it prints, and the two orders disagree —
+                // `int4in` is 42 and `namein` is 34, so the names sort the other way from the
+                // oids (ADR 0098).
+                | ColumnType::RegProc
+                | ColumnType::RegProcArray
                 // A `regclass` is not one for `regtype`'s reason — an oid that prints as a name —
                 // and `is_index_key` in `esker_keys::row` refuses it, with the decoder agreeing.
                 // **A pseudo-type is not a column**, so there is nothing for a key to order:

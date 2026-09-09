@@ -39,9 +39,9 @@ const CORPUS_FIXTURE: &[&str] = &[
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **These differ in a declared type and nothing else.** `pg_typeof` agrees on both sides now
-    // — it is resolved at plan time from the declared type (ADR 0093) — so what is left in this
-    // list is the catalog's own `oid` and `regproc`, each its own unit on the type-surface queue.
+    // **Empty.** The four catalog type families closed it — `name` (ADR 0084), `"char"`
+    // (ADR 0095), `oid` (ADR 0097) and `regproc` (ADR 0098) — and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). The *values* never changed a character.
     types: &[
         // `oid` and `oid[]` on a real server where this node says `bigint` and `bigint[]` — the
         // catalog-oid family, its own unit. `typname` agrees on both since ADR 0084.
@@ -49,8 +49,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // the value that differed was `name`'s `typelem`, 0 here against 18 on a real server,
         // and it is 18 since `"char"` became a row (ADR 0095). What is left is `oid` answered as
         // a `bigint` and `typinput` as `text` — the two families still on the type-surface queue.
-        "SELECT oid, typname, typlen, typtype, typcategory, typdelim, typelem, typarray, \
-         typinput FROM pg_type WHERE oid IN (19, 1003) ORDER BY oid",
     ],
     answers: &[
         // ----- `pg_typeof` over a value whose type lives in the *expression* --------------------

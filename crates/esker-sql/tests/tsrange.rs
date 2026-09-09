@@ -14,14 +14,14 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog type trade, down to `regtype` and `regproc` — `name` (ADR 0084) and
-    // `"char"` (ADR 0095) were the other two this sentence named and are types here now, and the
-    // values were always identical, which is why the row agrees. What the row *says* is the point: `tsrange`,
+    // The standing catalog type trade, down to `regtype` — `name` (ADR 0084), `"char"`
+    // (ADR 0095) and `regproc` (ADR 0098) were the others this sentence named and are types here
+    // now, and the values were always identical. What the row *says* is the point: `tsrange`,
     // `tstzrange` and `int4range` are `r`/`R` and `_tsrange` is `b`/`A`, all four right.
     //
     // **Three more join it with the six-range unit**, and every value in them agrees: `typelem`
-    // and `typinput` are a `regtype` and a `regproc` there and `text` here; `typname` is a `name`
-    // here (ADR 0084) and `pg_typeof` answers a `regtype` on both sides (ADR 0093). The `points_back` column —
+    // is a `regtype` there and `text` here; `typinput` is a `regproc` on both (ADR 0098),
+    // `typname` a `name` (ADR 0084) and `pg_typeof` a `regtype` on both sides (ADR 0093). The `points_back` column —
     // the two-way link `pg_19_array_type_map.txt` checks — is a `boolean` on both and is `t` for
     // all six range types.
     types: &[

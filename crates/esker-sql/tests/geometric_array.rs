@@ -25,15 +25,10 @@ mod parity;
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **A declared type and nothing else.** `pg_typeof` agrees on both sides now (ADR 0093) and
-    // `typdelim`/`typcategory` are `"char"` here since ADR 0095; what is left is the catalog's own
-    // `oid` and `regproc`, each its own unit.
-    types: &[
-        "SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, t.typcategory, t.typlen FROM \
-         pg_type t WHERE t.typname IN \
-         ('circle','_circle','path','_path','polygon','_polygon','lseg','_lseg','line','_line','point','_point','box','_box') \
-         ORDER BY t.oid",
-    ],
+    // **Empty.** The four catalog type families closed it — `name` (ADR 0084), `"char"`
+    // (ADR 0095), `oid` (ADR 0097) and `regproc` (ADR 0098) — and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). The *values* never changed a character.
+    types: &[],
     answers: &[],
 };
 

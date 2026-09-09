@@ -24,8 +24,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // implemented for any type; it answers a `regtype` on both sides now (ADR 0093), and
         // `format_type(2950, -1)` always agreed. `typname` is a `name` here (ADR 0084) and
         // `typcategory` a `"char"` (ADR 0095); `typlen` agrees exactly, as a `smallint`. What
-        // keeps the row in this list is the catalog's own `oid` and `regproc`.
-        "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'uuid'",
+        // kept the row in this list was the catalog's own `oid` and `regproc`, and both are types
+        // here now (ADR 0097, ADR 0098).
         // A cast **to** `varchar` reports `text` here: the two are one representation told apart
         // by OID, and a cast with no length has nothing to carry the distinction. The value is
         // identical, and `::text` on the line above agrees exactly.

@@ -16,10 +16,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // Three statements whose **rows agree and whose declared types do not**, each the standing
-    // `pg_catalog` trade, now down to two members: an `oid` answered as a `bigint` and a
-    // `regproc` as `text`, whose digits and characters are identical. `name` and `"char"` stood
-    // in this sentence beside them and are types here now (ADR 0084, ADR 0095). The third is `array_agg`, which
+    // **Empty.** The four catalog type families closed it — `name` (ADR 0084), `"char"`
+    // (ADR 0095), `oid` (ADR 0097) and `regproc` (ADR 0098) — and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). The *values* never changed a character.
+    // The third statement was `array_agg`, which
     // builds its array as text: now that an array is a type it could build one, and that is the
     // slice after the constructor rather than part of storage.
     types: &[
@@ -37,8 +37,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `SELECT array_agg(x) FROM (VALUES (NULL::int)) v(x)`, left with `Literal::TypedNull`:
         // the cast survives lowering, so the column is `integer` and the aggregate declares
         // `integer[]` — one of ADR 0047's four.
-        "SELECT oid, typname, typlen, typinput, typelem, typdelim, typcategory FROM pg_type WHERE \
-         typname IN ('_int4','_text') ORDER BY oid",
     ],
     answers: &[
         (

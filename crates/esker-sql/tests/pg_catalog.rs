@@ -36,14 +36,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 ///   container and broke the database. There are no roles here and a computed relation has
 ///   nothing to write to, so all four verbs get the answer a real server gives everyone who is not
 ///   a superuser.
-/// * And the `types` list, which is that many statements of the same sentence: a real server's
-///   `pg_type.oid` is an `oid` and `typinput` a `regproc`, so this node answers a `bigint` and a
-///   `text`. `typname` (a `name`, ADR 0084) and `typdelim`/`typtype` (`"char"`, ADR 0095) stood
-///   in that sentence too and are those types here now, which is what shrank the list.
-///   **Every value is identical** — the harness only reaches this list when the rows already
-///   agree — and what differs is the OID in `RowDescription`.
-///   `ActiveRecord` reads all five columns with `.to_i` or a string comparison, so nothing it does
-///   can see it.
+/// * And the `types` list, which is **empty**. It held 28 statements of one sentence — a real
+///   server's `pg_type.oid` is an `oid`, `typname` a `name`, `typdelim`/`typtype` a `"char"` and
+///   `typinput` a `regproc`, and this node answered a `bigint` and three `text`s — and the four
+///   type units emptied it one family at a time (ADR 0084, ADR 0095, ADR 0097, ADR 0098). **Every
+///   value was identical throughout**; what differed was the OID in `RowDescription`, which is why
+///   nothing `ActiveRecord` does could see it and why only a `Describe` ever could.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         // **Seven rows left this list when `typname` became `name`.** Every one of them projected
@@ -52,14 +50,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // columns). The rows that remain project an `oid` beside it, which is an `oid` there and a
         // `bigint` here. `"char"` columns were the other reason a row stayed and are no longer
         // one (ADR 0095).
-        "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'int8'",
-        "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'text'",
-        "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'bool'",
-        "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'bytea'",
-        "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'float8'",
-        "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'timestamptz'",
-        "SELECT typinput FROM pg_type WHERE typname = 'bool'",
-        "SELECT typinput FROM pg_type WHERE typname = 'timestamptz'",
     ],
     answers: &[
         (
