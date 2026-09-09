@@ -1,0 +1,27 @@
+crates/esker-sql/tests/nested_savepoint_deadlock.rs
+  s_2d916f5f540186::t_9a799e3da86e76 31,122-211
+crates/esker-sql/src/backend/mod.rs
+  s_2d916f5f540186::t_2eaaf9f9b523d0 983-987,1103,1384-1461
+crates/esker-sql/src/backend/store.rs
+  s_2d916f5f540186::t_93f796839141ef 456-457
+crates/esker-sql/src/exec/savepoint.rs
+  s_2d916f5f540186::t_656c2dda4407a0 159,169-198,342-347,349,419-511
+crates/esker-sql/src/backend/locks.rs
+  s_2d916f5f540186::t_0d842b2d3251b7 46-53,63,94,131,154-155,159-162,165-172,174-208,211,228,256-260,296-300
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "a19963a002a47a4cfe22cdd57be4088757788c33",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
