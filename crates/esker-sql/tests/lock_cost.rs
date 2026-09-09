@@ -122,7 +122,7 @@ fn what_a_hundred_row_lock_costs() {
         txn.commit().unwrap();
     };
     let baseline = timed(|| commit_with(&[]));
-    let one_region = timed(|| commit_with(&keys));
+    // The one-region hundred is the middle rung of the loop below, so it is not measured twice.
     let three_regions = timed(|| commit_with(&spread));
 
     // What writing the same hundred rows costs, which is the comparison that turns the number
