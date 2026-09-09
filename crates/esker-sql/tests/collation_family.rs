@@ -114,11 +114,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_collation_family.txt:167",
         ),
         (
-            "SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'g1co'::regclass AND contype = 'c' ORDER BY conname",
-            "**A `CHECK` is stored as written, so its literals show no coercion.** `CHECK ((upper(t) = 'A'::text))` there, `CHECK ((upper(t) = 'A'))` here. Not collation: it is the fifth reader of the deparse rule, recorded as `docs/plans/debts-v1.1.md` #25 -- the four ADR 0090 lists plus this one -- and it carries the same read-back requirement, since a check's text is re-parsed to evaluate it on every write.",
-            "pg19_collation_family.txt:177",
-        ),
-        (
             "SELECT 'r', (u COLLATE \"C\") < (t COLLATE \"POSIX\") FROM g1co",
             "**The other half of the same absence: two explicit collations that disagree.** PostgreSQL answers `42P21 collation mismatch between explicit collations` -- a different sqlstate from the indeterminate case, because this one is over-determined rather than under-determined -- and this node compares the two columns and answers. Both collations it has order by byte (ADR 0076), so the answer is the answer either would give; what is missing is the refusal. Its own line because it is a second sqlstate to implement.",
             "pg19_collation_family.txt:179",
