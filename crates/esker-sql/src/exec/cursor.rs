@@ -3416,10 +3416,14 @@ fn catalog_function(
         // has and each of them measured: a type's printed name, `-` for oid 0 — which is what
         // every non-array row of `pg_type` holds in `typelem` — and the number back for an oid
         // this node has no type for.
+        // **Through `named_by_oid`, so that an array this node has no `ColumnType` for still has
+        // a name**: `1020::regtype` is `box[]` on a real server and was the oid's own digits here.
+        // The third place the derived array rows had to reach, after `pg_type.typarray` and the
+        // row itself (`crate::value::named_by_oid`, `tests/array_types.rs`).
         CatalogFunc::RegTypeName => match oid_argument(args.first())? {
             None => Datum::Null,
-            Some(oid) => match u32::try_from(oid).ok().and_then(crate::value::type_by_oid) {
-                Some(ty) => Datum::Text(crate::value::Named::Scalar(ty).printed()),
+            Some(oid) => match u32::try_from(oid).ok().and_then(crate::value::named_by_oid) {
+                Some(named) => Datum::Text(named.printed()),
                 None if oid == 0 => Datum::Text("-".to_owned()),
                 None => Datum::Text(oid.to_string()),
             },

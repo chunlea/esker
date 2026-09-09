@@ -65,7 +65,14 @@ pub fn format_type(oid: Option<i64>, typmod: Option<i32>) -> Datum {
         return Datum::Text(INVALID_OID.to_owned());
     }
     let Some(ty) = type_of_oid(oid) else {
-        return Datum::Text(UNKNOWN_TYPE.to_owned());
+        // **An array this node has no `ColumnType` for still has a name**: ten base types have a
+        // `typarray` on a real server and no array type here, and `format_type(1020, NULL)` is
+        // `box[]` there — measured, beside `1020::regtype`, which is the same name through a
+        // different function. `???` is right only for an oid that names nothing at all.
+        return match u32::try_from(oid).ok().and_then(value::named_by_oid) {
+            Some(named @ value::Named::Array(_)) => Datum::Text(named.printed()),
+            _ => Datum::Text(UNKNOWN_TYPE.to_owned()),
+        };
     };
     Datum::Text(spell(ty, typmod))
 }

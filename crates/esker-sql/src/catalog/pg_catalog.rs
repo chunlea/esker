@@ -2415,9 +2415,7 @@ fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
                 // over. `typtype` stays `b` for an array too: `b` is "base", as
                 // against `r`ange, `e`num, `d`omain and `c`omposite, and an array is
                 // none of those.
-                Datum::Int8(
-                    ArrayValue::element_of(*ty).map_or(0, |element| i64::from(element.oid())),
-                ),
+                Datum::Int8(typelem(*ty)),
                 Datum::Text(typdelim(*ty).to_owned()),
                 Datum::Text(typinput(*ty).to_owned()),
                 Datum::Text(typtype(*ty).to_owned()),
@@ -2450,12 +2448,83 @@ fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
             ]
         })
         .collect();
+    rows.extend(derived_array_rows(&rows));
     rows.extend(user_type_rows(txn, tenant)?);
     rows.sort_by_key(|row| match row.first() {
         Some(Datum::Int8(oid)) => *oid,
         _ => 0,
     });
     Ok(rows)
+}
+
+/// The array rows no `ColumnType` stands for — one per base type whose `typarray` points at a row
+/// [`ColumnType::ALL`] does not produce.
+///
+/// **A `pg_type` row is a fact about the catalog, not a column type this node can store.** Ten
+/// base types here — the six geometric shapes, `regclass` and the two vectors, and `lquery` — have
+/// a `typarray` on a real server and no array type in this crate (ADR 0047: an array is a
+/// constructor over a scalar, and only the elements a column can hold have one). Leaving the row
+/// out made `typarray` a pointer at nothing, which is what
+/// `type_lookup_test#test_array_delimiters_are_looked_up_correctly` reads:
+///
+/// * `ActiveRecord` registers `box` **by name**, so 603 enters its type map;
+/// * it then asks for every type whose `typelem` is a known oid, which is where 1020 `_box` comes
+///   from — and `register_with_subtype` registers an array only when its element is already
+///   there, so both rows are needed and neither alone is enough;
+/// * `_box` is the one array in the suite whose delimiter is a **semicolon**, because a box's own
+///   text holds commas — `{(1,1),(0,0);(3,3),(2,2)}` is two boxes. With no row the lookup returns
+///   a bare value and the test dies on `undefined method 'delimiter'`.
+///
+/// Every column is the measurement's (`tests/corpus/pg19_array_types.txt`): `typelem` the element,
+/// `typinput` `array_in`, `typtype` `b` — an array is a *base* type, not a category of its own —
+/// `typlen` -1, `typcategory` `A`, and `typdelim` **the element's**, which is the only column that
+/// is not the same for all forty-eight.
+fn derived_array_rows(base: &[Vec<Datum>]) -> Vec<Vec<Datum>> {
+    let already: std::collections::BTreeSet<i64> = base
+        .iter()
+        .filter_map(|row| match row.first() {
+            Some(Datum::Int8(oid)) => Some(*oid),
+            _ => None,
+        })
+        .collect();
+    ColumnType::ALL
+        .iter()
+        .filter_map(|ty| {
+            let oid = i64::from(crate::value::array_oid(*ty));
+            // Zero is a type with no array at all, and an oid already in the table is an array
+            // this crate does have a `ColumnType` for — `_int4` is a type here, not a derived row.
+            if oid == 0 || already.contains(&oid) {
+                return None;
+            }
+            Some(vec![
+                Datum::Int8(oid),
+                Datum::Text(format!("_{}", typname(*ty))),
+                Datum::Int8(i64::from(ty.oid())),
+                // **The element's delimiter**, which is `;` for exactly one type and `,` for the
+                // other forty-seven — and it is on the array's row as well as the element's,
+                // measured on both.
+                Datum::Text(typdelim(*ty).to_owned()),
+                Datum::Text("array_in".to_owned()),
+                Datum::Text("b".to_owned()),
+                Datum::Int8(0),
+                // An array is collatable exactly when its element is: `_text` reports 100 beside
+                // `text`'s, measured. None of the ten here is a string type, so all ten are 0 —
+                // through the element's answer rather than a zero, so a collatable element added
+                // later cannot be quietly wrong.
+                Datum::Int8(super::pg_attribute::typcollation(*ty)),
+                Datum::Int8(PUBLIC_NAMESPACE_OID),
+                // A varlena, whatever the element's width: an array carries a header and its
+                // dimensions.
+                Datum::Int2(-1),
+                Datum::Text("A".to_owned()),
+                // An array has no array of its own.
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Bool(false),
+                Datum::Null,
+            ])
+        })
+        .collect()
 }
 
 /// One row per user-defined type, and **one more for the array type `CREATE TYPE` made with it**.
@@ -2986,6 +3055,33 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
 /// `ActiveRecord` reads it, and reads it by comparison — `row["typinput"] == "array_in"` is how it
 /// tells an array type from everything else — so the value is load-bearing and the spelling is the
 /// capture's, underscore and all: `timestamptz_in` has one and `int8in` does not.
+/// `pg_type.typelem`: what one element of this type is, and **not only for an array**.
+///
+/// An array's element is the obvious half. The other half is measured and was a zero here: a real
+/// server sets `typelem` on the fixed-length types that are *internally* an array of something —
+/// `point` and `line` are two `float8`s, `lseg` and `box` are two `point`s, `int2vector` is
+/// `int2`s and `oidvector` is `oid`s. `path`, `polygon` and `circle` are variable-length and
+/// report `0`, which is why this is a list and not a rule about shapes.
+///
+/// Harmless to a client that reads it and worth being right about anyway: `ActiveRecord` sorts a
+/// `pg_type` row by `typinput == 'array_in'` before it ever looks at `typelem`, and every one of
+/// these six is registered by *name* before that — which is why copying the oracle's value cannot
+/// change what the adapter does with it. Found by diffing the whole table against the oracle's
+/// column by column (`tests/corpus/pg19_array_types.txt`).
+fn typelem(ty: ColumnType) -> i64 {
+    if let Some(element) = ArrayValue::element_of(ty) {
+        return i64::from(element.oid());
+    }
+    let element = match ty {
+        ColumnType::Point | ColumnType::Line => ColumnType::Double,
+        ColumnType::Lseg | ColumnType::Box => ColumnType::Point,
+        ColumnType::Int2Vector => ColumnType::Int2,
+        ColumnType::OidVector => ColumnType::Oid,
+        _ => return 0,
+    };
+    i64::from(element.oid())
+}
+
 /// `pg_type.typdelim`: the character that separates two elements inside an array literal.
 ///
 /// **A comma for every type but one.** `box` uses a **semicolon**, because a box's own text
@@ -3071,13 +3167,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Hstore => "hstore_in",
         ColumnType::TsVector => "tsvectorin",
         ColumnType::TsQuery => "tsqueryin",
-        ColumnType::TsRange => "tsrange_in",
-        ColumnType::TstzRange => "tstzrange_in",
-        ColumnType::Int4Range => "int4range_in",
         ColumnType::Point => "point_in",
-        ColumnType::DateRange => "daterange_in",
-        ColumnType::NumRange => "numrange_in",
-        ColumnType::Int8Range => "int8range_in",
         // Not `money_in`: the input function is named for the C type behind it.
         ColumnType::Money => "cash_in",
         ColumnType::Inet => "inet_in",
@@ -3093,11 +3183,23 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Line => "line_in",
         ColumnType::Bit => "bit_in",
         ColumnType::VarBit => "varbit_in",
-        // **`range_in` for a user-defined range**, measured: a real server's `floatrange` has
-        // `typinput = range_in`, not `floatrange_in` — the input function belongs to the range
-        // *machinery* and reads the subtype out of `pg_range`. These two have no row of their
-        // own here (see `typname`); `user_type_rows` is where a `floatrange` gets one.
-        ColumnType::FloatRange | ColumnType::VarcharRange => "range_in",
+        // **`range_in` for every range**, measured: a real server's `int4range` has
+        // `typinput = range_in`, not `int4range_in` — the input function belongs to the range
+        // *machinery* and reads the subtype out of `pg_range`, which is why one function serves
+        // all of them.
+        //
+        // The rule was here for the two user-defined ranges and not for the six built-in ones,
+        // which had a name each. Found by diffing this whole table against the oracle's, column by
+        // column, rather than by anybody reading it. The user ranges have no row of their own here
+        // (see `typname`); `user_type_rows` is where a `floatrange` gets one.
+        ColumnType::TsRange
+        | ColumnType::TstzRange
+        | ColumnType::Int4Range
+        | ColumnType::DateRange
+        | ColumnType::NumRange
+        | ColumnType::Int8Range
+        | ColumnType::FloatRange
+        | ColumnType::VarcharRange => "range_in",
         ColumnType::Citext => "citextin",
         ColumnType::Bool => "boolin",
         ColumnType::Bytea => "byteain",
