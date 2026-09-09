@@ -35,6 +35,22 @@ use crate::value::PgDatum;
 use crate::value::{self, ColumnType, Datum, NO_TYPMOD, PgType};
 
 impl Parsed {
+    /// The options an `EXPLAIN` was written with, **without lowering the statement inside it**.
+    ///
+    /// `EXPLAIN … EXECUTE p1(1)` explains a statement that lives in the session's store, so the
+    /// statement and the options reach the executor separately and only the options are in this
+    /// tree. `None` when this is not an `EXPLAIN` at all.
+    ///
+    /// # Errors
+    ///
+    /// The option list's own refusals — an unrecognised option or value, `FORMAT` written outside
+    /// the parentheses — raised here exactly as they are when the whole statement is lowered,
+    /// because it is the same reader — the private `explain_settings` below, which is the one
+    /// function in this module that reads an option list.
+    pub fn explain_options(&self) -> Result<Option<(bool, plan::ExplainFormat)>> {
+        Ok(explain_settings(&self.statement)?.map(|settings| (settings.analyze, settings.format)))
+    }
+
     /// Lowers this statement into the plan types the executor runs, or names the construct that
     /// stopped it (contract C2).
     pub fn lower(&self) -> Result<plan::Statement> {
@@ -887,51 +903,19 @@ fn lower_statement(
             })
         }
         Statement::Explain {
-            describe_alias,
-            analyze,
-            verbose,
-            query_plan,
-            estimate,
-            statement,
-            format,
-            options,
+            statement: explained,
+            ..
         } => {
-            refuse_if(*query_plan, "EXPLAIN QUERY PLAN")?;
-            refuse_if(*estimate, "EXPLAIN ESTIMATE")?;
-            let _ = describe_alias;
-            // **The two spellings are one vocabulary.** `EXPLAIN ANALYZE VERBOSE` and
-            // `EXPLAIN (ANALYZE, VERBOSE)` mean the same thing on a real server, so the legacy
-            // keywords are folded into the option list rather than handled beside it — and
-            // `FORMAT` outside parentheses is a syntax error there, which is why only the
-            // parenthesised list can carry one (measured, `EXPLAIN FORMAT JSON SELECT 1`).
-            // `VERBOSE` is accepted and ignored here as it is inside the parentheses, so the
-            // legacy keyword needs no field of its own.
-            let _ = verbose;
-            let mut settings = ExplainOptions {
-                analyze: *analyze,
-                ..ExplainOptions::default()
-            };
-            // **`FORMAT` outside the parentheses is a syntax error on a real server**, and
-            // `sqlparser` parses it only for the dialects where it is not. Answering a plan here
-            // would be answering where PostgreSQL raises, which ADR 0031 calls the worst class of
-            // divergence — so it is refused in PostgreSQL's own words. Measured:
-            // `EXPLAIN FORMAT JSON SELECT 1` and `EXPLAIN ANALYZE FORMAT JSON SELECT 1`.
-            if format.is_some() {
-                return Err(SqlError::SyntaxAtOrNear("FORMAT".to_owned()));
-            }
-            for option in options.iter().flatten() {
-                settings.set(option)?;
-            }
-            settings.validate()?;
+            let settings = explain_settings(statement)?.unwrap_or_default();
             // A nested statement carries no storage parameter of its own.
-            let inner = lower_statement(statement, None)?;
+            let inner = lower_statement(explained, None)?;
             // **`ANALYZE` runs the statement**, which is what the word means on a real server. So
             // it is executed for a `SELECT`, where the point of it is the `ScanStats` a columnar
             // answer carries (ADR 0022 milestone 4), and stays `0A000` for everything else — an
             // `EXPLAIN ANALYZE INSERT` that ran would be an insert.
             refuse_if(
                 settings.analyze && !matches!(inner, plan::Statement::Select(_)),
-                "EXPLAIN ANALYZE of a statement that is not a SELECT",
+                EXPLAIN_ANALYZE_NOT_A_SELECT,
             )?;
             Ok(plan::Statement::Explain(Box::new(plan::Explain {
                 statement: Box::new(inner),
@@ -1541,6 +1525,64 @@ fn lower_cursor(read: &crate::parse::CursorRead) -> Result<plan::Statement> {
         CursorRead::Malformed { at } => return Err(SqlError::SyntaxAtOrNear(at.clone())),
     };
     Ok(plan::Statement::Cursor(cursor))
+}
+
+/// What an `EXPLAIN ANALYZE` of anything but a `SELECT` is refused with.
+///
+/// One spelling, because `EXPLAIN … EXECUTE` makes the same refusal from the executor — the
+/// statement it explains is substituted after this lowering has run, so the check happens twice
+/// and must not say two things.
+pub(crate) const EXPLAIN_ANALYZE_NOT_A_SELECT: &str =
+    "EXPLAIN ANALYZE of a statement that is not a SELECT";
+
+/// The option list an `EXPLAIN` carries, or `None` when the statement is not one.
+///
+/// **Shared by the lowering and by [`Parsed::explain_options`]**, because the statement *inside* an
+/// `EXPLAIN` is not always lowerable where the options are wanted: `EXPLAIN … EXECUTE p1(1)`
+/// explains a statement the session holds and the executor cannot see, so the two halves arrive
+/// separately and only the options are in this tree. Two readers of one option list is how one of
+/// them comes to accept a spelling the other refuses.
+fn explain_settings(statement: &Statement) -> Result<Option<ExplainOptions>> {
+    let Statement::Explain {
+        describe_alias,
+        analyze,
+        verbose,
+        query_plan,
+        estimate,
+        format,
+        options,
+        ..
+    } = statement
+    else {
+        return Ok(None);
+    };
+    refuse_if(*query_plan, "EXPLAIN QUERY PLAN")?;
+    refuse_if(*estimate, "EXPLAIN ESTIMATE")?;
+    let _ = describe_alias;
+    // **The two spellings are one vocabulary.** `EXPLAIN ANALYZE VERBOSE` and
+    // `EXPLAIN (ANALYZE, VERBOSE)` mean the same thing on a real server, so the legacy keywords are
+    // folded into the option list rather than handled beside it — and `FORMAT` outside parentheses
+    // is a syntax error there, which is why only the parenthesised list can carry one (measured,
+    // `EXPLAIN FORMAT JSON SELECT 1`). `VERBOSE` is accepted and ignored here as it is inside the
+    // parentheses, so the legacy keyword needs no field of its own.
+    let _ = verbose;
+    let mut settings = ExplainOptions {
+        analyze: *analyze,
+        ..ExplainOptions::default()
+    };
+    // **`FORMAT` outside the parentheses is a syntax error on a real server**, and `sqlparser`
+    // parses it only for the dialects where it is not. Answering a plan here would be answering
+    // where PostgreSQL raises, which ADR 0031 calls the worst class of divergence — so it is
+    // refused in PostgreSQL's own words. Measured: `EXPLAIN FORMAT JSON SELECT 1` and
+    // `EXPLAIN ANALYZE FORMAT JSON SELECT 1`.
+    if format.is_some() {
+        return Err(SqlError::SyntaxAtOrNear("FORMAT".to_owned()));
+    }
+    for option in options.iter().flatten() {
+        settings.set(option)?;
+    }
+    settings.validate()?;
+    Ok(Some(settings))
 }
 
 /// The three parameter names PostgreSQL's grammar spells with spaces, and no others.

@@ -148,6 +148,11 @@ pub struct Connection<S> {
     /// **It defaults to the user's name**, which is PostgreSQL's rule and is what makes `psql`
     /// with no `-d` connect to a database named for whoever is running it.
     database: String,
+    /// libpq's `options` startup parameter, verbatim.
+    ///
+    /// A command line — `-c name=value` and `--name=value` — applied to the session once it
+    /// exists. Empty when the client sent none, which is every client that does not ask.
+    options: String,
     /// Reused between messages so a busy session is not allocating a buffer per reply.
     ///
     /// It travels to the blocking thread with the session and comes back, so "reused" survives
@@ -190,6 +195,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// decoded by [`Connection::startup`].
     fn resuming(stream: S, config: Config, pending: Option<Vec<u8>>) -> Self {
         Connection {
+            options: String::new(),
             stream,
             config,
 
@@ -211,36 +217,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         if !self.startup().await? {
             return Ok(());
         }
-        // **After the startup packet, because the database it names is what decides the tenant.**
-        // A name the directory does not have is `3D000` here and the connection ends, which is
-        // what tells `rake db:create` it has work to do.
-        // The identity announced at startup, not a fresh one: `BackendKeyData` already told the
-        // client this pid and key.
-        let identity = self
-            .backend
-            .clone()
-            .unwrap_or_else(crate::session::register);
-        // **Onto a blocking thread, and this is the second time this class of bug has been found
-        // in this file.** `for_session` looks like bookkeeping and is not: against a real cluster
-        // it begins a transaction and reads the catalog, which goes `StoreTxn` -> `Router` ->
-        // `TcpStores` -> `BlockingTransport::call` -> `Runtime::block_on`, and building a runtime
-        // inside `#[tokio::main]`'s panics with "Cannot start a runtime from within a runtime".
-        // Every connection completed its startup burst and then died, on every real cluster, from
-        // 0510b44e (the startup packet selects the database) onwards — v1.0.0 included.
-        //
-        // The statement path sixty lines below has been on the blocking pool since it was written,
-        // with a comment saying why; session *creation* was not, and no test started a real node
-        // from a shell until the mpp lane did.
-        let database = self.database.clone();
-        let made = tokio::task::spawn_blocking(move || executors.for_session(&database, identity))
-            .await
-            .map_err(std::io::Error::other)?;
-        let executor = match made {
-            Ok(executor) => executor,
-            Err(error) => {
-                self.send_error(&error).await?;
-                return Ok(());
-            }
+        let Some(executor) = self.open_session(executors).await? else {
+            return Ok(());
         };
         let mut work = Work {
             session: Session::new(),
@@ -426,6 +404,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 .iter()
                 .find(|(name, _)| name == "database")
                 .map_or_else(|| self.user.clone(), |(_, value)| value.clone());
+            // libpq's `options`, which is a command line and is applied once the session exists
+            // (`Connection::apply_options`).
+            if let Some((_, options)) = parameters.iter().find(|(name, _)| name == "options") {
+                self.options.clone_from(options);
+            }
         }
         self.out.clear();
         match negotiation(startup) {
@@ -477,10 +460,93 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             key: backend.key,
         }
         .encode(&mut self.out);
-        Message::ReadyForQuery(TransactionStatus::Idle).encode(&mut self.out);
+        // **`ReadyForQuery` is not sent here**, and that is the whole of `test_bad_connection`.
+        // It is the message that tells a client its connection is established: libpq's `PQconnect`
+        // returns when it arrives, and an error after it is an error on a *live* connection —
+        // which the client meets later, as `PQconsumeInput() FATAL: …`, from wherever it happens
+        // to be reading. `ActiveRecord`'s `new_client` rescues `PG::Error` **from the connect**
+        // and reads the database name out of the message; an error that arrives afterwards never
+        // reaches it and becomes a `ConnectionNotEstablished` from somewhere else entirely.
+        //
+        // So readiness waits until the session exists, which is where the database this packet
+        // named is resolved (`Connection::run`). A real server validates it earlier still, before
+        // authentication; here it needs the executor, and anywhere before `ReadyForQuery` is
+        // early enough for every client.
         self.stream.write_all(&self.out).await?;
         self.stream.flush().await?;
         Ok(true)
+    }
+
+    /// The session this connection runs as, or `None` when the client has been told why not.
+    ///
+    /// **After the startup packet, because the database it names is what decides the tenant.** A
+    /// name the directory does not have is `3D000` here and the connection ends, which is what
+    /// tells `rake db:create` it has work to do — and it is answered **before readiness**, so it
+    /// is a connection that never opened rather than one that opened and died. `ActiveRecord`'s
+    /// `NoDatabaseError` and `rake db:create` both look at the connect.
+    ///
+    /// **Onto a blocking thread, and this is the second time this class of bug has been found in
+    /// this file.** `for_session` looks like bookkeeping and is not: against a real cluster it
+    /// begins a transaction and reads the catalog, which goes `StoreTxn` -> `Router` ->
+    /// `TcpStores` -> `BlockingTransport::call` -> `Runtime::block_on`, and building a runtime
+    /// inside `#[tokio::main]`'s panics with "Cannot start a runtime from within a runtime". Every
+    /// connection completed its startup burst and then died, on every real cluster, from 0510b44e
+    /// (the startup packet selects the database) onwards — v1.0.0 included.
+    ///
+    /// The statement path has been on the blocking pool since it was written, with a comment
+    /// saying why; session *creation* was not, and no test started a real node from a shell until
+    /// the mpp lane did.
+    async fn open_session(
+        &mut self,
+        executors: Arc<dyn Executors>,
+    ) -> std::io::Result<Option<Box<dyn Execute + Send>>> {
+        // The identity announced at startup, not a fresh one: `BackendKeyData` already told the
+        // client this pid and key.
+        let identity = self
+            .backend
+            .clone()
+            .unwrap_or_else(crate::session::register);
+        let database = self.database.clone();
+        let made = tokio::task::spawn_blocking(move || executors.for_session(&database, identity))
+            .await
+            .map_err(std::io::Error::other)?;
+        match made {
+            Ok(mut executor) => {
+                // **The startup packet's `options`, applied before the client is told it may
+                // speak.** A parameter the server cannot honour fails the connection on a real
+                // server rather than being dropped, and a dropped one leaves the client believing
+                // a setting it does not have — `connection_test.rb` connects with `-c geqo=off`
+                // and then asks `SHOW geqo`.
+                if let Err(error) = self.apply_options(executor.as_mut()) {
+                    self.send_error(&error).await?;
+                    return Ok(None);
+                }
+                self.announce_ready().await?;
+                Ok(Some(executor))
+            }
+            Err(error) => {
+                self.send_error(&error).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Applies every parameter the startup packet's `options` asked for.
+    fn apply_options(&self, executor: &mut dyn Execute) -> Result<()> {
+        for (name, value) in crate::parameter::command_line(&self.options)? {
+            executor.set_option(&name, &value)?;
+        }
+        Ok(())
+    }
+
+    /// Tells the client its connection is established.
+    ///
+    /// Sent once the session exists, never before: see the note at the end of `complete_startup`.
+    async fn announce_ready(&mut self) -> std::io::Result<()> {
+        self.out.clear();
+        Message::ReadyForQuery(TransactionStatus::Idle).encode(&mut self.out);
+        self.stream.write_all(&self.out).await?;
+        self.stream.flush().await
     }
 
     /// Returns false when authentication failed and the connection should close.
@@ -785,6 +851,27 @@ impl Execute for NotYetExecuting {
 
     /// Discarded: there is no catalog behind this, so nothing can read the view they would fill.
     fn remember_prepared(&mut self, _statements: Vec<crate::session::PreparedStatement>) {}
+
+    /// Nothing here has parameters to set.
+    fn set_option(&mut self, _name: &str, _value: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// There is no planner behind this, so there is no plan to explain.
+    fn explain_prepared(
+        &mut self,
+        _explain: &crate::parse::Parsed,
+        statement: &crate::parse::Parsed,
+        _params: &crate::pgwire::session::Params<'_>,
+    ) -> Result<crate::pgwire::session::Outcome> {
+        Err(SqlError::unsupported(format!(
+            "{} (the executor lands in unit 6 of docs/plans/phase-6a.md)",
+            statement
+                .class()
+                .unsupported_feature()
+                .unwrap_or("EXPLAIN of a prepared statement")
+        )))
+    }
 
     fn execute(
         &mut self,
