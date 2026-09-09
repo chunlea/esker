@@ -116,6 +116,25 @@ fn read(out: &[u8]) -> String {
     rows(out).join("|")
 }
 
+/// One field of the `ErrorResponse`, by its type byte.
+///
+/// The fields are `type-byte ++ NUL-terminated value`, so a field is a NUL-split part whose first
+/// character is the byte asked for.
+fn error_field(out: &[u8], code: char) -> Option<String> {
+    let text = String::from_utf8_lossy(out);
+    let parts: Vec<&str> = text.split('\u{0}').collect();
+    if !parts
+        .iter()
+        .any(|part| *part == "SERROR" || *part == "VERROR")
+    {
+        return None;
+    }
+    parts
+        .iter()
+        .find(|part| part.starts_with(code))
+        .map(|part| part[1..].to_owned())
+}
+
 fn rows(out: &[u8]) -> Vec<String> {
     let mut found = Vec::new();
     let mut at = 0;
@@ -339,4 +358,79 @@ fn the_describe_libpq_sends_between_bind_and_execute_does_not_heal_the_baseline(
         client.describe("w3"),
         "ERROR cached plan must not change result type"
     );
+}
+
+/// **`ActiveRecord` reads two fields, not one**, and the node sent only the first.
+///
+/// `postgresql_adapter.rb`'s `is_cached_plan_failure?` is
+///
+/// ```ruby
+/// pgerror.result.result_error_field(PG::PG_DIAG_SQLSTATE) == FEATURE_NOT_SUPPORTED &&
+///   pgerror.result.result_error_field(PG::PG_DIAG_SOURCE_FUNCTION) == "RevalidateCachedQuery"
+/// ```
+///
+/// and it reads the second because the first is not enough: `0A000` is every "feature not
+/// supported" this server has, and the adapter must tell *this* condition from all of them before
+/// it deallocates the statement and retries. So `R` is what names the error here, the way a
+/// SQLSTATE names every other one.
+///
+/// Measured on PostgreSQL 19 through the `pg` gem, every field of the real `ErrorResponse`:
+///
+/// ```text
+/// SEVERITY  "ERROR"      SOURCE_FILE     "plancache.c"
+/// SQLSTATE  "0A000"      SOURCE_LINE     "875"
+/// MESSAGE   "cached plan must not change result type"
+///                        SOURCE_FUNCTION "RevalidateCachedQuery"
+/// ```
+///
+/// **`F` and `L` are deliberately not sent.** They are what PostgreSQL's documentation says they
+/// are — the location of the error in *the server's own source* — and `plancache.c:875` is a
+/// coordinate in a file this server does not contain. Nothing reads them, and a fabricated
+/// citation is worse than an absent one. `R` is sent because for this condition it is not a
+/// source coordinate at all: it is the only thing on the wire that distinguishes the error.
+#[test]
+fn the_error_names_itself_the_way_the_adapter_looks_it_up() {
+    let mut client = Client::new();
+    assert_eq!(client.ask("PREPARE r1 AS SELECT * FROM t"), "");
+    assert_eq!(client.ask("EXECUTE r1"), "1\t2");
+    assert_eq!(client.ask("ALTER TABLE t ADD COLUMN c int"), "");
+
+    let mut out = Vec::new();
+    client.session.handle(
+        &Frontend::Query("EXECUTE r1".to_owned()),
+        &mut client.node.executor,
+        &mut out,
+    );
+    assert_eq!(
+        error_field(&out, 'C').as_deref(),
+        Some("0A000"),
+        "the SQLSTATE the adapter checks first"
+    );
+    assert_eq!(
+        error_field(&out, 'R').as_deref(),
+        Some("RevalidateCachedQuery"),
+        "the source function the adapter checks second"
+    );
+    assert_eq!(
+        error_field(&out, 'F'),
+        None,
+        "no source file: `plancache.c` is not a file this server has"
+    );
+}
+
+/// And **only** this condition carries it: `R` is an identifier here, not a field every error
+/// grew. An adapter that saw it on an unrelated `0A000` would deallocate a statement over a
+/// missing feature.
+#[test]
+fn no_other_error_claims_to_come_from_that_function() {
+    let mut client = Client::new();
+    let mut out = Vec::new();
+    client.session.handle(
+        // A different `0A000` entirely — the one the refusal register is full of.
+        &Frontend::Query("SELECT * FROM t NATURAL JOIN t".to_owned()),
+        &mut client.node.executor,
+        &mut out,
+    );
+    assert_eq!(error_field(&out, 'C').as_deref(), Some("0A000"));
+    assert_eq!(error_field(&out, 'R'), None);
 }

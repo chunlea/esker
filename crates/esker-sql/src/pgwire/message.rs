@@ -294,6 +294,15 @@ impl ErrorField {
     pub const HINT: ErrorField = ErrorField(b'H');
     /// One-based character offset into the query — `P`.
     pub const POSITION: ErrorField = ErrorField(b'P');
+    /// The server function the error came from — `R`.
+    ///
+    /// PostgreSQL's documentation calls `R`, `F` and `L` the location of the error **in the
+    /// server's own source**, and for almost every error that is all they are. One condition is
+    /// different: `ActiveRecord` reads `R` to tell `cached plan must not change result type` from
+    /// every other `0A000`, because the SQLSTATE alone cannot — it covers every unsupported
+    /// feature this server has. For that one error `R` is the identifier, which is why this node
+    /// sends it and does not send `F` or `L` (see [`crate::error::SqlError::source_function`]).
+    pub const SOURCE_FUNCTION: ErrorField = ErrorField(b'R');
 }
 
 /// A message from the server.
