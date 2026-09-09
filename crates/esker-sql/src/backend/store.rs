@@ -444,6 +444,13 @@ impl Txn for StoreTxn {
         }
     }
 
+    fn stop_waiting(&mut self) {
+        // A poisoned table is ignored rather than panicked on, the same as `unlock`.
+        if let Ok(mut locks) = self.locks.lock() {
+            locks.stop_waiting(self.id);
+        }
+    }
+
     fn holds(&self, key: &[u8]) -> bool {
         self.held.iter().any(|held| held == key)
     }

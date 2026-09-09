@@ -61,6 +61,13 @@ pub(super) struct Settings<'a> {
     /// The third, and the one the note above predicted: it is session state with no other way in,
     /// and the view over it is read by a plan like any other.
     pub(super) prepared: &'a [crate::session::PreparedStatement],
+    /// The node's advisory lock table, which is the whole of `pg_locks`'s `advisory` rows.
+    ///
+    /// The fourth, and the note above holds. `None` is an evaluator with no session behind it — a
+    /// column `DEFAULT` or an index key — which cannot be reading `pg_locks` in the first place.
+    /// The snapshot is taken inside the view rather than here, because that is where the rows are
+    /// wanted and `Locks::rows` already holds the mutex for exactly as long as the copy takes.
+    pub(super) advisory: Option<&'a crate::advisory::Locks>,
 }
 
 impl Settings<'_> {
@@ -70,6 +77,7 @@ impl Settings<'_> {
             search_path: &[],
             rendering: crate::value::Rendering::default(),
             prepared: &[],
+            advisory: None,
         }
     }
 }
@@ -341,7 +349,13 @@ fn inner_side(
     probe: &Probe,
 ) -> Result<Vec<Vec<Datum>>> {
     if let Some(view) = inner_view {
-        return view.rows_of(txn, tenant, settings.rendering, settings.prepared);
+        return view.rows_of(
+            txn,
+            tenant,
+            settings.rendering,
+            settings.prepared,
+            settings.advisory,
+        );
     }
     if !matches!(probe, Probe::Materialize) {
         return Ok(Vec::new());
@@ -400,8 +414,14 @@ impl<'a> Cursor<'a> {
             // Computed here, once, rather than page by page: `pg_type` is six rows and `pg_range`
             // is none. If a catalog view ever is not small, this is the line that changes.
             Node::CatalogView { view, .. } => Kind::Rows(
-                view.rows_of(txn, tenant, settings.rendering, settings.prepared)?
-                    .into_iter(),
+                view.rows_of(
+                    txn,
+                    tenant,
+                    settings.rendering,
+                    settings.prepared,
+                    settings.advisory,
+                )?
+                .into_iter(),
             ),
             // Rows written into the statement, evaluated here for the same reason a catalog view's
             // are: nothing is stored, so there is no key range to seek in and the row count is the

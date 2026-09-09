@@ -324,6 +324,33 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
     // ADR 0057, and is why the levels that already worked cannot regress.
     let waits = executor.isolation().waits();
     let deadline = executor.lock_deadline();
+    // **However this wait ends, it is over — and the graph is what has to be told.**
+    //
+    // The lock table records a waiter the moment it is refused, because that edge is what
+    // *another* transaction's deadlock walk reads. Only two of the four ways out go back
+    // through it: the lock comes free, or a cycle is found. A `lock_timeout`, a
+    // `statement_timeout` and a `pg_cancel_backend` all returned straight out of the loop and
+    // left the edge behind — on a transaction that is **still open**, because a failed
+    // statement does not end a block. What the edge then does is answer for a wait that is not
+    // happening: a third transaction asking for a row this one holds walks through it and is
+    // told `40P01` for a cycle with nobody waiting in it.
+    //
+    // Cleared here, at the one exit every path takes, rather than at each `return`: there are
+    // five of those and the two that were missed are the two nobody thinks of as a wait ending.
+    // It costs a map lookup on the paths that already cleared it.
+    let answer = wait_for_the_lock(txn, key, waits, deadline);
+    txn.stop_waiting();
+    answer
+}
+
+/// The wait itself: poll until the lock is ours, the level says not to wait, or something ends
+/// it. Split out so that [`wait_for_row`] has **one** exit to tidy the wait-for graph at.
+fn wait_for_the_lock(
+    txn: &mut dyn Txn,
+    key: &[u8],
+    waits: bool,
+    deadline: Option<(u64, Deadline)>,
+) -> Result<()> {
     // **Real elapsed time, not a count of turns round the loop.** This used to add `WAIT_STEP_MS`
     // per iteration and compare that to the timeout — which assumes each iteration really takes two
     // milliseconds. On a loaded box it does not, so `lock_timeout = '150ms'` meant *seventy-five
@@ -1433,6 +1460,7 @@ impl Executor {
             search_path,
             rendering: self.rendering(),
             prepared: &self.prepared,
+            advisory: Some(&self.locks),
         }
     }
 
@@ -1831,9 +1859,18 @@ impl Executor {
                 match txn.lock(&key)? {
                     crate::backend::Lock::Taken => {}
                     crate::backend::Lock::Deadlock => return Err(SqlError::Deadlock),
+                    // **`NOWAIT` and `SKIP LOCKED` ask and leave, so neither may stay in the
+                    // graph.** Being refused is what records a waiter, and these two are refused by
+                    // design — an edge from a clause whose whole meaning is "do not wait" is a
+                    // waiter that never waits, and a third transaction walking through it is told
+                    // `40P01` for a cycle nobody is in.
                     crate::backend::Lock::Held { .. } => match target.wait {
-                        crate::plan::LockWait::SkipLocked => continue 'row,
+                        crate::plan::LockWait::SkipLocked => {
+                            txn.stop_waiting();
+                            continue 'row;
+                        }
                         crate::plan::LockWait::NoWait => {
+                            txn.stop_waiting();
                             return Err(SqlError::LockNotAvailable(target.relation.clone()));
                         }
                         // The wait, and then the whole statement again: the same loop an `UPDATE`
@@ -2592,9 +2629,40 @@ impl Executor {
                 return;
             };
             let (call, args) = (*call, std::mem::take(args));
+            // **No key, so no key to parse.** `pg_advisory_unlock_all()` takes no arguments and
+            // releases everything this session holds — what the connection does when a session
+            // ends, asked for early.
+            if matches!(call, crate::plan::AdvisoryCall::UnlockAll) {
+                if args.is_empty() {
+                    self.locks.unlock_all(self.session);
+                    *expr = Expr::Literal(Literal::String(String::new()));
+                } else {
+                    failed.get_or_insert(SqlError::UndefinedFunction(format!("{}()", call.name())));
+                }
+                return;
+            }
             let answered = match advisory_key(call, &args) {
                 Ok(key) => {
-                    if call.takes() {
+                    if call.blocks() {
+                        // **The wait, on the statement's own clock.** `pg_advisory_lock` does not
+                        // answer until it holds the lock, so this polls the table the way a row
+                        // lock's wait does — the same cancel check at the top, so a
+                        // `pg_cancel_backend` reaches a session parked here, and the same
+                        // `lock_timeout` / `statement_timeout` pair, so a wait that a client
+                        // bounded stays bounded. `void` is what it evaluates to on a real server;
+                        // this node has no `void`, so it is the **empty string** — see
+                        // `AdvisoryCall::is_void` for why not a NULL.
+                        match self.wait_for_advisory(key, call.mode()) {
+                            Ok(()) => {
+                                *expr = Expr::Literal(Literal::String(String::new()));
+                                return;
+                            }
+                            Err(error) => {
+                                failed.get_or_insert(error);
+                                false
+                            }
+                        }
+                    } else if call.takes() {
                         self.locks.try_lock(self.session, key, call.mode())
                     } else {
                         let released = self.locks.unlock(self.session, key, call.mode());
@@ -2616,6 +2684,34 @@ impl Executor {
         };
         bind::walk_mut(statement, &mut resolve);
         failed.map_or(Ok(()), Err)
+    }
+
+    /// Waits until this session holds `key` in `mode`, or the statement's deadline ends the wait.
+    ///
+    /// The same three exits a row lock's wait has — the lock comes free, the statement is
+    /// cancelled, a timeout fires — and deliberately **not** a fourth: there is no deadlock
+    /// detection between advisory locks, because nothing here can tell an application's lock order
+    /// from a cycle. PostgreSQL does detect them; that difference is declared rather than
+    /// approximated, and a client that sets `lock_timeout` gets the same protection either way.
+    fn wait_for_advisory(
+        &self,
+        key: crate::advisory::Key,
+        mode: crate::advisory::Mode,
+    ) -> Result<()> {
+        let deadline = self.lock_deadline();
+        let began = std::time::Instant::now();
+        loop {
+            cancel::check()?;
+            if self.locks.try_lock(self.session, key, mode) {
+                return Ok(());
+            }
+            if let Some((limit, which)) = deadline
+                && u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX) >= limit
+            {
+                return Err(which.expired());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(WAIT_STEP_MS));
+        }
     }
 
     /// Folds every `current_setting(…)` to the value this session reports.

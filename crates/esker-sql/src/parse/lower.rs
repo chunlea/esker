@@ -3277,17 +3277,20 @@ fn lower_trigger_state(
 
 /// The advisory-lock function of that name, or `None`.
 ///
-/// Matched on the whole name rather than a prefix so that `pg_advisory_lock` — the **blocking**
-/// form — falls through to the refusal table instead of being read as a `try`. Answering a wait
-/// with an immediate failure would be the worse kind of wrong: a migrator told it holds the lock
-/// when it does not.
+/// Matched on the whole name rather than a prefix, because the blocking and the `try` families are
+/// two behaviours and not two spellings: reading `pg_advisory_lock` as a `try` would answer a wait
+/// with an immediate failure, which is the worse kind of wrong — a migrator told it holds a lock it
+/// does not. The blocking pair waits; see [`plan::AdvisoryCall::blocks`].
 fn advisory_call(name: &str) -> Option<plan::AdvisoryCall> {
     let folded = name.to_ascii_lowercase();
     match folded.as_str() {
+        "pg_advisory_lock" => Some(plan::AdvisoryCall::Lock),
+        "pg_advisory_lock_shared" => Some(plan::AdvisoryCall::LockShared),
         "pg_try_advisory_lock" => Some(plan::AdvisoryCall::TryLock),
         "pg_try_advisory_lock_shared" => Some(plan::AdvisoryCall::TryLockShared),
         "pg_advisory_unlock" => Some(plan::AdvisoryCall::Unlock),
         "pg_advisory_unlock_shared" => Some(plan::AdvisoryCall::UnlockShared),
+        "pg_advisory_unlock_all" => Some(plan::AdvisoryCall::UnlockAll),
         _ => None,
     }
 }
@@ -3744,6 +3747,74 @@ fn lower_on_conflict(on: &sqlparser::ast::OnInsert) -> Result<plan::OnConflict> 
 /// can walk on a worker's stack, because a plan this crate builds and then cannot execute would
 /// only move the crash a layer along. It did, once: guarding lowering alone left a 500-term chain
 /// lowering happily and overflowing in the resolver.
+/// Lowers `a AND b AND …` or `a OR b OR …` **iteratively**, into a tree of about `log2(n)` levels.
+///
+/// The spine is walked with a loop rather than by recursion, so the lowering of a long chain costs
+/// one frame plus the deepest operand rather than one frame per term; the fold that follows is what
+/// keeps every *later* walk over the tree short. See the `And | Or` arm of [`lower_expr`] for why
+/// reshaping a boolean chain is allowed.
+fn lower_boolean_chain(op: &BinaryOperator, left: &Expr, right: &Expr) -> Result<plan::Expr> {
+    let folded = if matches!(op, BinaryOperator::And) {
+        plan::BinaryOp::And
+    } else {
+        plan::BinaryOp::Or
+    };
+    // Right to left down the spine, because that is the way the tree leans; reversed afterwards so
+    // the operands are in the order they were written, which is what a reader of an `EXPLAIN` and
+    // anything matching on the tree expects to see.
+    let mut operands = vec![right];
+    let mut spine = left;
+    while let Expr::BinaryOp {
+        op: inner,
+        left: rest,
+        right: operand,
+    } = spine
+        && inner == op
+    {
+        operands.push(operand);
+        spine = rest;
+    }
+    operands.push(spine);
+    operands.reverse();
+
+    // **Through `lower_condition`, which is what the operand of an `AND` is owed.** An unadorned
+    // string literal in a boolean context is *read* as a boolean rather than refused — `WHERE
+    // 'true' AND true` runs on a real server and `WHERE 'text' AND true` is `22P02 invalid input
+    // syntax for type boolean`, a value error and not a type one. Lowering the operands with plain
+    // `lower_expr` turned both of those into `42804`, which two corpus lines caught at once.
+    let mut level = Vec::with_capacity(operands.len());
+    for operand in operands {
+        level.push(lower_condition(operand, true)?);
+    }
+    balance(folded, level)
+}
+
+/// Folds operands pairwise until one is left: `n` terms become a tree `⌈log2(n)⌉` deep.
+///
+/// An odd operand is carried to the next round rather than paired with a synthetic `true`, which
+/// would be a value the client did not write showing up in an `EXPLAIN`.
+fn balance(op: plan::BinaryOp, mut level: Vec<plan::Expr>) -> Result<plan::Expr> {
+    while level.len() > 1 {
+        let mut folded = Vec::with_capacity(level.len().div_ceil(2));
+        let mut operands = level.into_iter();
+        while let Some(left) = operands.next() {
+            folded.push(match operands.next() {
+                Some(right) => plan::Expr::Binary {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                None => left,
+            });
+        }
+        level = folded;
+    }
+    // The caller always passes both sides of a binary operator, so there is at least one.
+    level.pop().ok_or_else(|| {
+        SqlError::Internal("a boolean chain lowered to no operands at all".to_owned())
+    })
+}
+
 const INLINE_LOWER_DEPTH: usize = if cfg!(debug_assertions) { 24 } else { 128 };
 
 thread_local! {
@@ -4113,6 +4184,30 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 ty: None,
             })
         }
+        // **A boolean chain is a row of siblings, not a thousand generations.**
+        //
+        // `a OR b OR c` parses leaning left, so a predicate of *n* terms arrives as a tree *n*
+        // deep. Lowering it one frame per term is what the guard above exists to stop — it was
+        // added when a 500-term chain overflowed the resolver — and the guard then refused
+        // `or_test.rb`'s 1001-relation `.or` chain with `54001`, where PostgreSQL 19 answers a
+        // number. Measured on the oracle: twenty thousand terms flat is fine there, and so is five
+        // thousand levels of brackets, so nothing about this shape is too complex for a server.
+        //
+        // The chain is collected **in a loop** and folded into a balanced tree, so a thousand terms
+        // is a dozen levels rather than a thousand and every one of the forty walks over
+        // `plan::Expr` is short. The depth bound is untouched: what changes is that siblings stop
+        // being counted as generations, which is what they always were.
+        //
+        // Sound because `AND` and `OR` are associative — in three-valued logic too, where `OR`
+        // takes the largest of false < null < true and `AND` the smallest — and because
+        // PostgreSQL defines the evaluation order of a boolean expression's operands as **not
+        // guaranteed**, so no client may depend on the shape either. Nothing prints a
+        // `plan::Expr` back as SQL (`pg_get_expr` reads stored text), so no deparse can see it.
+        Expr::BinaryOp {
+            op: op @ (BinaryOperator::And | BinaryOperator::Or),
+            left,
+            right,
+        } => lower_boolean_chain(op, left, right),
         Expr::BinaryOp { op, left, right } => {
             let op = match op {
                 BinaryOperator::Eq => plan::BinaryOp::Eq,
@@ -4635,10 +4730,25 @@ fn lower_function(function: &sqlparser::ast::Function) -> Result<plan::Expr> {
         refuse_wrong_arity(function, "current_user", 0)?;
         return Ok(plan::Expr::CurrentUser);
     }
-    // The advisory-lock functions this node answers. The **blocking** forms are not here and are
-    // refused by name: they wait, and nothing here has anything to wait on. `ActiveRecord` sends
-    // only these (`postgresql_adapter.rb:474`), so the refusal costs the suite nothing.
+    // The advisory-lock functions this node answers, blocking forms included — see
+    // [`plan::AdvisoryCall`] for which are still refused and why.
     if let Some(call) = advisory_call(&name) {
+        // **`pg_advisory_unlock_all()` is the one with no arguments**, and `sqlparser` spells an
+        // empty argument list either way depending on how the call was written, so both are it.
+        let no_arguments = matches!(function.args, FunctionArguments::None)
+            || matches!(&function.args, FunctionArguments::List(list) if list.args.is_empty());
+        if matches!(call, plan::AdvisoryCall::UnlockAll) {
+            if !no_arguments {
+                return Err(SqlError::UndefinedFunction(format!(
+                    "{}() with arguments",
+                    call.name()
+                )));
+            }
+            return Ok(plan::Expr::Advisory {
+                call,
+                args: Vec::new(),
+            });
+        }
         let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
             return Err(SqlError::UndefinedFunction(format!("{}()", call.name())));
         };
@@ -6584,12 +6694,32 @@ fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {
             if digits.contains(['.', 'e', 'E']) {
                 plan::Literal::Decimal(text)
             } else {
-                // `bigint out of range`, not the input function's longer message: a literal
-                // too large is caught on a different path in PostgreSQL and says so differently.
-                plan::Literal::Integer(
-                    text.parse()
-                        .map_err(|_| SqlError::IntegerLiteralOutOfRange("bigint"))?,
-                )
+                // **A literal past `int8` is a `numeric`, not an error.** PostgreSQL gives an
+                // unadorned integer the smallest type that holds it, and `numeric` is the last
+                // rung: `pg_typeof(9223372036854775807)` is `bigint` and
+                // `pg_typeof(9223372036854775808)` is `numeric` — measured. So
+                // `WHERE id = 9223372036854775808` against a `bigint` column is a comparison the
+                // column is promoted for and is simply false, which is `or_test.rb`'s *or with
+                // large number* answering one row where this node raised `22003`.
+                //
+                // The sign is part of the literal and is folded before the choice — `-9223372036854775808`
+                // is a `bigint` and `-9223372036854775809` a `numeric` — which is why `text`
+                // carries it into the parse rather than being negated afterwards.
+                //
+                // The only way a run of digits fails to parse as an `i64` is by not fitting in
+                // one: the lexer has already kept `.`, `e` and `E` out of it above.
+                match text.parse() {
+                    Ok(fits) => plan::Literal::Integer(fits),
+                    // **A real `numeric`, not this crate's `Literal::Decimal`.** That variant is
+                    // `double precision` here — a divergence this node declares for `SELECT 1.5`
+                    // — and routing an out-of-range integer through it would answer
+                    // `double precision` where PostgreSQL says `numeric`, trading one wrong type
+                    // for another. A typed literal carries the value itself and types as what it
+                    // is.
+                    Err(_) => plan::Literal::Typed(Box::new(Datum::Numeric(
+                        value::numeric::from_text(&text)?,
+                    ))),
+                }
             }
         }
         Value::SingleQuotedString(text)

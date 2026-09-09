@@ -959,6 +959,7 @@ impl CatalogView {
         tenant: u64,
         rendering: crate::value::Rendering,
         prepared: &[crate::session::PreparedStatement],
+        advisory: Option<&crate::advisory::Locks>,
     ) -> Result<Vec<Vec<Datum>>> {
         match self {
             CatalogView::PgType => pg_type_rows(txn, tenant),
@@ -980,7 +981,7 @@ impl CatalogView {
             CatalogView::PgStatActivity => stat_activity_rows(txn, tenant),
             CatalogView::PgRoles => role_rows(txn, false),
             CatalogView::PgAuthid => role_rows(txn, true),
-            CatalogView::PgLocks => Ok(locks_rows(txn, tenant)),
+            CatalogView::PgLocks => Ok(locks_rows(txn, tenant, advisory)),
             CatalogView::PgPreparedStatements => Ok(prepared_statement_rows(prepared)),
             CatalogView::PgConstraint => super::pg_constraint::rows(txn, tenant),
             // **The standard's views delegate as a group**, in their own function: they are six
@@ -1594,7 +1595,11 @@ pub(super) fn trigger_oid(table_id: u64, at: usize) -> i64 {
 /// Locks are node-local (`crate::backend::locks`), so this answers for **this process**. Rows whose
 /// key belongs to another database are left out, which is what `database` filtering would do
 /// anyway.
-fn locks_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Vec<Vec<Datum>> {
+fn locks_rows(
+    txn: &dyn crate::backend::Txn,
+    tenant: u64,
+    advisory: Option<&crate::advisory::Locks>,
+) -> Vec<Vec<Datum>> {
     let view = txn.locks();
     // **A pid per row, from the lock table.** This was `std::process::id()` — the same number on
     // every row, so the column could not tell two holders apart and a join to
@@ -1663,6 +1668,51 @@ fn locks_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Vec<Vec<Datum>> {
             Datum::Bool(false),
             Datum::Bool(false),
             // The table records that a session waits, not since when.
+            Datum::Null,
+        ]);
+    }
+    // **The advisory locks, which are a third row shape and a different table.** Measured on
+    // PostgreSQL 19 for `pg_advisory_lock(5295901941258979200)`:
+    //
+    // ```text
+    // locktype | classid    | objid      | objsubid | mode          | granted | fastpath
+    // advisory | 1233048257 | 3054176128 |        1 | ExclusiveLock | t       | f
+    // ```
+    //
+    // with `relation`, `page`, `tuple`, `virtualxid` and `transactionid` all NULL. The key is
+    // **split**: `classid` is its high 32 bits and `objid` its low 32, which is what makes
+    // `(classid::bigint << 32) | objid::bigint` the number the client passed — the query
+    // `connection_test.rb` writes, and the reason the halves cannot be swapped or widened.
+    // `objsubid` is `1` for the one-argument form and `2` for `(int4, int4)`, which is how a real
+    // server tells the two key spaces apart, and this node keeps that distinction in
+    // `advisory::Space`.
+    //
+    // `database` is the **reading** session's, not the holder's: this table is one per node and
+    // records no tenant, and every session that can read this view is in the same database as the
+    // reader anyway. Declared rather than invented — the alternative is a NULL, and a real server
+    // never shows one here.
+    for row in advisory
+        .map(crate::advisory::Locks::rows)
+        .unwrap_or_default()
+    {
+        rows.push(vec![
+            Datum::Text("advisory".to_owned()),
+            database.clone(),
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Int8(i64::from(row.key.classid())),
+            Datum::Int8(i64::from(row.key.objid())),
+            Datum::Int2(row.key.space.objsubid()),
+            Datum::Text(format!("0/{}", row.session.pid())),
+            Datum::Int4(row.session.pid()),
+            Datum::Text(row.mode.name().to_owned()),
+            // An advisory lock in this table is held: a session that cannot take one is told
+            // `false` and queues nowhere, so there is no ungranted advisory row to report.
+            Datum::Bool(true),
+            Datum::Bool(false),
             Datum::Null,
         ]);
     }
