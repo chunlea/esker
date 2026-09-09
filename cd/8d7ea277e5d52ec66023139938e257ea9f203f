@@ -1,0 +1,28 @@
+crates/esker-store/src/driver.rs
+  h_44076b318daf9c 59-66,70-74,80-82,94-97,100-102,128-139,165-166,186-202,204-208,213-246,267-270,273-280,286-313,344-349,352,375,378,383-385,394-395,401,403-422,426,432,434-435,443-458
+crates/esker-store/src/peer.rs
+  h_44076b318daf9c 1344-1347,1354-1403,1405-1410,1417,1451,1453-1464,1778-1797,1923,1961-1992,2012,2662-2663,2746-2747,2814-2815,3323-3464
+crates/esker-store/src/server.rs
+  h_44076b318daf9c 687-691,698,708-709,715-719,1083-1087,1097,1107-1108,1125-1130,1135-1163,2081-2093,3491,3845,3849-3851,3854-3987
+crates/esker-store/tests/promotion.rs
+  h_44076b318daf9c 263-270,273-275,278-279,442,450-487,517-538
+crates/esker-store/tests/restart.rs
+  h_44076b318daf9c 102
+docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md
+  h_44076b318daf9c 133-146
+docs/adr/0099-one-core-per-region-per-store.md
+  h_44076b318daf9c 1-127
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "cd8d7ea277e5d52ec66023139938e257ea9f203f",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
