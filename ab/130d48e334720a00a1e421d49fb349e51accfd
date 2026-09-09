@@ -1,0 +1,19 @@
+crates/esker-sql/tests/multi_region_rows.rs
+  s_2bed4ac2b1c944::t_69a21f8b044886 573-666
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "ab130d48e334720a00a1e421d49fb349e51accfd",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
