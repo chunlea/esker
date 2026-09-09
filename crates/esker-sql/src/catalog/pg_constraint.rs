@@ -366,12 +366,26 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>, pretty: bo
         // pairs, each reader adding what it adds.
         let suffix = if check.validated { "" } else { " NOT VALID" };
         return Datum::Text(if pretty {
-            format!("CHECK ({}){suffix}", check.expr)
+            format!("CHECK ({}){suffix}", super::pretty_case(&check.expr))
         } else {
-            format!(
-                "CHECK (({})){suffix}",
-                super::parenthesised_operands(&check.expr)
-            )
+            // **The plain form's inner pair is the *expression's* own, not the printer's.** An
+            // operator node prints one — `CHECK ((price > 0))` — and a `CASE` does not:
+            // `CHECK (⏎CASE…END)` with a single pair, measured. So the wrap is conditional, the
+            // same shape `pg_index::parenthesised` already has for a bare column reference.
+            //
+            // **"Is a `CASE`" means the whole body, not its first word.**
+            // `CHECK (CASE … END > 0)` is a comparison whose left operand is a `CASE`, and a real
+            // server gives it both pairs — `CHECK ((⏎CASE…END > 0))`. Starting with `CASE` was not
+            // enough; it has to end with `END` too.
+            let body = super::parenthesised_operands(&check.expr);
+            let whole_case =
+                body.trim_start().starts_with("CASE") && body.trim_end().ends_with("END");
+            let wrapped = if whole_case {
+                body
+            } else {
+                format!("({body})")
+            };
+            format!("CHECK ({wrapped}){suffix}")
         });
     }
     // A `FOREIGN KEY`: the oid is the table and the constraint's position in its list.

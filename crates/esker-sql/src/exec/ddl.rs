@@ -6204,6 +6204,11 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             branches,
             otherwise,
         } => {
+            // **Every part takes its own pair, which is PostgreSQL's *plain* form** —
+            // `WHEN (price IS NOT NULL) THEN (price + 1) ELSE (price * 2)`, measured, and what
+            // `pg_get_expr(indexprs)` gives an index key. The *pretty* form takes none of them,
+            // and that is `catalog::pretty_case`'s job at the one reader that asks for it: the
+            // text is stored once, in this shape, and stripped on the way out.
             let mut text = "\nCASE".to_owned();
             for branch in branches {
                 let _ = write!(
