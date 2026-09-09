@@ -15,20 +15,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `relpersistence` is a `"char"` on a real server and `text` here, holding the same single
-    // character — the trade every `pg_catalog` column makes.
-    types: &[
-        "SELECT 'r', relname, relpersistence, relkind FROM pg_class WHERE relname IN \
-         ('unlogged_probe','unlogged_noid','logged_probe') ORDER BY relname",
-        "SELECT 'r', relname, relpersistence FROM pg_class WHERE relname IN \
-         ('unlogged_probe_pkey','logged_probe_pkey','unlogged_probe_id_seq','logged_probe_id_seq') \
-         ORDER BY relname",
-        "SELECT 'r', relname, relpersistence FROM pg_class WHERE relname = 'unlogged_probe'",
-        "SELECT 'r', relname, relpersistence FROM pg_class WHERE relname = 'temp_probe'",
-        "SELECT 'r', relname, relpersistence FROM pg_class WHERE relname = 'fk_unlogged_to_unlogged'",
-        // `information_schema`'s own domains again: `name` and `character varying` where this node
-        // says `text`, with identical characters.
-    ],
+    // **Empty.** Every statement here read `pg_class.relpersistence`, and the entry said it was a
+    // `"char"` on a real server and `text` here, holding the same single character. It is a
+    // `"char"` here now (ADR 0095), so all six agree on the declared type as well as the value —
+    // including `pg_typeof(relpersistence)`, which was the row that *proved* the divergence and
+    // is the row that closes it.
+    types: &[],
     answers: &[
         // **A temporary table is a different feature, not a kind of unlogged one**, and this file
         // is where the capture proves the three `relpersistence` values are three things. Both
@@ -42,12 +34,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              The rule cannot be reached without temporary tables, and it is about them rather than \
              about persistence.",
             "pg19_unlogged_table.txt:91",
-        ),
-        (
-            "SELECT 'r', pg_typeof(relpersistence) FROM pg_class WHERE relname = 'logged_probe'",
-            "`\"char\"` there and `text` here — the statement that would *prove* the declared-type \
-             divergence above, and it diverges in the same direction.",
-            "pg19_unlogged_table.txt:93",
         ),
     ],
 };

@@ -354,6 +354,14 @@ const TAG_LINE_ARRAY: u8 = 100;
 /// no column is declared one. The vocabulary is total, which is what keeps the two tag spaces in
 /// step.
 const TAG_VOID: u8 = 101;
+/// `"char"` and `"char"[]`, additive like every tag before them.
+const TAG_CHAR: u8 = 102;
+/// See [`TAG_CHAR`].
+const TAG_CHAR_ARRAY: u8 = 103;
+/// `regproc` and `regproc[]`, additive like every tag before them.
+const TAG_REGPROC: u8 = 104;
+const TAG_REGPROC_ARRAY: u8 = 105;
+
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
 const TAG_BIT_ARRAY: u8 = 71;
@@ -495,6 +503,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::CircleArray => TAG_CIRCLE_ARRAY,
         ColumnType::LineArray => TAG_LINE_ARRAY,
         ColumnType::Void => TAG_VOID,
+        ColumnType::Char => TAG_CHAR,
+        ColumnType::CharArray => TAG_CHAR_ARRAY,
         ColumnType::NameArray => TAG_NAME_ARRAY,
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
@@ -503,10 +513,12 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Interval => TAG_INTERVAL,
         ColumnType::Oid => TAG_OID,
         ColumnType::RegType => TAG_REGTYPE,
+        ColumnType::RegProc => TAG_REGPROC,
         ColumnType::RegClass => TAG_REGCLASS,
         ColumnType::Int2Vector => TAG_INT2VECTOR,
         ColumnType::OidVector => TAG_OIDVECTOR,
         ColumnType::RegTypeArray => TAG_REGTYPE_ARRAY,
+        ColumnType::RegProcArray => TAG_REGPROC_ARRAY,
         ColumnType::Int8Array => TAG_INT8_ARRAY,
         ColumnType::Int4Array => TAG_INT4_ARRAY,
         ColumnType::Int2Array => TAG_INT2_ARRAY,
@@ -649,6 +661,8 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_CIRCLE_ARRAY => ColumnType::CircleArray,
         TAG_LINE_ARRAY => ColumnType::LineArray,
         TAG_VOID => ColumnType::Void,
+        TAG_CHAR => ColumnType::Char,
+        TAG_CHAR_ARRAY => ColumnType::CharArray,
         TAG_NAME_ARRAY => ColumnType::NameArray,
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,
@@ -657,10 +671,12 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_INTERVAL => ColumnType::Interval,
         TAG_OID => ColumnType::Oid,
         TAG_REGTYPE => ColumnType::RegType,
+        TAG_REGPROC => ColumnType::RegProc,
         TAG_REGCLASS => ColumnType::RegClass,
         TAG_INT2VECTOR => ColumnType::Int2Vector,
         TAG_OIDVECTOR => ColumnType::OidVector,
         TAG_REGTYPE_ARRAY => ColumnType::RegTypeArray,
+        TAG_REGPROC_ARRAY => ColumnType::RegProcArray,
         TAG_INT8_ARRAY => ColumnType::Int8Array,
         TAG_INT4_ARRAY => ColumnType::Int4Array,
         TAG_INT2_ARRAY => ColumnType::Int2Array,

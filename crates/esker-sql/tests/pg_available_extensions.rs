@@ -16,11 +16,9 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
-        // `relkind` is a `"char"` and `relname` a `name` on a real server; both are `text` here,
-        // with identical characters. The trade every `pg_catalog` column makes.
-        "SELECT relkind, relname FROM pg_class WHERE relname = 'pg_available_extensions'",
-        // `name` is of type `name` there and `text` here, so the first column's declared type
-        // differs while every value agrees.
+        // **Empty.** `relkind` is a `"char"` here now (ADR 0095) and `relname` a `name`
+        // (ADR 0084), which is what these entries declared; `pg_available_extensions.name` is a
+        // `name` on both sides too, so every value and every declared type agrees.
     ],
     answers: &[
         // **`hstore` was three entries here and is now one.** The `CREATE EXTENSION` unit had

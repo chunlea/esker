@@ -16,57 +16,37 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **The standing catalog type trade, and every one of these rows agrees.** `typname` is a
-    // `name` on a real server, `typdelim` and `typcategory` are `"char"`, the oids are `oid` and
-    // `typinput` is a `regproc`; all of them are `text` or `bigint` here, with the same characters
-    // and the same numbers in them. `pg_typeof` is the same trade one step over — a `regtype`
-    // there, `text` here, which is what `'x'::regtype` already answers.
+    // **Empty.** The four catalog type families closed it — `name` (ADR 0084), `"char"`
+    // (ADR 0095), `oid` (ADR 0097) and `regproc` (ADR 0098) — and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). The *values* never changed a character.
     types: &[
         // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
-        "SELECT 'r', typname, typdelim FROM pg_type WHERE typname IN ('int4','text','varchar','box','_box') ORDER BY typname",
-        "SELECT 'r', b.typname, b.typdelim AS element_delim, a.typname AS array_name, a.typdelim AS array_row_delim FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname = 'box'",
-        "SELECT 'r', t.oid, t.typname, t.typelem, t.typdelim, t.typinput, t.typtype, \
-         t.typbasetype FROM pg_type as t LEFT JOIN pg_range as r ON t.oid = r.rngtypid WHERE \
-         t.typname IN \
-         ('_int4','_text','_varchar','_timestamp','_timestamptz','_date','_numeric','_uuid','_bool','_jsonb') \
-         ORDER BY t.typname",
-        "SELECT 'r', b.typname AS base, b.typarray, a.typname AS array_name, a.typelem, a.typelem \
-         = b.oid AS points_back FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE \
-         b.typname IN \
-         ('varchar','int4','timestamp','timestamptz','numeric','text','uuid','bool','date') ORDER \
-         BY b.typname",
-        "SELECT 'r', typname, typcategory, typelem <> 0 AS has_element, typinput FROM pg_type \
-         WHERE typname IN ('_int4','_varchar','int4','varchar') ORDER BY typname",
-        "SELECT 'r', b.typname, b.typarray, a.typname AS array_name FROM pg_type b JOIN pg_type a \
-         ON a.oid = b.typarray WHERE b.typname IN \
-         ('bytea','bpchar','float4','float8','interval','json','oid','time') ORDER BY b.typname",
     ],
     answers: &[
-        // **`regproc` is not a type here**, and the three statements that need it are the
-        // capture's own conformance checks. They are not lost: each is asked again below with
-        // `typinput::text`, the spelling both servers read — and `typinput = 'array_in'` with no
-        // cast at all is `22P02 invalid input syntax for type oid` on a real server, measured,
-        // because the unknown literal resolves to `oid` and not to `regproc`.
+        // **`regproc` *is* a type here now** (ADR 0098), and these two stopped being about it:
+        // the statement runs, and what differs is the **count** — this node's `pg_type` holds the
+        // types it has, which is the design the next entry states. The third statement of the
+        // group left this list entirely, because `dangling_typelem` is 0 on both.
+        //
+        // `typinput = 'array_in'` with no cast is still `22P02 invalid input syntax for type oid`
+        // on both servers, measured: the unknown literal resolves to `oid` and not to `regproc`,
+        // because `=` over a `regproc` is `oideq`. `tests/reg_proc.rs` asserts it.
         (
             "SELECT 'r', count(*) FROM pg_type WHERE typinput = 'array_in'::regproc",
-            "regproc is not a type here; asked again below through typinput::text",
+            "The predicate answers now; the count is this node's own — its `pg_type` lists the \
+             types it has, which is the decision the entry below states.",
             "pg19_array_type_map.txt:50",
         ),
         (
             "SELECT 'r', count(*) = count(*) FILTER (WHERE typcategory = 'A') AS \
              array_in_implies_category_A FROM pg_type WHERE typinput = 'array_in'::regproc",
-            "regproc, and an aggregate FILTER clause; asked again below through typinput::text",
+            "An aggregate `FILTER` clause, which this node does not have. The `regproc` half of \
+             this entry's reason closed with ADR 0098; the `FILTER` half is its own gap and is \
+             asked again below through `typinput::text`.",
             "pg19_array_type_map.txt:52",
-        ),
-        (
-            "SELECT 'r', count(*) AS dangling_typelem FROM pg_type t WHERE t.typinput = \
-             'array_in'::regproc AND NOT EXISTS (SELECT 1 FROM pg_type e WHERE e.oid = t.typelem)",
-            "regproc; **the same check runs below** through typinput::text and answers 0, which \
-             is the half of this statement that is about arrays",
-            "pg19_array_type_map.txt:77",
         ),
         // **This node's `pg_type` is the types it has**, which is the whole design: the rows are
         // derived from `ColumnType::ALL` so that a type cannot be added and left out of its own

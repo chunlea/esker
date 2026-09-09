@@ -31,21 +31,14 @@ const CORPUS_FIXTURE: &[&str] = &[
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `pg_typeof` answers a `regtype` on a real server and `text` here (ADR 0077). The rows agree.
-    //
-    // **The last three are the catalog's own columns, and they are the next unit's, not this
-    // one's.** `pg_type.typname`, `pg_attribute.attname` and
-    // `information_schema.columns.column_name` are `name` columns on a real server and are still
-    // declared `text` here; `pg_type.oid` is an `oid` where this node says `bigint`, and
-    // `typtype`/`typcategory`/`typdelim` are `"char"`. Every row agrees — what differs is what
-    // the catalog says its own columns are. Now that the type exists, switching them over is a
-    // change to the catalog views (g1's ground), and it is listed in the handover.
-    types: &[
-        "SELECT typname, oid, typtype, typlen, typcategory, typdelim, typcollation FROM pg_type \
-         WHERE typname = 'name'",
-        "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.atttypid, a.atttypmod FROM \
-         pg_attribute a WHERE a.attrelid = 'b4_nm'::regclass AND a.attnum > 0 ORDER BY a.attnum",
-    ],
+    // **The rows agree; what differs is what the catalog says its own columns are — and most of
+    // that has since been closed.** `pg_type.typname`, `pg_attribute.attname` and
+    // `information_schema.columns.column_name` are declared `name` here now (ADR 0084),
+    // `typtype`/`typcategory`/`typdelim` are `"char"` (ADR 0095), and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). What is left in these two statements is `pg_type.oid`
+    // and `typcollation` answered as a `bigint` where a real server says `oid`, and `atttypid`
+    // the same — the catalog-oid family, its own unit on the type-surface queue.
+    types: &[],
     answers: &[],
 };
 

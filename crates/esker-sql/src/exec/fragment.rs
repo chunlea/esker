@@ -1041,6 +1041,10 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // **A `void` is not a column at all**, so it is not a columnar one either.
         Row::Void
         | Row::Name
+        // **A `"char"` is not columnar either**: it is a catalog type, and `esker-columnar` has no
+        // tag for a one-byte string. The filter stays on the row side.
+        | Row::Char
+        | Row::CharArray
         | Row::NameArray
         | Row::LsegArray
         | Row::PathArray
@@ -1064,6 +1068,8 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // An hstore is not columnar, the same deliberate gap an array is — see
         // `esker_store::columnar::decode::columnar_type`, which says why.
         Row::RegType
+        | Row::RegProc
+        | Row::RegProcArray
         | Row::RegTypeArray
         | Row::RegClass
         | Row::Int2Vector
@@ -1177,6 +1183,7 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         // A regtype joins them: `column_type` refuses the column, so no fragment is built over
         // one, and this vocabulary has no tag for a value whose printed form is a name.
         | Datum::RegType { .. }
+        | Datum::RegProc { .. }
         | Datum::RegClass { .. }
         | Datum::Range { .. } => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),

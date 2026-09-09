@@ -21,11 +21,11 @@ const FUNCTIONS: &str = "A function this node does not implement for any type, n
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         // **Moved from `answers` by parity rule 4.** Its reason was `pg_typeof` not being
-        // implemented for any type; it answers now, and the `regtype`-versus-`text` half is
-        // what remains (ADR 0077). `format_type(2950, -1)` always agreed.
-        // `typname` is a `name` and `typcategory` a `"char"` on a real server; both are `text`
-        // here with identical characters. `typlen` agrees exactly, as a `smallint`.
-        "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'uuid'",
+        // implemented for any type; it answers a `regtype` on both sides now (ADR 0093), and
+        // `format_type(2950, -1)` always agreed. `typname` is a `name` here (ADR 0084) and
+        // `typcategory` a `"char"` (ADR 0095); `typlen` agrees exactly, as a `smallint`. What
+        // kept the row in this list was the catalog's own `oid` and `regproc`, and both are types
+        // here now (ADR 0097, ADR 0098).
         // A cast **to** `varchar` reports `text` here: the two are one representation told apart
         // by OID, and a cast with no length has nothing to carry the distinction. The value is
         // identical, and `::text` on the line above agrees exactly.

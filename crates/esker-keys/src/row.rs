@@ -156,7 +156,7 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         // **The oid and the name together**, because the name cannot be recovered from the oid
         // without a catalog and this crate must not have one (invariant 7). Four bytes then a
         // length-prefixed string, which is `Datum::Oid` followed by `Datum::Text`.
-        Datum::RegType { oid, name } => {
+        Datum::RegType { oid, name } | Datum::RegProc { oid, name } => {
             out.extend_from_slice(&oid.to_le_bytes());
             varint::put_u64(name.len() as u64, out);
             out.extend_from_slice(name.as_bytes());
@@ -486,6 +486,18 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 rest,
             )
         }
+        // The same four bytes and the same name, one catalog over.
+        ColumnType::RegProc => {
+            let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
+            let (name, rest) = reg_name(rest, "regproc")?;
+            (
+                Datum::RegProc {
+                    oid: u32::from_le_bytes(*head),
+                    name,
+                },
+                rest,
+            )
+        }
         // Eight bytes for the oid, then the same name.
         ColumnType::RegClass => {
             let (head, rest) = bytes.split_first_chunk::<8>().ok_or_else(truncated)?;
@@ -517,7 +529,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
-        | ColumnType::VarcharArray | ColumnType::NameArray
+        | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray
         | ColumnType::DateArray
         | ColumnType::TimeArray
         | ColumnType::TimestampArray
@@ -530,6 +542,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::JsonbArray
         | ColumnType::OidArray
         | ColumnType::RegTypeArray
+        | ColumnType::RegProcArray
         | ColumnType::CitextArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray
@@ -561,7 +574,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Varchar
         // `name` is stored as its text, like `varchar`; what makes it a type of its own is its
         // OID, its positive `typlen` and the truncation applied before it ever reaches here.
-        | ColumnType::Name
+        | ColumnType::Name | ColumnType::Char
         | ColumnType::Bpchar
         // **A `void` never reaches here**, because no column is one — but its value *is* a
         // `Datum::Text("")`, so this is where it would land and answering anything else would be
@@ -742,6 +755,7 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         | Datum::Point { .. }
         | Datum::Geometry { .. }
         | Datum::RegType { .. }
+        | Datum::RegProc { .. }
         | Datum::RegClass { .. } => {}
         Datum::Int8(v)
         | Datum::TimestampTz(v)
@@ -974,7 +988,7 @@ fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
         },
         ColumnType::Text
         | ColumnType::Varchar
-        | ColumnType::Name
+        | ColumnType::Name | ColumnType::Char
         | ColumnType::Bpchar
         | ColumnType::Json
         | ColumnType::Int2Vector
@@ -1195,6 +1209,8 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::Jsonb
             | ColumnType::RegType
             | ColumnType::RegTypeArray
+            | ColumnType::RegProc
+            | ColumnType::RegProcArray
             | ColumnType::RegClass
             // **A pseudo-type is not a key because it is not a column.** Nothing is ever stored as
             // a `void`, so there is no order for a key to encode.
@@ -1250,6 +1266,8 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         // is still refused by the other, which is the direction a disagreement has to fail in.
         ColumnType::RegType
         | ColumnType::RegTypeArray
+        | ColumnType::RegProc
+        | ColumnType::RegProcArray
         | ColumnType::RegClass
         | ColumnType::Void
         | ColumnType::Int2Vector
@@ -1272,7 +1290,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
-        | ColumnType::VarcharArray | ColumnType::NameArray
+        | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray
         | ColumnType::DateArray
         | ColumnType::TimeArray
         | ColumnType::TimestampArray
@@ -1486,7 +1504,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Varchar
         // **A `name` key sorts in byte order, which is what its C collation means** and what a
         // memcomparable key already is (ADR 0076). So it needs no rule of its own here.
-        | ColumnType::Name
+        | ColumnType::Name | ColumnType::Char
         | ColumnType::Bpchar
         | ColumnType::Citext
         | ColumnType::Ltree => {
@@ -2094,6 +2112,12 @@ mod tests {
                     name: name.into(),
                 })
                 .boxed(),
+            ColumnType::RegProc => (any::<u32>(), "[a-z_ ]{0,12}")
+                .prop_map(|(oid, name)| Datum::RegProc {
+                    oid,
+                    name: name.into(),
+                })
+                .boxed(),
             // The same, and for the same reason: a `regclass`'s name is qualified or bare
             // depending on the search path that resolved it, so the codec must carry whatever it
             // was given rather than a shape it expects.
@@ -2172,6 +2196,7 @@ mod tests {
             | ColumnType::BpcharArray
             | ColumnType::VarcharArray
             | ColumnType::NameArray
+            | ColumnType::CharArray
             | ColumnType::DateArray
             | ColumnType::TimeArray
             | ColumnType::TimestampArray
@@ -2184,6 +2209,7 @@ mod tests {
             | ColumnType::JsonbArray
             | ColumnType::OidArray
             | ColumnType::RegTypeArray
+            | ColumnType::RegProcArray
             | ColumnType::CitextArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray
@@ -2229,9 +2255,11 @@ mod tests {
             // A `name` is text to this crate: the truncation to 63 bytes happens in the SQL
             // layer's cast, where the character boundary is known, so the codec round-trips
             // whatever it is handed exactly as it does for `text`.
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Bpchar => {
-                ".{0,32}".prop_map(Datum::Text).boxed()
-            }
+            ColumnType::Text
+            | ColumnType::Varchar
+            | ColumnType::Name
+            | ColumnType::Char
+            | ColumnType::Bpchar => ".{0,32}".prop_map(Datum::Text).boxed(),
             // Valid documents, because that is what a `json` column holds — an arbitrary string
             // is not one, and the row codec is only ever handed a value the SQL layer validated.
             // An hstore is a `Datum::Text` here like every other text-shaped type: this crate

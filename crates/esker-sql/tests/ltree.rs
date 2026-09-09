@@ -18,8 +18,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // The standing catalog trade: `typname`, `udt_name` and `extname` are `name` on a real
         // server and `data_type` is `information_schema`'s own domain, all `text` here, all
         // comparing identically.
-        "SELECT 'r', typname, typlen, typcategory, typinput, typtype, typdelim FROM pg_type \
-         WHERE typname IN ('ltree','_ltree') ORDER BY typname",
         // `pg_typeof` is a `regtype` there and `text` here; the value beside it agrees, and it is
         // the one this asks — an `ltree[]` literal is an `ltree[]`.
     ],

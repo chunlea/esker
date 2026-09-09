@@ -36,7 +36,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
-        "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'numeric'",
     ],
     // Twenty-one of eighty, and **every one is a missing function or a refused feature** — not one is
     // a value where PostgreSQL answers something else. Everything the type *is* agrees: the scale

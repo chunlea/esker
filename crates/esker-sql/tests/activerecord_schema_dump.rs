@@ -33,11 +33,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `oid` and `indkey` is an `int2vector`; this node has none of those types, so they are `text`
     // and `bigint`. `atttypmod` is an `int4` and `ordinal_position` an `integer` on both. Every
     // value is identical — the harness only reaches this list when the rows already agree.
-    types: &[
-        "SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '\"dumpy\"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
-        "SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod, attidentity, attgenerated FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '\"dumpz\"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
-        "SELECT conname, contype, pg_get_constraintdef(c.oid) FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype = 'p' AND t.relname = 'dumpz' AND n.nspname = ANY (current_schemas(false))",
-    ],
+    types: &[],
     answers: &[
         // **Two entries left this list with the `name` columns, and their reasons had gone stale
         // behind the type difference.** They said `= ANY(i.indkey)` over an array value and a

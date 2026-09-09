@@ -10,16 +10,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `pg_constraint.conname` is a `name` and `contype`/`confupdtype`/`confdeltype` are `"char"`
-    // on a real server; all four are `text` here — types this node does not have, provided where
-    // the client's use of them is text-shaped (`catalog::pg_constraint`). **Every row agrees**,
+    // `pg_constraint.conname` is a `name` here (ADR 0084) and
+    // `contype`/`confupdtype`/`confdeltype` are `"char"` (ADR 0095) — all four were in this
+    // sentence as types this node did not have. What is left of the trade is the oids, answered
+    // as `bigint` (`catalog::pg_constraint`). **Every row agrees**,
     // which is the column that matters: the behaviour, the messages and the definition text are
     // byte-identical to PostgreSQL 19 across all of them.
-    types: &[
-        "SELECT conname, contype, condeferrable, condeferred, convalidated, confupdtype, confdeltype, pg_get_constraintdef(c.oid), c.conkey::text, c.confkey::text, t2.relname FROM pg_constraint c JOIN pg_class t2 ON t2.oid = c.confrelid WHERE c.conrelid = 'fxc'::regclass ORDER BY conname",
-        "SELECT conname, pg_get_constraintdef(oid), confupdtype, confdeltype FROM pg_constraint WHERE conrelid = 'fxd'::regclass AND contype = 'f' ORDER BY conname",
-        "SELECT conname, pg_get_constraintdef(oid), confupdtype, confdeltype FROM pg_constraint WHERE conrelid = 'fxc'::regclass AND contype = 'f' ORDER BY conname",
-    ],
+    types: &[],
     answers: &[],
 };
 

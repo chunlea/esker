@@ -10,9 +10,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `relkind` is a `"char"` on a real server and `relname` a `name`; both are `text` here, with
-    // identical characters. The standing trade every `pg_catalog` column makes.
-    types: &["SELECT relkind, relname FROM pg_class WHERE relname = 's1'"],
+    // **Empty.** The one entry read `relkind` and `relname` and said both were `text` here where
+    // a real server has a `"char"` and a `name`; they are those types here now (ADR 0095,
+    // ADR 0084), so the row agrees on its declared types as well as its characters.
+    types: &[],
     answers: &[
         (
             "CREATE SEQUENCE s4 AS smallint",

@@ -25,12 +25,10 @@ mod parity;
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `pg_typeof` answers a `regtype` on a real server and `text` here (ADR 0077); every row
-    // agrees, and the catalog row's own columns are the `oid`/`"char"`/`regproc` families.
-    types: &[
-        "SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput, typarray FROM \
-         pg_type WHERE typname = 'void'",
-    ],
+    // **Empty.** The four catalog type families closed it — `name` (ADR 0084), `"char"`
+    // (ADR 0095), `oid` (ADR 0097) and `regproc` (ADR 0098) — and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). The *values* never changed a character.
+    types: &[],
     answers: &[
         // **`pg_typeof` reads the datum, and a void's datum is a `Datum::Text("")`.** These two are
         // the rows whose type is carried by the *expression*; the `RowDescription` for both is

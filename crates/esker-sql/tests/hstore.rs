@@ -14,16 +14,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **The standing catalog type trade**, and nothing about hstore: `name`, `oid`, `"char"` and
-    // `regproc` are types this node does not have and answers as `text` and `bigint`, whose
-    // *values* are identical — which is why all three rows agree. These are the adapter's own boot
-    // queries, and what it reads out of them is the typname and the typinput, both of which are
-    // right.
-    types: &[
-        "SELECT 'r', t.typname, t.typelem, t.typdelim, t.typinput, t.typtype, t.typbasetype, \
-         t.typcategory, t.typlen FROM pg_type as t WHERE t.typname IN ('hstore') ORDER BY \
-         t.typname",
-    ],
+    // **Empty.** The four catalog type families closed it — `name` (ADR 0084), `"char"`
+    // (ADR 0095), `oid` (ADR 0097) and `regproc` (ADR 0098) — and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). The *values* never changed a character.
+    // These are the adapter's own boot queries, and what it reads out of them is the typname and
+    // the typinput, both of which are right.
+    types: &[],
     answers: &[
         // **Two operators this unit did not build**, and they are the two nothing in the suite
         // sends: `hstore - text` deletes a key and `?&` asks for all of a list. They are in the

@@ -56,20 +56,12 @@ const BPCHAR: &str = "An explicit cast to `character(n)` truncates on a real ser
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[
-        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
-        // differs is one of the standing declared-type families listed on
-        // `parity::Divergences::types`. The reason each one used to carry described an answer
-        // that had stopped differing.
-        // `typname` is a `name`, `typinput` a `regproc` and `typcategory` a `"char"` on a real
-        // server; all three are `text` here with identical characters, and `typlen` agrees
-        // exactly. The trade every `pg_catalog` column makes.
-        "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = \
-         'interval'",
-        // The value is right — `interval(3)` trims where `numeric(p,s)` pads, so `1.5 seconds`
-        // is `00:00:01.5` — and the declared type drops the precision, because a cast carries
-        // no typmod here for any parameterised type (`tests/numeric.rs`, `tests/time.rs`).
-    ],
+    // **Empty, and three units emptied it.** The `interval(0)` entry left with g1's typmod
+    // propagation (#28) — a cast carries its modifier now — and the `pg_type` row left when the
+    // last of its five columns stopped diverging: `typname` is a `name` (ADR 0084), `typcategory`
+    // a `"char"` (ADR 0095), `typinput` a `regproc` (ADR 0098) and `oid` an `oid` (ADR 0097).
+    // `typlen` always agreed. The row itself never changed a character.
+    types: &[],
     answers: &[
         (
             "SELECT attname, atttypmod, format_type(atttypid, atttypmod) FROM \

@@ -480,6 +480,9 @@ fn oid_of_table(relations: &Relations, table_id: u64) -> i64 {
 
 /// The columns of `pg_index`, in PostgreSQL's own order.
 pub const INDEX_COLUMNS: &[(&str, ColumnType, i32)] = &[
+    // **A `bigint`**, for `pg_class.oid`'s reason: a primary key's index oid is derived from
+    // `pg_relations::PRIMARY_KEY_OID_BASE` and does not fit four bytes (ADR 0097). `indrelid`
+    // beside it names a table, whose id is a counter, and is an `oid`.
     ("indexrelid", ColumnType::Int8, NO_LENGTH),
     ("indrelid", ColumnType::Int8, NO_LENGTH),
     ("indnatts", ColumnType::Int2, NO_LENGTH),

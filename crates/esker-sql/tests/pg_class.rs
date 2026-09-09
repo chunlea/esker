@@ -18,13 +18,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
-        // `relname` and `nspname` are `name` on a real server — the 64-byte identifier type — and
-        // `text` here. The values are identical and every comparison against one already treats
-        // them as text; `relkind` is `"char"` there and `text` here for the same reason. The same
-        // trade `pg_type`'s columns make, declared in `tests/pg_catalog.rs`.
-        "SELECT c.relname, c.relkind FROM pg_class c WHERE c.relname IN ('r4a','r4b') ORDER BY \
-         c.relname",
-        "SELECT c.relkind FROM pg_class c WHERE c.relname = 'r4a_pkey'",
+        // **Empty.** `relname` and `nspname` are the 64-byte `name` here (ADR 0084) and
+        // `relkind` a `"char"` (ADR 0095); all three stood in this sentence as types this node
+        // did not have, and they were the whole of what it declared. The `oid` family is still
+        // a `bigint` here and is declared where a statement reads one (`tests/pg_catalog.rs`).
     ],
     answers: &[],
 };

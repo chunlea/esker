@@ -29,19 +29,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[(
-        "SELECT 'r', conname, contype FROM pg_constraint WHERE contypid = 'ds_ci'::regtype",
-        "**The row is there; the `::regtype` in the comparison is not resolved to an oid.** \
-         `contypid` now carries the domain and the constraint has its row — `SELECT conname FROM \
-         pg_constraint WHERE contypid <> 0` finds it — but a bare `'ds_ci'::regtype` lowers to the \
-         type's *name*, and comparing that against a `bigint` column is `22P02`.\n\nThis is the \
-         limitation `tests/regtype_user.rs` already declares in the same words, over
-         `WHERE enumtypid = 'mood'::regtype`: the oid form is chosen when `::oid` is written, and a \
-         comparison is a position that wants the oid without saying so. Deciding it from the \
-         column being compared against is its own unit and would close both.",
-
-"pg19_domain_schema.txt:33",
-)],
+    // **Empty, and the last entry closed for a reason worth keeping.** It said
+    // `SELECT … FROM pg_constraint WHERE contypid = 'ds_ci'::regtype` was `22P02`, because a bare
+    // `::regtype` lowers to the type's *name* and comparing a name against a `bigint` column
+    // cannot work. `contypid` is an `oid` now (ADR 0097), and a `regtype` beside an `oid` is one
+    // representation rather than two — so the comparison resolves and the row is found. The same
+    // limitation over `pg_enum.enumtypid` closed with it.
+    answers: &[],
 };
 
 #[test]

@@ -36,41 +36,20 @@ const CORPUS_FIXTURE: &[&str] = &[];
 ///   container and broke the database. There are no roles here and a computed relation has
 ///   nothing to write to, so all four verbs get the answer a real server gives everyone who is not
 ///   a superuser.
-/// * And the `types` list, which is 28 statements of the same sentence: a real server's
-///   `pg_type.oid` is an `oid`, `typname` is a `name`, `typdelim` and `typtype` are `"char"` and
-///   `typinput` is a `regproc`. This node has none of those four types, so an `oid` is a `bigint`
-///   and the other three are `text`. **Every value is identical** — the harness only reaches this
-///   list when the rows already agree — and what differs is the OID in `RowDescription`.
-///   `ActiveRecord` reads all five columns with `.to_i` or a string comparison, so nothing it does
-///   can see it.
+/// * And the `types` list, which is **empty**. It held 28 statements of one sentence — a real
+///   server's `pg_type.oid` is an `oid`, `typname` a `name`, `typdelim`/`typtype` a `"char"` and
+///   `typinput` a `regproc`, and this node answered a `bigint` and three `text`s — and the four
+///   type units emptied it one family at a time (ADR 0084, ADR 0095, ADR 0097, ADR 0098). **Every
+///   value was identical throughout**; what differed was the OID in `RowDescription`, which is why
+///   nothing `ActiveRecord` does could see it and why only a `Describe` ever could.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         // **Seven rows left this list when `typname` became `name`.** Every one of them projected
         // `typname` alone, so the only thing that differed was the column's declared type — and
         // `pg_type.typname` is a `name` on a real server (ADR 0084's sibling unit, g1's catalog
         // columns). The rows that remain project an `oid` beside it, which is an `oid` there and a
-        // `bigint` here, or a `"char"` column — two types this node does not have.
-        "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'int8'",
-        "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'text'",
-        "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'bool'",
-        "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'bytea'",
-        "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'float8'",
-        "SELECT oid, typname, typelem, typdelim, typinput, typtype, typbasetype FROM pg_type WHERE typname = 'timestamptz'",
-        "SELECT oid FROM pg_type WHERE typname IN ('int8', 'text', 'bool', 'bytea', 'float8', 'timestamptz') ORDER BY oid",
-        "SELECT t.oid FROM pg_type AS t WHERE t.typname = 'int8'",
-        "SELECT typtype FROM pg_type WHERE typname = 'int8'",
-        "SELECT typdelim FROM pg_type WHERE typname = 'int8'",
-        "SELECT typinput FROM pg_type WHERE typname = 'bool'",
-        "SELECT typinput FROM pg_type WHERE typname = 'timestamptz'",
-        "SELECT typelem, typbasetype FROM pg_type WHERE typname = 'text'",
-        "SELECT oid FROM pg_type WHERE typname = 'int8' AND typtype = 'b'",
-        "SELECT oid FROM pg_type WHERE typtype IN ('r', 'e', 'd') AND typname IN ('int8', 'text')",
-        "SELECT oid FROM pg_type WHERE typelem IN (16, 17) AND typname IN ('int8', 'text')",
-        "SELECT DISTINCT typtype FROM pg_type WHERE typname IN ('int8', 'text', 'bool')",
-        "SELECT typtype, count(*) FROM pg_type WHERE typname IN ('int8', 'text', 'bool') GROUP BY typtype",
-        "SELECT rngsubtype FROM pg_range WHERE rngtypid = 20",
-        "SELECT t.typname, r.rngsubtype FROM pg_type AS t LEFT JOIN pg_range AS r ON t.oid = r.rngtypid WHERE t.typname = 'int8'",
-        "SELECT t.typname, r.rngsubtype FROM pg_type AS t LEFT JOIN pg_range AS r ON oid = rngtypid WHERE t.typname IN ('int8', 'text') ORDER BY t.oid",
+        // `bigint` here. `"char"` columns were the other reason a row stayed and are no longer
+        // one (ADR 0095).
     ],
     answers: &[
         (
@@ -181,10 +160,16 @@ fn activerecord_s_four_type_map_queries_answer() {
         vec![
             vec!["16", "bool", "0", ",", "boolin", "\\N", "b", "0"],
             vec!["17", "bytea", "0", ",", "byteain", "\\N", "b", "0"],
+            // **18 `char`, the catalog's own one-byte type** (ADR 0095). The quotes belong to how
+            // the *name* is written and not to `typname`, which is what this query reads.
+            vec!["18", "char", "0", ",", "charin", "\\N", "b", "0"],
             // **`name` answers this query now** (ADR 0084). It is one of the forty names
             // `ActiveRecord` asks for, and until the type existed the row simply was not there —
             // the adapter saw a type map with a hole where its own catalog columns are declared.
-            vec!["19", "name", "0", ",", "namein", "\\N", "b", "0"],
+            // Its `typelem` is **18** rather than 0 since `"char"` arrived (ADR 0095): a `name`
+            // is 64 of them, and the adapter reads `typinput` and not `typelem` to decide a row
+            // is an array, so the pointer costs it nothing and is the oracle's answer.
+            vec!["19", "name", "18", ",", "namein", "\\N", "b", "0"],
             vec!["20", "int8", "0", ",", "int8in", "\\N", "b", "0"],
             vec!["21", "int2", "0", ",", "int2in", "\\N", "b", "0"],
             vec!["23", "int4", "0", ",", "int4in", "\\N", "b", "0"],
@@ -303,7 +288,7 @@ fn activerecord_s_four_type_map_queries_answer() {
         ]
     );
 
-    // 9 — array types, found by their element type. **Forty-one rows**, which is every array
+    // 9 — array types, found by their element type. **Forty-three rows**, which is every array
     // type whose element is in the adapter's list: `typelem` is the element's oid, which is how
     // `ActiveRecord` finds them, and `typinput` is `array_in`, which is how it decides a column
     // is an array at all. It answered nothing while this node had no arrays and five rows while
@@ -314,7 +299,9 @@ fn activerecord_s_four_type_map_queries_answer() {
     // `tsvector` type: **3614 was already in the adapter's list**, waiting for a row, and `_name`
     // is the thirty-sixth for the same reason — 19 was in the list and had no array. The five
     // geometric arrays are thirty-seven through forty-one, and every one of their element oids was
-    // in the list too (ADR 0091).
+    // in the list too (ADR 0091), and `_char` is the forty-second for the same reason (ADR 0095).
+    // The forty-third is not an array at all: `name` joins the base types below once its `typelem`
+    // names a row that exists, which is what a real server answers here and this node did not.
     assert_eq!(
         node.rows(
             "SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, \
@@ -326,11 +313,27 @@ fn activerecord_s_four_type_map_queries_answer() {
         ),
         vec![
             // **The base types whose `typelem` is not zero**, which is what puts them in an *array*
-            // query at all: `point` and `line` are two `float8`s, `lseg` and `box` two `point`s,
-            // `int2vector` `int2`s and `oidvector` `oid`s. A real server answers this same statement
-            // with exactly these rows — measured — and `ActiveRecord` has registered every one of
-            // them by *name* long before it looks at `typelem`, which is why the value can be right
-            // here without changing what the adapter does with it.
+            // query at all: a `name` is 64 `"char"`s, `point` and `line` are two `float8`s, `lseg`
+            // and `box` two `point`s, `int2vector` `int2`s and `oidvector` `oid`s. A real server
+            // answers this same statement with exactly these rows — measured — and `ActiveRecord`
+            // has registered every one of them by *name* long before it looks at `typelem`, which
+            // is why the value can be right here without changing what the adapter does with it.
+            //
+            // **`name` leads them**, and this node was not answering it: with `typelem` 0 the row
+            // could not match `typelem IN (…)` at all, so the adapter's array query came back one
+            // row short of a real server's. It is the first row on the oracle too — measured in
+            // this session, `captures/pg19_char_type.txt` — and 18 was in the adapter's list
+            // already (ADR 0095).
+            vec![
+                "19".to_owned(),
+                "name".to_owned(),
+                "18".to_owned(),
+                ",".to_owned(),
+                "namein".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
             vec![
                 "22".to_owned(),
                 "int2vector".to_owned(),
@@ -483,6 +486,17 @@ fn activerecord_s_four_type_map_queries_answer() {
             // lost ten tests because `array_agg(enum.enumlabel)` over a `name` column had no array
             // type to be declared as. 19 is `name` and it was already in the list above, waiting
             // for a row, the way 3614 was.
+            // **1002 `_char`**, whose element 18 was already in the adapter's list (ADR 0095).
+            vec![
+                "1002".to_owned(),
+                "_char".to_owned(),
+                "18".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
             vec![
                 "1003".to_owned(),
                 "_name".to_owned(),

@@ -460,6 +460,14 @@ pub enum ColumnType {
     /// comparison is `25 < 23` and not the names; and `'text'::regtype = 25` is true against an
     /// uncast integer.
     RegType,
+    /// `regproc`: an oid that prints as a **function's** name — `pg_type.typinput`'s type, and
+    /// oid 24 ([ADR 0098](../../../docs/adr/0098-regproc-is-an-oid-that-prints-as-a-function.md)).
+    ///
+    /// The same shape as [`ColumnType::RegType`] one catalog over, with two measured differences:
+    /// an oid **no function has prints as the number** — `24::regproc` is `24` where
+    /// `42::regproc` is `int4in` — and `min`/`max` over one **decay to `oid`**, where a `regtype`
+    /// keeps its type.
+    RegProc,
     /// `regclass`: an oid that prints as a **relation's** name, the type
     /// [ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)'s shape one
     /// letter along.
@@ -516,6 +524,23 @@ pub enum ColumnType {
     CircleArray,
     /// See [`ColumnType::LsegArray`].
     LineArray,
+    /// PostgreSQL's `"char"` — oid 18, **one byte**, and not `character(1)`.
+    ///
+    /// The catalog's own one-character type: `pg_class.relkind`, `pg_constraint.contype`,
+    /// `pg_type.typcategory` and `typdelim` are all this. The quotes are part of how it is written,
+    /// because an unquoted `char` means `bpchar`.
+    ///
+    /// **The byte is what is kept, not the character.** `'abc'::"char"` is `a` and `'é'::"char"` is
+    /// the first *byte* of a two-byte character — which is not valid UTF-8 on its own, so it prints
+    /// as the octal escape `Ã`. Stored as a `Datum::Text` holding what the output function would
+    /// print, so that the escape is a property of the value rather than of one printer.
+    ///
+    /// **`typcategory` is `Z`**, its own group rather than `S` with the strings, and that one
+    /// letter is why `'r'::"char" = 'r'::text` is `t` while a `CASE` over the two is `42804`: they
+    /// compare and have no common type.
+    Char,
+    /// `"char"[]` — oid 1002, `_char`.
+    CharArray,
     /// PostgreSQL's `void` — oid 2278, and **the one pseudo-type in this vocabulary**.
     ///
     /// `typtype` is `p` and `typcategory` `P`, which is what says it is not a storage type: no
@@ -560,6 +585,8 @@ pub enum ColumnType {
     CitextArray,
     /// `regtype[]`, which is what an `ARRAY['text'::regtype]` is.
     RegTypeArray,
+    /// `regproc[]`, oid 1008 — what `array_agg(typinput)` is.
+    RegProcArray,
 }
 
 /// The address family a `Datum::Inet` names: 4 for IPv4, 6 for IPv6, and the **first** byte of an
@@ -575,7 +602,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 99] = [
+    pub const ALL: [ColumnType; 103] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -609,6 +636,7 @@ impl ColumnType {
         ColumnType::Interval,
         ColumnType::Oid,
         ColumnType::RegType,
+        ColumnType::RegProc,
         ColumnType::RegClass,
         ColumnType::Int2Vector,
         ColumnType::OidVector,
@@ -622,6 +650,8 @@ impl ColumnType {
         ColumnType::BpcharArray,
         ColumnType::VarcharArray,
         ColumnType::NameArray,
+        ColumnType::Char,
+        ColumnType::CharArray,
         ColumnType::Void,
         ColumnType::LsegArray,
         ColumnType::PathArray,
@@ -641,6 +671,7 @@ impl ColumnType {
         ColumnType::OidArray,
         ColumnType::CitextArray,
         ColumnType::RegTypeArray,
+        ColumnType::RegProcArray,
         ColumnType::DateRange,
         ColumnType::NumRange,
         ColumnType::Int8Range,
@@ -868,6 +899,18 @@ pub enum Datum {
         /// What it prints as.
         name: Box<str>,
     },
+    /// [`ColumnType::RegProc`]: the same, for a **function**.
+    ///
+    /// Compared by the oid, like a `regtype`. What differs is the *printing*: an oid no function
+    /// has prints as its digits — measured, `24::regproc` is `24` and `42::regproc` is `int4in`
+    /// — and there are far more oids without a function than a real server's `pg_proc` has rows,
+    /// so the digits are the common case rather than the corner one.
+    RegProc {
+        /// The oid, which is the value.
+        oid: u32,
+        /// What it prints as: the function's name, or the oid's digits when none has it.
+        name: Box<str>,
+    },
     /// [`ColumnType::RegClass`]: the same, for a **relation**.
     ///
     /// The name rides along for the reason a `regtype`'s does — deriving it needs the catalog and
@@ -980,7 +1023,8 @@ impl PartialEq for Datum {
             // separate pairs**: this is representation equality, and a row holding an `oid` is not
             // a row holding a `regtype`.
             (Datum::Oid(a), Datum::Oid(b))
-            | (Datum::RegType { oid: a, .. }, Datum::RegType { oid: b, .. }) => a == b,
+            | (Datum::RegType { oid: a, .. }, Datum::RegType { oid: b, .. })
+            | (Datum::RegProc { oid: a, .. }, Datum::RegProc { oid: b, .. }) => a == b,
             // Representation equality, element by element: two arrays that print the same are
             // the same row. What `1.0` and `1.00` are to a `numeric`, `{1.0}` and `{1.00}` are
             // to a `numeric[]`, and `pg_cmp` is again where the *values* are compared.
@@ -1097,6 +1141,7 @@ impl Datum {
             Datum::Interval { .. } => ColumnType::Interval,
             Datum::Oid(_) => ColumnType::Oid,
             Datum::RegType { .. } => ColumnType::RegType,
+            Datum::RegProc { .. } => ColumnType::RegProc,
             Datum::RegClass { .. } => ColumnType::RegClass,
             Datum::Numeric(_) => ColumnType::Numeric,
             // The array's own element type decides which of the four it is, so a value always
@@ -1164,7 +1209,7 @@ fn one_representation(held: ColumnType, wanted: ColumnType) -> bool {
                 // **A `name` is its text too**, and truncated before it ever reaches a row: the
                 // 63-byte cut belongs to the cast, where the character boundary is known, so what
                 // arrives here is already a value of the type.
-                | ColumnType::Name
+                | ColumnType::Name | ColumnType::Char
                 | ColumnType::Bpchar
                 | ColumnType::Json
                 | ColumnType::Jsonb

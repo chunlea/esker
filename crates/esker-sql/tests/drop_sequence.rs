@@ -10,9 +10,9 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `relname` is a `name` on a real server and `relkind` a `"char"`; both are `text` here, with
-    // identical characters. The standing trade every `pg_catalog` column makes.
-    types: &["SELECT relname, relkind FROM pg_class WHERE relname = 'seqco_id_seq'"],
+    // **Empty.** What was listed read `relname` and `relkind`; they are a `name` (ADR 0084) and
+    // a `"char"` (ADR 0095) here now, so the declared types agree with the characters.
+    types: &[],
     answers: &[
         // **Both entries here are deleted** (ADR 0031, rule 2). They said a free-standing
         // sequence could not be created, so `DROP SEQUENCE` never met the one shape that needs no

@@ -6151,6 +6151,32 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 _ => {}
             }
         }
+        // **A `"char"` casts to and from an `int4` as the *byte*, not as the printed text.**
+        // Measured: `'r'::"char"::int4` is 114 and `65::int4::"char"` is `A`, both **explicit**
+        // casts in `pg_cast`. Through the ordinary text path the first was
+        // `22P02 invalid input syntax for type integer: "r"`, which is the same shape
+        // `uuid::bytea` had — a pair with a real conversion read as a re-parse.
+        if source_type(expr)? == Some(ColumnType::Char)
+            && lower_type(data_type).ok().map(|(ty, _)| ty) == Some(ColumnType::Int4)
+            && let Some(text) = cast_literal_text(expr)?
+        {
+            return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::Int4(i32::from(value::char_type::to_byte(&text))),
+            ))));
+        }
+        // The other direction, and it is the same fact: the number **is** the byte, so `65` is `A`
+        // and not the first character of `65`.
+        if matches!(
+            source_type(expr)?,
+            Some(ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+        ) && lower_type(data_type).ok().map(|(ty, _)| ty) == Some(ColumnType::Char)
+            && let Some(text) = cast_literal_text(expr)?
+        {
+            let byte = u8::try_from(text.parse::<i64>().unwrap_or(0).rem_euclid(256)).unwrap_or(0);
+            return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                Datum::Text(value::char_type::render(byte)),
+            ))));
+        }
         // **`money::numeric` is the cents as a decimal, not the printed money read back.** The
         // output function writes `$567.89` and `numeric`'s input function refuses it, so the
         // ordinary text path made a conversion a real server performs into a `22P02` about the
@@ -6338,7 +6364,18 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // arms above still come first, because `'x'::regtype::oid` is asking a different
         // question — what OID does this *name* have — and answers before any value is read.
         (CastTarget::Oid, _) => {
-            let text = cast_operand(expr, data_type)?;
+            // **A cast of an expression is an ordinary cast.** `oid` reaches this function at all
+            // only because `sqlparser` has no `DataType` for it, so the name arrives as a custom
+            // one; folding a literal here is a convenience, and a *column* has nothing to fold.
+            // Without this arm `typinput::oid` — a statement a real server answers — was
+            // `0A000 the cast typinput::oid is not supported` (ADR 0098).
+            let Ok(text) = cast_operand(expr, data_type) else {
+                return Ok(plan::Expr::Cast {
+                    operand: Box::new(lower_expr(expr)?),
+                    to: ColumnType::Oid,
+                    typmod: NO_TYPMOD,
+                });
+            };
             Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
                 Datum::Oid(value::oid::from_text(&text)?),
             ))))
@@ -6735,6 +6772,20 @@ fn cast_literal_text(expr: &Expr) -> Result<Option<String>> {
         } => Ok(cast_literal_text(inner)?.map(|text| format!("-{text}"))),
         // The inner cast, run: its *result* is what the outer one reads.
         Expr::Cast { .. } => match lower_expr(expr)? {
+            // **Through the `Cast` node a folded cast keeps** (ADR 0086). That node exists so the
+            // declared type survives a value that cannot carry it, and it is a no-op on the value
+            // — so what the outer cast reads is the literal under it. Without this arm a chain
+            // whose inner step is one of those types stopped folding and took the per-row path
+            // instead, which is how `'r'::"char"::int4` became
+            // `22P02 invalid input syntax for type integer: "r"`.
+            plan::Expr::Cast { operand, .. } => Ok(match operand.as_ref() {
+                plan::Expr::Literal(plan::Literal::Typed(value)) => match value.as_ref() {
+                    Datum::Text(text) => Some(text.clone()),
+                    other => other.to_text(),
+                },
+                plan::Expr::Literal(plan::Literal::String(text)) => Some(text.clone()),
+                _ => None,
+            }),
             plan::Expr::Literal(plan::Literal::Typed(value)) => Ok(match value.as_ref() {
                 Datum::Text(text) => Some(text.clone()),
                 other => other.to_text(),
@@ -6752,17 +6803,15 @@ fn cast_literal_text(expr: &Expr) -> Result<Option<String>> {
 /// Only a literal: `column::regtype` would need the cast at run time, and answering it here from
 /// the text of an expression would be a wrong answer rather than a missing feature.
 fn cast_operand(expr: &Expr, data_type: &DataType) -> Result<String> {
-    match expr {
-        Expr::Value(value) => match &value.value {
-            Value::SingleQuotedString(text) => Ok(text.clone()),
-            _ => Err(SqlError::unsupported(format!(
-                "the cast {expr}::{data_type}"
-            ))),
-        },
-        _ => Err(SqlError::unsupported(format!(
-            "the cast {expr}::{data_type}"
-        ))),
-    }
+    // **One reader for the literal, not two.** This function used to accept a single-quoted string
+    // and nothing else, so `'26'::oid` answered and `26::oid` was
+    // `0A000 the cast 26::oid is not supported` — a refusal for a spelling a real server takes and
+    // the one a person writes. [`cast_literal_text`] already knows every shape a literal has here:
+    // a number, a signed number, a bit string, and a cast chain whose inner step folded (ADR 0086).
+    // Asking it is the whole fix, and it is the third time in this crate that one grammar had two
+    // readers and the narrow one was the bug.
+    cast_literal_text(expr)?
+        .ok_or_else(|| SqlError::unsupported(format!("the cast {expr}::{data_type}")))
 }
 
 /// The two cast targets this node answers, or `None` for every other one.
@@ -8426,6 +8475,15 @@ pub(super) fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
         && let Some(part) = only.as_ident()
         && part.quote_style.is_some()
     {
+        // **`pg_type` first, and `"char"` is why.** Stripping the quotes and re-reading is right
+        // for every name where the quoted and the bare spelling are the same type — `"bit"`,
+        // `"varchar"`, `"int4"` all answer the same either way — and wrong for the one where they
+        // are **not**: bare `char` is `bpchar` and `"char"` is oid 18. A quoted name is an
+        // identifier, so it is looked up the way an identifier is; anything `pg_type` does not
+        // hold (a domain, an enum) falls through to the strip below and reaches the user-type path.
+        if let Some(ty) = value::internal_type_by_name(&part.value) {
+            return Ok((ty, NO_TYPMOD));
+        }
         return lower_type(&DataType::Custom(
             ObjectName::from(vec![Ident::new(part.value.clone())]),
             Vec::new(),
@@ -8705,6 +8763,20 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         // custom name, so this is the one place the three paths meet; without it `bpchar` was a
         // *user* type nobody had declared and the answer was `0A000 the type bpchar is not
         // supported` about a type this node has.
+        // **A quoted name is an identifier and is looked up in `pg_type` alone.** The one place
+        // it matters is `"char"`: bare `char` is `bpchar` and the quoted spelling is oid 18, and
+        // `ObjectName`'s `Display` drops the quote style — so the decision is made here, where the
+        // identifier still carries it.
+        DataType::Custom(name, modifiers)
+            if modifiers.is_empty()
+                && name.0.len() == 1
+                && let Some(part) = name.0.first()
+                && let Some(ident) = part.as_ident()
+                && ident.quote_style.is_some()
+                && let Some(ty) = value::internal_type_by_name(&ident.value) =>
+        {
+            ty
+        }
         DataType::Custom(name, modifiers)
             if modifiers.is_empty()
                 && name.0.len() == 1

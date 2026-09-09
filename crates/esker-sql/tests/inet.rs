@@ -13,19 +13,16 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog type trade, five times: `typname` and `udt_name` are `name`, the two
-    // oids are `oid`, `typcategory` is a `"char"` and `typinput` a `regproc`,
-    // `information_schema`'s columns are its own domains, `pg_typeof` answers a `regtype`, and a
-    // `::varchar` cast is a `character varying` — all `text` here. **Every value agrees**, and
+    // **Empty.** The four catalog type families closed it — `name` (ADR 0084), `"char"`
+    // (ADR 0095), `oid` (ADR 0097) and `regproc` (ADR 0098) — and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). The *values* never changed a character.
+    // The `information_schema` rows left this list with them. **Every value agrees**, and
     // the values are what these five ask: `inet` is 869 with array 1041, `cidr` 650/651 and
     // `macaddr` 829/1040; the two addresses are category `I` and the `macaddr` `U`; `macaddr`'s
     // `typlen` is 6 where the other two are varlenas; the three defaults read back
     // `'192.168.1.1'::inet`, `'192.168.1.0/24'::cidr` and `'ff:ff:ff:ff:ff:ff'::macaddr`, which
     // is what the schema dumper parses.
-    types: &[
-        "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type WHERE \
-         typname IN ('inet','cidr','macaddr','_inet','_cidr','_macaddr') ORDER BY typname",
-    ],
+    types: &[],
     answers: &[
         // **The network functions and operators are a unit of their own, and none of them is in
         // the suite.** `network_test.rb` stores addresses and reads them back; `host`, `masklen`,

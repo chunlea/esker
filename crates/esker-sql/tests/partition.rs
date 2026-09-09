@@ -10,14 +10,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog trade, and nothing new: `relkind` is a `"char"` on a real server and
-    // `relname` a `name`, and this node has neither type — both are `text`, with the same
-    // characters in them. Every row agrees.
-    types: &[
-        "SELECT 'r', relkind, relispartition, relhassubclass FROM pg_class WHERE relname = 'measurements'",
-        "SELECT 'r', relkind, relispartition FROM pg_class WHERE relname = 'index_measurements_on_logdate_and_city_id'",
-        "SELECT 'r', c.relname, c.relkind, c.relispartition FROM pg_class c WHERE c.relname LIKE 'measurements%' ORDER BY c.relname",
-    ],
+    // **Empty.** `relkind` is a `"char"` here now (ADR 0095) and `relname` a `name` (ADR 0084),
+    // which is the whole of what this list declared. Every row agrees, and so does every
+    // declared type.
+    types: &[],
     answers: &[
         (
             "ALTER TABLE \"measurements\" ADD CONSTRAINT \"m_bad_pk\" PRIMARY KEY (\"logdate\")",

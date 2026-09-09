@@ -13,17 +13,14 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog type trade, six times: `typname` and `udt_name` are `name` on a real
-    // server, `typcategory` and `typinput` are `"char"` and `regproc`, `information_schema`'s
-    // three are its own domains, and `pg_typeof` answers a `regtype`. All `text` here, all
-    // comparing identically. **Every value agrees**, and the values are the whole point of these
+    // **Empty.** The four catalog type families closed it — `name` (ADR 0084), `"char"`
+    // (ADR 0095), `oid` (ADR 0097) and `regproc` (ADR 0098) — and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). The *values* never changed a character.
+    // **Every value agrees**, and the values are the whole point of these
     // six: `money` is `typlen` 8 with category `N` and input `cash_in`, its precision and scale
     // are both NULL, its default reads back `'$150.55'::money`, `money / money` really is a
     // `double precision`, `money::numeric` is `567.89` with no symbol, and `money[]` exists.
-    types: &[
-        "SELECT 'r', typname, typlen, typcategory, typinput FROM pg_type WHERE typname IN \
-         ('money','_money') ORDER BY typname",
-    ],
+    types: &[],
     answers: &[
         // **`||` is not built here for any type**, which is the standing gap
         // `tests/integer_plus_text.rs` already declares three times over — not a money question.
