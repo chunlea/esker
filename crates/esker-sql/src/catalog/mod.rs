@@ -462,6 +462,41 @@ impl ExprShape {
     }
 }
 
+/// [`ExprShape::printed`]'s pair taken back off — the **pretty** form of a printed expression.
+///
+/// `pg_get_expr(adbin, adrelid)` prints an operator expression in one pair and
+/// `pg_get_expr(adbin, adrelid, true)` prints the same expression without it: measured on 19beta1,
+/// `(c1 + 1)` and `c1 + 1` for one stored generated column. This crate stores the printed form, so
+/// the pretty form is that form with its own pair removed.
+///
+/// **Only a pair that is its own match.** `(a) + (b)` begins and ends with a parenthesis and is not
+/// parenthesised; taking the ends off it would produce `a) + (b`. So the inside is scanned, and a
+/// close that arrives at depth zero says the two ends belong to different pairs.
+#[must_use]
+pub(crate) fn unparenthesised(expr: &str) -> &str {
+    let Some(inner) = expr
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return expr;
+    };
+    let (mut depth, mut quoted) = (0_i32, false);
+    for byte in inner.bytes() {
+        match byte {
+            b'\'' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => {
+                depth -= 1;
+                if depth < 0 {
+                    return expr;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth == 0 { inner } else { expr }
+}
+
 /// One part of an index's key, in the order it is stored in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexKey {

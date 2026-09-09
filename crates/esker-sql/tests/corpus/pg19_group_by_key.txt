@@ -20,7 +20,30 @@
 # The capture runs inside `BEGIN … ROLLBACK`; error probes sit in `SAVEPOINT`/`ROLLBACK TO`, and
 # the `SELECT count(*)` after the `ROLLBACK` proves it left nothing behind.
 #
-# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.
+# Rows start with a literal `'r'` because `sesscap.py` drops output rows that begin with a space.#
+# ---- run 104: the clause the dependency was NOT applied to ----
+#
+# `ORDER BY` was missing, and it is the clause `ActiveRecord` actually reaches this through.
+# `Company.includes(:comments).order(:rating).ids` sends `GROUP BY "companies"."id" ORDER BY
+# "companies"."rating"`, where the ordered column is nowhere else in the statement — not in the
+# select list, not in the `HAVING` — so a widening that walked only those two freed nothing and the
+# node answered `42803` for a query PostgreSQL answers with fifteen rows
+# (`calculations_test#test_ids_with_includes_and_non_primary_key_order`).
+#
+# Four more things the ORDER BY section pins, each measured rather than reasoned:
+#
+# * **a positional grouping key frees the table too**: `GROUP BY 2` where position 2 is the key.
+#   Position 1 is the leading `'r'` every row here projects, which is a trap of this file's own
+#   making — the first attempt at this probe wrote `GROUP BY 1`, grouped by a constant, and got a
+#   `42803` naming `gb_firms.id` that looked like a finding about positions;
+# * **a composite key frees its table only when every column of it is grouped**: `GROUP BY a` over
+#   `PRIMARY KEY (a, b)` leaves `extra` bare, in the select list and in the `ORDER BY` alike;
+# * **a `UNIQUE NOT NULL` column determines nothing.** `GROUP BY u` is `42803` about `extra` even
+#   though one row per group is just as true — PostgreSQL's `check_functional_grouping` reads the
+#   *primary key* and nothing else, so a node that generalised to "any unique constraint" would
+#   accept queries a real server refuses;
+# * **the other table's column stays bare** in `ORDER BY` as it is in the select list, which is the
+#   per-table rule this file already had, in the one clause that had not been asked.
 BEGIN		-
 CREATE TABLE gb_firms (id bigint primary key, name character varying(255), rating integer)		-
 CREATE TABLE gb_accounts (id bigint primary key, firm_id bigint, credit_limit integer)		-
@@ -56,6 +79,70 @@ SELECT 'r', rating FROM gb_firms GROUP BY name	!42803 column "gb_firms.rating" m
 ROLLBACK TO g5		-
 # ---- multiple group values, which is `test_find_keeps_multiple_group_values` ----
 SELECT 'r', f.id, f.name, f.rating FROM gb_firms f GROUP BY f.id, f.name, f.rating ORDER BY f.id		r|1|one|5 ; r|2|two|7
+# ---- and the ORDER BY, which is the clause ActiveRecord reaches the dependency through ----
+CREATE TABLE gb_pair (a bigint, b bigint, extra integer, PRIMARY KEY (a, b))		-
+INSERT INTO gb_pair VALUES (1, 1, 10), (1, 2, 20)		-
+CREATE TABLE gb_uniq (id bigint primary key, u bigint UNIQUE NOT NULL, extra integer)		-
+INSERT INTO gb_uniq VALUES (1, 100, 7), (2, 200, 8)		-
+# the statement calculations_test#test_ids_with_includes_and_non_primary_key_order sends
+SAVEPOINT p1		-
+SELECT 'r', f.id FROM gb_firms f LEFT OUTER JOIN gb_accounts a ON a.firm_id = f.id GROUP BY f.id ORDER BY f.rating ASC		r|1 ; r|2
+ROLLBACK TO p1		-
+# unqualified, and the ordered column is nowhere else in the statement
+SAVEPOINT p2		-
+SELECT 'r', id FROM gb_firms GROUP BY id ORDER BY rating		r|1 ; r|2
+ROLLBACK TO p2		-
+SAVEPOINT p3		-
+SELECT 'r', id FROM gb_firms GROUP BY id ORDER BY rating DESC		r|2 ; r|1
+ROLLBACK TO p3		-
+SAVEPOINT p4		-
+SELECT 'r', id FROM gb_firms GROUP BY id ORDER BY rating + 1		r|1 ; r|2
+ROLLBACK TO p4		-
+SAVEPOINT p5		-
+SELECT 'r', id FROM gb_firms GROUP BY id ORDER BY name, rating		r|1 ; r|2
+ROLLBACK TO p5		-
+SAVEPOINT p6		-
+SELECT 'r', count(*) FROM gb_firms GROUP BY id ORDER BY rating		r|1 ; r|1
+ROLLBACK TO p6		-
+# a positional grouping key frees the table too -- 2, because the leading 'r' is position 1
+SAVEPOINT p7		-
+SELECT 'r', id FROM gb_firms GROUP BY 2 ORDER BY rating		r|1 ; r|2
+ROLLBACK TO p7		-
+# ...and the other table's column is still the 42803 it was
+SAVEPOINT p8		-
+SELECT 'r', f.id FROM gb_firms f JOIN gb_accounts a ON a.firm_id = f.id GROUP BY f.id ORDER BY a.credit_limit	!42803 column "a.credit_limit" must appear in the GROUP BY clause or be used in an aggregate function
+ROLLBACK TO p8		-
+SAVEPOINT p9		-
+SELECT 'r', a.firm_id FROM gb_accounts a GROUP BY a.firm_id ORDER BY a.credit_limit	!42803 column "a.credit_limit" must appear in the GROUP BY clause or be used in an aggregate function
+ROLLBACK TO p9		-
+SAVEPOINT p10		-
+SELECT 'r', f.id, a.id FROM gb_firms f JOIN gb_accounts a ON a.firm_id = f.id GROUP BY f.id, a.id ORDER BY f.rating, a.credit_limit		r|1|1 ; r|1|2 ; r|2|3
+ROLLBACK TO p10		-
+# a composite key frees its table only when EVERY column of it is grouped
+SAVEPOINT p11		-
+SELECT 'r', a, b, extra FROM gb_pair GROUP BY a, b ORDER BY extra		r|1|1|10 ; r|1|2|20
+ROLLBACK TO p11		-
+SAVEPOINT p12		-
+SELECT 'r', a, extra FROM gb_pair GROUP BY a	!42803 column "gb_pair.extra" must appear in the GROUP BY clause or be used in an aggregate function
+ROLLBACK TO p12		-
+SAVEPOINT p13		-
+SELECT 'r', a FROM gb_pair GROUP BY a ORDER BY extra	!42803 column "gb_pair.extra" must appear in the GROUP BY clause or be used in an aggregate function
+ROLLBACK TO p13		-
+SAVEPOINT p14		-
+SELECT 'r', a, count(*) FROM gb_pair GROUP BY a ORDER BY a		r|1|2
+ROLLBACK TO p14		-
+# a UNIQUE NOT NULL column determines nothing: only the primary key does
+SAVEPOINT p15		-
+SELECT 'r', u, extra FROM gb_uniq GROUP BY u	!42803 column "gb_uniq.extra" must appear in the GROUP BY clause or be used in an aggregate function
+ROLLBACK TO p15		-
+SAVEPOINT p16		-
+SELECT 'r', u FROM gb_uniq GROUP BY u ORDER BY extra	!42803 column "gb_uniq.extra" must appear in the GROUP BY clause or be used in an aggregate function
+ROLLBACK TO p16		-
+SAVEPOINT p17		-
+SELECT 'r', id, u, extra FROM gb_uniq GROUP BY id ORDER BY extra		r|1|100|7 ; r|2|200|8
+ROLLBACK TO p17		-
+DROP TABLE gb_uniq		-
+DROP TABLE gb_pair		-
 DROP TABLE gb_accounts		-
 DROP TABLE gb_firms		-
 ROLLBACK		-

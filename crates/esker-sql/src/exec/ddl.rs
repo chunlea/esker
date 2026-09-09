@@ -5297,14 +5297,6 @@ fn index_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)
     let resolved = crate::exec::query::resolve(&parsed, &scope)?;
     refuse_unless_immutable(&resolved)?;
     let ty = crate::exec::query::expr_type(&resolved, &scope)?;
-    // **A `CASE` is stored deparsed and every other expression is stored as written**, which is
-    // the smallest form of what a real server does: PostgreSQL stores a parse tree everywhere and
-    // prints it back, so the text that comes out is never quite the text that went in. For a
-    // function call or an operator the two agree once the outer parentheses are normalised, and
-    // this crate has stored the written text since the expression-index unit. A `CASE` is the
-    // first shape where they cannot agree — the implicit `ELSE` is **filled in with the resolved
-    // type**, which is not in the written text at all and is not knowable until here, where the
-    // expression has met the table.
     // **A `CASE` and a scalar call are stored deparsed; everything else is stored as written.**
     // Both are shapes where the text that went in cannot be the text that comes out: a `CASE`'s
     // implicit `ELSE` is filled in with the resolved type, and a text function's argument shows
