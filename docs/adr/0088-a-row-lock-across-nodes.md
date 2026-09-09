@@ -252,6 +252,82 @@ back, which is the resolver's rule and not the format. The alternative — leave
 and accept "both abort" — is cheaper and is a worse answer to the same question, so it should be
 measured against, not assumed.
 
+### What building it changed, and the one thing that needs your eye
+
+The lock itself was the small half. Five rules came out of making it work, each found by a test
+going red rather than by reading, and four of them are consequences nobody would have listed in
+advance.
+
+**1. A transaction upgrades its own lock to the write it took the lock for.** `check_prewrite`
+answered `AlreadyLocked` for any lock of our own, which is right for a retry and wrong for
+`SELECT … FOR UPDATE` followed by `UPDATE` of the same row: the `Kind::Lock` record stays, the value
+is never staged, and the row commits as a lock. The first run of the suite found it on the fixture's
+own `INSERT`. Only in that direction — a `Check` arriving over our own `Put` must not downgrade it,
+which would drop the value just as surely.
+
+**2. A reader never blocks on a lock-only lock.** `percolator::read` blocks on any lock at or below
+the snapshot, because it may yet commit a version the reader would have to see. A lock-only record
+promises the opposite — its transaction is holding the key and writing nothing — so the newest
+committed version below is the answer whatever the holder does next. Without this a
+`SELECT … FOR UPDATE` stops the row being *read* for the length of the transaction, which is not
+what any of `FOR UPDATE`'s sentences promise.
+
+**3. A reader never wounds.** Wound-wait is for a transaction that holds locks and wants another;
+a reader holds none. `docs/plans/cross-node-deadlock.md` had already put it exactly — *"a reader
+holds no locks: it can wait and cannot be waited for"* — and the first version of this killed live
+transactions because somebody read a row they were holding. The rule is now a parameter on
+`resolve`, set by the two callers that acquire and cleared by the one that reads.
+
+**4. A transaction that did not commit takes its locks with it.** Percolator leaves a failed
+commit's locks for a later reader to resolve, which is correct and costs every session that wants
+one of those rows a whole TTL. That was bearable while arriving there was rare; a wound makes the
+loser of every cross-node deadlock arrive there holding every key it prewrote. The primary is
+**asked** what happened rather than guessed at — `Rollback` of it answers `Committed` if the commit
+got there first — because the two answers need opposite cleanups and getting it backwards would
+tear a committed transaction in half.
+
+**5. And the one that reverses a decision: a lock-only record is not a conflict.**
+`newest_write_after` deliberately counted a `Kind::Lock` record as a commit — *"a
+`SELECT … FOR UPDATE` that committed is a committer"* — with a test holding the line. That rule was
+written while `Kind::Lock` was reserved and nothing could write one. Now every locked row leaves
+one, and the rule the conflict check exists for is first-committer-wins: *somebody wrote a version
+of this key after my snapshot, so what I computed is stale*. A lock record says its transaction
+wrote **nothing**. No value moved, so nothing is stale.
+
+What it cost while it stood, both measured in `tests/cross_node_deadlock.rs`: every completed
+locking read refused the next write of that row by any transaction older than it — a `40001` for a
+race nobody ran — and a deadlock victim was told it had lost a race rather than that it had been
+killed. It also widens SERIALIZABLE by the same argument: two transactions that merely *read* the
+same key stop refusing each other, which ADR 0062 never needed and never claimed. The test that
+held the old line now states the new one with the reasoning, under the name
+`a_lock_kind_record_is_neither_a_version_nor_a_conflict`.
+
+**It is a semantic change to the conflict surface and not a format change**, so it is inside this
+ADR's ruling rather than a stop — but it is the one line here worth a second reading, because it
+reverses something that was written down on purpose.
+
+### What it does today
+
+```text
+one node:   A: id=1 FOR UPDATE   B: id=2 FOR UPDATE, crossed writes
+            40P01, one victim, one survivor          — unchanged
+
+two nodes:  A: ok                B: 40P01 at COMMIT
+            rows afterwards: (1, 1), (2, 9)          — one transaction's writes, and only one
+```
+
+The victim learns at its commit rather than at the crossed write, which is what wound-wait buys: it
+is not told to wait and then killed, it is killed at the moment an older transaction needs its row
+and finds out when it next asks the store for anything. The assertion is the outcome and not the
+site, for that reason.
+
+**What the TTL still owes.** An eager lock lives `LOCK_TTL_MS` — three seconds — and
+`TxnKv::Heartbeat` is still an RPC with a handler and no sender (`DESIGN.md` §8). A `FOR UPDATE`
+held longer than that can be resolved out from under its holder. It is loud rather than silent: the
+resolver settles the holder's **primary**, so the wounded transaction cannot commit and is told
+`40P01` — but a transaction that sat for four seconds should not lose its rows to a session that
+wanted one of them, and the sender is what closes that. It is the next thing this ADR owes.
+
 ## Consequences
 
 * **Until it is built**, two application servers behind two nodes get a lock that does not lock. It

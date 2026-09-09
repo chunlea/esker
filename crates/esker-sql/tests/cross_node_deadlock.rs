@@ -17,7 +17,6 @@
 mod cluster;
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use cluster::{Cluster, Session, TENANT};
 use esker_sql::exec::Executor;
@@ -109,81 +108,106 @@ fn one_node_answers_a_crossed_lock_with_a_deadlock() {
     );
 }
 
-/// **The measurement: the same sequence across two nodes**, each with its own lock table.
+/// **The same sequence across two nodes, and it must end the way one node's ends.**
 ///
-/// What it found, and it is larger than the debt's name:
+/// This test replaced the measurement that came before it, and the measurement's own words are why:
+/// *"A design that makes `FOR UPDATE` exclude across nodes turns both of these red, which is the
+/// point of writing them down now."* What it recorded — both crossed writes accepted, both
+/// transactions committed, rows `(1, 9)` and `(2, 9)`, `pg_locks` empty — is in
+/// [ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md) and in this file's module docs,
+/// which is where a measurement belongs once it has been acted on.
 ///
-/// ```text
-/// A crossed-write:  ok in 2.1 ms      B crossed-write:  ok in 1.5 ms
-/// A commit:         ok                B commit:         ok
-/// rows afterwards:  (1, 9), (2, 9)    -- both writes committed
-/// ```
+/// **Two threads, like the control**, and for the same reason: once the lock is real, one of the
+/// two blocks, and a single thread that interleaves the statements has only one waiter — the first
+/// crossed write never returns. That is a hang, not a measurement.
 ///
-/// **Nothing waited and nothing was detected, because nothing was locked.** A's `FOR UPDATE` on
-/// row 1 is a row in A's own table and invisible to B, so B takes row 1 without pausing.
-/// PostgreSQL, given this sequence, deadlocks and kills one. So the gap is not an undetected cycle
-/// — there is no cycle, because there is no wait — it is that `SELECT … FOR UPDATE` is not a
-/// cluster-wide lock. Percolator's first-committer-wins is not the backstop either: it fires on two
-/// transactions writing the **same** key, and here they write different ones.
-///
-/// Asserted only where the assertion is about today's behaviour rather than tomorrow's design:
-/// that both writes are accepted, and that the answer differs from the one-node control above.
-/// `docs/adr/0088-a-row-lock-across-nodes.md` is the draft this measurement is for.
+/// The assertion is the outcome and not the site. Which statement tells the victim depends on
+/// whether it learns at the lock or at its commit, and both are honest answers to "one of you has
+/// to die"; what is not negotiable is that **exactly one transaction commits** and the other is
+/// told `40P01`.
 #[test]
-fn two_nodes_crossing_a_lock_are_measured() {
+fn two_nodes_crossing_a_lock_leave_one_victim() {
     let cluster = Cluster::start();
-    let mut a = cluster.session();
-    a.run("CREATE TABLE lk (id int8 PRIMARY KEY, n int8)")
+    let mut setup = cluster.session();
+    setup
+        .run("CREATE TABLE lk (id int8 PRIMARY KEY, n int8)")
         .unwrap();
-    a.run("INSERT INTO lk VALUES (1, 1), (2, 2)").unwrap();
-    let mut b = on_a_second_node(&cluster);
+    setup.run("INSERT INTO lk VALUES (1, 1), (2, 2)").unwrap();
 
-    a.run("BEGIN").unwrap();
-    b.run("BEGIN").unwrap();
-    a.run("SET lock_timeout = '5s'").unwrap();
-    b.run("SET lock_timeout = '5s'").unwrap();
-    a.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE").unwrap();
-    b.run("SELECT n FROM lk WHERE id = 2 FOR UPDATE").unwrap();
+    let (a_says, hears_a) = std::sync::mpsc::channel();
+    let (b_says, hears_b) = std::sync::mpsc::channel();
+    let here = &cluster;
+    let (mine, theirs) = std::thread::scope(|scope| {
+        let far = scope.spawn(move || {
+            let mut b = on_a_second_node(here);
+            let out = one_half(&mut b, 2, 1, &b_says, &hears_a);
+            println!("B (second node): {out}");
+            out
+        });
+        let mut a = cluster.session();
+        let mine = one_half(&mut a, 1, 2, &a_says, &hears_b);
+        println!("A (first node):  {mine}");
+        (mine, far.join().unwrap())
+    });
 
-    let at = Instant::now();
-    let a_second = a.run("UPDATE lk SET n = 9 WHERE id = 2").err();
-    let a_wrote_in = at.elapsed();
-    let at = Instant::now();
-    let b_second = b.run("UPDATE lk SET n = 9 WHERE id = 1").err();
-    let b_wrote_in = at.elapsed();
-
-    let at = Instant::now();
-    let a_commit = a.run("COMMIT").err();
-    let a_committed_in = at.elapsed();
-    let at = Instant::now();
-    let b_commit = b.run("COMMIT").err();
-    let b_committed_in = at.elapsed();
-
-    println!("--- two nodes, each with its own wait-for graph ---");
-    let a_said = said(a_second);
-    println!("A crossed-write: {a_said} in {a_wrote_in:?}");
-    let b_said = said(b_second);
-    println!("B crossed-write: {b_said} in {b_wrote_in:?}");
-    println!("A commit:        {} in {a_committed_in:?}", said(a_commit));
-    println!("B commit:        {} in {b_committed_in:?}", said(b_commit));
     let mut after = cluster.session();
     let rows = after.rows("SELECT id, n FROM lk ORDER BY id");
     println!("rows afterwards: {rows:?}");
-    // The two assertions this file will keep whatever is decided: neither write was refused, and
-    // both landed. A design that makes `FOR UPDATE` exclude across nodes turns both of these red,
-    // which is the point of writing them down now.
-    assert_eq!(a_said, "ok", "A's crossed write was refused");
-    assert_eq!(b_said, "ok", "B's crossed write was refused");
+
+    let committed = [&mine, &theirs].into_iter().filter(|o| *o == "ok").count();
     assert_eq!(
-        rows,
-        vec![
-            vec![Some("1".to_owned()), Some("9".to_owned())],
-            vec![Some("2".to_owned()), Some("9".to_owned())],
-        ],
-        "both transactions committed, which one node's control forbids"
+        committed, 1,
+        "exactly one of the two commits: A said {mine}, B said {theirs}"
     );
-    println!(
-        "pg_locks on A: {:?}",
-        a.rows("SELECT locktype, granted FROM pg_locks")
+    let victim = [&mine, &theirs]
+        .into_iter()
+        .find(|outcome| *outcome != "ok")
+        .expect("the other one is the victim");
+    assert!(
+        victim.contains("[40P01]"),
+        "the victim is told it deadlocked, not something else: {victim}"
     );
+    // One row moved and one did not, which is what one committed transaction looks like. Which
+    // row it is depends on which transaction survived, so the assertion is the shape.
+    let moved = rows
+        .iter()
+        .filter(|row| row[1] == Some("9".to_owned()))
+        .count();
+    assert_eq!(
+        moved, 1,
+        "exactly one transaction's write is visible: {rows:?}"
+    );
+}
+
+/// One session's whole part of the crossed sequence, mirrored: lock `mine`, wait for the other
+/// side to have locked theirs, then write `theirs` and commit. Answers `ok`, or the error that
+/// stopped it — whichever statement that was.
+fn one_half(
+    node: &mut Session,
+    mine: i64,
+    theirs: i64,
+    says: &std::sync::mpsc::Sender<&'static str>,
+    hears: &std::sync::mpsc::Receiver<&'static str>,
+) -> String {
+    node.run("BEGIN").unwrap();
+    node.run("SET lock_timeout = '20s'").unwrap();
+    node.run(&format!("SELECT n FROM lk WHERE id = {mine} FOR UPDATE"))
+        .unwrap();
+    says.send("locked my row").unwrap();
+    hears
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the other session never locked its row");
+
+    if let Some(error) = node
+        .run(&format!("UPDATE lk SET n = 9 WHERE id = {theirs}"))
+        .err()
+    {
+        let _ = node.run("ROLLBACK");
+        return format!("at the crossed write: {}", said(Some(error)));
+    }
+    if let Some(error) = node.run("COMMIT").err() {
+        let _ = node.run("ROLLBACK");
+        return format!("at COMMIT: {}", said(Some(error)));
+    }
+    "ok".to_owned()
 }

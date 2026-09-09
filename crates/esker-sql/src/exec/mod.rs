@@ -312,7 +312,12 @@ impl Drop for Executor {
 /// lease and this loop only ever sleeps; taking a row from an owner still inside its lease is a
 /// lost update wearing a successful commit, which is the one failure in this design that destroys
 /// data rather than answering wrongly.
-pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -> Result<()> {
+pub(super) fn wait_for_row(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    key: &[u8],
+    reach: crate::backend::Reach,
+) -> Result<()> {
     // A read-only transaction writes nothing and waits for nobody; a plain `SELECT` never blocks
     // on a real server either, measured.
     if txn.is_read_only() {
@@ -338,7 +343,7 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
     // Cleared here, at the one exit every path takes, rather than at each `return`: there are
     // five of those and the two that were missed are the two nobody thinks of as a wait ending.
     // It costs a map lookup on the paths that already cleared it.
-    let answer = wait_for_the_lock(txn, key, waits, deadline);
+    let answer = wait_for_the_lock(txn, key, waits, deadline, reach);
     txn.stop_waiting();
     answer
 }
@@ -350,6 +355,7 @@ fn wait_for_the_lock(
     key: &[u8],
     waits: bool,
     deadline: Option<(u64, Deadline)>,
+    reach: crate::backend::Reach,
 ) -> Result<()> {
     // **Real elapsed time, not a count of turns round the loop.** This used to add `WAIT_STEP_MS`
     // per iteration and compare that to the timeout — which assumes each iteration really takes two
@@ -374,7 +380,13 @@ fn wait_for_the_lock(
         // microseconds apart and this loop sleeps two milliseconds, which is why the sweeps read
         // 12, 11 and 10 failures of 12 rather than a clean split.
         cancel::check()?;
-        match txn.lock(key)? {
+        // **The same reach the caller's first attempt asked for**
+        // ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)). This loop is shared by
+        // the write path, which needs the node's table, and by `SELECT … FOR UPDATE`, which needs
+        // the store — and a retry that quietly asked for the cheaper one answered `Taken` at once
+        // for a row another node was holding. That is not a slower lock, it is no lock: the
+        // waiter walks straight through the wait it was sent here to do.
+        match txn.lock(key, reach)? {
             // **A lock taken at once is not proof that nothing moved.** The writer in front may
             // have committed and released between this statement's read and this lock, in which
             // case there was nothing to wait for and the value in hand is stale anyway. Asking is
@@ -1856,7 +1868,7 @@ impl Executor {
                     continue;
                 }
                 let key = crate::row::row_key(self.tenant, target.table_id, &key)?;
-                match txn.lock(&key)? {
+                match txn.lock(&key, crate::backend::Reach::Cluster)? {
                     crate::backend::Lock::Taken => {}
                     crate::backend::Lock::Deadlock => return Err(SqlError::Deadlock),
                     // **`NOWAIT` and `SKIP LOCKED` ask and leave, so neither may stay in the
@@ -1875,7 +1887,9 @@ impl Executor {
                         }
                         // The wait, and then the whole statement again: the same loop an `UPDATE`
                         // behind a lock goes through.
-                        crate::plan::LockWait::Wait => wait_for_row(self, txn, &key)?,
+                        crate::plan::LockWait::Wait => {
+                            wait_for_row(self, txn, &key, crate::backend::Reach::Cluster)?;
+                        }
                     },
                 }
             }

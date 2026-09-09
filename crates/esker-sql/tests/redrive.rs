@@ -367,8 +367,12 @@ impl Txn for GatedTxn {
     // adds the first `lock()` to the re-driver, because the test that should catch them is the one
     // that has quietly stopped locking. The same omission was a live wrong answer one file over
     // (`Recording::locks`, `tests/pg_locks.rs`).
-    fn lock(&mut self, key: &[u8]) -> esker_sql::Result<esker_sql::backend::Lock> {
-        self.inner.lock(key)
+    fn lock(
+        &mut self,
+        key: &[u8],
+        reach: esker_sql::backend::Reach,
+    ) -> esker_sql::Result<esker_sql::backend::Lock> {
+        self.inner.lock(key, reach)
     }
     fn locks(&self) -> esker_sql::backend::LockView {
         self.inner.locks()

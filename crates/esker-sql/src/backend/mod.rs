@@ -130,6 +130,25 @@ pub struct StepInterval {
     pub removal_extra_ms: u64,
 }
 
+/// **How far a lock has to reach** ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)).
+///
+/// The two are not a preference, they are two different jobs:
+///
+/// * a **write** needs [`Reach::Node`], because Percolator already excludes the writers of every
+///   other node — its prewrite is first-committer-wins on the key, and a second cluster-wide lock
+///   would buy nothing and cost a round trip per row;
+/// * a **locking read** needs [`Reach::Cluster`], because it writes nothing, so there is no
+///   prewrite to collide with and nothing at all stops another node's transaction from taking the
+///   row this one is holding. Measured: two nodes given the crossed sequence that costs one node a
+///   `40P01` both committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// The sessions of this `esker-sql` process.
+    Node,
+    /// Every session of every node, which costs a lock record in the store.
+    Cluster,
+}
+
 /// What [`Txn::lock`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lock {
@@ -204,7 +223,7 @@ pub trait Txn: fmt::Debug + Send {
     /// A backend with no notion of locks answers `Ok(Lock::Taken)`, which is what it was already
     /// doing implicitly. It writes that itself — see the trait's own docs for why none of this is
     /// defaulted.
-    fn lock(&mut self, key: &[u8]) -> Result<Lock>;
+    fn lock(&mut self, key: &[u8], reach: Reach) -> Result<Lock>;
 
     /// Tells this transaction which session opened it, for `pg_locks.pid` to report.
     ///
@@ -922,7 +941,7 @@ impl Txn for MemoryTxn {
 
     /// Takes the row lock, or names the holder. See [`Txn::lock`] for why it is here and not in
     /// [`Txn::put`].
-    fn lock(&mut self, key: &[u8]) -> Result<Lock> {
+    fn lock(&mut self, key: &[u8], _reach: Reach) -> Result<Lock> {
         if self.read_only {
             // A time-machine transaction writes nothing, so it needs nothing and must not take a
             // lock a live writer would then wait behind.
@@ -1411,13 +1430,22 @@ mod tests {
         block.owned_by_session(101);
         // One row locked before a savepoint and one inside it. Only the second is the
         // savepoint's to give back.
-        assert!(matches!(block.lock(b"before").unwrap(), Lock::Taken));
-        assert!(matches!(block.lock(b"inside").unwrap(), Lock::Taken));
+        assert!(matches!(
+            block.lock(b"before", super::Reach::Cluster).unwrap(),
+            Lock::Taken
+        ));
+        assert!(matches!(
+            block.lock(b"inside", super::Reach::Cluster).unwrap(),
+            Lock::Taken
+        ));
 
         let mut other = backend.begin().unwrap();
         other.owned_by_session(102);
         assert!(
-            matches!(other.lock(b"before").unwrap(), Lock::Held { .. }),
+            matches!(
+                other.lock(b"before", super::Reach::Cluster).unwrap(),
+                Lock::Held { .. }
+            ),
             "the other session waits for the row the savepoint did not take"
         );
 
@@ -1454,21 +1482,36 @@ mod tests {
         let backend = MemoryBackend::new();
         let mut block = backend.begin().unwrap();
         block.owned_by_session(101);
-        assert!(matches!(block.lock(b"before").unwrap(), Lock::Taken));
-        assert!(matches!(block.lock(b"inside").unwrap(), Lock::Taken));
+        assert!(matches!(
+            block.lock(b"before", super::Reach::Cluster).unwrap(),
+            Lock::Taken
+        ));
+        assert!(matches!(
+            block.lock(b"inside", super::Reach::Cluster).unwrap(),
+            Lock::Taken
+        ));
 
         let mut other = backend.begin().unwrap();
         other.owned_by_session(102);
-        assert!(matches!(other.lock(b"theirs").unwrap(), Lock::Taken));
+        assert!(matches!(
+            other.lock(b"theirs", super::Reach::Cluster).unwrap(),
+            Lock::Taken
+        ));
         // `other` waits for the row the savepoint will not give back.
-        assert!(matches!(other.lock(b"before").unwrap(), Lock::Held { .. }));
+        assert!(matches!(
+            other.lock(b"before", super::Reach::Cluster).unwrap(),
+            Lock::Held { .. }
+        ));
 
         block.unlock(b"inside");
 
         // Now this block asks for the row `other` holds, and `other` is waiting for this block:
         // a cycle, through a lock the rollback kept.
         assert!(
-            matches!(block.lock(b"theirs").unwrap(), Lock::Deadlock),
+            matches!(
+                block.lock(b"theirs", super::Reach::Cluster).unwrap(),
+                Lock::Deadlock
+            ),
             "a cycle closed by a lock the transaction kept is a deadlock"
         );
     }
