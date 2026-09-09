@@ -1,0 +1,36 @@
+crates/esker-sql/src/catalog/information_schema.rs
+  h_44076b318daf9c 217,219-224,357-366,408,410-415
+crates/esker-sql/src/catalog/pg_attribute.rs
+  h_44076b318daf9c 468-483,528-534,537
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 215-217,5192-5197,5199,5233-5256
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 246-249
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 2989-2990,2992,3005-3006,3018-3031,3048-3051,3055,3058-3074,3108,3126,3147,3159,3178,3198,3243
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 792-803
+crates/esker-sql/tests/create_in_a_schema.rs
+  h_44076b318daf9c 133-186
+crates/esker-sql/tests/gin_expression_index.rs
+  h_44076b318daf9c 1-77
+crates/esker-sql/tests/index_deparse.rs
+  h_44076b318daf9c 40,42-50,82-136
+crates/esker-sql/tests/information_schema_in_a_schema.rs
+  h_44076b318daf9c 1-116
+crates/esker-sql/tests/nextval_default_quoting.rs
+  h_44076b318daf9c 1-79
+crates/esker-sql/tests/regtype_on_the_path.rs
+  h_44076b318daf9c 1-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "17761e914fa49c54914e386071cadeff91295ec2",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
