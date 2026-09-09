@@ -1,0 +1,19 @@
+crates/esker-sql/tests/check_constraint.rs
+  s_6f7019c05b578b::t_d15ccf4f510ea8 15-22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "86a7f30f4048a88f13eb9ea4174e5be90c899f9a",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
