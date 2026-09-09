@@ -818,6 +818,16 @@ async fn watch_until_every_learner_votes(
                  is the easy case and not the one this test is named for. It has written {} now.",
                 written.load(Ordering::Relaxed)
             );
+            // **The counters on the way out, not only on the way down.** `debts-v1.1.md` #9 is
+            // about a term that climbs through pre-vote rounds, and a run that *passes* is where
+            // the evidence for "it does not any more" has to come from: a failure prints these
+            // already, and ten green runs that printed nothing would say only that nothing stalled.
+            for id in pd_regions(pd).iter().map(|region| region.id) {
+                eprintln!(
+                    "promotion settled: region {id}: {}",
+                    election_counters(all, id).await
+                );
+            }
             break;
         }
         // The history is what decides success, so it is what a failure has to show: "0 learners
