@@ -13,14 +13,16 @@
 //! `-2147483649` is `bigint`, so the minus sign belongs to the literal and not to an operator
 //! applied after it.
 //!
-//! # The `int4` rung is measured and **not** implemented, deliberately
+//! # The `int4` rung, and the sentence that outlived it
 //!
-//! `pg_typeof(1)` is `integer` on PostgreSQL 19 and `bigint` here: this node has one integer
-//! literal type and it is `int8`. That is a real divergence and it is not this unit — giving small
-//! literals `int4` changes the type OID in the `RowDescription` of every `SELECT 1` the suite
-//! sends, which is a blast radius that wants its own unit and its own gate. What is here is the
-//! rung the Rails test needs, and the one that was an *error* rather than a wrong type: past
-//! `int8` is `numeric`, in both signs.
+//! This section used to be titled "the `int4` rung is measured and **not** implemented,
+//! deliberately", and it said `pg_typeof(1)` was `bigint` here — a real divergence whose blast
+//! radius (the type OID in the `RowDescription` of every `SELECT 1` the suite sends) wanted its own
+//! unit. It got one: [ADR 0087](../../../docs/adr/0087-an-integer-literal-is-the-narrowest-type-that-holds-it.md)
+//! and b4's literal ladder. The prose stayed behind, and the test could not catch it because the
+//! table below **started at `2147483648`** — the rung the section was about was the one rung
+//! nothing asserted. It is asserted now, in both signs and at both boundaries, which is what
+//! `docs/plans/debts-v1.1.md` #12 was reconciled against.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -32,6 +34,12 @@ mod parity;
 fn an_integer_literal_takes_the_smallest_type_that_holds_it() {
     let mut node = parity::Node::new(&[]);
     for (literal, want) in [
+        // The bottom rung, which this file's prose called measured-and-not-implemented and which
+        // b4's ladder landed: the section below is rewritten if these two pass.
+        ("1", "integer"),
+        ("2147483647", "integer"),
+        ("-2147483648", "integer"),
+        ("-2147483649", "bigint"),
         ("2147483648", "bigint"),
         ("9223372036854775807", "bigint"),
         ("9223372036854775808", "numeric"),
