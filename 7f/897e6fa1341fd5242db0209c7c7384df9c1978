@@ -1,0 +1,65 @@
+crates/esker-sql/src/exec/cursor.rs
+  s_e5c0c6e78b5662::t_1fadf9d9e0a8d5 3305-3319
+crates/esker-sql/src/parse/lower.rs
+  s_e5c0c6e78b5662::t_05e422f6391d20 5443-5454,5476-5480
+crates/esker-sql/tests/arithmetic.rs
+  s_e5c0c6e78b5662::t_eee6d0a52646f3 22-27
+crates/esker-sql/tests/bind_operand.rs
+  s_e5c0c6e78b5662::t_259098ae338b69 14-19
+crates/esker-sql/tests/bitwise.rs
+  s_e5c0c6e78b5662::t_22f11afdac0548 31-35,43-46
+crates/esker-sql/tests/case_expression.rs
+  s_e5c0c6e78b5662::t_e4607d0442ba97 21
+crates/esker-sql/tests/concat.rs
+  s_e5c0c6e78b5662::t_5619adcf19fb4f 21-29,32-33
+crates/esker-sql/tests/cte.rs
+  s_e5c0c6e78b5662::t_eadaedbf28aa5f 40-42
+crates/esker-sql/tests/discard_all.rs
+  s_e5c0c6e78b5662::t_54135c3d0a60cb 18-21
+crates/esker-sql/tests/money.rs
+  s_e5c0c6e78b5662::t_9876e6e7076a20 40-44,48-49,59-60
+crates/esker-sql/tests/recursive_cte.rs
+  s_e5c0c6e78b5662::t_00c6ecfd5b13f2 42-50,53-54,186-189,192
+crates/esker-sql/tests/select.rs
+  s_e5c0c6e78b5662::t_baba68e1e457a9 129-132
+crates/esker-sql/tests/slt_harness/mod.rs
+  s_e5c0c6e78b5662::t_b61209d647245d 276-280
+crates/esker-sql/tests/unknown_literal.rs
+  s_e5c0c6e78b5662::t_1674cbc191c4e2 89,92-96,154
+crates/esker-sql/tests/values_relation.rs
+  s_e5c0c6e78b5662::t_576e814aed04ca 22
+crates/esker-sql/src/exec/aggregate.rs
+  s_e5c0c6e78b5662::t_54a80fed7dd3da 1112-1130,1209-1221,1250
+crates/esker-sql/src/exec/query.rs
+  s_e5c0c6e78b5662::t_80d186b686f673 3846-3860,3862-3863,3866-3867,3895-3903,4439-4458,4680-4707,4733-4743,4751,4828-4836,4840-4846
+crates/esker-sql/src/plan/expr.rs
+  s_e5c0c6e78b5662::t_98c01d3a320d3a 2179-2198
+crates/esker-sql/tests/int4.rs
+  s_e5c0c6e78b5662::t_5ffe7199b475bb 27-32
+crates/esker-sql/tests/provenance_budget.rs
+  s_e5c0c6e78b5662::t_19ba9a8477af00 21-25
+crates/esker-sql/tests/srf_target_list.rs
+  s_e5c0c6e78b5662::t_a242a11ed77785 17-22
+docs/adr/0046-arithmetic-is-its-own-node-and-postgresql-s-promotion-table.md
+  s_e5c0c6e78b5662::t_e43ee73ee617f1 85-90
+docs/adr/0048-a-values-list-is-a-relation-with-a-synthetic-tabledef.md
+  s_e5c0c6e78b5662::t_bda8d96097f980 52,55-58
+docs/adr/0085-an-integer-literal-is-the-narrowest-type-that-holds-it.md
+  s_e5c0c6e78b5662::t_4090d4daf42b66 1-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "7f897e6fa1341fd5242db0209c7c7384df9c1978",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
