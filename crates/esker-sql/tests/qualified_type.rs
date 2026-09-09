@@ -22,8 +22,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // value agrees**, and the values are what these ask: a column of `schema_9.text` reports
         // `udt_name` `text` and `udt_schema` `pg_catalog`, because both name the *base* type, and
         // the domain itself is `typtype` `d` in the schema it was declared in.
-        "SELECT 'r', column_name, data_type, udt_name, udt_schema FROM information_schema.columns \
-         WHERE table_name = 'd' ORDER BY ordinal_position",
         "SELECT 'r', typname, typtype FROM pg_type WHERE typname = 'text' AND typnamespace = \
          (SELECT oid FROM pg_namespace WHERE nspname = 'schema_9')",
     ],

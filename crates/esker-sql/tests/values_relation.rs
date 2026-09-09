@@ -14,22 +14,20 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **One fact, twenty-five times.** A bare integer constant is `int8` here and `int4` on a real
-    // server, so every column a `VALUES` list builds from one is `bigint` where PostgreSQL says
-    // `integer` — and an array of them is `bigint[]`. The rows agree everywhere; only the declared
-    // type differs. Listing them one by one rather than dropping the type column is what makes the
-    // day this is fixed a *failing* test rather than a silent improvement.
-    types: &[],
+    // **One entry, and it was twenty-six.** Twenty-five of them said that a bare integer constant
+    // was an `int8` here where a real server's is an `int4`, so every column a `VALUES` list built
+    // from one was `bigint`; listing them one by one rather than dropping the type column is what
+    // made the day the ladder gained its `int4` rung (ADR 0085) a *failing* test rather than a
+    // silent improvement, and all twenty-five went at once. What is left is `pg_typeof`'s own
+    // `regtype`/`text` trade (ADR 0077), whose two answers are now right.
+    types: &[
+        "SELECT 'r', pg_typeof(x), pg_typeof(y) FROM (VALUES (1,'a'),(2,'b')) AS t(x,y) LIMIT 1",
+    ],
     answers: &[
         // The standing constant-width divergence, showing through the one function that reports a
         // type as a value: a bare integer constant is `int8` here and `int4` on a real server, so
         // a `VALUES` column built from one is `bigint`. `pg_typeof` itself answers `text` rather
         // than `regtype` here, which is why the declared types differ too.
-        (
-            "SELECT 'r', pg_typeof(x), pg_typeof(y) FROM (VALUES (1,'a'),(2,'b')) AS t(x,y) LIMIT 1",
-            "a bare integer constant is int8 here and int4 there, and pg_typeof answers text",
-            "UNMEASURED",
-        ),
         // The same divergence for the other constant: a decimal constant is `double precision`
         // here and `numeric` there, which `Literal::Decimal` already chooses everywhere else.
         (

@@ -57,6 +57,12 @@ const BPCHAR: &str = "An explicit cast to `character(n)` truncates on a real ser
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT pg_typeof('1 day'::interval), format_type(1186, -1)",
+        "SELECT '1 second'::interval(0), '1.5 seconds'::interval(0)",
         // `typname` is a `name`, `typinput` a `regproc` and `typcategory` a `"char"` on a real
         // server; all three are `text` here with identical characters, and `typlen` agrees
         // exactly. The trade every `pg_catalog` column makes.
@@ -68,11 +74,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT '1.5 seconds'::interval(3)",
     ],
     answers: &[
-        (
-            "SELECT pg_typeof('1 day'::interval), format_type(1186, -1)",
-            TYPMOD,
-            "pg19_interval.txt:59",
-        ),
         (
             "SELECT attname, atttypmod, format_type(atttypid, atttypmod) FROM \
              pg_attribute WHERE attrelid = 'iv'::regclass AND attnum > 0 ORDER BY attnum",
@@ -146,11 +147,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT INTERVAL '1 day', INTERVAL '1' DAY, INTERVAL '1 2' DAY TO HOUR",
             TYPMOD,
             "pg19_interval.txt:82",
-        ),
-        (
-            "SELECT '1 second'::interval(0), '1.5 seconds'::interval(0)",
-            TYPMOD,
-            "pg19_interval.txt:95",
         ),
         (
             "SELECT '1 year 1 month'::interval::interval year",

@@ -22,6 +22,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // **`name` and `"char"` there, `text` here** — PostgreSQL's identifier and single-byte types,
     // which compare identically and are the standing choice every catalog view in this crate makes.
     types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT 'r', relkind, relname FROM pg_class WHERE relname IN ('pg_type','pg_range','pg_class') ORDER BY relname",
         "SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE \
          a.attrelid = 'pg_stat_activity'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER \
          BY a.attnum",
@@ -60,20 +65,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              column is. The other three agree, which is what says the divergence is the one string \
              type and not the view.",
             "pg19_relation_resolution.txt:57",
-        ),
-        (
-            "SELECT 'r', relkind, relname FROM pg_class WHERE relname IN \
-             ('pg_type','pg_range','pg_class') ORDER BY relname",
-            "**`r` there and `v` here, and the two are load-bearing in opposite directions.** On a \
-             real server `pg_class` and `pg_type` are ordinary tables that a client never sees in \
-             a table list because they live in `pg_catalog`, which is not in \
-             `current_schemas(false)`. This node has no `pg_catalog` namespace: every catalog \
-             relation is reported in `public`, so the only thing keeping them out of \
-             `ActiveRecord`'s `tables()` — which filters `relkind IN ('r','p')` — is that they \
-             answer `v`. Reporting `r` without the namespace first would put `pg_class` in every \
-             schema dump. The two changes are one unit and it is a namespace unit, not a `relkind` \
-             one. `pg_stat_activity` is `v` on both sides, which is the row this unit needed.",
-            "pg19_relation_resolution.txt:61",
         ),
     ],
 };

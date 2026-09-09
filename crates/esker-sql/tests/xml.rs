@@ -23,9 +23,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput, typtype, typdelim \
          FROM pg_type WHERE typname IN ('xml','_xml') ORDER BY typname",
-        "SELECT 'r', column_name, data_type, udt_name, character_maximum_length, \
-         numeric_precision FROM information_schema.columns WHERE table_name = 'xml_data_type' \
-         ORDER BY ordinal_position",
         "SELECT 'r', '{\"<a/>\"}'::xml[], pg_typeof('{\"<a/>\"}'::xml[])",
         // **A cast's declared type, and one reason for all nine**: an `xml` value is a
         // `Datum::Text`, as a `json` value is, so `RowDescription` carries `text`'s oid where a

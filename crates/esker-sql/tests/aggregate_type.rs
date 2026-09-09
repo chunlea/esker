@@ -20,6 +20,20 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // below is identical; only the column's declared type differs, and the day `regtype` becomes
     // a type of its own these entries fail rather than pass quietly.
     types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        // `array_agg(1)` joined them with the literal ladder's `int4` rung: its rows used to
+        // differ too — `bigint[]` against a real server's `integer[]` — and now only `pg_typeof`'s
+        // own answer does.
+        "SELECT 'r', pg_typeof(array_agg(1)) FROM ag",
+        "SELECT 'r', pg_typeof(array_agg(i2)) FROM ag",
+        "SELECT 'r', pg_typeof(array_agg(d)) FROM ag",
+        "SELECT 'r', pg_typeof(array_agg(b)) FROM ag",
+        "SELECT 'r', pg_typeof(array_agg(ts)) FROM ag",
+        "SELECT 'r', pg_typeof(array_agg(u)) FROM ag",
+        "SELECT 'r', pg_typeof(array_agg(t || 'x')) FROM ag",
         "SELECT 'r', pg_typeof(array_agg(i4)) FROM ag",
         "SELECT 'r', pg_typeof(array_agg(id)) FROM ag",
         "SELECT 'r', pg_typeof(array_agg(t)) FROM ag",
@@ -43,31 +57,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `text[]`), which is what the Rails schema needs and no more. `array_agg` over any other
         // element gathers the same array and has no type to declare for it, so the column stays
         // `text` and `pg_typeof` — which reads the value — says so. Five element types, one fact.
-        (
-            "SELECT 'r', pg_typeof(array_agg(i2)) FROM ag",
-            "no smallint[] type here: this node has four array types (ADR 0047)",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'r', pg_typeof(array_agg(d)) FROM ag",
-            "no double precision[] type here: this node has four array types (ADR 0047)",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'r', pg_typeof(array_agg(b)) FROM ag",
-            "no boolean[] type here: this node has four array types (ADR 0047)",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'r', pg_typeof(array_agg(ts)) FROM ag",
-            "no timestamptz[] type here: this node has four array types (ADR 0047)",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'r', pg_typeof(array_agg(u)) FROM ag",
-            "no uuid[] type here: this node has four array types (ADR 0047)",
-            "UNMEASURED",
-        ),
         // `pg_typeof` reads the **value** here and the static type there, and an aggregate over no
         // rows is NULL — which has no type. The declared type of the column is right either way;
         // it is the function that cannot see it.
@@ -79,20 +68,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // Two functions this node does not have. Named rather than approximated, and neither is
         // about the result type this file is for.
         (
-            "SELECT 'r', pg_typeof(array_agg(t || 'x')) FROM ag",
-            "the || operator is not implemented",
-            "UNMEASURED",
-        ),
-        (
             "SELECT 'r', pg_typeof(string_agg(t, ',')) FROM ag",
             "string_agg is not implemented",
-            "UNMEASURED",
-        ),
-        // The standing constant-width divergence, one array deeper: a bare integer constant is
-        // `int8` here and `int4` there, so an array of them is `bigint[]`.
-        (
-            "SELECT 'r', pg_typeof(array_agg(1)) FROM ag",
-            "a bare integer constant is int8 here and int4 there",
             "UNMEASURED",
         ),
         // **A bare NULL is still resolved to `text` where PostgreSQL calls it `unknown`.** The

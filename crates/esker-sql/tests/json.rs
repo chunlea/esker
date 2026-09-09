@@ -25,18 +25,32 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 
 /// Statements whose **rows** are right and whose declared type is not.
 ///
-/// **Empty, and it was seventeen.** One reason for all of them: a `json` or `jsonb` value is a
-/// `Datum::Text`, so a folded cast threw the declared type away and `RowDescription` carried
-/// `text`'s OID where a real server carries `json`'s or `jsonb`'s. A **column** of either type
-/// always reported correctly — a column's type comes from the catalog rather than from its values
-/// — and it was only a bare literal or cast that lost it, which is why no test but this list saw
-/// it. The `name` unit closed it for every shared representation at once: a folded cast keeps the
-/// `Expr::Cast` node when its value cannot speak for itself, and that node is what `expr_type`
-/// reads (`tests/name_array.rs`).
+/// Statements whose **rows** are right and whose declared type is not.
+///
+/// **One entry, and it was eighteen.** Seventeen of them said the same thing: a `json` or `jsonb`
+/// value is a `Datum::Text`, so a folded cast threw the declared type away and `RowDescription`
+/// carried `text`'s OID where a real server carries `json`'s or `jsonb`'s. A **column** of either
+/// type always reported correctly — a column's type comes from the catalog rather than from its
+/// values — and only a bare literal or cast lost it, which is why no test but this list saw it.
+/// The `name` unit closed it for every shared representation at once (ADR 0086): a folded cast
+/// keeps its `Expr::Cast` node when the value cannot speak for itself, and that node is what
+/// `expr_type` reads.
 ///
 /// `Datum` still has no `jsonb` variant, and the `COMPARISON` divergence below is still that fact
 /// — this half of it never needed one.
-const TYPES: &[&str] = &[];
+const TYPES: &[&str] = &[
+    // **Moved here from `answers` by parity rule 4**: the rows agree and what still differs is the
+    // declared type, which is one of the standing families — see `parity::Divergences::types`.
+    // `typlen`, `typinput` and `typcategory` are a `smallint`, a `regproc` and a `"char"` on a real
+    // server and `text` here; the catalog's own columns are their own units.
+    "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN \
+     ('json','jsonb') ORDER BY oid",
+    // `pg_typeof`'s own `regtype`/`text` trade (ADR 0077). The two type names it answers are right
+    // since a folded cast started keeping the type it named (ADR 0086), and both `format_type`
+    // calls always were.
+    "SELECT pg_typeof('{}'::json), pg_typeof('{}'::jsonb), format_type(114, -1), \
+     format_type(3802, -1)",
+];
 
 /// One of `DIVERGENCES`' eight reasons.
 const CATALOG: &str = "`typlen`, `typcategory` and `pg_typeof` are columns and a function this node's \
@@ -87,18 +101,6 @@ const CASTS: &str = "**Both refuse a `jsonb` *object* cast to a scalar; the code
      with this one.";
 /// Every statement this node answers differently, each pointing at one reason above.
 const ANSWERS: &[(&str, &str, &str)] = &[
-    (
-        "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE \
-             typname IN ('json','jsonb') ORDER BY oid",
-        CATALOG,
-        "pg19_json.txt:59",
-    ),
-    (
-        "SELECT pg_typeof('{}'::json), pg_typeof('{}'::jsonb), format_type(114, -1), \
-             format_type(3802, -1)",
-        CATALOG,
-        "pg19_json.txt:60",
-    ),
     ("SELECT id, b FROM js ORDER BY b", ORDER, "pg19_json.txt:69"),
     (
         "SELECT id FROM js WHERE b @> '{\"a\":2}'",

@@ -25,6 +25,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // and is too narrow for a cast. Closing it means `plan::Literal::Typed` carrying the typmod
     // it was cast to, which is a change to the plan's value shape and not to this type.
     types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'numeric'",
+        "SELECT pg_typeof(1.5::numeric(10,2) + 1::int4), pg_typeof(1.5::numeric + 1.5::float8)",
         "SELECT id, n, d FROM nm ORDER BY id",
         "SELECT 1.5::numeric(10,2), 1.5::numeric(10,0), 1.5::numeric(10)",
         "SELECT 1.0::numeric(10,3)",
@@ -53,11 +59,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT (10::numeric ^ 100)::text",
             "Arithmetic. The line's point — that a `numeric` grows to a hundred digits without a width to overflow — is the storage half, and that is built: the corpus stores and prints exact values of any length.",
             "pg19_numeric.txt:87",
-        ),
-        (
-            "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'numeric'",
-            "`pg_type.typlen` is a column this node's `pg_type` does not have, for every type. Not this unit's — the `numeric` row is there with oid 1700 and `numeric_in`, and `typlen` is `-1` for it because it is a varlena.",
-            "pg19_numeric.txt:56",
         ),
         (
             "SELECT pg_typeof(1.5), pg_typeof(1.5::numeric), pg_typeof(sum(1.5::numeric)), pg_typeof(avg(1::int8))",
@@ -93,11 +94,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT to_char(1.5::numeric, 'FM999.00'), to_char(1234.5::numeric, '9,999.99')",
             "`to_char` is `0A000` naming itself — a whole format-picture language, and nothing `ActiveRecord` sends.",
             "pg19_numeric.txt:126",
-        ),
-        (
-            "SELECT pg_typeof(1.5::numeric(10,2) + 1::int4), pg_typeof(1.5::numeric + 1.5::float8)",
-            "`pg_typeof` is `0A000` naming itself, for every type, and the arithmetic under it is refused too. **The promotion rule it asks about is implemented**: `pg_cmp` compares a `numeric` with an integer exactly and with a float through `f64`, which is the same \"exact loses to inexact\" rule this line measures.",
-            "pg19_numeric.txt:130",
         ),
         (
             "SELECT 2::numeric ^ 10, 2::numeric ^ 0.5",

@@ -2217,6 +2217,18 @@ pub fn casts_to(from: ColumnType, to: ColumnType) -> bool {
     if from == to || typcategory(from) == "S" || typcategory(to) == "S" {
         return true;
     }
+    // **An array casts to an array exactly when its element does**, which no `pg_cast` row says:
+    // a real server has no `_int4 -> _int8` row and derives the coercion from the element pair.
+    // Measured, four each way — `int4[]::int8[]`, `::text[]`, `::numeric[]` and `::bool[]` all
+    // answer, and `int4[]::date[]` and `date[]::int4[]` are `42846`, which is the element rule
+    // exactly. It became reachable when `ARRAY(SELECT 1)` started folding to an `int4[]`
+    // (ADR 0085) and `ARRAY(SELECT 1)::int8[]` refused itself.
+    if let (Some(held), Some(wanted)) = (
+        esker_keys::array::ArrayValue::element_of(from),
+        esker_keys::array::ArrayValue::element_of(to),
+    ) {
+        return casts_to(held, wanted);
+    }
     let (from, to) = (i64::from(from.oid()), i64::from(to.oid()));
     CASTS
         .iter()

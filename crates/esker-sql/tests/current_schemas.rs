@@ -15,8 +15,16 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
-        // `name` is the 64-byte identifier type, which this node does not have; it answers `text`,
-        // whose values are identical and which every comparison against one already assumes.
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        //
+        // **One left of four.** `current_schemas(false)`, `(true)` and `unnest` of one all answer
+        // `name[]` and `name` now, declared type included (ADR 0086). `session_user` and `user`
+        // are still `text` here: only `current_user` was given the type, because the other two are
+        // a different value on a real server and this node has no roles to tell them apart.
+        "SELECT current_user, session_user, user",
     ],
     answers: &[
         // **The reason changed under these two and the entry has to say so.** Selecting the
@@ -51,12 +59,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "The database's own name, which this node does not model: it serves one database and \
              has no name for it. A session-identity unit, not this one.",
             "pg19_current_schemas.txt:55",
-        ),
-        (
-            "SELECT current_user, session_user, user",
-            "The same — there are no roles here, which is already the declared divergence behind \
-             `pg_catalog`'s `42501`.",
-            "pg19_current_schemas.txt:56",
         ),
         (
             "SELECT version() IS NOT NULL",

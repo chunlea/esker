@@ -246,7 +246,7 @@ impl Router {
             // A resolver failure is not a routing answer: the placement driver could not say,
             // which is usually momentary. It goes through the same classifier as a store's
             // refusal so that "retryable" is decided in one place, by the protocol crate.
-            let error = match self.route(body.routing_key()) {
+            let error = match self.route(body.routing_key(), Some(deadline)) {
                 Err(error) => error,
                 Ok(route) => {
                     let target = route.target().ok_or_else(|| Error::NoRegion {
@@ -337,7 +337,11 @@ impl Router {
     /// cost the caller something: a hit, a `GetRegion` that says no region covers the key —
     /// terminal, because waiting does not create one — and a `GetRegion` that could not be
     /// answered, which is the caller's to classify and usually to retry.
-    pub(crate) fn route(&self, key: &[u8]) -> std::result::Result<Route, ProtoError> {
+    pub(crate) fn route(
+        &self,
+        key: &[u8],
+        until: Option<std::time::Instant>,
+    ) -> std::result::Result<Route, ProtoError> {
         if let Some(route) = self.cache.lookup(key) {
             return Ok(route);
         }
@@ -356,8 +360,21 @@ impl Router {
         let mut resolved = self.resolver.locate(key)?;
         if resolved.is_none() {
             let policy = RetryPolicy::default();
-            for attempt in 0..ROUTE_REPAIR_ATTEMPTS {
-                self.clock.sleep(self.jitter.apply(policy.backoff(attempt)));
+            for attempt in 0.. {
+                let wait = self.jitter.apply(policy.backoff(attempt));
+                // **The caller's deadline, not a number invented here.** `until` is what the call
+                // above said it was willing to spend; a lookup inside it that gave up sooner would
+                // be this crate deciding on the caller's behalf, and that is what
+                // `ROUTE_REPAIR_ATTEMPTS` was doing — 310 ms, fifteen heartbeats on an idle box
+                // and less than one *effective* cycle on a loaded one.
+                match until {
+                    Some(until) if self.clock.now() + wait >= until => break,
+                    // No deadline to work to: the fixed count, for the callers that follow this
+                    // with `repair_route` and so have a second chance of their own.
+                    None if attempt >= ROUTE_REPAIR_ATTEMPTS => break,
+                    _ => {}
+                }
+                self.clock.sleep(wait);
                 resolved = self.resolver.locate(key)?;
                 if resolved.is_some() {
                     break;
@@ -529,10 +546,17 @@ pub(crate) fn repair_route(
     Err(terminal(refusal.clone(), Method::PdGetRegion))
 }
 
-/// How many times the driver is asked before a refusal is believed as final.
+/// How many times the driver is asked, **for a lookup with no deadline to work to**.
 ///
-/// Small and fixed rather than a deadline: each attempt is a round trip to the authority and the
-/// thing being waited for is one heartbeat, not an unbounded queue.
+/// A call has one and [`Router::route`] uses it; this is the fallback for the three call sites that
+/// do not — the two scans and the fragment dispatch, each of which follows a failed lookup with
+/// [`repair_route`] and so has a second chance this number does not have to provide.
+///
+/// It was the *only* bound, and its justification — "the thing being waited for is one heartbeat,
+/// not an unbounded queue" — is true by the clock and false under load: five attempts is about
+/// 310 ms of backoff, which is fifteen 20 ms heartbeats on an idle box and can be less than one
+/// effective cycle on a loaded one. That is where `08006 … key is not in region 0` came from in a
+/// gate whose re-run passed.
 const ROUTE_REPAIR_ATTEMPTS: u32 = 5;
 
 /// Whether `[start_key, end_key)` — a region, as the store named it — contains `key`.

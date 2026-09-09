@@ -22,6 +22,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `oid`s on a real server; this node has none of those three types, so they are `text` and
     // `bigint`. Every value is identical.
     types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'kd'::regclass ORDER BY conname",
+        "SELECT conname, contype, conkey FROM pg_constraint WHERE conrelid = 'kd'::regclass ORDER BY conname",
         "SELECT conname, contype, condeferrable, condeferred, convalidated FROM pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname",
         "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname",
         "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'kc'::regclass ORDER BY conname",
@@ -29,41 +35,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT conname, conrelid = 'ka'::regclass, confrelid FROM pg_constraint WHERE conrelid = 'ka'::regclass AND contype = 'p'",
         "SELECT conname, confupdtype = ' ', confdeltype = ' ', confrelid, conindid = 0 FROM pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname",
     ],
-    answers: &[
-        (
-            "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'kd'::regclass ORDER BY conname",
-            "**a `UNIQUE` constraint and a `CREATE UNIQUE INDEX` are one record here.** A real \
-             server keeps `kd_u_key` and `kd_w_v_key` in both `pg_constraint` (contype `u`) and \
-             `pg_index`; this node stores an `IndexDef` with `unique` set and nothing that says \
-             which statement wrote it, so it reports the shape it can prove — the unique index, \
-             which agrees exactly — and claims no constraint. A `u` row for every unique index \
-             would tell `unique_constraints()` about a constraint the user never declared, which \
-             is a wrong answer rather than a missing one. Closing it is one bool on `IndexDef`, \
-             which is a catalog **record format** change and a question for a human \
-             (`CLAUDE.md`, \"Ask before doing\"). Until then `schema_dumper` writes \
-             `t.index …, unique: true` where a real server writes `t.unique_constraint …`, and \
-             the schema that round-trips is the same schema.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT conname, contype, conkey FROM pg_constraint WHERE conrelid = 'kd'::regclass ORDER BY conname",
-            "**`conkey` is refused by name** (`42703`), where a real server answers `{1}` and \
-             `{3,4}`. It is a `smallint[]`, and every use `ActiveRecord` makes of it is a real \
-             array subscript — `c.conkey[idx]` under `generate_subscripts` — so a `text` column \
-             spelled `{1}` would answer `conkey[1]` with a brace rather than a column number. \
-             That is the opposite of `pg_index.indkey`, which is provided as text *because* the \
-             client's use of it is `split(\" \")`. The rule is the client's use, not the type. \
-             `information_schema.key_column_usage` answers the same question in a shape this node \
-             has, and unit 4 provides it.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT pg_typeof(contype), pg_typeof(conname), pg_typeof(conrelid) FROM pg_constraint WHERE conrelid = 'kd'::regclass AND contype = 'p'",
-            "`pg_typeof` is a function this node does not have. What it would have said is the \
+    answers: &[(
+        "SELECT pg_typeof(contype), pg_typeof(conname), pg_typeof(conrelid) FROM pg_constraint WHERE conrelid = 'kd'::regclass AND contype = 'p'",
+        "`pg_typeof` is a function this node does not have. What it would have said is the \
              type divergence declared above.",
-            "UNMEASURED",
-        ),
-    ],
+        "UNMEASURED",
+    )],
 };
 
 #[test]

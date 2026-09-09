@@ -22,6 +22,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // and the same numbers in them. `pg_typeof` is the same trade one step over — a `regtype`
     // there, `text` here, which is what `'x'::regtype` already answers.
     types: &[
+        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
+        // differs is one of the standing declared-type families listed on
+        // `parity::Divergences::types`. The reason each one used to carry described an answer
+        // that had stopped differing.
+        "SELECT 'r', typname, typdelim FROM pg_type WHERE typname IN ('int4','text','varchar','box','_box') ORDER BY typname",
+        "SELECT 'r', b.typname, b.typdelim AS element_delim, a.typname AS array_name, a.typdelim AS array_row_delim FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname = 'box'",
         "SELECT 'r', t.oid, t.typname, t.typelem, t.typdelim, t.typinput, t.typtype, \
          t.typbasetype FROM pg_type as t LEFT JOIN pg_range as r ON t.oid = r.rngtypid WHERE \
          t.typname IN \
@@ -78,19 +84,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // this node has uses `,`, so the rule the capture warns about is recorded and cannot be
         // demonstrated: a hard-coded comma would be wrong on a server with a `box` and is right
         // on this one. The day a geometric type lands here, these three become the test for it.
-        (
-            "SELECT 'r', typname, typdelim FROM pg_type WHERE typname IN \
-             ('int4','text','varchar','box','_box') ORDER BY typname",
-            "box is not a type here, so the one delimiter that is not a comma has no row",
-            "pg19_array_type_map.txt:54",
-        ),
-        (
-            "SELECT 'r', b.typname, b.typdelim AS element_delim, a.typname AS array_name, \
-             a.typdelim AS array_row_delim FROM pg_type b JOIN pg_type a ON a.oid = b.typarray \
-             WHERE b.typname = 'box'",
-            "box is not a type here",
-            "pg19_array_type_map.txt:55",
-        ),
         (
             "SELECT 'r', '{(1,1),(0,0);(3,3),(2,2)}'::box[], \
              array_length('{(1,1),(0,0);(3,3),(2,2)}'::box[], 1)",

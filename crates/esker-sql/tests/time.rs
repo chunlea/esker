@@ -44,6 +44,10 @@ const FUNCTIONS: &str = "A function this node does not implement for any type, n
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
+        // **Moved from `answers` by parity rule 4.** Its reason was `pg_typeof` not being
+        // implemented; it answers now, and what is left is the standing one — `pg_typeof` is a
+        // `regtype` there and `text` here (ADR 0077).
+        "SELECT pg_typeof('12:34:56'::time)",
         // **A cast's declared type carries no typmod here**, for any parameterised type: the
         // three below answer the right *values* — the rounding is exact, including `time(7)`
         // clamping to six digits — and report `time without time zone` where a real server
@@ -59,7 +63,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // too, and the column is missing for all sixteen types.
         "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN \
          ('time','timetz') ORDER BY oid",
-        "SELECT pg_typeof('12:34:56'::time)",
         "SELECT '12:34:56'::time::varchar, '12:34:56'::time::char(5)",
         "SELECT '12:34:56'::time::interval, '24:00:00'::time::interval",
         "SELECT '1 day 02:00:00'::interval::time",
@@ -80,11 +83,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              and the missing column belongs to the catalog surface, not to this type. The row \
              for `timetz` would be absent in any case.",
             "pg19_time.txt:49",
-        ),
-        (
-            "SELECT pg_typeof('12:34:56'::time)",
-            FUNCTIONS,
-            "pg19_time.txt:50",
         ),
         (
             "SELECT '12:34:56'::time(-1)",

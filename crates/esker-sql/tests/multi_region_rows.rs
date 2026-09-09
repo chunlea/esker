@@ -570,3 +570,97 @@ fn faces(session: &mut Session) -> Vec<(String, Vec<Vec<Option<String>>>)> {
         .map(|(name, sql)| (name.to_owned(), session.rows(&sql)))
         .collect()
 }
+
+/// **A cursor left open across a split still reads its snapshot, once each.**
+///
+/// The faces above meet a boundary that moved *between* statements. This one moves it **while the
+/// scan is open**: the reader declares a cursor over the whole table, fetches part of it, and only
+/// then does a second node grow the table until the store splits again. Every remaining `FETCH`
+/// crosses regions that did not exist when the cursor was declared.
+///
+/// Two assertions, and they are about different things:
+///
+/// * the ids are exactly `1..=ROWS`, **once each** — the scan did not lose a region's worth of rows
+///   at a boundary that moved under it, and did not serve one twice by restarting a range;
+/// * the rows the writer added are **not** among them, because a cursor reads the snapshot it was
+///   declared at. A cursor that picked them up would be a scan that re-read the table rather than
+///   resuming it, which is the failure this shape is most likely to have.
+#[test]
+fn a_cursor_open_across_a_split_reads_its_snapshot_once() {
+    let many = Splitting::start(SPLIT_SIZE);
+    let mut reader = many.session();
+    load(&mut reader);
+    wait_for(
+        "the table's region to split at least three ways",
+        60,
+        || many.regions() >= 3,
+    );
+    let first = many.regions();
+
+    reader.run("BEGIN").unwrap();
+    // **No `ORDER BY`, and that is the whole difference between this test and a test of nothing.**
+    // `Node::Sort` drains its input by definition — its input's last row can be its output's first
+    // — so a cursor over an ordered query has read the entire table before it answers the first
+    // `FETCH`, and a split afterwards touches nothing it will ever look at. The first version of
+    // this test was ordered and passed for that reason. A bare scan is chunked (`SCAN_CHUNK` keys
+    // at a time), so the rows after the split really are fetched from regions that did not exist
+    // when the cursor was declared.
+    reader
+        .run("DECLARE c CURSOR FOR SELECT id FROM ledger")
+        .unwrap();
+    let mut seen: Vec<i64> = Vec::new();
+    for _ in 0..50 {
+        let row = reader.rows("FETCH c");
+        assert_eq!(row.len(), 1, "the cursor ran out before the split");
+        seen.push(row[0][0].as_deref().unwrap().parse().unwrap());
+    }
+
+    // **Now**, with the cursor open and its snapshot taken, a second node splits the table under
+    // it. Nothing tells the reader.
+    let mut writer = many.another_node();
+    let mut last = ROWS;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while many.regions() <= first {
+        assert!(
+            Instant::now() < deadline,
+            "the table never split again: still {first} regions after {last} rows"
+        );
+        for id in (last + 1)..=(last + 200) {
+            writer
+                .run(&format!(
+                    "INSERT INTO ledger VALUES ({id}, 'who-{}', {})",
+                    id % 7,
+                    id * 3
+                ))
+                .unwrap();
+        }
+        last += 200;
+    }
+    let now = many.regions();
+
+    // The rest of the cursor, over regions that did not exist when it was declared.
+    loop {
+        let row = reader.rows("FETCH c");
+        if row.is_empty() {
+            break;
+        }
+        seen.push(row[0][0].as_deref().unwrap().parse().unwrap());
+    }
+    reader.run("COMMIT").unwrap();
+
+    // Sorted, because a bare scan promises no order — what is asserted is the **set** and the
+    // count, which is what "every row once" means. A duplicate or a loss changes one or the other.
+    assert_eq!(
+        i64::try_from(seen.len()).unwrap(),
+        ROWS,
+        "a cursor declared over {first} regions and finished over {now} returned {} rows",
+        seen.len()
+    );
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        (1..=ROWS).collect::<Vec<_>>(),
+        "a cursor declared over {first} regions and finished over {now} did not read 1..={ROWS} \
+         once each"
+    );
+}

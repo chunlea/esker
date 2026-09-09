@@ -48,8 +48,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          WHERE typname = 'name'",
         "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.atttypid, a.atttypmod FROM \
          pg_attribute a WHERE a.attrelid = 'b4_nm'::regclass AND a.attnum > 0 ORDER BY a.attnum",
-        "SELECT column_name, data_type, character_maximum_length FROM information_schema.columns \
-         WHERE table_name = 'b4_nm' ORDER BY ordinal_position",
     ],
     answers: &[
         // **A cast to `name` folds to a `Datum::Text`**, and `pg_typeof` reads the datum. This

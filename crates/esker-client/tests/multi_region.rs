@@ -631,3 +631,63 @@ fn a_write_waits_out_a_driver_that_does_not_know_the_key_yet() {
         "and then the write went to the region that owns the key"
     );
 }
+
+/// **A driver that is behind for longer than a fixed handful of asks is still just behind.**
+///
+/// `Router::route` raises its own `KeyNotInRegion { region_id: 0 }` when the resolver says no
+/// region covers a key, and waits the driver out first — because a store learns of its own split
+/// immediately and the placement driver at the next heartbeat, so for a moment after every split
+/// there is no answer to give. That wait was five asks, about 310 ms of backoff: fifteen
+/// heartbeats on an idle box and less than one *effective* cycle on a loaded one, which is where
+/// `08006 … key is not in region 0` came from in a gate that passed the same test alone.
+///
+/// A call carries a deadline, and it is the caller's answer to "how long am I willing to wait".
+/// The lookup inside it is bounded by that now, so a driver that takes seven asks to catch up is
+/// waited out by a call that had a second to spend.
+#[test]
+fn a_driver_behind_for_more_asks_than_the_old_bound_is_still_waited_out() {
+    #[derive(Debug)]
+    struct BehindThenRight {
+        table: RegionTable,
+        silent: AtomicU32,
+        asks: AtomicU32,
+    }
+    impl RegionResolver for BehindThenRight {
+        fn locate(&self, key: &[u8]) -> Result<Option<Route>, ProtoError> {
+            self.asks.fetch_add(1, Ordering::Relaxed);
+            // **`Ok(None)`, not an error.** "No region covers this key" is what a driver says while
+            // it is behind, and it is the answer this bound is about; an outage is a different
+            // shape and `an_unreachable_placement_driver_is_waited_out` has it.
+            if self
+                .silent
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(1)
+                })
+                != Err(0)
+            {
+                return Ok(None);
+            }
+            self.table.locate(key)
+        }
+    }
+
+    // Six is what the old bound allowed — one ask plus five repairs — so seven is the first count
+    // that could not be waited out however long the caller was willing to wait.
+    let resolver = Arc::new(BehindThenRight {
+        table: RegionTable::from_routes([route(region(1, b"", b"", Epoch::INITIAL))]),
+        silent: AtomicU32::new(7),
+        asks: AtomicU32::new(0),
+    });
+    let harness = harness_with(Arc::clone(&resolver) as Arc<dyn RegionResolver>);
+    harness.transport.script(ok());
+
+    harness
+        .client
+        .get(b"k")
+        .expect("a driver seven asks behind is still a driver that is behind");
+    assert!(
+        resolver.asks.load(Ordering::Relaxed) >= 8,
+        "the lookup gave up early: {} asks",
+        resolver.asks.load(Ordering::Relaxed)
+    );
+}
