@@ -79,7 +79,7 @@ fn insert_and_update_refuse_it_differently() {
 ///
 /// `tests/generated_parens.rs` asserts what `pg_get_expr` prints, and printing is not the whole
 /// contract: the stored string is parsed again to compute the column's value on every write
-/// ([ADR 0088](../../../docs/adr/0088-a-stored-expression-is-deparsed-by-the-statement-that-writes-it.md)),
+/// ([ADR 0090](../../../docs/adr/0090-a-stored-expression-is-deparsed-by-the-statement-that-writes-it.md)),
 /// so a printed form that reads back as something else is a wrong *value* and not a wrong string.
 /// `exec::ddl::reads_back` is the guard on the write path; this is the assertion from the other
 /// side, and it is here rather than there because a corpus row cannot insert.

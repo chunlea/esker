@@ -1,4 +1,4 @@
-# 0088 — A stored expression is deparsed by the statement that writes it
+# 0090 — A stored expression is deparsed by the statement that writes it
 
 ## Context
 
