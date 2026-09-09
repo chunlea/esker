@@ -540,3 +540,53 @@ fn a_recorded_vote_survives_a_restart_and_is_not_cast_twice() {
         }]
     ));
 }
+
+/// **A node that is not a voter here does not get a vote from here.**
+///
+/// Found by counters on a stalling three-store cluster: a peer the placement driver held as a
+/// `Learner` had campaigned 404 times and adopted a term 81 times, while the region's one voter
+/// answered 478 vote requests and **granted 477** of them. The campaigner's own configuration said
+/// it was a voter — that half is the store's to explain — but the disruption needed the other half
+/// as well, and this is it: a grant costs the granter its term and its leader, and it was being
+/// given to a node the granter's own configuration does not admit as a voter.
+///
+/// Refusing is right even when the asker is correct and this node is behind: it will be added here
+/// too, and it can ask again. A vote is not owed to a stranger.
+#[test]
+fn a_vote_is_not_granted_to_a_node_this_configuration_does_not_admit() {
+    let mut group = Harness::new(&[1, 2, 3], 7);
+    while group.leaders().is_empty() {
+        group.tick_and_settle(1);
+    }
+    let leader = group.leader();
+    let term_before = group.node(leader).term();
+
+    // Node 9 is in nobody's configuration. It asks for a real vote in a much later term, which is
+    // the shape that would depose a healthy leader.
+    for id in [1, 2, 3] {
+        group
+            .node_mut(id)
+            .step(Message::RequestVote {
+                from: 9,
+                to: id,
+                term: term_before + 20,
+                last_log_index: u64::MAX,
+                last_log_term: term_before + 20,
+                pre_vote: false,
+                force: false,
+            })
+            .unwrap();
+    }
+    group.settle();
+
+    assert_eq!(
+        group.leader(),
+        leader,
+        "a stranger's vote request unseated the leader"
+    );
+    assert_eq!(
+        group.node(leader).term(),
+        term_before,
+        "a stranger's vote request moved the term"
+    );
+}
