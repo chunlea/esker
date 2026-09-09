@@ -3547,6 +3547,35 @@ impl SqlError {
         }
     }
 
+    /// The server function PostgreSQL reports in the `R` field, for the one error whose identity
+    /// depends on it.
+    ///
+    /// **`0A000` is not enough to name this error, and `ActiveRecord` says so.**
+    /// `postgresql_adapter.rb`'s `is_cached_plan_failure?` reads two fields and not one —
+    /// SQLSTATE `0A000` *and* `PG_DIAG_SOURCE_FUNCTION == "RevalidateCachedQuery"` — because
+    /// `0A000` covers every unsupported feature this server has, and the adapter must tell this
+    /// condition from all of them before it deallocates a statement and retries. Without the
+    /// field the node raised the right error and the adapter could not recognise it; the two
+    /// `hot_compatibility_test` tests are exactly that gap.
+    ///
+    /// **`F` and `L` are not sent with it**, though a real server sends `plancache.c` and a line
+    /// number beside it. Those are what the documentation says: coordinates in *the server's own
+    /// source*, and `plancache.c` is a file this server does not contain. Nothing reads them, and
+    /// a fabricated citation is worse than an absent field. `R` is sent because for this one
+    /// condition it is not a coordinate at all — it is the only thing on the wire that
+    /// distinguishes the error, which is what makes it part of the contract rather than a
+    /// diagnostic.
+    ///
+    /// `None` for every other error, and that is load-bearing too: an adapter that saw this
+    /// function name on an unrelated `0A000` would deallocate a statement over a missing feature.
+    #[must_use]
+    pub fn source_function(&self) -> Option<&'static str> {
+        match self {
+            SqlError::CachedPlanMustNotChangeResultType => Some("RevalidateCachedQuery"),
+            _ => None,
+        }
+    }
+
     /// The one-based character offset PostgreSQL reports in the `P` field, when there is one.
     #[must_use]
     pub fn position(&self) -> Option<u32> {

@@ -149,6 +149,40 @@ pub trait Execute {
     /// catalog behind it discards the list in one line and says so.
     fn remember_prepared(&mut self, statements: Vec<crate::session::PreparedStatement>);
 
+    /// Applies one parameter the startup packet's `options` asked for.
+    ///
+    /// **Not a `SET` statement built out of the client's text.** The name and the value come off
+    /// the wire, and turning them back into SQL to parse would be building a statement out of
+    /// something a client wrote — for a setting the same client could set with a `SET` a moment
+    /// later, so there is nothing to gain and a shape to get wrong.
+    ///
+    /// **Required rather than defaulted**: a default that did nothing would leave a client
+    /// believing a setting it does not have, which is the one outcome the connection refusal
+    /// exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the parameter itself refuses — an unrecognised name, or a value the parameter does
+    /// not take. Both end the connection before it opens, which is what a real server does.
+    fn set_option(&mut self, name: &str, value: &str) -> Result<()>;
+
+    /// Explains `statement` under the options `explain` was written with.
+    ///
+    /// **Two halves, because they live in two places.** `EXPLAIN … EXECUTE p1(1)` explains a
+    /// statement the *session* holds and the executor has never seen, so the session resolves the
+    /// name and hands both trees over: the options are read off `explain` and the statement is
+    /// lowered from `statement`. Nothing new crosses this boundary — both are already the currency
+    /// of `execute` and `describe`.
+    ///
+    /// **Required rather than defaulted**, for `terminated`'s reason: a default would answer an
+    /// empty plan for a statement that has one, and an empty plan looks like an answer.
+    fn explain_prepared(
+        &mut self,
+        explain: &Parsed,
+        statement: &Parsed,
+        params: &Params<'_>,
+    ) -> Result<Outcome>;
+
     /// What a statement takes and what it returns, without running it — what `Describe` needs.
     ///
     /// The default answers "no parameters, no rows", which is right for an executor that runs
@@ -241,6 +275,21 @@ pub trait Execute {
     fn idle_in_transaction_timeout(&self) -> Option<std::time::Duration> {
         None
     }
+}
+
+/// A prepared statement resolved by name, with its arguments bound.
+///
+/// What `EXECUTE` and `EXPLAIN … EXECUTE` both need: they disagree about what to do with the
+/// statement and about nothing else.
+struct Bound {
+    /// The statement itself, out of the session's store.
+    statement: Parsed,
+    /// Its arguments, as a `Bind`'s values.
+    values: Vec<Option<Vec<u8>>>,
+    /// The parameter types the client declared, if any.
+    declared: Vec<u32>,
+    /// What `Describe` last answered for it, which is the cached plan's baseline.
+    baseline: Option<Described>,
 }
 
 /// A statement that has been parsed and named, waiting to be bound.
@@ -364,12 +413,52 @@ impl Session {
     /// **The arguments go in as `Params`, the same way a `Bind`'s do**, so everything the extended
     /// protocol already does for a `$1` — inferring its type from the column beside it, and the
     /// assignment cast into that column — happens here without a second implementation.
-    fn execute_sql(
+    /// `EXPLAIN [(options)] EXECUTE name [(args)]` — the options here, the statement in the store.
+    ///
+    /// **The same resolution `EXECUTE` does**, which is why it is the same function: the name is
+    /// looked up in the one store both doors write to, the argument count is checked against the
+    /// statement, and every refusal is the one a bare `EXECUTE` would have given — `26000` for a
+    /// name that is not there and `42601` for the wrong number of arguments, both measured on the
+    /// oracle through `EXPLAIN` itself.
+    ///
+    /// `connection_test.rb`'s `test_statement_key_is_logged` is why this exists: it names a
+    /// statement with `PQprepare` and then asks `EXPLAIN (FORMAT JSON) EXECUTE <that name>(1)`,
+    /// so the two doors have to meet here as they already do at `EXECUTE`.
+    fn explain_execute(
         &mut self,
         name: String,
         args: Option<Vec<Option<String>>>,
+        explain: &Parsed,
         executor: &mut dyn Execute,
     ) -> Result<Outcome> {
+        let bound = self.bound_statement(name, args)?;
+        // **The same revalidation an `EXECUTE` does.** Measured: a statement whose result type
+        // changed is `0A000` from `EXPLAIN … EXECUTE` too, because the plan being explained is the
+        // cached one and revalidating it is what explaining it means.
+        revalidate(
+            &bound.statement,
+            bound.baseline.as_ref(),
+            &bound.declared,
+            executor,
+        )?;
+        executor.explain_prepared(
+            explain,
+            &bound.statement,
+            &Params {
+                values: &bound.values,
+                formats: &[],
+                declared: &bound.declared,
+                bound: true,
+            },
+        )
+    }
+
+    /// The stored statement a name refers to, and its arguments as a `Bind`'s values.
+    ///
+    /// One reader for `EXECUTE` and `EXPLAIN … EXECUTE`: they disagree about what to do with the
+    /// statement and about nothing else, and two lookups would be two chances to fold a quoted
+    /// name differently or to check the argument count against the wrong thing.
+    fn bound_statement(&self, name: String, args: Option<Vec<Option<String>>>) -> Result<Bound> {
         let Some(args) = args else {
             return Err(SqlError::unsupported(
                 "an EXECUTE argument that is not a literal",
@@ -381,11 +470,6 @@ impl Session {
         let Some(body) = stored.parsed.as_ref() else {
             return Err(SqlError::InvalidSqlStatementName(name));
         };
-        let baseline = stored.described.clone();
-        // The declared types reach the revalidation and the execution both: without them a
-        // `PREPARE p (int) AS SELECT $1` was re-described as `text` here and refused against its
-        // own baseline as a changed result type.
-        let declared = stored.param_types.clone();
         let wanted = crate::exec::bind::parameter_count(&body.lower()?);
         if args.len() != wanted {
             return Err(SqlError::WrongParameterCount {
@@ -394,20 +478,41 @@ impl Session {
                 got: args.len(),
             });
         }
-        let values: Vec<Option<Vec<u8>>> = args
-            .into_iter()
-            .map(|arg| arg.map(String::into_bytes))
-            .collect();
-        // Cloned out of the store because `execute` takes `&mut dyn Execute` and the borrow of
-        // `self.statements` would otherwise outlive it.
-        let body = body.clone();
-        revalidate(&body, baseline.as_ref(), &declared, executor)?;
+        Ok(Bound {
+            // Cloned out of the store because the caller hands it to `&mut dyn Execute` and the
+            // borrow of `self.statements` would otherwise outlive it.
+            statement: body.clone(),
+            values: args
+                .into_iter()
+                .map(|arg| arg.map(String::into_bytes))
+                .collect(),
+            // The declared types reach the revalidation and the execution both: without them a
+            // `PREPARE p (int) AS SELECT $1` was re-described as `text` and refused against its
+            // own baseline as a changed result type.
+            declared: stored.param_types.clone(),
+            baseline: stored.described.clone(),
+        })
+    }
+
+    fn execute_sql(
+        &mut self,
+        name: String,
+        args: Option<Vec<Option<String>>>,
+        executor: &mut dyn Execute,
+    ) -> Result<Outcome> {
+        let bound = self.bound_statement(name, args)?;
+        revalidate(
+            &bound.statement,
+            bound.baseline.as_ref(),
+            &bound.declared,
+            executor,
+        )?;
         executor.execute(
-            &body,
+            &bound.statement,
             &Params {
-                values: &values,
+                values: &bound.values,
                 formats: &[],
-                declared: &declared,
+                declared: &bound.declared,
                 bound: true,
             },
         )
@@ -933,6 +1038,9 @@ impl Session {
             StatementClass::Execute { name, args } => {
                 self.execute_sql(name.clone(), args.clone(), executor)
             }
+            StatementClass::ExplainExecute { name, args } => {
+                self.explain_execute(name.clone(), args.clone(), parsed, executor)
+            }
             StatementClass::Deallocate(name) => self.deallocate_sql(name.clone()),
             _ => executor.execute(parsed, &Params::NONE),
         }
@@ -1143,6 +1251,35 @@ mod tests {
 
         fn remember_prepared(&mut self, statements: Vec<crate::session::PreparedStatement>) {
             self.prepared = statements;
+        }
+
+        /// Records the option so a test can assert it reached the executor.
+        fn set_option(&mut self, name: &str, value: &str) -> Result<()> {
+            self.calls.push(format!("set {name} = {value}"));
+            Ok(())
+        }
+
+        /// Records what it was asked to explain, so a test can assert the session resolved the
+        /// right statement, and answers one row the way a plan does.
+        fn explain_prepared(
+            &mut self,
+            explain: &Parsed,
+            statement: &Parsed,
+            _params: &Params<'_>,
+        ) -> Result<Outcome> {
+            self.calls.push(format!(
+                "explain {} of {}",
+                explain.rendered(),
+                statement.rendered()
+            ));
+            Ok(Outcome::Rows {
+                fields: vec![FieldDescription::computed(
+                    "QUERY PLAN",
+                    crate::value::ColumnType::Text,
+                )],
+                rows: vec![vec![Some(b"Result".to_vec())]],
+                tag: "EXPLAIN".to_owned(),
+            })
         }
 
         fn describe(&mut self, parsed: &Parsed, declared: &[u32]) -> Result<Described> {

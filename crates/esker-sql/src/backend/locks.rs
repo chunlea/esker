@@ -150,6 +150,28 @@ impl RowLocks {
     /// from a destructor: a key this transaction no longer holds belongs to somebody else.
     pub(crate) fn release(&mut self, id: u64, held: &[Vec<u8>]) {
         self.waits_for.remove(&id);
+        // **And every edge pointing *at* it**, which is the other half and was missing.
+        //
+        // An edge means "this transaction is waiting for that one"; a transaction that has given
+        // back everything it held cannot be waited for, so the edge is stale the instant this
+        // runs. It is cleared here rather than left for the waiter's next poll because of what
+        // lives in the gap: the waiter polls every two milliseconds, and the deadlock detector
+        // walks these edges on **every** contended attempt. A deadlock's victim gives its locks
+        // back at once (`Txn::abandon_locks`) and then retries — and in that window the survivor's
+        // edge still named the victim, so the retry walked survivor → victim → itself and was
+        // told `40P01` for a cycle that no longer existed.
+        //
+        // `transaction_nested_test.rb`'s *deadlock inside nested SavepointTransaction is
+        // recoverable* is exactly that shape: the victim rolls back to its savepoint and writes
+        // the row again, inside the same block, before the survivor has polled once. The module
+        // note above already says an edge left behind "can close a cycle that does not exist and
+        // answer `40P01` to a transaction that was never in one" — this is the second way it
+        // happens, and it needs the waiter's edge cleared rather than the holder's.
+        //
+        // Correct because every caller releases **everything** it holds — commit, rollback and
+        // `abandon_locks` all pass the whole list — so after this there is nothing left of `id` to
+        // wait for. A partial release would need the edges to name keys instead of transactions.
+        self.waits_for.retain(|_, holder| *holder != id);
         // The transaction is over, so its row is gone from both maps above and nothing can ask
         // whose it was. Left behind, this would grow by one entry per transaction for the life of
         // the process.
@@ -222,6 +244,32 @@ mod tests {
             "b holds the key now and is waiting for nobody: {:?}",
             locks.waits_for
         );
+    }
+
+    /// **A transaction that has given everything back cannot be waited for**, and the edge saying
+    /// so goes with it.
+    ///
+    /// The deadlock detector walks these edges on every contended attempt, and a deadlock's victim
+    /// releases at once and retries — so an edge still naming it makes the retry walk
+    /// survivor → victim → itself and answer `40P01` for a cycle that ended a moment ago. That is
+    /// `transaction_nested_test.rb`'s recoverable-deadlock test, 15 runs of 15 red before this.
+    #[test]
+    fn releasing_clears_the_edges_that_pointed_at_the_transaction() {
+        let mut locks = RowLocks::default();
+        let (a, b) = (locks.next_id(), locks.next_id());
+        assert!(matches!(locks.take(b"k", a, 10, 101), Lock::Taken));
+        assert!(matches!(locks.take(b"k", b, 20, 102), Lock::Held { .. }));
+        assert_eq!(locks.waits_for.get(&b), Some(&a), "b waits for a");
+
+        // `a` gives everything back — a deadlock's victim does this before it retries.
+        locks.release(a, &[b"k".to_vec()]);
+        assert!(
+            locks.waits_for.is_empty(),
+            "nothing waits for a transaction that holds nothing: {:?}",
+            locks.waits_for
+        );
+        // And the retry is a plain acquisition rather than a phantom cycle.
+        assert!(matches!(locks.take(b"k", b, 20, 102), Lock::Taken));
     }
 
     /// The other way out: the waiter gives up — `lock_timeout` — and so holds nothing at all.

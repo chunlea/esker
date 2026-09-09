@@ -1348,6 +1348,66 @@ impl Executor {
     ///
     /// The path is resolved by the caller because resolving it reads the catalog and needs a
     /// transaction; everything else here is session state and is read from the parameters.
+    /// The three guards every statement runs under, taken together so that no path can take two of
+    /// them and forget the third.
+    ///
+    /// **The clock starts here**, at the one boundary every statement crosses, and stops when the
+    /// guards drop however the statement ends. `statement_timeout` alone: `lock_timeout` bounds a
+    /// *wait* and is applied where the waiting happens, which is the precedence `deadline_from`
+    /// keeps.
+    ///
+    /// **The cancellation flag is installed here, not by the protocol layer.** It was in pgwire's
+    /// blocking closure while only a connection had an identity, which left every in-process
+    /// session — a `Pair`, a `Cluster`, a re-drive — uncancellable: `cancel::check` found no flag
+    /// on the thread and a `pg_cancel_backend` that had already returned `true` stopped nothing.
+    /// One identity, one place that arms it.
+    ///
+    /// **And what `pg_stat_activity` shows while it runs**, which is where an in-process session
+    /// gets a `query` column too: the executor is the one layer every session goes through, socket
+    /// or not.
+    fn statement_guards(
+        &self,
+        source: &str,
+    ) -> (cancel::Guard, cancel::FlagGuard, crate::session::Running) {
+        (
+            cancel::until(self.statement_deadline()),
+            cancel::with_session(self.identity.pid, Arc::clone(&self.identity.cancel)),
+            self.identity.running(source),
+        )
+    }
+
+    /// A statement that is already lowered, through the block checks and into a transaction.
+    ///
+    /// Shared by `execute` and `explain_prepared`: the second builds its plan rather than lowering
+    /// one tree, and everything after that is identical — which is the whole reason it is a
+    /// function and not two copies of three checks.
+    fn run_lowered(&mut self, statement: Statement, params: &Params<'_>) -> Result<Outcome> {
+        // The mirror of the check below, and it has the same trap for the same reason: a cursor is
+        // transaction-scoped, so a `DECLARE` outside a block could never be read back, and
+        // `self.open` is the only place that still knows whether there is one.
+        if self.open.is_none()
+            && let Some(named) = statement.requires_a_transaction_block()
+        {
+            return Err(SqlError::OutsideTransactionBlock(named));
+        }
+        // PostgreSQL's `25001`, captured: a concurrent change is *many* transactions, so it cannot
+        // be part of one, and a block that could roll it back would be a block that could roll
+        // back half a schema change.
+        //
+        // Checked **here** rather than beside the write gate, and the reason is a trap worth
+        // naming: `in_a_transaction` *takes* the open transaction out of `self` before it runs the
+        // statement, so a check for "am I in a block" further down always reads `None`.
+        if self.open.is_some()
+            && let Some(named) = statement.refused_in_a_transaction_block()
+        {
+            return Err(SqlError::NotInATransactionBlock(named));
+        }
+        // After the session statements, because `SET TRANSACTION SNAPSHOT` is the one thing a
+        // block may run before it counts as having read anything.
+        self.open_used = true;
+        self.in_a_transaction(statement, params)
+    }
+
     fn settings<'a>(&'a self, search_path: &'a [String]) -> cursor::Settings<'a> {
         cursor::Settings {
             search_path,
@@ -3894,22 +3954,48 @@ impl Execute for Executor {
             .map(std::time::Duration::from_millis)
     }
 
+    fn set_option(&mut self, name: &str, value: &str) -> Result<()> {
+        self.set_parameter(name, Some(value))
+    }
+
+    /// Explains a statement the **session** holds: `EXPLAIN … EXECUTE p1(1)`.
+    ///
+    /// The two halves arrive separately because they live separately — the options are in the
+    /// `EXPLAIN` the client wrote and the statement is in the session's store, which this executor
+    /// has never seen. Everything after that is the ordinary path: the same guards, the same
+    /// block checks, the same transaction.
+    fn explain_prepared(
+        &mut self,
+        explain: &Parsed,
+        statement: &Parsed,
+        params: &Params<'_>,
+    ) -> Result<Outcome> {
+        let _guards = self.statement_guards(explain.source());
+        let Some((analyze, format)) = explain.explain_options()? else {
+            return Err(SqlError::Internal(
+                "explain_prepared was handed a statement that is not an EXPLAIN".to_owned(),
+            ));
+        };
+        let inner = statement.lower()?;
+        // **The same refusal the lowering makes**, in the same words, because the statement it
+        // would have checked was not there yet when it ran.
+        if analyze && !matches!(inner, Statement::Explain(_) | Statement::Select(_)) {
+            return Err(SqlError::unsupported(
+                crate::parse::lower::EXPLAIN_ANALYZE_NOT_A_SELECT,
+            ));
+        }
+        self.run_lowered(
+            Statement::Explain(Box::new(crate::plan::Explain {
+                statement: Box::new(inner),
+                analyze,
+                format,
+            })),
+            params,
+        )
+    }
+
     fn execute(&mut self, parsed: &Parsed, params: &Params<'_>) -> Result<Outcome> {
-        // **The statement's clock starts here**, at the one boundary every statement crosses, and
-        // stops when this call returns however it returns (`cancel::Guard`). `statement_timeout`
-        // alone: `lock_timeout` bounds a *wait* and is applied where the waiting happens, which is
-        // the precedence `deadline_from` keeps.
-        let _clock = cancel::until(self.statement_deadline());
-        // **The cancellation flag is installed here, not by the protocol layer.** It was in
-        // pgwire's blocking closure while only a connection had an identity, which left every
-        // in-process session — a `Pair`, a `Cluster`, a re-drive — uncancellable: `cancel::check`
-        // found no flag on the thread and a `pg_cancel_backend` that had already returned `true`
-        // stopped nothing. One identity, one place that arms it.
-        let _flag = cancel::with_session(self.identity.pid, Arc::clone(&self.identity.cancel));
-        // **What `pg_stat_activity` shows while this runs**, cleared by the guard however the
-        // statement ends. This is where an in-process session gets a `query` column too: the
-        // executor is the one layer every session goes through, socket or not.
-        let _running = self.identity.running(parsed.source());
+        let _guards = self.statement_guards(parsed.source());
         // **Before lowering**, because the statement the parser was given is a placeholder: what
         // the user wrote is on the class (`crate::parse::StatementClass::SetConstraints`).
         if let crate::parse::StatementClass::SetConstraints { names, deferred } = parsed.class() {
@@ -3939,10 +4025,7 @@ impl Execute for Executor {
         {
             return Err(SqlError::NotInATransactionBlock(named));
         }
-        // After the session statements, because `SET TRANSACTION SNAPSHOT` is the one thing a
-        // block may run before it counts as having read anything.
-        self.open_used = true;
-        self.in_a_transaction(statement, params)
+        self.run_lowered(statement, params)
     }
 
     fn describe(&mut self, parsed: &Parsed, declared: &[u32]) -> Result<Described> {
