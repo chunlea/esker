@@ -133,3 +133,58 @@ fn a_value_of_a_pseudo_type_is_refused_in_two_ways() {
     assert_eq!(error.sqlstate(), esker_sql::sqlstate::FEATURE_NOT_SUPPORTED);
     assert_eq!(error.to_string(), "cannot accept a value of type anyarray");
 }
+
+/// **The `Describe` a prepared statement gets must say the same type the simple protocol does.**
+///
+/// `enum · test_enum_mapping` reads an enum column back through `PREPARE`/`EXECUTE`. The value on
+/// the wire was right — `"sad"` — and the `RowDescription` said **21**, which is `int2`: the
+/// enum's *storage* type leaking out where its own OID belongs. `ActiveRecord` decodes by that
+/// OID, so it parsed the label as an integer and got `0`, then `nil`.
+///
+/// Measured, run 105, one fixture and three protocol paths on both servers: PostgreSQL answers its
+/// enum's OID on all three, and this node answered its own enum OID on the simple path and `21` on
+/// the two extended ones.
+///
+/// **A test that reads `Outcome::Rows` cannot see this** — that is the simple path, and it was
+/// already right. This asks the executor for the `Describe`, which is the only thing a client that
+/// prepares ever sees.
+#[test]
+fn a_describe_names_the_enum_the_way_the_simple_protocol_does() {
+    let mut node = parity::Node::new(&[
+        "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')",
+        "CREATE TABLE feelings (id bigint primary key, current_mood mood)",
+        "INSERT INTO feelings VALUES (1, 'sad')",
+    ]);
+
+    // What the simple path says, which is the answer both must give.
+    let outcome = node.run("SELECT current_mood FROM feelings").unwrap();
+    let esker_sql::pgwire::session::Outcome::Rows { fields, .. } = outcome else {
+        panic!("the read answered no rows");
+    };
+    let simple = fields[0].type_oid;
+    assert_ne!(
+        simple, 21,
+        "the enum's own oid, not `int2` — this is the assertion the whole test rests on"
+    );
+
+    for statement in [
+        "SELECT current_mood FROM feelings",
+        "SELECT * FROM feelings",
+        "SELECT current_mood FROM feelings WHERE id = 1",
+    ] {
+        let described = node.describe(statement).unwrap();
+        let fields = described
+            .fields
+            .unwrap_or_else(|| panic!("{statement} was described as returning nothing"));
+        let mood = fields
+            .iter()
+            .find(|field| field.name == "current_mood")
+            .unwrap_or_else(|| panic!("{statement} has no `current_mood` column"));
+        assert_eq!(
+            mood.type_oid, simple,
+            "`{statement}` was described as {} through the extended protocol and as {simple} \
+             through the simple one",
+            mood.type_oid
+        );
+    }
+}

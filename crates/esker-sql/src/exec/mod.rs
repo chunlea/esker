@@ -1813,24 +1813,7 @@ impl Executor {
                     .collect(),
             );
         }
-        let fields = planned
-            .columns
-            .iter()
-            .map(|column| match (&column.user_type, column.pseudo) {
-                (Some(def), _) => FieldDescription::of_user_type(
-                    column.name.clone(),
-                    u32::try_from(def.oid).unwrap_or(0),
-                    def.kind.typlen(),
-                ),
-                // **A pseudo-type reaches a client here and nowhere else.** There is no value to
-                // render — the only one a cast to it accepts is NULL — so the oid and the length
-                // are the whole of what it is.
-                (None, Some(pseudo)) => {
-                    FieldDescription::of_user_type(column.name.clone(), pseudo.oid, pseudo.type_len)
-                }
-                (None, None) => FieldDescription::of(column.name.clone(), column.ty, column.typmod),
-            })
-            .collect();
+        let fields = planned.columns.iter().map(field_of).collect();
         let tag = format!("SELECT {}", rows.len());
         Ok(Outcome::Rows { fields, rows, tag })
     }
@@ -4083,11 +4066,34 @@ fn update_returning_fields(
 }
 
 /// A resolved target list as the wire describes it.
+/// **The one place an `OutputColumn` becomes a `RowDescription` field.**
+///
+/// There were three, and two of them dropped the column's user type on the floor: an enum column
+/// went out as `int2` — its *storage* — to every client that prepared, while the simple protocol
+/// sent the enum's own oid. The value on the wire was the label either way, so the bytes were right
+/// and the declared type was wrong, which `ActiveRecord` reads as an integer and turns into `0`.
+/// `psql` and `pg_typeof` cannot see it; only a `Describe` can (`enum · test_enum_mapping`).
+///
+/// The three questions a column answers are in a fixed order and that order is the whole of this
+/// function: a **user-defined type** is what the client is told (an enum's ordinal is rendered as
+/// its label, ADR 0050); a **pseudo-type** reaches a client here and nowhere else, since the only
+/// value a cast to one takes is NULL; and otherwise the storage type is the answer.
+fn field_of(column: &query::OutputColumn) -> FieldDescription {
+    match (&column.user_type, column.pseudo) {
+        (Some(def), _) => FieldDescription::of_user_type(
+            column.name.clone(),
+            u32::try_from(def.oid).unwrap_or(0),
+            def.kind.typlen(),
+        ),
+        (None, Some(pseudo)) => {
+            FieldDescription::of_user_type(column.name.clone(), pseudo.oid, pseudo.type_len)
+        }
+        (None, None) => FieldDescription::of(column.name.clone(), column.ty, column.typmod),
+    }
+}
+
 fn described(columns: Vec<query::OutputColumn>) -> Vec<FieldDescription> {
-    columns
-        .into_iter()
-        .map(|column| FieldDescription::of(column.name, column.ty, column.typmod))
-        .collect()
+    columns.iter().map(field_of).collect()
 }
 
 impl Execute for Executor {
@@ -4624,8 +4630,8 @@ impl Executor {
                 Some(
                     query::plan(select, self.tenant, from.as_deref(), &inner_refs)?
                         .columns
-                        .into_iter()
-                        .map(|column| FieldDescription::of(column.name, column.ty, column.typmod))
+                        .iter()
+                        .map(field_of)
                         .collect(),
                 )
             }
