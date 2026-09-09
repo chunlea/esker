@@ -664,3 +664,88 @@ fn a_cursor_open_across_a_split_reads_its_snapshot_once() {
          once each"
     );
 }
+
+/// **A row lock survives the split that moves its row**, which is the whole argument for reusing
+/// the Percolator lock ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md) (a')).
+///
+/// The option this ADR refused put a lock of its own in the store, and the objection to it was that
+/// a lock has to travel: a region that splits hands its keys to a child, and a lock left behind — or
+/// dropped — is a promise broken in silence. The Percolator lock is a record in the `lock` column
+/// family under the row's own key, so it travels the way the row does, by being the same bytes in
+/// the same range. This is the test that says so rather than the paragraph that assumes it.
+///
+/// **The control is the half that makes it evidence.** A second node refused a locked row after a
+/// split could be a second node refused *anything* after a split — a stale route, a region cache
+/// that has not caught up, any of the failures this file was written for. So the same node, in the
+/// same transaction, immediately takes a **different** row of the same table: if the split had
+/// broken its routing it would fail there too, and it does not.
+#[test]
+fn a_row_lock_survives_the_split_that_moves_its_row() {
+    let many = Splitting::start(SPLIT_SIZE);
+    let mut writer = many.session();
+    load(&mut writer);
+    wait_for("the table to split", 60, || many.regions() >= 3);
+    let before = many.regions();
+
+    // The lock, taken while the row lives in whatever region holds it now.
+    let mut holder = many.session();
+    holder.run("BEGIN").unwrap();
+    holder
+        .run("SELECT amount FROM ledger WHERE id = 450 FOR UPDATE")
+        .unwrap();
+
+    // **Before the split, so that a refusal after it means the split.** Without this the test
+    // cannot tell "the lock travelled" from "the lock was never taken", and those fail the same
+    // way.
+    let mut early = many.another_node();
+    early.run("BEGIN").unwrap();
+    early.run("SET lock_timeout = '2s'").unwrap();
+    let held = early
+        .run("SELECT amount FROM ledger WHERE id = 450 FOR UPDATE")
+        .expect_err("the lock was never taken, so the split has nothing to lose");
+    assert_eq!(held.sqlstate(), "55P03", "before the split: {held}");
+    early.run("ROLLBACK").unwrap();
+
+    // And now the ground moves under it: more rows, more splits, until the table is cut at least
+    // twice more than it was when the lock was taken.
+    for id in ROWS + 1..=ROWS * 2 {
+        writer
+            .run(&format!(
+                "INSERT INTO ledger VALUES ({id}, 'who-{}', {})",
+                id % 7,
+                id * 3
+            ))
+            .unwrap();
+    }
+    wait_for("two further splits", 60, || many.regions() >= before + 2);
+
+    // A second node, with a region cache of its own, asks for the row the first node is holding.
+    let mut other = many.another_node();
+    other.run("BEGIN").unwrap();
+    other.run("SET lock_timeout = '2s'").unwrap();
+    let refused = other
+        .run("SELECT amount FROM ledger WHERE id = 450 FOR UPDATE")
+        .expect_err("the lock did not survive the split: a second node took the row");
+    assert_eq!(
+        refused.sqlstate(),
+        "55P03",
+        "the wait ended some other way than the timeout: {refused}"
+    );
+
+    // **The control**: the same node, the same transaction, a row nobody holds. If the splits had
+    // broken this node's routing rather than the lock holding, this would fail too.
+    let free = other.rows("SELECT amount FROM ledger WHERE id = 451 FOR UPDATE");
+    assert_eq!(free.len(), 1, "an unlocked row of the same table");
+    other.run("ROLLBACK").unwrap();
+
+    // And the holder still owns what it took, across every split that happened under it.
+    holder
+        .run("UPDATE ledger SET amount = 7 WHERE id = 450")
+        .unwrap();
+    holder.run("COMMIT").unwrap();
+    let mut after = many.session();
+    assert_eq!(
+        after.rows("SELECT amount FROM ledger WHERE id = 450"),
+        vec![vec![Some("7".to_owned())]]
+    );
+}

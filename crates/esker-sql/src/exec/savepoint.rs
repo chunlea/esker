@@ -291,12 +291,12 @@ impl Txn for Recording<'_> {
     // default `lock` the recording took every lock without telling the store, so the transaction
     // *holding* a row never held it and the one waiting never waited. Found by the red test in
     // `tests/read_committed.rs`, which then failed on the wrong side (ADR 0057).
-    fn lock(&mut self, key: &[u8]) -> Result<crate::backend::Lock> {
+    fn lock(&mut self, key: &[u8], reach: crate::backend::Reach) -> Result<crate::backend::Lock> {
         // Recorded **before** the call, while the answer to "did we already hold this?" is still
         // the honest one: afterwards `Lock::Taken` means "holds it now, or held it already" and
         // cannot tell a fresh lock from one the outer transaction took.
         let fresh = !self.inner.holds(key);
-        let taken = self.inner.lock(key)?;
+        let taken = self.inner.lock(key, reach)?;
         if fresh && matches!(taken, crate::backend::Lock::Taken) {
             self.savepoints.locks.push(key.to_vec());
         }
@@ -445,7 +445,10 @@ mod tests {
         let backend = MemoryBackend::new();
         let mut txn = backend.begin().unwrap();
         // The outer block's row, locked before there is a savepoint at all.
-        assert!(matches!(txn.lock(b"before").unwrap(), Lock::Taken));
+        assert!(matches!(
+            txn.lock(b"before", crate::backend::Reach::Cluster).unwrap(),
+            Lock::Taken
+        ));
 
         let mut savepoints = Savepoints::default();
         savepoints.savepoint("sp", txn.read_set(), None, Parameters::new());
@@ -453,7 +456,12 @@ mod tests {
         {
             // Which is what the executor hands every statement while a savepoint is open.
             let mut recording = Recording::new(&mut *txn, &mut savepoints);
-            assert!(matches!(recording.lock(b"inside").unwrap(), Lock::Taken));
+            assert!(matches!(
+                recording
+                    .lock(b"inside", crate::backend::Reach::Cluster)
+                    .unwrap(),
+                Lock::Taken
+            ));
             // The victim's call, from the `Lock::Deadlock` arm of `exec::wait_for_row`.
             recording.abandon_locks();
         }
@@ -474,13 +482,21 @@ mod tests {
     fn rolling_back_to_the_savepoint_gives_back_the_same_set() {
         let backend = MemoryBackend::new();
         let mut txn = backend.begin().unwrap();
-        assert!(matches!(txn.lock(b"before").unwrap(), Lock::Taken));
+        assert!(matches!(
+            txn.lock(b"before", crate::backend::Reach::Cluster).unwrap(),
+            Lock::Taken
+        ));
 
         let mut savepoints = Savepoints::default();
         savepoints.savepoint("sp", txn.read_set(), None, Parameters::new());
         {
             let mut recording = Recording::new(&mut *txn, &mut savepoints);
-            assert!(matches!(recording.lock(b"inside").unwrap(), Lock::Taken));
+            assert!(matches!(
+                recording
+                    .lock(b"inside", crate::backend::Reach::Cluster)
+                    .unwrap(),
+                Lock::Taken
+            ));
         }
         savepoints.rollback_to("sp", &mut *txn).unwrap();
 
@@ -497,13 +513,21 @@ mod tests {
     fn rolling_back_after_a_deadlock_gives_nothing_back_twice() {
         let backend = MemoryBackend::new();
         let mut txn = backend.begin().unwrap();
-        assert!(matches!(txn.lock(b"before").unwrap(), Lock::Taken));
+        assert!(matches!(
+            txn.lock(b"before", crate::backend::Reach::Cluster).unwrap(),
+            Lock::Taken
+        ));
 
         let mut savepoints = Savepoints::default();
         savepoints.savepoint("sp", txn.read_set(), None, Parameters::new());
         {
             let mut recording = Recording::new(&mut *txn, &mut savepoints);
-            assert!(matches!(recording.lock(b"inside").unwrap(), Lock::Taken));
+            assert!(matches!(
+                recording
+                    .lock(b"inside", crate::backend::Reach::Cluster)
+                    .unwrap(),
+                Lock::Taken
+            ));
             recording.abandon_locks();
         }
         // Re-locked by the recovered block *before* it rolls back would be the interesting case;

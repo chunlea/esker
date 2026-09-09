@@ -2843,8 +2843,19 @@ mod tests {
             Arc::clone(&auditor) as Arc<dyn RaftTransport>,
         );
 
+        let mut granted = 0_u32;
         // Grant the votes, acknowledge nothing: a leader that cannot reach a quorum of two.
+        //
+        // **The barrier, which `a_pre_vote_campaign_takes_office` in this file already needed and
+        // already explains**: without it the next `take_sent` looks for a message whose cause the
+        // driver has handled and has not yet sent, finds nothing, and this loop ticks — and a tick
+        // past an unsent `RequestVote` restarts the election, so the answer this round sends names
+        // a term the peer has left. Every later answer is then ignored and the peer pre-votes for
+        // ever, which is `PreCandidate` at the assertion below. It is only reachable when the
+        // driver is slow enough to be overtaken, which is why an idle box never showed it and a
+        // gate at load 8 did (`gate-g1-432aec79.log`).
         for _ in 0..400 {
+            let mut answered = 0_u32;
             for message in auditor.take_sent() {
                 if let Message::RequestVote {
                     from,
@@ -2862,15 +2873,26 @@ mod tests {
                     })
                     .await
                     .unwrap();
+                    answered += 1;
                 }
             }
             peer.tick().await.unwrap();
+            peer.settled().await.unwrap();
             if peer.status().await.unwrap().role == Role::Leader {
                 break;
             }
+            granted += answered;
         }
         let before = peer.status().await.unwrap();
-        assert_eq!(before.role, Role::Leader, "the peer never took office");
+        assert_eq!(
+            before.role,
+            Role::Leader,
+            "the peer never took office: it is {:?} in term {}, having granted itself {granted} \
+             votes — more than the one pre-vote and one vote an uninterrupted campaign needs means \
+             an election restarted",
+            before.role,
+            before.term
+        );
 
         let proposing = {
             let peer = Arc::clone(&peer);

@@ -940,7 +940,7 @@ pub(super) fn write_row(
     // what this node answered `40001` for. Under the other isolation levels the wait is skipped
     // and the conflict is still the transaction's to lose at commit, which is what those levels
     // promise.
-    super::wait_for_row(executor, txn, &key)?;
+    super::wait_for_row(executor, txn, &key, crate::backend::Reach::Node)?;
 
     // The primary key is a unique index whose entry is the row itself.
     let detail = render_key(table, &table.primary_key, &primary_key);

@@ -968,10 +968,22 @@ fn a_second_insert_that_arrives_before_the_commit_still_loses() {
     );
 }
 
-/// A `Lock`-kind record — reserved for `SELECT … FOR UPDATE` — is bookkeeping like a rollback
-/// marker: it enters the conflict check but is not a version a read returns.
+/// A `Lock`-kind record — what `SELECT … FOR UPDATE` leaves — is bookkeeping like a rollback
+/// marker: **neither a version a read returns nor a commit a later writer is stale against.**
+///
+/// It read the other way while `Kind::Lock` was reserved and nothing could write one: a record in
+/// the `write` column family above a writer's snapshot looked like a commit, and was treated as
+/// one. [ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md) made them reachable — one
+/// per locked row — and the rule the conflict check exists for is first-committer-wins: *somebody
+/// wrote a version of this key after my snapshot, so what I computed is stale*. A lock record says
+/// its transaction held the key and wrote **nothing** to it. No value moved, so nothing is stale,
+/// and the refusal was a `40001` for a race nobody ran.
+///
+/// What it cost while it stood, both measured in `tests/cross_node_deadlock.rs`: every completed
+/// locking read refused the next write of that row by any transaction older than it, and a
+/// deadlock victim was told it had lost a race rather than that it had been killed.
 #[test]
-fn a_lock_kind_record_is_a_conflict_but_not_a_version() {
+fn a_lock_kind_record_is_neither_a_version_nor_a_conflict() {
     let mut store = MemoryStore::new();
     commit_one(&mut store, b"k", b"v", 5, 8);
     store.put_raw(
@@ -985,9 +997,11 @@ fn a_lock_kind_record_is_a_conflict_but_not_a_version() {
         ReadOutcome::Value(key(b"v")),
         "a lock record is stepped past, like a rollback marker"
     );
-    assert_eq!(
-        check_prewrite(&store, &prewrite(b"k", b"k", 10, put(b"loser"))).unwrap(),
-        PrewriteDecision::Conflict { commit_ts: 20 },
-        "but it is a commit after our snapshot, so it conflicts"
+    assert!(
+        matches!(
+            check_prewrite(&store, &prewrite(b"k", b"k", 10, put(b"loser"))).unwrap(),
+            PrewriteDecision::Lock(_)
+        ),
+        "and it is not a commit either: nothing was written, so nothing is stale"
     );
 }
