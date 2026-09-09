@@ -684,13 +684,18 @@ impl Store {
             );
             return Ok(());
         }
+        // **Reserved, not yet hosted.** The map below is what decides whether this store may
+        // serve the region at all, and until it has said so the peer is only a claim on its
+        // driver ([ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md)): the `?`
+        // on the insert drops the reservation, which gives the region straight back.
+        let mut reserved = None;
         let state = match (&self.raft, &self.transport) {
             (Some(raft), Some(transport)) => {
                 let host: Arc<dyn RegionHost> = Arc::new(StoreHost {
                     store: Arc::downgrade(self),
                 });
                 let view = transport.for_region(region.id, region.epoch, &region.peers);
-                let peer = start_peer(
+                let reservation = start_peer(
                     &self.db,
                     &region,
                     self.store_id,
@@ -700,12 +705,18 @@ impl Store {
                     Arc::clone(&self.drivers),
                     Some(self.columnar_slot(region.id)),
                 )?;
-                self.spawn_ticker(&peer, raft.tick);
+                let peer = Arc::clone(reservation.peer());
+                reserved = Some((reservation, raft.tick));
                 RegionState::replicated(RegionMeta::new(region), peer, view)
             }
             _ => RegionState::unreplicated(RegionMeta::new(region)),
         };
         self.regions.insert(state)?;
+        if let Some((reservation, tick)) = reserved {
+            // The store has it: from here the peer is the region's, and it starts counting time.
+            let peer = reservation.commit();
+            self.spawn_ticker(&peer, tick);
+        }
         Ok(())
     }
 
@@ -1069,6 +1080,11 @@ impl Store {
     /// what the child now owns — the "key space is a contiguous partition" invariant holds through
     /// the split rather than after it.
     fn adopt_split(self: &Arc<Self>, parent: &Region, child: &Region) -> Result<()> {
+        // Reserved until `apply_split` below has taken it, exactly as `host_region` does: three of
+        // that call's refusals — the parent not here, the child already here, the parent's start
+        // key moved — used to leave the child's core driving a region this store does not host
+        // ([ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md)).
+        let mut reserved = None;
         let child_state = match (&self.raft, &self.transport) {
             (Some(raft), Some(transport)) => {
                 let host: Arc<dyn RegionHost> = Arc::new(StoreHost {
@@ -1078,7 +1094,7 @@ impl Store {
                 // as the membership *as of index 0* — which for a region whose log starts there is
                 // exactly the split-time membership, and is the anchor rule of `91de89a`.
                 let view = transport.for_region(child.id, child.epoch, &child.peers);
-                let peer = start_peer(
+                let reservation = start_peer(
                     &self.db,
                     child,
                     self.store_id,
@@ -1088,7 +1104,8 @@ impl Store {
                     Arc::clone(&self.drivers),
                     Some(self.columnar_slot(child.id)),
                 )?;
-                self.spawn_ticker(&peer, raft.tick);
+                let peer = Arc::clone(reservation.peer());
+                reserved = Some((reservation, raft.tick));
                 // **The child stands for election at once, if this store led the parent**
                 // ([ADR 0094](../../../docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md)).
                 //
@@ -1105,35 +1122,45 @@ impl Store {
                 //
                 // Only on the parent's leader, because two replicas campaigning at once is a split
                 // vote that costs another timeout — the thing this exists to avoid.
-                if self
-                    .regions
-                    .get(parent.id)
-                    .and_then(|state| state.peer().map(|peer| peer.is_leader()))
-                    .unwrap_or(false)
-                {
-                    // **The store's own runtime handle, not `tokio::spawn`.** This runs on the
-                    // parent's *driver* thread, which is a plain thread from `DriverPool` and not a
-                    // reactor worker — `tokio::spawn` there panics for want of a runtime context,
-                    // and a panic on the driver thread stops the region applying anything. The
-                    // first version of this did exactly that: the same load split twice instead of
-                    // a hundred and thirty times, and the writer got seventy-nine `08006`s because
-                    // the regions it wanted had stopped moving.
-                    //
-                    // Spawned rather than awaited because the child's driver is another thread:
-                    // awaiting here would have the parent's apply loop wait on the child's.
-                    if let Some(runtime) = &self.runtime {
-                        let child_peer = Arc::clone(&peer);
-                        let tick = raft.tick;
-                        runtime.spawn(async move {
-                            Self::campaign_the_child(&child_peer, tick).await;
-                        });
-                    }
-                }
+                //
+                // **After the map has taken the child**, below, and not here: a campaign is the
+                // one thing a peer does entirely on its own initiative, so a child this store
+                // turns out not to host would otherwise campaign — and go on campaigning — for a
+                // region nothing on this store can serve. That is the `campaigns_pre: 1108`
+                // beside `campaigns_real: 91` in `docs/plans/debts-v1.1.md` #9.
                 RegionState::replicated(RegionMeta::new(child.clone()), peer, view)
             }
             _ => RegionState::unreplicated(RegionMeta::new(child.clone())),
         };
-        self.regions.apply_split(parent.clone(), child_state)
+        let leads_the_parent = self
+            .regions
+            .get(parent.id)
+            .and_then(|state| state.peer().map(|peer| peer.is_leader()))
+            .unwrap_or(false);
+        self.regions.apply_split(parent.clone(), child_state)?;
+        let Some((reservation, tick)) = reserved else {
+            return Ok(());
+        };
+        let peer = reservation.commit();
+        self.spawn_ticker(&peer, tick);
+        if leads_the_parent {
+            // **The store's own runtime handle, not `tokio::spawn`.** This runs on the parent's
+            // *driver* thread, which is a plain thread from `DriverPool` and not a reactor worker
+            // — `tokio::spawn` there panics for want of a runtime context, and a panic on the
+            // driver thread stops the region applying anything. The first version of this did
+            // exactly that: the same load split twice instead of a hundred and thirty times, and
+            // the writer got seventy-nine `08006`s because the regions it wanted had stopped
+            // moving.
+            //
+            // Spawned rather than awaited because the child's driver is another thread: awaiting
+            // here would have the parent's apply loop wait on the child's.
+            if let Some(runtime) = &self.runtime {
+                runtime.spawn(async move {
+                    Self::campaign_the_child(&peer, tick).await;
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Stands the child for election until somebody can vote for it
@@ -2049,6 +2076,19 @@ impl Store {
         self.regions
             .get(region_id)
             .and_then(|state| state.peer().map(Arc::clone))
+    }
+
+    /// **Which peer's core actually answers for this region**, asked through the handle the
+    /// request path holds.
+    ///
+    /// The two are the same peer or the store is broken in the way
+    /// [ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md) describes: the handle
+    /// publishes what the request path reads, so a handle whose core has been displaced answers
+    /// `NotLeader` for ever while another core leads the region.
+    #[cfg(test)]
+    async fn answered_by(&self, region_id: u64) -> Option<u64> {
+        let peer = self.peer_of(region_id)?;
+        peer.status().await.ok().map(|status| status.id)
     }
 
     /// Feeds a batch of Raft messages from another store into this one's peer.
@@ -3448,7 +3488,7 @@ fn start_peer(
     host: Arc<dyn RegionHost>,
     pool: Arc<DriverPool>,
     columnar: Option<Arc<ColumnarSlot>>,
-) -> Result<Arc<RaftPeer>> {
+) -> Result<crate::peer::Reservation> {
     let voters: Vec<u64> = region
         .peers
         .iter()
@@ -3802,12 +3842,148 @@ impl Service for StoreService {
 
 #[cfg(test)]
 mod tests {
-    use super::{Store, StoreOptions, conf_change_for};
+    use super::{RaftOptions, Store, StoreOptions, conf_change_for};
     use crate::region::RegionMeta;
     use crate::regions::RegionState;
     use bytes::Bytes;
-    use esker_proto::{Epoch, Operator, Peer, ProtoError, RawKvReq, RawKvResp, RequestHeader};
+    use esker_proto::{
+        Epoch, Operator, Peer, ProtoError, RawKvReq, RawKvResp, Region, RequestHeader,
+    };
     use std::sync::Arc;
+
+    /// A store that replicates, on a runtime, with nobody to talk to.
+    ///
+    /// The address is unreachable on purpose: every test below is about what this store does with
+    /// its **own** region map and driver pool before a message would ever leave it.
+    fn replicated_store(dir: &tempfile::TempDir) -> Arc<Store> {
+        Store::open(
+            dir.path(),
+            StoreOptions {
+                raft: Some(RaftOptions::new(
+                    vec![crate::PeerAddress::new(
+                        1,
+                        1,
+                        "127.0.0.1:1".parse().unwrap(),
+                    )],
+                    7,
+                )),
+                ..StoreOptions::new()
+            },
+        )
+        .unwrap()
+    }
+
+    /// A region record naming a peer on store 1, for the refusals below to be refused *on their
+    /// own merits* rather than for not naming this store.
+    fn record(id: u64, start: &'static [u8], end: &'static [u8]) -> Region {
+        Region {
+            id,
+            start_key: Bytes::from_static(start),
+            end_key: Bytes::from_static(end),
+            peers: vec![Peer::voter(1, id + 100)],
+            epoch: Epoch::INITIAL,
+        }
+    }
+
+    /// **Every way the region map can refuse a peer this store has already built, and the one
+    /// thing all of them have to leave behind: nothing.**
+    ///
+    /// [ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md). `start_peer` hands the
+    /// core to the driver pool before the map has said whether this store may host the region at
+    /// all — that is unavoidable, the peer has to exist to be offered — so what matters is that
+    /// every refusal gives it straight back. Before the reservation, each of these left a live
+    /// core driving the region: ticking, campaigning, answering every Raft message, while the
+    /// request path read a handle nobody published into and answered `NotLeader` for ever.
+    ///
+    /// One test rather than five, and it **collects** rather than stopping at the first: the
+    /// answer wanted is *which* branches leak, and a run that panics on branch one says nothing
+    /// about the other four.
+    ///
+    /// Red before the fix, in the shape the field had — the ticker spawned while the peer was
+    /// still only reserved, so its `Arc` outlived the refusal and nothing else would give the
+    /// region back: `an overlapping range left a core driving region 41: region 41 [b"a", b"b")
+    /// overlaps region 1 [b"", b"") already on this store`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_refusal_leaves_nothing_driving_the_region_it_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = replicated_store(&dir);
+        let hosted = store.regions().regions()[0].clone();
+        let mine = store
+            .peer_of(hosted.id)
+            .expect("the bootstrapped region is replicated")
+            .peer_id();
+        assert!(
+            store.drivers.driving(hosted.id),
+            "the bootstrapped region is driven by its own peer"
+        );
+        let mut leaked: Vec<String> = Vec::new();
+
+        // 1. `host_region`, a range that overlaps one this store already holds. The bootstrapped
+        //    region is the whole key space, so any range at all overlaps it.
+        let refused = store
+            .host_region(record(41, b"a", b"b"))
+            .expect_err("an overlapping range");
+        if store.drivers.driving(41) {
+            leaked.push(format!(
+                "an overlapping range left region 41 driven ({refused})"
+            ));
+        }
+
+        // 2. `adopt_split`, a parent this store does not host.
+        let refused = store
+            .adopt_split(&record(42, b"", b"m"), &record(43, b"m", b""))
+            .expect_err("a parent this store does not host");
+        if store.drivers.driving(43) {
+            leaked.push(format!(
+                "a split of a region this store does not host left its child 43 driven ({refused})"
+            ));
+        }
+
+        // 3. `adopt_split`, a parent whose start key a split appears to have moved.
+        let moved = Region {
+            start_key: Bytes::from_static(b"a"),
+            ..hosted.clone()
+        };
+        let refused = store
+            .adopt_split(&moved, &record(44, b"m", b""))
+            .expect_err("a parent whose start key moved");
+        if store.drivers.driving(44) {
+            leaked.push(format!(
+                "a split that moved its parent's start key left its child 44 driven ({refused})"
+            ));
+        }
+
+        // 4. `host_region`, a region id this store already hosts, and
+        // 5. `adopt_split`, a child this store already hosts. Neither of these can leave an
+        //    *unhosted* region driven — the id is one this store serves — so what they are checked
+        //    for is the other face of the same defect: the region's own peer must still be the
+        //    core that answers for it.
+        let _ = store
+            .host_region(record(hosted.id, b"", b""))
+            .expect_err("a region already hosted");
+        if store.answered_by(hosted.id).await != Some(mine) {
+            leaked.push(format!(
+                "a second host of region {}: its peer is no longer the core that answers for it",
+                hosted.id
+            ));
+        }
+        let _ = store
+            .adopt_split(&hosted, &record(hosted.id, b"m", b""))
+            .expect_err("a child already hosted");
+        if store.answered_by(hosted.id).await != Some(mine) {
+            leaked.push(format!(
+                "a split into region {}, which this store already hosts: its peer is no longer \
+                 the core that answers for it",
+                hosted.id
+            ));
+        }
+
+        assert!(leaked.is_empty(), "{}", leaked.join("\n  "));
+        assert!(
+            store.drivers.driving(hosted.id),
+            "the region this store does host stopped being driven at all"
+        );
+    }
 
     /// A region with the peers named, and nothing else: what `conf_change_for` reads.
     fn placed(peers: Vec<Peer>) -> RegionState {
