@@ -1,0 +1,85 @@
+crates/esker-sql/src/exec/cursor.rs
+  s_2d916f5f540186::t_5cbad19bbaf163 3323-3330,3333-3334
+crates/esker-sql/src/exec/query.rs
+  s_2d916f5f540186::t_b13825d11630e4 3045-3059,3062-3069,4825-4880,4964-4968,5021-5027
+crates/esker-sql/src/plan/expr.rs
+  s_2d916f5f540186::t_2ba47c829457e4 1699-1704,1776-1781
+crates/esker-sql/tests/advisory_lock.rs
+  s_2d916f5f540186::t_81d3b44baf8df7 19
+crates/esker-sql/tests/aggregate_type.rs
+  s_2d916f5f540186::t_350409fc4abd65 18-21
+crates/esker-sql/tests/all_quantifier.rs
+  s_2d916f5f540186::t_2cf67be9380a4d 26-29
+crates/esker-sql/tests/between.rs
+  s_2d916f5f540186::t_6a11ba84ecd960 19-22
+crates/esker-sql/tests/bitwise.rs
+  s_2d916f5f540186::t_4bc1f3a32cc0c6 31-34
+crates/esker-sql/tests/boolean_argument.rs
+  s_2d916f5f540186::t_81bb4b0292f34f 19-22
+crates/esker-sql/tests/catalog_vectors.rs
+  s_2d916f5f540186::t_725bf598de16a0 24
+crates/esker-sql/tests/cidr_aggregate.rs
+  s_2d916f5f540186::t_fe1911f89c5243 32-36
+crates/esker-sql/tests/crossed_bounds.rs
+  s_2d916f5f540186::t_e7ff38853943fb 27
+crates/esker-sql/tests/date_trunc.rs
+  s_2d916f5f540186::t_5c5280a8fab700 39-42
+crates/esker-sql/tests/decimal_literal.rs
+  s_2d916f5f540186::t_8d6d133592d15b 31-34
+crates/esker-sql/tests/default_expression.rs
+  s_2d916f5f540186::t_6fa6e87f65306d 13
+crates/esker-sql/tests/default_now.rs
+  s_2d916f5f540186::t_e4f7140cef67f3 15
+crates/esker-sql/tests/enum_value.rs
+  s_2d916f5f540186::t_ac25f4454b4688 27
+crates/esker-sql/tests/exclusion_constraint.rs
+  s_2d916f5f540186::t_5ad5d81c37ba4f 13-16
+crates/esker-sql/tests/integer_plus_text.rs
+  s_2d916f5f540186::t_65fffdbd9a9b02 18
+crates/esker-sql/tests/interval_aggregate.rs
+  s_2d916f5f540186::t_296bdaf5b98d0c 29-32
+crates/esker-sql/tests/name_type.rs
+  s_2d916f5f540186::t_dfd52541eb81f3 49
+crates/esker-sql/tests/on_conflict.rs
+  s_2d916f5f540186::t_a93096ee81cead 14-18
+crates/esker-sql/tests/operator_types.rs
+  s_2d916f5f540186::t_4103c76cc52e43 18-21
+crates/esker-sql/tests/pg_catalog_index.rs
+  s_2d916f5f540186::t_6cb8ff91864a8c 23-27
+crates/esker-sql/tests/provenance_budget.rs
+  s_2d916f5f540186::t_3153f62623a0ff 30-32,35
+crates/esker-sql/tests/regex_match.rs
+  s_2d916f5f540186::t_70114ac37eb2ba 13-16
+crates/esker-sql/tests/relation_resolution.rs
+  s_2d916f5f540186::t_901f511d6311d5 43-44,47,55-56
+crates/esker-sql/tests/schema_namespace.rs
+  s_2d916f5f540186::t_520715433b97d2 27-29,35-36
+crates/esker-sql/tests/search_path.rs
+  s_2d916f5f540186::t_68c65b47d5399d 14-17,19
+crates/esker-sql/tests/srf_target_list.rs
+  s_2d916f5f540186::t_27fb1715efe7d2 17-21
+crates/esker-sql/tests/unique_constraint.rs
+  s_2d916f5f540186::t_3b7ba4a1dba87c 18
+crates/esker-sql/tests/values_relation.rs
+  s_2d916f5f540186::t_8395e167e788bf 17-21
+docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md
+  s_2d916f5f540186::t_ad57cb2d66d865 3-5
+docs/adr/0093-pg_typeof-is-resolved-against-the-declared-type.md
+  s_2d916f5f540186::t_df4f4fae65152e 1-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "cc7a7b4ef5f89ac8bbb3b6da8ebe31d2f9b54a5f",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
