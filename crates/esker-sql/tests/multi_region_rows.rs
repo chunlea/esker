@@ -75,6 +75,15 @@ fn wait_for<F: FnMut() -> bool>(what: &str, seconds: u64, mut ready: F) {
 /// A real placement driver, real stores that split, and a SQL node routed through `PdConn`.
 struct Splitting {
     pd: Arc<Pd>,
+    /// Where the stores and PD listen, so a test can build a **second** SQL node over the same
+    /// cluster — one with a region cache of its own, which is what makes a stale route reachable.
+    addresses: Vec<SocketAddr>,
+    pd_address: SocketAddr,
+    /// **Shared with every node here, because two clocks are two clusters.** A second node with an
+    /// oracle of its own starts numbering at the same instant the first did and reads at a snapshot
+    /// from before the first node's `CREATE TABLE` — `42P01` for a table that is right there. The
+    /// harness in `tests/cluster` says the same thing in its own words.
+    oracle: Arc<dyn TimestampOracle>,
     backend: Arc<dyn Backend>,
     catalog: Arc<Catalog>,
     _handles: Vec<ServerHandle>,
@@ -89,9 +98,13 @@ impl Splitting {
             .enable_all()
             .build()
             .unwrap();
-        let (pd, backend, catalog, handles, dirs) = runtime.block_on(Self::open(split_size));
+        let (pd, addresses, pd_address, oracle, backend, catalog, handles, dirs) =
+            runtime.block_on(Self::open(split_size));
         Splitting {
             pd,
+            addresses,
+            pd_address,
+            oracle,
             backend,
             catalog,
             _handles: handles,
@@ -105,6 +118,9 @@ impl Splitting {
         split_size: u64,
     ) -> (
         Arc<Pd>,
+        Vec<SocketAddr>,
+        SocketAddr,
+        Arc<dyn TimestampOracle>,
         Arc<dyn Backend>,
         Arc<Catalog>,
         Vec<ServerHandle>,
@@ -190,6 +206,24 @@ impl Splitting {
             dirs.push(dir);
         }
 
+        let (backend, oracle) = Self::node_over(addresses.clone(), pd_address).await;
+        (
+            pd,
+            addresses,
+            pd_address,
+            oracle,
+            backend,
+            Arc::new(Catalog::new()),
+            handles,
+            dirs,
+        )
+    }
+
+    /// The client half: connections, a `PdConn` resolver, a clock and a backend over them.
+    async fn node_over(
+        addresses: Vec<SocketAddr>,
+        pd_address: SocketAddr,
+    ) -> (Arc<dyn Backend>, Arc<dyn TimestampOracle>) {
         let stores = tokio::task::spawn_blocking(move || {
             TcpStores::connect_all(&addresses, TransportConfig::new())
         })
@@ -210,14 +244,55 @@ impl Splitting {
         );
         let oracle: Arc<dyn TimestampOracle> = Arc::new(CountingOracle::starting_at(1_000));
         let client = Arc::new(TxnClient::on_router(Arc::new(router), Arc::clone(&oracle)));
-        let backend: Arc<dyn Backend> = Arc::new(StoreBackend::new(client, oracle));
-        (pd, backend, Arc::new(Catalog::new()), handles, dirs)
+        let backend: Arc<dyn Backend> = Arc::new(StoreBackend::new(client, Arc::clone(&oracle)));
+        (backend, oracle)
     }
 
     fn session(&self) -> Session {
         Session {
             executor: Executor::new(
                 Arc::clone(&self.backend),
+                Arc::clone(&self.catalog),
+                TENANT,
+                esker_sql::session::register(),
+            ),
+        }
+    }
+
+    /// **A second SQL node over the same stores, with a region cache of its own.**
+    ///
+    /// Its own `PdConn`, its own `Router`, its own connections — which is what makes it a second
+    /// node rather than a second session. Two sessions of one node share a cache and could never
+    /// hold different ideas about where a region is, and holding different ideas is the whole
+    /// subject of `a_stale_region_cache_still_reads_every_row_once`.
+    ///
+    /// The **catalog is shared**, because a catalog is the node's view of the schema and both nodes
+    /// are looking at one cluster; what is not shared is the routing.
+    fn another_node(&self) -> Session {
+        let addresses = self.addresses.clone();
+        let stores = std::thread::spawn(move || {
+            TcpStores::connect_all(&addresses, TransportConfig::new()).unwrap()
+        })
+        .join()
+        .unwrap();
+        let conn = Arc::new(PdConn::new(self.pd_address));
+        let router = Router::with_options(
+            Arc::new(stores),
+            conn as Arc<dyn RegionResolver>,
+            ClientOptions {
+                jitter_seed: Some(29),
+                ..ClientOptions::default()
+            },
+        );
+        let client = Arc::new(TxnClient::on_router(
+            Arc::new(router),
+            Arc::clone(&self.oracle),
+        ));
+        let backend: Arc<dyn Backend> =
+            Arc::new(StoreBackend::new(client, Arc::clone(&self.oracle)));
+        Session {
+            executor: Executor::new(
+                backend,
                 Arc::clone(&self.catalog),
                 TENANT,
                 esker_sql::session::register(),
@@ -295,6 +370,83 @@ fn load(session: &mut Session) {
             ))
             .unwrap();
     }
+}
+
+/// **A node whose region cache is stale reads the whole table anyway** — no row lost, none twice.
+///
+/// This is §11's first clause, `EpochNotMatch` and the refresh, and the only way to reach it
+/// deliberately is two nodes: the first caches routes for the regions as they are, the second
+/// grows the table until the store splits them, and then the first is asked for every row. Its
+/// cached routes name regions that no longer exist at the epoch it holds, so every one of them is
+/// refused and re-fetched from PD before the scan can answer.
+///
+/// The assertion is the whole table, in order, against what the writer sees: a scan that dropped a
+/// region's worth of rows or served one twice cannot pass it.
+#[test]
+fn a_stale_region_cache_still_reads_every_row_once() {
+    let many = Splitting::start(SPLIT_SIZE);
+    let mut reader = many.session();
+    load(&mut reader);
+    wait_for("the first splits", 60, || many.regions() >= 3);
+    let first = many.regions();
+
+    // The reader caches a route per region by reading every one of them.
+    let seen = reader.rows("SELECT count(*) FROM ledger");
+    assert_eq!(seen[0][0].as_deref(), Some(ROWS.to_string().as_str()));
+
+    // A **second node**, with a region cache of its own, grows the table until the store splits
+    // again. Nothing tells the first node.
+    let mut writer = many.another_node();
+    // **Until it splits, not a fixed number of rows.** How many inserts cross the next threshold
+    // depends on where the last split left the halves, so a fixed count is a test that passes on
+    // some runs — it did, and then it did not, which is how this loop came to be here.
+    let mut last = ROWS;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while many.regions() <= first {
+        assert!(
+            Instant::now() < deadline,
+            "the table never split again: still {first} regions after {last} rows"
+        );
+        for id in (last + 1)..=(last + 200) {
+            writer
+                .run(&format!(
+                    "INSERT INTO ledger VALUES ({id}, 'who-{}', {})",
+                    id % 7,
+                    id * 3
+                ))
+                .unwrap();
+        }
+        last += 200;
+    }
+    let written = last;
+    let now = many.regions();
+    assert!(
+        now > first,
+        "the table did not split again: {first} regions before and {now} after"
+    );
+
+    // The reader's cache is stale for every region that split. This is the scan that has to
+    // notice, refresh, and finish.
+    let rows = reader.rows("SELECT id FROM ledger ORDER BY id");
+    assert_eq!(
+        i64::try_from(rows.len()).unwrap(),
+        written,
+        "a scan over {now} regions from a cache built for {first} lost or repeated rows"
+    );
+    let ids: Vec<i64> = rows
+        .iter()
+        .map(|row| row[0].as_deref().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        (1..=written).collect::<Vec<_>>(),
+        "the ids are not exactly 1..={written} once each"
+    );
+    // And the writer, whose cache is current, agrees.
+    assert_eq!(
+        writer.rows("SELECT count(*) FROM ledger")[0][0].as_deref(),
+        Some(written.to_string().as_str())
+    );
 }
 
 /// Every face, as text, so that a difference is a diff and not a guess.
