@@ -1112,3 +1112,103 @@ It watches `Backend::schema_lease_remaining()` — literally the value the write
 `25006` — rather than any proxy for it. The slow-report wrapper forwards `schema_lease_remaining`
 and `schema_step_interval` explicitly: both have trait defaults, and a wrapper that inherited them
 would answer "this node may always write" from the very object the test uses to watch a lease lapse.
+
+## J14. The two engines disagreed once — 2026-09-09, not reproduced, and what will say so next time
+
+`esker-sql::routing_differential the_two_engines_agree_while_a_writer_keeps_committing` failed once
+in the gate for `76001434` at 03:18, at load 8–10:
+
+```text
+the two engines disagree (under a writer) on
+`SELECT region, count(*) FROM t GROUP BY region ORDER BY region` at 468962246262784000
+routed: [[north 711], [south 8]]
+```
+
+The row engine's answer is not in the record — the gate log keeps the first lines of a failure and
+the diagnosis was cut one line short of it, which is the first thing this section is here to stop
+happening again.
+
+### What it cannot be
+
+**Two different moments.** `compare` pins both runs to one instant with
+`SET TRANSACTION SNAPSHOT 'esker-<16 hex>'` — by token rather than by `read_as_of`, because a TSO
+timestamp's logical half is what separates two commits inside one millisecond and no time a user can
+write carries it. And the contract is explicit that the instant is enough: `FragmentReq::ts` is
+**one number with two jobs**, the snapshot the request is made under *and* the MVCC visibility the
+evaluator applies while it scans, deliberately separate from `min_apply_index` because *"they fail
+differently — one refuses with `TooFarBehind`, the other silently returns older data"*.
+
+So at one pinned `ts`, two answers is a wrong answer. What it does **not** say is which side, and
+that is exactly what the record could not settle.
+
+### Ten rounds, and they do not reproduce it
+
+`the_two_engines_agree_while_a_writer_keeps_committing`, alone, ten times, 2026-09-09:
+
+| rounds | one-minute load | result |
+|---|---|---|
+| 1–2 | 4.6 – 4.9 (quiet) | green, 11–25 s |
+| 3–5 | 10.0 – 15.2 | green, 25–58 s |
+| 6–8 | 16.3 – 16.7 | green, 22–86 s |
+| 9–10 | 13.6 – 14.4 | green, 22–24 s |
+
+The load was ambient — other lanes building and a gate running — rather than an arm, and it is
+recorded because it happens to span the band the sighting fell in and four rounds above it. Ten
+green says the window is narrow, and nothing else. *(The controlled six-thread arm is a separate
+row; see the handover for its numbers.)*
+
+### The instrument, so the next sighting is self-diagnosing
+
+Three things are printed on a disagreement now, and one of the three the investigation asked for
+turns out not to exist.
+
+1. **Ask again, at the same instant, in the reverse order.** A snapshot is a function: one `ts`
+   must answer the same rows for ever, on either engine. So the second pair separates two
+   investigations that want opposite work — *disagreeing again* is a **deterministic wrong answer**
+   (go to the runs), *agreeing the second time* means the read was **never pinned** (go to the read
+   path). Reversing the order distinguishes "it follows the engine" from "it follows which ran
+   first".
+2. **Every store's applied index**, taken in process from the harness's own stores.
+3. **A run's `[lo, hi]` window does not exist**, and asking for one is the wrong question here:
+   runs hold **every version** and visibility is resolved at read time — *"the newest version of
+   each key with `commit_ts <= ts`"* — so a run is bounded by an **apply index**, not by a time.
+   Point 2 is what stands in for it. Putting an apply index on `FragmentResp` would be a format
+   change for a diagnostic, and it is not made for one.
+
+### What a deterministic probe now rules out
+
+`a_pinned_snapshot_does_not_move_when_later_rows_commit` asks the sequential half of the same
+question and **passes**: take an instant, answer it on both engines, commit a hundred rows, answer
+the same instant again — nothing moves on either side, and the columns did answer (the test fails if
+they refused both times, which would have been the row engine compared with itself).
+
+So visibility at a pinned `ts` is sound when the commits are *between* the reads. Whatever the
+window is, it needs a commit landing **while** a fragment is being evaluated. That is a narrowing
+worth having: it is measured rather than argued, it is permanent, and it costs 1.7 s.
+
+It also removes the asymmetry the concurrent test cannot control. There the routed run goes first
+and the row run second, so **whichever engine fails to pin sees more commits by the time it runs** —
+one number cannot say which failed. The probe asks each engine to agree with *itself* across a
+hundred commits, and the instrument above re-asks in the reverse order for the same reason.
+
+### The nearest prior, and what would tell them apart
+
+[J13](#j13-a-fragment-answered-from-a-copy-that-did-not-have-the-row--2026-09-05) is the same family
+of question and was closed on 2026-09-05: a columnar copy that missed one Raft entry after a
+snapshot install answered **four rows where the scan had five**. Its fix — `ColumnarSlot::saw(index)`
+dropping an open copy the moment an entry does not follow the last one it saw — is a gap detector,
+and a gap of that kind should no longer be reachable.
+
+So the direction of the error is what separates them, and it is the number the record lost:
+
+* the columnar side **lower** than the rows is J13's shape — a copy missing versions — and would
+  mean the detector has a hole;
+* the columnar side **higher** is not J13's shape at all. Nothing in a missing-entry story adds
+  rows. It would point instead at version resolution: `scan::visible`'s resolver carries **one**
+  settled key, which is sound only while the merged stream is globally ordered by key, and
+  `scan::merged::order` skips a key column it cannot read on either side rather than treating the
+  rows as incomparable.
+
+That second sentence is a place to look, **not a finding** — no measurement here supports it, and
+the ten rounds say nothing about it either way. It is written down so the next sighting is read
+against something rather than from scratch.

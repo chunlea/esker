@@ -461,13 +461,45 @@ fn compare(gate: &Gate, session: &mut Session, query: &str, note: &str) -> bool 
     let (routed, plan) = at_snapshot(session, "auto", at, query);
     let (by_rows, _) = at_snapshot(session, "row", at, query);
 
-    assert_eq!(
-        routed, by_rows,
-        "the two engines disagree{note} on `{query}` at {at}\n\
-         routed: {routed:?}\n\
-         rows:   {by_rows:?}\n\
-         plan:\n{plan}"
-    );
+    if routed != by_rows {
+        // **Ask again, at the same instant, before saying anything.**
+        //
+        // A snapshot is a function: the same `ts` must answer the same rows for ever, whichever
+        // engine reads it. So a second disagreeing pair is a *wrong answer* and a second agreeing
+        // pair is something that moved while the first pair was being taken — and those two want
+        // opposite investigations. The gate log for `76001434` had one of these and could not say
+        // which, so the next one says it itself.
+        //
+        // The order is reversed on purpose: rows first, then routed. If the disagreement follows
+        // the *order* rather than the engine, that is the tell for a read that is not pinned at
+        // all.
+        let (rows_again, rows_plan) = at_snapshot(session, "row", at, query);
+        let (routed_again, plan_again) = at_snapshot(session, "auto", at, query);
+        panic!(
+            "the two engines disagree{note} on `{query}` at {at}\n\
+             routed:       {routed:?}\n\
+             rows:         {by_rows:?}\n\
+             rows again:   {rows_again:?}   (same instant, asked second)\n\
+             routed again: {routed_again:?}   (same instant, asked second)\n\
+             stable?       routed {}, rows {} — a snapshot that answers differently twice is not \
+             pinned; one that answers the same twice is a wrong answer rather than a moving one\n\
+             applied indexes, taken now:\n{}\
+             plan:\n{plan}\n\
+             plan again:\n{plan_again}\n\
+             row plan:\n{rows_plan}",
+            if routed == routed_again {
+                "stable"
+            } else {
+                "MOVED"
+            },
+            if by_rows == rows_again {
+                "stable"
+            } else {
+                "MOVED"
+            },
+            gate.witness(),
+        );
+    }
     // **Whether the columns actually answered**, from the plan that ran rather than from the plan
     // that was made: a query that fell back is compared with the row engine and agrees trivially,
     // so a caller that did not look at this would be counting agreements it got for free.
@@ -774,6 +806,37 @@ impl Gate {
         self.oracle.timestamp().unwrap()
     }
 
+    /// **What every store had applied, at the moment a disagreement was found.**
+    ///
+    /// The third number the investigation asked for, and the only one of the three that exists. A
+    /// fragment's runs have no `[lo, hi]` timestamp window to print: they hold **every version**
+    /// and visibility is resolved at read time — *"the newest version of each key with
+    /// `commit_ts <= ts`"* (`esker_columnar::scan::visible`) — so a run is bounded by an **apply
+    /// index**, not by a time. What stands in for that window is how far each replica has applied,
+    /// which is exactly what "the learner is behind" means.
+    ///
+    /// Taken in process, from the stores this harness owns. Nothing is added to the wire for it:
+    /// `FragmentResp` carries no apply index, and putting one there would be a format change for a
+    /// diagnostic.
+    fn witness(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        for (at, node) in self.nodes.iter().enumerate() {
+            for status in node.store.region_statuses() {
+                let _ = writeln!(
+                    out,
+                    "  store {} region {} applied {} leader {} (self: {})",
+                    at + 1,
+                    status.region.id,
+                    status.applied_index,
+                    status.leader_peer_id,
+                    status.is_leader
+                );
+            }
+        }
+        out
+    }
+
     async fn stop(mut self) {
         for node in self.nodes.drain(..) {
             node.store.stop();
@@ -1005,4 +1068,77 @@ fn explain(session: &mut Session, sql: &str) -> String {
         }
     }
     out
+}
+
+/// **A pinned snapshot is a function**, on either engine, with the commits made in between rather
+/// than concurrently.
+///
+/// `the_two_engines_agree_while_a_writer_keeps_committing` asks the same question under a racing
+/// writer, which is what makes a disagreement rare and its record hard to read: the gate for
+/// `76001434` caught one at 03:18 and ten rounds since have not (`docs/plans/phase-16-mpp.md`
+/// §J14). This asks the deterministic half of it — take an instant, answer it, commit a hundred
+/// rows, answer the same instant again — so that a snapshot that is not honoured fails **every**
+/// time rather than under load.
+///
+/// The asymmetry the concurrent test cannot control is the point. There the routed run goes first
+/// and the row run second, so whichever engine fails to pin sees *more* commits by the time it
+/// runs, and the two failures are indistinguishable from one number. Here both engines answer the
+/// same instant twice, before and after a hundred commits, so each is compared with **itself**.
+///
+/// **What would make this pass for nothing**: the columns refusing and the rows answering both
+/// times. So it asserts the columnar engine actually answered, which is §10's rule — *agreement is
+/// not correctness* — applied to a test that would otherwise be comparing the row engine with
+/// itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pinned_snapshot_does_not_move_when_later_rows_commit() {
+    const QUERY: &str = "SELECT region, count(*) FROM t GROUP BY region ORDER BY region";
+
+    let gate = Gate::start().await;
+    gate.fill().await;
+
+    let (before, after, columnar) = tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        let at = gate.now();
+        let (routed_before, plan) = at_snapshot(&mut session, "auto", at, QUERY);
+        let (rows_before, _) = at_snapshot(&mut session, "row", at, QUERY);
+        assert_eq!(
+            routed_before, rows_before,
+            "the two engines disagree before anything else happened, at {at}"
+        );
+        let answered = plan.contains("Engine: columnar");
+
+        // A hundred rows, committed and settled, all of them after the instant above.
+        for id in 1_000..1_100_i64 {
+            settle(
+                &mut session,
+                &format!("INSERT INTO t VALUES ({id}, 'north', {}, 1.0)", id % 50),
+            );
+        }
+
+        // The same instant, asked again. Row first this time, so that the order is not what
+        // decides.
+        let (rows_after, _) = at_snapshot(&mut session, "row", at, QUERY);
+        let (routed_after, plan_after) = at_snapshot(&mut session, "auto", at, QUERY);
+        (
+            (routed_before, rows_before),
+            (routed_after, rows_after),
+            answered || plan_after.contains("Engine: columnar"),
+        )
+    });
+
+    assert_eq!(
+        after.1, before.1,
+        "the ROW engine's answer at a pinned instant moved when a hundred later rows committed"
+    );
+    assert_eq!(
+        after.0, before.0,
+        "the COLUMNAR answer at a pinned instant moved when a hundred later rows committed"
+    );
+    assert!(
+        columnar,
+        "the columns refused both times, so this compared the row engine with itself — which is \
+         exactly the free agreement §10 says not to count"
+    );
+
+    gate.stop().await;
 }
