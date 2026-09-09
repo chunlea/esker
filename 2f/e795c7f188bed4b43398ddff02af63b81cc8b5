@@ -1,0 +1,61 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2bed4ac2b1c944::t_2232922cc8fcb8 2150,2165-2170
+crates/esker-sql/src/exec/cursor.rs
+  s_2bed4ac2b1c944::t_923d106b4e1781 2283-2292,3541-3585,3745-3771,3928-3967
+crates/esker-sql/src/exec/ddl.rs
+  s_2bed4ac2b1c944::t_b030ea39d15285 5929-5939,6006
+crates/esker-sql/src/exec/query.rs
+  s_2bed4ac2b1c944::t_2017c547a60fe2 889-901,3154-3178,4068-4080,5046-5052,5059-5065,5179-5192,5288-5303,5515-5521,5524
+crates/esker-sql/src/parse/lower.rs
+  s_2bed4ac2b1c944::t_6a4c19a743add5 6202-6216,6245-6256,6309-6321,6382-6401,6552-6556,6865-6886
+crates/esker-sql/src/plan/expr.rs
+  s_2bed4ac2b1c944::t_1bf6562aa0f2b8 1828-1831
+crates/esker-sql/src/value/mod.rs
+  s_2bed4ac2b1c944::t_5681d07e5ba0e0 381-385,425-437,535-555,2171-2193
+crates/esker-sql/tests/array_families.rs
+  s_2bed4ac2b1c944::t_d947c3eebcfce8 1-139
+crates/esker-sql/tests/captures/pg19_array_families.txt
+  s_2bed4ac2b1c944::t_fdbb697cdce9ba 1-74
+crates/esker-sql/tests/captures/pg19_catalog_vectors.txt
+  s_2bed4ac2b1c944::t_6b01aee27f85d7 1-44
+crates/esker-sql/tests/catalog_vectors.rs
+  s_2bed4ac2b1c944::t_9065750c177a04 18-35
+crates/esker-sql/tests/concat.rs
+  s_2bed4ac2b1c944::t_a5e2289df16b0e 36-40
+crates/esker-sql/tests/corpus/pg19_array_families.txt
+  s_2bed4ac2b1c944::t_5353de55997923 1-74
+crates/esker-sql/tests/corpus/pg19_catalog_vectors.txt
+  s_2bed4ac2b1c944::t_213a2436348c41 43-50
+crates/esker-sql/tests/floatrange.rs
+  s_2bed4ac2b1c944::t_9d62e29fa8b612 18-23
+crates/esker-sql/tests/negative_constant_deparse.rs
+  s_2bed4ac2b1c944::t_8e0879a6612719 25,27-43,54-57,60
+crates/esker-sql/tests/numeric_literal_deparse.rs
+  s_2bed4ac2b1c944::t_d7b1b142257ad6 24-30
+crates/esker-sql/tests/serial_name.rs
+  s_2bed4ac2b1c944::t_00f56b9705a659 24-30
+crates/esker-sql/tests/set_operation.rs
+  s_2bed4ac2b1c944::t_60910d113ff1f9 374-455
+crates/esker-sql/tests/subscript.rs
+  s_2bed4ac2b1c944::t_2acd2549919572 13-20
+crates/esker-sql/tests/tsrange.rs
+  s_2bed4ac2b1c944::t_57bcb2516ad474 17-24
+docs/plans/debts-v1.1.md
+  s_2bed4ac2b1c944::t_ceac0f2a7af240 24,60-61,71-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "2fe795c7f188bed4b43398ddff02af63b81cc8b5",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
