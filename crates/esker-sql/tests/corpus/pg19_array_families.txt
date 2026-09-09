@@ -1,0 +1,74 @@
+# **The three array families r1's wire sweep left** — PostgreSQL 19beta1, 2026-09-09.
+# `ON_ERROR_ROLLBACK on`, one `BEGIN … ROLLBACK`, temp table `ac (t text, i int4)` holding
+# `('int4', 23)`.
+#
+# `rs-wire-107b.txt` §37–48 filed three:
+#
+#   1. `array_agg(c::regtype)`  node: an internal error, `an oid is an integer, not Text("int4")`
+#   2. `ARRAY[…] || ARRAY[…]`   node: refused, on `regtype[]` and `name[]`
+#   3. `oid[]` in every shape   node: `oid is not supported`
+#
+# **Measured here first, and two of the three were not what the report said.**
+#
+# ## 1 is not about arrays: `column::regtype` was broken in every shape
+#
+#     SELECT t::regtype FROM ac      an oid is an integer, not Text("int4")
+#
+# A `regtype` has an **input** function and an **output** one, and which a cast needs is decided by
+# what it casts *from*: a text operand resolves a name, an integer operand reads an oid. This node
+# sent both to the oid direction, so a text column reached it as a `Datum::Text` and the error a
+# user saw was an internal representation. The three array shapes r1 probed were the same defect
+# seen through a constructor.
+#
+#     t::regtype              integer     pg_typeof  regtype        <- and it answered `text` here
+#     i::regtype              integer     t::regtype::oid  23
+#     array_agg(t::regtype)   {integer}   pg_typeof  regtype[]
+#     ARRAY[t::regtype]       {integer}   (ARRAY[t::regtype])::regtype[]  {integer}
+#     'nosuchtype'::text::regtype        !42704 type "nosuchtype" does not exist
+#
+# **Two rows for the printing, and the second is the one that matters.** `ARRAY[23::regtype]` is
+# `{integer}` — 23 is a type — and `ARRAY[1::regtype]` is `{1}`, because oid 1 is no type and
+# `regtypeout` falls back to the digits. A corpus with only the second pins the fallback and not
+# the rule.
+#
+# ## 2 is not about `regtype[]` or `name[]`: there is no array `||` at all
+#
+#     ARRAY['a'::text] || ARRAY['b'::text]   operator does not exist: text[] || text[]
+#
+# Three shapes, and two rules that are about the same NULL on the two sides of one operator:
+#
+#     ARRAY[1,2] || ARRAY[3]      {1,2,3}      pg_typeof  integer[]
+#     ARRAY[1,2] || 3             {1,2,3}      an element appends
+#     3 || ARRAY[1,2]             {3,1,2}      and prepends
+#     ARRAY[1,2] || NULL::int4    {1,2,NULL}   a NULL *element* is an element
+#     NULL::int4[] || ARRAY[1]    {1}          a NULL *array* is empty, not NULL
+#     ARRAY[]::int4[] || ARRAY[1] {1}
+#
+# **`1 || 2` is still `42883 operator does not exist: integer || integer`**, which is the sentence
+# `text_concat` already carried: PostgreSQL has no `anynonarray || anynonarray`.
+#
+# ## 3 was already closed
+#
+# `oid[]` answers in every shape r1 probed, and has since the `oid` unit (ADR 0097) gave the type
+# its array. Kept in the corpus so that it cannot quietly go away again.
+#
+#     ARRAY[1::oid]  {1}   array_agg(1::oid)  {1}   pg_typeof  oid[]
+#     (ARRAY[1::oid])::oid[]  {1}   '{1,2}'::oid[]  {1,2}
+
+CREATE TABLE ac (t text, i int4)		-
+INSERT INTO ac VALUES ('int4', 23)		-
+SELECT 'r', t::regtype, pg_typeof(t::regtype) FROM ac	text,regtype,regtype	r|integer|regtype
+SELECT 'r', i::regtype, t::regtype::oid FROM ac	text,regtype,oid	r|integer|23
+SELECT 'r', array_agg(t::regtype), pg_typeof(array_agg(t::regtype)) FROM ac	text,regtype[],regtype	r|{integer}|regtype[]
+SELECT 'r', ARRAY[t::regtype], (ARRAY[t::regtype])::regtype[] FROM ac	text,regtype[],regtype[]	r|{integer}|{integer}
+SELECT 'r', ARRAY[23::regtype], ARRAY[1::regtype]	text,regtype[],regtype[]	r|{integer}|{1}
+SELECT 'r', ARRAY[1,2] || ARRAY[3], pg_typeof(ARRAY[1,2] || ARRAY[3])	text,integer[],regtype	r|{1,2,3}|integer[]
+SELECT 'r', ARRAY[1,2] || 3, 3 || ARRAY[1,2]	text,integer[],integer[]	r|{1,2,3}|{3,1,2}
+SELECT 'r', ARRAY[1,2] || NULL::int4, NULL::int4[] || ARRAY[1]	text,integer[],integer[]	r|{1,2,NULL}|{1}
+SELECT 'r', ARRAY['a'::name] || ARRAY['b'::name], pg_typeof(ARRAY['a'::name] || ARRAY['b'::name])	text,name[],regtype	r|{a,b}|name[]
+SELECT 'r', ARRAY['int4'::regtype] || ARRAY['text'::regtype], pg_typeof(ARRAY['int4'::regtype] || ARRAY['text'::regtype])	text,regtype[],regtype	r|{integer,text}|regtype[]
+SELECT 'r', ARRAY[1::oid], array_agg(1::oid), pg_typeof(ARRAY[1::oid])	text,oid[],oid[],regtype	r|{1}|{1}|oid[]
+SELECT 'r', (ARRAY[1::oid])::oid[], '{1,2}'::oid[]	text,oid[],oid[]	r|{1}|{1,2}
+SELECT 'r', ARRAY[]::int4[] || ARRAY[1]	text,integer[]	r|{1}
+SELECT 'r', 1 || 2	!42883 operator does not exist: integer || integer
+SELECT 'r', 'nosuchtype'::text::regtype	!42704 type "nosuchtype" does not exist

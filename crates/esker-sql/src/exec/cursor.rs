@@ -3522,12 +3522,51 @@ fn catalog_function(
         // has and each of them measured: a type's printed name, `-` for oid 0 — which is what
         // every non-array row of `pg_type` holds in `typelem` — and the number back for an oid
         // this node has no type for.
-        CatalogFunc::RegTypeName => match oid_argument(args.first())? {
-            None => Datum::Null,
-            Some(oid) => match u32::try_from(oid).ok().and_then(crate::value::type_by_oid) {
-                Some(ty) => Datum::Text(crate::value::Named::Scalar(ty).printed()),
-                None if oid == 0 => Datum::Text("-".to_owned()),
-                None => Datum::Text(oid.to_string()),
+        // **Which direction a `::regtype` goes is decided by what it casts *from*.** A `regtype`
+        // has an input function and an output one: `t::regtype` over a **text** column is
+        // `regtypein` — it resolves a name — and `i::regtype` over an integer is the oid read as
+        // one. Both answer `integer` for `int4` and 23, measured. Lowering cannot tell them apart
+        // because it has no types, so the datum decides here; before this, a text operand was
+        // handed to `oid_argument` and `SELECT t::regtype FROM t` was
+        // `an oid is an integer, not Text("int4")` — an internal representation in a user's face,
+        // and the reason r1's wire sweep saw it through three array shapes that were not the
+        // defect.
+        //
+        // **The answer is a `regtype` and not its name.** It used to be a `Datum::Text`, so the
+        // `RowDescription` said 25 where a real server says 2206 — right bytes, wrong declared
+        // type, the shape only a `Describe` sees.
+        CatalogFunc::RegTypeName => match args.first() {
+            None | Some(Datum::Null) => Datum::Null,
+            Some(Datum::Text(name)) => {
+                let named = crate::value::named_type(name)?
+                    .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
+                Datum::RegType {
+                    oid: named.oid(),
+                    name: named.printed().into_boxed_str(),
+                }
+            }
+            other => match oid_argument(other)? {
+                None => Datum::Null,
+                Some(oid) => {
+                    let printed = u32::try_from(oid)
+                        .ok()
+                        .and_then(crate::value::type_by_oid)
+                        .map_or_else(
+                            // An oid no type has prints its digits, and 0 prints `-`.
+                            || {
+                                if oid == 0 {
+                                    "-".to_owned()
+                                } else {
+                                    oid.to_string()
+                                }
+                            },
+                            |ty| crate::value::Named::Scalar(ty).printed(),
+                        );
+                    Datum::RegType {
+                        oid: u32::try_from(oid).unwrap_or(0),
+                        name: printed.into_boxed_str(),
+                    }
+                }
             },
         },
         // Every element's oid, space separated: what `pg_proc.proargtypes` holds, so the two
@@ -3687,6 +3726,33 @@ fn catalog_function(
         CatalogFunc::HstoreConcat if call.args.iter().all(is_jsonb_typed) => {
             jsonb_concat(args.first(), args.get(1))?
         }
+        // **An array operand makes `||` array concatenation**, which is a sixth spelling of the
+        // symbol and the one this crate did not have at all: `text[] || text[]` was
+        // `42883 operator does not exist`, and so was every other element type — r1's wire sweep
+        // saw it through `regtype[]` and `name[]` and it was never about those.
+        //
+        // Three shapes, all measured, and two rules reasoning gets backwards:
+        //
+        // ```text
+        //   ARRAY[1,2] || ARRAY[3]      {1,2,3}
+        //   ARRAY[1,2] || 3             {1,2,3}     an element appends
+        //   3 || ARRAY[1,2]             {3,1,2}     and prepends
+        //   ARRAY[1,2] || NULL::int4    {1,2,NULL}  a NULL *element* is an element
+        //   NULL::int4[] || ARRAY[1]    {1}         a NULL *array* is empty, not NULL
+        // ```
+        //
+        // The last two are `array_cat`'s own rules and neither follows from the other: the same
+        // NULL is a value on one side of the operator and an absence on the other.
+        CatalogFunc::HstoreConcat
+            if args.iter().any(|arg| matches!(arg, Datum::Array(_)))
+                || matches!(
+                    (args.first(), args.get(1)),
+                    (Some(Datum::Null), Some(Datum::Array(_)))
+                        | (Some(Datum::Array(_)), Some(Datum::Null))
+                ) =>
+        {
+            array_concat(args.first(), args.get(1))
+        }
         CatalogFunc::HstoreConcat
             if !args.iter().any(|value| {
                 matches!(
@@ -3841,6 +3907,46 @@ fn type_oid_argument(arg: Option<&Datum>) -> Result<Option<i64>> {
             )));
         }
     })
+}
+
+/// `array_cat`: two arrays, an array and an element, or an element and an array.
+///
+/// **A NULL array is empty and a NULL element is an element.** Measured on 19beta1:
+/// `NULL::int4[] || ARRAY[1]` is `{1}` and `ARRAY[1,2] || NULL::int4` is `{1,2,NULL}`. The two
+/// rules are about the same NULL on the two sides of one operator and neither follows from the
+/// other, which is why both are written down.
+///
+/// One dimension only, which is what this crate stores; the element type comes from whichever
+/// operand is an array, so `ARRAY[1,2] || 3` keeps `integer[]`.
+fn array_concat(left: Option<&Datum>, right: Option<&Datum>) -> Datum {
+    let element_type = [left, right]
+        .into_iter()
+        .flatten()
+        .find_map(|value| match value {
+            Datum::Array(array) => Some(array.element),
+            _ => None,
+        })
+        .unwrap_or(ColumnType::Text);
+    let mut values: Vec<Option<Datum>> = Vec::new();
+    let mut push = |side: Option<&Datum>| match side {
+        // A NULL *array* contributes nothing; a NULL element cannot be told from it here, and
+        // this arm is reached only when the other side is an array, so the operand's own declared
+        // type is what decides. `ARRAY[1,2] || NULL::int4` reaches the element arm below because
+        // the plan gives the NULL the element's type — see `exec::query::concat_type`.
+        None | Some(Datum::Null) => {}
+        Some(Datum::Array(array)) => values.extend(array.values.iter().cloned()),
+        Some(other) => values.push(Some(other.clone())),
+    };
+    push(left);
+    push(right);
+    // **Lower bound 1**, which the second argument is — it is the bound and not the length, and
+    // passing the length printed `[3:5]={1,2,3}`. PostgreSQL keeps the left operand's bounds and
+    // every array this crate builds starts at 1, so a concatenation does too.
+    Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+        element_type,
+        1,
+        values,
+    ))
 }
 
 /// An `oid` argument, which is an integer of whatever width the column it came from has.

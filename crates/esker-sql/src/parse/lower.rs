@@ -6303,7 +6303,19 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 ..
             },
         ) if cast_target(inner_type) == Some(CastTarget::RegType) => {
-            let name = cast_operand(inner, data_type)?;
+            // **A column's `::regtype::oid` is two casts, run.** This arm answers the *literal*
+            // form from the name alone — `'int4'::regtype::oid` is 23 without a row — and a
+            // column has no name to read at parse time, so it takes the ordinary path: the
+            // `regtype` is built per row and the `::oid` is the reinterpretation `pg_cast` calls
+            // implicit. Without this, `t::regtype::oid` was
+            // `0A000 the cast t::oid is not supported`, which names a cast nobody wrote.
+            let Ok(name) = cast_operand(inner, data_type) else {
+                return Ok(plan::Expr::Cast {
+                    operand: Box::new(lower_expr(expr)?),
+                    to: ColumnType::Oid,
+                    typmod: NO_TYPMOD,
+                });
+            };
             // **A name the catalog might know**, which is where `ActiveRecord`'s
             // `lookup_cast_type` lands: `SELECT 'color'::regtype::oid` over a type a
             // `CREATE TYPE` made. Lowering has no catalog, so the name is carried and the

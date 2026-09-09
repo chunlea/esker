@@ -3142,6 +3142,31 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 // has a candidate at every string width and category `Z` picks none of them, so it
                 // is `42725` and not the `42883` a wrong type gets — measured. Decided here
                 // because the evaluator sees a `Datum::Text` for a `"char"` and cannot tell.
+                // **An element beside an array is wrapped into a one-element array**, which is
+                // what makes the two NULL rules one rule. Measured: `ARRAY[1,2] || NULL::int4` is
+                // `{1,2,NULL}` and `NULL::int4[] || ARRAY[1]` is `{1}` — the same NULL is a value
+                // on one side of the operator and an absence on the other, and the evaluator
+                // cannot tell them apart, because a NULL datum carries no type. Decided here,
+                // where the declared types are, so that the evaluator has one rule: a NULL array
+                // contributes nothing.
+                (CatalogFunc::HstoreConcat, Some(_))
+                    if args.len() == 2 && concat_element_side(&args, scope).is_some() =>
+                {
+                    let at = concat_element_side(&args, scope).unwrap_or(0);
+                    let element = expr_type(&args[1 - at], scope)
+                        .ok()
+                        .and_then(esker_keys::array::ArrayValue::element_of);
+                    let mut args = args;
+                    let operand = args[at].clone();
+                    args[at] = Expr::Array {
+                        elements: vec![operand],
+                        element,
+                    };
+                    Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                        func: call.func,
+                        args,
+                    }))
+                }
                 (CatalogFunc::HstoreConcat, Some(_))
                     if args
                         .iter()
@@ -5121,6 +5146,20 @@ fn concat_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> Column
     // **A fourth spelling.** A tsvector operand makes it a tsvector, and the rows were
     // already right — it was only the *declared* type that said `text`, which a client
     // binds against.
+    // **A sixth spelling: an array operand makes it array concatenation**, and the result is that
+    // array's type — `ARRAY[1,2] || 3` is `integer[]`, measured. Asked first because an array of
+    // `text` would otherwise fall through to the string arm and be declared `text`, which is the
+    // wrong-declaration bug this function has now been the site of four times.
+    if let Some(array) = call
+        .args
+        .iter()
+        .find_map(|arg| match expr_type(arg, scope) {
+            Ok(ty) if esker_keys::array::ArrayValue::element_of(ty).is_some() => Some(ty),
+            _ => None,
+        })
+    {
+        return array;
+    }
     if all_jsonb {
         ColumnType::Jsonb
     } else if of(ColumnType::Hstore) {
@@ -5216,6 +5255,22 @@ fn range_bound_type(
 /// to `text` before anything asks — so the name comes from the *expression* rather than from its
 /// resolved type. That is the one place in this message where the two differ, and it is why
 /// `'r'::"char" || 'x'` reads `"char" || unknown` on both.
+/// Which side of an array `||` is the **element**, or `None` when both or neither is an array.
+///
+/// The wrapping this decides is what makes the operator's two NULL rules one rule; see the arm in
+/// [`resolve`] that calls it.
+fn concat_element_side(args: &[Expr], scope: &Scope<'_>) -> Option<usize> {
+    let is_array = |at: usize| {
+        matches!(expr_type(&args[at], scope), Ok(ty)
+            if esker_keys::array::ArrayValue::element_of(ty).is_some())
+    };
+    match (is_array(0), is_array(1)) {
+        (true, false) => Some(1),
+        (false, true) => Some(0),
+        _ => None,
+    }
+}
+
 fn concat_operand_name(expr: Option<&Expr>, scope: &Scope<'_>) -> String {
     match expr {
         None | Some(Expr::Literal(Literal::String(_) | Literal::Null)) => "unknown".to_owned(),
