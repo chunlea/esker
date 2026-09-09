@@ -1,0 +1,21 @@
+crates/esker-sql/tests/routing_differential.rs
+  s_2bed4ac2b1c944::t_29179f8bf590a3 1444-1572
+docs/plans/phase-16-mpp.md
+  s_2bed4ac2b1c944::t_0dee6a861e4be9 536-582
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "78d7a67603ee5f803119c8ed1c75c5b1658f527c",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
