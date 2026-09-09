@@ -3363,7 +3363,7 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // An `oid` is a number and compares with the integers: `26::oid = 26` is `t`.
             | ColumnType::Oid
             | ColumnType::Numeric => 0,
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => 1,
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Bpchar => 1,
             ColumnType::Bool => 2,
             ColumnType::Bytea => 3,
             // A `date` is in the datetime family, not one of its own: `'2020-01-01'::date =
@@ -3423,6 +3423,9 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // early return below; this rank exists so the match stays total.
             ColumnType::Point => 57,
             ColumnType::PointArray => 58,
+            // Its own family: an array compares with an array of the same element, and 85 is the
+            // next number nothing else uses — 59 is `floatrange`'s and 77 `xml`'s.
+            ColumnType::BoxArray => 85,
             // A family each, like every other range: a `floatrange` compares with a
             // `floatrange` and `float_range = '[0.5,0.7]'::numrange` is `42883`, measured.
             ColumnType::FloatRange => 59,

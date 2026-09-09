@@ -24,17 +24,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', current_database()",
         "SELECT 'r', datname FROM pg_database WHERE datname = current_database()",
     ],
-    answers: &[(
-        "SELECT 'r', 'a'::name = 'a'::name",
-        "**A cast to `name`**, PostgreSQL's 63-byte identifier type, which is not one of the \
-             stored types (ADR 0033) and has no spelling here at all — the standing choice is that \
-             every catalog column and every server function answering a `name` answers a `text`, \
-             declared in the `types` list above and in `tests/coalesce.rs`. So the two halves are \
-             one fact: a `name` cannot be *reported* and cannot be *cast to*. It compares \
-             identically, which is why the row this line asks for is right on both sides and only \
-             the cast is refused. A type-surface item, not a database one.",
-        "pg19_two_database_dogs.txt:76",
-    )],
+    // **This list is empty now.** It held `'a'::name = 'a'::name`, declared because `name` was
+    // "not one of the stored types and has no spelling here at all". It is a stored type as of
+    // ADR 0084, the cast answers, and rule 2 says the entry goes rather than becoming a comment
+    // about a gap that closed.
+    answers: &[],
 };
 
 #[test]

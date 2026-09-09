@@ -124,11 +124,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_regtype.txt:79",
         ),
         (
-            "SELECT 'oid'::regtype::oid, 'name'::regtype::oid, 'regtype'::regtype::oid",
-            NO_SUCH_TYPE,
-            "pg19_regtype.txt:80",
-        ),
-        (
             "SELECT 'time without time zone'::regtype::oid, 'timetz'::regtype::oid, \
              'time with time zone'::regtype::oid",
             NO_SUCH_TYPE,

@@ -33,15 +33,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// one. It closes one type at a time as types arrive.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[(
-        "SELECT format_type(26, NULL), format_type(19, NULL), format_type(2206, NULL)",
-        "the same, for the three types this node deliberately does not have: `oid`, `name` and \
-             `regtype` are the ones `pg_catalog`'s own columns are declared as on a real server, \
-             and this node reports those columns as `bigint` and `text` (declared in \
-             `tests/pg_catalog.rs`). A `format_type` that named them would name types no \
-             `RowDescription` from here ever carries.",
-        "pg19_format_type.txt:50",
-    )],
+    // **This list is empty now, and it held one entry that closed by itself.** `format_type(26,
+    // NULL), format_type(19, NULL), format_type(2206, NULL)` was declared a divergence "for the
+    // three types this node deliberately does not have" — `oid`, `name` and `regtype`. All three
+    // arrived since, `name` last (ADR 0084), and the statement agrees. Rule 2: a listed
+    // divergence that starts agreeing is deleted rather than kept as a comment about a gap that
+    // is closed.
+    answers: &[],
 };
 
 #[test]

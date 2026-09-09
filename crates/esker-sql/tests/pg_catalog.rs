@@ -189,6 +189,10 @@ fn activerecord_s_four_type_map_queries_answer() {
         vec![
             vec!["16", "bool", "0", ",", "boolin", "\\N", "b", "0"],
             vec!["17", "bytea", "0", ",", "byteain", "\\N", "b", "0"],
+            // **`name` answers this query now** (ADR 0084). It is one of the forty names
+            // `ActiveRecord` asks for, and until the type existed the row simply was not there —
+            // the adapter saw a type map with a hole where its own catalog columns are declared.
+            vec!["19", "name", "0", ",", "namein", "\\N", "b", "0"],
             vec!["20", "int8", "0", ",", "int8in", "\\N", "b", "0"],
             vec!["21", "int2", "0", ",", "int2in", "\\N", "b", "0"],
             vec!["23", "int4", "0", ",", "int4in", "\\N", "b", "0"],
@@ -458,6 +462,20 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "_point".to_owned(),
                 "600".to_owned(),
                 ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            // **`_box` is the one array in all of `pg_type` whose delimiter is not a comma**, and
+            // it is here because `type_lookup_test.rb` looks it up by oid to read exactly that.
+            // The `;` is `box`'s own: a box is written `(x1,y1),(x2,y2)`, so a comma could not
+            // separate two of them.
+            vec![
+                "1020".to_owned(),
+                "_box".to_owned(),
+                "603".to_owned(),
+                ";".to_owned(),
                 "array_in".to_owned(),
                 "\\N".to_owned(),
                 "b".to_owned(),

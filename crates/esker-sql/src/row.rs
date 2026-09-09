@@ -81,6 +81,7 @@ mod tests {
             | ColumnType::TsVectorArray
             | ColumnType::TsQueryArray
             | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray
+ | ColumnType::BoxArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
@@ -180,7 +181,9 @@ mod tests {
                 .prop_map(|text| Datum::from_text(ColumnType::Numeric, text).unwrap_or(Datum::Null)),
             ]
             .boxed(),
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
+            // A `name` is text here: the 63-byte truncation belongs to the cast, where the
+            // character boundary is known, and the codec round-trips whatever it is handed.
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Bpchar => {
                 ".{0,32}".prop_map(Datum::Text).boxed()
             }
             // Documents, because that is what these columns hold — the row codec is only ever
