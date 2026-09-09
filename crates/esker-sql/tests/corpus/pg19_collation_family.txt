@@ -1,0 +1,187 @@
+# **Which expressions PostgreSQL will not derive a collation for, and which contexts ask.**
+#
+# `docs/plans/debts-v1.1.md` #19 recorded one row of this: a real server refuses
+# `GENERATED ALWAYS AS (upper('a')) STORED` with `42P22 could not determine which collation to use
+# for upper() function`, and this node builds the column. The brief was to measure the **family**
+# before deciding anything, and the family has two independent halves.
+#
+# ## Half one: which operations need a collation
+#
+# An operation that *uses* a collation is refused when every input is a literal; one that does not
+# use one is accepted. The message names the operation, and the three names are its own:
+#
+#   REFUSED  upper('a')  lower('a')  upper('a'::text)  upper(1::text)   -> "upper()/lower() function"
+#   REFUSED  ('a' < 'b')  ('a' = 'b')  replace('abc','b','x')           -> "string comparison"
+#   REFUSED  ('ab' LIKE 'a%')                                           -> "LIKE"
+#
+#   accepted  'a'   ('a')::text   (1 + 2)
+#   accepted  length('a')  octet_length('a')  md5('a')  substr('abc',1,2)  btrim(' a ')
+#   accepted  ('a' || 'b')   COALESCE('a','b')   CASE WHEN true THEN 'a' ELSE 'b' END
+#   accepted  upper(t)  upper(u)  (t || 'x')  (t < 'b')      -- a COLUMN settles it
+#
+# `replace` is in the first group and `substr` in the second, which is the pair worth keeping: both
+# are string functions and only one compares. Concatenation needs no collation at all. Neither of
+# those is derivable from a name — they are rows here.
+#
+# ## Half two: only a **column** settles it, and only in some contexts
+#
+# An explicit `COLLATE` on a literal does **not** make a stored expression acceptable, wherever it
+# is written — measured one placement at a time:
+#
+#   REFUSED  upper('a' COLLATE "C")        upper('a'::text COLLATE "C")
+#   REFUSED  upper('a') COLLATE "C"        (('a' COLLATE "C") < 'b')
+#   accepted upper(t COLLATE "C")          -- prints back as `upper((t COLLATE "C"))`
+#
+# And the same expression is refused or answered according to **where it is written**:
+#
+#   SELECT upper('a')                          answers `A`
+#   DEFAULT upper('a')                         accepted, and prints `upper('a'::text)`
+#   DEFAULT ('a' < 'b')                        accepted, and prints `('a'::text < 'b'::text)`
+#   GENERATED ALWAYS AS (upper('a')) STORED    42P22
+#   CREATE INDEX ON t ((upper('a')))           42P22
+#   CHECK (upper('a') = 'A')                   42P22
+#
+# So a `DEFAULT` is **not** a collation-requiring context and the other three stored contexts are —
+# which is a distinction about what the value is *for*: a default is evaluated per row when the row
+# is written, while a generated column, an index key and a check constraint are values that get
+# **compared**, and a comparison is what needs the collation. That reading is consistent with every
+# row above and is not asserted by any of them; the `why` is PostgreSQL's own and is not measured
+# here.
+#
+# **Two read-backs go through `replace(..., '|', '!')`, and debt #20 is why.** A corpus row is
+# `statement TAB types TAB rows` with columns split on `'|'` and no escape, so a *value* holding a
+# pipe is parsed as extra columns: `('a'::text || 'b'::text)` came back as five fields against
+# three and the row "disagreed" while reading identically in the report. Second time that has cost
+# a round — `pg19_deparse_parens.txt` has the same wrapper for the same reason — which is what the
+# register's #20 is for.
+#
+# **Every probe the *node* might refuse is guarded too, not only the ones PostgreSQL refuses.**
+# A capture is taken against PostgreSQL, so a row it accepts looks safe — and three of these are
+# rows this node declines, which abort the replay's transaction and swallow whatever follows
+# (parity rule 3 reports it). `collation_name` is the sharpest case: PostgreSQL answers `C` and
+# this node has no such column, so nothing about the capture suggested a savepoint was needed.
+# In a corpus whose subject *is* a gap, guard every probe.
+#
+# Captured against esker-pg19 (PostgreSQL 19beta1) with
+# `sesscap.py captures-src/pg19_collation_family.txt.in`, inside one `BEGIN ... ROLLBACK`, every
+# expected refusal guarded by its own `SAVEPOINT`/`ROLLBACK TO` — the first pass had one refusal
+# outside a savepoint and it swallowed the two rows after it — and verified idempotent by replaying
+# `cut -f1` of the result through the same recorder.
+BEGIN		-
+CREATE TABLE g1co (t text, u text COLLATE "C", n integer)		-
+SELECT 'r', upper('a')	text,text	r|A
+SELECT 'r', 'a' < 'b'	text,boolean	r|t
+SELECT 'r', ('a' || 'b')	text,text	r|ab
+CREATE TABLE g1cd (a text DEFAULT upper('a'), b boolean DEFAULT ('a' < 'b'), c text DEFAULT ('a' || 'b'))		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cd'::regclass ORDER BY a.attnum		r|a|upper('a'::text) ; r|b|('a'::text < 'b'::text) ; r|c|('a'::text !! 'b'::text)
+SAVEPOINT sp_gc_upper_lit		-
+ALTER TABLE g1co ADD COLUMN gc_upper_lit text GENERATED ALWAYS AS (upper('a')) STORED	!42P22 could not determine which collation to use for upper() function HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_gc_upper_lit		-
+SAVEPOINT sp_gc_upper_col		-
+ALTER TABLE g1co ADD COLUMN gc_upper_col text GENERATED ALWAYS AS (upper(t)) STORED		-
+ROLLBACK TO sp_gc_upper_col		-
+SAVEPOINT sp_gc_upper_collate		-
+ALTER TABLE g1co ADD COLUMN gc_upper_collate text GENERATED ALWAYS AS (upper('a' COLLATE "C")) STORED	!42P22 could not determine which collation to use for upper() function HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_gc_upper_collate		-
+SAVEPOINT sp_gc_upper_colcol		-
+ALTER TABLE g1co ADD COLUMN gc_upper_colcol text GENERATED ALWAYS AS (upper(u)) STORED		-
+ROLLBACK TO sp_gc_upper_colcol		-
+SAVEPOINT sp_gc_upper_cast		-
+ALTER TABLE g1co ADD COLUMN gc_upper_cast text GENERATED ALWAYS AS (upper('a'::text)) STORED	!42P22 could not determine which collation to use for upper() function HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_gc_upper_cast		-
+SAVEPOINT sp_gc_lower_lit		-
+ALTER TABLE g1co ADD COLUMN gc_lower_lit text GENERATED ALWAYS AS (lower('a')) STORED	!42P22 could not determine which collation to use for lower() function HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_gc_lower_lit		-
+SAVEPOINT sp_gc_concat_lit		-
+ALTER TABLE g1co ADD COLUMN gc_concat_lit text GENERATED ALWAYS AS (('a' || 'b')) STORED		-
+ROLLBACK TO sp_gc_concat_lit		-
+SAVEPOINT sp_gc_concat_mix		-
+ALTER TABLE g1co ADD COLUMN gc_concat_mix text GENERATED ALWAYS AS ((t || 'x')) STORED		-
+ROLLBACK TO sp_gc_concat_mix		-
+SAVEPOINT sp_gc_lt_lit		-
+ALTER TABLE g1co ADD COLUMN gc_lt_lit boolean GENERATED ALWAYS AS (('a' < 'b')) STORED	!42P22 could not determine which collation to use for string comparison HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_gc_lt_lit		-
+SAVEPOINT sp_gc_eq_lit		-
+ALTER TABLE g1co ADD COLUMN gc_eq_lit boolean GENERATED ALWAYS AS (('a' = 'b')) STORED	!42P22 could not determine which collation to use for string comparison HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_gc_eq_lit		-
+SAVEPOINT sp_gc_lt_mix		-
+ALTER TABLE g1co ADD COLUMN gc_lt_mix boolean GENERATED ALWAYS AS ((t < 'b')) STORED		-
+ROLLBACK TO sp_gc_lt_mix		-
+SAVEPOINT sp_gc_like_lit		-
+ALTER TABLE g1co ADD COLUMN gc_like_lit boolean GENERATED ALWAYS AS (('ab' LIKE 'a%')) STORED	!42P22 could not determine which collation to use for LIKE HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_gc_like_lit		-
+SAVEPOINT sp_gc_length_lit		-
+ALTER TABLE g1co ADD COLUMN gc_length_lit integer GENERATED ALWAYS AS (length('a')) STORED		-
+ROLLBACK TO sp_gc_length_lit		-
+SAVEPOINT sp_gc_md5_lit		-
+ALTER TABLE g1co ADD COLUMN gc_md5_lit text GENERATED ALWAYS AS (md5('a')) STORED		-
+ROLLBACK TO sp_gc_md5_lit		-
+SAVEPOINT sp_gc_octet_lit		-
+ALTER TABLE g1co ADD COLUMN gc_octet_lit integer GENERATED ALWAYS AS (octet_length('a')) STORED		-
+ROLLBACK TO sp_gc_octet_lit		-
+SAVEPOINT sp_gc_substr_lit		-
+ALTER TABLE g1co ADD COLUMN gc_substr_lit text GENERATED ALWAYS AS (substr('abc', 1, 2)) STORED		-
+ROLLBACK TO sp_gc_substr_lit		-
+SAVEPOINT sp_gc_replace_lit		-
+ALTER TABLE g1co ADD COLUMN gc_replace_lit text GENERATED ALWAYS AS (replace('abc', 'b', 'x')) STORED	!42P22 could not determine which collation to use for string comparison HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_gc_replace_lit		-
+SAVEPOINT sp_gc_btrim_lit		-
+ALTER TABLE g1co ADD COLUMN gc_btrim_lit text GENERATED ALWAYS AS (btrim(' a ')) STORED		-
+ROLLBACK TO sp_gc_btrim_lit		-
+SAVEPOINT sp_gc_lit_only		-
+ALTER TABLE g1co ADD COLUMN gc_lit_only text GENERATED ALWAYS AS ('a') STORED		-
+ROLLBACK TO sp_gc_lit_only		-
+SAVEPOINT sp_gc_cast_only		-
+ALTER TABLE g1co ADD COLUMN gc_cast_only text GENERATED ALWAYS AS (('a')::text) STORED		-
+ROLLBACK TO sp_gc_cast_only		-
+SAVEPOINT sp_gc_num		-
+ALTER TABLE g1co ADD COLUMN gc_num integer GENERATED ALWAYS AS ((1 + 2)) STORED		-
+ROLLBACK TO sp_gc_num		-
+SAVEPOINT sp_gc_case_lit		-
+ALTER TABLE g1co ADD COLUMN gc_case_lit text GENERATED ALWAYS AS ((CASE WHEN true THEN 'a' ELSE 'b' END)) STORED		-
+ROLLBACK TO sp_gc_case_lit		-
+SAVEPOINT sp_gc_coalesce_lit		-
+ALTER TABLE g1co ADD COLUMN gc_coalesce_lit text GENERATED ALWAYS AS (COALESCE('a', 'b')) STORED		-
+ROLLBACK TO sp_gc_coalesce_lit		-
+SAVEPOINT sp_gc_upper_num		-
+ALTER TABLE g1co ADD COLUMN gc_upper_num text GENERATED ALWAYS AS (upper(1::text)) STORED	!42P22 could not determine which collation to use for upper() function HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_gc_upper_num		-
+ALTER TABLE g1co ADD COLUMN k_upper_col text GENERATED ALWAYS AS (upper(t)) STORED		-
+SAVEPOINT sp_c_lit_collate		-
+ALTER TABLE g1co ADD COLUMN c_lit_collate text GENERATED ALWAYS AS (upper('a' COLLATE "C")) STORED	!42P22 could not determine which collation to use for upper() function HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_c_lit_collate		-
+SAVEPOINT sp_c_cast_collate		-
+ALTER TABLE g1co ADD COLUMN c_cast_collate text GENERATED ALWAYS AS (upper('a'::text COLLATE "C")) STORED	!42P22 could not determine which collation to use for upper() function HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_c_cast_collate		-
+SAVEPOINT sp_c_outside		-
+ALTER TABLE g1co ADD COLUMN c_outside text GENERATED ALWAYS AS (upper('a') COLLATE "C") STORED	!42P22 could not determine which collation to use for upper() function HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_c_outside		-
+SAVEPOINT sp_c_cmp_collate		-
+ALTER TABLE g1co ADD COLUMN c_cmp_collate text GENERATED ALWAYS AS ((('a' COLLATE "C") < 'b')) STORED	!42P22 could not determine which collation to use for string comparison HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_c_cmp_collate		-
+ALTER TABLE g1co ADD COLUMN k_col_collate text GENERATED ALWAYS AS (upper(t COLLATE "C")) STORED		-
+SAVEPOINT sp_k_upper_collate		-
+ALTER TABLE g1co ADD COLUMN k_upper_collate text GENERATED ALWAYS AS (upper('a' COLLATE "C")) STORED	!42P22 could not determine which collation to use for upper() function HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_k_upper_collate		-
+ALTER TABLE g1co ADD COLUMN k_length_lit integer GENERATED ALWAYS AS (length('a')) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1co'::regclass AND a.attnum > 3 ORDER BY a.attnum		r|k_upper_col|upper(t) ; r|k_col_collate|upper((t COLLATE "C")) ; r|k_length_lit|length('a'::text)
+SAVEPOINT sp_ix_lit		-
+CREATE INDEX g1co_ix1 ON g1co ((upper('a')))		-
+ROLLBACK TO sp_ix_lit		-
+CREATE INDEX g1co_ix2 ON g1co ((upper(t)))		-
+SELECT 'r', pg_get_expr(x.indexprs, x.indrelid) FROM pg_index x WHERE x.indexrelid = 'g1co_ix2'::regclass		r|upper(t)
+SAVEPOINT sp_ck_lit		-
+ALTER TABLE g1co ADD CONSTRAINT g1co_ck1 CHECK (upper('a') = 'A')		-
+ROLLBACK TO sp_ck_lit		-
+ALTER TABLE g1co ADD CONSTRAINT g1co_ck2 CHECK (upper(t) = 'A')		-
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'g1co'::regclass AND contype = 'c' ORDER BY conname		r|g1co_ck2|CHECK ((upper(t) = 'A'::text))
+SAVEPOINT sp_mismatch		-
+SELECT 'r', (u COLLATE "C") < (t COLLATE "POSIX") FROM g1co	!42P21 collation mismatch between explicit collations "C" and "POSIX"
+ROLLBACK TO sp_mismatch		-
+SAVEPOINT sp_collation_name		-
+SELECT 'r', collation_name FROM information_schema.columns WHERE table_name = 'g1co' AND column_name = 'u'	text,name	r|C
+ROLLBACK TO sp_collation_name		-
+DROP TABLE g1cd		-
+DROP TABLE g1co		-
+ROLLBACK		-
+SELECT 'r', count(*) FROM pg_class WHERE relname IN ('g1co','g1cd')	text,bigint	r|0
