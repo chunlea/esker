@@ -1384,7 +1384,7 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             render(operand, columns),
             if *negated { "NOT " } else { "" }
         ),
-        Expr::AnyArray { operand, array } => format!(
+        Expr::QuantifiedArray { operand, array, .. } => format!(
             "{} = ANY ({})",
             render(operand, columns),
             render(array, columns)

@@ -1577,6 +1577,16 @@ pub enum SqlError {
     #[error("count(*) must be used to call a parameterless aggregate function")]
     ParameterlessAggregate,
 
+    /// `1 = ALL (1)` — a quantified comparison whose right-hand side is not an array.
+    ///
+    /// PostgreSQL's own sentence, to the character, and its own `42809` rather than the `42883` a
+    /// missing operator gets: the operator exists, the *shape* on the right is wrong. Measured on
+    /// 19beta1 (`tests/corpus/pg19_all_quantifier.txt`). It names both quantifiers because
+    /// PostgreSQL does — the message is one string for `ANY` and `ALL` alike, which is a small
+    /// piece of evidence that they are one construct.
+    #[error("op ANY/ALL (array) requires array on right side")]
+    QuantifierNeedsArray,
+
     /// An aggregate called with a number of arguments it has no form for. A **different** `DETAIL`
     /// from [`SqlError::UndefinedAggregate`]: PostgreSQL distinguishes the wrong *number* of
     /// arguments from the wrong *types*, and both sentences were captured.
@@ -2989,6 +2999,7 @@ impl SqlError {
             | SqlError::ConstraintNotDeferrable(_)
             | SqlError::IndexNotUnique(_)
             | SqlError::ParameterlessAggregate
+            | SqlError::QuantifierNeedsArray
             | SqlError::ExclusionOperatorNotInFamily { .. }
             // A template database is there rather than missing, and is not a dependency violation
             // either: it is a kind of database `DROP DATABASE` cannot act on.

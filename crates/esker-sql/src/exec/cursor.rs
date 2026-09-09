@@ -2589,11 +2589,13 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 Some(None) | None => Datum::Null,
             }
         }
-        Expr::AnyArray { operand, array } => {
+        Expr::QuantifiedArray {
+            operand,
+            op,
+            all,
+            array,
+        } => {
             let operand = evaluate_in(operand, row, env)?;
-            if matches!(operand, Datum::Null) {
-                return Ok(Datum::Null);
-            }
             let Some(array) = read_array(&evaluate_in(array, row, env)?)? else {
                 // A NULL array, which is not an empty one: `1 = ANY(NULL::int[])` is NULL where
                 // `1 = ANY('{}')` is false. Measured, both.
@@ -2602,6 +2604,13 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             // Each element is read **as the operand's type**, which is the same rule the plan-time
             // form uses: an array's elements have no type of their own here, and what gives them
             // one is what they are being compared against.
+            //
+            // **A NULL operand is decided here and not before the array is read**, which is the
+            // one edge that made this arm wrong for as long as it existed:
+            // `NULL = ANY (ARRAY[]::integer[])` is `f` and `NULL = ALL (…)` of an empty array is
+            // `t`, because an empty array settles the quantifier with no comparison at all —
+            // measured, and the subquery form's own doc has said so since it was written. The old
+            // `if operand is NULL { return NULL }` above ran first and answered NULL.
             let ty = operand.column_type().unwrap_or(ColumnType::Text);
             let mut values = Vec::with_capacity(array.elements.len());
             for element in &array.elements {
@@ -2610,7 +2619,7 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     None => Datum::Null,
                 });
             }
-            three_valued_match(&operand, &values, false)
+            crate::exec::subquery::quantified_over(*op, *all, &operand, &values)
         }
 
         Expr::Binary { op, left, right } => {

@@ -1058,7 +1058,7 @@ pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) 
         // complete: whatever is not here is never visited, so a `$1` inside it is never bound and
         // a `'x'::regclass` inside it is never resolved. Measured — `'rc'::regclass::text` reached
         // the row evaluator with the cast unresolved, because a cast to text was not on this list.
-        Expr::AnyArray { operand, array } => {
+        Expr::QuantifiedArray { operand, array, .. } => {
             walk_expr_mut(operand, visit);
             walk_expr_mut(array, visit);
         }
@@ -1389,7 +1389,7 @@ pub(super) fn descend<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
                 descend(arg, visit);
             }
         }
-        Expr::AnyArray { operand, array } => {
+        Expr::QuantifiedArray { operand, array, .. } => {
             descend(operand, visit);
             descend(array, visit);
         }
