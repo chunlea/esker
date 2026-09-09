@@ -5,9 +5,12 @@
 # Two days of run-108-shaped reds had one thing in common -- they were **wrong and green**: the
 # node printed a stored expression differently from a real server and no test in this repository
 # said so, because each reader had been measured on the shapes that happened to reach it. This
-# file is the cross product instead: 42 expression shapes and 10 constants against the eight
-# readers each admits, 160 probes, so the next parenthesis rule is learned here and not from the
-# suite.
+# file is the cross product instead: 57 expression shapes and 10 constants against the eight
+# readers each admits, 184 probes, so the next parenthesis rule is learned here and not from the
+# suite. Fifteen of the shapes were added by group A's own measurement, which is the census
+# working: a four-term chain, a chain parenthesised in the middle, a `CASE` under an arithmetic
+# operator, under a `NOT`, and on either side of an `AND`, and an exclusion constraint's predicate
+# through both of its readers.
 #
 #     shapes   binary chains (AND/OR mixed and nested) * operator-spelled functions in both
 #              directions * CASE searched and simple, with comparisons and functions in every
@@ -684,4 +687,105 @@ SAVEPOINT sp_d_mod		-
 ALTER TABLE cend ALTER COLUMN t SET DEFAULT (mod(7, 3))::text		-
 SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'		(mod(7, 3))::text
 ROLLBACK TO sp_d_mod		-
+CREATE TABLE cenx (s date, e date, b integer, flag boolean)		-
+SAVEPOINT sp_chain4		-
+ALTER TABLE cen ADD CONSTRAINT k4 CHECK (a > 0 AND b > 0 AND a < 9 AND b < 9)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k4'		CHECK (((a > 0) AND (b > 0) AND (a < 9) AND (b < 9)))
+ROLLBACK TO sp_chain4		-
+SAVEPOINT sp_chain4_p		-
+ALTER TABLE cen ADD CONSTRAINT k4 CHECK (a > 0 AND b > 0 AND a < 9 AND b < 9)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k4'		CHECK (a > 0 AND b > 0 AND a < 9 AND b < 9)
+ROLLBACK TO sp_chain4_p		-
+SAVEPOINT sp_chain4_mid		-
+ALTER TABLE cen ADD CONSTRAINT k4m CHECK ((a > 0 AND b > 0) AND (a < 9 AND b < 9))		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k4m'		CHECK (((a > 0) AND (b > 0) AND ((a < 9) AND (b < 9))))
+ROLLBACK TO sp_chain4_mid		-
+SAVEPOINT sp_chain4_mid_p		-
+ALTER TABLE cen ADD CONSTRAINT k4m CHECK ((a > 0 AND b > 0) AND (a < 9 AND b < 9))		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'k4m'		CHECK (a > 0 AND b > 0 AND a < 9 AND b < 9)
+ROLLBACK TO sp_chain4_mid_p		-
+SAVEPOINT sp_chain_right		-
+ALTER TABLE cen ADD CONSTRAINT k4r CHECK (a > 0 AND (b > 0 AND a < 9))		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'k4r'		CHECK (((a > 0) AND ((b > 0) AND (a < 9))))
+ROLLBACK TO sp_chain_right		-
+SAVEPOINT sp_case_arith		-
+ALTER TABLE cen ADD CONSTRAINT kca CHECK (a + CASE WHEN flag THEN 1 ELSE 2 END > 0)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'kca'		CHECK (((a +\nCASE\n    WHEN flag THEN 1\n    ELSE 2\nEND) > 0))
+ROLLBACK TO sp_case_arith		-
+SAVEPOINT sp_case_arith_p		-
+ALTER TABLE cen ADD CONSTRAINT kca CHECK (a + CASE WHEN flag THEN 1 ELSE 2 END > 0)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'kca'		CHECK ((a +\nCASE\n    WHEN flag THEN 1\n    ELSE 2\nEND) > 0)
+ROLLBACK TO sp_case_arith_p		-
+SAVEPOINT sp_case_and		-
+ALTER TABLE cen ADD CONSTRAINT kcn CHECK (flag AND CASE WHEN a > 0 THEN true ELSE false END)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'kcn'		CHECK ((flag AND\nCASE\n    WHEN (a > 0) THEN true\n    ELSE false\nEND))
+ROLLBACK TO sp_case_and		-
+SAVEPOINT sp_case_and_p		-
+ALTER TABLE cen ADD CONSTRAINT kcn CHECK (flag AND CASE WHEN a > 0 THEN true ELSE false END)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'kcn'		CHECK (flag AND\nCASE\n    WHEN a > 0 THEN true\n    ELSE false\nEND)
+ROLLBACK TO sp_case_and_p		-
+SAVEPOINT sp_case_not		-
+ALTER TABLE cen ADD CONSTRAINT kcnot CHECK (NOT CASE WHEN a > 0 THEN true ELSE false END)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'kcnot'		CHECK ((NOT\nCASE\n    WHEN (a > 0) THEN true\n    ELSE false\nEND))
+ROLLBACK TO sp_case_not		-
+SAVEPOINT sp_case_not_p		-
+ALTER TABLE cen ADD CONSTRAINT kcnot CHECK (NOT CASE WHEN a > 0 THEN true ELSE false END)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'kcnot'		CHECK (NOT\nCASE\n    WHEN a > 0 THEN true\n    ELSE false\nEND)
+ROLLBACK TO sp_case_not_p		-
+SAVEPOINT sp_case_cmp_p		-
+ALTER TABLE cen ADD CONSTRAINT kcc CHECK (CASE WHEN a > 0 THEN a + 1 ELSE a * 2 END > 0)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'kcc'		CHECK (\nCASE\n    WHEN a > 0 THEN a + 1\n    ELSE a * 2\nEND > 0)
+ROLLBACK TO sp_case_cmp_p		-
+SAVEPOINT sp_ex_bare		-
+ALTER TABLE cenx ADD CONSTRAINT kx EXCLUDE USING gist (daterange(s, e) WITH &&) WHERE (flag)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'kx'		EXCLUDE USING gist (daterange(s, e) WITH &&) WHERE (flag)
+SELECT pg_get_indexdef(conindid) FROM pg_constraint WHERE conname = 'kx'		CREATE INDEX kx ON public.cenx USING gist (daterange(s, e)) WHERE flag
+ROLLBACK TO sp_ex_bare		-
+SAVEPOINT sp_ex_cmp		-
+ALTER TABLE cenx ADD CONSTRAINT kx EXCLUDE USING gist (daterange(s, e) WITH &&) WHERE (b > 0)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'kx'		EXCLUDE USING gist (daterange(s, e) WITH &&) WHERE ((b > 0))
+SELECT pg_get_indexdef(conindid) FROM pg_constraint WHERE conname = 'kx'		CREATE INDEX kx ON public.cenx USING gist (daterange(s, e)) WHERE (b > 0)
+ROLLBACK TO sp_ex_cmp		-
+SAVEPOINT sp_ex_chain		-
+ALTER TABLE cenx ADD CONSTRAINT kx EXCLUDE USING gist (daterange(s, e) WITH &&) WHERE (b > 0 AND flag)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'kx'		EXCLUDE USING gist (daterange(s, e) WITH &&) WHERE (((b > 0) AND flag))
+SELECT pg_get_indexdef(conindid) FROM pg_constraint WHERE conname = 'kx'		CREATE INDEX kx ON public.cenx USING gist (daterange(s, e)) WHERE ((b > 0) AND flag)
+ROLLBACK TO sp_ex_chain		-
+SAVEPOINT sp_ex_or		-
+ALTER TABLE cenx ADD CONSTRAINT kx EXCLUDE USING gist (daterange(s, e) WITH &&) WHERE ((b > 0 OR flag) AND b < 9)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'kx'		EXCLUDE USING gist (daterange(s, e) WITH &&) WHERE ((((b > 0) OR flag) AND (b < 9)))
+SELECT pg_get_indexdef(conindid) FROM pg_constraint WHERE conname = 'kx'		CREATE INDEX kx ON public.cenx USING gist (daterange(s, e)) WHERE (((b > 0) OR flag) AND (b < 9))
+ROLLBACK TO sp_ex_or		-
+SAVEPOINT sp_chain_case		-
+ALTER TABLE cen ADD CONSTRAINT ky1 CHECK (a > 0 AND CASE WHEN a > 5 THEN true ELSE false END)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ky1'		CHECK (((a > 0) AND\nCASE\n    WHEN (a > 5) THEN true\n    ELSE false\nEND))
+ROLLBACK TO sp_chain_case		-
+SAVEPOINT sp_chain_case_p		-
+ALTER TABLE cen ADD CONSTRAINT ky1 CHECK (a > 0 AND CASE WHEN a > 5 THEN true ELSE false END)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'ky1'		CHECK (a > 0 AND\nCASE\n    WHEN a > 5 THEN true\n    ELSE false\nEND)
+ROLLBACK TO sp_chain_case_p		-
+SAVEPOINT sp_case_chain		-
+ALTER TABLE cen ADD CONSTRAINT ky2 CHECK (CASE WHEN a > 5 THEN true ELSE false END AND a > 0)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ky2'		CHECK ((\nCASE\n    WHEN (a > 5) THEN true\n    ELSE false\nEND AND (a > 0)))
+ROLLBACK TO sp_case_chain		-
+SAVEPOINT sp_case_chain_p		-
+ALTER TABLE cen ADD CONSTRAINT ky2 CHECK (CASE WHEN a > 5 THEN true ELSE false END AND a > 0)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'ky2'		CHECK (\nCASE\n    WHEN a > 5 THEN true\n    ELSE false\nEND AND a > 0)
+ROLLBACK TO sp_case_chain_p		-
+SAVEPOINT sp_chain_case_mid		-
+ALTER TABLE cen ADD CONSTRAINT ky3 CHECK (a > 0 AND CASE WHEN a > 5 THEN true ELSE false END AND b > 0)		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ky3'		CHECK (((a > 0) AND\nCASE\n    WHEN (a > 5) THEN true\n    ELSE false\nEND AND (b > 0)))
+ROLLBACK TO sp_chain_case_mid		-
+SAVEPOINT sp_chain_case_mid_p		-
+ALTER TABLE cen ADD CONSTRAINT ky3 CHECK (a > 0 AND CASE WHEN a > 5 THEN true ELSE false END AND b > 0)		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'ky3'		CHECK (a > 0 AND\nCASE\n    WHEN a > 5 THEN true\n    ELSE false\nEND AND b > 0)
+ROLLBACK TO sp_chain_case_mid_p		-
+SAVEPOINT sp_nest_case		-
+ALTER TABLE cen ADD CONSTRAINT ky4 CHECK (a > 0 AND (CASE WHEN a > 5 THEN true ELSE false END AND b > 0))		-
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ky4'		CHECK (((a > 0) AND (\nCASE\n    WHEN (a > 5) THEN true\n    ELSE false\nEND AND (b > 0))))
+ROLLBACK TO sp_nest_case		-
+SAVEPOINT sp_nest_case_p		-
+ALTER TABLE cen ADD CONSTRAINT ky4 CHECK (a > 0 AND (CASE WHEN a > 5 THEN true ELSE false END AND b > 0))		-
+SELECT pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conname = 'ky4'		CHECK (a > 0 AND\nCASE\n    WHEN a > 5 THEN true\n    ELSE false\nEND AND b > 0)
+ROLLBACK TO sp_nest_case_p		-
 ROLLBACK		-

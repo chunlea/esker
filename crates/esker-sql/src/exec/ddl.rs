@@ -217,6 +217,7 @@ pub(super) fn create_table(
     normalise_defaults(&mut table);
     normalise_checks(&mut table);
     normalise_index_predicates(&mut table);
+    normalise_exclude_predicates(&mut table);
     let table = table;
     // Resolved against a table that is not in the catalog yet, which is what lets a
     // self-reference — `CREATE TABLE t (id int8 PRIMARY KEY, parent int8 REFERENCES t)` — work
@@ -728,7 +729,15 @@ fn add_exclude(
         });
     }
     validate_exclude_rows(txn, executor, updated, exclude)?;
-    updated.excludes.push(exclude.clone());
+    // The seventh reader, at the statement that writes one — the same rule the `CHECK` and the
+    // partial index above follow, and for the same reason: what is stored is what is printed.
+    let mut exclude = exclude.clone();
+    if let Some(predicate) = &exclude.predicate
+        && let Some(text) = deparse_wrapped_predicate(updated, predicate)
+    {
+        exclude.predicate = Some(text);
+    }
+    updated.excludes.push(exclude);
     updated.schema_version += 1;
     catalog::replace_table(txn, executor.tenant, table, updated)
 }
@@ -5681,44 +5690,41 @@ fn parenthesise(body: &str) -> String {
     }
 }
 
-/// One boolean expression a **reader wraps**, printed the way that reader prints it.
+/// An operand with the separator that goes in front of it — a space, or **a line break when the
+/// operand is a `CASE`**.
 ///
-/// A `CHECK` and a partial index's predicate are both stored as text and both re-parenthesised on
-/// the way out — `pg_get_constraintdef` gives `CHECK ((p > 0))` and `pg_get_expr(indpred)` gives
-/// `(p > 0)` — so what is stored has to be the deparsed form with its **outermost pair removed**,
-/// or the reader's pair lands on top of `deparse`'s and the text gains a level per write.
-/// [`catalog::unparenthesised`] is the same helper [`index_expression`] uses, for the same reason
-/// one column over.
-fn deparse_wrapped_predicate(table: &TableDef, expr: &str) -> Option<String> {
-    // **A top-level `AND`/`OR` chain is deparsed operand by operand**, because its reader
-    // re-parenthesises the operands itself: `pg_get_constraintdef` and `pg_get_expr(indpred)` both
-    // print each operand of a chain in its own pair ([`catalog::parenthesised_operands`],
-    // measured). Deparsing the chain as one expression gave every operand a pair and the reader
-    // added a second — `(((n > 0)) AND flag)`, which `tests/index_deparse.rs` caught — so each
-    // operand is deparsed on its own, stripped of *its* outermost pair, and re-joined with the
-    // keywords the reader will parenthesise around. The split comes from
-    // [`catalog::boolean_chain`], the same scanner the reader uses, so the two cannot disagree
-    // about where an operand ends.
-    //
-    // An operand that does not deparse keeps its written text, which is [`deparse_default`]'s
-    // contract one level down; a chain can therefore be part deparsed and part verbatim, and each
-    // half is right for its own operand.
-    if let Some((operands, separators)) = catalog::boolean_chain(expr) {
-        let mut printed = String::new();
-        for (at, operand) in operands.iter().enumerate() {
-            if at > 0 {
-                printed.push(' ');
-                printed.push_str(separators[at - 1]);
-                printed.push(' ');
-            }
-            match deparse_default(table, operand) {
-                Some(text) => printed.push_str(catalog::unparenthesised(&text)),
-                None => printed.push_str(operand),
-            }
-        }
-        return Some(printed);
+/// A real server starts a `CASE` on its own line wherever it sits, not only at the head of a
+/// parenthesised body: `(a +\nCASE …)`, `(flag AND\nCASE …)`, `(NOT\nCASE …)`, measured through a
+/// `CHECK` in all three positions. The break *replaces* the space rather than following it, so
+/// there is no trailing blank at the end of the line — which is a difference a byte comparison
+/// sees. [`parenthesise`] is the same rule one position earlier, where the `(` is what precedes.
+///
+/// **An operand that already begins with the break keeps it and takes no space.** Flattening a
+/// chain strips the pair off a nested one, and what is left can start with the newline the inner
+/// call put there: `a AND (CASE … AND b)` gives `\nCASE … END AND (b)` for the right-hand side. A
+/// space in front of that is a line ending in one, and nothing else about the text would say so.
+fn spaced(operand: &str) -> String {
+    if operand.starts_with("CASE") {
+        format!("\n{operand}")
+    } else if operand.starts_with('\n') {
+        operand.to_owned()
+    } else {
+        format!(" {operand}")
     }
-    deparse_default(table, expr).map(|text| catalog::unparenthesised(&text).to_owned())
+}
+
+/// One boolean expression, printed exactly the way [`deparse`] prints it.
+///
+/// **The readers add nothing, and that is the whole of group A.** A `CHECK` and a partial index's
+/// predicate used to be stored flat and re-parenthesised at read time by
+/// `catalog::parenthesised_operands`, which split on the top-level keyword and wrapped each piece.
+/// A splitter cannot say which operands bind first: `(a > 0 OR b > 0) AND flag` is
+/// `(((a > 0) OR (b > 0)) AND flag)` on a real server and came back
+/// `(((a > 0)) OR ((b > 0)) AND flag)` here — the grouping lost and a pair doubled. The tree has
+/// the grouping and `deparse` already writes it, so the writer writes all of it and the reader
+/// prints what it was given.
+fn deparse_wrapped_predicate(table: &TableDef, expr: &str) -> Option<String> {
+    deparse_default(table, expr)
 }
 
 /// [`deparse_wrapped_predicate`] for a caller outside this module: the form a predicate is
@@ -5745,6 +5751,28 @@ fn normalise_index_predicates(table: &mut TableDef) {
         };
         if let Some(text) = deparse_wrapped_predicate(&snapshot, predicate) {
             index.predicate = Some(text);
+        }
+    }
+}
+
+/// Every `EXCLUDE`'s predicate on this table, printed the way its index's `pg_get_expr(indpred)`
+/// prints one.
+///
+/// **The seventh reader, and it was reading a text no writer had shaped.** An exclusion
+/// constraint carries its own predicate rather than an [`catalog::IndexDef`]'s, and
+/// `catalog::pg_index` builds the index row straight from it — so the `WHERE` came back as the
+/// user wrote it, `WHERE start_date IS NOT NULL AND end_date IS NOT NULL`, where a real server
+/// gives `WHERE ((start_date IS NOT NULL) AND (end_date IS NOT NULL))`. Measured through both of
+/// its readers at once: `pg_get_constraintdef` wraps this form once more and
+/// `pg_get_indexdef` prints it as it stands.
+fn normalise_exclude_predicates(table: &mut TableDef) {
+    let snapshot = table.clone();
+    for exclude in &mut table.excludes {
+        let Some(predicate) = &exclude.predicate else {
+            continue;
+        };
+        if let Some(text) = deparse_wrapped_predicate(&snapshot, predicate) {
+            exclude.predicate = Some(text);
         }
     }
 }
@@ -6122,18 +6150,57 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
                     deparse(right, table, operand)
                 );
             }
+            // **`AND` and `OR` are n-ary on a real server, and binary here.** PostgreSQL's
+            // `BoolExpr` holds a list, so `a AND b AND c AND d` written without parentheses is one
+            // node and prints `((a) AND (b) AND (c) AND (d))` — flat. This node holds a tree, and
+            // `parse::lower::balance` folds a chain *pairwise* to keep it `log2(n)` deep, so the
+            // same four terms are `(a AND b) AND (c AND d)` here: neither side is the spine.
+            // Flattening only the left printed `((a) AND (b) AND ((c) AND (d)))`, which is a real
+            // server's answer — to the question `CHECK ((a AND b) AND (c AND d))`, measured — and
+            // not the one that was asked.
+            //
+            // **So both sides are flattened, and the written grouping is not recoverable.** A
+            // chain the user *did* parenthesise in the middle lowers to the same balanced tree as
+            // one they did not, so there is nothing left to tell the two apart; the flat form is
+            // what the common shape asks for, and PostgreSQL's pretty spelling flattens both in
+            // any case (`a AND b AND c AND d` for either). The census records the one direction
+            // this leaves: a mid-chain pair the user wrote is not printed back.
+            if matches!(op, plan::BinaryOp::And | plan::BinaryOp::Or) {
+                let chained = |side: &plan::Expr| matches!(side, Expr::Binary { op: inner, .. } if inner == op);
+                if chained(left) || chained(right) {
+                    let side = |side: &plan::Expr| {
+                        let text = deparse(side, table, operand);
+                        if chained(side) {
+                            catalog::unparenthesised(&text).to_owned()
+                        } else {
+                            text
+                        }
+                    };
+                    return parenthesise(&format!(
+                        "{} {}{}",
+                        side(left),
+                        op.symbol(),
+                        spaced(&side(right))
+                    ));
+                }
+            }
             parenthesise(&format!(
-                "{} {} {}",
+                "{} {}{}",
                 deparse(left, table, operand),
                 op.symbol(),
-                deparse(right, table, operand)
+                spaced(&deparse(right, table, operand))
             ))
         }
         Expr::Negate(operand) => format!("(- {})", sub(operand)),
         Expr::Arithmetic {
             op, left, right, ..
-        } => parenthesise(&format!("{} {} {}", sub(left), op.symbol(), sub(right))),
-        Expr::Not(operand) => parenthesise(&format!("NOT {}", sub(operand))),
+        } => parenthesise(&format!(
+            "{} {}{}",
+            sub(left),
+            op.symbol(),
+            spaced(&sub(right))
+        )),
+        Expr::Not(operand) => parenthesise(&format!("NOT{}", spaced(&sub(operand)))),
         Expr::IsNull { operand, negated } => format!(
             "({} IS {}NULL)",
             sub(operand),

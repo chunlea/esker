@@ -38,6 +38,16 @@ Two rules come from that file's own failures, and both are applied here rather t
 > file's eight rows turned out to be closed when somebody looked. So every row below was put to the
 > tree or to a log before it was written, and each says which; the two that could only be taken
 > from another lane's evidence say that too.
+>
+> **The direction where this node is *more permissive* than PostgreSQL had never been asked by a
+> corpus.** Every capture here was taken by writing what a real server accepts and comparing the
+> answers, so a row could only be opened where the node refused or answered differently — and a
+> shape the node accepts and a real server rejects produces no capture at all, because nobody
+> wrote the statement. The deparse census found the same blind spot one layer down, in printing:
+> a reader that was measured on the shapes that happened to reach it is **wrong and green**, and
+> stays that way until something asks it the cross product. Both are the same rule — *the corpus
+> can only answer the question it was written to ask* — and both are cheapest to fix by writing
+> the enumeration rather than the example.
 
 [`docs/acceptance/v1.1.md`](../acceptance/v1.1.md) carries the numbers — run 107 on main
 `9d642ef0`, 10,081 of 10,134 — and points back here for what is left. This file is the what
