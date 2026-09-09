@@ -1,0 +1,22 @@
+crates/esker-sql/src/row.rs
+  h_44076b318daf9c 50,56-78
+crates/esker-sql/tests/captures/pg19_stored_regclass_array.txt
+  h_44076b318daf9c 1-39
+crates/esker-sql/tests/stored_regclass.rs
+  h_44076b318daf9c 140-145,147-151
+crates/esker-sql/tests/stored_regclass_array.rs
+  h_44076b318daf9c 1-116
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,115,127
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "481a7407fed7ba78242b71f2010d5d16ea962f68",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
