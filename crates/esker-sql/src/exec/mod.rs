@@ -4104,7 +4104,7 @@ fn returning_fields(
         return Ok(None);
     };
     let (columns, _) = query::returning_columns(items, table)?;
-    Ok(Some(described(columns)))
+    Ok(Some(described(&columns)))
 }
 
 /// The same for an `UPDATE`, whose `RETURNING` may name a `FROM` relation as readily as the row
@@ -4135,7 +4135,7 @@ fn update_returning_fields(
     };
     let (columns, _) =
         query::returning_columns_over(items, Some(from), &chain, &query::Scope::chain(&entries))?;
-    Ok(Some(described(columns)))
+    Ok(Some(described(&columns)))
 }
 
 /// A resolved target list as the wire describes it.
@@ -4165,7 +4165,7 @@ fn field_of(column: &query::OutputColumn) -> FieldDescription {
     }
 }
 
-fn described(columns: Vec<query::OutputColumn>) -> Vec<FieldDescription> {
+fn described(columns: &[query::OutputColumn]) -> Vec<FieldDescription> {
     columns.iter().map(field_of).collect()
 }
 
