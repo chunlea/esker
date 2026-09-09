@@ -1,0 +1,51 @@
+# **`min(cidr)` is an `inet`** — PostgreSQL 19beta1, 2026-09-09. One `BEGIN … ROLLBACK`,
+# `ON_ERROR_ROLLBACK on` so a refusal cannot swallow the statements after it.
+#
+# r1's wire sweep filed two rows: `min(c::cidr)` and `max(c::cidr)` come back OID 650 (`cidr`) here
+# and 869 (`inet`) on a real server. It is the same shape `min(varchar)` and `min(name)` already
+# have in this crate — **the aggregate decays to the category's preferred type** — and `inet` is the
+# preferred type of the network category the way `text` is of the string one.
+#
+#     pg_typeof(min(c::cidr))                          inet     <- not cidr
+#     pg_typeof(max(c::cidr))                          inet
+#     min(c::cidr), max(c::cidr) over /24 and /8       10.0.0.0/8 | 127.0.0.0/24
+#     min(c::cidr)::text                               10.0.0.0/8
+#     pg_typeof(min(c::inet))                          inet     <- itself, unchanged
+#
+# **The values do not change**, which is what makes this a declared type and not an answer: a
+# `cidr` printed through `inet`'s output function is the same characters, mask included.
+#
+# ## What does *not* decay, and the one that does not exist at all
+#
+#     pg_typeof(array_agg(c::cidr))                    cidr[]   <- the aggregate keeps the type
+#     pg_typeof(greatest('10/8'::cidr, '127/24'::cidr))  cidr    <- and so does GREATEST
+#     pg_typeof(coalesce('10/8'::cidr, '127.0.0.1'::inet))         inet
+#     pg_typeof(CASE WHEN true THEN '10/8'::cidr ELSE '127.0.0.1'::inet END)   inet
+#     '10.0.0.0/8'::cidr = '10.0.0.0/8'::inet          t
+#     '127.0.0.0/24'::cidr::inet                       127.0.0.0/24  (inet)
+#
+#     min(c::macaddr)   42883 function min(macaddr) does not exist
+#
+# **A `macaddr` has no `min` at all**, which is the third rule in the family and not derivable from
+# the first two: `cidr` decays, `inet` keeps itself, and `macaddr` is refused. ADR 0031's law again
+# — the aggregate set is per type and cannot be derived from whether the type is ordered.
+#
+# The 16 statements below are the capture itself — `statement`, `\gdesc` types, rows — taken in this
+# session against `127.0.0.1:55432` with no fixture at all.
+
+SELECT pg_typeof(min(c::cidr)) FROM (VALUES ('127.0.0.0/24')) s(c)	regtype	inet
+SELECT pg_typeof(max(c::cidr)) FROM (VALUES ('127.0.0.0/24')) s(c)	regtype	inet
+SELECT min(c::cidr), max(c::cidr) FROM (VALUES ('127.0.0.0/24'),('10.0.0.0/8')) s(c)	inet,inet	10.0.0.0/8|127.0.0.0/24
+SELECT pg_typeof(min(c::inet)) FROM (VALUES ('127.0.0.1')) s(c)	regtype	inet
+SELECT min(c::inet), max(c::inet) FROM (VALUES ('127.0.0.1'),('10.0.0.1')) s(c)	inet,inet	10.0.0.1|127.0.0.1
+SELECT pg_typeof(min(c::macaddr)) FROM (VALUES ('ff:ff:ff:ff:ff:ff')) s(c)	!42883 function min(macaddr) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT min(c::macaddr) FROM (VALUES ('ff:ff:ff:ff:ff:ff'),('01:23:45:67:89:0a')) s(c)	!42883 function min(macaddr) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT pg_typeof('127.0.0.0/24'::cidr), pg_typeof('127.0.0.1'::inet)	regtype,regtype	cidr|inet
+SELECT '127.0.0.0/24'::cidr::inet, pg_typeof('127.0.0.0/24'::cidr::inet)	inet,regtype	127.0.0.0/24|inet
+SELECT min(c::cidr)::text FROM (VALUES ('127.0.0.0/24'),('10.0.0.0/8')) s(c)	text	10.0.0.0/8
+SELECT pg_typeof(array_agg(c::cidr)) FROM (VALUES ('127.0.0.0/24')) s(c)	regtype	cidr[]
+SELECT pg_typeof(greatest('10.0.0.0/8'::cidr, '127.0.0.0/24'::cidr))	regtype	cidr
+SELECT pg_typeof(coalesce('10.0.0.0/8'::cidr, '127.0.0.1'::inet))	regtype	inet
+SELECT pg_typeof(CASE WHEN true THEN '10.0.0.0/8'::cidr ELSE '127.0.0.1'::inet END)	regtype	inet
+SELECT '10.0.0.0/8'::cidr = '10.0.0.0/8'::inet	boolean	t
+SELECT pg_typeof(min(c::cidr)) FROM (SELECT '127.0.0.0/24'::cidr AS c) s	regtype	inet

@@ -32,6 +32,7 @@ pub mod fragment;
 pub mod gate;
 pub mod raw;
 pub mod region_cache;
+mod renew;
 pub mod retry;
 pub mod router;
 pub mod tcp;

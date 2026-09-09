@@ -1,0 +1,16 @@
+SELECT pg_typeof(min(c::cidr)) FROM (VALUES ('127.0.0.0/24')) s(c)	regtype	inet
+SELECT pg_typeof(max(c::cidr)) FROM (VALUES ('127.0.0.0/24')) s(c)	regtype	inet
+SELECT min(c::cidr), max(c::cidr) FROM (VALUES ('127.0.0.0/24'),('10.0.0.0/8')) s(c)	inet,inet	10.0.0.0/8|127.0.0.0/24
+SELECT pg_typeof(min(c::inet)) FROM (VALUES ('127.0.0.1')) s(c)	regtype	inet
+SELECT min(c::inet), max(c::inet) FROM (VALUES ('127.0.0.1'),('10.0.0.1')) s(c)	inet,inet	10.0.0.1|127.0.0.1
+SELECT pg_typeof(min(c::macaddr)) FROM (VALUES ('ff:ff:ff:ff:ff:ff')) s(c)	!42883 function min(macaddr) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT min(c::macaddr) FROM (VALUES ('ff:ff:ff:ff:ff:ff'),('01:23:45:67:89:0a')) s(c)	!42883 function min(macaddr) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT pg_typeof('127.0.0.0/24'::cidr), pg_typeof('127.0.0.1'::inet)	regtype,regtype	cidr|inet
+SELECT '127.0.0.0/24'::cidr::inet, pg_typeof('127.0.0.0/24'::cidr::inet)	inet,regtype	127.0.0.0/24|inet
+SELECT min(c::cidr)::text FROM (VALUES ('127.0.0.0/24'),('10.0.0.0/8')) s(c)	text	10.0.0.0/8
+SELECT pg_typeof(array_agg(c::cidr)) FROM (VALUES ('127.0.0.0/24')) s(c)	regtype	cidr[]
+SELECT pg_typeof(greatest('10.0.0.0/8'::cidr, '127.0.0.0/24'::cidr))	regtype	cidr
+SELECT pg_typeof(coalesce('10.0.0.0/8'::cidr, '127.0.0.1'::inet))	regtype	inet
+SELECT pg_typeof(CASE WHEN true THEN '10.0.0.0/8'::cidr ELSE '127.0.0.1'::inet END)	regtype	inet
+SELECT '10.0.0.0/8'::cidr = '10.0.0.0/8'::inet	boolean	t
+SELECT pg_typeof(min(c::cidr)) FROM (SELECT '127.0.0.0/24'::cidr AS c) s	regtype	inet
