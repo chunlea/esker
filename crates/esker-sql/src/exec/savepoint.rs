@@ -156,11 +156,7 @@ impl Savepoints {
         // those rows for the life of the outer transaction, and leaves this one in a wait-for graph
         // it has already left — which is the `40P01` Rails sees on the statement *after* its
         // `rescue` (`transaction_nested_test.rb:187`).
-        let locks_at = self.marks[at].locks_at;
-        while self.locks.len() > locks_at {
-            let Some(key) = self.locks.pop() else { break };
-            txn.unlock(&key);
-        }
+        self.give_locks_back_to(self.marks[at].locks_at, txn);
         // And the reads, which are the other half of what a commit is validated against.
         txn.restore_read_set(self.marks[at].reads.clone());
         self.marks.truncate(at + 1);
@@ -168,6 +164,36 @@ impl Savepoints {
             self.marks[at].parameters.clone(),
             self.marks[at].authorization.clone(),
         ))
+    }
+
+    /// **A deadlock raised inside a savepoint**: gives back the locks *this* savepoint took, and
+    /// nothing the block held before it.
+    ///
+    /// The victim of a `40P01` releases at once rather than at its `ROLLBACK TO`, and the reason is
+    /// in the `Lock::Deadlock` arm: the survivor is asleep on those rows and would otherwise wait
+    /// out an already-dead transaction. What the arm used to do was release **everything**, which
+    /// is right for a deadlock in a plain block and wrong inside a savepoint — a savepoint is a
+    /// subtransaction, and what the error kills is the subtransaction. The rows the outer block
+    /// locked before the mark are the rows it will write after the `rescue`.
+    ///
+    /// Shares one log with [`Savepoints::rollback_to`], so the `ROLLBACK TO` that follows finds
+    /// these keys already popped and gives nothing back twice.
+    pub(super) fn abandon_inner_locks(&mut self, txn: &mut dyn Txn) {
+        // No mark means no `Recording`, so this is unreachable through the executor; `0` is still
+        // the honest answer to "how far back does the innermost savepoint go" when there is none.
+        let locks_at = self.marks.last().map_or(0, |mark| mark.locks_at);
+        self.give_locks_back_to(locks_at, txn);
+    }
+
+    /// Unlocks back down to a mark's high-water line, newest first. The one reader of `locks`,
+    /// shared by the `ROLLBACK TO` and the deadlock, so the two can never disagree about which
+    /// locks belong to a savepoint.
+    fn give_locks_back_to(&mut self, locks_at: usize, txn: &mut dyn Txn) {
+        while self.locks.len() > locks_at {
+            // The loop condition is the bound, so there is always one to take.
+            let Some(key) = self.locks.pop() else { break };
+            txn.unlock(&key);
+        }
     }
 
     /// The block is over: every mark and every pre-image with it.
@@ -313,8 +339,14 @@ impl Txn for Recording<'_> {
         self.inner.restart_statement()
     }
 
+    /// **Scoped to the savepoint, and that is the whole difference between a block that survives
+    /// its deadlock and one that has quietly ended.**
+    ///
+    /// Forwarding this gave every lock back, including the ones the outer block took before the
+    /// mark — so a `40P01` inside a nested `transaction do` handed another session rows the block
+    /// was still going to write. See [`Savepoints::abandon_inner_locks`].
     fn abandon_locks(&mut self) {
-        self.inner.abandon_locks();
+        self.savepoints.abandon_inner_locks(&mut *self.inner);
     }
 
     fn begin_statement(&mut self) -> Result<()> {
@@ -382,5 +414,98 @@ impl Txn for Recording<'_> {
         Err(SqlError::Internal(
             "a recording transaction was rolled back".to_owned(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Parameters, Recording, Savepoints};
+    use crate::backend::{Backend, Lock, MemoryBackend, Txn};
+
+    /// **A deadlock inside a savepoint gives back what the savepoint took, and not what the block
+    /// held before it.**
+    ///
+    /// The victim of a `40P01` releases at once so the survivor stops waiting — but a savepoint is
+    /// a *sub*transaction, and what dies with it is the subtransaction. The rows the outer block
+    /// locked before the mark are the rows it is going to write after the `rescue`, and a server
+    /// that hands them to somebody else in between has ended the transaction without saying so.
+    ///
+    /// `transaction_nested_test.rb`'s recoverable-deadlock test cannot see this: every lock it
+    /// takes is inside the savepoint, so releasing everything and releasing the savepoint's own
+    /// are the same act there. This is the sequence that separates them.
+    #[test]
+    fn a_deadlock_inside_a_savepoint_gives_back_only_what_the_savepoint_took() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        // The outer block's row, locked before there is a savepoint at all.
+        assert!(matches!(txn.lock(b"before").unwrap(), Lock::Taken));
+
+        let mut savepoints = Savepoints::default();
+        savepoints.savepoint("sp", txn.read_set(), None, Parameters::new());
+
+        {
+            // Which is what the executor hands every statement while a savepoint is open.
+            let mut recording = Recording::new(&mut *txn, &mut savepoints);
+            assert!(matches!(recording.lock(b"inside").unwrap(), Lock::Taken));
+            // The victim's call, from the `Lock::Deadlock` arm of `exec::wait_for_row`.
+            recording.abandon_locks();
+        }
+
+        assert!(
+            txn.holds(b"before"),
+            "the row locked before the savepoint is the outer block's, and it is still open"
+        );
+        assert!(
+            !txn.holds(b"inside"),
+            "the savepoint's own lock is given back, so the survivor stops waiting at once"
+        );
+    }
+
+    /// And the same scoping through `ROLLBACK TO`, which is the statement the client actually
+    /// sends after its `rescue`: the two paths give back the same set.
+    #[test]
+    fn rolling_back_to_the_savepoint_gives_back_the_same_set() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        assert!(matches!(txn.lock(b"before").unwrap(), Lock::Taken));
+
+        let mut savepoints = Savepoints::default();
+        savepoints.savepoint("sp", txn.read_set(), None, Parameters::new());
+        {
+            let mut recording = Recording::new(&mut *txn, &mut savepoints);
+            assert!(matches!(recording.lock(b"inside").unwrap(), Lock::Taken));
+        }
+        savepoints.rollback_to("sp", &mut *txn).unwrap();
+
+        assert!(txn.holds(b"before"), "the outer block's row is untouched");
+        assert!(!txn.holds(b"inside"), "the savepoint's row goes back");
+    }
+
+    /// A `ROLLBACK TO` **after** the deadlock has already given the savepoint's locks back asks for
+    /// the same keys a second time, and must be a no-op rather than a second unlock.
+    ///
+    /// It is the ordinary sequence — the victim releases, the client's `rescue` sends
+    /// `ROLLBACK TO SAVEPOINT` — and the two share one log so that the second pass finds it empty.
+    #[test]
+    fn rolling_back_after_a_deadlock_gives_nothing_back_twice() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        assert!(matches!(txn.lock(b"before").unwrap(), Lock::Taken));
+
+        let mut savepoints = Savepoints::default();
+        savepoints.savepoint("sp", txn.read_set(), None, Parameters::new());
+        {
+            let mut recording = Recording::new(&mut *txn, &mut savepoints);
+            assert!(matches!(recording.lock(b"inside").unwrap(), Lock::Taken));
+            recording.abandon_locks();
+        }
+        // Re-locked by the recovered block *before* it rolls back would be the interesting case;
+        // this is the plain one, and what it pins is that the second pass has nothing left to pop.
+        savepoints.rollback_to("sp", &mut *txn).unwrap();
+
+        assert!(
+            txn.holds(b"before"),
+            "and the outer block's row survives both passes"
+        );
     }
 }

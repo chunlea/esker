@@ -453,7 +453,8 @@ impl Txn for StoreTxn {
         // A poisoned table is ignored rather than panicked on, the same as `release`: the process
         // is already in trouble and a panic here would take it down for a lock it is giving away.
         if let Ok(mut locks) = self.locks.lock() {
-            locks.release(self.id, &[key.to_vec()]);
+            // `give_back` and not `release`: the transaction carries on. See `RowLocks`.
+            locks.give_back(self.id, &[key.to_vec()]);
         }
     }
 
