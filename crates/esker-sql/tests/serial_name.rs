@@ -21,20 +21,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[
-        // The standing catalog trade: `seqtypid::regtype` is a `regtype` on a real server and
-        // `text` here. **The values agree** — `integer` for a `serial`'s sequence and `bigint` for
-        // a `bigserial`'s, which is what these two statements are asking.
-        "SELECT 'r', seqtypid::regtype, seqstart, seqincrement, seqmax FROM pg_sequence s JOIN \
-         pg_class c ON c.oid = s.seqrelid WHERE c.relname = 'foo_bar_baz_id_seq'",
-        "SELECT 'r', seqtypid::regtype, seqstart, seqmax FROM pg_sequence s JOIN pg_class c ON \
-         c.oid = s.seqrelid WHERE c.relname LIKE 'foo_bar_baz_id_seq%' ORDER BY c.relname",
-        // `pg_class.relname` is a `name` here (ADR 0084) and `relkind` a `"char"` (ADR 0095);
-        // what these two still declare is `seqtypid::regtype`, a `regtype` on a real server and
-        // `text` here — its own unit. **Every value agrees** — and the values are
-        // the whole point of these three, which are the names the collision and the truncation
-        // produced.
-    ],
+    // **Empty.** `seqtypid::regtype` was the last of them and is a `regtype` here now — a
+    // `::regtype` over a column resolves the direction it is cast from, where it used to answer
+    // the name as a `text`. `pg_class.relname` is a `name` (ADR 0084) and `relkind` a `"char"`
+    // (ADR 0095), which emptied the rest. **Every value always agreed** — `integer` for a
+    // `serial`'s sequence and `bigint` for a `bigserial`'s, and the names the collision and the
+    // truncation produced.
+    types: &[],
     answers: &[
         (
             "SELECT 'r', count(*) AS columns_that_OWN_a_sequence FROM pg_attribute a WHERE \

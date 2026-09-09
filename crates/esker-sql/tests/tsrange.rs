@@ -14,20 +14,14 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog type trade, down to `regtype` — `name` (ADR 0084), `"char"`
-    // (ADR 0095) and `regproc` (ADR 0098) were the others this sentence named and are types here
-    // now, and the values were always identical. What the row *says* is the point: `tsrange`,
-    // `tstzrange` and `int4range` are `r`/`R` and `_tsrange` is `b`/`A`, all four right.
-    //
-    // **Three more join it with the six-range unit**, and every value in them agrees: `typelem`
-    // is a `regtype` there and `text` here; `typinput` is a `regproc` on both (ADR 0098),
-    // `typname` a `name` (ADR 0084) and `pg_typeof` a `regtype` on both sides (ADR 0093). The `points_back` column —
-    // the two-way link `pg_19_array_type_map.txt` checks — is a `boolean` on both and is `t` for
-    // all six range types.
-    types: &[
-        "SELECT 'r', t.typname, t.typelem::regtype, t.typcategory, t.typinput FROM pg_type t \
-         WHERE t.typname IN ('_tsrange','_tstzrange') ORDER BY t.typname",
-    ],
+    // **Empty.** Four families named this list and all four are types here now: `name`
+    // (ADR 0084), `"char"` (ADR 0095), `regproc` (ADR 0098) and — the last of them —
+    // `typelem::regtype`, which answers a `regtype` since a `::regtype` over a column resolves
+    // the direction it is cast from. The values were always identical; what the rows *say* is
+    // the point: `tsrange`, `tstzrange` and `int4range` are `r`/`R` and `_tsrange` is `b`/`A`,
+    // and `points_back` — the two-way link `pg19_array_type_map.txt` checks — is `t` for all six
+    // range types.
+    types: &[],
     answers: &[
         // **The standing constant-width trade, seen through a range bound.** Every integer here
         // is an `i64`, so `int4range`'s subtype reports `bigint` where a real server names

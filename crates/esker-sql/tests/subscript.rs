@@ -10,13 +10,14 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // An element's declared type: `smallint` on a real server, `text` here — an array is text on
-    // this node and so are its elements (`crate::value::vector`). **Every row agrees**, and the
-    // join two lines down is the proof that the *value* carries the right type where it matters:
-    // it is an `int2` column matched against a subscript, and it finds the column.
-    types: &[
-        "SELECT d.indkey[0], d.indkey[1], d.indkey[2] FROM pg_index d WHERE d.indexrelid = 'sb_ab'::regclass",
-    ],
+    // **Empty.** The entry read an `int2vector`'s element as `text` where a real server says
+    // `smallint`. The type was right all along and there were two readers: `pg_typeof` folds
+    // after resolution and asked the element the resolver had just set, while `output_columns`
+    // types a projection *before* it and asked the one the node still carried. They agreed
+    // wherever resolution had run, so only a `Describe` could see the difference, and the join
+    // two lines down in the corpus — an `int2` column matched against a subscript, which finds
+    // the column — is why the *value* was never wrong.
+    types: &[],
     // One, and it is **not the subscript**: `pg_constraint.conkey` is filled here only for a
     // foreign key, where a real server fills it for every constraint that has columns — a primary
     // key's is `{1}` there and NULL here. So the subscript is NULL for the right reason and the
