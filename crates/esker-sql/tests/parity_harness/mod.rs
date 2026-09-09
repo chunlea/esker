@@ -256,18 +256,26 @@ pub(crate) struct Divergences {
     ///
     /// | PostgreSQL | here | why |
     /// |---|---|---|
-    /// | `regtype` | `text` | `pg_typeof` and `x::regtype` answer the name; ADR 0077 |
+    /// | ~~`regtype`~~ | — | **closed**: `ColumnType::RegType` exists (ADR 0077) and no corpus declares it |
     /// | `oid` | `bigint` | an oid is an `int8` here — the catalog's own oid columns |
     /// | `"char"` | `text` | the one-byte type is not in `ColumnType`: `relkind`, `contype`, `typcategory`, `typdelim` |
     /// | `regproc` | `text` | `typinput`'s type; the names are identical |
-    /// | `name[]` | `text` | `current_schemas()`; a `NameArray` is a named gap (ADR 0084) |
-    /// | `integer` | `bigint` | a bare integer constant is an `int8` here — the constant-width trade |
+    /// | `name[]` | `text` | one row left, an `array_agg` over `pg_enum`; the type exists (ADR 0084) |
+    /// | ~~`integer`~~ | — | **closed** by the literal ladder (ADR 0087): `pg_typeof(1)` is `integer` |
     /// | `integer[]` | `bigint[]` | the same, one dimension out |
     /// | `character varying(3)` | `character varying` | `yes_or_no`'s length: a catalog column list carries a type and no typmod |
     ///
-    /// Two closed since the census was written, and both by giving the catalog's own columns the
-    /// type a real server declares: `name` for every identifier column, and `character varying`
-    /// for `information_schema`'s `character_data`.
+    /// **Four closed since the census was written**, and the table keeps their rows struck rather
+    /// than deleting them, because a family that is gone is the useful half of a census. Two went
+    /// by giving the catalog's own columns the type a real server declares — `name` for every
+    /// identifier column, and `character varying` for `information_schema`'s `character_data`;
+    /// `regtype` went with ADR 0077's type; and `integer` went with b4's literal ladder
+    /// (ADR 0087), which made `pg_typeof(1)` an `integer` here.
+    ///
+    /// The counts behind "closed" are re-taken by walking every test's `types` list back to its
+    /// corpus row, which is cheap and exact: [`replay`] deletes an entry that starts agreeing, so
+    /// **a surviving entry is the evidence**. At `docs/plans/debts-v1.1.md`'s last reconciliation
+    /// that left `"char"` 68, `oid` 32, `regproc` 12 and `name[]` 1.
     pub(crate) types: &'static [&'static str],
     /// Statements answered differently, each with the reason.
     pub(crate) answers: &'static [provenance::Divergence],

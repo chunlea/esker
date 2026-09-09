@@ -1,0 +1,59 @@
+# **A `character(n)`'s trailing blanks: which readers see them and which do not**, measured on
+# every shape this node can build.
+#
+# `docs/plans/debts-v1.1.md` #31. A `bpchar` is stored blank-padded and printed padded — `SELECT c`
+# over a `character(4)` holding `x` is `x   ` on both servers — and that is where the agreement
+# ends. The row was found in `tests/typmod.rs` behind a mis-parse (#20) and four more readers
+# turned up while measuring #28.
+#
+# ## The rule is not "read as text"
+#
+# It is three rules, and the discriminators are in this file:
+#
+#     the `text` coercion trims      '[' || c || ']'   ->  [x]      c::text, c::varchar too
+#     ... so a text function trims   upper(c)          ->  X        substr, replace, btrim, strpos
+#     a comparison ignores them      c = 'x'           ->  t        and c = 'x   ' is t as well
+#     `length` has its own           length(c)         ->  1
+#     `octet_length` has its own     octet_length(c)   ->  4        the storage, not the value
+#     `concat` takes `any`           concat(c, 'z')    ->  x   z    the output function, so padded
+#     `LIKE` has its own             c LIKE 'x'        ->  f        the padded value is matched
+#     a cast out of bpchar trims     c::varchar        ->  x        and c::name and c::text
+#     ... a cast *into* one does not c::char(6)        ->  x     6 bytes, and c::bpchar keeps 4
+#
+# So `octet_length`, `concat` and `LIKE` are the three that keep the padding, and they are here for
+# exactly that reason: a fix that trimmed everywhere would break them, and a corpus without them
+# would not say so. `c LIKE 'x'` being **false** while `c = 'x'` is **true** is the sharpest pair.
+#
+# ## And a bare read is padded on both
+#
+# `SELECT c` is `x   ` here and there, and `min(c)`/`max(c)` are too. The padding is real storage;
+# what differs is who is allowed to see it.
+#
+# Captured against esker-pg19 (PostgreSQL 19beta1) with
+# `sesscap.py src/pg19_bpchar_padding.txt.in`, inside one `BEGIN ... ROLLBACK`. The types field is
+# empty throughout: this file is about values, and `sesscap.py` describes nothing for a statement
+# over a table the capture created (its `\gdesc` pass runs after the rollback -- r1's, and named
+# in `NOTE-for-r1-corpus-escape-contract.md`).
+BEGIN		-
+CREATE TABLE g1bp (c char(4), d char(2), t text)		-
+INSERT INTO g1bp VALUES ('x', 'ab', 'x')		-
+SELECT 'r', '[' || c || ']' FROM g1bp		r|[x]
+SELECT 'r', c FROM g1bp		r|x   
+SELECT 'r', '[' || c::text || ']' FROM g1bp		r|[x]
+SELECT 'r', '[' || c::varchar || ']' FROM g1bp		r|[x]
+SELECT 'r', '[' || c || d || ']' FROM g1bp		r|[xab]
+SELECT 'r', upper(c), lower(c) FROM g1bp		r|X|x
+SELECT 'r', '[' || btrim(c) || ']', '[' || rtrim(c) || ']' FROM g1bp		r|[x]|[x]
+SELECT 'r', '[' || substr(c, 1, 4) || ']' FROM g1bp		r|[x]
+SELECT 'r', '[' || replace(c, 'x', 'y') || ']' FROM g1bp		r|[y]
+SELECT 'r', strpos(c, 'x'), split_part(c, 'q', 1) FROM g1bp		r|1|x
+SELECT 'r', length(c), char_length(c), octet_length(c) FROM g1bp		r|1|1|4
+SELECT 'r', '[' || concat(c, 'z') || ']' FROM g1bp		r|[x   z]
+SELECT 'r', c = 'x', c = 'x   ', c <> 'x', c < 'x ', c > 'w' FROM g1bp		r|t|t|f|f|t
+SELECT 'r', c IN ('x'), c IS NOT DISTINCT FROM 'x' FROM g1bp		r|t|t
+SELECT 'r', c = d, d < c FROM g1bp		r|f|t
+SELECT 'r', c LIKE 'x', c LIKE 'x%', c LIKE 'x   ' FROM g1bp		r|f|t|t
+SELECT 'r', count(*) FROM g1bp WHERE c = 'x'		r|1
+SELECT 'r', min(c), max(c) FROM g1bp		r|x   |x   
+SELECT 'r', octet_length(c), octet_length(c::varchar), octet_length(c::name), octet_length(c::char(2)), octet_length(c::char(6)), octet_length(c::bpchar), octet_length(c::text) FROM g1bp		r|4|1|1|2|6|4|1
+ROLLBACK		-
