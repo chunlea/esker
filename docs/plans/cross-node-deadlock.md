@@ -1,5 +1,16 @@
 # Cross-node deadlock detection — what is actually there, and what closing it costs
 
+> **Read this with [ADR 0088](../adr/0088-a-row-lock-across-nodes.md) (accepted 2026-09-09).** The
+> argument below is about the **write** path and it still holds: locks are taken at commit, in
+> ascending key order, and a prewrite undoes rather than waits, so nobody is ever in the state a
+> cycle needs. What it does not cover is the **row lock** — `SELECT … FOR UPDATE` — which was
+> measured across two nodes and turns out not to lock across them at all. ADR 0088 rules that it
+> becomes a Percolator lock acquired when the statement runs, and **an eager lock is exactly the
+> "holds X, waits for Y" state this note says cannot happen**. So the conclusion here — "not
+> reachable, half a day" — is right about the path it examined and stops being the whole answer the
+> day (a') lands. The sizing below, for the case where the ordering argument does not hold, is what
+> becomes live again.
+
 Debt #4 (`docs/plans/debts-v1.md`), sized before starting. **It does not fit in a day**; the sizing
 is at the end. What took most of the reading is that the three records describing this debt
 disagree with each other and all three disagree with the code, so the first half of this note is
