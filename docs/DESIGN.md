@@ -9,8 +9,16 @@ Goals: a from-scratch, crash-safe, linearizable, horizontally scalable ordered K
 distributed transactions, designed so that a stateless SQL layer and object-storage tiering can be added
 without changing the lower layers.
 
-Non-goals for v1: multi-region geo-replication, encryption at rest, online schema change, pessimistic
+Non-goals for v1: multi-region geo-replication, encryption at rest, pessimistic
 locks, secondary-index-aware engine features, anything that needs a wall clock for correctness.
+
+**Online schema change left that list during v1**: `CREATE INDEX CONCURRENTLY` is four states and
+a batched backfill ([ADR 0020](adr/0020-online-schema-change.md)), driven by the statement that
+starts it and answered when the change is over — which is what a client sees on a real server
+([ADR 0083](adr/0083-a-concurrent-build-answers-when-it-is-built.md)). `SET
+esker.concurrent_index_build = 'stage'` is the other half of that contract — the job written and
+left for a driver, which is what a cluster steps and what the state machine's own tests drive by
+hand. It belongs to §13, the SQL surface, and this list is where it used to be.
 
 ## 2. Request path
 
@@ -1009,7 +1017,7 @@ is in its first sentence.
   them routes to the columnar engine.
   **`pg_catalog` and `information_schema` are computed relations**
   ([ADR 0044](adr/0044-a-catalog-relation-is-computed-and-its-oid-is-the-record-s-id.md)):
-  **thirty-one** views — twenty-five in `pg_catalog` and six in `information_schema` — over the same `'m'`-space
+  **thirty-nine** views — thirty-two in `pg_catalog` and seven in `information_schema` — over the same `'m'`-space
   records the planner already reads, materialised per query, with no second store to keep in step.
   The count is `CatalogView::ALL`, which a test walks so that none is added without one. Their oids are the ids those records already carry — a table's, an
   index's, a sequence's — from **one** snapshot read once per statement and bounded like every other
@@ -1019,11 +1027,16 @@ is in its first sentence.
   A `pg_catalog` function is resolved where its argument allows: `'x'::regclass` before the plan is
   built, `pg_get_indexdef(d.indexrelid)` per row against a snapshot the cursor holds. Every write is
   `42501`, and a type this node has no value for is provided where the client reads it as text
-  (`pg_index.indkey`) and refused where the client subscripts it (`pg_constraint.conkey`).
+  (`pg_index.indkey`, an `int2vector` there and text here, printed the same and subscripted from
+  zero). `pg_constraint.conkey` was the refusal beside it and is a `smallint[]` now, which is what
+  it is on a real server.
   **The catalog record is a versioned on-disk format** like every other byte this system writes
-  (invariant 2): `catalog::record::CATALOG_FORMAT_VERSION` is **29**, a record carries it in its
+  (invariant 2): `catalog::record::CATALOG_FORMAT_VERSION` is **36**, a record carries it in its
   first byte, and every field added since version 2 is read behind a `reader.version >= N` guard so
-  an older record still decodes. Goldens in `catalog::tests` pin the bytes. A field is appended —
+  an older record still decodes. **A record's *contents* are what that number versions, and a
+  second one versions the key layout**: `CATALOG_LAYOUT_VERSION` is a database-level marker at a
+  reserved key, and a database written before index names became schema-scoped is refused with one
+  sentence rather than misread ([ADR 0080](adr/0080-an-index-name-record-is-scoped-to-its-schema.md)). Goldens in `catalog::tests` pin the bytes. A field is appended —
   at the end of the record, or beside the item it belongs to when the reader already walks that
   list — and a version is claimed by the lane that takes it, out loud, because two lanes have
   collided on the number twice.
