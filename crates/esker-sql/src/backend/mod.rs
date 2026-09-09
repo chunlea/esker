@@ -302,11 +302,6 @@ pub trait Txn: fmt::Debug + Send {
     /// that was `None`. Also no default, for the same reason.
     fn restore(&mut self, key: &[u8], prior: Buffered);
 
-    /// Whether this transaction already holds `key`'s row lock.
-    ///
-    /// [`Lock::Taken`] cannot answer this — it means "holds it now, **or held it already**" — and a
-    /// savepoint rollback has to know the difference, or it gives back a lock the transaction took
-    /// before the mark and still needs.
     /// This transaction is no longer waiting for a row lock.
     ///
     /// **Required, with no default on purpose.** A wrapper that silently answered for this would
@@ -315,6 +310,11 @@ pub trait Txn: fmt::Debug + Send {
     /// cycle at all, which is the shape this trait has produced twice already.
     fn stop_waiting(&mut self);
 
+    /// Whether this transaction already holds `key`'s row lock.
+    ///
+    /// [`Lock::Taken`] cannot answer this — it means "holds it now, **or held it already**" — and a
+    /// savepoint rollback has to know the difference, or it gives back a lock the transaction took
+    /// before the mark and still needs.
     fn holds(&self, key: &[u8]) -> bool;
 
     /// Gives back one row lock, for a statement the transaction has rolled back.

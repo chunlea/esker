@@ -22,6 +22,8 @@
 //! rung the Rails test needs, and the one that was an *error* rather than a wrong type: past
 //! `int8` is `numeric`, in both signs.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 #[path = "parity_harness/mod.rs"]
 mod parity;
 
