@@ -69,6 +69,16 @@ fn every_arrays_delimiter_is_its_elements() {
         ),
         vec![vec!["_box"]]
     );
+    // The other half of the same measurement: on a real server `box` is the **only** base type
+    // whose delimiter is not a comma, asked with `typinput <> 'array_in'` so that `box` — whose
+    // `typelem` is `point` there — is counted as the base type it is.
+    assert_eq!(
+        node.rows(
+            "SELECT typname FROM pg_type WHERE typtype = 'b' AND typinput <> 'array_in' \
+             AND typdelim <> ',' ORDER BY typname"
+        ),
+        vec![vec!["box"]]
+    );
 }
 
 /// A `box[]` is a type this node stores, not only a row in the catalog.
@@ -88,4 +98,76 @@ fn a_box_array_is_a_column_type() {
         panic!("no rows");
     };
     assert_eq!(fields[0].type_oid, 1020);
+}
+
+/// **Every `typarray` names a row that is there**, which is not a tautology: the pointer and the
+/// row are written by two different rules, and a `typarray` naming nothing is what
+/// `TypeError: can't quote Array` was before sixteen array types arrived at once.
+#[test]
+fn no_typarray_dangles() {
+    let mut node = parity::Node::new(&[]);
+    let dangling = node.rows(
+        "SELECT t.typname, t.typarray FROM pg_type t WHERE t.typarray <> 0 \
+         AND NOT EXISTS (SELECT 1 FROM pg_type a WHERE a.oid = t.typarray)",
+    );
+    assert!(
+        dangling.is_empty(),
+        "these types point at an array row that is not there: {dangling:?}"
+    );
+}
+
+/// A base type without an array is a **decision**, so it is listed with the others.
+///
+/// On a real server almost every base type has one — 65 of them below oid 10000, of which only six
+/// internal ones (`pg_node_tree`, `pg_ndistinct`, `pg_dependencies`, the two BRIN summaries and
+/// their sibling) do not, measured. This node has fewer types and a few deliberate gaps; the point
+/// of the list is that adding a type makes somebody choose rather than inherit a `0`.
+#[test]
+fn every_base_type_has_an_array_or_is_listed() {
+    let mut node = parity::Node::new(&[]);
+    let without: Vec<String> = node
+        // **`typinput <> 'array_in'`, not `typelem = 0`.** A `box`'s `typelem` is `point` on a
+        // real server and it is not an array — the input function is what says which a row is.
+        // Written the other way this guard passed only because this node reports `box`'s
+        // `typelem` as 0, so it was resting on a divergence rather than on the rule.
+        .rows(
+            "SELECT typname FROM pg_type WHERE typtype = 'b' AND typinput <> 'array_in' \
+             AND typarray = 0 ORDER BY typname",
+        )
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    // Each of these is a named gap with a reason, not an oversight:
+    //
+    //   the five remaining geometric shapes  `geometric_test.rb` declares no array of one, and
+    //                                        `box[]` left this list when `type_lookup_test.rb`
+    //                                        turned out to look `_box` up by oid (ADR 0084's
+    //                                        sibling unit)
+    //   name                                 a real server pairs it with `_name` (1003); this
+    //                                        node has no `NameArray` for that row to describe
+    //                                        (ADR 0084)
+    //   regclass, int2vector, oidvector      catalog types a client reads and never stores an
+    //                                        array of
+    //   lquery                               `ltree`'s *pattern* type: it appears in a `WHERE`
+    //                                        and is not a column anybody declares, so an array of
+    //                                        one has no writer. `ltree` itself has `_ltree`.
+    //
+    // This list is the test. Writing it out found `lquery`, which had inherited a `0` rather than
+    // being decided — nine names were expected and the node answered ten.
+    let expected = [
+        "circle",
+        "int2vector",
+        "line",
+        "lquery",
+        "lseg",
+        "name",
+        "oidvector",
+        "path",
+        "polygon",
+        "regclass",
+    ];
+    assert_eq!(
+        without, expected,
+        "a base type gained or lost its array without this list being updated"
+    );
 }
