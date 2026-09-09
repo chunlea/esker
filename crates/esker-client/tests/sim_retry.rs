@@ -231,6 +231,76 @@ fn an_epoch_that_never_settles_ends_at_the_deadline() {
     );
 }
 
+/// **What a leaderless region costs a caller today**, printed rather than argued with.
+///
+/// The two answers the retry budget was designed around both *say something*: a newer epoch is
+/// progress, and a leader hint is a place to try next. A region between leaders says neither —
+/// `NotLeader` with **no hint**, at an epoch that is not moving — so the count treats it as a loop
+/// to stop, and the count is what ends the call:
+///
+/// ```text
+/// a leaderless region: 9 calls, 2266ms   —  of a 10,000 ms deadline the caller set
+/// ```
+///
+/// **Twenty-three per cent of the time the caller allowed**, answered `gave up after 9 attempts`.
+/// [ADR 0100](../../../docs/adr/0100-a-region-between-leaders-waits-on-the-callers-deadline.md)
+/// asked whether that count should give way to the caller's deadline, and **the measurement said
+/// no**: at 192–325 regions a region that loses its leader does not get one back inside thirty
+/// seconds — fourteen sightings in four runs, none recovered — so spending the whole deadline
+/// would turn a two-second failure into a ten-second one and not into a success. The count is a
+/// real shape and it is not what stands between that load and an answer.
+///
+/// So this asserts **what the client does today** and prints the three numbers the ADR quotes. If
+/// somebody changes the contract, this goes red and the ADR is where the argument is.
+#[test]
+fn what_a_leaderless_region_costs_a_caller() {
+    let transport = Arc::new(FakeTransport::new());
+    // No hint, and no new epoch: the honest answer of a peer that is not the leader and does not
+    // know who is. A `forever` rule, because an election that is under way keeps saying this.
+    transport.script(
+        Rule::new(
+            Matcher::Any,
+            Outcome::Fail(ProtoError::NotLeader {
+                region_id: 1,
+                leader_hint: None,
+            }),
+        )
+        .forever(),
+    );
+    let clock = Arc::new(FakeClock::new());
+    let client = RawClient::with_options(
+        transport.clone(),
+        one_region(),
+        ClientOptions {
+            jitter_seed: Some(0xE5E5),
+            ..ClientOptions::default()
+        },
+    )
+    .with_clock(clock.clone());
+
+    let error = client
+        .get(b"k")
+        .expect_err("a leaderless region answers nothing else");
+    let calls = transport.calls().len();
+    let elapsed_ms = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+    println!(
+        "a leaderless region: {calls} calls, {elapsed_ms}ms of a {}ms deadline",
+        esker_client::retry::CALL_TIMEOUT_MS
+    );
+
+    assert!(
+        matches!(error, Error::RetriesExhausted { .. }),
+        "the count is what ends this call today, and the ADR's numbers are read off that: got \
+         `{error}` after {elapsed_ms}ms and {calls} calls"
+    );
+    assert!(
+        elapsed_ms < esker_client::retry::CALL_TIMEOUT_MS / 2,
+        "it spent {elapsed_ms}ms of a {}ms deadline, which is no longer the shape the ADR \
+         describes",
+        esker_client::retry::CALL_TIMEOUT_MS
+    );
+}
+
 #[test]
 fn the_two_kinds_of_refusal_are_told_apart_on_the_wire() {
     // A guard on the binding rather than on the client, and it earns its place: if `fruitless`
