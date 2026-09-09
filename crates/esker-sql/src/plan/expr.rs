@@ -1807,7 +1807,6 @@ impl CatalogFunc {
             // is what it prints as. The one place the difference shows is the declared type.
             | CatalogFunc::PgGetPartkeydef
             | CatalogFunc::RegClassName
-            | CatalogFunc::RegTypeName
             | CatalogFunc::OidVector
             | CatalogFunc::JsonFetchText
             | CatalogFunc::ToRegClass
@@ -1826,7 +1825,10 @@ impl CatalogFunc {
             // [ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md), and
             // the comment that stood here — "this node has no `regtype`" — outlived the decision
             // that made it false by fifteen ADRs.
-            CatalogFunc::PgTypeof => ColumnType::RegType,
+            // **And `t::regtype` is one too**, not the name it prints as: it answered a `text`
+            // here where a real server says 2206 — the declared type only a `Describe` sees,
+            // which is what r1's wire sweep is for.
+            CatalogFunc::PgTypeof | CatalogFunc::RegTypeName => ColumnType::RegType,
             // `ts_rank` answers a `real`, measured with `pg_typeof`.
             CatalogFunc::TsRank => ColumnType::Real,
             // An `oid` on a real server, and a `bigint` here for the reason `pg_class.oid` is one.

@@ -1,8 +1,9 @@
 //! One session cancels another's **blocked** statement, over the extended protocol.
 //!
 //! `transaction_test.rb`'s `raises QueryCanceled when canceling statement due to user request`,
-//! which has been the file's last failure since run 86 and reports
-//! `ActiveRecord::QueryCanceled expected but nothing was raised`. The shape is a holder that takes
+//! which was the file's last failure from run 86 to run 103 and reported
+//! `ActiveRecord::QueryCanceled expected but nothing was raised`. **Run 104's sweep read 0 FAIL of
+//! 12** on the build that carries `ddc8b891`, and runs 105 to 108 do not mention it. The shape is a holder that takes
 //! a row, a waiter that blocks behind it, and the **holder itself** — from inside its own open
 //! transaction — hunting the waiter in `pg_stat_activity` and issuing one `pg_cancel_backend`.
 //!
@@ -356,6 +357,28 @@ fn the_running_session_is_listed_before_the_one_idle_in_its_transaction() {
 /// apart — and the cancel and the commit arrive microseconds apart, so it lost nearly every time.
 /// The sweeps read 12, 11 and 10 FAIL of 12 across three builds, which is what a race that is
 /// almost always lost looks like from the outside.
+///
+/// **Closed, and measured closed**: run 103 is its last sighting, run 104's sweep read **0 FAIL of
+/// 12** on the build carrying `ddc8b891`, and runs 105 to 108 never mention it again.
+///
+/// # What this test pins, and what it does not — measured 2026-09-09
+///
+/// `ddc8b891` put a `cancel::check` in **two** places: at the top of `wait_for_row`'s loop, and in
+/// front of the statement restart. Reverting them one at a time says this test cannot tell them
+/// apart:
+///
+/// | counterfactual | this test |
+/// |---|---|
+/// | the loop-top check moved back into the `Held` arm | **passes** |
+/// | the restart check removed | **passes** |
+/// | both | **FAILS** — *the cancelled statement must not go on to answer because the lock came free* |
+///
+/// So the pair is pinned and neither half is: **either one alone can be deleted and the whole suite
+/// stays green.** That is worth knowing before deleting one as redundant, and it is not an
+/// oversight that can be fixed by trying harder here — the restart guard's own case is *the flag
+/// set after the last loop-top check and before the re-run*, a window of microseconds inside one
+/// blocking call, which no test can schedule from outside. The two guards are belt and braces for
+/// one scenario, and this table is the honest record of that.
 #[test]
 fn a_cancel_survives_the_lock_coming_free_underneath_it() {
     let pair = Pair::new(&[

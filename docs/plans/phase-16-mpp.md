@@ -524,14 +524,60 @@ loading ten thousand rows across the ~160 regions a 16 KB threshold produces fai
 `a lock from the transaction … could not be cleared`. Bulk-loading a table while it splits under
 itself a hundred and sixty times is its own workload, and it is not the one being measured.
 
-**One number in the two runs does not agree with itself, and it is recorded rather than explained.**
-The per-region cost is 1.2 ms at three thousand rows and 7.9 ms at ten thousand — and each region
-holds about the same amount in both, because the split threshold is a size. So the per-region term
-is not purely dispatch: something in it scales with the *table*, not with the region. Candidates
-that would need a measurement to separate — a ReadIndex round per fragment getting slower as Raft
-traffic grows, the learner's own catch-up, PD's routing lookups — and none of them is the finish,
-which is the term this section is about. **It does not move the verdict**: at both row counts the
-dispatch-shaped term is three times the finish, and it is the term an exchange does not remove.
+**One number in the two runs did not agree with itself, and it has since been measured** — see
+*What the per-region term is made of*, below. The per-region cost reads 1.2 ms at three thousand
+rows and 7.9 ms at ten thousand, and the guess recorded here was that "something in it scales with
+the table": a `ReadIndex` round per fragment getting slower as Raft traffic grows, the learner's
+catch-up, PD's routing lookups. **All three were wrong.** It is the scan, and the two runs varied
+the region count and the region's *contents* together. **It does not move the verdict** either way:
+at both row counts the dispatch-shaped term is three times the finish, and it is the term an
+exchange does not remove.
+
+### What the per-region term is made of — measured 2026-09-09
+
+The two runs above disagree about what a region costs: **1.21 ms** on the region axis at three
+thousand rows and **8.07 ms** on the group axis at ten thousand. A round trip does not know how big
+a table is, so something a fragment *does* was growing — and the two runs differ in **rows per
+region** (61 against 238) as much as in region count.
+
+So the split threshold was held at 16 KB and only the row count moved.
+`what_grows_in_a_fragment_when_the_table_grows` prints the store's own account beside the clock,
+because `EXPLAIN ANALYZE`'s counters are summed over every fragment:
+
+| rows | regions | rows/region | `count(*)` | per region | the store's account |
+|---|---|---|---|---|---|
+| 3,000 | 49 | 61.2 | 90.67 ms | **1.85 ms** | 48 fragments · stripes 53 of 53 read · **5,663 rows scanned, 3,000 matched** |
+| 10,000 | 157 | 63.7 | 444.48 ms | **2.83 ms** | 157 fragments · stripes 177 of 177 read · **20,468 rows scanned, 10,000 matched** |
+
+**1. At a fixed threshold a bigger table is more regions, not bigger ones.** Rows per region moved
+by 4% while the table grew 3.3×. That is what a size threshold does, and it is what makes this pair
+able to separate the region count from the region's contents — which is exactly what the earlier
+two runs could not do.
+
+**2. The per-region cost still grew, by 53%, with the region count alone.** So one term is in the
+region count itself: about **9 µs per region per fragment** across these two points, which at 157
+regions is a third of what a fragment costs. Dispatch is serial, so that term is quadratic in the
+region count rather than linear, and it is the term item 4 is about.
+
+**3. The other term is per row, and it is the larger one wherever regions are big.** The group-axis
+run had 238 rows a region and 8.6 ms a region; these two have 61–64 rows and 1.85–2.83 ms. A line
+through the wide points is **33–38 µs per row a fragment scans**, and it reproduces the number that
+had no explanation: 238 × 35 µs = 8.3 ms against the 8.07 measured. **The per-region term was never
+a dispatch cost.** It is the scan, and the earlier runs moved the region count and the rows in a
+region together.
+
+**4. A fragment scans about twice the rows it answers about, and the ratio is growing**: 1.89× at
+three thousand rows, 2.05× at ten thousand. Not a missing filter — `count(*)` has no predicate, so
+reading every stripe is correct, and `Chunks: 0` says no column data was decoded at all. What it
+reads and cannot use are **rows outside its own region**: a run written before a split covers a
+range the split then divided, so every fragment over that run pays for its neighbours' rows until a
+compaction rewrites it. A load that splits the table while filling it is the shape that produces the
+most of them, and it is the shape this whole section measures.
+
+**What it changes about item 4.** Parallel dispatch removes the wall clock of R serial round trips
+and removes neither term above: the per-row term is work, and the per-region term is queueing that
+overlapping re-shapes rather than removes. The finish is still far below both, so the verdict is
+unchanged and one of its two reasons is now a different reason.
 
 ### The bulk-load failure, run down — it is `40003`, and the lock clears in 1.4 s
 
@@ -579,6 +625,30 @@ measurement behind them**, which is what they are.
 whose lock it meets, so wound-wait sends it to wait rather than to kill — which is the right
 answer, because the older transaction may still commit. A rule that let the retry wound its own
 predecessor would roll back a transaction whose proposal was on its way to being applied.
+
+#### Re-measured after ADR 0094 and ADR 0099 — 2026-09-09, and it breaks **two** ways
+
+Three rounds on a quiet box, at HEAD `fa15a76f`, each loading in batches until the first refusal:
+
+| round | ran for | last batch that landed | how it broke |
+|---|---|---|---|
+| 1 | 144.8 s | 6,000 rows @ **162** regions | `08006 … gave up after 10 attempts: peer is not the leader of region 655` (4 in the round) |
+| 2 | 8.3 s | 750 rows @ **16** regions | `40003` *the outcome is unknown … region 67 stopped leading with this proposal in its log*, then `40001 … a lock … could not be cleared` **inside the retry, which settled after 2.7 s** |
+| 3 | 132.9 s | 4,500 rows @ **120** regions | `08006 … gave up after 9 attempts: peer is not the leader` (3 in the round) |
+
+**So the row's name was wrong twice over.** It is not "at the 160-region tier" — round 2 broke at
+sixteen — and the lock is the *rarer* half and no longer terminal: one round in three reached it,
+inside a retry that then succeeded, and the 250 single-row inserts after it all committed at 35
+regions. The `40003` above is the same one this section already ran down, and everything it
+concluded still holds.
+
+**What is open is the other half, and it is a shape rather than a bug in this file.** `08006 …
+**gave up after 10 attempts**` is a **count** standing where a **deadline** belongs: the client
+spends its budget in attempts, so a burst of splits that leaves a region without a leader for a
+little longer than ten backoffs is a hard failure rather than a slower success — the same shape as
+the router's fixed 310 ms wait for PD, which became the caller's deadline. Measuring how long a
+region really has no leader after a split (ADR 0094 changed it) and turning the retry into
+"back off within the caller's deadline" is the unit that closes it.
 
 ### Agreement is not correctness
 

@@ -15,16 +15,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog type trade, twice now rather than three times: `typname` is a `name`
-    // on a real server and `rngsubtype::regtype` is a `regtype`, both `text` here. The
-    // `information_schema` line left this list when its columns took `name` and
-    // `character varying` — the row agrees whole (ADR 0031 rule 2). **Every value agrees** on the
-    // two that remain, and the values are what they ask: `floatrange` is `typtype` `r` and
-    // `typcategory` `R`, and its `rngsubtype` is `double precision`.
-    types: &[
-        "SELECT 'r', t.typname, r.rngsubtype::regtype FROM pg_range r JOIN pg_type t ON t.oid = \
-         r.rngtypid WHERE t.typname IN ('floatrange','stringrange') ORDER BY 2",
-    ],
+    // **Empty.** `typname` is a `name` here (ADR 0084) and `rngsubtype::regtype` a `regtype`
+    // now that a `::regtype` over a column resolves the direction it is cast from — the entry
+    // was `text` on both counts. Every value always agreed, and the values are what the row
+    // asks: `floatrange` is `typtype` `r` and `typcategory` `R`, and its `rngsubtype` is
+    // `double precision`.
+    types: &[],
     answers: &[
         // **A `varchar` bound comes back as `text`.** The value is right — `["ca""t","do\g")`
         // round-trips byte for byte, which is what `range_test.rb` reads — and it is the *bound's

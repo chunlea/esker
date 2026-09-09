@@ -44,9 +44,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // unknown number prints as itself." What is left is the trade a `regtype` always was: a
         // type of its own on a real server, four bytes holding an oid that print as a name, and
         // `text` here — so `RowDescription` differs and the characters do not.
-        "SELECT 23::regtype, 1043::regtype",
-        "SELECT 1007::regtype, 1009::regtype",
-        "SELECT 999999::regtype",
         // A real server's `regtype` is a type of its own — four bytes holding an OID that print as
         // the type's name. This node has no `regtype`, so `'x'::regtype` answers the **name**, as
         // text: the value is byte-identical and only `RowDescription`'s OID differs, `text` where
