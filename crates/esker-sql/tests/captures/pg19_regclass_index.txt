@@ -1,0 +1,30 @@
+# **An index on a `regclass` column** — PostgreSQL 19beta1, 2026-09-09.
+# `ON_ERROR_ROLLBACK on`, one `BEGIN … ROLLBACK`, three tables as the fixture.
+#
+# `debts-v1.1.md` #39. A real server allows one, and a **primary key** over the same column already
+# worked on this node — the row key is `encode_row`-shaped and took #35's eight-byte form for free,
+# where the secondary index has its own encoding and its own list.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **The order is the oid's, not the name's.** `ra` and `rb` are created in that order and `ra`
+#     is then renamed to `rz`; `ORDER BY r` answers `rz` before `rb`. A key over the printed name
+#     would sort them the other way — and would have to be rebuilt on every rename, which is the
+#     same reason the row does not carry the name.
+#   * **A rename does not move the key.** The row is still found, under its new name.
+#   * **Uniqueness is on the number too**, so a rename cannot make a duplicate acceptable.
+#
+# ## The measurements
+#
+CREATE TABLE ra (id int8)		-
+CREATE TABLE rb (id int8)		-
+CREATE TABLE rk (id int8, r regclass)		-
+CREATE INDEX rk_r ON rk (r)		-
+INSERT INTO rk VALUES (1, 'ra'), (2, 'rb'), (3, NULL)		-
+SELECT id, r FROM rk WHERE r = 'ra'::regclass	bigint,regclass	1|ra
+SELECT indkey, indisunique FROM pg_index WHERE indrelid = 'rk'::regclass	int2vector,boolean	2|f
+ALTER TABLE ra RENAME TO rz		-
+SELECT id, r FROM rk WHERE r = 'rz'::regclass	bigint,regclass	1|rz
+SELECT id, r FROM rk ORDER BY r	bigint,regclass	1|rz ; 2|rb ; 3|\N
+CREATE UNIQUE INDEX rk_r_u ON rk (r)		-
+INSERT INTO rk VALUES (4, 'rb')	!23505 duplicate key value violates unique constraint "rk_r_u"
