@@ -1,0 +1,23 @@
+crates/esker-sql/tests/integer_literal_type.rs
+  s_2d916f5f540186::t_594d2ef18748b3 16,18-25,37-42
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_2d916f5f540186::t_683da832cb2a1e 259,263-264,268-278
+docs/plans/debts-v1.1.md
+  s_2d916f5f540186::t_ce907505025171 47-48,60-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "a1d6059049387b37b74a273f06be8b3c3a7ad99e",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
