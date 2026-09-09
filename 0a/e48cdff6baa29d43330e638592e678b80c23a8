@@ -1,0 +1,21 @@
+crates/esker-sql/tests/cross_node_deadlock.rs
+  s_2d916f5f540186::t_919d78f4a176de 1-189
+docs/adr/0088-a-row-lock-across-nodes.md
+  s_2d916f5f540186::t_6dc6f8cf724d8f 1-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "0ae48cdff6baa29d43330e638592e678b80c23a8",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
