@@ -1,0 +1,21 @@
+crates/esker-sql/tests/lock_cost.rs
+  s_6f7019c05b578b::t_29d0c457d8efba 1-180
+docs/adr/0088-a-row-lock-across-nodes.md
+  s_6f7019c05b578b::t_c4335f60e7062f 187-224,260-263
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "e0e3984e715a697f3fca02f9680864afab08a2d6",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
