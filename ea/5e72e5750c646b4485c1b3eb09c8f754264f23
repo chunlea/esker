@@ -1,0 +1,57 @@
+crates/esker-keys/src/columnar.rs
+  s_2bed4ac2b1c944::t_233304197f8146 150-155,260
+crates/esker-keys/src/row.rs
+  s_2bed4ac2b1c944::t_b2da7516f5de5b 566-569,1199-1201,1254,2083-2086,2393-2396,2400
+crates/esker-keys/src/value.rs
+  s_2bed4ac2b1c944::t_81c47e7efb1aef 519-529,578,625
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2bed4ac2b1c944::t_446c1402f6a519 2941,2979-2980,3003-3006,3175-3177
+crates/esker-sql/src/catalog/record.rs
+  s_2bed4ac2b1c944::t_482cf4c6a7dfcc 353-356,497,651
+crates/esker-sql/src/error.rs
+  s_2bed4ac2b1c944::t_62cc87d0da8c66 142-155,3194-3195
+crates/esker-sql/src/exec/bind.rs
+  s_2bed4ac2b1c944::t_3f3b458accdb2c 1475-1477
+crates/esker-sql/src/exec/fragment.rs
+  s_2bed4ac2b1c944::t_37f5e21f236b00 1039-1041
+crates/esker-sql/src/exec/mod.rs
+  s_2bed4ac2b1c944::t_14a822c8f87b9d 2639,2658,4182-4200
+crates/esker-sql/src/exec/query.rs
+  s_2bed4ac2b1c944::t_38e0eb6f104350 3361-3364,4837-4847
+crates/esker-sql/src/parse/lower.rs
+  s_2bed4ac2b1c944::t_cc1960ad606a14 2671,2949,3066,8261-8277
+crates/esker-sql/src/plan/expr.rs
+  s_2bed4ac2b1c944::t_fe5777404834a4 2337-2340,2427-2430,2599-2602,2769-2775,2777-2780
+crates/esker-sql/src/row.rs
+  s_2bed4ac2b1c944::t_ea1923a926c38c 42-45,331-332,336
+crates/esker-sql/src/value/mod.rs
+  s_2bed4ac2b1c944::t_31774046556eae 1222-1223,1476,1584-1585,1707,1825-1827,2036-2039,2332-2333
+crates/esker-sql/tests/captures/pg19_void.txt
+  s_2bed4ac2b1c944::t_bb6361910ac3b2 1-58
+crates/esker-sql/tests/corpus/pg19_void.txt
+  s_2bed4ac2b1c944::t_6512737662866c 1-16
+crates/esker-sql/tests/row_order.rs
+  s_2bed4ac2b1c944::t_865d6c019fed7a 169-171
+crates/esker-sql/tests/void_type.rs
+  s_2bed4ac2b1c944::t_846a99f16825f9 1-191
+crates/esker-store/src/columnar/decode.rs
+  s_2bed4ac2b1c944::t_50377c5cf93997 210
+docs/adr/0092-void-is-a-type-and-it-is-the-first-pseudo-type.md
+  s_2bed4ac2b1c944::t_4f17aae8af95f5 1-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "ea5e72e5750c646b4485c1b3eb09c8f754264f23",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
