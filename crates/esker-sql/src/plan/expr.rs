@@ -772,6 +772,12 @@ impl CatalogFuncCall {
     /// this crate had for every catalog function before: an index whose key is not a function of
     /// the row is not a slow index, it is a wrong one. A function measured immutable is added
     /// here; nothing is added by reasoning.
+    ///
+    /// **And the measurement is now the whole table rather than the name in front of the reader.**
+    /// `tests/captures/pg19_provolatile_census.txt` is `pg_proc.provolatile` for all 79 names
+    /// [`CatalogFunc::from_name`] and [`ScalarFunc::from_name`] resolve, in one query; the arms
+    /// below carry what it said. Before that, this list had grown one family per defect four times
+    /// over, and every one of those commits had the query in front of it.
     #[must_use]
     pub fn is_immutable(&self) -> bool {
         match self.func {
@@ -821,7 +827,68 @@ impl CatalogFuncCall {
             // What it cost: `GENERATED ALWAYS AS (t || 'x') STORED` was `42P17 functions in index
             // expression must be marked IMMUTABLE` for a column a real server creates — measured,
             // and `length(t || 'x')` with it.
-            | CatalogFunc::HstoreConcat => true,
+            | CatalogFunc::HstoreConcat
+            // **And then the whole table was measured at once instead of a twelfth name.**
+            // Everything above arrived one family per defect, and each time the reasoning that
+            // added one name would have added the ones below it. #25's corpus refused
+            // `replace(t, 'a', 'b')` in a generated column -- `42P17`, for a call whose
+            // `provolatile` is `i` -- and the answer to that is not `Replace`. It is
+            // `tests/captures/pg19_provolatile_census.txt`: `pg_proc.provolatile` for all 79
+            // names `from_name` and `ScalarFunc::from_name` resolve, in one query. Twenty-two of
+            // them were `i` on the oracle and `false` here, and they are these.
+            //
+            // *The string function the corpus found.* One name, and the reason the other
+            // twenty-one are in this commit rather than in a later one.
+            | CatalogFunc::Replace
+            // *Array introspection.* A length, a bound and a search over an array value: no
+            // catalog read, no setting, no clock.
+            | CatalogFunc::ArrayLength
+            | CatalogFunc::ArrayLower
+            | CatalogFunc::ArrayUpper
+            | CatalogFunc::ArrayPosition
+            | CatalogFunc::Cardinality
+            // *Range introspection and the two constructors this node resolves.* `isempty`,
+            // `lower_inc`/`lower_inf`, `upper_inc`/`upper_inf` read the range value's own flags;
+            // `daterange(a, b)` and `tsrange(a, b)` build one from their arguments. All `i`, both
+            // arities.
+            | CatalogFunc::IsEmpty
+            | CatalogFunc::RangeLowerInc
+            | CatalogFunc::RangeLowerInf
+            | CatalogFunc::RangeUpperInc
+            | CatalogFunc::RangeUpperInf
+            | CatalogFunc::DateRange
+            | CatalogFunc::RangeBuild
+            // *The two path predicates*, which are a property of the geometry and nothing else.
+            | CatalogFunc::PathIsClosed
+            | CatalogFunc::PathIsOpen
+            // *hstore's accessors and its constructor.* Measured in a throwaway database with the
+            // extension installed, which is the second half of the capture: every `hstore`
+            // overload is `i`, **`hstore(record)` included** -- the one that looks like it should
+            // not be, since a record's shape comes from a relation.
+            | CatalogFunc::HstoreAkeys
+            | CatalogFunc::HstoreAvals
+            | CatalogFunc::HstoreBuild
+            // *`ltree`'s depth and its two text conversions*, and `numnode(tsquery)` beside them:
+            // all four are arithmetic on the value's own bytes.
+            | CatalogFunc::LtreeNlevel
+            | CatalogFunc::LtreeToText
+            | CatalogFunc::TextToLtree
+            | CatalogFunc::NumNode => true,
+            // **Everything else answers `false`**, and after the census that is a measurement
+            // too: of the 79 names, `concat`, `convert_to`, `format_type`, `pg_typeof`,
+            // `to_regclass`, `pg_encoding_to_char`, the seven `pg_get_*` printers, the two
+            // `*_description` readers, `now`/`current_date`/`localtime`/`localtimestamp` and the
+            // one-argument text-search forms are `s`; `random`, `clock_timestamp`, `pg_sleep`,
+            // `pg_backend_pid`, `pg_cancel_backend` and `pg_terminate_backend` are `v`.
+            //
+            // `date_trunc` is the one that is **both**, and it stays here for a reason worth
+            // writing down rather than leaving as an omission: `date_trunc(text, timestamp)` and
+            // `date_trunc(text, interval)` are `i`, `date_trunc(text, timestamptz)` is `s`
+            // because truncating an absolute instant needs `TimeZone`, and the three-argument
+            // form that names the zone is `i` again. The discriminator is the *argument type*,
+            // and `self.args` here are unresolved `Expr`s with no types on them -- so the
+            // conservative answer is the only honest one this function can give.
+            // `tests/index_expression_volatility.rs` pins that refusal as deliberate.
             _ => false,
         }
     }
