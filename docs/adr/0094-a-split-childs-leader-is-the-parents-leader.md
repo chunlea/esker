@@ -130,6 +130,20 @@ and if none of them lands the region elects on its timeout exactly as it did bef
   perspective for the keys that leave it. What (a) removes is the sixty-millisecond window in which
   *every* arriving write is in that position.
 
+## Amended by [ADR 0099](0099-one-core-per-region-per-store.md): the campaign runs after the map takes the child
+
+The campaign was fired from inside `adopt_split`'s peer-building arm, **before**
+`RegionMap::apply_split` had said whether this store may host the child at all. Three of that
+call's refusals do not need the child to exist anywhere else — the parent is not here, the parent's
+start key moved, the child is already here — and each of them used to leave the child's peer alive
+in its own ticker task. So a store that was told it does not host a child would campaign for it,
+and, because `campaign_the_child` retries and the region will never get a leader this store can
+see, go on campaigning: `campaigns_pre: 1108` beside `campaigns_real: 91` on one region, in
+`docs/plans/debts-v1.1.md` #9.
+
+It is one line later now, after `commit`, and the 62 ms this ADR measures is unaffected — what runs
+between them is a lock and a `BTreeMap` insert, not I/O.
+
 ## The red test, and why it is not the one this ADR first named
 
 The draft named *"a bulk load into a table splitting fifty times does not produce a `40003`"*. **It
