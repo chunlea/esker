@@ -74,6 +74,81 @@ fn a_new_leader_appends_an_empty_entry_of_its_own_term() {
     assert!(log[0].data.is_empty());
 }
 
+/// **A batch of ticks flattens the randomised election timeout, and the group stops electing.**
+///
+/// `docs/plans/debts-v1.1.md` #40. The randomisation exists so that two nodes that time out
+/// together do it *once*: each draws its own timeout from `election_tick`, which is `(10, 20)` by
+/// default, so a redraw separates them. [ADR 0081](../../../../docs/adr/0081-the-tick-driver-catches-up.md)
+/// has a driver that was not scheduled deliver the ticks it slept through **as a batch**, because a
+/// tick never delivered is elapsed time the cluster never counts — and that is right on its own.
+///
+/// Together they cancel. A batch as wide as the span the draws come from **covers every draw in
+/// it**: whatever each node picked, it crosses its threshold inside the same batch, so the group
+/// campaigns in lockstep however carefully it randomised. The vote splits three ways, the pre-vote
+/// round ends with nobody, and the next batch does it again.
+///
+/// Measured on a real cluster before it was reproduced here: three voters all `PreCandidate` with
+/// no leader, terms 209, 210 and then 617 on one region, thirty seconds with no answer — but only
+/// on an in-process harness driving three hundred groups on four threads at a five-millisecond
+/// tick, which is exactly the shape that starves a driver into batching.
+///
+/// **The pair is what makes it a defect and not a scenario**: the same number of ticks, delivered
+/// one at a time, elects a leader immediately.
+#[test]
+fn a_batch_of_ticks_flattens_the_randomised_timeout() {
+    // The span the timeout is drawn from, and the width of a batch that covers it.
+    let (low, high) = Config::new(1, vec![1, 2, 3], 7).election_tick;
+    let span = high - low;
+
+    // **The control, first.** One tick at a time is what a driver that keeps up delivers, and it
+    // is the arrangement the randomisation was designed for.
+    let mut one_at_a_time = Harness::new(&[1, 2, 3], 7);
+    one_at_a_time.tick_and_settle(high + span);
+    let elected = one_at_a_time.leaders();
+    assert_eq!(
+        elected.len(),
+        1,
+        "one tick at a time must elect exactly one leader: {elected:?}"
+    );
+
+    // **The same ticks, in batches.** Nothing is delivered until the batch is over, which is what
+    // a starved driver catching up does.
+    let mut in_batches = Harness::new(&[1, 2, 3], 7);
+    let rounds = 6;
+    for _ in 0..rounds {
+        for _ in 0..=high {
+            in_batches.tick_all();
+        }
+        in_batches.settle();
+    }
+    let after = in_batches.leaders();
+    let term = in_batches.node(1).term();
+    let counters = in_batches.node(1).counters();
+    println!(
+        "  batched: leaders {after:?}, node 1 at term {term}, \
+         pre {} real {}",
+        counters.campaigns_pre, counters.campaigns_real
+    );
+
+    // **The mechanism, asserted rather than argued.** This is where the core's behaviour is
+    // pinned, not where the defect is fixed: a batch is not a thing the core can see — `tick()` is
+    // the whole of its clock — so the rule that prevents one lives in the driver that decides how
+    // many ticks travel together (`esker_store::driver`'s `TICKS_PER_BATCH`,
+    // [ADR 0101](../../../../docs/adr/0101-a-batch-of-ticks-never-carries-a-whole-election.md)).
+    // If this ever stops holding, the core has grown a defence of its own and the driver's rule
+    // can be revisited — which is why it is written down as an assertion and not as a comment.
+    assert!(
+        after.is_empty(),
+        "batched delivery elected {after:?}, so the core now separates peers that time out in one \
+         batch and `esker_store::driver::TICKS_PER_BATCH` may no longer be needed"
+    );
+    assert!(
+        term >= rounds,
+        "the term climbed to {term} over {rounds} batches; the livelock this characterises is a \
+         term ladder with no leader at the top of it"
+    );
+}
+
 /// A single voter is its own majority and needs no round trip.
 #[test]
 fn a_lone_voter_elects_itself() {

@@ -88,6 +88,22 @@ enum Job {
     Stop,
 }
 
+impl Job {
+    /// Whether this job advances a region's clock, which is the only kind a batch counts.
+    ///
+    /// A batch of appends or reads is exactly what batching is *for*; it is ticks that must not
+    /// pile up ([ADR 0101](../../../docs/adr/0101-a-batch-of-ticks-never-carries-a-whole-election.md)).
+    fn is_a_tick(&self) -> bool {
+        matches!(
+            self,
+            Self::Deliver {
+                message: PeerMsg::Tick,
+                ..
+            }
+        )
+    }
+}
+
 impl std::fmt::Debug for Job {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -338,6 +354,29 @@ impl DriverPool {
     }
 }
 
+/// **How many ticks one batch may carry before the worker drives.**
+///
+/// [ADR 0101](../../../docs/adr/0101-a-batch-of-ticks-never-carries-a-whole-election.md). A batch
+/// as wide as the election timeout's own randomisation covers **every draw in it**, so every peer
+/// crosses its threshold inside one batch and campaigns in lockstep however carefully it
+/// randomised — the vote splits, the pre-vote round ends with nobody, and the next batch does it
+/// again. Driving between chunks is what lets the first peer to time out be *heard* before the
+/// others fire, which is the whole of what the randomisation is for.
+///
+/// One below `esker_raft::ELECTION_TIMEOUT_MIN_TICKS`, because the property wanted is that a batch
+/// cannot carry a whole election timeout — not that it carries some particular number.
+const TICKS_PER_BATCH: u64 = esker_raft::ELECTION_TIMEOUT_MIN_TICKS - 1;
+
+/// Whether a batch that has already carried `ticks` must stop and drive.
+///
+/// Pure, so the rule can be asserted without a cluster: the arrangement it prevents is measured in
+/// `esker-raft`'s `a_batch_of_ticks_flattens_the_randomised_timeout` and on a real cluster in
+/// `docs/plans/debts-v1.1.md` #40.
+#[must_use]
+fn a_whole_election_would_fit(ticks: u64) -> bool {
+    ticks >= TICKS_PER_BATCH
+}
+
 /// How long [`DriverPool::retire`] waits for a worker to let go of a region.
 const RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -363,10 +402,14 @@ fn run(mut inbox: mpsc::Receiver<Job>, stopping: &AtomicBool) {
         // Everything queued travels together, then each region that was touched is driven once.
         // That is the per-region thread's rule, applied across the regions this worker holds.
         let mut touched = BTreeSet::new();
+        let mut ticks = u64::from(job.is_a_tick());
         let mut running = handle(&mut cores, &mut touched, job);
-        while running {
+        while running && !a_whole_election_would_fit(ticks) {
             match inbox.try_recv() {
-                Ok(next) => running = handle(&mut cores, &mut touched, next),
+                Ok(next) => {
+                    ticks += u64::from(next.is_a_tick());
+                    running = handle(&mut cores, &mut touched, next);
+                }
                 Err(_) => break,
             }
         }
@@ -473,7 +516,60 @@ impl Drop for DriverPool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DRIVER_WORKERS, DriverPool, Job, PeerMsg, mpsc, run};
+    use super::{
+        DRIVER_WORKERS, DriverPool, Job, PeerMsg, TICKS_PER_BATCH, a_whole_election_would_fit,
+        mpsc, run,
+    };
+
+    /// **A batch stops before it can carry a whole election timeout**
+    /// ([ADR 0101](../../../docs/adr/0101-a-batch-of-ticks-never-carries-a-whole-election.md)).
+    ///
+    /// The randomisation that keeps two peers from campaigning together draws from
+    /// `ELECTION_TIMEOUT_MIN_TICKS..=ELECTION_TIMEOUT_MAX_TICKS`. A batch that carries the floor
+    /// covers the bottom of that range for **every** peer at once, so they all time out inside it
+    /// and the draw buys nothing — measured as a livelock in `esker-raft`'s
+    /// `a_batch_of_ticks_flattens_the_randomised_timeout` and on a real cluster as
+    /// `docs/plans/debts-v1.1.md` #40, three voters `PreCandidate` with the term climbing.
+    ///
+    /// The rule is therefore about the floor and not about a tuned number: below it, no peer can
+    /// have timed out on this batch's ticks alone.
+    #[test]
+    fn a_batch_never_carries_a_whole_election_timeout() {
+        assert!(
+            TICKS_PER_BATCH < esker_raft::ELECTION_TIMEOUT_MIN_TICKS,
+            "a batch of {TICKS_PER_BATCH} ticks can carry a whole election timeout of {}",
+            esker_raft::ELECTION_TIMEOUT_MIN_TICKS
+        );
+        assert!(
+            !a_whole_election_would_fit(0),
+            "an empty batch drives nothing"
+        );
+        assert!(!a_whole_election_would_fit(TICKS_PER_BATCH - 1));
+        assert!(
+            a_whole_election_would_fit(TICKS_PER_BATCH),
+            "the batch must stop at the floor, not past it"
+        );
+    }
+
+    /// A tick is the only job a batch counts: batching appends and reads is what batching is for.
+    #[test]
+    fn only_a_tick_counts_against_the_batch() {
+        let (notify, _answer) = tokio::sync::oneshot::channel();
+        assert!(
+            Job::Deliver {
+                region_id: 1,
+                message: PeerMsg::Tick,
+            }
+            .is_a_tick()
+        );
+        assert!(
+            !Job::Deliver {
+                region_id: 1,
+                message: PeerMsg::Status(notify),
+            }
+            .is_a_tick()
+        );
+    }
 
     /// Pinning is by modulo, so consecutive region ids land on consecutive workers and the
     /// mapping is the same on every open — a region that moved workers between two opens would be
