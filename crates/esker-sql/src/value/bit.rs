@@ -46,12 +46,24 @@ use crate::error::{Result, SqlError};
 /// `22P02 "F" is not a valid binary digit`, which is its own sentence and not the
 /// `invalid input syntax for type …` every other type gives.
 pub fn from_text(text: &str) -> Result<String> {
-    for ch in text.chars() {
+    // **A leading `b` or `x` says which base the rest is in**, which is `varbit_in`'s own rule and
+    // not the literal syntax's: `'xff'::varbit` is `11111111` and `'b101'::varbit` is `101`,
+    // measured, where `X'ff'` and `B'101'` are the *literals* [`from_hex`] already serves. The two
+    // doors look alike and are not the same one — this is a string being read by an input
+    // function, and that is the parser reading a token — and the tell that this one was missing is
+    // the refusal: `'xyz'::varbit` is `22P02 "y" is not a valid hexadecimal digit` on a real
+    // server, naming the *second* character, where reading it as binary blames the `x`.
+    // A prefix on its own is the empty bit string: `'x'::varbit` and `'b'::varbit` are both `''`.
+    if let Some(hex) = text.strip_prefix(['x', 'X']) {
+        return from_hex(hex);
+    }
+    let digits = text.strip_prefix(['b', 'B']).unwrap_or(text);
+    for ch in digits.chars() {
         if ch != '0' && ch != '1' {
             return Err(SqlError::InvalidBinaryDigit(ch.to_string()));
         }
     }
-    Ok(text.to_owned())
+    Ok(digits.to_owned())
 }
 
 /// Reads the digits of an `X'…'` literal: **four bits a digit**, most significant first.
@@ -115,6 +127,64 @@ pub fn fit_to_column(bits: &str, length: Option<usize>, varying: bool) -> Result
         });
     }
     Ok(())
+}
+
+/// An integer as `bit(n)`: **its two's complement, sign-extended or truncated to `n` bits**.
+///
+/// `pg_cast` has `integer -> bit` and `bigint -> bit` as explicit casts by function, and this is
+/// what those functions do. Measured, and the two halves are separate rules:
+///
+///   * `n` **shorter** than the source keeps the **low** `n` bits — `300::int4::bit(8)` is
+///     `00101100`, which is 300 modulo 256, and `5::int4::bit(2)` is `01`.
+///   * `n` **longer** than the source **sign-extends** — `5::int4::bit(40)` is thirty-seven zeros
+///     then `101`, and `(-1)::int4::bit(40)` is forty ones. Zero-padding would be right for the
+///     first and wrong for the second, which is the half a reader gets wrong.
+///
+/// `width` is the source's own width in bits: 32 for an `int4`, 64 for an `int8`.
+#[must_use]
+pub fn from_integer(value: i64, width: u32, bits: u32) -> String {
+    let sign = u8::from(value < 0);
+    (0..bits)
+        .rev()
+        .map(|at| {
+            let bit = if at < width {
+                u8::try_from((value >> at) & 1).unwrap_or(0)
+            } else {
+                sign
+            };
+            if bit == 1 { '1' } else { '0' }
+        })
+        .collect()
+}
+
+/// `bit(n)` as an integer: **the bits are the low `n` of the target, and the rest are zero**.
+///
+/// So the sign comes out of the bits themselves rather than being extended into them:
+/// `'1'*32::bit(32)::int4` is `-1` — the top bit lands in the sign bit — and
+/// `'1'*40::bit(40)::int8` is `1099511627775`, a *positive* number, because forty bits leave an
+/// `int8`'s sign bit clear. Measured, both.
+///
+/// More bits than the target holds is `22003`, not a truncation: `'1'*40::bit(40)::int4` is
+/// `integer out of range`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "the wrap is the rule: `bit(32)::int4` reinterprets the bits as a signed value, so \
+              thirty-two ones are `-1` — measured — and the width check above is what makes each \
+              conversion exact rather than lossy"
+)]
+pub fn to_integer(bits: &str, width: u32, ty: &'static str) -> Result<i64> {
+    if u32::try_from(bits.len()).unwrap_or(u32::MAX) > width {
+        return Err(SqlError::IntegerLiteralOutOfRange(ty));
+    }
+    let unsigned = bits
+        .chars()
+        .fold(0_u64, |value, ch| value << 1 | u64::from(ch == '1'));
+    Ok(if width == 32 {
+        i64::from(unsigned as u32 as i32)
+    } else {
+        unsigned as i64
+    })
 }
 
 #[cfg(test)]

@@ -5348,6 +5348,18 @@ fn arrow_fetch(func: CatalogFunc, args: &[Expr], scope: &Scope<'_>) -> CatalogFu
 fn catalog_func_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> ColumnType {
     match call.func {
         CatalogFunc::HstoreConcat => concat_type(call, scope),
+        // **`substring` over a bit string answers a bit string**, and a plain `bit` whichever of
+        // the two it was given — measured, `pg_typeof(substring('10110'::varbit from 2 for 3))` is
+        // `bit`. One name over two families, told apart by the operand, which is the same shape as
+        // `||` and `->` above; `text` is the answer for everything else.
+        CatalogFunc::Substr | CatalogFunc::Substring
+            if matches!(
+                call.args.first().map(|arg| expr_type(arg, scope)),
+                Some(Ok(ColumnType::Bit | ColumnType::VarBit))
+            ) =>
+        {
+            ColumnType::Bit
+        }
         // **`->` is the same shape as `||` above** — one symbol over several types, told apart by
         // the operand — and it needs the same arm here for the same reason that one gives: the
         // rows were already right and it was the *declared* type that said `text`, which a client

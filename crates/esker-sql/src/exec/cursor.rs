@@ -2262,6 +2262,52 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     crate::value::Rendering::default(),
                 )?
             }
+            // **A bit string and an integer convert, they do not round-trip through the text.**
+            // `pg_cast` has `bit->integer`, `bit->bigint` and both backs as explicit casts by
+            // function, and a function is what they are: the digits of `'101'::bit(3)` are a
+            // *number written in base two*, so reading them as decimal answered `101` where a real
+            // server says `5`. `value::bit` holds the two rules, each measured, and the typmod is
+            // the width the integer is written in — which is why this cannot live in
+            // `assignment_cast`, where there is no typmod to read. A `bit varying` reaches neither
+            // arm: it has no numeric cast at all, and `parse::lower` refuses it before here.
+            Datum::Bit {
+                varying: false,
+                bits,
+            } if matches!(to, ColumnType::Int4 | ColumnType::Int8) => {
+                let (width, name) = if *to == ColumnType::Int4 {
+                    (32, "integer")
+                } else {
+                    (64, "bigint")
+                };
+                let value = crate::value::bit::to_integer(&bits, width, name)?;
+                if *to == ColumnType::Int4 {
+                    Datum::Int4(
+                        i32::try_from(value)
+                            .map_err(|_| SqlError::IntegerLiteralOutOfRange("integer"))?,
+                    )
+                } else {
+                    Datum::Int8(value)
+                }
+            }
+            // **A bare `bit` is `bit(1)`**, which is the grammar's rule and the one `lower_type`
+            // already applies; `NO_TYPMOD` here means the cast was written without a length, so
+            // the target is one bit wide and `5::int4::bit` is `1`.
+            Datum::Int4(value) if *to == ColumnType::Bit => Datum::Bit {
+                varying: false,
+                bits: crate::value::bit::from_integer(
+                    i64::from(value),
+                    32,
+                    u32::try_from(*typmod).unwrap_or(1).max(1),
+                ),
+            },
+            Datum::Int8(value) if *to == ColumnType::Bit => Datum::Bit {
+                varying: false,
+                bits: crate::value::bit::from_integer(
+                    value,
+                    64,
+                    u32::try_from(*typmod).unwrap_or(1).max(1),
+                ),
+            },
             // **An array to `regclass[]` resolves every element**, because the type is a name per
             // element and the names come from the catalog. `array_in` cannot do it — the input
             // function of a `regclass` needs a relation lookup and `crate::value` has none — so it
@@ -3267,8 +3313,14 @@ fn catalog_function(
         // positions -1, 0 and 1, of which only 1 exists. Getting that wrong by clamping `from`
         // before applying `count` gives `hel`, which is the plausible answer and not the measured
         // one.
+        // **A bit string is substringed as its digits**, and comes back a bit string: measured,
+        // `substring('10110'::varbit from 2 for 3)` is `011` and `pg_typeof` of it is `bit` — a
+        // plain `bit`, whichever of the two the argument was. The digits *are* the value, so the
+        // arithmetic below is the same arithmetic; what was wrong was that a `Datum::Bit` matched
+        // none of these arms and fell through to the NULL at the end, which is a wrong answer
+        // wearing a right one's clothes.
         CatalogFunc::Substr | CatalogFunc::Substring => match (args.first(), args.get(1)) {
-            (Some(Datum::Text(text)), Some(from)) => {
+            (Some(Datum::Text(text) | Datum::Bit { bits: text, .. }), Some(from)) => {
                 let Some(from) = whole_number(Some(from)) else {
                     return Ok(Datum::Null);
                 };
@@ -3297,7 +3349,14 @@ fn catalog_function(
                         within.then_some(ch)
                     })
                     .collect();
-                Datum::Text(taken)
+                if matches!(args.first(), Some(Datum::Bit { .. })) {
+                    Datum::Bit {
+                        varying: false,
+                        bits: taken,
+                    }
+                } else {
+                    Datum::Text(taken)
+                }
             }
             _ => Datum::Null,
         },

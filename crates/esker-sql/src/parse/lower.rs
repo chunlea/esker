@@ -6285,6 +6285,46 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 Datum::from_text(ColumnType::Numeric, &value::money::to_numeric_text(cents))?,
             ))));
         }
+        // **The permission is `pg_cast`'s, and the fold has to ask it too.** `casts_to` is the one
+        // gate for a cast over an *expression* (`exec::query`), and a folded literal never reached
+        // it: `'101'::bit(3)::int2` read the digits as decimal and answered `101` where a real
+        // server has no such row and says `42846`, and `5::int2::bit(4)` blamed the *value* with a
+        // `22P02` for a pair that does not exist at all. Two readers of one fact, and this is the
+        // second asking the first.
+        //
+        // Asked here only where a bit string is involved, because that family's rows are a
+        // measured census (see `pg_catalog::CASTS`) and the other families' folds are not this
+        // unit's to re-decide.
+        if let Some(from) = source_type(expr)?
+            && let Ok((to, _)) = lower_type(data_type)
+            && (matches!(from, ColumnType::Bit | ColumnType::VarBit)
+                || matches!(to, ColumnType::Bit | ColumnType::VarBit))
+            && !catalog::pg_catalog::casts_to(from, to)
+        {
+            return Err(SqlError::CannotCast {
+                from: from.name(),
+                to: to.name(),
+            });
+        }
+        // **A bit string and an integer convert; the fold below would read the digits.**
+        // `5::int4::bit(4)` is `0101` on a real server and `cast_literal_text` hands the fold the
+        // characters `5`, which `bit`'s input function refuses — `22P02 "5" is not a valid binary
+        // digit` for a statement that has an answer. The other direction is worse, because it has
+        // no refusal to stop it: `'101'::bit(3)::int` read `101` as decimal and answered `101`
+        // where a real server says `5`. So neither is folded here; the `Cast` node carries the
+        // typmod — the width the integer is written in, which is the whole of `bit(4)` — down to
+        // `exec::cursor`, where `value::bit` holds both measured rules.
+        if let Some(from) = source_type(expr)?
+            && let Ok((to, typmod)) = lower_type(data_type)
+            && (matches!(from, ColumnType::Int4 | ColumnType::Int8) && to == ColumnType::Bit
+                || from == ColumnType::Bit && matches!(to, ColumnType::Int4 | ColumnType::Int8))
+        {
+            return Ok(plan::Expr::Cast {
+                operand: Box::new(lower_expr(expr)?),
+                to,
+                typmod,
+            });
+        }
         if source_type(expr)? == Some(ColumnType::Numeric)
             && let Some(to) = lower_type(data_type).ok().map(|(ty, _)| ty)
             && matches!(to, ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2)
@@ -8653,7 +8693,18 @@ pub(super) fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
     // **The typmod is the length**, not the length plus a header: `character_maximum_length` for
     // `bit(8)` is 8 and `format_type(1560, 8)` is `bit(8)`, both measured. A bare `bit` keeps
     // `NO_TYPMOD` and reads back as `bit(1)`, which is where that rule lives.
-    if let DataType::Bit(length) | DataType::BitVarying(length) = data_type {
+    //
+    // **`varbit` and `bit varying` are one type under two spellings**, and `sqlparser` gives them
+    // two `DataType` variants — `VarBit` for the one word, `BitVarying` for the two. Only the
+    // second was read here, so `'101'::bit varying` answered and `'101'::varbit` was
+    // `0A000 the type VARBIT is not supported`, and with it every statement that reaches the type
+    // through that spelling: the array, the aggregates, the operators, a column declaration. One
+    // missing variant, six wire probes. The printed name of both is `bit varying` — measured,
+    // `pg_typeof('101'::varbit)` and `'varbit'::regtype` both answer it — so nothing downstream
+    // has to know which spelling was written.
+    if let DataType::Bit(length) | DataType::BitVarying(length) | DataType::VarBit(length) =
+        data_type
+    {
         let ty = if matches!(data_type, DataType::Bit(_)) {
             ColumnType::Bit
         } else {

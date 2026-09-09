@@ -38,16 +38,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // even on a `bit varying` column, and `bit(1)` for the bare `another_bit`.
     ],
     answers: &[
-        // **`integer -> bit` is a cast and not a reading of the digits.** `5::int4::bit(8)` is
-        // `00000101` — the number in binary — where this node reads the *text* `5` and finds a
-        // character that is not a binary digit. Refused rather than answered, and named here.
-        (
-            "SELECT 'r', '101'::bit(3)::text, 5::int4::bit(8)",
-            "integer -> bit is a conversion, not a reading of the printed digits",
-            "UNMEASURED",
-        ),
+        // **`integer -> bit` was here and is closed.** It read the *text* `5` and found a
+        // character that is not a binary digit; it is a conversion in two's complement now, both
+        // directions, with `pg_cast`'s own eight rows deciding which pairs exist at all
+        // (`tests/varbit.rs`, `tests/captures/pg19_varbit.txt`). The entry said `UNMEASURED` for
+        // as long as it stood, which is what a gap looks like before somebody measures it.
+        //
         // The functions and operators over a bit string, which are one unit and none of it is in
-        // the suite: `length`/`octet_length`, the bitwise `& | # ~`, and the shifts.
+        // the suite: `length`/`octet_length`, the bitwise `& | # ~`, and the shifts. Each is
+        // measured now — `tests/varbit.rs` carries them with capture lines instead of
+        // `UNMEASURED` — and still not built.
         (
             "SELECT 'r', length('10101'::bit(5)), octet_length('10101'::bit(5))",
             "the bit-string functions are their own unit",
