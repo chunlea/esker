@@ -3232,7 +3232,8 @@ impl<'a> Reader<'a> {
             .split_at_checked(len)
             .ok_or_else(|| corrupt(format!("a value of {len} bytes is truncated")))?;
         self.bytes = rest;
-        let mut row = crate::row::decode_row(&crate::row::RowSchema::nullable(vec![ty]), body)?;
+        let mut row =
+            crate::row::decode_row(&crate::row::RowSchema::nullable(vec![ty]), body, None)?;
         // One column in, one column out; a row that decoded to another width is corruption in the
         // catalog rather than something to work around.
         row.pop()

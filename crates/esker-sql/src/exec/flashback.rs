@@ -245,7 +245,7 @@ fn restore(
     value: &[u8],
     written: &mut Written,
 ) -> Result<()> {
-    let mut row = crate::row::decode_row(schema, value)?;
+    let mut row = crate::row::decode_row(schema, value, None)?;
     // Widened to today's shape if the table has gained columns since. The pad is the catalog's
     // missing value, which is the same answer a read of that row would have given.
     row.resize(table.columns.len(), Datum::Null);
@@ -261,7 +261,7 @@ fn remove(
     schema: &RowSchema,
     value: &[u8],
 ) -> Result<()> {
-    let row = crate::row::decode_row(schema, value)?;
+    let row = crate::row::decode_row(schema, value, None)?;
     // The keys it removed are of no interest here: a flashback is a rewrite of the whole table
     // rather than a statement whose failed commit has to be explained per key.
     crate::exec::dml::remove_row(executor, txn, table, &row)?;

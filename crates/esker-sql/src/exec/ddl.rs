@@ -762,7 +762,7 @@ fn validate_exclude_rows(
             if found.is_some() {
                 return Ok(());
             }
-            let row = crate::row::decode_row(&schema, value)?;
+            let row = crate::row::decode_row(&schema, value, None)?;
             if let Some(SqlError::ExclusionViolation {
                 constraint,
                 key,
@@ -801,7 +801,7 @@ fn validate_check_rows(
             if violated {
                 return Ok(());
             }
-            let row = crate::row::decode_row(&schema, value)?;
+            let row = crate::row::decode_row(&schema, value, None)?;
             let parsed = crate::parse::parse_stored_expr(&check.expr)?;
             let scope = super::query::Scope::single(table);
             let resolved = super::query::resolve(&parsed, &scope)?;
@@ -1393,7 +1393,7 @@ fn set_column_type(
     let mut rows: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
     super::for_each_page(txn, &start, &end, |_, page| {
         for (key, value) in page {
-            rows.push((key.to_vec(), crate::row::decode_row(&schema, value)?));
+            rows.push((key.to_vec(), crate::row::decode_row(&schema, value, None)?));
         }
         Ok(())
     })?;
@@ -1550,7 +1550,7 @@ fn set_column_not_null(
         let schema = updated.row_schema();
         super::for_each_page(txn, &start, &end, |_, page| {
             for (_, value) in page {
-                let row = crate::row::decode_row(&schema, value)?;
+                let row = crate::row::decode_row(&schema, value, None)?;
                 if matches!(row.get(at), Some(Datum::Null)) {
                     return Err(SqlError::ColumnContainsNulls {
                         column: column.to_owned(),
@@ -4491,7 +4491,7 @@ fn truncate_one_table(
     let mut rows: Vec<Vec<Datum>> = Vec::new();
     super::for_each_page(txn, &start, &end, |_, page| {
         for (_, value) in page {
-            rows.push(crate::row::decode_row(&schema, value)?);
+            rows.push(crate::row::decode_row(&schema, value, None)?);
         }
         Ok(())
     })?;
@@ -4547,7 +4547,7 @@ fn fill_default_for_existing_rows(
     let mut rows: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
     super::for_each_page(txn, &start, &end, |_, page| {
         for (key, value) in page {
-            rows.push((key.to_vec(), crate::row::decode_row(&schema, value)?));
+            rows.push((key.to_vec(), crate::row::decode_row(&schema, value, None)?));
         }
         Ok(())
     })?;
@@ -4582,7 +4582,7 @@ fn fill_generated_for_existing_rows(
     let mut rows: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
     super::for_each_page(txn, &start, &end, |_, page| {
         for (key, value) in page {
-            rows.push((key.to_vec(), crate::row::decode_row(&schema, value)?));
+            rows.push((key.to_vec(), crate::row::decode_row(&schema, value, None)?));
         }
         Ok(())
     })?;
@@ -7471,7 +7471,7 @@ fn backfill(
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     super::for_each_page(txn, &start, &end, |_, page| {
         for (_, value) in page {
-            let row = crate::row::decode_row(&schema, value)?;
+            let row = crate::row::decode_row(&schema, value, None)?;
             let primary_key: Vec<Datum> = table
                 .primary_key
                 .iter()

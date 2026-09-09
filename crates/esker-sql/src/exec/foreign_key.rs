@@ -118,7 +118,7 @@ pub(super) fn validate(
     let mut pending: Vec<Vec<Datum>> = Vec::new();
     super::for_each_page(txn, &start, &end, |_, page| {
         for (_, value) in page {
-            let decoded = row::decode_row(&schema, value)?;
+            let decoded = row::decode_row(&schema, value, None)?;
             // A NULL key points at nothing and is not a violation, here as at an `INSERT`.
             if let Some(values) = referencing_values(key, &decoded) {
                 pending.push(values);
@@ -450,7 +450,7 @@ fn referencing_rows(
     let schema = child.row_schema();
     let mut rows = Vec::new();
     for (_, encoded) in txn.scan(&start, &end, 0)? {
-        let row = row::decode_row(&schema, &encoded)?;
+        let row = row::decode_row(&schema, &encoded, None)?;
         let Some(referencing) = referencing_values(key, &row) else {
             continue;
         };
@@ -475,7 +475,7 @@ pub(super) fn parent_row(
     if parent.primary_key == key.parent_columns {
         let row_key = row::row_key(tenant, parent.id, values)?;
         return match txn.get(&row_key)? {
-            Some(encoded) => Ok(Some(row::decode_row(&parent.row_schema(), &encoded)?)),
+            Some(encoded) => Ok(Some(row::decode_row(&parent.row_schema(), &encoded, None)?)),
             None => Ok(None),
         };
     }
@@ -498,10 +498,11 @@ pub(super) fn parent_row(
     let primary_key = row::decode_row(
         &row::RowSchema::nullable(parent.primary_key_types()),
         &encoded,
+        None,
     )?;
     let row_key = row::row_key(tenant, parent.id, &primary_key)?;
     match txn.get(&row_key)? {
-        Some(encoded) => Ok(Some(row::decode_row(&parent.row_schema(), &encoded)?)),
+        Some(encoded) => Ok(Some(row::decode_row(&parent.row_schema(), &encoded, None)?)),
         None => Ok(None),
     }
 }

@@ -722,7 +722,7 @@ impl<'a> Side<'a> {
     /// aborting the diff, because a row that will not decode is a fact about the data and hiding
     /// it would make the diff look complete.
     fn values(&self, value: &[u8]) -> std::result::Result<Vec<Datum>, String> {
-        crate::row::decode_row(&self.schema, value).map_err(|error| error.to_string())
+        crate::row::decode_row(&self.schema, value, None).map_err(|error| error.to_string())
     }
 
     /// A row rendered the way PostgreSQL renders a composite: `(1, ann, t)`, `null` for a NULL.

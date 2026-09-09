@@ -662,7 +662,7 @@ impl<'a> Cursor<'a> {
                 loop {
                     if let Some((key, value)) = batch.next() {
                         *next = successor(&key);
-                        let row = row::decode_row(columns, &value)?;
+                        let row = row::decode_row(columns, &value, Some(&relation_namer(env)))?;
                         // **A child's row is decoded as the child and answered as the parent.**
                         // The two layouts differ whenever the child has a row id the parent has
                         // not, or a column of its own, so the values are lifted by position from
@@ -704,7 +704,8 @@ impl<'a> Cursor<'a> {
                 if std::mem::replace(looked, true) {
                     return Ok(None);
                 }
-                point(self.txn, self.tenant, node)
+                let namer = relation_namer(env);
+                point(self.txn, self.tenant, node, Some(&namer))
             }
 
             Kind::NestedLoop {
@@ -792,7 +793,8 @@ impl<'a> Cursor<'a> {
                             continue;
                         }
                         let node = probe_node(probe, *inner_table_id, inner_columns, row);
-                        if let Some(inner) = point(self.txn, self.tenant, &node)? {
+                        let namer = relation_namer(env);
+                        if let Some(inner) = point(self.txn, self.tenant, &node, Some(&namer))? {
                             let mut joined = row.clone();
                             joined.extend(inner);
                             *current = None;
@@ -1148,7 +1150,12 @@ fn probe_node(probe: &Probe, table_id: u64, columns: &RowSchema, outer: &[Datum]
     }
 }
 
-fn point(txn: &dyn Txn, tenant: u64, node: &Node) -> Result<Option<Vec<Datum>>> {
+fn point(
+    txn: &dyn Txn,
+    tenant: u64,
+    node: &Node,
+    name_of: Option<row::NameOfRelation<'_>>,
+) -> Result<Option<Vec<Datum>>> {
     match node {
         Node::PointGet {
             table_id,
@@ -1157,7 +1164,7 @@ fn point(txn: &dyn Txn, tenant: u64, node: &Node) -> Result<Option<Vec<Datum>>> 
         } => {
             let key = row::row_key(tenant, *table_id, key)?;
             txn.get(&key)?
-                .map(|value| row::decode_row(columns, &value))
+                .map(|value| row::decode_row(columns, &value, name_of))
                 .transpose()
                 .map_err(SqlError::from)
         }
@@ -1173,10 +1180,10 @@ fn point(txn: &dyn Txn, tenant: u64, node: &Node) -> Result<Option<Vec<Datum>>> 
             let Some(entry) = txn.get(&index_key)? else {
                 return Ok(None);
             };
-            let primary_key = row::decode_row(primary_key_types, &entry)?;
+            let primary_key = row::decode_row(primary_key_types, &entry, name_of)?;
             let key = row::row_key(tenant, *table_id, &primary_key)?;
             match txn.get(&key)? {
-                Some(value) => row::decode_row(columns, &value)
+                Some(value) => row::decode_row(columns, &value, name_of)
                     .map(Some)
                     .map_err(SqlError::from),
                 // An index entry pointing at a row that is not there is corruption, not a miss:
@@ -4095,6 +4102,23 @@ fn array_concat(left: Option<&Datum>, right: Option<&Datum>) -> Datum {
 /// `SET search_path = g1_rc, public`. Oid 0 is `-`, PostgreSQL's rendering of `InvalidOid`, and an
 /// oid naming nothing prints its digits: measured, both, and neither is an error — raising here
 /// would break a `LEFT JOIN` that legitimately has no match.
+/// The rule a decoded row's `regclass` columns get their names from.
+///
+/// **A `regclass` column stores eight bytes and no name** (`debts-v1.1.md` #35) — a name in a row
+/// goes stale the moment its relation is renamed — so the name is put back here, where the session
+/// and the catalog both are. Measured on a real server: after `ALTER TABLE rc_a RENAME TO rc_b` a
+/// stored `regclass` prints `rc_b`, and after the relation is dropped it prints the oid's digits.
+///
+/// **A lookup that fails falls back to the digits**, which is that second measured answer: an oid
+/// naming nothing prints as its number there, so a catalog this cursor cannot read degrades to a
+/// real server's rendering rather than to an error in the middle of a scan.
+fn relation_namer(env: Env<'_>) -> impl Fn(i64) -> Box<str> + '_ {
+    move |oid| match regclass_of(env, oid) {
+        Ok(Datum::RegClass { name, .. }) => name,
+        _ => oid.to_string().into_boxed_str(),
+    }
+}
+
 fn regclass_of(env: Env<'_>, oid: i64) -> Result<Datum> {
     let printed = match crate::catalog::pg_catalog::view_by_oid(oid) {
         Some(view) => view.name().to_owned(),

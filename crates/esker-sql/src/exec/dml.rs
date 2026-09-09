@@ -1504,7 +1504,7 @@ fn conflicting_row(
         let key = row::row_key(executor.tenant, table.id, &values)?;
         if let Some(bytes) = txn.get(&key)? {
             return Ok(Some(Conflicting {
-                row: row::decode_row(&table.row_schema(), &bytes)?,
+                row: row::decode_row(&table.row_schema(), &bytes, None)?,
                 key,
             }));
         }
@@ -1529,13 +1529,17 @@ fn conflicting_row(
             continue;
         };
         // An index entry's value is the primary key, which is what a lookup follows back.
-        let values = row::decode_row(&row::RowSchema::nullable(table.primary_key_types()), &bytes)?;
+        let values = row::decode_row(
+            &row::RowSchema::nullable(table.primary_key_types()),
+            &bytes,
+            None,
+        )?;
         let key = row::row_key(executor.tenant, table.id, &values)?;
         let Some(bytes) = txn.get(&key)? else {
             continue;
         };
         return Ok(Some(Conflicting {
-            row: row::decode_row(&table.row_schema(), &bytes)?,
+            row: row::decode_row(&table.row_schema(), &bytes, None)?,
             key,
         }));
     }
