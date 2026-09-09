@@ -1,0 +1,71 @@
+crates/esker-sql/src/catalog/information_schema.rs
+  s_2d916f5f540186::t_21b114e5060598 86-87,122-123,539-540,546-548,557,568,573,578-581,589-593,600-603
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_2d916f5f540186::t_4ff4af577888c7 580
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2d916f5f540186::t_98f7610d9d452e 527,575,605,625,635,638,648,655,673,678,707,718-721,728-730,738-741,781,799-802,814,818,848,860,895
+crates/esker-sql/src/catalog/pg_constraint.rs
+  s_2d916f5f540186::t_8dd51887f58a55 765
+crates/esker-sql/tests/activerecord_schema_dump.rs
+  s_2d916f5f540186::t_0c1e0b911d0f28 43-49
+crates/esker-sql/tests/array_column.rs
+  s_2d916f5f540186::t_6b3d8d51911707 21
+crates/esker-sql/tests/check_constraint.rs
+  s_2d916f5f540186::t_17e4b90f414e10 21-22,24,32-33
+crates/esker-sql/tests/check_not_valid.rs
+  s_2d916f5f540186::t_8c2c6e81e69300 28
+crates/esker-sql/tests/comment.rs
+  s_2d916f5f540186::t_4aeaf4eeff5d55 20
+crates/esker-sql/tests/create_extension.rs
+  s_2d916f5f540186::t_5b9c4408e8169a 14
+crates/esker-sql/tests/desc_index.rs
+  s_2d916f5f540186::t_d4440c3a437d54 15
+crates/esker-sql/tests/drop_column.rs
+  s_2d916f5f540186::t_eb87c4b9389188 27
+crates/esker-sql/tests/drop_constraint.rs
+  s_2d916f5f540186::t_06c9c5da075cde 23
+crates/esker-sql/tests/expression_index.rs
+  s_2d916f5f540186::t_0ffad518a7c4c7 16
+crates/esker-sql/tests/extension_inherits.rs
+  s_2d916f5f540186::t_6d07c2f4c4e534 16,29-33
+crates/esker-sql/tests/include_index.rs
+  s_2d916f5f540186::t_4d5e55203b7933 16
+crates/esker-sql/tests/indkey_any.rs
+  s_2d916f5f540186::t_75ef0bc5dcf9bc 26
+crates/esker-sql/tests/inherits.rs
+  s_2d916f5f540186::t_bb91761ebaff69 15-18,27-28
+crates/esker-sql/tests/name_columns.rs
+  s_2d916f5f540186::t_f00a51c9cbb4a5 1-162
+crates/esker-sql/tests/nulls_not_distinct.rs
+  s_2d916f5f540186::t_590381209508ff 15
+crates/esker-sql/tests/pg_catalog.rs
+  s_2d916f5f540186::t_0cc5bbda24d790 48-52
+crates/esker-sql/tests/pg_catalog_index.rs
+  s_2d916f5f540186::t_7787cf604bc0f4 26-28,31-32
+crates/esker-sql/tests/provenance_budget.rs
+  s_2d916f5f540186::t_a8d88be7f1cc14 17-21
+crates/esker-sql/tests/rename_column.rs
+  s_2d916f5f540186::t_bff8cca92bc4fe 21
+crates/esker-sql/tests/slt_harness/mod.rs
+  s_2d916f5f540186::t_f9b2c14a7f1345 277-281
+crates/esker-sql/tests/trigger_function.rs
+  s_2d916f5f540186::t_087cc095571f7a 25
+crates/esker-sql/tests/two_database_dogs.rs
+  s_2d916f5f540186::t_27b18d86b9cf4b 23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "57ee9436a2e55ace6a5eb0999e44fa756071e742",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
