@@ -217,6 +217,7 @@ pub(super) fn create_table(
     normalise_defaults(&mut table);
     normalise_checks(&mut table);
     normalise_index_predicates(&mut table);
+    normalise_exclude_predicates(&mut table);
     let table = table;
     // Resolved against a table that is not in the catalog yet, which is what lets a
     // self-reference — `CREATE TABLE t (id int8 PRIMARY KEY, parent int8 REFERENCES t)` — work
@@ -728,7 +729,15 @@ fn add_exclude(
         });
     }
     validate_exclude_rows(txn, executor, updated, exclude)?;
-    updated.excludes.push(exclude.clone());
+    // The seventh reader, at the statement that writes one — the same rule the `CHECK` and the
+    // partial index above follow, and for the same reason: what is stored is what is printed.
+    let mut exclude = exclude.clone();
+    if let Some(predicate) = &exclude.predicate
+        && let Some(text) = deparse_wrapped_predicate(updated, predicate)
+    {
+        exclude.predicate = Some(text);
+    }
+    updated.excludes.push(exclude);
     updated.schema_version += 1;
     catalog::replace_table(txn, executor.tenant, table, updated)
 }
@@ -5074,12 +5083,24 @@ pub(super) fn create_index(
                     refuse_unindexable(&table, &table.columns[at], &create.access_method)?;
                     KeyPart::Column(at)
                 }
+                // **A key that resolves to a bare column is a column key**, however it was
+                // written. `((t)::text)` over a `text` column is `USING btree (t)` on a real
+                // server, with `indkey` naming the column and `indexprs` null — the no-op cast is
+                // not a node (`exec::query::resolve`), so what is left is the column and the
+                // catalog records it as one. The parser already unwraps `((t))`; this is the same
+                // answer one resolution later, and it is the half of group E that no printer
+                // could have reached.
                 plan::KeyPartName::Expression { expr, shape } => {
-                    let (expr, ty) = index_expression(&table, expr)?;
-                    KeyPart::Expression {
-                        expr,
-                        shape: *shape,
-                        ty,
+                    if let Some(at) = index_key_column(&table, expr) {
+                        refuse_unindexable(&table, &table.columns[at], &create.access_method)?;
+                        KeyPart::Column(at)
+                    } else {
+                        let (expr, ty) = index_expression(&table, expr)?;
+                        KeyPart::Expression {
+                            expr,
+                            shape: *shape,
+                            ty,
+                        }
                     }
                 }
             };
@@ -5333,6 +5354,26 @@ fn index_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)
     Ok((catalog::unparenthesised(&text).to_owned(), ty))
 }
 
+/// The column an index key names, if what it resolves to is a bare one.
+///
+/// `CREATE INDEX ON t (((c)::text))` over a `text` column is a **column** index on a real server,
+/// not an expression index over a cast: the cast is not a node, so the key is the column and
+/// `indkey`, `indexprs` and `pg_get_indexdef` all say so. Measured beside `((c))`, which the
+/// parser already unwraps, and beside `(((v)::text))` over a `varchar`, which stays an expression
+/// because that cast is real.
+///
+/// `None` for anything else, including an expression that does not resolve — the caller's
+/// `index_expression` raises the refusal, and raising it twice from two places is how two
+/// sentences for one cause start.
+fn index_key_column(table: &TableDef, expr: &str) -> Option<usize> {
+    let parsed = crate::parse::parse_stored_expr(expr).ok()?;
+    let scope = crate::exec::query::Scope::single(table);
+    match crate::exec::query::resolve(&parsed, &scope).ok()? {
+        plan::Expr::Ordinal { at, .. } => Some(at),
+        _ => None,
+    }
+}
+
 /// One expression, checked the way an index key is checked and printed the way `pg_get_expr`
 /// prints it — **including its own outermost pair**.
 ///
@@ -5360,7 +5401,7 @@ fn deparsed_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnTy
     let parsed = crate::parse::parse_stored_expr(expr)?;
     let scope = crate::exec::query::Scope::single(table);
     let resolved = crate::exec::query::resolve(&parsed, &scope)?;
-    refuse_unless_immutable(&resolved)?;
+    refuse_unless_immutable(&resolved, &scope)?;
     let ty = crate::exec::query::expr_type(&resolved, &scope)?;
     let printed = deparse(&resolved, table, ty);
     if reads_back(table, &printed, ty) {
@@ -5437,15 +5478,24 @@ fn comparison_operand_type(
 /// comparison among them, where PostgreSQL picks a cross-type operator and coerces *nothing*
 /// (debt #23). One rule for one caller is the honest shape here: the productions are the callers
 /// that coerce.
-/// Whether this expression is a **quoted string constant** — the shape PostgreSQL's parser coerces
+/// Whether this expression is an **unknown constant** — the shape PostgreSQL's parser coerces
 /// straight to a cast's target type instead of building a `text` constant under a cast.
 ///
-/// `Literal::String` is one the parser has not typed yet; `Literal::Typed` over a `Datum::Text` is
-/// the same constant after `parse::fold_column_default` gave it a type. Both were written as
-/// `'...'` and both print as one node.
-fn written_as_a_quoted_string(expr: &plan::Expr) -> bool {
+/// Two of them, and they are the two [`crate::exec::query::is_unknown_literal`] names. A quoted
+/// string: `Literal::String` is one the parser has not typed yet and `Literal::Typed` over a
+/// `Datum::Text` is the same constant after `parse::fold_column_default` gave it a type — both
+/// were written `'...'` and both print as one node. And a bare `NULL`, for the same reason.
+fn folded_into_its_cast(expr: &plan::Expr) -> bool {
     match expr {
-        plan::Expr::Literal(plan::Literal::String(_)) => true,
+        // The two unknown constants. **A bare `NULL` is one of them**, and the cast over it is the
+        // same single node a quoted string's is: `(NULL)::text` is `NULL::text` on a real server,
+        // not `(NULL::text)::text`. This node printed the type twice — once from the literal,
+        // which has to name a type because nothing else would, and once from the cast — and group
+        // E is what made that visible: the no-op elision collapses the re-parse of the doubled
+        // form, so `reads_back` refused the whole expression and the written text was kept
+        // instead. A `TypedNull` is *not* here: the user named a type, and `(NULL::integer)::text`
+        // is a cast a real server keeps.
+        plan::Expr::Literal(plan::Literal::String(_) | plan::Literal::Null) => true,
         plan::Expr::Literal(plan::Literal::Typed(value)) => {
             matches!(value.as_ref(), Datum::Text(_))
         }
@@ -5681,44 +5731,41 @@ fn parenthesise(body: &str) -> String {
     }
 }
 
-/// One boolean expression a **reader wraps**, printed the way that reader prints it.
+/// An operand with the separator that goes in front of it — a space, or **a line break when the
+/// operand is a `CASE`**.
 ///
-/// A `CHECK` and a partial index's predicate are both stored as text and both re-parenthesised on
-/// the way out — `pg_get_constraintdef` gives `CHECK ((p > 0))` and `pg_get_expr(indpred)` gives
-/// `(p > 0)` — so what is stored has to be the deparsed form with its **outermost pair removed**,
-/// or the reader's pair lands on top of `deparse`'s and the text gains a level per write.
-/// [`catalog::unparenthesised`] is the same helper [`index_expression`] uses, for the same reason
-/// one column over.
-fn deparse_wrapped_predicate(table: &TableDef, expr: &str) -> Option<String> {
-    // **A top-level `AND`/`OR` chain is deparsed operand by operand**, because its reader
-    // re-parenthesises the operands itself: `pg_get_constraintdef` and `pg_get_expr(indpred)` both
-    // print each operand of a chain in its own pair ([`catalog::parenthesised_operands`],
-    // measured). Deparsing the chain as one expression gave every operand a pair and the reader
-    // added a second — `(((n > 0)) AND flag)`, which `tests/index_deparse.rs` caught — so each
-    // operand is deparsed on its own, stripped of *its* outermost pair, and re-joined with the
-    // keywords the reader will parenthesise around. The split comes from
-    // [`catalog::boolean_chain`], the same scanner the reader uses, so the two cannot disagree
-    // about where an operand ends.
-    //
-    // An operand that does not deparse keeps its written text, which is [`deparse_default`]'s
-    // contract one level down; a chain can therefore be part deparsed and part verbatim, and each
-    // half is right for its own operand.
-    if let Some((operands, separators)) = catalog::boolean_chain(expr) {
-        let mut printed = String::new();
-        for (at, operand) in operands.iter().enumerate() {
-            if at > 0 {
-                printed.push(' ');
-                printed.push_str(separators[at - 1]);
-                printed.push(' ');
-            }
-            match deparse_default(table, operand) {
-                Some(text) => printed.push_str(catalog::unparenthesised(&text)),
-                None => printed.push_str(operand),
-            }
-        }
-        return Some(printed);
+/// A real server starts a `CASE` on its own line wherever it sits, not only at the head of a
+/// parenthesised body: `(a +\nCASE …)`, `(flag AND\nCASE …)`, `(NOT\nCASE …)`, measured through a
+/// `CHECK` in all three positions. The break *replaces* the space rather than following it, so
+/// there is no trailing blank at the end of the line — which is a difference a byte comparison
+/// sees. [`parenthesise`] is the same rule one position earlier, where the `(` is what precedes.
+///
+/// **An operand that already begins with the break keeps it and takes no space.** Flattening a
+/// chain strips the pair off a nested one, and what is left can start with the newline the inner
+/// call put there: `a AND (CASE … AND b)` gives `\nCASE … END AND (b)` for the right-hand side. A
+/// space in front of that is a line ending in one, and nothing else about the text would say so.
+fn spaced(operand: &str) -> String {
+    if operand.starts_with("CASE") {
+        format!("\n{operand}")
+    } else if operand.starts_with('\n') {
+        operand.to_owned()
+    } else {
+        format!(" {operand}")
     }
-    deparse_default(table, expr).map(|text| catalog::unparenthesised(&text).to_owned())
+}
+
+/// One boolean expression, printed exactly the way [`deparse`] prints it.
+///
+/// **The readers add nothing, and that is the whole of group A.** A `CHECK` and a partial index's
+/// predicate used to be stored flat and re-parenthesised at read time by
+/// `catalog::parenthesised_operands`, which split on the top-level keyword and wrapped each piece.
+/// A splitter cannot say which operands bind first: `(a > 0 OR b > 0) AND flag` is
+/// `(((a > 0) OR (b > 0)) AND flag)` on a real server and came back
+/// `(((a > 0)) OR ((b > 0)) AND flag)` here — the grouping lost and a pair doubled. The tree has
+/// the grouping and `deparse` already writes it, so the writer writes all of it and the reader
+/// prints what it was given.
+fn deparse_wrapped_predicate(table: &TableDef, expr: &str) -> Option<String> {
+    deparse_default(table, expr)
 }
 
 /// [`deparse_wrapped_predicate`] for a caller outside this module: the form a predicate is
@@ -5745,6 +5792,28 @@ fn normalise_index_predicates(table: &mut TableDef) {
         };
         if let Some(text) = deparse_wrapped_predicate(&snapshot, predicate) {
             index.predicate = Some(text);
+        }
+    }
+}
+
+/// Every `EXCLUDE`'s predicate on this table, printed the way its index's `pg_get_expr(indpred)`
+/// prints one.
+///
+/// **The seventh reader, and it was reading a text no writer had shaped.** An exclusion
+/// constraint carries its own predicate rather than an [`catalog::IndexDef`]'s, and
+/// `catalog::pg_index` builds the index row straight from it — so the `WHERE` came back as the
+/// user wrote it, `WHERE start_date IS NOT NULL AND end_date IS NOT NULL`, where a real server
+/// gives `WHERE ((start_date IS NOT NULL) AND (end_date IS NOT NULL))`. Measured through both of
+/// its readers at once: `pg_get_constraintdef` wraps this form once more and
+/// `pg_get_indexdef` prints it as it stands.
+fn normalise_exclude_predicates(table: &mut TableDef) {
+    let snapshot = table.clone();
+    for exclude in &mut table.excludes {
+        let Some(predicate) = &exclude.predicate else {
+            continue;
+        };
+        if let Some(text) = deparse_wrapped_predicate(&snapshot, predicate) {
+            exclude.predicate = Some(text);
         }
     }
 }
@@ -6127,18 +6196,58 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
                     deparse(right, table, operand)
                 );
             }
+            // **`AND` and `OR` are n-ary on a real server, and binary here.** PostgreSQL's
+            // `BoolExpr` holds a list, so `a AND b AND c AND d` written without parentheses is one
+            // node and prints `((a) AND (b) AND (c) AND (d))` — flat. This node holds a tree, and
+            // `parse::lower::balance` folds a chain *pairwise* to keep it `log2(n)` deep, so the
+            // same four terms are `(a AND b) AND (c AND d)` here: neither side is the spine.
+            // Flattening only the left printed `((a) AND (b) AND ((c) AND (d)))`, which is a real
+            // server's answer — to the question `CHECK ((a AND b) AND (c AND d))`, measured — and
+            // not the one that was asked.
+            //
+            // **So both sides are flattened, and the written grouping is not recoverable.** A
+            // chain the user *did* parenthesise in the middle lowers to the same balanced tree as
+            // one they did not, so there is nothing left to tell the two apart; the flat form is
+            // what the common shape asks for, and PostgreSQL's pretty spelling flattens both in
+            // any case (`a AND b AND c AND d` for either). The census records the one direction
+            // this leaves: a mid-chain pair the user wrote is not printed back.
+            if matches!(op, plan::BinaryOp::And | plan::BinaryOp::Or) {
+                let chained =
+                    |side: &Expr| matches!(side, Expr::Binary { op: inner, .. } if inner == op);
+                if chained(left) || chained(right) {
+                    let side = |side: &Expr| {
+                        let text = deparse(side, table, operand);
+                        if chained(side) {
+                            catalog::unparenthesised(&text).to_owned()
+                        } else {
+                            text
+                        }
+                    };
+                    return parenthesise(&format!(
+                        "{} {}{}",
+                        side(left),
+                        op.symbol(),
+                        spaced(&side(right))
+                    ));
+                }
+            }
             parenthesise(&format!(
-                "{} {} {}",
+                "{} {}{}",
                 deparse(left, table, operand),
                 op.symbol(),
-                deparse(right, table, operand)
+                spaced(&deparse(right, table, operand))
             ))
         }
         Expr::Negate(operand) => format!("(- {})", sub(operand)),
         Expr::Arithmetic {
             op, left, right, ..
-        } => parenthesise(&format!("{} {} {}", sub(left), op.symbol(), sub(right))),
-        Expr::Not(operand) => parenthesise(&format!("NOT {}", sub(operand))),
+        } => parenthesise(&format!(
+            "{} {}{}",
+            sub(left),
+            op.symbol(),
+            spaced(&sub(right))
+        )),
+        Expr::Not(operand) => parenthesise(&format!("NOT{}", spaced(&sub(operand)))),
         Expr::IsNull { operand, negated } => format!(
             "({} IS {}NULL)",
             sub(operand),
@@ -6201,6 +6310,15 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
                 format!("{}({argument})", func.name())
             }
         }
+        // **A cast to `text` lands here, so the unknown constant folds here too.** `(NULL)::text`
+        // is `NULL::text` on a real server and this printed `(NULL::text)::text`: the literal
+        // names a type because a bare `NULL` has none to print, and then the cast named it again.
+        // The `Cast` arm below has had this rule for a quoted string all along —
+        // [`folded_into_its_cast`] is now the one predicate for both arms, because `::text` is the
+        // one target that does not reach that arm.
+        Expr::ToText { operand, .. } if folded_into_its_cast(operand) => {
+            deparse_literal_of(operand, ColumnType::Text)
+        }
         Expr::ToText { operand, .. } => format!("{}::text", parenthesise(&sub(operand))),
         // **A cast over an unadorned string literal is *one* node on a real server**, so it prints
         // as one: `'{}'::jsonb` and not `('{}'::text)::jsonb`. The parser coerces an `unknown`
@@ -6211,11 +6329,25 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         // Only a **bare** string literal: `('a' || 'b')::text` really is a cast over an
         // expression, and a numeric constant under a cast is [`numeric_constant`]'s three forms
         // and debt #24's remaining case.
-        Expr::Cast { operand, to, .. } if written_as_a_quoted_string(operand) => {
+        Expr::Cast { operand, to, .. } if folded_into_its_cast(operand) => {
             deparse_literal_of(operand, *to)
         }
-        Expr::Cast { operand, to, .. } => {
-            format!("{}::{}", parenthesise(&sub(operand)), to.name())
+        // **A cast carries its modifier into its name.** `(v)::character varying(5)` and
+        // `(n)::numeric(10,2)` are what a real server prints, and this arm dropped the parameter
+        // and printed the bare type — so a cast that PostgreSQL *keeps* was printed wrong even
+        // before group E stopped printing the ones it elides. `value::format_type` is the same
+        // renderer `format_type()` and an error message use, so there is one spelling of a
+        // parameterised type in this crate and not two.
+        Expr::Cast {
+            operand,
+            to,
+            typmod,
+        } => {
+            format!(
+                "{}::{}",
+                parenthesise(&sub(operand)),
+                crate::value::format_type(*to, *typmod)
+            )
         }
         // **Five lines, indented four spaces, with the implicit `ELSE` materialised.** This layout
         // is what `pg_get_indexdef` answers on a real server — `pg_get_indexdef` deparses with
@@ -6524,7 +6656,7 @@ fn deparse_literal(literal: &plan::Literal, ty: ColumnType) -> String {
     }
 }
 /// Walks one resolved expression, refusing every node that may not be an index key.
-fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
+fn refuse_unless_immutable(expr: &plan::Expr, scope: &crate::exec::query::Scope<'_>) -> Result<()> {
     use crate::plan::Expr;
     let mut refusal = None;
     super::subquery::walk(expr, &mut |node| {
@@ -6532,6 +6664,36 @@ fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
             return;
         }
         refusal = match node {
+            // **A cast between `text` and a type whose text form is a *setting* is not
+            // immutable**, and this node accepted every one of them. Measured on 19beta1 by
+            // asking, in both directions and through both readers:
+            //
+            // ```text
+            // refused   date  timestamp  timestamptz  interval  money  and every array type
+            // accepted  integer  numeric  double precision  inet  uuid  boolean  json  jsonb  bytea
+            // ```
+            //
+            // `DateStyle` is what makes a `date` stable, `IntervalStyle` an `interval`,
+            // `lc_monetary` a `money`, and an array's output function is its element's plus a
+            // delimiter. `double precision` is the one a guess gets wrong — `extra_float_digits`
+            // moves its output and PostgreSQL marks `float8out` immutable anyway — which is why
+            // this list is measured and not derived.
+            //
+            // **This is the direction no corpus had asked about**: the node was *more permissive*
+            // than the server it copies, so nothing here could go red. `docs/plans/debts-v1.1.md`
+            // carries the methodology note.
+            Expr::ToText { operand, .. } if unstable_text_form(operand, scope) => {
+                Some(SqlError::NotImmutableInIndex)
+            }
+            Expr::Cast { operand, to, .. }
+                if *to == ColumnType::Text && unstable_text_form(operand, scope) =>
+            {
+                Some(SqlError::NotImmutableInIndex)
+            }
+            // And the same cast read the other way: `(t)::date` is `DateStyle` again.
+            Expr::Cast { to, .. } if has_unstable_text_form(*to) => {
+                Some(SqlError::NotImmutableInIndex)
+            }
             Expr::Aggregate(_) => Some(SqlError::AggregateNotAllowed(
                 "aggregate functions are not allowed in index expressions",
             )),
@@ -6589,6 +6751,33 @@ fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
     });
     refusal.map_or(Ok(()), Err)
 }
+/// Whether this expression's text form depends on a setting, so a cast to or from `text` over it
+/// is **stable rather than immutable**.
+///
+/// The measured list is in [`refuse_unless_immutable`]'s `ToText` arm. A type is named here rather
+/// than reasoned about: `double precision` is accepted by a real server even though
+/// `extra_float_digits` moves its output, and `bytea` is accepted even though `bytea_output` does
+/// — the answer is `provolatile` on the output function, and only the oracle knows it.
+fn has_unstable_text_form(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Date
+            | ColumnType::Timestamp
+            | ColumnType::TimestampTz
+            | ColumnType::Interval
+            | ColumnType::Money
+    ) || esker_keys::array::ArrayValue::element_of(ty).is_some()
+}
+
+/// [`has_unstable_text_form`] for the type an operand turns out to have.
+///
+/// An operand whose type cannot be worked out is **not** refused: this guard exists to reproduce a
+/// refusal a real server makes, and inventing one for a shape it cannot type would be the more
+/// permissive direction's mirror image.
+fn unstable_text_form(operand: &plan::Expr, scope: &crate::exec::query::Scope<'_>) -> bool {
+    crate::exec::query::expr_type(operand, scope).is_ok_and(has_unstable_text_form)
+}
+
 /// An index's key as column **names**, which is how a partition's copy is matched to its parent's.
 ///
 /// Positions cannot do it: the copy's ordinals are the partition's and the original's are the

@@ -189,18 +189,23 @@ fn activerecord_check_constraints_reads_the_expression_without_the_extra_parenth
 /// non-pretty  CHECK (((a > 0) AND (b > 0)))
 /// ```
 ///
-/// — the second parenthesising every operand. This node prints the text it stored, so the pretty
-/// form agrees exactly and the non-pretty one is `CHECK ((a > 0 AND b > 0))`, which is a
-/// divergence **measured and left open**: closing it means `catalog::parenthesised_operands`,
-/// the helper the index and exclusion predicates already use, and that helper wraps an operand
-/// the user had already parenthesised a second time — trading one divergence for another on a
-/// shape no capture here covers. Nothing in the Rails suite reads a chain through the
-/// one-argument form. Only the agreeing half is asserted.
+/// — the second parenthesising every operand. **Both halves agree now, and the one that did not is
+/// why the deparse census exists.** This file used to record the non-pretty form as a divergence
+/// measured and left open, because closing it meant re-parenthesising the chain at read time and
+/// that wraps an operand the user had already parenthesised a second time. Group A of the census
+/// closed it from the other end instead: the writer stores what it prints, so the stored text
+/// *is* `((a > 0) AND (b > 0))` and each reader adds only its own pair — one here, none for
+/// `pg_get_expr`. The pretty form is then derived back from it (`catalog::pretty`), which is the
+/// direction that has the grouping to work with.
 #[test]
-fn a_boolean_chain_agrees_in_the_pretty_form() {
+fn a_boolean_chain_agrees_in_both_forms() {
     let mut node = parity::Node::new(FIXTURE);
     assert_eq!(
         def(&mut node, "chain_check", ", true"),
         "CHECK (a > 0 AND b > 0)"
+    );
+    assert_eq!(
+        def(&mut node, "chain_check", ""),
+        "CHECK (((a > 0) AND (b > 0)))"
     );
 }

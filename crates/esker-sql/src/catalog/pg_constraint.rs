@@ -352,50 +352,31 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>, pretty: bo
         && let Some(check) = table.checks.get(at)
     {
         // `CHECK ((p > 0))` — the doubled parentheses are PostgreSQL's, which wraps the whole
-        // predicate and then prints it parenthesised; `pretty` is the spelling that keeps one
-        // pair. Measured, and so is the suffix: an unvalidated one prints
-        // `CHECK ((quantity > 0)) NOT VALID` and `CHECK (quantity > 0) NOT VALID`, always
-        // **outside** the parentheses, which is what lets `ActiveRecord`'s greedy
-        // `/CHECK \((.+)\)/` stop before it.
-        // **And the plain form parenthesises each operand of a top-level chain, where the pretty
-        // one does not.** `CHECK (a > 0 AND b > 0)` comes back `CHECK (((a > 0) AND (b > 0)))`
-        // plain and `CHECK (a > 0 AND b > 0)` pretty — measured, both. That is the same rule
-        // `pg_get_expr(indpred)` applies (`catalog::parenthesised_operands`, called from
-        // `pg_index::parenthesised`), so the two readers now want the **same stored text** and
-        // `exec::ddl::normalise_checks` can keep giving them one: operands without their own
-        // pairs, each reader adding what it adds.
+        // predicate and then prints it parenthesised. Measured, and so is the suffix: an
+        // unvalidated one prints `CHECK ((quantity > 0)) NOT VALID` and
+        // `CHECK (quantity > 0) NOT VALID`, always **outside** the parentheses, which is what lets
+        // `ActiveRecord`'s greedy `/CHECK \((.+)\)/` stop before it.
+        //
+        // **The body is printed as it was stored, and the stored form is the deparser's own.** An
+        // operator node writes its own pair, so `CHECK ((price > 0))` and
+        // `CHECK (((a > 0) AND (b > 0)))` both fall out of one `format!` — the printer adds one
+        // pair and the expression brought the rest. This used to re-parenthesise the operands
+        // (`catalog::parenthesised_operands`), which could not express nesting and doubled a pair
+        // the deparser had already written.
+        //
+        // `pretty` is the spelling that drops what it can: the pairs the deparser writes for
+        // clarity go, and `catalog::pretty` is where that lives — the one reader that asks for it,
+        // deriving the second spelling from the first because this node has text where a real
+        // server has a tree.
         let suffix = if check.validated { "" } else { " NOT VALID" };
         return Datum::Text(if pretty {
-            let body = super::pretty_case(&check.expr);
+            let body = super::pretty(&check.expr);
             let lead = if body.starts_with("CASE") { "\n" } else { "" };
             format!("CHECK ({lead}{body}){suffix}")
         } else {
-            // **The plain form's inner pair is the *expression's* own, not the printer's.** An
-            // operator node prints one — `CHECK ((price > 0))` — and a `CASE` does not:
-            // `CHECK (⏎CASE…END)` with a single pair, measured. So the wrap is conditional, the
-            // same shape `pg_index::parenthesised` already has for a bare column reference.
-            //
-            // **"Is a `CASE`" means the whole body, not its first word.**
-            // `CHECK (CASE … END > 0)` is a comparison whose left operand is a `CASE`, and a real
-            // server gives it both pairs — `CHECK ((⏎CASE…END > 0))`. Starting with `CASE` was not
-            // enough; it has to end with `END` too.
-            let body = super::parenthesised_operands(&check.expr);
-            let whole_case =
-                body.trim_start().starts_with("CASE") && body.trim_end().ends_with("END");
-            let wrapped = if whole_case {
-                body
-            } else {
-                format!("({body})")
-            };
-            // The break PostgreSQL puts after an opening parenthesis when a `CASE` follows, which
-            // is this printer's pair rather than the expression's (`exec::ddl::parenthesise` is
-            // the same rule inside the deparser).
-            let lead = if wrapped.starts_with("CASE") {
-                "\n"
-            } else {
-                ""
-            };
-            format!("CHECK ({lead}{wrapped}){suffix}")
+            let body = &check.expr;
+            let lead = if body.starts_with("CASE") { "\n" } else { "" };
+            format!("CHECK ({lead}{body}){suffix}")
         });
     }
     // A `FOREIGN KEY`: the oid is the table and the constraint's position in its list.
@@ -633,11 +614,13 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
 
 /// `EXCLUDE USING gist (daterange(a, b) WITH &&) WHERE (((…))) DEFERRABLE INITIALLY DEFERRED`.
 ///
-/// **Triple parentheses around the `WHERE`**, and they are not a typo: PostgreSQL prints the
-/// predicate with each operand parenthesised, wraps that, and `pg_get_constraintdef` wraps it
-/// again — where `pg_get_indexdef` stops one level earlier. Written
+/// **One pair more than the index gets**, and the triple is not a typo: the predicate is stored in
+/// the form `deparse` writes — every operator node in its own pair — `pg_get_indexdef` prints that
+/// as it stands, and `pg_get_constraintdef` wraps it once. Written
 /// `WHERE (a IS NOT NULL AND b IS NOT NULL)`, it comes back
-/// `WHERE (((a IS NOT NULL) AND (b IS NOT NULL)))`. Three spellings of one predicate, measured.
+/// `WHERE (((a IS NOT NULL) AND (b IS NOT NULL)))`. Measured across all three shapes a predicate
+/// takes, including the one that keeps no pair at all: `WHERE (flag)` here against `WHERE flag`
+/// there, so the wrap this adds is unconditional and the rest is whatever was stored.
 ///
 /// `DEFERRABLE INITIALLY IMMEDIATE` prints as bare `DEFERRABLE` — the same "keep only what differs
 /// from the default" rule a deferrable `UNIQUE` follows.
@@ -647,11 +630,7 @@ fn exclude_definition(exclude: &crate::catalog::ExcludeDef) -> String {
         exclude.method, exclude.key, exclude.operator
     );
     if let Some(predicate) = &exclude.predicate {
-        let _ = write!(
-            out,
-            " WHERE (({}))",
-            super::parenthesised_operands(predicate)
-        );
+        let _ = write!(out, " WHERE ({predicate})");
     }
     if exclude.deferrable {
         out.push_str(" DEFERRABLE");

@@ -1665,6 +1665,98 @@ pub struct ExcludeDef {
     pub deferred: bool,
 }
 
+/// A stored predicate in PostgreSQL's **pretty** spelling: the parentheses that are there for
+/// clarity removed, and the ones precedence needs kept.
+///
+/// `pg_get_constraintdef(oid)` prints every node in its own pair and
+/// `pg_get_constraintdef(oid, true)` prints the fewest that still parse — `((a > 0) AND (b > 0))`
+/// against `a > 0 AND b > 0`. `ActiveRecord` reads the second. A real server renders both from one
+/// tree; this node stores text, so the pretty form is derived from the plain one.
+///
+/// **That derivation is only safe because the stored form is canonical.** Since group A the
+/// deparser writes every operator node in its own pair and flattens a same-connective chain, so
+/// this reads a shape it produced: strip the outer pair, split the chain with the same scanner the
+/// writer's callers use ([`boolean_chain`]), and give an operand its pair back only when its own
+/// connective binds *looser* than its parent's — an `OR` inside an `AND`. Measured:
+/// `(a > 0 OR b > 0) AND flag` keeps that pair and `a > 0 AND b > 0 OR flag` needs none.
+pub(crate) fn pretty(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with("CASE") {
+        return pretty_case(trimmed);
+    }
+    let inner = unparenthesised(trimmed);
+    let Some((operands, separators)) = boolean_chain(inner) else {
+        // Not a chain. `NOT` is the one leaf that wraps something: its operand keeps a pair only
+        // when it is itself a chain — `NOT (a > 0 AND flag)` against `NOT a IS DISTINCT FROM b`.
+        if let Some(rest) = inner.strip_prefix("NOT ") {
+            let body = unparenthesised(rest.trim());
+            let body_pretty = pretty(body);
+            return if boolean_chain(body).is_some() {
+                format!("NOT ({body_pretty})")
+            } else {
+                format!("NOT{}", broken(&body_pretty))
+            };
+        }
+        // **A `CASE` that is an operand is still a `CASE`.** `CHECK (CASE … END > 0)` reaches here
+        // as a comparison and not as a chain, and returning it untouched left the branches in
+        // their plain spelling — `WHEN (price > 0) THEN (price + 1)` where a real server's pretty
+        // form has `WHEN price > 0 THEN price + 1`, measured,
+        // `tests/corpus/pg19_case_printed.txt`'s `c6`. [`pretty_case`] is line-oriented and the
+        // block moves as a whole, so it strips wherever the keyword sits — under a comparison,
+        // under an arithmetic operator, or under a `NOT`. **After the chain split, not before**:
+        // an operand of a chain reaches it through the recursion below, and a chain that reached
+        // it here would keep the pairs the split is what removes.
+        //
+        // The test is a `CASE` at the start of a line, which is the deparser's own layout and
+        // nothing else's — that is what keeps this the inverse of one emitter rather than a
+        // general parenthesis remover, which is what [`pretty_case`]'s own doc forbids it to
+        // become.
+        if inner.contains("\nCASE") {
+            return pretty_case(inner);
+        }
+        return inner.to_owned();
+    };
+    let parent = separators.first().copied().unwrap_or("AND");
+    let mut out = String::new();
+    for (at, operand) in operands.iter().enumerate() {
+        if at > 0 {
+            out.push(' ');
+            out.push_str(separators[at - 1]);
+        }
+        let body = unparenthesised(operand.trim());
+        let rendered = pretty(operand);
+        let rendered = match boolean_chain(body) {
+            // **Only an `OR` inside an `AND`**, which is the one direction precedence cannot
+            // recover: `AND` binds tighter, so `a AND b OR flag` needs no pair and
+            // `(a OR b) AND flag` does. "A different connective" was the wrong test and the census
+            // said so in one row.
+            Some((_, inner_seps))
+                if parent == "AND" && inner_seps.first().copied() == Some("OR") =>
+            {
+                format!("({rendered})")
+            }
+            _ => rendered,
+        };
+        // The first operand has no separator in front of it, so it takes no space and no break.
+        out.push_str(&if at > 0 { broken(&rendered) } else { rendered });
+    }
+    out
+}
+
+/// An operand with what goes in front of it — a space, or **a line break when it is a `CASE`**.
+///
+/// The pretty side of `exec::ddl::spaced`, for the separator between a chain's operands:
+/// `flag AND\nCASE …`, measured through `pg_get_constraintdef(oid, true)`. The break replaces the
+/// space, so no line ends in one. A `NOT` reaches [`pretty_case`] directly instead — what the
+/// deparser stored is already `NOT\nCASE`, and the prefix this looks for has a space in it.
+fn broken(operand: &str) -> String {
+    if operand.starts_with("CASE") {
+        format!("\n{operand}")
+    } else {
+        format!(" {operand}")
+    }
+}
+
 /// A printed `CASE` with the parentheses PostgreSQL's **pretty** form leaves off.
 ///
 /// A real server holds a tree and renders it twice: `pg_get_constraintdef(oid)` parenthesises the
@@ -1729,14 +1821,32 @@ fn last_then(line: &str) -> Option<usize> {
     found
 }
 
+/// **A chain keyword at this offset, whatever whitespace follows it.**
+///
+/// The separator is not always `" AND "`: since a `CASE` operand starts on its own line
+/// (`exec::ddl::spaced`), a stored chain can read `flag AND\nCASE …`, and a scanner that insisted
+/// on the trailing *space* did not see the keyword at all — the chain went unsplit and the
+/// operands before it kept the pairs the pretty form drops. Measured,
+/// `CHECK (a > 0 AND\nCASE … END)` is `CHECK (a > 0 AND\nCASE …)` pretty, with the pair gone.
+fn separator(upper: &[u8], at: usize, keyword: &str) -> bool {
+    upper[at..].starts_with(keyword.as_bytes())
+        && upper
+            .get(at + keyword.len())
+            .is_some_and(u8::is_ascii_whitespace)
+}
+
 /// The operands of a top-level `AND`/`OR` chain and the keywords between them, or `None` for a
 /// predicate that is not a chain.
 ///
-/// **The scanner, extracted so there is one of it.** [`parenthesised_operands`] re-parenthesises a
-/// chain for a reader, and `exec::ddl` deparses a chain's operands for a *writer* — the two need
-/// the same split, and a second copy of "find a top-level `AND`" is the shape that cost this
-/// project 4,873 tests once already. Split on the **top level only**: a keyword inside parentheses
-/// or inside a string literal is part of an operand, not a separator.
+/// **The scanner, extracted so there is one of it.** [`pretty`] splits a stored chain to derive
+/// PostgreSQL's pretty spelling, and `exec::ddl` deparses a chain's operands for a *writer* — the
+/// two need the same split, and a second copy of "find a top-level `AND`" is the shape that cost
+/// this project 4,873 tests once already. Split on the **top level only**: a keyword inside
+/// parentheses or inside a string literal is part of an operand, not a separator.
+///
+/// It once fed a third caller, `parenthesised_operands`, which re-parenthesised a chain at *read*
+/// time. Group A of the deparse census deleted it: a splitter cannot say which operands bind
+/// first, and the tree that can is the writer's.
 pub(crate) fn boolean_chain(predicate: &str) -> Option<(Vec<&str>, Vec<&str>)> {
     let bytes = predicate.as_bytes();
     let upper = predicate.to_ascii_uppercase();
@@ -1774,10 +1884,10 @@ pub(crate) fn boolean_chain(predicate: &str) -> Option<(Vec<&str>, Vec<&str>)> {
             _ if word(at, "END") => cases -= 1,
             _ if depth != 0 || cases != 0 => {}
             _ if word(at, "BETWEEN") => betweens += 1,
-            _ if betweens > 0 && upper[at..].starts_with(b" AND ") => betweens -= 1,
+            _ if betweens > 0 && separator(upper, at, " AND") => betweens -= 1,
             _ => {
-                for keyword in [" AND ", " OR "] {
-                    if upper[at..].starts_with(keyword.as_bytes()) {
+                for keyword in [" AND", " OR"] {
+                    if separator(upper, at, keyword) {
                         operands.push(predicate[start..at].trim());
                         separators.push(keyword.trim());
                         start = at + keyword.len();
@@ -1794,70 +1904,6 @@ pub(crate) fn boolean_chain(predicate: &str) -> Option<(Vec<&str>, Vec<&str>)> {
     }
     operands.push(predicate[start..].trim());
     Some((operands, separators))
-}
-
-/// Each operand of a top-level `AND`/`OR` chain in its own parentheses — PostgreSQL's rule for
-/// re-printing a boolean expression.
-///
-/// `a IS NOT NULL AND b IS NOT NULL` comes back `(a IS NOT NULL) AND (b IS NOT NULL)`; a predicate
-/// that is a single comparison is returned unchanged, which is why `CHECK ((p > 0))` has only the
-/// two pairs `pg_get_constraintdef` adds around it. Measured, both.
-///
-/// Split on the **top level only**: a keyword inside parentheses or inside a string literal is
-/// part of an operand, not a separator.
-/// Whether an expression is nothing but one column name — bare, or delimited.
-///
-/// **The one shape PostgreSQL's boolean deparser leaves unparenthesised.** Measured on 19beta1,
-/// over a partial index's predicate and an exclusion constraint's alike:
-///
-/// ```text
-/// WHERE "primary"        -> "primary"            WHERE n > 0 AND flag -> ((n > 0) AND flag)
-/// WHERE flag             -> flag                 WHERE NOT flag       -> (NOT flag)
-/// WHERE (flag)           -> flag                 WHERE n > 0          -> (n > 0)
-/// ```
-///
-/// Deliberately narrow: anything with an operator, a call, a space outside quotes or a second
-/// token is not this shape and takes its pair. A delimited name may hold any character but `"`,
-/// so that case is matched on its own rather than by scanning for spaces.
-#[must_use]
-pub(crate) fn is_column_reference(expr: &str) -> bool {
-    let expr = expr.trim();
-    if let Some(inner) = expr
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-    {
-        return !inner.is_empty() && !inner.contains('"');
-    }
-    !expr.is_empty()
-        && expr
-            .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-        && expr
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-}
-
-pub(crate) fn parenthesised_operands(predicate: &str) -> String {
-    let Some((operands, separators)) = boolean_chain(predicate) else {
-        return predicate.to_owned();
-    };
-    // **A bare column operand takes no pair**, which is the server's own rule and not a nicety:
-    // `n > 0 AND flag` comes back `((n > 0) AND flag)`, measured through a partial index and an
-    // exclusion constraint both.
-    let wrap = |operand: &str| {
-        if is_column_reference(operand) {
-            operand.to_owned()
-        } else {
-            format!("({operand})")
-        }
-    };
-    let mut out = wrap(operands[0]);
-    for (operand, separator) in operands[1..].iter().zip(&separators) {
-        let _ =
-            std::fmt::Write::write_fmt(&mut out, format_args!(" {separator} {}", wrap(operand)));
-    }
-    out
 }
 
 /// One `FOREIGN KEY` constraint, held by the **child** — the table whose rows must point at

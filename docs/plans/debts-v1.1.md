@@ -50,6 +50,27 @@ Two rules come from that file's own failures, and both are applied here rather t
 > file's eight rows turned out to be closed when somebody looked. So every row below was put to the
 > tree or to a log before it was written, and each says which; the two that could only be taken
 > from another lane's evidence say that too.
+>
+> **A reader nobody wrote for is invisible to a register that reads code.** Six readers of a
+> stored expression had a writer that shaped the text they print; the seventh — an exclusion
+> constraint's predicate — had none, so `pg_get_indexdef` on the index behind it printed whatever
+> the user typed, and no row here said so because nothing in the tree looks wrong: the writer that
+> is missing has no site to inspect. It took a cross product to name it. The same shape put
+> [ADR 0090](../adr/0090-a-stored-expression-is-deparsed-by-the-statement-that-writes-it.md)'s own
+> decision — *every reader returns those bytes unchanged* — in the odd position of being **an
+> aspiration its file recorded as a fact** for as long as two of its readers were re-parenthesising
+> on the way out. A decision record is checkable: walk its sentence over every caller, not over the
+> ones it lists.
+>
+> **The direction where this node is *more permissive* than PostgreSQL had never been asked by a
+> corpus.** Every capture here was taken by writing what a real server accepts and comparing the
+> answers, so a row could only be opened where the node refused or answered differently — and a
+> shape the node accepts and a real server rejects produces no capture at all, because nobody
+> wrote the statement. The deparse census found the same blind spot one layer down, in printing:
+> a reader that was measured on the shapes that happened to reach it is **wrong and green**, and
+> stays that way until something asks it the cross product. Both are the same rule — *the corpus
+> can only answer the question it was written to ask* — and both are cheapest to fix by writing
+> the enumeration rather than the example.
 
 [`docs/acceptance/v1.1.md`](../acceptance/v1.1.md) carries the numbers — run 107 on main
 `9d642ef0`, 10,081 of 10,134 — and points back here for what is left. This file is the what
@@ -75,6 +96,7 @@ re-measured a month later.
 | 37 | **A domain is not a type a client can be sent.** `information_schema.tables.table_name` is the domain `sql_identifier` on a real server — `typtype = 'd'`, base `name`, with an array type of its own — so `pg_typeof` of the column is `information_schema.sql_identifier` and `array_agg` of it is `_sql_identifier` (13360). This node answers the *base* type and its array, `name` and `_name` (1003). **The values are identical**: a domain adds a constraint, not a representation, so every row this node returns is the row a real server returns and what differs is the name a `RowDescription` carries. The reason it cannot be an arm somewhere is structural: `ColumnType` is a closed enum of storage types, a domain is carried beside a column (`catalog::ColumnDef`) rather than as one, and the oid sent to a client comes from the enum — so a domain has nowhere to live on the wire. `CREATE DOMAIN` already works and its constraint is already enforced; what is missing is the *type identity*. Group 10 of r1's wire-108 baseline is this row and nothing else, and it is deliberately not in the sweep: it needs an ADR and a milestone the user sets, not a wire fix. | `value::ColumnType` is the closed enum; `catalog::pg_catalog::typname`/`typtype` have no domain row to emit; the four declared rows are in `tests/aggregate_groups.rs` | medium — a type-system unit with an ADR in it, and the `information_schema` columns are five domains rather than one | unassigned | `crates/esker-sql/tests/captures/pg19_aggregate_groups.txt`, the `sql_identifier` block |
 
 
+| 34 | **A region can be without a leader for more than thirty seconds at 192–325 regions, and it is repeatedly region 1.** | `crates/esker-sql/tests/routing_differential.rs`'s `how_long_a_writer_waits_for_a_region_between_leaders` (a measurement) and `a_splitting_bulk_load_never_fails_for_want_of_attempts` (a reproducer), both `#[ignore]`d | unknown, and the first question is not the fix: **the system and the harness are not separated** — four stores in one process driving three hundred Raft groups at a 5 ms tick is its own explanation and nothing rules it out yet | h1 | **four runs, fourteen sightings, none recovered**: 30.0–33.4 s each at 192, 252, 276 and 325 regions, where thirty seconds is where the instrument gives up — so every number is a floor. Seven of the fourteen name **region 1**, the original whole-key-space region. Found by [ADR 0100](../adr/0100-a-region-between-leaders-waits-on-the-callers-deadline.md)'s measurement, which was asked whether a retry budget should give way to the caller's deadline and answered that the budget is not what stands in the way. For contrast, [ADR 0094](../adr/0094-a-split-childs-leader-is-the-parents-leader.md) measured a split child's leaderless window at a **median of 10 ms** across 132 splits on the same harness at ~130 regions — so what this row is really about is how that window behaves as the region count grows |
 
 
 ## 2. Closed since v1, and recorded here because the register is where a reader looks

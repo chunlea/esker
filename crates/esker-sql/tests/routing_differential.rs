@@ -1361,6 +1361,166 @@ fn timed_engine(
     (answer, samples[samples.len() / 2], plan)
 }
 
+/// **A bulk load into a splitting table fails on a count, not on its deadline.**
+///
+/// The 160-region tier, which is where `where_a_bulk_load_into_a_splitting_table_breaks` measured
+/// it: three rounds on 2026-09-09 broke at 162, 16 and 120 regions, and two of the three broke with
+/// `08006 … gave up after 9 or 10 attempts: peer is not the leader`
+/// ([ADR 0100](../../../docs/adr/0100-a-region-between-leaders-waits-on-the-callers-deadline.md)).
+///
+/// **The assertion is the shape, not a duration**: a refusal whose own sentence says it ran out of
+/// *attempts* is the defect, whatever the wall clock says, because the caller's deadline had time
+/// left when it was raised. A load that fails because it ran out of *time* is a different answer
+/// and this test lets it through — that one is a machine being slow, which is not what this is
+/// about.
+///
+/// Kept beside the measurement rather than in the gate, and `#[ignore]`d for the same reason it is:
+/// a hundred and sixty in-process Raft groups over four stores is minutes of a quiet box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "the 160-region tier: minutes, and it wants a quiet box"]
+async fn a_splitting_bulk_load_never_fails_for_want_of_attempts() {
+    let gate = Gate::start_splitting(8 * 1024).await;
+    let mut counted = Vec::new();
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, filler text)",
+        );
+        let filler = "x".repeat(256);
+        for at in (1..=10_000_i64).step_by(250) {
+            let values: Vec<String> = (at..at + 250)
+                .map(|id| format!("({id}, '{filler}')"))
+                .collect();
+            let statement = format!("INSERT INTO t VALUES {}", values.join(", "));
+            if let Err(error) = session.run(&statement) {
+                let text = error.to_string();
+                // **The sentence names what ended the call.** `gave up after N attempts` is the
+                // count; `deadline` is the caller's own limit and is allowed.
+                if text.contains("gave up after") {
+                    counted.push(format!(
+                        "at row {at} and {} regions: {text}",
+                        gate.regions()
+                    ));
+                }
+                break;
+            }
+        }
+    });
+    gate.stop().await;
+    assert!(
+        counted.is_empty(),
+        "a load into a splitting table was refused for want of attempts while its deadline had \
+         time left:\n  {}",
+        counted.join("\n  ")
+    );
+}
+
+/// **How long a writer has to wait when it meets a region between leaders** — the measurement
+/// [ADR 0100](../../../docs/adr/0100-a-region-between-leaders-waits-on-the-callers-deadline.md)
+/// defers its decision on.
+///
+/// The red test beside this one says the client gives up on a **count** while the caller's deadline
+/// still has time. Whether that count should simply go depends on a number nobody has: **how long a
+/// region really has no leader during a burst of splits**, now that
+/// [ADR 0094](../../../docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md) makes a split
+/// child campaign at once. If the distribution sits well inside the default ten seconds, removing
+/// the count turns a hard failure into a slower success. If it has a long tail, removing it turns a
+/// two-second failure into a ten-second one for every writer that meets it.
+///
+/// So this measures it the way the caller experiences it: when a statement is refused for want of
+/// attempts, it is asked again — and again — until it lands, and what is recorded is **how long the
+/// deadline would have had to be**. Nothing else here is timed, so a slow box moves every number
+/// the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement for ADR 0100: the 160-region tier, minutes, and it wants a quiet box"]
+async fn how_long_a_writer_waits_for_a_region_between_leaders() {
+    const GIVE_UP_AFTER: Duration = Duration::from_secs(30);
+    let gate = Gate::start_splitting(8 * 1024).await;
+    let mut waits: Vec<(i64, usize, Duration)> = Vec::new();
+    let mut never = Vec::new();
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, filler text)",
+        );
+        let filler = "x".repeat(256);
+        // Four thousand rows and twenty-five waits: enough to cross three hundred regions and
+        // meet the window repeatedly, and small enough to finish inside the window it is measured
+        // in. The first version asked for ten thousand and was killed at ten minutes.
+        for at in (1..=4_000_i64).step_by(250) {
+            if waits.len() >= 25 {
+                break;
+            }
+            let values: Vec<String> = (at..at + 250)
+                .map(|id| format!("({id}, '{filler}')"))
+                .collect();
+            let statement = format!("INSERT INTO t VALUES {}", values.join(", "));
+            let Err(first) = session.run(&statement) else {
+                continue;
+            };
+            // Only the refusal this ADR is about. Anything else is somebody else's row.
+            if !first.to_string().contains("not the leader") {
+                continue;
+            }
+            let regions = gate.regions();
+            let began = Instant::now();
+            loop {
+                match session.run(&statement) {
+                    Ok(_) => {
+                        // **Printed here, not at the end.** The first run of this was killed by
+                        // its own timeout at 602 s and printed nothing at all, because every
+                        // number was in a `Vec` waiting for a summary that never ran. A
+                        // measurement under a budget streams.
+                        println!(
+                            "    row {at:<6} {regions:>4} regions   {:>8.1} ms",
+                            began.elapsed().as_secs_f64() * 1000.0
+                        );
+                        waits.push((at, regions, began.elapsed()));
+                        break;
+                    }
+                    Err(error) if began.elapsed() >= GIVE_UP_AFTER => {
+                        never.push(format!(
+                            "row {at} at {regions} regions: still refused after {:?}: {error}",
+                            began.elapsed()
+                        ));
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        }
+    });
+    gate.stop().await;
+
+    let mut millis: Vec<u128> = waits.iter().map(|(_, _, at)| at.as_millis()).collect();
+    millis.sort_unstable();
+    println!(
+        "\n  {} statements met a region between leaders",
+        millis.len()
+    );
+    if let (Some(min), Some(max)) = (millis.first(), millis.last()) {
+        let median = millis[millis.len() / 2];
+        let p90 = millis[millis.len() * 9 / 10];
+        println!("  min {min} ms   median {median} ms   p90 {p90} ms   max {max} ms");
+        println!("  every wait, in order met:");
+        for (row, regions, waited) in &waits {
+            println!(
+                "    row {row:<6} {regions:>4} regions   {:>8.1} ms",
+                waited.as_secs_f64() * 1000.0
+            );
+        }
+    }
+    for line in &never {
+        println!("  {line}");
+    }
+    assert!(
+        never.is_empty(),
+        "a region stayed leaderless past {GIVE_UP_AFTER:?}, which is not the window this measures"
+    );
+}
+
 /// **Which part of the per-region cost grows with the table.**
 ///
 /// `docs/plans/phase-16-mpp.md` §10 has the region axis at three thousand rows and the group axis
