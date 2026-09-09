@@ -5730,29 +5730,60 @@ fn normalise_generated(table: &mut TableDef) -> Result<()> {
 /// non-default type — `(-1)::bigint` is `('-1'::integer)::bigint` on a real server, two nodes deep
 /// — and it is declared rather than approximated.
 fn numeric_constant(printed: &str, ty: ColumnType) -> String {
-    let integral = !printed.contains(['.', 'e', 'E']);
-    let negative = printed.starts_with('-');
-    let fits_int4 = integral && printed.parse::<i32>().is_ok();
-    let fits_int8 = integral && printed.parse::<i64>().is_ok();
+    // **One rule, in two steps**: print the constant under the type the *digits* would have had,
+    // then wrap that in a cast if the type wanted is not that one. The three forms fall out of it
+    // rather than being enumerated, which is what [`natural_constant_type`] and
+    // [`constant_in_its_own_type`] are between them; `tests/corpus/pg19_negative_constant.txt`
+    // is the measurement, over both signs and every target type.
+    let natural = natural_constant_type(printed);
+    let inner = constant_in_its_own_type(printed, natural);
+    if ty == natural {
+        return inner;
+    }
+    format!("({inner})::{}", ty.name())
+}
 
-    // The two canonical literal forms print bare, and nothing else does.
-    let is_literal_form = match ty {
-        ColumnType::Int4 => integral,
-        ColumnType::Numeric => !integral,
-        _ => false,
-    };
-    if is_literal_form && !negative {
+/// The type PostgreSQL's scanner gives a numeric constant written with these characters.
+///
+/// `integer` if the digits fit one, `bigint` if they fit that, `numeric` for anything wider and
+/// for anything with a decimal point (ADR 0087's ladder, read from the printing end). **The sign
+/// is part of the value here**: `-1` is an `integer` and `-9223372036854775807` a `bigint`, which
+/// is what makes the wrap below decidable — measured, `(-9223372036854775807)::numeric` is
+/// `('-9223372036854775807'::bigint)::numeric` and not `('-9223372036854775807'::integer)::…`.
+fn natural_constant_type(printed: &str) -> ColumnType {
+    if printed.contains(['.', 'e', 'E']) {
+        return ColumnType::Numeric;
+    }
+    if printed.parse::<i32>().is_ok() {
+        return ColumnType::Int4;
+    }
+    if printed.parse::<i64>().is_ok() {
+        return ColumnType::Int8;
+    }
+    ColumnType::Numeric
+}
+
+/// That constant printed under its own type: **bare** where the type has a literal syntax for the
+/// value, and quoted with a type annotation where it does not.
+///
+/// Two spellings have a literal syntax and no others: an unsigned run of digits is an `integer`
+/// and an unsigned decimal is a `numeric`. Everything else is a `Const` PostgreSQL prints as
+/// `'…'::type` — a value too wide for the literal form's type, and **every negative value**,
+/// because a negative constant is a unary minus folded into the constant by the scanner and so was
+/// never a literal at all. That is the whole reason `(-1)::bigint` is `('-1'::integer)::bigint`
+/// where `(1)::bigint` is `(1)::bigint`.
+fn constant_in_its_own_type(printed: &str, natural: ColumnType) -> String {
+    let integral = !printed.contains(['.', 'e', 'E']);
+    let literal_form = !printed.starts_with('-')
+        && match natural {
+            ColumnType::Int4 => integral,
+            ColumnType::Numeric => !integral,
+            _ => false,
+        };
+    if literal_form {
         return printed.to_owned();
     }
-    // A bare constant of a non-default type: quoted, with the type the scanner would have given
-    // it. Everything else is a cast over a constant of the literal form's type.
-    let bare_constant = negative
-        || (ty == ColumnType::Int8 && !fits_int4)
-        || (ty == ColumnType::Numeric && integral && !fits_int8);
-    if bare_constant {
-        return format!("'{printed}'::{}", ty.name());
-    }
-    format!("({printed})::{}", ty.name())
+    format!("'{printed}'::{}", natural.name())
 }
 
 /// One `DEFAULT`, as `pg_get_expr` prints it — for the shapes where that is not what was written.
@@ -5834,6 +5865,21 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
         // must never be stored: `DEFAULT ('a' || 'b')` prints `('a'::text || 'b'::text)`,
         // `btrim(t, 'x')` prints `btrim(t, 'x'::text)`, and `setweight(tv, 'A')` prints nothing
         // this node can produce, so its written text is kept.
+        // **A numeric constant on its own**, which is a shape `pg_get_expr` really does reprint:
+        // `DEFAULT (-1)::bigint` is `('-1'::integer)::bigint` there and was kept as written here,
+        // because a folded cast leaves a bare `Literal` and this list had none. `numeric_constant`
+        // is PostgreSQL's own `get_const_expr` for these, so deparsing them loses nothing — and
+        // for the constants that already agreed it prints the same characters (`7` is `7`).
+        //
+        // Numeric only. A string, a boolean and a `NULL` are left where they were: `DEFAULT 'x'`
+        // and `DEFAULT true` agree as written, and adding them would be a change with no
+        // measurement behind it.
+        Expr::Literal(literal) => matches!(
+            literal,
+            plan::Literal::Integer(_) | plan::Literal::Decimal(_)
+        ) || matches!(literal, plan::Literal::Typed(value)
+                if matches!(**value, Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)
+                    | Datum::Numeric(_) | Datum::Real(_) | Datum::Double(_))),
         Expr::CatalogFunc(call) => {
             (operator_operand_types(call.func).is_some() && call.args.len() == 2)
                 || matches!(
@@ -5862,11 +5908,12 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
         | Expr::CurrentDatabase
         | Expr::CurrentSetting { .. }
         | Expr::Advisory { .. }
-        // *There is nothing to reprint.* A bare literal is stored as a **value** and never reaches
-        // here (`parse::lower::column_default` folds it), and a folded negative literal is the
-        // same case — `DEFAULT - 1` is the `Datum` `-1`, which is why `Negate` is here and not
-        // above with the operators.
-        | Expr::Literal(_)
+        // *There is nothing to reprint.* A folded negative literal is stored as a **value** —
+        // `DEFAULT - 1` is the `Datum` `-1` — which is why `Negate` is here and not above with
+        // the operators. `Literal` used to be on this line with it, on the reasoning that a bare
+        // literal never reaches here either; that is true of the *value* and false of the text,
+        // because `parse::fold_column_default` keeps the unfolded expression beside the folded
+        // datum and `deparse_default` reads that. See the numeric arm below.
         | Expr::Negate(_)
         | Expr::Array { .. }
         | Expr::Subscript { .. }

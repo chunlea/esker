@@ -4214,7 +4214,20 @@ fn retype(
     // the literal is declared (ADR 0087), so narrowing to either is a no-op and only `smallint`
     // had a distinct one. Written as the rule rather than as the width, because a fix aimed at
     // `smallint` would be a fix to the symptom.
-    if matches!(literal, Literal::Integer(_))
+    //
+    // **And a literal that already *carries* an integer type keeps it**, which is the same
+    // sentence again and the half that was missing: `i8 > 1::bigint` folds the written cast into
+    // the constant, so the literal arrives here as `Literal::Typed(Int8(1))`, fell through to
+    // `assign` and came back `Literal::Integer(1)` — the `Datum::Int8(value) =>
+    // Literal::Integer(value)` line below, which is where the declared width went. A real server
+    // prints `(i8 > (1)::bigint)` and this node printed `(i8 > 1)`
+    // (`debts-v1.1.md` #24's `c_i8_cast` row). Measured over both signs and three widths in
+    // `tests/corpus/pg19_negative_constant.txt`: `(i2 > (1)::smallint)`,
+    // `(i2 > ('-1'::integer)::smallint)`, `(nm > ('-1'::integer)::numeric)`.
+    let carries_an_integer_type = matches!(literal, Literal::Integer(_))
+        || matches!(literal, Literal::Typed(value)
+            if matches!(**value, Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)));
+    if carries_an_integer_type
         && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
     {
         return Ok(literal.clone());
