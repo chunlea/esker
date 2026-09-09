@@ -1,0 +1,31 @@
+crates/esker-sql/src/error.rs
+  s_2bed4ac2b1c944::t_17f526bb6c355a 1114-1124,3068-3072,3151
+crates/esker-sql/src/exec/ddl.rs
+  s_2bed4ac2b1c944::t_122fb49c058fa4 218,641-649,5331-5346,5414-5569,5647-5684,5691,5830-5847,6051-6062,6079-6080,6084-6086,6139-6256,6932
+crates/esker-sql/tests/captures/pg19_catalog_func_deparse.txt
+  s_2bed4ac2b1c944::t_61d10ca36e2f24 1-206
+crates/esker-sql/tests/catalog_func_deparse.rs
+  s_2bed4ac2b1c944::t_e01fd245ca7752 1-68
+crates/esker-sql/tests/check_constraint.rs
+  s_2bed4ac2b1c944::t_44be12084c7e48 21-28
+crates/esker-sql/tests/corpus/pg19_catalog_func_deparse.txt
+  s_2bed4ac2b1c944::t_0543d1f5f95a5c 1-206
+docs/plans/debts-v1.1.md
+  s_2bed4ac2b1c944::t_662cdc0f43d025 57-58,68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "76b9083375a4b36c75e09d69394efac2acd60bb4",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
