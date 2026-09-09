@@ -786,6 +786,22 @@ impl Execute for NotYetExecuting {
     /// Discarded: there is no catalog behind this, so nothing can read the view they would fill.
     fn remember_prepared(&mut self, _statements: Vec<crate::session::PreparedStatement>) {}
 
+    /// There is no planner behind this, so there is no plan to explain.
+    fn explain_prepared(
+        &mut self,
+        _explain: &crate::parse::Parsed,
+        statement: &crate::parse::Parsed,
+        _params: &crate::pgwire::session::Params<'_>,
+    ) -> Result<crate::pgwire::session::Outcome> {
+        Err(SqlError::unsupported(format!(
+            "{} (the executor lands in unit 6 of docs/plans/phase-6a.md)",
+            statement
+                .class()
+                .unsupported_feature()
+                .unwrap_or("EXPLAIN of a prepared statement")
+        )))
+    }
+
     fn execute(
         &mut self,
         parsed: &crate::parse::Parsed,

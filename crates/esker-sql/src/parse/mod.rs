@@ -189,6 +189,18 @@ pub enum StatementClass {
         /// argument is not a literal, which the session refuses by name.
         args: Option<Vec<Option<String>>>,
     },
+    /// `EXPLAIN [(options)] EXECUTE name [(args)]` — an `EXPLAIN` **of a prepared statement**.
+    ///
+    /// Its own class because the statement being explained is not in this one: it is in the
+    /// session's store, which the executor cannot see. `connection_test.rb`'s
+    /// `test_statement_key_is_logged` sends exactly this, over a statement `PQprepare` named —
+    /// so the two doors meet here as they do at `EXECUTE`.
+    ExplainExecute {
+        /// Which prepared statement, folded the way `PREPARE` and `EXECUTE` fold theirs.
+        name: String,
+        /// The literal arguments, read the same way `EXECUTE`'s are.
+        args: Option<Vec<Option<String>>>,
+    },
     /// `DEALLOCATE name` and `DEALLOCATE ALL` — `None` for `ALL`.
     Deallocate(Option<String>),
     /// `SET CONSTRAINTS { ALL | name [, …] } { DEFERRED | IMMEDIATE }`.
@@ -3047,26 +3059,28 @@ pub fn classify(statement: &Statement) -> StatementClass {
             name: Some(name),
             parameters,
             ..
-        } => StatementClass::Execute {
-            // The identifier itself, not its rendering: `Display` for an `ObjectNamePart` writes
-            // the quotes back, so `EXECUTE "Q"` looked up `"q"` — quotes included — and answered
-            // `26000` for a statement `PREPARE "Q"` had just made. Folded exactly as `PREPARE`
-            // folds its name above, which is what makes the two meet.
-            name: match name.0.last() {
-                Some(sqlparser::ast::ObjectNamePart::Identifier(ident)) => {
-                    crate::catalog::fold_identifier(&ident.value, ident.quote_style.is_some())
-                }
-                _ => crate::catalog::fold_identifier("", false),
-            }
-            .0,
-            // `collect` over `Option` turns one unreadable argument into no list at all, and
-            // the session refuses by name rather than running with a hole in it.
-            args: parameters
-                .iter()
-                .map(argument_text)
-                .collect::<Option<Vec<_>>>()
-                .map(|args| args.into_iter().map(Argument::into_bind).collect()),
-        },
+        } => {
+            let (name, args) = execute_target(name, parameters);
+            StatementClass::Execute { name, args }
+        }
+        // **`EXPLAIN … EXECUTE` reads the same grammar**, which is why it reads it with the same
+        // function: the name is folded the same way and the arguments are literals the same way,
+        // and two readers of one grammar is how a quoted name comes to be looked up with its
+        // quotes on in one of them.
+        Statement::Explain { statement, .. }
+            if matches!(statement.as_ref(), Statement::Execute { name: Some(_), .. }) =>
+        {
+            let Statement::Execute {
+                name: Some(name),
+                parameters,
+                ..
+            } = statement.as_ref()
+            else {
+                unreachable!("the guard above matched this shape")
+            };
+            let (name, args) = execute_target(name, parameters);
+            StatementClass::ExplainExecute { name, args }
+        }
         // **`ALL` is a keyword here and a name when it is quoted.** `DEALLOCATE ALL` drops
         // everything; `DEALLOCATE "ALL"` drops the statement called `ALL`, which PostgreSQL allows
         // and which a case-insensitive match on the folded text alone would silently turn into the
@@ -3142,6 +3156,35 @@ fn argument_text(expr: &sqlparser::ast::Expr) -> Option<Argument> {
         Value::Null => Some(Argument::Null),
         _ => None,
     }
+}
+
+/// The prepared statement an `EXECUTE` names, and the arguments it passes.
+///
+/// **The identifier itself, not its rendering**: `Display` for an `ObjectNamePart` writes the
+/// quotes back, so `EXECUTE "Q"` looked up `"q"` — quotes included — and answered `26000` for a
+/// statement `PREPARE "Q"` had just made. Folded exactly as `PREPARE` folds its name, which is
+/// what makes the two meet.
+///
+/// `args` is `None` when any argument is not a literal — `collect` over `Option` turns one
+/// unreadable argument into no list at all, and the session refuses by name rather than running
+/// with a hole in it.
+fn execute_target(
+    name: &sqlparser::ast::ObjectName,
+    parameters: &[sqlparser::ast::Expr],
+) -> (String, Option<Vec<Option<String>>>) {
+    let folded = match name.0.last() {
+        Some(sqlparser::ast::ObjectNamePart::Identifier(ident)) => {
+            crate::catalog::fold_identifier(&ident.value, ident.quote_style.is_some())
+        }
+        _ => crate::catalog::fold_identifier("", false),
+    }
+    .0;
+    let args = parameters
+        .iter()
+        .map(argument_text)
+        .collect::<Option<Vec<_>>>()
+        .map(|args| args.into_iter().map(Argument::into_bind).collect());
+    (folded, args)
 }
 
 /// The feature name for a statement we do not execute.

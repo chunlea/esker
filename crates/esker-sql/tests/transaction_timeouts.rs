@@ -752,6 +752,16 @@ impl Execute for Idling {
     /// Discarded: this fake answers `SELECT 1` and has no catalog to read the view from.
     fn remember_prepared(&mut self, _statements: Vec<esker_sql::session::PreparedStatement>) {}
 
+    /// This fake has no planner, and nothing here explains anything.
+    fn explain_prepared(
+        &mut self,
+        _explain: &esker_sql::parse::Parsed,
+        _statement: &esker_sql::parse::Parsed,
+        _params: &Params<'_>,
+    ) -> esker_sql::Result<Outcome> {
+        Ok(Outcome::done("EXPLAIN"))
+    }
+
     fn execute(
         &mut self,
         _parsed: &esker_sql::parse::Parsed,
