@@ -56,15 +56,30 @@ pub const DRIVER_WORKERS: usize = 4;
 /// `fsync` is a memory leak with extra steps (`docs/DESIGN.md` §9).
 pub const WORKER_QUEUE_DEPTH: usize = crate::peer::PEER_QUEUE_DEPTH;
 
+/// Which registration a region's core belongs to.
+///
+/// **A region id names a place; this names an occupant.** Two peers of one region on one store
+/// can exist for a moment — one being replaced by a snapshot, one built by a caller that has not
+/// yet been told it may not host the region — and every operation that says "this region" has to
+/// say *which* of them it meant, or it acts on the wrong one. Monotonic per pool, never reused.
+pub(crate) type Token = u64;
+
 /// What a worker is asked to do.
 enum Job {
     /// Take on a region, and drive it from now on.
-    Register { region_id: u64, core: Box<PeerCore> },
+    Register {
+        region_id: u64,
+        token: Token,
+        core: Box<PeerCore>,
+    },
     /// One message for a region this worker holds.
     Deliver { region_id: u64, message: PeerMsg },
     /// Give up a region, failing whatever it still owes its callers.
     Retire {
         region_id: u64,
+        /// **The registration being retired, not just the region.** A handle that has already
+        /// been superseded must not be able to stop the core that took its place.
+        token: Token,
         /// Signalled once the region is gone, so a caller that is about to flush the database can
         /// know that nothing is still applying into it.
         done: std::sync::mpsc::SyncSender<()>,
@@ -76,11 +91,15 @@ enum Job {
 impl std::fmt::Debug for Job {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Register { region_id, .. } => {
-                write!(formatter, "Register({region_id})")
+            Self::Register {
+                region_id, token, ..
+            } => {
+                write!(formatter, "Register({region_id}#{token})")
             }
             Self::Deliver { region_id, .. } => write!(formatter, "Deliver({region_id})"),
-            Self::Retire { region_id, .. } => write!(formatter, "Retire({region_id})"),
+            Self::Retire {
+                region_id, token, ..
+            } => write!(formatter, "Retire({region_id}#{token})"),
             Self::Stop => formatter.write_str("Stop"),
         }
     }
@@ -106,6 +125,18 @@ pub struct DriverPool {
     /// or it was full — which means a job is pending, which means the worker wakes, and the first
     /// thing it does on waking is read this.
     stopping: Arc<AtomicBool>,
+    /// **Which registration is driving each region, decided here rather than in a worker.**
+    ///
+    /// `Job::Register` used to be a `BTreeMap::insert` inside the worker: it replaced whatever
+    /// core was there and said nothing, so a caller that built a peer and was then refused the
+    /// region left the store answering from a handle nobody published into while another core
+    /// answered every message ([ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md)).
+    /// The claim is taken here, before the job is even queued, because the answer has to be
+    /// synchronous: `adopt_split` registers a child from the **parent's driver thread**, which may
+    /// be the same worker, so waiting for a worker to answer would be waiting for itself.
+    registered: Mutex<BTreeMap<u64, Token>>,
+    /// Hands out [`Token`]s. Monotonic, never reused, so a stale retire names nothing.
+    next_token: std::sync::atomic::AtomicU64,
 }
 
 impl DriverPool {
@@ -131,6 +162,8 @@ impl DriverPool {
             workers: senders,
             threads: Mutex::new(threads),
             stopping,
+            registered: Mutex::new(BTreeMap::new()),
+            next_token: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
@@ -150,14 +183,67 @@ impl DriverPool {
     }
 
     /// Hands a region's core to the worker it is pinned to.
-    pub(crate) fn register(&self, region_id: u64, core: Box<PeerCore>) -> Result<()> {
+    /// Hands a region's core to the worker it is pinned to, **claiming the region first**.
+    ///
+    /// Refuses a region this pool is already driving, and the refusal is the point: registering is
+    /// a claim on a place, not an overwrite of whoever is in it. The token it returns is the
+    /// claim's identity — [`DriverPool::retire`] and [`DriverPool::abandon`] both take it, so a
+    /// superseded handle can only ever retire itself.
+    pub(crate) fn register(&self, region_id: u64, core: Box<PeerCore>) -> Result<Token> {
+        let mut registered = self
+            .registered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(held) = registered.get(&region_id) {
+            return Err(StoreError::RegionConflict(format!(
+                "region {region_id} is already being driven by registration {held}; a store                  drives one core per region"
+            )));
+        }
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         self.workers[self.worker_of(region_id)]
-            .try_send(Job::Register { region_id, core })
+            .try_send(Job::Register {
+                region_id,
+                token,
+                core,
+            })
             .map_err(|_| {
                 StoreError::Bootstrap(format!(
                     "the driver worker for region {region_id} would not take it"
                 ))
-            })
+            })?;
+        registered.insert(region_id, token);
+        Ok(token)
+    }
+
+    /// Whether this pool is driving a core for `region_id`.
+    ///
+    /// The observable the refusal paths are tested against: a caller that was told it may not host
+    /// a region must leave nothing behind driving it.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn driving(&self, region_id: u64) -> bool {
+        self.registered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&region_id)
+    }
+
+    /// Releases the claim if `token` still holds it, and says whether it did.
+    fn release(&self, region_id: u64, token: Token) -> bool {
+        let mut registered = self
+            .registered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registered.get(&region_id) != Some(&token) {
+            tracing::debug!(
+                region_id,
+                token,
+                "a superseded registration asked to retire a region it no longer drives"
+            );
+            return false;
+        }
+        registered.remove(&region_id);
+        true
     }
 
     /// Queues one message for a region.
@@ -178,13 +264,51 @@ impl DriverPool {
     /// database, and a worker still holding the core would be applying into it. The wait is
     /// bounded, because a wedged worker must not be able to hold a shutdown open for ever — a
     /// timeout here means the process is going down anyway.
-    pub(crate) fn retire(&self, region_id: u64) {
+    pub(crate) fn retire(&self, region_id: u64, token: Token) {
+        if !self.release(region_id, token) {
+            return;
+        }
         let (done, waiter) = std::sync::mpsc::sync_channel(1);
         let sender = &self.workers[self.worker_of(region_id)];
-        if sender.try_send(Job::Retire { region_id, done }).is_err() {
+        if sender
+            .try_send(Job::Retire {
+                region_id,
+                token,
+                done,
+            })
+            .is_err()
+        {
             return;
         }
         let _ = waiter.recv_timeout(RETIRE_TIMEOUT);
+    }
+
+    /// Gives a region up **without waiting**, for a peer that was never handed to the store.
+    ///
+    /// The waiting version exists because a caller that retires a region is usually about to flush
+    /// or drop the database. A peer whose reservation was never committed wrote nothing anybody is
+    /// about to read, and its canceller may be a **driver thread** — `adopt_split` runs on the
+    /// parent's, and the child can be pinned to the same worker, so waiting there would be a
+    /// thread waiting for itself.
+    pub(crate) fn abandon(&self, region_id: u64, token: Token) {
+        if !self.release(region_id, token) {
+            return;
+        }
+        let (done, _waiter) = std::sync::mpsc::sync_channel(1);
+        if self.workers[self.worker_of(region_id)]
+            .try_send(Job::Retire {
+                region_id,
+                token,
+                done,
+            })
+            .is_err()
+        {
+            tracing::error!(
+                region_id,
+                token,
+                "a peer that was never hosted could not be given back to its worker"
+            );
+        }
     }
 
     /// Stops every worker and waits for them, failing whatever is outstanding on every region.
@@ -217,9 +341,15 @@ impl DriverPool {
 /// How long [`DriverPool::retire`] waits for a worker to let go of a region.
 const RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A region's core and the registration it arrived under.
+struct Held {
+    token: Token,
+    core: PeerCore,
+}
+
 /// One worker: hold some regions, drive the ones that were touched.
 fn run(mut inbox: mpsc::Receiver<Job>, stopping: &AtomicBool) {
-    let mut cores: BTreeMap<u64, PeerCore> = BTreeMap::new();
+    let mut cores: BTreeMap<u64, Held> = BTreeMap::new();
 
     while let Some(job) = inbox.blocking_recv() {
         // Read on every wake, before the job is even looked at. A worker that woke to a queue
@@ -242,16 +372,17 @@ fn run(mut inbox: mpsc::Receiver<Job>, stopping: &AtomicBool) {
         }
 
         for region_id in touched {
-            let Some(core) = cores.get_mut(&region_id) else {
+            let Some(held) = cores.get_mut(&region_id) else {
                 continue;
             };
-            if let Err(error) = core.drive() {
+            if let Err(error) = held.core.drive() {
                 // A failed write is not something this layer can paper over: the log and the state
                 // machine may now disagree. The region is dropped — loudly — and the worker keeps
                 // serving the others, because one region's disk is not another's.
                 tracing::error!(region_id, %error, "the Raft driver failed for a region");
-                if let Some(mut core) = cores.remove(&region_id) {
-                    core.fail_outstanding("this region's Raft driver stopped");
+                if let Some(mut held) = cores.remove(&region_id) {
+                    held.core
+                        .fail_outstanding("this region's Raft driver stopped");
                 }
             }
         }
@@ -260,30 +391,48 @@ fn run(mut inbox: mpsc::Receiver<Job>, stopping: &AtomicBool) {
         }
     }
 
-    for core in cores.values_mut() {
-        core.fail_outstanding("the Raft driver stopped");
+    for held in cores.values_mut() {
+        held.core.fail_outstanding("the Raft driver stopped");
     }
 }
 
 /// Applies one job. Returns `false` when a region asked its worker to stop, which only
 /// [`PeerMsg::Stop`] does and which now retires that region rather than the whole worker.
-fn handle(cores: &mut BTreeMap<u64, PeerCore>, touched: &mut BTreeSet<u64>, job: Job) -> bool {
+fn handle(cores: &mut BTreeMap<u64, Held>, touched: &mut BTreeSet<u64>, job: Job) -> bool {
     match job {
-        Job::Register { region_id, core } => {
-            cores.insert(region_id, *core);
+        Job::Register {
+            region_id,
+            token,
+            core,
+        } => {
+            // The pool takes the claim before it queues this, so an occupied slot here is a lost
+            // `Retire` and not a second host — loud, because it is the state
+            // [ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md) exists to make
+            // impossible, and because the core going out of scope below owed its callers answers.
+            if let Some(mut displaced) = cores.insert(region_id, Held { token, core: *core }) {
+                tracing::error!(
+                    region_id,
+                    displaced = displaced.token,
+                    token,
+                    "a registration displaced one this worker still held"
+                );
+                displaced
+                    .core
+                    .fail_outstanding("this region's core was displaced");
+            }
             touched.insert(region_id);
         }
         Job::Deliver { region_id, message } => {
-            let Some(core) = cores.get_mut(&region_id) else {
+            let Some(held) = cores.get_mut(&region_id) else {
                 // A message for a region this worker has already let go of. Dropping it is right:
                 // whoever sent it holds a handle that is on its way out too.
                 tracing::debug!(region_id, "a driver job arrived for a region that is gone");
                 return true;
             };
-            if !core.handle(message) {
+            if !held.core.handle(message) {
                 // `Stop`. The region goes; the worker stays, because it holds others.
-                if let Some(mut core) = cores.remove(&region_id) {
-                    core.fail_outstanding("the Raft peer stopped");
+                if let Some(mut held) = cores.remove(&region_id) {
+                    held.core.fail_outstanding("the Raft peer stopped");
                 }
                 touched.remove(&region_id);
                 return true;
@@ -291,11 +440,23 @@ fn handle(cores: &mut BTreeMap<u64, PeerCore>, touched: &mut BTreeSet<u64>, job:
             touched.insert(region_id);
         }
         Job::Stop => return false,
-        Job::Retire { region_id, done } => {
-            if let Some(mut core) = cores.remove(&region_id) {
-                core.fail_outstanding("the Raft peer stopped");
+        Job::Retire {
+            region_id,
+            token,
+            done,
+        } => {
+            // **Only the registration that asked.** A retire that names a token this worker no
+            // longer holds is a handle that was superseded catching up with itself, and acting on
+            // it would stop the core that took its place.
+            if cores
+                .get(&region_id)
+                .is_some_and(|held| held.token == token)
+            {
+                if let Some(mut held) = cores.remove(&region_id) {
+                    held.core.fail_outstanding("the Raft peer stopped");
+                }
+                touched.remove(&region_id);
             }
-            touched.remove(&region_id);
             // Only after the core is gone, so a caller that was about to flush knows nothing is
             // still applying into the database.
             let _ = done.send(());

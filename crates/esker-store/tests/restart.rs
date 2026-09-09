@@ -99,6 +99,7 @@ fn start(db: &Arc<Db>) -> Arc<RaftPeer> {
         Arc::new(DriverPool::new(1).unwrap()),
     )
     .unwrap()
+    .commit()
 }
 
 /// The region this test's peer serves: everything, as a bootstrapped store's is.
