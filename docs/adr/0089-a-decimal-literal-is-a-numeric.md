@@ -1,4 +1,4 @@
-# 0088 — A decimal literal is a `numeric`, and a `CASE`'s branches fold to their common type
+# 0089 — A decimal literal is a `numeric`, and a `CASE`'s branches fold to their common type
 
 Status: accepted · 2026-09-09
 
