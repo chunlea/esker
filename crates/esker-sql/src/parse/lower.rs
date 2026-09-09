@@ -4139,24 +4139,40 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             low,
             high,
         } => {
+            // **The negated form is a different pair of comparisons, not a `NOT` around this
+            // one.** PostgreSQL expands `a NOT BETWEEN 1 AND 10` to `((a < 1) OR (a > 10))` and
+            // prints that back through every reader; this node wrapped the positive pair and
+            // printed `(NOT ((a >= 1) AND (a <= 10)))`, which is the same *answer* and not the
+            // same *definition*.
+            //
+            // The two agree on every NULL, which is what had to be checked before swapping them:
+            // measured on 19beta1 with a NULL value, a NULL low and a NULL high, `NOT BETWEEN`,
+            // the `OR` form and the `NOT`-wrapped form give the same three NULLs and the same
+            // trues and falses elsewhere. The doc that used to sit here said the wrap was what
+            // carried the NULL through — true of it, and true of the `OR` form as well.
             let value = lower_expr(expr)?;
-            let pair = plan::Expr::Binary {
-                op: plan::BinaryOp::And,
+            let (low, high) = (lower_expr(low)?, lower_expr(high)?);
+            let (op, first, second) = if *negated {
+                (plan::BinaryOp::Or, plan::BinaryOp::Lt, plan::BinaryOp::Gt)
+            } else {
+                (
+                    plan::BinaryOp::And,
+                    plan::BinaryOp::GtEq,
+                    plan::BinaryOp::LtEq,
+                )
+            };
+            Ok(plan::Expr::Binary {
+                op,
                 left: Box::new(plan::Expr::Binary {
-                    op: plan::BinaryOp::GtEq,
+                    op: first,
                     left: Box::new(value.clone()),
-                    right: Box::new(lower_expr(low)?),
+                    right: Box::new(low),
                 }),
                 right: Box::new(plan::Expr::Binary {
-                    op: plan::BinaryOp::LtEq,
+                    op: second,
                     left: Box::new(value),
-                    right: Box::new(lower_expr(high)?),
+                    right: Box::new(high),
                 }),
-            };
-            Ok(if *negated {
-                plan::Expr::Not(Box::new(pair))
-            } else {
-                pair
             })
         }
         Expr::UnaryOp {
