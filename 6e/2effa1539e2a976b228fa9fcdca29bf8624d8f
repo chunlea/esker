@@ -1,0 +1,23 @@
+crates/esker-sql/tests/generated_stored.rs
+  s_2bed4ac2b1c944::t_18cbc2e4e47ca8 82
+docs/adr/0090-a-stored-expression-is-deparsed-by-the-statement-that-writes-it.md
+  s_2bed4ac2b1c944::t_026f0899ec1f54 1
+docs/plans/phase-9-rails.md
+  s_2bed4ac2b1c944::t_cb52b237ce5252 1260
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "6e2effa1539e2a976b228fa9fcdca29bf8624d8f",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
