@@ -772,6 +772,12 @@ impl CatalogFuncCall {
     /// this crate had for every catalog function before: an index whose key is not a function of
     /// the row is not a slow index, it is a wrong one. A function measured immutable is added
     /// here; nothing is added by reasoning.
+    ///
+    /// **And the measurement is now the whole table rather than the name in front of the reader.**
+    /// `tests/captures/pg19_provolatile_census.txt` is `pg_proc.provolatile` for all 79 names
+    /// [`CatalogFunc::from_name`] and [`ScalarFunc::from_name`] resolve, in one query; the arms
+    /// below carry what it said. Before that, this list had grown one family per defect four times
+    /// over, and every one of those commits had the query in front of it.
     #[must_use]
     pub fn is_immutable(&self) -> bool {
         match self.func {
@@ -798,6 +804,10 @@ impl CatalogFuncCall {
             | CatalogFunc::Rtrim
             | CatalogFunc::Greatest
             | CatalogFunc::Least
+            // `NULLIF` is a comparison, and a comparison between two immutable operands is one:
+            // measured, `CREATE INDEX i ON t ((nullif(t, 'x')))` is built by a real server and
+            // `pg_get_indexdef` prints `btree (NULLIF(t, 'x'::text))`.
+            | CatalogFunc::NullIf
             | CatalogFunc::Substr
             | CatalogFunc::Substring
             // **The JSON accessors, `i` on a real server** — measured through `pg_operator`
@@ -821,7 +831,68 @@ impl CatalogFuncCall {
             // What it cost: `GENERATED ALWAYS AS (t || 'x') STORED` was `42P17 functions in index
             // expression must be marked IMMUTABLE` for a column a real server creates — measured,
             // and `length(t || 'x')` with it.
-            | CatalogFunc::HstoreConcat => true,
+            | CatalogFunc::HstoreConcat
+            // **And then the whole table was measured at once instead of a twelfth name.**
+            // Everything above arrived one family per defect, and each time the reasoning that
+            // added one name would have added the ones below it. #25's corpus refused
+            // `replace(t, 'a', 'b')` in a generated column -- `42P17`, for a call whose
+            // `provolatile` is `i` -- and the answer to that is not `Replace`. It is
+            // `tests/captures/pg19_provolatile_census.txt`: `pg_proc.provolatile` for all 79
+            // names `from_name` and `ScalarFunc::from_name` resolve, in one query. Twenty-two of
+            // them were `i` on the oracle and `false` here, and they are these.
+            //
+            // *The string function the corpus found.* One name, and the reason the other
+            // twenty-one are in this commit rather than in a later one.
+            | CatalogFunc::Replace
+            // *Array introspection.* A length, a bound and a search over an array value: no
+            // catalog read, no setting, no clock.
+            | CatalogFunc::ArrayLength
+            | CatalogFunc::ArrayLower
+            | CatalogFunc::ArrayUpper
+            | CatalogFunc::ArrayPosition
+            | CatalogFunc::Cardinality
+            // *Range introspection and the two constructors this node resolves.* `isempty`,
+            // `lower_inc`/`lower_inf`, `upper_inc`/`upper_inf` read the range value's own flags;
+            // `daterange(a, b)` and `tsrange(a, b)` build one from their arguments. All `i`, both
+            // arities.
+            | CatalogFunc::IsEmpty
+            | CatalogFunc::RangeLowerInc
+            | CatalogFunc::RangeLowerInf
+            | CatalogFunc::RangeUpperInc
+            | CatalogFunc::RangeUpperInf
+            | CatalogFunc::DateRange
+            | CatalogFunc::RangeBuild
+            // *The two path predicates*, which are a property of the geometry and nothing else.
+            | CatalogFunc::PathIsClosed
+            | CatalogFunc::PathIsOpen
+            // *hstore's accessors and its constructor.* Measured in a throwaway database with the
+            // extension installed, which is the second half of the capture: every `hstore`
+            // overload is `i`, **`hstore(record)` included** -- the one that looks like it should
+            // not be, since a record's shape comes from a relation.
+            | CatalogFunc::HstoreAkeys
+            | CatalogFunc::HstoreAvals
+            | CatalogFunc::HstoreBuild
+            // *`ltree`'s depth and its two text conversions*, and `numnode(tsquery)` beside them:
+            // all four are arithmetic on the value's own bytes.
+            | CatalogFunc::LtreeNlevel
+            | CatalogFunc::LtreeToText
+            | CatalogFunc::TextToLtree
+            | CatalogFunc::NumNode => true,
+            // **Everything else answers `false`**, and after the census that is a measurement
+            // too: of the 79 names, `concat`, `convert_to`, `format_type`, `pg_typeof`,
+            // `to_regclass`, `pg_encoding_to_char`, the seven `pg_get_*` printers, the two
+            // `*_description` readers, `now`/`current_date`/`localtime`/`localtimestamp` and the
+            // one-argument text-search forms are `s`; `random`, `clock_timestamp`, `pg_sleep`,
+            // `pg_backend_pid`, `pg_cancel_backend` and `pg_terminate_backend` are `v`.
+            //
+            // `date_trunc` is the one that is **both**, and it stays here for a reason worth
+            // writing down rather than leaving as an omission: `date_trunc(text, timestamp)` and
+            // `date_trunc(text, interval)` are `i`, `date_trunc(text, timestamptz)` is `s`
+            // because truncating an absolute instant needs `TimeZone`, and the three-argument
+            // form that names the zone is `i` again. The discriminator is the *argument type*,
+            // and `self.args` here are unresolved `Expr`s with no types on them -- so the
+            // conservative answer is the only honest one this function can give.
+            // `tests/index_expression_volatility.rs` pins that refusal as deliberate.
             _ => false,
         }
     }
@@ -1262,6 +1333,31 @@ pub enum CatalogFunc {
     Greatest,
     /// `least(...)`, which is [`CatalogFunc::Greatest`] with the comparison turned round.
     Least,
+    /// `nullif(a, b)`: `a`, or NULL when the two are equal.
+    ///
+    /// **The third of PostgreSQL's four comparison productions to live in this enum**, beside
+    /// `GREATEST` and `LEAST` -- `COALESCE` is [`Expr::Coalesce`] because it is variadic and
+    /// branches. Like them it is a grammar production and not a `pg_proc` row, so its arity is
+    /// enforced by the grammar there: `nullif(1)` and `nullif(1, 2, 3)` are
+    /// `42601 syntax error at or near ")"` on a real server, where this node answers the `42883`
+    /// its arity table gives -- one sqlstate apart on a statement nothing sends, recorded rather
+    /// than special-cased in the parser.
+    ///
+    /// **Its result type is the comparison's *left* input type, which is not always the common
+    /// type.** Measured on 19beta1, and the pair that says so is `nullif(int4, int8)` ->
+    /// `integer` where `GREATEST(int4, int8)` is `bigint`: PostgreSQL resolves `=` between the
+    /// two, finds `int48eq(int4, int8)`, and the left side keeps its own type. Where no cross-type
+    /// operator exists both sides coerce and the answer *is* the common type --
+    /// `nullif(int4, numeric)` is `numeric`, `nullif(int4, float8)` is `double precision`. And a
+    /// `varchar` operand has no `=` of its own, so it resolves through `texteq` and the answer is
+    /// `text`: `nullif(v, 'x')` on a `varchar(10)` column is `text`, and prints
+    /// `NULLIF((v)::text, 'x'::text)`. `exec::query::nullif_type` is that rule and
+    /// `tests/nullif.rs` is the twelve measurements behind it.
+    ///
+    /// **Not strict, and in the other direction from `GREATEST`**: `nullif(NULL, 1)` is NULL and
+    /// `nullif(1, NULL)` is `1` -- the comparison against NULL is unknown, which is not equal, so
+    /// the first argument comes back.
+    NullIf,
     /// `substr(text, from[, count])`: the substring, 1-based and clamped.
     ///
     /// **`from` may be zero or negative**, and the clamp is what makes those work: the result is
@@ -1391,6 +1487,7 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("ltrim") => Some(CatalogFunc::Ltrim),
             () if name.eq_ignore_ascii_case("rtrim") => Some(CatalogFunc::Rtrim),
             () if name.eq_ignore_ascii_case("greatest") => Some(CatalogFunc::Greatest),
+            () if name.eq_ignore_ascii_case("nullif") => Some(CatalogFunc::NullIf),
             () if name.eq_ignore_ascii_case("least") => Some(CatalogFunc::Least),
             () if name.eq_ignore_ascii_case("substr") => Some(CatalogFunc::Substr),
             () if name.eq_ignore_ascii_case("substring") => Some(CatalogFunc::Substring),
@@ -1519,6 +1616,7 @@ impl CatalogFunc {
             CatalogFunc::Ltrim => "ltrim",
             CatalogFunc::Rtrim => "rtrim",
             CatalogFunc::Greatest => "greatest",
+            CatalogFunc::NullIf => "nullif",
             CatalogFunc::Least => "least",
             CatalogFunc::Substr => "substr",
             CatalogFunc::Substring => "substring",
@@ -1545,6 +1643,11 @@ impl CatalogFunc {
             | CatalogFunc::PgGetSerialSequence
             | CatalogFunc::ColDescription
             | CatalogFunc::ArrayPosition
+            // Two, exactly, and on a real server it is the **grammar** that says so: `nullif(1)`
+            // is `42601 syntax error at or near ")"` there where the arity table answers the
+            // `42883` this set gives everything else. One sqlstate apart, on a statement nothing
+            // sends; the variant's doc records it rather than the parser special-casing it.
+            | CatalogFunc::NullIf
             // The type's name, then the operand.
             | CatalogFunc::UserCast
             | CatalogFunc::ArrayLower
@@ -1661,6 +1764,7 @@ impl CatalogFunc {
             // see, and there is no such caller.
             CatalogFunc::Greatest
             | CatalogFunc::Least
+            | CatalogFunc::NullIf
             | CatalogFunc::Btrim
             | CatalogFunc::Ltrim
             | CatalogFunc::Rtrim

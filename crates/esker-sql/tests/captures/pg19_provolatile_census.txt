@@ -1,0 +1,210 @@
+# **`pg_proc.provolatile` for every function name this node resolves**, as a real PostgreSQL
+# 19beta1 answers it.
+#
+# NOT types, NOT answers: one column of `pg_proc`, for the 79 names in
+# `plan::CatalogFunc::from_name` and `plan::ScalarFunc::from_name` together. It is the evidence
+# behind `plan::CatalogFuncCall::is_immutable`, which decides whether a call may be an **index
+# key** or a **generated column**, and behind the census in
+# `tests/index_expression_volatility.rs`.
+#
+# Why the whole table at once rather than the name in front of me. `is_immutable` was a list that
+# grew one function per defect -- the text-search family, then the JSON accessors, then `||` over
+# text -- and each time the reasoning that added one name would have added the others. #25's
+# corpus then refused `replace(t, 'a', 'b')` in a generated column, `42P17 functions in index
+# expression must be marked IMMUTABLE`, for a call PostgreSQL says is `i`. So this is the list
+# measured against the oracle in one pass instead of a twelfth name.
+#
+# `i` immutable, `s` stable, `v` volatile. A name with more than one row has overloads, and they
+# do not always agree: `date_trunc(text, timestamp)` is `i` where `date_trunc(text, timestamptz)`
+# is `s`, and `length(bytea, name)` is `s` where every one-argument `length` is `i` -- the same
+# name, immutable or not depending on the *argument type*, which is what makes the two-column
+# answer below necessary and a name-keyed table wrong.
+#
+# Eight of the 79 have no row: `greatest`, `least`, `current_date`, `localtime` and
+# `localtimestamp` are grammar productions rather than `pg_proc` entries, and `akeys`, `avals` and
+# `hstore` need the extension, so they are captured separately below.
+#
+# Captured against esker-pg19 (PostgreSQL 19beta1), read-only, no transaction needed:
+#
+#     SELECT p.proname, p.pronargs, p.provolatile,
+#            pg_catalog.pg_get_function_arguments(p.oid)
+#       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+#      WHERE p.proname IN (<the 79 names>)
+#        AND n.nspname IN ('pg_catalog', 'public')
+#      ORDER BY 1, 2, 3, 4;
+#
+# proname	pronargs	provolatile	arguments
+abs	1	i	bigint
+abs	1	i	double precision
+abs	1	i	integer
+abs	1	i	numeric
+abs	1	i	real
+abs	1	i	smallint
+array_length	2	i	anyarray, integer
+array_lower	2	i	anyarray, integer
+array_position	2	i	anycompatiblearray, anycompatible
+array_position	3	i	anycompatiblearray, anycompatible, integer
+array_upper	2	i	anyarray, integer
+ascii	1	i	text
+btrim	1	i	text
+btrim	2	i	bytea, bytea
+btrim	2	i	text, text
+cardinality	1	i	anyarray
+char_length	1	i	character
+char_length	1	i	text
+character_length	1	i	character
+character_length	1	i	text
+clock_timestamp	0	v	
+col_description	2	s	oid, integer
+concat	1	s	VARIADIC "any"
+convert_to	2	s	text, name
+date_trunc	2	i	text, interval
+date_trunc	2	i	text, timestamp without time zone
+date_trunc	2	s	text, timestamp with time zone
+date_trunc	3	i	text, timestamp with time zone, text
+daterange	2	i	date, date
+daterange	3	i	date, date, text
+format_type	2	s	oid, integer
+isclosed	1	i	path
+isempty	1	i	anymultirange
+isempty	1	i	anyrange
+isopen	1	i	path
+length	1	i	bit
+length	1	i	bytea
+length	1	i	character
+length	1	i	lseg
+length	1	i	path
+length	1	i	text
+length	1	i	tsvector
+length	2	s	bytea, name
+lower	1	i	anymultirange
+lower	1	i	anyrange
+lower	1	i	text
+lower_inc	1	i	anymultirange
+lower_inc	1	i	anyrange
+lower_inf	1	i	anymultirange
+lower_inf	1	i	anyrange
+ltree2text	1	i	ltree
+ltrim	1	i	text
+ltrim	2	i	bytea, bytea
+ltrim	2	i	text, text
+nlevel	1	i	ltree
+now	0	s	
+numnode	1	i	tsquery
+obj_description	1	s	oid
+obj_description	2	s	oid, name
+octet_length	1	i	bit
+octet_length	1	i	bytea
+octet_length	1	i	character
+octet_length	1	i	text
+pg_backend_pid	0	s	
+pg_cancel_backend	1	v	integer
+pg_encoding_to_char	1	s	integer
+pg_get_constraintdef	1	s	oid
+pg_get_constraintdef	2	s	oid, boolean
+pg_get_expr	2	s	pg_node_tree, oid
+pg_get_expr	3	s	pg_node_tree, oid, boolean
+pg_get_indexdef	1	s	oid
+pg_get_indexdef	3	s	oid, integer, boolean
+pg_get_partkeydef	1	s	oid
+pg_get_serial_sequence	2	s	text, text
+pg_get_triggerdef	1	s	oid
+pg_get_triggerdef	2	s	oid, boolean
+pg_get_viewdef	1	s	oid
+pg_get_viewdef	1	s	text
+pg_get_viewdef	2	s	oid, boolean
+pg_get_viewdef	2	s	oid, integer
+pg_get_viewdef	2	s	text, boolean
+pg_sleep	1	v	double precision
+pg_terminate_backend	2	v	pid integer, timeout bigint DEFAULT '0'::bigint
+pg_typeof	1	s	"any"
+phraseto_tsquery	1	s	text
+phraseto_tsquery	2	i	regconfig, text
+plainto_tsquery	1	s	text
+plainto_tsquery	2	i	regconfig, text
+random	0	v	
+random	2	v	min bigint, max bigint
+random	2	v	min date, max date
+random	2	v	min integer, max integer
+random	2	v	min numeric, max numeric
+random	2	v	min timestamp without time zone, max timestamp without time zone
+random	2	v	min timestamp with time zone, max timestamp with time zone
+replace	3	i	text, text, text
+reverse	1	i	bytea
+reverse	1	i	text
+rtrim	1	i	text
+rtrim	2	i	bytea, bytea
+rtrim	2	i	text, text
+setweight	2	i	tsvector, "char"
+setweight	3	i	tsvector, "char", text[]
+split_part	3	i	text, text, integer
+statement_timestamp	0	s	
+string_to_array	2	i	text, text
+string_to_array	3	i	text, text, text
+strip	1	i	tsvector
+strpos	2	i	text, text
+substr	2	i	bytea, integer
+substr	2	i	text, integer
+substr	3	i	bytea, integer, integer
+substr	3	i	text, integer, integer
+substring	2	i	bit, integer
+substring	2	i	bytea, integer
+substring	2	i	text, integer
+substring	2	i	text, text
+substring	3	i	bit, integer, integer
+substring	3	i	bytea, integer, integer
+substring	3	i	text, integer, integer
+substring	3	i	text, text, text
+text2ltree	1	i	text
+to_regclass	1	s	text
+to_tsquery	1	s	text
+to_tsquery	2	i	regconfig, text
+to_tsvector	1	s	json
+to_tsvector	1	s	jsonb
+to_tsvector	1	s	text
+to_tsvector	2	i	regconfig, json
+to_tsvector	2	i	regconfig, jsonb
+to_tsvector	2	i	regconfig, text
+transaction_timestamp	0	s	
+ts_headline	2	s	jsonb, tsquery
+ts_headline	2	s	json, tsquery
+ts_headline	2	s	text, tsquery
+ts_headline	3	i	regconfig, jsonb, tsquery
+ts_headline	3	i	regconfig, json, tsquery
+ts_headline	3	i	regconfig, text, tsquery
+ts_headline	3	s	jsonb, tsquery, text
+ts_headline	3	s	json, tsquery, text
+ts_headline	3	s	text, tsquery, text
+ts_headline	4	i	regconfig, jsonb, tsquery, text
+ts_headline	4	i	regconfig, json, tsquery, text
+ts_headline	4	i	regconfig, text, tsquery, text
+ts_rank	2	i	tsvector, tsquery
+ts_rank	3	i	real[], tsvector, tsquery
+ts_rank	3	i	tsvector, tsquery, integer
+ts_rank	4	i	real[], tsvector, tsquery, integer
+tsrange	2	i	timestamp without time zone, timestamp without time zone
+tsrange	3	i	timestamp without time zone, timestamp without time zone, text
+upper	1	i	anymultirange
+upper	1	i	anyrange
+upper	1	i	text
+upper_inc	1	i	anymultirange
+upper_inc	1	i	anyrange
+upper_inf	1	i	anymultirange
+upper_inf	1	i	anyrange
+websearch_to_tsquery	1	s	text
+websearch_to_tsquery	2	i	regconfig, text
+#
+# The hstore three, in a throwaway database with `CREATE EXTENSION hstore` -- the oracle's own
+# databases do not have it installed, and the capture rule here is that a probe never writes to
+# one that a scoreboard run reads:
+#
+#     CREATE DATABASE g1_hstore_probe; CREATE EXTENSION hstore;
+#     SELECT ... AND n.nspname = 'public' ORDER BY 1, 2, 4;
+#
+# proname	pronargs	provolatile	arguments
+akeys	1	i	hstore
+avals	1	i	hstore
+hstore	1	i	record
+hstore	1	i	text[]
+hstore	2	i	text, text
+hstore	2	i	text[], text[]

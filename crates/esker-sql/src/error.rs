@@ -1111,6 +1111,17 @@ pub enum SqlError {
     #[error("functions in index expression must be marked IMMUTABLE")]
     NotImmutableInIndex,
 
+    /// The same condition in a **generated column**, where PostgreSQL words it differently.
+    ///
+    /// One requirement, two sentences, and both are captured rather than written: an index key
+    /// gets the sentence above and `GENERATED ALWAYS AS (to_tsvector(t)) STORED` gets
+    /// `generation expression is not immutable`, same `42P17`. This node answered the index
+    /// sentence in both places, which is a true statement about the wrong construct — there is no
+    /// index in an `ALTER TABLE ADD COLUMN`. Measured on 19beta1 beside the index one
+    /// (`tests/corpus/pg19_catalog_func_deparse.txt`).
+    #[error("generation expression is not immutable")]
+    NotImmutableInGeneratedColumn,
+
     /// A **qualified** column reference — `o.nosuch` — that the named table does not have.
     ///
     /// Three sentences for one condition, and all three are PostgreSQL's, captured rather than
@@ -3054,9 +3065,11 @@ impl SqlError {
 
             // `42P17 invalid_object_definition`, not `42P16` — measured, and the two are one
             // digit apart.
-            SqlError::NotPartitioned(_) | SqlError::PartitionOverlap { .. } => {
-                sqlstate::INVALID_OBJECT_DEFINITION
-            }
+            SqlError::NotPartitioned(_)
+            | SqlError::PartitionOverlap { .. }
+            // One requirement in two constructs, one sqlstate and two sentences.
+            | SqlError::NotImmutableInIndex
+            | SqlError::NotImmutableInGeneratedColumn => sqlstate::INVALID_OBJECT_DEFINITION,
             SqlError::NoPartitionForRow { .. }
             | SqlError::PartitionConstraintViolation(_)
             | SqlError::CheckViolation { .. }
@@ -3135,7 +3148,7 @@ impl SqlError {
                 sqlstate::DATATYPE_MISMATCH
             }
             SqlError::UndefinedParameter(_) => sqlstate::UNDEFINED_PARAMETER,
-            SqlError::NotImmutableInIndex => sqlstate::INVALID_OBJECT_DEFINITION,
+
             SqlError::UndefinedUnaryOperator { .. }
             // Not "operator does not exist": `=` may answer and still not be the member of a
             // btree family `DISTINCT` needs. Same class, different sentence.

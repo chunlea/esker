@@ -1,0 +1,206 @@
+# **How `pg_get_expr` prints a call to a catalog function**, measured for every one this node can
+# store, in every reader that prints one.
+#
+# `docs/plans/debts-v1.1.md` #25. When this was captured, `exec::ddl::deparse`'s `CatalogFunc` arm
+# was a `name(...)` placeholder that `exec::ddl::reads_back` refused to store (which is the guard
+# working), so every stored expression over a catalog function kept its **written** text. The row's
+# own sizing said "the corpus is the work", and this is it: 29 declared divergences when it landed,
+# 3 after the arm was given its arguments, and each of the three names a type or a spelling this
+# node does not have rather than a rule it has not measured.
+#
+# ## The name
+#
+# Four functions are **grammar productions** rather than catalog entries, and PostgreSQL prints
+# them upper-cased:
+#
+#     COALESCE(t, 'x'::text)      GREATEST(b, (1)::bigint)      LEAST(t, u)
+#     NULLIF(t, 'x'::text)
+#
+# A fifth is a production **and** a function, and which it prints as depends on how it was written:
+#
+#     substring(t from 1 for 2)   ->  SUBSTRING(t FROM 1 FOR 2)   the production, keywords and all
+#     substring(t, 1, 2)          ->  "substring"(t, 1, 2)        the call, and `substring` is a
+#                                                                 reserved word so it is quoted
+#     substr(t, 1, 2)             ->  substr(t, 1, 2)             an ordinary name, unquoted
+#
+# Everything else prints its own lower-case name: `btrim`, `ltrim`, `rtrim`, `split_part`, `strpos`,
+# `string_to_array`, `replace`, `to_tsvector`, `strip`, `setweight`.
+#
+# ## The arguments
+#
+# A literal argument carries the coercion its **parameter** took, and the parameter is not always
+# `text`:
+#
+#     btrim(t, 'x'::text)              split_part(t, ','::text, 1)     -- the integer stays bare
+#     setweight(tv, 'A'::"char")       -- a quoted type name, because `char` is reserved too
+#     to_tsvector('english'::regconfig, t)
+#
+# For the four productions the coercion is to the call's **common type** instead, which is the same
+# rule a comparison follows: `GREATEST(b, (1)::bigint)` widens the literal to the `bigint` column's
+# type, and `GREATEST(n, 1)` shows no cast at all because an `integer` column and an integer
+# literal already agree. `COALESCE(NULL, 1)` is `COALESCE(NULL::integer, 1)` — the untyped NULL
+# takes the common type and the literal, being of the form's own type, stays bare
+# (`pg19_numeric_literal_deparse.txt` is where that half is measured).
+#
+# ## The operators
+#
+# Three of these are spelled as operators and print as operators, each in its own pair:
+#
+#     (j -> 'k'::text)      (j ->> 'k'::text)      (j || '{}'::jsonb)
+#
+# ## Six read paths, one text
+#
+# The same expression prints identically through `pg_get_expr(adbin)` for a generated column, for a
+# `DEFAULT`, `pg_get_expr(indexprs)`, `pg_get_indexdef`, `pg_get_expr(indpred)` for a partial
+# index's predicate, and `pg_get_constraintdef`. All six are in this file, on `greatest(b, 1)` and
+# `btrim(t, 'x')`, because a fix that reached one of them would look like a fix.
+#
+# ## One refusal, and its message is the generated column's own
+#
+# `to_tsvector(t)` — the one-argument form — is
+# `42P17 generation expression is not immutable`, because it reads `default_text_search_config`.
+# Worth noting that PostgreSQL's wording here is about the **generation expression** where an index
+# gets "functions in index expression must be marked IMMUTABLE"; this node uses the index sentence
+# in both places.
+#
+# Every read-back goes through `replace(..., '|', '!')`: a value holding a pipe is parsed as extra
+# columns by the corpus format (debt #20), and three of these values hold one.
+#
+# **Each probe is read back inside its own savepoint**, which is the shape that satisfies both
+# rules this corpus had to learn. PostgreSQL accepts all but one of these, so nothing here *looked*
+# like it needed guarding — and the node refuses `nullif`, which aborted the replay and swallowed
+# the forty statements after it. Reading the printed form before the `ROLLBACK TO` records what
+# PostgreSQL prints *and* contains what the node declines: a capture is written against one server
+# and replayed against another, and only the second one's refusals cascade.
+#
+# Captured against esker-pg19 (PostgreSQL 19beta1) with
+# `sesscap.py captures-src/pg19_catalog_func_deparse.txt.in`, inside one `BEGIN ... ROLLBACK`, and
+# verified idempotent by replaying `cut -f1` of the result through the same recorder.
+BEGIN		-
+CREATE TABLE g1cf (t text, u text, n integer, b bigint, j jsonb, js json, tv tsvector)		-
+SAVEPOINT sp_f_coalesce		-
+ALTER TABLE g1cf ADD COLUMN f_coalesce text GENERATED ALWAYS AS (COALESCE(t, 'x')) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_coalesce'		r|f_coalesce|COALESCE(t, 'x'::text)
+ROLLBACK TO sp_f_coalesce		-
+SAVEPOINT sp_f_coalesce_n		-
+ALTER TABLE g1cf ADD COLUMN f_coalesce_n bigint GENERATED ALWAYS AS (COALESCE(b, 1)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_coalesce_n'		r|f_coalesce_n|COALESCE(b, (1)::bigint)
+ROLLBACK TO sp_f_coalesce_n		-
+SAVEPOINT sp_f_greatest		-
+ALTER TABLE g1cf ADD COLUMN f_greatest text GENERATED ALWAYS AS (greatest(t, u)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_greatest'		r|f_greatest|GREATEST(t, u)
+ROLLBACK TO sp_f_greatest		-
+SAVEPOINT sp_f_greatest_n		-
+ALTER TABLE g1cf ADD COLUMN f_greatest_n bigint GENERATED ALWAYS AS (greatest(b, 1)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_greatest_n'		r|f_greatest_n|GREATEST(b, (1)::bigint)
+ROLLBACK TO sp_f_greatest_n		-
+SAVEPOINT sp_f_greatest_i		-
+ALTER TABLE g1cf ADD COLUMN f_greatest_i integer GENERATED ALWAYS AS (greatest(n, 1)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_greatest_i'		r|f_greatest_i|GREATEST(n, 1)
+ROLLBACK TO sp_f_greatest_i		-
+SAVEPOINT sp_f_least		-
+ALTER TABLE g1cf ADD COLUMN f_least text GENERATED ALWAYS AS (least(t, u)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_least'		r|f_least|LEAST(t, u)
+ROLLBACK TO sp_f_least		-
+SAVEPOINT sp_f_nullif		-
+ALTER TABLE g1cf ADD COLUMN f_nullif text GENERATED ALWAYS AS (nullif(t, 'x')) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_nullif'		r|f_nullif|NULLIF(t, 'x'::text)
+ROLLBACK TO sp_f_nullif		-
+SAVEPOINT sp_f_btrim1		-
+ALTER TABLE g1cf ADD COLUMN f_btrim1 text GENERATED ALWAYS AS (btrim(t)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_btrim1'		r|f_btrim1|btrim(t)
+ROLLBACK TO sp_f_btrim1		-
+SAVEPOINT sp_f_btrim2		-
+ALTER TABLE g1cf ADD COLUMN f_btrim2 text GENERATED ALWAYS AS (btrim(t, 'x')) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_btrim2'		r|f_btrim2|btrim(t, 'x'::text)
+ROLLBACK TO sp_f_btrim2		-
+SAVEPOINT sp_f_ltrim		-
+ALTER TABLE g1cf ADD COLUMN f_ltrim text GENERATED ALWAYS AS (ltrim(t, 'x')) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_ltrim'		r|f_ltrim|ltrim(t, 'x'::text)
+ROLLBACK TO sp_f_ltrim		-
+SAVEPOINT sp_f_rtrim		-
+ALTER TABLE g1cf ADD COLUMN f_rtrim text GENERATED ALWAYS AS (rtrim(t, 'x')) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_rtrim'		r|f_rtrim|rtrim(t, 'x'::text)
+ROLLBACK TO sp_f_rtrim		-
+SAVEPOINT sp_f_splitpart		-
+ALTER TABLE g1cf ADD COLUMN f_splitpart text GENERATED ALWAYS AS (split_part(t, ',', 1)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_splitpart'		r|f_splitpart|split_part(t, ','::text, 1)
+ROLLBACK TO sp_f_splitpart		-
+SAVEPOINT sp_f_strpos		-
+ALTER TABLE g1cf ADD COLUMN f_strpos integer GENERATED ALWAYS AS (strpos(t, 'x')) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_strpos'		r|f_strpos|strpos(t, 'x'::text)
+ROLLBACK TO sp_f_strpos		-
+SAVEPOINT sp_f_substr2		-
+ALTER TABLE g1cf ADD COLUMN f_substr2 text GENERATED ALWAYS AS (substr(t, 1)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_substr2'		r|f_substr2|substr(t, 1)
+ROLLBACK TO sp_f_substr2		-
+SAVEPOINT sp_f_substr3		-
+ALTER TABLE g1cf ADD COLUMN f_substr3 text GENERATED ALWAYS AS (substr(t, 1, 2)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_substr3'		r|f_substr3|substr(t, 1, 2)
+ROLLBACK TO sp_f_substr3		-
+SAVEPOINT sp_f_substring		-
+ALTER TABLE g1cf ADD COLUMN f_substring text GENERATED ALWAYS AS (substring(t from 1 for 2)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_substring'		r|f_substring|SUBSTRING(t FROM 1 FOR 2)
+ROLLBACK TO sp_f_substring		-
+SAVEPOINT sp_f_substring_f		-
+ALTER TABLE g1cf ADD COLUMN f_substring_f text GENERATED ALWAYS AS (substring(t, 1, 2)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_substring_f'		r|f_substring_f|"substring"(t, 1, 2)
+ROLLBACK TO sp_f_substring_f		-
+SAVEPOINT sp_f_str2arr		-
+ALTER TABLE g1cf ADD COLUMN f_str2arr text[] GENERATED ALWAYS AS (string_to_array(t, ',')) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_str2arr'		r|f_str2arr|string_to_array(t, ','::text)
+ROLLBACK TO sp_f_str2arr		-
+SAVEPOINT sp_f_replace		-
+ALTER TABLE g1cf ADD COLUMN f_replace text GENERATED ALWAYS AS (replace(t, 'a', 'b')) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_replace'		r|f_replace|replace(t, 'a'::text, 'b'::text)
+ROLLBACK TO sp_f_replace		-
+SAVEPOINT sp_f_tsvector		-
+ALTER TABLE g1cf ADD COLUMN f_tsvector tsvector GENERATED ALWAYS AS (to_tsvector('english', t)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_tsvector'		r|f_tsvector|to_tsvector('english'::regconfig, t)
+ROLLBACK TO sp_f_tsvector		-
+SAVEPOINT sp_f_tsvector1		-
+ALTER TABLE g1cf ADD COLUMN f_tsvector1 tsvector GENERATED ALWAYS AS (to_tsvector(t)) STORED	!42P17 generation expression is not immutable
+ROLLBACK TO sp_f_tsvector1		-
+SAVEPOINT sp_f_tsstrip		-
+ALTER TABLE g1cf ADD COLUMN f_tsstrip tsvector GENERATED ALWAYS AS (strip(tv)) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_tsstrip'		r|f_tsstrip|strip(tv)
+ROLLBACK TO sp_f_tsstrip		-
+SAVEPOINT sp_f_setweight		-
+ALTER TABLE g1cf ADD COLUMN f_setweight tsvector GENERATED ALWAYS AS (setweight(tv, 'A')) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_setweight'		r|f_setweight|setweight(tv, 'A'::"char")
+ROLLBACK TO sp_f_setweight		-
+SAVEPOINT sp_f_jsonfetch		-
+ALTER TABLE g1cf ADD COLUMN f_jsonfetch jsonb GENERATED ALWAYS AS (j -> 'k') STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_jsonfetch'		r|f_jsonfetch|(j -> 'k'::text)
+ROLLBACK TO sp_f_jsonfetch		-
+SAVEPOINT sp_f_jsonfetcht		-
+ALTER TABLE g1cf ADD COLUMN f_jsonfetcht text GENERATED ALWAYS AS (j ->> 'k') STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_jsonfetcht'		r|f_jsonfetcht|(j ->> 'k'::text)
+ROLLBACK TO sp_f_jsonfetcht		-
+SAVEPOINT sp_f_jsonconcat		-
+ALTER TABLE g1cf ADD COLUMN f_jsonconcat jsonb GENERATED ALWAYS AS (j || '{}'::jsonb) STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_jsonconcat'		r|f_jsonconcat|(j !! '{}'::jsonb)
+ROLLBACK TO sp_f_jsonconcat		-
+SAVEPOINT sp_f_jsonfetch_j		-
+ALTER TABLE g1cf ADD COLUMN f_jsonfetch_j json GENERATED ALWAYS AS (js -> 'k') STORED		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cf'::regclass AND a.attname = 'f_jsonfetch_j'		r|f_jsonfetch_j|(js -> 'k'::text)
+ROLLBACK TO sp_f_jsonfetch_j		-
+ALTER TABLE g1cf ADD COLUMN k_greatest bigint GENERATED ALWAYS AS (greatest(b, 1)) STORED		-
+ALTER TABLE g1cf ADD COLUMN k_least text GENERATED ALWAYS AS (least(t, u)) STORED		-
+ALTER TABLE g1cf ADD COLUMN k_btrim text GENERATED ALWAYS AS (btrim(t, 'x')) STORED		-
+ALTER TABLE g1cf ADD COLUMN k_tsvector tsvector GENERATED ALWAYS AS (to_tsvector('english', t)) STORED		-
+ALTER TABLE g1cf ADD COLUMN k_coalesce bigint GENERATED ALWAYS AS (COALESCE(b, 1)) STORED		-
+CREATE TABLE g1cfd (a bigint DEFAULT greatest(1, 2), b text DEFAULT least('a', 'b'), c text DEFAULT btrim(' x '), d bigint DEFAULT COALESCE(NULL, 1))		-
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1cfd'::regclass ORDER BY a.attnum		r|a|GREATEST(1, 2) ; r|b|LEAST('a'::text, 'b'::text) ; r|c|btrim(' x '::text) ; r|d|COALESCE(NULL::integer, 1)
+CREATE INDEX g1cf_ix1 ON g1cf ((greatest(b, 1)))		-
+CREATE INDEX g1cf_ix2 ON g1cf ((btrim(t, 'x')))		-
+SELECT 'r', replace(pg_get_expr(x.indexprs, x.indrelid), '|', '!') FROM pg_index x WHERE x.indexrelid = 'g1cf_ix1'::regclass		r|GREATEST(b, (1)::bigint)
+SELECT 'r', replace(pg_get_indexdef('g1cf_ix2'::regclass), '|', '!')		r|CREATE INDEX g1cf_ix2 ON public.g1cf USING btree (btrim(t, 'x'::text))
+CREATE INDEX g1cf_ix3 ON g1cf (n) WHERE btrim(t, 'x') = 'y'		-
+SELECT 'r', replace(pg_get_expr(x.indpred, x.indrelid), '|', '!') FROM pg_index x WHERE x.indexrelid = 'g1cf_ix3'::regclass		r|(btrim(t, 'x'::text) = 'y'::text)
+ALTER TABLE g1cf ADD CONSTRAINT g1cf_ck CHECK (greatest(b, 1) > 0)		-
+SELECT 'r', conname, replace(pg_get_constraintdef(oid), '|', '!') FROM pg_constraint WHERE conrelid = 'g1cf'::regclass AND contype = 'c'		r|g1cf_ck|CHECK ((GREATEST(b, (1)::bigint) > 0))
+DROP TABLE g1cfd		-
+DROP TABLE g1cf		-
+ROLLBACK		-
+SELECT 'r', count(*) FROM pg_class WHERE relname IN ('g1cf','g1cfd')	text,bigint	r|0

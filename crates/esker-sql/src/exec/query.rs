@@ -4803,6 +4803,88 @@ fn greatest_type(args: &[Expr], scope: &Scope<'_>) -> ColumnType {
     found.unwrap_or(ColumnType::Text)
 }
 
+/// The type `NULLIF(a, b)` answers, which is **the comparison's left input type** and not the
+/// common type of the pair.
+///
+/// The pair that says so is `nullif(int4, int8)`, `integer` -- where `GREATEST(int4, int8)` is
+/// `bigint`. PostgreSQL resolves `=` between the two arguments and the *left* side of the operator
+/// it finds is the answer, so:
+///
+/// ```text
+/// nullif(int2, int8)   smallint          nullif(int8, int2)   bigint
+/// nullif(float4, float8) real            nullif(date, timestamptz) date
+/// nullif(int4, numeric) numeric          nullif(int4, float8) double precision
+/// nullif(varchar, text) text             nullif(char, text)   character
+/// ```
+///
+/// Two rules cover all of it, and both are measured rather than reasoned from the type lattice.
+/// **A `varchar` has no `=` of its own** — `varchar = varchar` resolves to `texteq` — so it is
+/// asked as `text` and answers `text`; `bpchar` does have one and answers `character`. **And a
+/// pair inside one comparison family keeps the left type**, because the family has a cross-type
+/// operator to resolve to (`int48eq`, `date_lt_timestamptz`); a pair across families has none, so
+/// both sides coerce and the answer is the common type after all.
+///
+/// `tests/nullif.rs` holds the twelve measurements. The families are the three PostgreSQL gives
+/// cross-type comparison operators to; anything else is either the same type on both sides or a
+/// coercion, and both of those fall out of the two rules above.
+fn nullif_type(args: &[Expr], scope: &Scope<'_>) -> ColumnType {
+    let compared = |at: usize| {
+        args.get(at)
+            .and_then(|arg| expr_type(arg, scope).ok())
+            .map(compared_as)
+    };
+    let (Some(left), Some(right)) = (compared(0), compared(1)) else {
+        return compared(0).unwrap_or(ColumnType::Text);
+    };
+    if left == right || same_comparison_family(left, right) {
+        return left;
+    }
+    crate::value::arith::result_type(crate::plan::ArithOp::Add, left, right).unwrap_or(left)
+}
+
+/// [`nullif_type`]'s rule over two values rather than two expressions, for the evaluator.
+///
+/// The same two rules read off the datums' own types, which is how the `GREATEST` arm in
+/// `exec::cursor` recomputes its promotion: the resolved type is not carried into evaluation, and
+/// recomputing it there is what keeps one rule in one place.
+pub(crate) fn nullif_datum_type(left: &Datum, right: &Datum) -> Option<ColumnType> {
+    let left = compared_as(left.column_type()?);
+    let right = compared_as(right.column_type()?);
+    if left == right || same_comparison_family(left, right) {
+        return Some(left);
+    }
+    Some(crate::value::arith::result_type(crate::plan::ArithOp::Add, left, right).unwrap_or(left))
+}
+
+/// The type an operand is *compared* at, which is its own for everything but `varchar`.
+///
+/// `varchar` has no equality operator of its own and resolves through `texteq`, so a comparison
+/// involving one happens at `text` — measured, and visible in the printed form too:
+/// `NULLIF((v)::text, 'x'::text)` on a `varchar(10)` column, where a `bpchar` column shows no cast
+/// because `bpchareq` exists.
+fn compared_as(ty: ColumnType) -> ColumnType {
+    match ty {
+        ColumnType::Varchar => ColumnType::Text,
+        other => other,
+    }
+}
+
+/// Whether the two types have a **cross-type** comparison operator, and so resolve without
+/// coercing either side.
+///
+/// Three families on a real server: the integers, the two floats, and the date/timestamp trio.
+/// `numeric` is its own — `int4 = numeric` does not exist, which is why `nullif(int4, numeric)` is
+/// `numeric` where `nullif(int4, int8)` is `integer`.
+fn same_comparison_family(left: ColumnType, right: ColumnType) -> bool {
+    let family = |ty: ColumnType| match ty {
+        ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 => Some(0_u8),
+        ColumnType::Real | ColumnType::Double => Some(1),
+        ColumnType::Date | ColumnType::Timestamp | ColumnType::TimestampTz => Some(2),
+        _ => None,
+    };
+    matches!((family(left), family(right)), (Some(a), Some(b)) if a == b)
+}
+
 fn concat_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> ColumnType {
     // **And an `ltree` makes it an `ltree`**, by the same rule and for the same reason —
     // `'a.b'::ltree || 'c'::text` is an `ltree` on a real server, so one operand being
@@ -4972,6 +5054,7 @@ fn catalog_func_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> 
         // `double precision` — the same promotion arithmetic makes, so it is folded through that
         // rule rather than written a second time.
         CatalogFunc::Greatest | CatalogFunc::Least => greatest_type(&call.args, scope),
+        CatalogFunc::NullIf => nullif_type(&call.args, scope),
         _ => call.func.result_type(),
     }
 }
