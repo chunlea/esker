@@ -1765,6 +1765,9 @@ fn broken(operand: &str) -> String {
 /// `ActiveRecord` reads the second — `check_constraint_test#test_check_constraints` asserts
 /// `WHEN price IS NOT NULL` to the character.
 ///
+/// The **simple** form's operand is a fourth position with the same rule: `CASE (a + 1)` plain and
+/// `CASE a + 1` pretty.
+///
 /// This node stores one text, in the plain shape, because that is what
 /// `pg_get_expr(indexprs)` and the plain `pg_get_constraintdef` want. So the pretty reader strips.
 /// **This is not a general parenthesis remover** and must not become one: it is the inverse of one
@@ -1792,8 +1795,14 @@ pub(crate) fn pretty_case(printed: &str) -> String {
                     }
                 );
             }
-            match body.strip_prefix("ELSE ") {
-                Some(rest) => format!("{indent}ELSE {}", unparenthesised(rest.trim())),
+            if let Some(rest) = body.strip_prefix("ELSE ") {
+                return format!("{indent}ELSE {}", unparenthesised(rest.trim()));
+            }
+            // **The simple form's operand is the fourth position**, and it drops its pair like the
+            // other three: `CASE (a + 1)` plain against `CASE a + 1` pretty, measured. `CASE` on
+            // its own is the searched form and has nothing to strip.
+            match body.strip_prefix("CASE ") {
+                Some(rest) => format!("{indent}CASE {}", unparenthesised(rest.trim())),
                 None => line.to_owned(),
             }
         })

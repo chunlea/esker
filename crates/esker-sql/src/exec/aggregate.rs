@@ -697,9 +697,15 @@ impl Aggregation {
                     .collect::<Result<Vec<_>>>()?,
             ),
             Expr::Case {
+                operand,
                 branches,
                 otherwise,
             } => Expr::Case {
+                operand: operand
+                    .as_deref()
+                    .map(|expr| self.rewrite(expr, scope))
+                    .transpose()?
+                    .map(Box::new),
                 branches: branches
                     .iter()
                     .map(|branch| {
@@ -962,9 +968,13 @@ fn walk<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
             }
         }
         Expr::Case {
+            operand,
             branches,
             otherwise,
         } => {
+            if let Some(operand) = operand {
+                walk(operand, visit);
+            }
             for branch in branches {
                 walk(&branch.when, visit);
                 walk(&branch.then, visit);

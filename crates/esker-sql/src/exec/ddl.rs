@@ -6376,6 +6376,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
                 .join(", ")
         ),
         Expr::Case {
+            operand,
             branches,
             otherwise,
         } => {
@@ -6394,9 +6395,27 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             // spaces.** Measured; this node inlined it at the same depth. [`indented`] is what
             // makes the recursion work without a depth parameter: the inner call has already
             // produced a block, and a block moves as a whole.
-            let mut text = "CASE".to_owned();
+            // **The simple form's operand goes on the `CASE` line**, in its own pair when it is
+            // an operator: `CASE a`, `CASE (a + 1)`, `CASE t` — measured through
+            // `pg_get_constraintdef`, where the pretty form drops that pair and the plain one
+            // keeps it, which is `catalog::pretty_case`'s half of the same rule.
+            let mut text = match operand {
+                Some(operand) => format!("CASE {}", sub(operand)),
+                None => "CASE".to_owned(),
+            };
+            // **A simple form's `WHEN` is deparsed under the *operand's* type, not the `CASE`'s.**
+            // The same correction the comparison arm carries, for the same reason: the value is
+            // compared against the operand, so `CASE t WHEN 'x'` prints `'x'::text` — and printing
+            // it under the type the branches resolved to gave `'x'::integer`, which `reads_back`
+            // then refused, so the whole `CHECK` fell back to the text the user wrote. Measured,
+            // `tests/corpus/pg19_deparse_census.txt`'s `kf5`. A searched form's `WHEN` is a
+            // condition and keeps the expression's own type, which is what it had before.
+            let when_type = operand
+                .as_deref()
+                .and_then(|operand| column_type_of(operand, table))
+                .unwrap_or(ty);
             for branch in branches {
-                let when = sub(&branch.when);
+                let when = deparse(&branch.when, table, when_type);
                 let then = sub(&branch.then);
                 if then.starts_with("CASE") {
                     let _ = write!(text, "\n    WHEN {when} THEN\n{}", indented(&then));
