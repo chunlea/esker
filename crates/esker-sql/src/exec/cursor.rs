@@ -3305,6 +3305,39 @@ fn catalog_function(
                 _ => best.clone(),
             }
         }
+        // **`nullif(a, b)` is `a`, or NULL when the two are equal** -- and not strict in the
+        // other direction from `GREATEST` above. `nullif(NULL, 1)` is NULL because `a` is what
+        // comes back; `nullif(1, NULL)` is `1`, because a comparison against NULL is *unknown*
+        // rather than equal, so the "they matched" branch is not taken. Measured, both.
+        //
+        // The answer carries the type `query::nullif_type` described, for the reason the
+        // `GREATEST` arm above states at length: handing back the operand's own datum where the
+        // `RowDescription` said something wider is invisible in text format and wrong in binary.
+        // Here the recomputation is the same rule read off the datums -- a `varchar` operand
+        // resolves through `texteq`, so it answers `text`.
+        CatalogFunc::NullIf => {
+            // Two arguments, guaranteed by `CatalogFunc::arities` before evaluation -- so the
+            // `else` here is not a case to handle but the answer a one-argument call would have
+            // had, and it never reaches this arm.
+            let (Some(left), Some(right)) = (args.first(), args.get(1)) else {
+                return Ok(Datum::Null);
+            };
+            if !matches!(left, Datum::Null)
+                && !matches!(right, Datum::Null)
+                && left.pg_cmp(right) == Ordering::Equal
+            {
+                return Ok(Datum::Null);
+            }
+            match crate::exec::query::nullif_datum_type(left, right) {
+                Some(ty)
+                    if left.column_type() != Some(ty)
+                        && crate::value::has_assignment_cast(left.column_type(), ty) =>
+                {
+                    crate::value::assignment_cast(left.clone(), ty, env.settings.rendering)?
+                }
+                _ => left.clone(),
+            }
+        }
         CatalogFunc::Concat => Datum::Text(
             args.iter()
                 .filter(|arg| !matches!(arg, Datum::Null))

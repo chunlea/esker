@@ -20,19 +20,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = \
          'ck'::regclass AND contype = 'c' ORDER BY conname",
     ],
-    answers: &[(
-        "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE \
-             conrelid = 'ck'::regclass AND contype = 'c' ORDER BY conname",
-        "**The predicate is printed as written, where PostgreSQL prints its deparsed tree.** \
-             A real server answers `CHECK ((q <> 'no'::text))` and this node `CHECK ((q <> \
-             'no'))` — the doubled parentheses agree and the `::text` does not, because \
-             PostgreSQL annotates each literal with the type it resolved to and this node stores \
-             the text the user wrote. Closing it means deparsing a lowered expression rather than \
-             keeping the text, which would also mean the catalog holds a serialised tree; the \
-             text is what `pg_get_constraintdef` needs anyway, so the trade was made deliberately \
-             (`catalog::CheckDef`). Semantics and values are identical; one string differs.",
-        "UNMEASURED",
-    )],
+    // **Nothing.** The entry that stood here said the predicate was printed as written where
+    // PostgreSQL prints its deparsed tree — `CHECK ((q <> 'no'))` against
+    // `CHECK ((q <> 'no'::text))` — with the reasoning that closing it meant deparsing a lowered
+    // expression rather than keeping the text. That is what `exec::ddl::normalise_checks` now
+    // does, at the statement that writes the check, and the text is still text: the deparser
+    // prints into the same `CheckDef::expr` the reader already used. It was also this file's one
+    // `UNMEASURED` provenance.
+    answers: &[],
 };
 
 #[test]

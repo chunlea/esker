@@ -230,3 +230,34 @@ fix re-cuts a refused group against the cache the refusal repaired.
   `docs/plans/phase-16-mpp.md` §10 item 3;
 * replication: `multi_region_rows.rs` runs one store, because what it is about is routing across a
   boundary and a second copy of every region proves that no better.
+
+### A split child elects from scratch, and it costs 62 ms a split — measured 2026-09-09
+
+`Store::adopt_split` brings the child up with `start_peer` and `spawn_ticker` and **nothing else**:
+no campaign, no leadership inherited from the parent, no term carried over. Every replica of the
+child therefore begins as a follower and waits out an election timeout before anyone stands.
+
+`how_long_a_split_child_has_no_leader` loads a table that splits under itself and samples every two
+milliseconds, recording for each child the interval between first sighting and first leader:
+
+```text
+4,001 rows, 132 regions, 132 children measured
+min 0 ms   median 62 ms   p90 77 ms   max 93 ms
+0 refusals during this load
+```
+
+**The first instrument saw none of it, and that is part of the finding.** Sampling PD's region
+records reported every one of 130 children as led at zero milliseconds — because PD learns of a
+child at the next region heartbeat, 20 ms here, by which time the election is over. *An instrument
+that reports zero and a system with no window look exactly alike.* The number above comes from
+sampling the **stores'** own maps, where a child appears the instant `adopt_split` runs.
+
+**Why it usually costs nothing.** Sixty-two milliseconds is well inside the client's own retry
+budget for `NotLeader`, so a writer that arrives during the window waits and proceeds — this load
+took zero refusals across 132 splits. It becomes visible only for a proposal that was **already in
+the log** when leadership moved, which cannot be retried transparently because the client cannot
+know whether it applied: that is the `40003` the batched loads hit at 37 and at 76 regions.
+
+So the cost is not the median, it is the tail shape: **one ambiguous outcome per split that catches
+a proposal in flight**, and a bulk load that is wide enough or fast enough to always have one in
+flight will meet it on most splits.

@@ -215,6 +215,7 @@ pub(super) fn create_table(
     let mut table = table;
     normalise_generated(&mut table)?;
     normalise_defaults(&mut table);
+    normalise_checks(&mut table);
     let table = table;
     // Resolved against a table that is not in the catalog yet, which is what lets a
     // self-reference — `CREATE TABLE t (id int8 PRIMARY KEY, parent int8 REFERENCES t)` — work
@@ -637,6 +638,15 @@ fn add_check(
     }
     updated.checks.push(check.clone());
     validate_checks(updated)?;
+    // The fifth reader, at the statement that writes one: `pg_get_constraintdef` prints what is
+    // stored, so the deparsed form is what has to be stored. Only the check this statement adds
+    // is touched, which is the rule the two `ALTER` sites for a `DEFAULT` already follow.
+    let snapshot = updated.clone();
+    if let Some(last) = updated.checks.last_mut()
+        && let Some(text) = deparse_wrapped_predicate(&snapshot, &last.expr)
+    {
+        last.expr = text;
+    }
     // **The rows already there are checked, unless `NOT VALID` says not to** — the same rule the
     // foreign-key path follows, and it was missing here entirely: a `CHECK` added over a row that
     // violates it was accepted silently, leaving a table whose rows contradict a constraint it
@@ -5318,6 +5328,22 @@ fn index_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)
 /// for a generated column too: it is the same requirement (a function of the row alone) for the
 /// same reason (the value is written once and read forever), and a real server gives the same
 /// `42P17` for a generated column over `nextval`.
+/// [`deparsed_expression`] for a **generated column**, which is the same check with PostgreSQL's
+/// other sentence for it.
+///
+/// One requirement — a function of the row alone — and two wordings: an index key is
+/// `42P17 functions in index expression must be marked IMMUTABLE` and a generated column is
+/// `42P17 generation expression is not immutable`. This node gave the index sentence in both
+/// places, which named a construct the statement does not have. Only that one refusal is
+/// translated; every other one [`refuse_unless_immutable`] raises already names its own cause
+/// (`0A000 the function md5`, `42P02 there is no parameter $1`).
+fn generated_column_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)> {
+    deparsed_expression(table, expr).map_err(|error| match error {
+        SqlError::NotImmutableInIndex => SqlError::NotImmutableInGeneratedColumn,
+        other => other,
+    })
+}
+
 fn deparsed_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)> {
     let parsed = crate::parse::parse_stored_expr(expr)?;
     let scope = crate::exec::query::Scope::single(table);
@@ -5383,6 +5409,162 @@ fn comparison_operand_type(
         .or_else(|| column_type_of(right, table))
         .or_else(|| decided_literal_type(left))
         .or_else(|| decided_literal_type(right))
+}
+
+/// One argument of a **grammar production**, printed the way PostgreSQL prints it after the
+/// production coerced it to the call's common type.
+///
+/// `GREATEST(b, 1)` on a `bigint` column is `GREATEST(b, (1)::bigint)`: the production coerces
+/// both arguments, so the `integer` constant sits under a cast in the tree and the cast prints.
+/// `GREATEST(n, 1)` on an `integer` column is `GREATEST(n, 1)` — nothing was coerced, so there is
+/// no cast node to print. [`numeric_constant`] already knows which of the three forms a constant
+/// of a given type takes; what this adds is *which* type to ask it about.
+///
+/// **Deliberately not folded into [`deparse_literal`]**, whose integer arm types a literal by its
+/// own value on purpose (ADR 0087) and is threaded a type by every caller in the crate — a
+/// comparison among them, where PostgreSQL picks a cross-type operator and coerces *nothing*
+/// (debt #23). One rule for one caller is the honest shape here: the productions are the callers
+/// that coerce.
+/// Whether this expression is a **quoted string constant** — the shape PostgreSQL's parser coerces
+/// straight to a cast's target type instead of building a `text` constant under a cast.
+///
+/// `Literal::String` is one the parser has not typed yet; `Literal::Typed` over a `Datum::Text` is
+/// the same constant after `parse::fold_column_default` gave it a type. Both were written as
+/// `'...'` and both print as one node.
+fn written_as_a_quoted_string(expr: &plan::Expr) -> bool {
+    match expr {
+        plan::Expr::Literal(plan::Literal::String(_)) => true,
+        plan::Expr::Literal(plan::Literal::Typed(value)) => {
+            matches!(value.as_ref(), Datum::Text(_))
+        }
+        _ => false,
+    }
+}
+
+/// That constant, printed with the type the cast named rather than the type it is held as.
+fn deparse_literal_of(expr: &plan::Expr, to: ColumnType) -> String {
+    match expr {
+        plan::Expr::Literal(plan::Literal::Typed(value)) => match value.as_ref() {
+            Datum::Text(text) => format!("'{}'::{}", text.replace('\'', "''"), to.name()),
+            _ => deparse_literal(&plan::Literal::Null, to),
+        },
+        plan::Expr::Literal(literal) => deparse_literal(literal, to),
+        _ => String::new(),
+    }
+}
+
+/// The type a **grammar production** coerces its arguments to: the common type of the arguments
+/// themselves, and not the type the parent threaded down.
+///
+/// The parent's type is wrong wherever the production is not the whole expression. Inside a
+/// `CHECK`, `greatest(b, 1) > 0` deparses the comparison first and threads its *operand* type
+/// down, which for a call on the left is whatever the literal on the right decided — `integer` —
+/// so the `bigint` column's own width never reached the constant and `GREATEST(b, 1)` printed
+/// where a real server prints `GREATEST(b, (1)::bigint)`. Measured through
+/// `pg_get_constraintdef`, which is the reader that found it.
+///
+/// The reduction is `exec::query::greatest_type`'s, over what a `plan::Expr` can say about itself:
+/// a column's declared type, or a literal's own. `None` from both — two untyped string literals,
+/// `LEAST('a', 'b')` — falls back to the parent's, which is where the type came from there.
+fn production_common_type(args: &[plan::Expr], table: &TableDef, ty: ColumnType) -> ColumnType {
+    args.iter()
+        .filter_map(|arg| column_type_of(arg, table).or_else(|| decided_literal_type(arg)))
+        .reduce(|sofar, one| {
+            if sofar == one {
+                sofar
+            } else {
+                crate::value::arith::result_type(plan::ArithOp::Add, sofar, one).unwrap_or(sofar)
+            }
+        })
+        .unwrap_or(ty)
+}
+
+fn deparse_production_argument(arg: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
+    if let plan::Expr::Literal(plan::Literal::Integer(value)) = arg {
+        let own = if i32::try_from(*value).is_ok() {
+            ColumnType::Int4
+        } else {
+            ColumnType::Int8
+        };
+        if own != ty {
+            return numeric_constant(&value.to_string(), ty);
+        }
+    }
+    deparse(arg, table, ty)
+}
+
+/// The type each argument of a catalog function is **printed under**, or `None` for a function
+/// whose parameters have not been measured.
+///
+/// `pg_get_expr` shows the coercion a literal argument took, and the coercion is to the
+/// *parameter's* type rather than to the call's: `btrim(t, 'x'::text)`, and
+/// `split_part(t, ','::text, 1)` where the third argument is an `integer` and prints bare. So a
+/// call is deparsed by threading this list down, one type per argument, which is the same
+/// mechanism [`deparse`]'s operator arms use for an operand.
+///
+/// **`None` keeps the placeholder, and that is the safe answer rather than a gap.** A function
+/// whose parameters are not in this table deparses to `name(...)`, which [`reads_back`] refuses,
+/// so the expression keeps the text it was written with — right in the sense that it re-parses to
+/// the same value, and wrong in the characters. Printing an unmeasured coercion would be worse:
+/// it might read back, and then a stored expression would carry a cast this node invented.
+/// Three functions are out for exactly that reason: `setweight(tv, 'A'::"char")` and
+/// `to_tsvector('english'::regconfig, t)` name types this node does not have (`"char"` is
+/// PostgreSQL's one-byte type, not `char(n)`), and there is no `ColumnType` to thread for either.
+fn catalog_parameter_types(func: plan::CatalogFunc, argc: usize) -> Option<&'static [ColumnType]> {
+    use crate::plan::CatalogFunc as Func;
+    const TEXT: ColumnType = ColumnType::Text;
+    const INT: ColumnType = ColumnType::Int4;
+    Some(match (func, argc) {
+        (Func::Btrim | Func::Ltrim | Func::Rtrim, 1) => &[TEXT],
+        (Func::Btrim | Func::Ltrim | Func::Rtrim | Func::StrPos | Func::StringToArray, 2) => {
+            &[TEXT, TEXT]
+        }
+        (Func::Replace, 3) => &[TEXT, TEXT, TEXT],
+        (Func::SplitPart, 3) => &[TEXT, TEXT, INT],
+        (Func::Substr, 2) => &[TEXT, INT],
+        (Func::Substr, 3) => &[TEXT, INT, INT],
+        // No literal argument is possible, so the type threaded is only the one a column ignores
+        // — listed anyway, because being in this table is what makes the call print at all.
+        (Func::TsStrip, 1) => &[ColumnType::TsVector],
+        _ => return None,
+    })
+}
+
+/// The `(left, right)` types of a catalog function **spelled as an operator**, which prints in its
+/// own pair rather than as a call — or `None` for one that prints as a call.
+///
+/// `pg_get_expr` gives `(t || 'x'::text)` and not `||(t, 'x')`, and the coercion on the right is
+/// the operator's own argument type: `(j || '{}'::jsonb)` for `jsonb`, `(j -> 'k'::text)` for a
+/// fetch whose key is always `text` whatever the document is. `parse::lower` makes every `||` a
+/// `CatalogFunc` — hstore, jsonb and text alike — so the pair has to come from the *variant* and
+/// not from the symbol, which is what this table is and what the earlier `name() == "||"` guard
+/// could not be: it printed a `jsonb` literal as `'{}'::text`.
+fn operator_operand_types(func: plan::CatalogFunc) -> Option<(ColumnType, ColumnType)> {
+    use crate::plan::CatalogFunc as Func;
+    match func {
+        // `textcat(text, text)`, which is what every `||` that is not a document merge lowers to.
+        Func::HstoreConcat => Some((ColumnType::Text, ColumnType::Text)),
+        Func::JsonbConcat => Some((ColumnType::Jsonb, ColumnType::Jsonb)),
+        // `->` and `->>`: the document on the left keeps its own type (a column prints its name
+        // and ignores what is threaded, and [`deparse`] prefers the column's type anyway), and the
+        // key on the right is `text` for all three spellings — measured on `jsonb`, `json` and
+        // `hstore`.
+        Func::JsonFetch | Func::JsonbFetch | Func::JsonFetchText | Func::HstoreFetch => {
+            Some((ColumnType::Jsonb, ColumnType::Text))
+        }
+        _ => None,
+    }
+}
+
+/// The name a catalog function's call prints with, quoted where PostgreSQL quotes it.
+///
+/// Four of these are **grammar productions** and print upper-cased — `COALESCE`, `GREATEST`,
+/// `LEAST`, `NULLIF` — and are handled by their own arms in [`deparse`] because their arguments
+/// follow a different rule. What is left is the ordinary lower-case name, with one exception:
+/// `substring` is a **reserved word**, so a call to it prints `"substring"(t, 1, 2)` where
+/// `substr(t, 1, 2)` beside it prints bare. Measured, both.
+fn printed_call_name(func: plan::CatalogFunc) -> String {
+    catalog::quote_identifier(func.name())
 }
 
 /// The type a literal carries on its own, or `None` for the two PostgreSQL calls `unknown`.
@@ -5462,13 +5644,51 @@ fn normalise_defaults(table: &mut TableDef) {
     }
 }
 
+/// One boolean expression a **reader wraps**, printed the way that reader prints it.
+///
+/// A `CHECK` and a partial index's predicate are both stored as text and both re-parenthesised on
+/// the way out — `pg_get_constraintdef` gives `CHECK ((p > 0))` and `pg_get_expr(indpred)` gives
+/// `(p > 0)` — so what is stored has to be the deparsed form with its **outermost pair removed**,
+/// or the reader's pair lands on top of `deparse`'s and the text gains a level per write.
+/// [`catalog::unparenthesised`] is the same helper [`index_expression`] uses, for the same reason
+/// one column over.
+fn deparse_wrapped_predicate(table: &TableDef, expr: &str) -> Option<String> {
+    // **A top-level `AND`/`OR` chain is left alone, because its reader re-parenthesises it.**
+    // `pg_get_constraintdef` prints each operand of a chain in its own pair
+    // ([`catalog::parenthesised_operands`], measured), so deparsing the chain here would give
+    // every operand a pair and the reader would add a second:
+    // `CHECK (((a > 0)) AND (b > 0))`. What is not deparsed then is the *operands*, which is a
+    // register row and not a silent gap — `tests/check_constraint_pretty.rs` pins the layout that
+    // says so.
+    if catalog::parenthesised_operands(expr) != expr.trim() {
+        return None;
+    }
+    deparse_default(table, expr).map(|text| catalog::unparenthesised(&text).to_owned())
+}
+
+/// Every `CHECK` on this table, printed the way `pg_get_constraintdef` prints one.
+///
+/// **The fifth reader of [`deparse`]**, after a generated column, a `DEFAULT`, an index key and a
+/// partial index's predicate. `CHECK (greatest(b, 1) > 0)` on a `bigint` column is
+/// `CHECK ((GREATEST(b, (1)::bigint) > 0))` on a real server, and the written text is neither
+/// upper-cased nor coerced — measured. A check whose expression does not deparse keeps its text,
+/// which is [`deparse_default`]'s own contract.
+fn normalise_checks(table: &mut TableDef) {
+    let snapshot = table.clone();
+    for check in &mut table.checks {
+        if let Some(text) = deparse_wrapped_predicate(&snapshot, &check.expr) {
+            check.expr = text;
+        }
+    }
+}
+
 fn normalise_generated(table: &mut TableDef) -> Result<()> {
     let snapshot = table.clone();
     for column in &mut table.columns {
         let Some(expr) = &column.generated else {
             continue;
         };
-        let (text, _) = deparsed_expression(&snapshot, expr)?;
+        let (text, _) = generated_column_expression(&snapshot, expr)?;
         column.generated = Some(text);
     }
     Ok(())
@@ -5607,7 +5827,24 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
         // [`deparse`] prints as one. Gated on the same condition `deparse`'s own arm uses, because
         // every other `CatalogFunc` deparses to a `name(...)` placeholder that must never be
         // stored: `DEFAULT ('a' || 'b')` prints `('a'::text || 'b'::text)`, measured.
-        Expr::CatalogFunc(call) => call.func.name() == "||" && call.args.len() == 2,
+        // **A catalog function whose arguments [`deparse`] can print**, which is three sets: one
+        // spelled as an operator ([`operator_operand_types`]), one of the four grammar productions
+        // that print upper-cased, and one whose parameter types are measured
+        // ([`catalog_parameter_types`]). Every other one deparses to a `name(...)` placeholder that
+        // must never be stored: `DEFAULT ('a' || 'b')` prints `('a'::text || 'b'::text)`,
+        // `btrim(t, 'x')` prints `btrim(t, 'x'::text)`, and `setweight(tv, 'A')` prints nothing
+        // this node can produce, so its written text is kept.
+        Expr::CatalogFunc(call) => {
+            (operator_operand_types(call.func).is_some() && call.args.len() == 2)
+                || matches!(
+                    call.func,
+                    plan::CatalogFunc::Greatest
+                        | plan::CatalogFunc::Least
+                        | plan::CatalogFunc::NullIf
+                        | plan::CatalogFunc::Substring
+                )
+                || catalog_parameter_types(call.func, call.args.len()).is_some()
+        }
         // **Everything else keeps the text it was written with, and is listed rather than
         // wildcarded** so that a new expression node has to decide before it compiles — the same
         // reason [`deparse`] is total. One arm, because `match_same_arms` will not have two, and
@@ -5811,6 +6048,18 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             }
         }
         Expr::ToText { operand, .. } => format!("({})::text", sub(operand)),
+        // **A cast over an unadorned string literal is *one* node on a real server**, so it prints
+        // as one: `'{}'::jsonb` and not `('{}'::text)::jsonb`. The parser coerces an `unknown`
+        // constant straight to the target type rather than building a cast over a `text` one, so
+        // there is no inner node to parenthesise — measured through `(j || '{}'::jsonb)`, where
+        // this node printed the double form and the pair with it.
+        //
+        // Only a **bare** string literal: `('a' || 'b')::text` really is a cast over an
+        // expression, and a numeric constant under a cast is [`numeric_constant`]'s three forms
+        // and debt #24's remaining case.
+        Expr::Cast { operand, to, .. } if written_as_a_quoted_string(operand) => {
+            deparse_literal_of(operand, *to)
+        }
         Expr::Cast { operand, to, .. } => format!("({})::{}", sub(operand), to.name()),
         // **Five lines, indented four spaces, with the implicit `ELSE` materialised.** This layout
         // is what `pg_get_indexdef` answers on a real server — `pg_get_indexdef` deparses with
@@ -5827,10 +6076,14 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        // **A production, so its arguments carry the coercion to the common type**:
+        // `COALESCE(b, (1)::bigint)` where the column is `bigint` and the literal is not.
         Expr::Coalesce(args) => format!(
             "COALESCE({})",
             args.iter()
-                .map(|arg| deparse(arg, table, ty))
+                .map(|arg| {
+                    deparse_production_argument(arg, table, production_common_type(args, table, ty))
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -5883,19 +6136,124 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         // Measured: `t || 'x'` is `(t || 'x'::text)` and `length(t || 'x')` is
         // `length((t || 'x'::text))` — the argument keeps its own pair inside the call's
         // parentheses, which is what makes this an operator arm and not a call one.
-        Expr::CatalogFunc(call) if call.func.name() == "||" && call.args.len() == 2 => {
-            // **Each operand is deparsed as `text`, which is the operator's own argument type and
-            // not the expression's.** `deparse` threads one type down to every literal, and that
-            // is right for a comparison — where `reconcile` has already retyped the literal
-            // against the column — and wrong here: `length(t || 'x')` printed
-            // `length((t || 'x'::integer))`, taking `length`'s *result* type, where a real server
-            // says `length((t || 'x'::text))`. The operator is `textcat(text, text)`, measured.
-            let operand = |expr: &Expr| deparse(expr, table, ColumnType::Text);
-            format!("({} || {})", operand(&call.args[0]), operand(&call.args[1]))
+        // **A catalog function spelled as an operator prints as one**, which is the shape
+        // `pg_get_expr` gives it: `(t || 'x'::text)` and not `||(t, 'x')`.
+        //
+        // **Each operand is deparsed under the *operator's* argument type, not the expression's.**
+        // `deparse` threads one type down to every literal, which is right for a comparison — where
+        // `reconcile` has already retyped the literal against the column — and wrong here:
+        // `length(t || 'x')` printed `length((t || 'x'::integer))`, taking `length`'s *result*
+        // type, where a real server says `length((t || 'x'::text))`. The pair comes from
+        // [`operator_operand_types`], per variant, because the symbol is not enough: `||` over
+        // `jsonb` wants `'{}'::jsonb` where `||` over text wants `'x'::text`.
+        //
+        // The left operand prefers its own column's type when it has one, so a document keeps its
+        // declared type where the table can only name one for the family.
+        Expr::CatalogFunc(call)
+            if operator_operand_types(call.func).is_some() && call.args.len() == 2 =>
+        {
+            let (left, right) =
+                operator_operand_types(call.func).unwrap_or((ColumnType::Text, ColumnType::Text));
+            let left = column_type_of(&call.args[0], table).unwrap_or(left);
+            format!(
+                "({} {} {})",
+                deparse(&call.args[0], table, left),
+                call.func.name(),
+                deparse(&call.args[1], table, right)
+            )
         }
-        // Everything else a catalog function can be has no deparse of its own yet: an index or a
-        // generated column over one is refused as not immutable long before this, except the
-        // text-search family, which `tests/corpus/pg19_deparse_parens.txt` does not reach.
+        // **`GREATEST` and `LEAST` are grammar productions**: upper-cased, and their arguments
+        // coerced to the call's **common type**, which is the type threaded in. Measured:
+        // `GREATEST(b, (1)::bigint)` on a `bigint` column widens the literal, and
+        // `GREATEST(n, 1)` on an `integer` one shows no cast because the two already agree.
+        Expr::CatalogFunc(call)
+            if matches!(
+                call.func,
+                plan::CatalogFunc::Greatest | plan::CatalogFunc::Least
+            ) =>
+        {
+            format!(
+                "{}({})",
+                call.func.name().to_uppercase(),
+                call.args
+                    .iter()
+                    .map(|arg| {
+                        deparse_production_argument(
+                            arg,
+                            table,
+                            production_common_type(&call.args, table, ty),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        // **`NULLIF` is the fourth production and the one whose arguments are *not* coerced.**
+        // It resolves `=` between the two and PostgreSQL leaves both sides as they are, so
+        // `NULLIF(b, 1)` prints the literal bare where `GREATEST(b, 1)` one arm up prints
+        // `(1)::bigint` — the same fact as its result type being the comparison's left input
+        // (`exec::query::nullif_type`). So the left is threaded the call's type, which is that
+        // input, and the right is threaded **its own**, falling back to the call's for an
+        // untyped literal that takes it: `NULLIF(t, 'x'::text)`. Both measured on 19beta1.
+        Expr::CatalogFunc(call)
+            if call.func == plan::CatalogFunc::NullIf && call.args.len() == 2 =>
+        {
+            let right = decided_literal_type(&call.args[1]).unwrap_or(ty);
+            format!(
+                "NULLIF({}, {})",
+                deparse(&call.args[0], table, ty),
+                deparse(&call.args[1], table, right)
+            )
+        }
+        // **`SUBSTRING` is the fifth production, and the one that is a production *and* a
+        // function.** Which it prints as depends on how it was written, and PostgreSQL keeps the
+        // two apart: `substring(t from 1 for 2)` is `SUBSTRING(t FROM 1 FOR 2)`, keywords and all,
+        // while `substring(t, 1, 2)` is `"substring"(t, 1, 2)` — the call, quoted, because
+        // `substring` is a reserved word. `substr(t, 1, 2)` beside them is an ordinary name and
+        // prints bare, which is [`catalog_parameter_types`]'s row.
+        //
+        // **This node keeps only one of the two spellings**, so the keyword form is what prints.
+        // `parse::lower` reads `substr(...)` into `CatalogFunc::Substr` and *both* spellings of
+        // `substring` into `CatalogFunc::Substring` — the flag it has separates `substr` from
+        // `substring` and not the call form from the keyword form — so the call spelling of
+        // `substring` is a declared divergence in
+        // `tests/corpus/pg19_catalog_func_deparse.txt` and the keyword one agrees. Printing the
+        // production is the half that also reads back: this node's parser has no quoted function
+        // names.
+        Expr::CatalogFunc(call)
+            if call.func == plan::CatalogFunc::Substring && (2..=3).contains(&call.args.len()) =>
+        {
+            let operand = deparse(&call.args[0], table, ColumnType::Text);
+            let from = deparse(&call.args[1], table, ColumnType::Int4);
+            match call.args.get(2) {
+                Some(count) => format!(
+                    "SUBSTRING({operand} FROM {from} FOR {})",
+                    deparse(count, table, ColumnType::Int4)
+                ),
+                None => format!("SUBSTRING({operand} FROM {from})"),
+            }
+        }
+        // **An ordinary call, with its arguments and the coercion each parameter took.** The name
+        // is its own, lower-case, quoted where a real server quotes it — `substring` is a reserved
+        // word and prints `"substring"(t, 1, 2)` where `substr(t, 1, 2)` beside it prints bare.
+        Expr::CatalogFunc(call)
+            if catalog_parameter_types(call.func, call.args.len()).is_some() =>
+        {
+            let params = catalog_parameter_types(call.func, call.args.len()).unwrap_or(&[]);
+            format!(
+                "{}({})",
+                printed_call_name(call.func),
+                call.args
+                    .iter()
+                    .zip(params)
+                    .map(|(arg, param)| deparse(arg, table, *param))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        // Everything else a catalog function can be keeps the placeholder, which [`reads_back`]
+        // refuses — so the expression keeps the text it was written with.
+        // [`catalog_parameter_types`] is where that decision lives and why.
         Expr::CatalogFunc(call) => format!("{}(...)", call.func.name()),
         Expr::Aggregate(call) => format!("{}(...)", call.func.name()),
         Expr::Subquery(sub) => sub.kind.describe().to_owned(),
@@ -6571,7 +6929,7 @@ pub(super) fn alter_table(
         // the table does not have is `42703` from here rather than a stored expression nothing can
         // evaluate.
         let generated = match &column.generated {
-            Some(expr) => Some(deparsed_expression(&updated, expr)?.0),
+            Some(expr) => Some(generated_column_expression(&updated, expr)?.0),
             None => None,
         };
         // The second of `deparse_default`'s three callers: this column only, over the table as it
