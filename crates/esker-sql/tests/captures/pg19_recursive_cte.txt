@@ -1,0 +1,97 @@
+# **`WITH RECURSIVE` with a body that names itself** — PostgreSQL 19beta1, 2026-09-08.
+# One `BEGIN … ROLLBACK`, a `SAVEPOINT` per probe, `SET LOCAL statement_timeout = '5s'`.
+#
+# The timeout is not decoration. The first attempt at this capture hung the shared oracle on
+#
+#     WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n FROM t LEFT JOIN rec_co ON true) …
+#
+# which I had written expecting a refusal. PostgreSQL only refuses a recursive reference on the
+# **nullable** side of an outer join; on the other side it is legal, and that query grows without
+# bound. A capture of a recursive feature needs its own timeout, and the probe below is the
+# refusing spelling.
+#
+# The fixture also had to be renamed: `companies` **already exists** in this database — it is the
+# Rails suite's own fixture table — so the first run measured the suite's data instead of mine.
+#
+# ## The statement `with_test.rb#test_with_recursive` sends
+#
+#     WITH RECURSIVE "rec_tree" AS (
+#       SELECT "rec_co".* FROM "rec_co" WHERE "rec_co"."firm_id" IS NULL
+#       UNION ALL
+#       SELECT "rec_co".* FROM "rec_co" JOIN rec_tree ON rec_co.firm_id = rec_tree.id
+#     ) SELECT "rec_co"."id" FROM rec_tree AS rec_co ORDER BY "rec_co"."id" ASC
+#
+# over (1,NULL),(2,NULL),(3,1),(4,1),(5,3),(6,NULL),(7,6) it is **1 2 3 4 5 6 7**: every top and
+# every descendant, transitively — 5 is a grandchild and is in, which is what makes this a fixpoint
+# and not a self-join.
+#
+# ## What the CTE is, as a relation
+#
+#     WITH RECURSIVE t AS (SELECT id, firm_id, name FROM rec_co WHERE firm_id IS NULL
+#                          UNION ALL
+#                          SELECT c.id, c.firm_id, c.name FROM rec_co c JOIN t ON c.firm_id = t.id)
+#     SELECT * FROM t
+#         id       bigint
+#         firm_id  bigint
+#         name     character varying(255)      <- the typmod survives
+#
+# **The names and the types come from the non-recursive term**, and the column alias list renames
+# them: `WITH RECURSIVE t(p, q) AS (SELECT 1, 'x'::text UNION ALL …)` is `p integer, q text`.
+#
+# ## The seed's type is the answer's type, and the recursive term must already fit it
+#
+#     WITH RECURSIVE t AS (SELECT 1::int4 AS a UNION ALL SELECT (a+1)::int8 FROM t WHERE a < 2) …
+#         42804 recursive query "t" column 1 has type integer in non-recursive term
+#               but type bigint overall
+#         HINT: Cast the output of the non-recursive term to the correct type.
+#
+# **This is not the ordinary union rule.** A plain `UNION` promotes both arms to a common type; a
+# recursive query does not — the non-recursive term decides, and a wider recursive term is an error
+# telling you to widen the *seed*. Two arms with no common type at all keep the ordinary message:
+# `42804 UNION types integer and text cannot be matched`.
+#
+# ## `UNION` deduplicates against everything already produced
+#
+#     WITH RECURSIVE n(i) AS (SELECT 1 UNION SELECT 1 FROM n) SELECT i FROM n          1
+#
+# One row, and it **terminates**: the dedup is against the whole accumulated result, not against
+# the last iteration, so the second round produces nothing new and the loop ends. That is what
+# makes `UNION` a termination rule and `UNION ALL` not one.
+#
+#     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i FROM n) SELECT i FROM n LIMIT 3
+#                                                                                  1, 1, 1
+#
+# **PostgreSQL streams the working table**, so a `LIMIT` stops an infinite recursion. Any
+# implementation that materialises hits its cap and must raise here instead. Whatever cap is
+# chosen, this statement is a declared divergence and not a bug in the cap.
+#
+# ## The refusals, all measured
+#
+#     SELECT n FROM t, t AS u                 42P19 recursive reference to query "t" must not
+#                                                   appear more than once
+#     WITH RECURSIVE t AS (SELECT n FROM t)   42P19 recursive query "t" does not have the form
+#                                                   non-recursive-term UNION [ALL] recursive-term
+#     SELECT n FROM t UNION ALL SELECT 1      42P19 recursive reference to query "t" must not
+#                                                   appear within its non-recursive term
+#     … UNION ALL SELECT count(*) FROM t      42P19 aggregate functions are not allowed in a
+#                                                   recursive query's recursive term
+#     … UNION ALL SELECT n FROM t ORDER BY n  0A000 ORDER BY in a recursive query is not implemented
+#     … UNION ALL SELECT n FROM t LIMIT 1     0A000 LIMIT in a recursive query is not implemented
+#     … SELECT t.n FROM rec_co LEFT JOIN t    42P19 recursive reference to query "t" must not
+#                                                   appear within an outer join
+#     SELECT 1 INTERSECT SELECT n FROM t      42P19 … does not have the form non-recursive-term …
+#     SELECT 1 EXCEPT SELECT n FROM t         42P19 … does not have the form non-recursive-term …
+#     a AS (… FROM b), b AS (… FROM a)        0A000 mutual recursion between WITH items is not
+#                                                   implemented
+#
+# **Two classes again**: what the SQL standard's shape forbids is `42P19`, and what PostgreSQL
+# simply has not built is `0A000`. `ORDER BY` and `LIMIT` inside the body are in the second class,
+# which is worth knowing — they are not illegal, they are unimplemented, and the message says so.
+#
+# ## Around the recursion
+#
+#   * A **non-recursive** body in the same `WITH RECURSIVE` list still runs, and the two can be
+#     referenced in one statement.
+#   * The outer query sees **every** row, and may reference the CTE more than once:
+#     `SELECT (SELECT count(*) FROM n) AS c, i FROM n` is `3|1, 3|2, 3|3`. The "must not appear
+#     more than once" rule is about the *recursive term*, not about the statement.
