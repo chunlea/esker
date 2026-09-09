@@ -59,7 +59,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // too, and the column is missing for all sixteen types.
         "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN \
          ('time','timetz') ORDER BY oid",
-        "SELECT '12:34:56'::time::varchar, '12:34:56'::time::char(5)",
         "SELECT '12:34:56'::time::interval, '24:00:00'::time::interval",
         "SELECT '1 day 02:00:00'::interval::time",
         "SELECT '12:34:56'::time::timetz",
@@ -87,15 +86,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              a syntax error on both sides and neither reaches this type.",
             "pg19_time.txt:84",
         ),
-        (
-            "SELECT '12:34:56'::time::varchar, '12:34:56'::time::char(5)",
-            "**An explicit cast to `character(n)` truncates on a real server and raises `22001` \
-             here.** `'12:34:56'::char(5)` is `12:34` there. Nothing to do with `time` — the \
-             `varchar` half agrees, and the same `::char(5)` of any over-long string diverges the \
-             same way — but this statement is where the corpus meets it, so it is recorded here \
-             and belongs to `bpchar`'s cast path.",
-            "pg19_time.txt:86",
-        ),
+        // `::char(n)` truncating on a cast and raising only on an assignment was declared
+        // here and is closed: `debts-v1.1.md` #36 gave the cast and the row write their own
+        // sides of one seam (`tests/typmod_seam.rs`). It had nothing to do with this type,
+        // which is what every copy of it said — five entries across four files, one cause.
         (
             "SELECT '12:34:56'::time::interval, '24:00:00'::time::interval",
             INTERVAL,

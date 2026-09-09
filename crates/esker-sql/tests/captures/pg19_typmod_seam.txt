@@ -1,0 +1,43 @@
+# **A cast truncates and an assignment refuses** — PostgreSQL 19beta1, 2026-09-09.
+# `ON_ERROR_ROLLBACK on`, `BEGIN … ROLLBACK`, a temp table and a domain per statement group.
+#
+# `debts-v1.1.md` #36. One rule, four types, two callers — and this node had each type wired to
+# whichever caller it was written for, so the two halves were exactly swapped:
+#
+#                       cast                assignment
+#     varchar(3)        22001  (wrong)      22001  (right)
+#     character(3)      22001  (wrong)      22001  (right)
+#     bit(3)            truncates (right)   truncates (wrong)
+#     bit varying(3)    truncates (right)   truncates (wrong)
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **`22001` and `22026` are not interchangeable.** `22001` is "too long" and belongs to the
+#     types whose modifier is a **maximum**; `22026` is "does not match" and belongs to `bit(n)`,
+#     whose modifier is an **exact width** — which is why it is raised for a value that is too
+#     **short** as well. `'1'` into a `bit(3)` column is `22026 bit string length 1 does not match
+#     type bit(3)`, where the same value *cast* to `bit(3)` is `100`, padded on the right.
+#
+#   * **A cast to a domain takes its base type's rule**, both halves: `'abcdef'::d` over a domain
+#     on `varchar(3)` is `abc`, and the same value into a column of that domain is `22001`.
+#
+# ## The measurements
+#
+# casts, all three spellings of one
+SELECT 'abcdef'::varchar(3)	varchar	abc
+SELECT 'abcdef'::character(3)	bpchar	abc
+SELECT 'abcdef'::text::varchar(3)	varchar	abc
+SELECT CAST('abcdef' AS varchar(3))	varchar	abc
+SELECT '10101'::bit(3)	bit	101
+SELECT '1'::bit(3)	bit	100
+SELECT '10101'::varbit(3)	varbit	101
+CREATE DOMAIN d36 AS varchar(3)		-
+SELECT 'abcdef'::d36	d36	abc
+# assignments, into a column of each
+CREATE TABLE s36 (v varchar(3), c character(3), b bit(3), vb varbit(3), d d36)		-
+INSERT INTO s36(v) VALUES ('abcdef')	!22001 value too long for type character varying(3)
+INSERT INTO s36(c) VALUES ('abcdef')	!22001 value too long for type character(3)
+INSERT INTO s36(b) VALUES ('10101')	!22026 bit string length 5 does not match type bit(3)
+INSERT INTO s36(b) VALUES ('1')	!22026 bit string length 1 does not match type bit(3)
+INSERT INTO s36(vb) VALUES ('10101')	!22001 bit string too long for type bit varying(3)
+INSERT INTO s36(d) VALUES ('abcdef')	!22001 value too long for type character varying(3)
