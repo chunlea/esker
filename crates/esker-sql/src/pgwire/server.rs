@@ -148,6 +148,11 @@ pub struct Connection<S> {
     /// **It defaults to the user's name**, which is PostgreSQL's rule and is what makes `psql`
     /// with no `-d` connect to a database named for whoever is running it.
     database: String,
+    /// libpq's `options` startup parameter, verbatim.
+    ///
+    /// A command line — `-c name=value` and `--name=value` — applied to the session once it
+    /// exists. Empty when the client sent none, which is every client that does not ask.
+    options: String,
     /// Reused between messages so a busy session is not allocating a buffer per reply.
     ///
     /// It travels to the blocking thread with the session and comes back, so "reused" survives
@@ -190,6 +195,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     /// decoded by [`Connection::startup`].
     fn resuming(stream: S, config: Config, pending: Option<Vec<u8>>) -> Self {
         Connection {
+            options: String::new(),
             stream,
             config,
 
@@ -398,6 +404,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 .iter()
                 .find(|(name, _)| name == "database")
                 .map_or_else(|| self.user.clone(), |(_, value)| value.clone());
+            // libpq's `options`, which is a command line and is applied once the session exists
+            // (`Connection::apply_options`).
+            if let Some((_, options)) = parameters.iter().find(|(name, _)| name == "options") {
+                self.options.clone_from(options);
+            }
         }
         self.out.clear();
         match negotiation(startup) {
@@ -500,7 +511,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             .await
             .map_err(std::io::Error::other)?;
         match made {
-            Ok(executor) => {
+            Ok(mut executor) => {
+                // **The startup packet's `options`, applied before the client is told it may
+                // speak.** A parameter the server cannot honour fails the connection on a real
+                // server rather than being dropped, and a dropped one leaves the client believing
+                // a setting it does not have — `connection_test.rb` connects with `-c geqo=off`
+                // and then asks `SHOW geqo`.
+                if let Err(error) = self.apply_options(executor.as_mut()) {
+                    self.send_error(&error).await?;
+                    return Ok(None);
+                }
                 self.announce_ready().await?;
                 Ok(Some(executor))
             }
@@ -509,6 +529,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 Ok(None)
             }
         }
+    }
+
+    /// Applies every parameter the startup packet's `options` asked for.
+    fn apply_options(&self, executor: &mut dyn Execute) -> Result<()> {
+        for (name, value) in crate::parameter::command_line(&self.options)? {
+            executor.set_option(&name, &value)?;
+        }
+        Ok(())
     }
 
     /// Tells the client its connection is established.
@@ -823,6 +851,11 @@ impl Execute for NotYetExecuting {
 
     /// Discarded: there is no catalog behind this, so nothing can read the view they would fill.
     fn remember_prepared(&mut self, _statements: Vec<crate::session::PreparedStatement>) {}
+
+    /// Nothing here has parameters to set.
+    fn set_option(&mut self, _name: &str, _value: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// There is no planner behind this, so there is no plan to explain.
     fn explain_prepared(

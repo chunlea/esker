@@ -149,6 +149,23 @@ pub trait Execute {
     /// catalog behind it discards the list in one line and says so.
     fn remember_prepared(&mut self, statements: Vec<crate::session::PreparedStatement>);
 
+    /// Applies one parameter the startup packet's `options` asked for.
+    ///
+    /// **Not a `SET` statement built out of the client's text.** The name and the value come off
+    /// the wire, and turning them back into SQL to parse would be building a statement out of
+    /// something a client wrote — for a setting the same client could set with a `SET` a moment
+    /// later, so there is nothing to gain and a shape to get wrong.
+    ///
+    /// **Required rather than defaulted**: a default that did nothing would leave a client
+    /// believing a setting it does not have, which is the one outcome the connection refusal
+    /// exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the parameter itself refuses — an unrecognised name, or a value the parameter does
+    /// not take. Both end the connection before it opens, which is what a real server does.
+    fn set_option(&mut self, name: &str, value: &str) -> Result<()>;
+
     /// Explains `statement` under the options `explain` was written with.
     ///
     /// **Two halves, because they live in two places.** `EXPLAIN … EXECUTE p1(1)` explains a
@@ -1234,6 +1251,12 @@ mod tests {
 
         fn remember_prepared(&mut self, statements: Vec<crate::session::PreparedStatement>) {
             self.prepared = statements;
+        }
+
+        /// Records the option so a test can assert it reached the executor.
+        fn set_option(&mut self, name: &str, value: &str) -> Result<()> {
+            self.calls.push(format!("set {name} = {value}"));
+            Ok(())
         }
 
         /// Records what it was asked to explain, so a test can assert the session resolved the

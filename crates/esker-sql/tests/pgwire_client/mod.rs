@@ -46,9 +46,25 @@ impl Client {
     ///
     /// The message of that `ErrorResponse`.
     pub async fn connect_to(address: std::net::SocketAddr, database: &str) -> Result<Self, String> {
+        Client::connect_with(address, database, "").await
+    }
+
+    /// The same, carrying libpq's `options` — a command line the server applies to the session.
+    ///
+    /// # Errors
+    ///
+    /// The message of an `ErrorResponse` that arrived before `ReadyForQuery`.
+    pub async fn connect_with(
+        address: std::net::SocketAddr,
+        database: &str,
+        options: &str,
+    ) -> Result<Self, String> {
         let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
         let mut body = 0x0003_0000u32.to_be_bytes().to_vec();
-        for (name, value) in [("user", "esker"), ("database", database)] {
+        for (name, value) in [("user", "esker"), ("database", database)]
+            .into_iter()
+            .chain((!options.is_empty()).then_some(("options", options)))
+        {
             body.extend_from_slice(name.as_bytes());
             body.push(0);
             body.extend_from_slice(value.as_bytes());

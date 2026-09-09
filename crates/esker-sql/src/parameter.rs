@@ -601,6 +601,48 @@ impl Isolation {
     }
 }
 
+/// The parameters a startup packet's `options` string asks for, in order.
+///
+/// **libpq's `options` is a command line**, and PostgreSQL processes it as one: `-c name=value`
+/// and the long `--name=value` both set a parameter for the session, and whitespace between them
+/// is whatever the client wrote. `ActiveRecord`'s `connection_test.rb` passes `-c geqo=off` and
+/// then asks `SHOW geqo`, which is the whole of `test_connection_options`.
+///
+/// Measured on PostgreSQL 19: `-c geqo=off`, `--geqo=off` and `  -c   geqo=off  ` all apply;
+/// several `-c` in one string all apply; and anything the server cannot honour **fails the
+/// connection** rather than being ignored — `-c nosuchparam=1` is
+/// `FATAL: unrecognized configuration parameter "nosuchparam"` and `-c geqo=banana` is
+/// `FATAL: parameter "geqo" requires a Boolean value`, both at connect. Applying what it
+/// understands and dropping the rest would leave a client believing a setting it does not have.
+///
+/// # Errors
+///
+/// A word that is not one of the two forms, named as itself. Real server options — `-B 4` and the
+/// rest of `postgres`'s command line — are not parameters and are refused here rather than
+/// silently skipped.
+pub fn command_line(options: &str) -> Result<Vec<(String, String)>> {
+    let mut asked = Vec::new();
+    let mut words = options.split_whitespace();
+    while let Some(word) = words.next() {
+        let assignment = if word == "-c" {
+            words.next().unwrap_or_default()
+        } else if let Some(long) = word.strip_prefix("--") {
+            long
+        } else {
+            return Err(SqlError::unsupported(format!(
+                "the connection option {word}"
+            )));
+        };
+        let Some((name, value)) = assignment.split_once('=') else {
+            return Err(SqlError::unsupported(format!(
+                "the connection option {assignment}"
+            )));
+        };
+        asked.push((name.to_owned(), value.to_owned()));
+    }
+    Ok(asked)
+}
+
 /// `transaction_isolation`, the level this transaction is running at.
 #[must_use]
 pub fn transaction_isolation() -> &'static Parameter {

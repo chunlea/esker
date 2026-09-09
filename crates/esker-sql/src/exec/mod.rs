@@ -3930,6 +3930,10 @@ impl Execute for Executor {
             .map(std::time::Duration::from_millis)
     }
 
+    fn set_option(&mut self, name: &str, value: &str) -> Result<()> {
+        self.set_parameter(name, Some(value))
+    }
+
     /// Explains a statement the **session** holds: `EXPLAIN … EXECUTE p1(1)`.
     ///
     /// The two halves arrive separately because they live separately — the options are in the
