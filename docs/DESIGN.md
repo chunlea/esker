@@ -1164,6 +1164,16 @@ issues the changes and might one day want to move two peers together · separate
 async commit / 1PC · leader leases vs ReadIndex only · secondary-index encoding for composite keys ·
 how much Postgres surface for the first SQL milestone.
 
+**The catalog's region is on the path of every statement, and nothing about its read path is
+decided.** The catalog lives under `'m'` (§3) and every SQL key under `'x'`, so the catalog sorts
+below all data and stays in the **left-most region for the life of the cluster** — while
+`Catalog::view` reads `catalog_version` from the store **once per transaction**. One region is
+therefore read by every statement on every node, and a moment when it has no leader is a moment the
+whole node is refusing. Three shapes to choose between when this is decided: a **cached** version
+with an invalidation the store pushes, a **lease read** that a follower may answer, or a **split
+exemption** that keeps the catalog in a region nothing else can make busy. Measured evidence for
+why it matters is `docs/plans/debts-v1.1.md` #34.
+
 *Pending, decided elsewhere and not in this tree yet:* the `"char"` one-byte type
 (ADR 0095), `oid` as its own type rather than `bigint` (ADR 0097) and `regproc` (ADR 0098) are
 b4's, accepted and unlanded at the time of writing — the three families
