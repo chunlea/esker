@@ -140,6 +140,14 @@ fn key(n: u32) -> Bytes {
 /// always worked. A cluster whose leadership actually spreads refuses those writes with
 /// `NotLeader`, correctly, so a load generator that only knows one store measures the bug rather
 /// than the fix.
+/// How long one store may take to answer before the writer asks another.
+///
+/// The bound the arm was missing: its retry loop had a deadline and the call inside it had none, so
+/// a single `serve` awaiting a commit that a leaderless region will never make ran the arm to two
+/// hundred seconds against a ninety-second budget. Generous against a slow box, short against a
+/// region that has stopped answering.
+const ATTEMPT: Duration = Duration::from_secs(10);
+
 async fn put(stores: &[&Arc<Store>], key: Bytes, value: &[u8]) {
     let deadline = Instant::now() + Duration::from_secs(90);
     let started = Instant::now();
@@ -157,7 +165,25 @@ async fn put(stores: &[&Arc<Store>], key: Bytes, value: &[u8]) {
             }
             let header = RequestHeader::new(state.id(), state.region().epoch, 0);
             let request = RawKvReq::put(key.clone(), Bytes::copy_from_slice(value));
-            match store.serve(header, request).await {
+            // **One attempt cannot outlive the arm's own budget.** The deadline below is checked
+            // between rounds, and that bounds the *loop* — it does not bound the call inside it.
+            // `serve` awaits the proposal it made, and a peer that led when `is_leader()` was asked
+            // and lost the office a moment later is awaiting a commit that will not come while the
+            // region has no leader. That is how a ninety-second arm reported **two hundred
+            // seconds** in g1's gate: one await, unbounded, inside a bounded loop.
+            //
+            // A round is short because the answer either comes from a leader or does not come at
+            // all; giving up on it and asking the next store is exactly what the loop is for.
+            let attempt = tokio::time::timeout(ATTEMPT, store.serve(header, request));
+            let Ok(answered) = attempt.await else {
+                last = Some(format!(
+                    "store {} led region {} and did not answer within {ATTEMPT:?}",
+                    store.store_id(),
+                    state.id()
+                ));
+                continue;
+            };
+            match answered {
                 Ok(_) => return,
                 Err(error) => {
                     // **An ambiguous answer is not a retryable one in general.** A leader that
