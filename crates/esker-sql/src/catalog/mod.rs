@@ -1617,6 +1617,39 @@ pub struct ExcludeDef {
 ///
 /// Split on the **top level only**: a keyword inside parentheses or inside a string literal is
 /// part of an operand, not a separator.
+/// Whether an expression is nothing but one column name — bare, or delimited.
+///
+/// **The one shape PostgreSQL's boolean deparser leaves unparenthesised.** Measured on 19beta1,
+/// over a partial index's predicate and an exclusion constraint's alike:
+///
+/// ```text
+/// WHERE "primary"        -> "primary"            WHERE n > 0 AND flag -> ((n > 0) AND flag)
+/// WHERE flag             -> flag                 WHERE NOT flag       -> (NOT flag)
+/// WHERE (flag)           -> flag                 WHERE n > 0          -> (n > 0)
+/// ```
+///
+/// Deliberately narrow: anything with an operator, a call, a space outside quotes or a second
+/// token is not this shape and takes its pair. A delimited name may hold any character but `"`,
+/// so that case is matched on its own rather than by scanning for spaces.
+#[must_use]
+pub(crate) fn is_column_reference(expr: &str) -> bool {
+    let expr = expr.trim();
+    if let Some(inner) = expr
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        return !inner.is_empty() && !inner.contains('"');
+    }
+    !expr.is_empty()
+        && expr
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && expr
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 pub(crate) fn parenthesised_operands(predicate: &str) -> String {
     let bytes = predicate.as_bytes();
     let upper = predicate.to_ascii_uppercase();
@@ -1648,9 +1681,20 @@ pub(crate) fn parenthesised_operands(predicate: &str) -> String {
         return predicate.to_owned();
     }
     operands.push(predicate[start..].trim());
-    let mut out = format!("({})", operands[0]);
+    // **A bare column operand takes no pair**, which is the server's own rule and not a nicety:
+    // `n > 0 AND flag` comes back `((n > 0) AND flag)`, measured through a partial index and an
+    // exclusion constraint both.
+    let wrap = |operand: &str| {
+        if is_column_reference(operand) {
+            operand.to_owned()
+        } else {
+            format!("({operand})")
+        }
+    };
+    let mut out = wrap(operands[0]);
     for (operand, separator) in operands[1..].iter().zip(&separators) {
-        let _ = std::fmt::Write::write_fmt(&mut out, format_args!(" {separator} ({operand})"));
+        let _ =
+            std::fmt::Write::write_fmt(&mut out, format_args!(" {separator} {}", wrap(operand)));
     }
     out
 }

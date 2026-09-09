@@ -193,14 +193,34 @@ fn definition(
     out
 }
 
-/// One pair of parentheses around a stored expression, and never two.
+/// One pair of parentheses around a stored expression, and never two — **except around a bare
+/// column, which takes none**.
 ///
 /// The text a `WHERE` is stored with has had its own outer pair removed when it was lowered
 /// (`crate::parse::lower::unwrap_nested`), so this is where PostgreSQL's pair goes back on — and
 /// each operand of an `AND`/`OR` chain gets a pair of its own, which is the server's own rule for
 /// re-printing a boolean (`crate::catalog::parenthesised_operands`).
+///
+/// A predicate that is **only a column reference** is printed unadorned. Measured on 19beta1, one
+/// table and eight partial indexes:
+///
+/// ```text
+/// WHERE "primary"          -> "primary"          WHERE n > 0        -> (n > 0)
+/// WHERE flag               -> flag               WHERE NOT flag     -> (NOT flag)
+/// WHERE (flag)             -> flag               WHERE v IS NOT NULL-> (v IS NOT NULL)
+///                                                WHERE n > 0 AND flag -> ((n > 0) AND flag)
+/// ```
+///
+/// The user's own parentheses are dropped and the server's are added, which is the same rule as
+/// before; the boolean column is the one shape that needs none, and
+/// `postgresql_adapter_test#test_partial_index_on_column_named_like_keyword` asserts exactly it —
+/// `index.where` must be `"primary"`, quoted and unwrapped.
 fn parenthesised(expr: &str) -> String {
-    format!("({})", crate::catalog::parenthesised_operands(expr))
+    let operands = crate::catalog::parenthesised_operands(expr);
+    if super::is_column_reference(&operands) {
+        return operands;
+    }
+    format!("({operands})")
 }
 
 /// One index's key, however it is stored.

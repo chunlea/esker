@@ -5193,6 +5193,34 @@ fn index_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)
     Ok((text, ty))
 }
 
+/// Whether a scalar function takes `text`, and so shows a cast its argument needed.
+///
+/// Six of the seven do; `abs` is the numeric one. Measured rather than read off the names:
+/// `length((v)::text)`, `upper((c)::text)`, `octet_length((v)::text)`, `abs(n)`.
+fn takes_text(func: plan::ScalarFunc) -> bool {
+    use crate::plan::ScalarFunc;
+    match func {
+        ScalarFunc::Lower
+        | ScalarFunc::Upper
+        | ScalarFunc::Reverse
+        | ScalarFunc::Ascii
+        | ScalarFunc::Length
+        | ScalarFunc::OctetLength => true,
+        ScalarFunc::Abs => false,
+    }
+}
+
+/// The declared type of an expression that is exactly one column of this table, or `None`.
+///
+/// Only a column takes a visible cast: a literal carries its own type annotation already, and a
+/// nested call's result is whatever that call returns.
+fn column_type_of(expr: &plan::Expr, table: &TableDef) -> Option<ColumnType> {
+    match expr {
+        plan::Expr::Ordinal { at, .. } => table.columns.get(*at).map(|column| column.ty),
+        _ => None,
+    }
+}
+
 /// One resolved expression, as `pg_get_expr` prints it.
 ///
 /// Only reached for a `CASE` today — everything else is stored as written — but total over the
@@ -5270,7 +5298,22 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             if *negated { "NOT " } else { "" },
             list.iter().map(&sub).collect::<Vec<_>>().join(", ")
         ),
-        Expr::Scalar { func, operand } => format!("{}({})", func.name(), sub(operand)),
+        // **A text function shows the cast its argument took.** `lower(v)` over a `varchar` prints
+        // `lower((v)::text)` and over a `text` prints `lower(t)`; `abs(n)` prints bare, being the
+        // one scalar function here that does not take text. Measured on 19beta1 across all four
+        // shapes, and it is what `schema_dumper_test#test_schema_dump_expression_indices` asserts
+        // — the regex names `lower((name)::text)` exactly.
+        Expr::Scalar { func, operand } => {
+            let argument = sub(operand);
+            let cast = takes_text(*func)
+                && matches!(column_type_of(operand, table), Some(from)
+                if matches!(from, ColumnType::Varchar | ColumnType::Bpchar));
+            if cast {
+                format!("{}(({argument})::text)", func.name())
+            } else {
+                format!("{}({argument})", func.name())
+            }
+        }
         Expr::ToText { operand, .. } => format!("({})::text", sub(operand)),
         Expr::Cast { operand, to, .. } => format!("({})::{}", sub(operand), to.name()),
         // **Five lines, indented four spaces, with the implicit `ELSE` materialised.** This layout
