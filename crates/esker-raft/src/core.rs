@@ -26,7 +26,7 @@ use crate::message::Message;
 use crate::progress::{Progress, ProgressMap};
 use crate::readonly::ReadOnly;
 use crate::storage::LogStorage;
-use crate::types::{ConfState, HardState, Index, NodeId, ReadState, Term};
+use crate::types::{ConfState, Counters, HardState, Index, NodeId, ReadState, Term};
 
 /// What a node currently believes it is.
 ///
@@ -94,6 +94,8 @@ pub(crate) struct Raft<S: LogStorage> {
     pub(crate) heartbeat_elapsed: u64,
     /// This election's timeout, redrawn every time the node resets its term.
     pub(crate) randomized_election_timeout: u64,
+    /// What this node's elections have done, for a caller that has to explain a stall.
+    pub(crate) counters: Counters,
     pub(crate) election_tick: (u64, u64),
     pub(crate) heartbeat_tick: u64,
     pub(crate) max_inflight_msgs: usize,
@@ -174,6 +176,7 @@ impl<S: LogStorage> Raft<S> {
             election_elapsed: 0,
             heartbeat_elapsed: 0,
             randomized_election_timeout: config.election_tick.0,
+            counters: Counters::default(),
             election_tick: config.election_tick,
             heartbeat_tick: config.heartbeat_tick,
             max_inflight_msgs: config.max_inflight_msgs,
@@ -355,6 +358,7 @@ impl<S: LogStorage> Raft<S> {
             // it: the leader refuses proposals while one is in flight.
             self.abort_transfer();
             if self.check_quorum && !self.check_quorum_active() {
+                self.counters.check_quorum_step_downs += 1;
                 tracing::info!(
                     id = self.id,
                     term = self.term,

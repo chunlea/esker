@@ -213,6 +213,8 @@ pub enum PeerMsg {
     Settled(oneshot::Sender<()>),
     /// How far each peer of this region has got, as its leader sees it. Empty on a follower.
     Progress(oneshot::Sender<Vec<esker_raft::PeerProgress>>),
+    /// What this peer's elections have done. See [`esker_raft::Counters`].
+    Counters(oneshot::Sender<esker_raft::Counters>),
     /// Ask this region's leadership to move to another peer.
     TransferLeader(NodeId),
     /// What became of a snapshot transfer this store was serving to `to`. The core stops sending
@@ -1126,6 +1128,9 @@ impl PeerCore {
             PeerMsg::Progress(notify) => {
                 let _ = notify.send(self.node.progress());
             }
+            PeerMsg::Counters(notify) => {
+                let _ = notify.send(self.node.counters());
+            }
             PeerMsg::TransferLeader(target) => self.node.transfer_leader(target),
             PeerMsg::ReportSnapshot { to, status } => self.node.report_snapshot(to, status),
             PeerMsg::Stop => return false,
@@ -1457,6 +1462,18 @@ impl RaftPeer {
     pub async fn progress(&self) -> std::result::Result<Vec<esker_raft::PeerProgress>, ProtoError> {
         let (notify, answer) = oneshot::channel();
         self.send(PeerMsg::Progress(notify)).await?;
+        answer
+            .await
+            .map_err(|_| ProtoError::internal("the Raft peer stopped"))
+    }
+
+    /// What this peer's elections have done, monotonic over its whole life.
+    ///
+    /// **A counter and not a log**, for the reason [`esker_raft::Counters`] gives: the stalls this
+    /// exists to explain are races that per-event tracing displaces.
+    pub async fn counters(&self) -> std::result::Result<esker_raft::Counters, ProtoError> {
+        let (notify, answer) = oneshot::channel();
+        self.send(PeerMsg::Counters(notify)).await?;
         answer
             .await
             .map_err(|_| ProtoError::internal("the Raft peer stopped"))
