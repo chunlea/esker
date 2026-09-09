@@ -41,23 +41,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "the hash halves are absent because USING hash is refused",
             "UNMEASURED",
         ),
-        // **`position` is a keyword and a real server quotes it.** Pre-existing and declared where
-        // it lives (`catalog::pg_index::quote_identifier`): PostgreSQL quotes every non-unreserved
-        // keyword and this node carries no such list, so `"position"` comes back bare. The
-        // *operator class* is what these two statements are here for and it is byte-identical —
-        // `gin_trgm_ops` after the column, `text_pattern_ops` after the second of two. Closing it
-        // means carrying `pg_get_keywords()`'s categories, which is a unit of its own and would
-        // move every index definition in every corpus.
-        (
-            "SELECT 'r', pg_get_indexdef('trains_position'::regclass)",
-            "a keyword column name is quoted there and bare here — quote_identifier's declared gap",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'r', pg_get_indexdef('trains_np'::regclass)",
-            "a keyword column name is quoted there and bare here — quote_identifier's declared gap",
-            "UNMEASURED",
-        ),
         // **`indclass` is an `oidvector` and this node has no such type**, so the statement that
         // unnests it needs a `LATERAL … WITH ORDINALITY` FROM item this node does not have either.
         // Two gaps in one line, neither of them the operator class's: `pg_get_indexdef` above

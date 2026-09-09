@@ -24,80 +24,36 @@ mod parity;
 /// Nothing: the corpus builds the two tables it needs.
 const CORPUS_FIXTURE: &[&str] = &[];
 
-/// What this node answers differently, and why.
+/// What this node answers differently, and why: **nothing, as of the deparser unit.**
+///
+/// This list held six entries and holds none. Four were about the two shapes below and two about
+/// the type of `information_schema.columns.column_default`, and all six are gone for reasons worth
+/// keeping, because each says something about how a register goes stale:
+///
+/// * **the nested pairs** (`(c1 * 2 + 3)` back as `((c1 * 2) + 3)`, `(c1 > 0 AND c2 > 0)` back as
+///   `((c1 > 0) AND (c2 > 0))`) said they needed "a deparser this node does not have". It had one:
+///   `exec::ddl::deparse` printed exactly this rule and was reachable from one caller, the index
+///   key list. The entries were not wrong about the rule, they were wrong about the code, which
+///   is what [ADR 0075](../../../docs/adr/0075-the-oracle-captures-live-in-the-repository.md)
+///   asks a provenance line to make checkable — `docs/plans/debts-v1.1.md` #17;
+/// * **a literal's coercion inside a call** (`upper('a')` back as `upper('a'::text)`) said a
+///   default "is not stored deparsed, and giving it that treatment is the same unit". It was the
+///   same unit, and this is it: one `pg_attrdef` row, one printer, three statements that store one;
+/// * **`column_default`'s declared type** closed on somebody else's commit. It is
+///   `character_data`, a domain over `character varying`, and the node said `text` until the
+///   catalog's `name` unit landed. Nobody came back to this file, which is what
+///   [ADR 0031](../../../docs/adr/0031-rails-compatibility-is-measured.md) rule 2 is for — "an
+///   entry that starts passing is deleted, and the deletion is a commit" — and is why the
+///   harness reports an agreeing entry rather than trusting a reader to notice.
+///
+/// Two of the six could not have been reported by rule 2 at all before this unit, and that was a
+/// hole in the harness rather than in this file: rule 2 asked `actual == expected` for a listed
+/// entry, where the corpus line declares no types and the comparison the rest of the harness uses
+/// says an undeclared types column pins nothing. Fixed in `parity_harness/mod.rs` in the same
+/// commit — an entry on a types-less line was previously *permanently* invisible to rule 2.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **`column_default` is a domain, not `text`.** `information_schema.columns.column_default`
-    // is `character_data` on a real server — a domain over `character varying` — and this node
-    // declares `text` for it. The rows agree to the character; only the declared type differs, and
-    // it is the same family as `sql_identifier` and `name` (b4's type unit). The two rows below
-    // that also disagree about the *value* carry the same type difference inside their own reason.
     types: &[],
-    answers: &[
-        (
-            "SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_nested'",
-            "**The nested pairs, which need a deparser this node does not have.** PostgreSQL \
-         parenthesises *every* operator node and not only the top one: `(c1 * 2 + 3)` comes back \
-         `((c1 * 2) + 3)` and `(c1 > 0 AND c2 > 0)` comes back `((c1 > 0) AND (c2 > 0))`. This \
-         crate stores text and normalises it where the text is taken, so only the outermost pair \
-         is knowable there; the rest means storing the tree and printing it back, which changes \
-         the index key list too and is its own unit. The top-level pair is the one the suite \
-         reads, and it agrees.",
-            "pg19_generated_parens.txt:55",
-        ),
-        (
-            "SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_and'",
-            "**The nested pairs, which need a deparser this node does not have.** PostgreSQL \
-         parenthesises *every* operator node and not only the top one: `(c1 * 2 + 3)` comes back \
-         `((c1 * 2) + 3)` and `(c1 > 0 AND c2 > 0)` comes back `((c1 > 0) AND (c2 > 0))`. This \
-         crate stores text and normalises it where the text is taken, so only the outermost pair \
-         is knowable there; the rest means storing the tree and printing it back, which changes \
-         the index key list too and is its own unit. The top-level pair is the one the suite \
-         reads, and it agrees.",
-            "pg19_generated_parens.txt:64",
-        ),
-        (
-            "SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp'::regclass AND a.attname = 'd_func'",
-            "**A literal's coercion inside a call.** `upper('a')` comes back `upper('a'::text)`: the \
-         deparser prints the *coerced* argument, and a text function's unknown literal is coerced. \
-         The same rule over a **column** already agrees here — `upper((name)::text)`, which is \
-         what `virtual_column_test` reads — because a generated column's scalar call is stored \
-         deparsed. A default is not, and giving it that treatment is the same unit as the nested \
-         pairs above.",
-            "pg19_generated_parens.txt:68",
-        ),
-        (
-            "SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp'::regclass AND a.attname = 'd_nested'",
-            "**The nested pairs, which need a deparser this node does not have.** PostgreSQL \
-         parenthesises *every* operator node and not only the top one: `(c1 * 2 + 3)` comes back \
-         `((c1 * 2) + 3)` and `(c1 > 0 AND c2 > 0)` comes back `((c1 > 0) AND (c2 > 0))`. This \
-         crate stores text and normalises it where the text is taken, so only the outermost pair \
-         is knowable there; the rest means storing the tree and printing it back, which changes \
-         the index key list too and is its own unit. The top-level pair is the one the suite \
-         reads, and it agrees.",
-            "pg19_generated_parens.txt:70",
-        ),
-        (
-            "SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_func'",
-            "**A literal's coercion inside a call.** `upper('a')` comes back `upper('a'::text)`: the \
-         deparser prints the *coerced* argument, and a text function's unknown literal is coerced. \
-         The same rule over a **column** already agrees here — `upper((name)::text)`, which is \
-         what `virtual_column_test` reads — because a generated column's scalar call is stored \
-         deparsed. A default is not, and giving it that treatment is the same unit as the nested \
-         pairs above.",
-            "pg19_generated_parens.txt:75",
-        ),
-        (
-            "SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_nested'",
-            "**The nested pairs, which need a deparser this node does not have.** PostgreSQL \
-         parenthesises *every* operator node and not only the top one: `(c1 * 2 + 3)` comes back \
-         `((c1 * 2) + 3)` and `(c1 > 0 AND c2 > 0)` comes back `((c1 > 0) AND (c2 > 0))`. This \
-         crate stores text and normalises it where the text is taken, so only the outermost pair \
-         is knowable there; the rest means storing the tree and printing it back, which changes \
-         the index key list too and is its own unit. The top-level pair is the one the suite \
-         reads, and it agrees.",
-            "pg19_generated_parens.txt:77",
-        ),
-    ],
+    answers: &[],
 };
 
 #[test]
@@ -108,4 +64,72 @@ fn every_printed_expression_is_postgresql_19_s() {
         &DIVERGENCES,
     );
     assert!(checked > 35, "the corpus shrank: {checked} statements");
+}
+
+/// What this node answers differently on the shape corpus, and why.
+const SHAPE_DIVERGENCES: parity::Divergences = parity::Divergences {
+    types: &[],
+    answers: &[
+        (
+            "SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'x_lit'",
+            "**One integer literal type, so a literal's cast is gone before the printer runs.**          `GENERATED ALWAYS AS (1::bigint)` prints `(1)::bigint` on a real server and `1` here.          PostgreSQL's rule is `get_const_expr`'s: a numeric `Const` shows its type when that type          is not the one the literal form defaults to, and `1` defaults to `integer`, so an `int8`          `1` needs the cast to re-parse as itself. This node resolves every integer literal to one          type (`docs/plans/debts-v1.1.md` #12, and it is b4's), so `1` and `1::bigint` are the          same resolved literal and there is nothing left to print the cast from. Not a deparser          gap: the sibling row `x_lit_expr` — `(1 + 1)::bigint` — agrees, because there the cast is          over an operator and survives as a `Cast` node. The *default* spelling agrees too          (`d_cast`), from `parse::lower::cast_default_text`, which reads the written text before          anything folds it. **Expected to close on b4's work rather than here**: their branch carries ADR 0086 (a folded cast keeps the type it named) and ADR 0087 (an integer literal is the narrowest type that holds it), which are the two halves of this row. Delete the entry when they land -- the harness will say so.",
+            "pg19_deparse_parens.txt:118",
+        ),
+        (
+            "ALTER TABLE g1dp2 ADD COLUMN f_literal text GENERATED ALWAYS AS (upper('a')) STORED",
+            "**No collation derivation, so a text call over nothing but literals is accepted          where a real server refuses it.** PostgreSQL answers `42P22 could not determine which          collation to use for upper() function`: a generated column's expression must have a          determinable collation, a literal argument carries none, and the column's own is not          consulted. Measured, and it is the reason this corpus tests a literal argument as a          *default* (`g1dp3`) rather than as a generated column. This node has no collation          inference at all — `COLLATE` is recorded per column and never derived through an          expression — so it builds the column and stores `upper('a'::text)`, which is what the          same expression prints as a default here and there. C3, in the direction that accepts          more than the oracle; the value it computes is the value a real server would compute if          it built it.",
+            "pg19_deparse_parens.txt:141",
+        ),
+        (
+            "SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_in'",
+            "**Printed and then refused by the reader, so the written text is kept.** \
+         `pg_get_expr` says `(c1 = ANY (ARRAY[1, 2]))` and `deparse` prints exactly that -- and \
+         the stored string is *evaluated*, by a reader that parses it again for every row, so \
+         `exec::ddl::reads_back` requires the printed form to resolve back to itself before it may \
+         be stored. This one does not: `c1` is an `integer` and `ARRAY[1, 2]` is a `bigint[]` here \
+         (one integer literal type -- `docs/plans/debts-v1.1.md` #12), and `resolve`'s `AnyArray` \
+         arm raises `42883 operator does not exist: integer = bigint` on the way back. So the \
+         guard keeps `(c1 IN (1, 2))`, which is what this node stored before the deparser reached \
+         this shape -- a text that reads back and computes the right value, printed differently. \
+         The sibling `c_in_text` **agrees**, its array being `text[]` against a `text` column, \
+         which is what says this is #12 and not the `IN` rule. Expected to close on b4's ADR 0087 \
+         (an integer literal is the narrowest type that holds it).",
+            "pg19_deparse_parens.txt:124",
+        ),
+        (
+            "SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_notin'",
+            "**`NOT IN` prints as a quantifier this node's expression language does not have.** \
+         PostgreSQL says `(c1 <> ALL (ARRAY[1, 2]))`. There is an `Expr::AnyArray` here and no \
+         `AllArray` -- `= ANY` exists because a query needs it, `<> ALL` has never been written -- \
+         so the printed form cannot be parsed back at all, and `reads_back` keeps the written \
+         `(c1 NOT IN (1, 2))` rather than storing a string the next `INSERT` would raise `XX000` \
+         on. Recorded as `docs/plans/debts-v1.1.md` #21: it is a **language** gap and not a \
+         printer one, and the printer is already right for the day the node has the node.",
+            "pg19_deparse_parens.txt:129",
+        ),
+    ],
+};
+
+/// **The deparser's specification**, one row per shape, taken from the oracle.
+///
+/// The corpus above asks the question a column at a time and was enough to find that the printed
+/// form differs from the written one. It is not enough to say *how*: two of its rows carried the
+/// whole nested-parentheses rule and a reader had to infer the rest. This one is 38 shapes chosen
+/// to separate the rules from each other — precedence from association, a cast's pair from its
+/// operand's, a call's argument from the call, a desugaring from a parenthesisation — and its
+/// header states each rule beside the row that measures it.
+///
+/// Four of them are why this file exists rather than a second `ExprShape` variant:
+/// `BETWEEN`, `IN` and `LIKE` come back as the *operators* they desugar to
+/// (`((a >= x) AND (a <= y))`, `(a = ANY (ARRAY[…]))`, `(a ~~ 'p'::text)`) and `- 1` comes back as
+/// `'-1'::integer`. No rule about parentheses over the written text can produce any of the four;
+/// they need the tree, which is what [`esker_sql`]'s `exec::ddl::deparse` walks.
+#[test]
+fn every_deparsed_shape_is_postgresql_19_s() {
+    let checked = parity::replay(
+        include_str!("corpus/pg19_deparse_parens.txt"),
+        CORPUS_FIXTURE,
+        &SHAPE_DIVERGENCES,
+    );
+    assert!(checked > 70, "the corpus shrank: {checked} statements");
 }

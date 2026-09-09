@@ -17,22 +17,22 @@ mod parity;
 const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
+/// **Nothing, and the two entries that used to be here closed one after the other.**
+///
+/// `ALTER COLUMN … SET NOT NULL` was the first: refused because it has to check every row, then
+/// built, and its entry deleted per [ADR 0031](../../../docs/adr/0031-rails-compatibility-is-measured.md)
+/// rule 2 — `pg19_foreign_key_options.txt` is where that family is measured now. The second was
+/// its *consequence*, a `pg_constraint` read that came back one row short because the constraint
+/// the refusal never restored was missing, and it agreed the moment the first was built. Nobody
+/// deleted it, because rule 2 could not see it: its corpus line declares no types, and rule 2
+/// asked for the whole answer to be equal while this node always answers *some* type. Fixed in
+/// `parity_harness/mod.rs`'s `agrees`, which found this row and eleven others across eight files.
+///
+/// The `types` list emptied the same way, on the catalog's `name` unit; the header comment that
+/// described its three occurrences went with it.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `pg_indexes.indexname` is a `name` on a real server and `text` here, with the same
-    // characters — the standing trade every `pg_catalog` column makes. Three occurrences.
     types: &[],
-    answers: &[
-        // `ALTER COLUMN … SET NOT NULL` was here, refused because it has to check every row.
-        // It now runs the scan and is gone from this list (ADR 0031 rule 2) —
-        // `pg19_foreign_key_options.txt` is where the whole family is measured.
-        (
-            "SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = '\"dcp\"'::regclass \
-             AND contype = 'n' ORDER BY conname",
-            "Reads back what the `SET NOT NULL` above would have restored, so it is one row short \
-             here — a consequence of that refusal and not of anything `DROP CONSTRAINT` did.",
-            "pg19_drop_constraint.txt:88",
-        ),
-    ],
+    answers: &[],
 };
 
 #[test]

@@ -37,14 +37,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "|| over arrays is not built; it refuses rather than answering",
             "pg19_concat.txt:25",
         ),
-        // **`pg_typeof` of the merge**: `jsonb` on both, and it is the one line here whose
-        // *column type* still differs — a `regtype` there and `text` here, the standing catalog
-        // trade. The value agrees.
-        (
-            "SELECT 'r', pg_typeof('{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb)",
-            "pg_typeof answers a regtype on a real server and text here; the value is jsonb on both",
-            "pg19_concat.txt:33",
-        ),
     ],
 };
 

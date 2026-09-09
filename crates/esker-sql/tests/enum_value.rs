@@ -59,21 +59,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "no pg_type rows for the built-in ranges and information_schema's domains",
             "UNMEASURED",
         ),
-        // **A cast *to* a user-defined type is not built**, which is one gap wearing four
-        // statements. `'happy'::mood` needs the catalog at a point where a cast is lowered without
-        // one — the same road `CREATE TABLE t (c mood)` took, and the same answer: the name is
-        // carried and the executor resolves it. Nothing here is approximated in the meantime; each
-        // is `0A000` naming the type, and the two that a real server *refuses* refuse here too, so
-        // the divergence is the code and not the outcome. It is the next unit, with `::regtype`
-        // below, because both are "a user type is a name you can write in an expression".
-        // **`||` over text is unbuilt for every type**, which is where this statement stops — the
-        // cast in front of it is right, and `'happy'::mood::text` on the line above proves it.
-        // `tests/citext.rs` declares the same operator for the same reason.
-        (
-            "SELECT 'r', ('happy'::mood)::text || '!'",
-            "|| over text is not built for any type",
-            "UNMEASURED",
-        ),
         // **A name that is nobody's type is `42704` there and `0A000` here**, and this is the one
         // place the pass cannot do better: after the catalog says no, the name is either a type
         // PostgreSQL has and this node has not built — `money`, `tsvector` — or a name that is no
@@ -104,17 +89,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', v FROM (VALUES ('happy'::mood), ('sad'::mood), ('ok'::mood)) t(v) ORDER \
              BY v",
             "a VALUES list's synthetic TableDef carries no user type, so the ordinal prints",
-            "UNMEASURED",
-        ),
-        // **`'mood'::regtype` resolves against this node's own type names and not the catalog.**
-        // The lowering answers `42704` for a name `crate::value::named_type` does not have, which
-        // is the right answer for a typo and the wrong one for a type somebody declared. It needs
-        // the statement-level pass `::regclass` already has (`Executor::resolve_regclass`), and it
-        // is the reason the line below has no rows to find.
-        (
-            "SELECT 'r', enumlabel, enumsortorder FROM pg_enum WHERE enumtypid = \
-             'mood'::regtype ORDER BY enumsortorder",
-            "'x'::regtype does not resolve a user-defined type's name to its oid",
             "UNMEASURED",
         ),
         // **The standing constant-width divergence, in three sentences that are otherwise

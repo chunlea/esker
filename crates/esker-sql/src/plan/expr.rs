@@ -800,7 +800,18 @@ impl CatalogFuncCall {
             | CatalogFunc::JsonFetch
             | CatalogFunc::JsonbFetch
             | CatalogFunc::JsonFetchText
-            | CatalogFunc::JsonbConcat => true,
+            | CatalogFunc::JsonbConcat
+            // **And `||` over text, which is the same family's fifth member and was the one left
+            // out.** The comment above says "`->`, `->>` and `||` over `json`/`jsonb`" and stopped
+            // there; `text || text` is `textcat`, whose `provolatile` is `i` — measured off
+            // `pg_operator` beside `concat`'s `s`, which is the distinction that makes this a list
+            // and not a rule about names. `CatalogFunc::HstoreConcat` is what `parse::lower` makes
+            // of every `||` that is not a document merge, hstore and text alike.
+            //
+            // What it cost: `GENERATED ALWAYS AS (t || 'x') STORED` was `42P17 functions in index
+            // expression must be marked IMMUTABLE` for a column a real server creates — measured,
+            // and `length(t || 'x')` with it.
+            | CatalogFunc::HstoreConcat => true,
             _ => false,
         }
     }

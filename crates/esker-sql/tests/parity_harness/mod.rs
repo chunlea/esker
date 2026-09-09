@@ -562,7 +562,7 @@ pub(crate) fn replay_reporting(
 
         if let Some(entry) = listed {
             listed_seen.push(entry);
-            if actual == expected {
+            if agrees(&expected, &actual) {
                 listed_agreements.push((entry, line_number, statement.clone()));
             }
             // **Rule 4: an answer divergence whose rows have started agreeing.** A listed entry
@@ -734,6 +734,33 @@ pub(crate) fn replay_reporting(
     Replay {
         checked,
         swallowed: cascaded,
+    }
+}
+
+/// Whether a statement's answer **agrees**, by the same reading the comparison below uses.
+///
+/// **Rule 2's predicate, and it used to be `actual == expected`, which is a stricter reading than
+/// the one applied to an unlisted statement.** The comparison for an unlisted statement has an arm
+/// saying so in as many words — "an undeclared types column pins nothing: the rows are the whole
+/// claim" — and rule 2 did not have it. The consequence is not a false report, it is silence: an
+/// entry whose corpus line declares no types could **never** be reported as agreeing, because this
+/// node always answers *some* type and `[]` is never equal to it. Two entries in
+/// `tests/generated_parens.rs` sat in that state, closed and invisible, and were found by deleting
+/// them by hand and watching the file stay green.
+///
+/// Same shape as rule 4 one screen below: a listed entry is not compared, so whatever decides
+/// "still diverging" is the only thing that can ever say "not any more". Both readings have to be
+/// the same reading, which is what this function is for — there is now one place to change it.
+fn agrees(expected: &Answer, actual: &Answer) -> bool {
+    match (expected, actual) {
+        (
+            Answer::Rows { types, rows },
+            Answer::Rows {
+                types: _,
+                rows: theirs,
+            },
+        ) if types.is_empty() => rows == theirs,
+        _ => expected == actual,
     }
 }
 
