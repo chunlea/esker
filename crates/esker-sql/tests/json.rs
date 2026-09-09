@@ -38,14 +38,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 ///
 /// `Datum` still has no `jsonb` variant, and the `COMPARISON` divergence below is still that fact
 /// — this half of it never needed one.
-const TYPES: &[&str] = &[
-    // **Moved here from `answers` by parity rule 4**: the rows agree and what still differs is the
-    // declared type, which is one of the standing families — see `parity::Divergences::types`.
-    // `typlen`, `typinput` and `typcategory` are a `smallint`, a `regproc` and a `"char"` on a real
-    // server and `text` here; the catalog's own columns are their own units.
-    "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN \
-     ('json','jsonb') ORDER BY oid",
-];
+/// **Empty.** The one entry moved here from `answers` by parity rule 4 and then ran out of
+/// reasons: `typlen` was a `smallint` against a `text`, `typcategory` became a `"char"`
+/// (ADR 0095), `oid` an `oid` (ADR 0097) and `typinput` a `regproc` (ADR 0098). The row never
+/// changed a character; what changed is what the catalog says its own columns are.
+const TYPES: &[&str] = &[];
 
 /// One of `DIVERGENCES`' seven reasons.
 const ORDER: &str = "The same refusal for the same reason: a byte sort is not `jsonb`'s order, which puts \

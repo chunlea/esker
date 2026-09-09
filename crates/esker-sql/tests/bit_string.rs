@@ -13,9 +13,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // Two trades and both are standing. The catalog one — `typname` and `udt_name` are `name`,
-    // the oids `oid`, `typcategory` a `"char"`, `typinput` a `regproc`, `pg_typeof` a `regtype` —
-    // and the **typmod one**: a typmod travels only with a plain column reference here, so
+    // Two trades, and the catalog one is gone: The four catalog type families closed it — `name` (ADR 0084), `"char"`
+    // (ADR 0095), `oid` (ADR 0097) and `regproc` (ADR 0098) — and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). The *values* never changed a character.
+    // Then the **typmod one**: a typmod travels only with a plain column reference here, so
     // `'101'::bit(3)` is declared `bit(1)` where a real server keeps the 3 through the cast. The
     // *values* agree in every one of these, which is what they are here to say: `bit` is 1560
     // with array 1561 and `varbit` 1562/1563, both category `V`, inputs `bit_in`/`varbit_in`; the
@@ -23,7 +24,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `bit varying`; the defaults read back `'00000011'::"bit"` and `'0011'::bit varying`; and a
     // cast pads on the right (`10100000`) and truncates (`1010`, `101`) exactly as measured.
     types: &[
-        "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type WHERE typname IN ('bit','varbit','_bit','_varbit') ORDER BY typname",
         // **The values agree now** — `x'F'` is `1111` and `x'1A'` is `00011010`, four bits a
         // digit — and what is left is the standing one three lines up: a cast's typmod does not
         // reach the declared type, so this says `"bit"` where a real server says `bit(4)`.

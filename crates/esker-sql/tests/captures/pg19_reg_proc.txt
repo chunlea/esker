@@ -1,0 +1,91 @@
+# **`regproc` is an oid that prints as a function's name** — PostgreSQL 19beta1, 2026-09-09.
+# `ON_ERROR_ROLLBACK on`, one `BEGIN … ROLLBACK`, no fixture.
+#
+# ## The census
+#
+#     SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+#      WHERE a.atttypid = 24 AND c.relnamespace = 'pg_catalog'::regnamespace
+#        AND c.relkind IN ('r','v') AND a.attnum > 0 AND NOT a.attisdropped;
+#
+# **40 columns on PG 19beta1**, and this node has exactly **one** of them: `pg_type.typinput`.
+# The other thirty-nine are in catalogs it does not serve —
+#
+#     pg_aggregate   aggfnoid aggtransfn aggfinalfn aggcombinefn aggserialfn aggdeserialfn
+#                    aggmtransfn aggminvtransfn aggmfinalfn
+#     pg_am          amhandler          pg_amproc     amproc        pg_conversion  conproc
+#     pg_operator    oprcode oprrest oprjoin        pg_proc       prosupport
+#     pg_range       rngconstruct2 rngconstruct3 rngmltconstruct0..2 rngcanonical rngsubdiff
+#     pg_transform   trffromsql trftosql
+#     pg_ts_parser   prsstart prstoken prsend prsheadline prslextype
+#     pg_ts_template tmplinit tmpllexize
+#     pg_type        typsubscript typinput typoutput typreceive typsend typmodin
+#
+# — and of `pg_type`'s six only `typinput` is a column this node reports.
+#
+# ## The two catalog rows
+#
+#     oid   typname   typlen  typtype  typcategory  typdelim  typinput   typarray
+#     24    regproc   4       b        N            ,         regprocin  1008
+#     1008  _regproc  -1      b        A            ,         array_in   0
+#
+# `typcategory` is **N**, with the integers — the same call a real server makes for `oid`.
+#
+# ## An oid no function has prints as the number
+#
+#     42::regproc            int4in
+#     24::regproc            24            <- nothing has oid 24 as a *function*
+#     'int4in'::regproc      int4in        'int4in'::regproc::oid   42
+#     ' int4in '::regproc    int4in        <- whitespace trimmed
+#     'pg_catalog.int4in'    int4in        <- schema qualification accepted and dropped
+#     'nosuchfn'::regproc    !42883 function "nosuchfn" does not exist
+#
+# ## A comparison reads the literal as an `oid`, an assignment as a name
+#
+#     WHERE typinput = 'array_in'            !22P02 invalid input syntax for type oid: "array_in"
+#     WHERE typinput = 'array_in'::regproc   636
+#     WHERE typinput::text = 'array_in'      636
+#     WHERE typinput = 750                   636
+#
+# `=` over a `regproc` is `oideq`, whose right operand is an `oid`, so the `unknown` literal goes
+# to `oidin`. `regprocin` — which resolves a name — is what an *assignment* uses. This node's own
+# `tests/array_delimiter.rs` wrote the refused form and passed, because `typinput` was `text` here.
+#
+# ## `min`/`max` decay to `oid`, and a `regtype` does not
+#
+#     pg_typeof(min(typinput))     oid
+#     pg_typeof(array_agg(typinput))  regproc[]
+#     pg_typeof(count(typinput))   bigint
+#     typinput::oid                42        <- pg_cast 24->26 is implicit, method b
+#
+# ## The input functions this node names, with the oid a real server gives each
+#
+# `SELECT proname, oid FROM pg_proc WHERE proname IN (…) AND pronamespace = 'pg_catalog'`:
+#
+#     array_in 750  bit_in 1564  boolin 1242  box_in 123  bpcharin 1044  byteain 1244
+#     cash_in 886  charin 1245  cidr_in 1267  circle_in 1450  date_in 1084  float4in 200
+#     float8in 214  inet_in 910  int2in 38  int2vectorin 40  int4in 42  int8in 460
+#     interval_in 1160  json_in 321  jsonb_in 3806  line_in 1490  lseg_in 119  macaddr_in 436
+#     namein 34  numeric_in 1701  oidin 1798  oidvectorin 54  path_in 121  point_in 117
+#     poly_in 347  range_in 3834  regclassin 2218  regprocin 44  regtypein 2220  textin 46
+#     time_in 1143  timestamp_in 1312  timestamptz_in 1150  tsqueryin 3612  tsvectorin 3610
+#     uuid_in 2952  varbit_in 1579  varcharin 1046  void_in 2298  xml_in 2893
+#
+# **`citextin`, `hstore_in`, `lquery_in` and `ltree_in` are not here**: an extension's functions
+# are allocated an oid at `CREATE EXTENSION`, so they differ between two databases that both have
+# the extension. There is no fixed number to record and this node carries its own.
+
+SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput, typarray FROM pg_type WHERE typname IN ('regproc','_regproc') ORDER BY oid	oid,name,smallint,"char","char","char",regproc,oid	24|regproc|4|b|N|,|regprocin|1008 ; 1008|_regproc|-1|b|A|,|array_in|0
+SELECT format_type(24,-1), format_type(1008,-1)	text,text	regproc|regproc[]
+SELECT pg_typeof(typinput) FROM pg_type LIMIT 1	regtype	regproc
+SELECT typinput, typinput::oid FROM pg_type WHERE typname = 'int4'	regproc,oid	int4in|42
+SELECT 42::regproc, 24::regproc	regproc,regproc	int4in|24
+SELECT 'int4in'::regproc, ' int4in '::regproc, 'pg_catalog.int4in'::regproc	regproc,regproc,regproc	int4in|int4in|int4in
+SELECT pg_typeof(min(typinput)), pg_typeof(max(typinput)) FROM pg_type	regtype,regtype	oid|oid
+SELECT pg_typeof(array_agg(typinput)) FROM (SELECT typinput FROM pg_type LIMIT 2) s	regtype	regproc[]
+SELECT pg_typeof(count(typinput)) FROM pg_type	regtype	bigint
+SELECT count(*) FROM pg_type WHERE typinput = 'array_in'::regproc	bigint	636
+SELECT count(*) FROM pg_type WHERE typinput::text = 'array_in'	bigint	636
+SELECT count(*) FROM pg_type WHERE typinput = 750	bigint	636
+SELECT castsource, casttarget, castcontext, castmethod FROM pg_cast WHERE castsource = 24 OR casttarget = 24 ORDER BY 1,2	oid,oid,"char","char"	24|26|i|b ; 26|24|i|b
+SELECT count(*) FROM pg_type WHERE typinput = 'array_in'	!22P02 invalid input syntax for type oid: "array_in"
+SELECT 'nosuchfn'::regproc	!42883 function "nosuchfn" does not exist

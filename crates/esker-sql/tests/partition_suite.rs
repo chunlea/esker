@@ -14,27 +14,16 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog trade and nothing new: `relname` and `conname` are a `name` on a real
-    // server, `relkind` and `contype` are `"char"`, and `indkey` is an `int2vector`. This node has
-    // none of the four types, so each is `text` with the same characters in it. **Every row
+    // **Empty.** `relname` and `conname` are a `name` here (ADR 0084), `relkind` and `contype`
+    // are `"char"` (ADR 0095), and the last member — `indkey`, an `int2vector` — left with the
+    // entries that read it. **Every row
     // agrees** — including the `ON ONLY`, the `int2vector`\u{2019}s `2 1`, and the partition\u{2019}s own
     // `pk_part_1_pkey`.
-    types: &[
-        "SELECT 'r', relkind, relhassubclass FROM pg_class WHERE relname = 'partitioned_events'",
-        "SELECT 'r', relkind, relhassubclass FROM pg_class WHERE relname = 'pk_part'",
-        "SELECT 'r', conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = \
-         'pk_part'::regclass",
-        "SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = 'pk_part_1'::regclass",
-    ],
-    answers: &[(
-        "SELECT \'r\', pg_typeof(relhassubclass), pg_typeof(relkind) FROM pg_class WHERE relname = \'measurements\'",
-        "The standing catalog-type trade, and this is the one query that makes it a *row* \
-             rather than a declared type: `pg_typeof` returns the type as a value, so `relkind` \
-             being `\"char\"` there and `text` here shows up in the answer. `relhassubclass` agrees. \
-             Every value in the column is identical; only the name of the type it is stored under \
-             differs, which is the trade every `pg_catalog` column in this crate makes",
-        "pg19_partition_suite.txt:147",
-    )],
+    types: &[],
+    // **Empty.** The one entry read `pg_typeof(relkind)` and recorded `"char"` against `text`;
+    // `relkind` is a `"char"` here now (ADR 0095) and `pg_typeof` answers from the declared type
+    // (ADR 0093), so the row agrees on both counts.
+    answers: &[],
 };
 
 #[test]

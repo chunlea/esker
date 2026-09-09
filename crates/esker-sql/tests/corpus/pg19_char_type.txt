@@ -1,0 +1,34 @@
+SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput, typarray FROM pg_type WHERE oid IN (18, 1002) ORDER BY oid	oid,name,smallint,"char","char","char",regproc,oid	18|char|1|b|Z|,|charin|1002 ; 1002|_char|-1|b|A|,|array_in|0
+SELECT pg_typeof('r'::"char"), pg_typeof('r'::text)	regtype,regtype	"char"|text
+SELECT 'r'::"char", length('r'::"char"), octet_length('r'::"char")	"char",integer,integer	r|1|1
+SELECT 'abc'::"char", length('abc'::"char")	"char",integer	a|1
+SELECT ''::"char", length(''::"char"), ''::"char" IS NULL	"char",integer,boolean	|0|f
+SELECT 'r'::"char" = 'r', 'r'::"char" = 'r'::text	boolean,boolean	t|t
+SELECT 'r'::"char" < 's'::"char", 'A'::"char" < 'a'::"char"	boolean,boolean	t|t
+SELECT 'r'::"char"::text, 'r'::"char"::int4, 65::int4::"char"	text,integer,"char"	r|114|A
+SELECT pg_typeof(relkind), pg_typeof(relname) FROM pg_class LIMIT 1	regtype,regtype	"char"|name
+SELECT pg_typeof(contype) FROM pg_constraint LIMIT 1	regtype	"char"
+SELECT pg_typeof(typcategory), pg_typeof(typdelim) FROM pg_type LIMIT 1	regtype,regtype	"char"|"char"
+SELECT relkind FROM pg_class WHERE relname = 'pg_class'	"char"	r
+SELECT count(*) FROM pg_class WHERE relkind = 'r'	bigint	383
+SELECT count(*) FROM pg_class WHERE relkind = 'r'::"char"	bigint	383
+SELECT pg_typeof(min(relkind)) FROM pg_class	regtype	text
+SELECT pg_typeof(array_agg(relkind)) FROM (SELECT relkind FROM pg_class LIMIT 2) s	regtype	"char"[]
+SELECT array_agg(c) FROM (VALUES ('r'::"char"),('v'::"char")) s(c)	"char"[]	{r,v}
+SELECT '{r,v}'::"char"[]	"char"[]	{r,v}
+SELECT pg_typeof('{r,v}'::"char"[])	regtype	"char"[]
+SELECT typcategory, typdelim FROM pg_type WHERE typname = 'text'	"char","char"	S|,
+SELECT 'r'::"char" || 'x'	!42725 operator is not unique: "char" || unknown
+SELECT pg_typeof('r'::"char" || 'x')	!42725 operator is not unique: "char" || unknown
+SELECT relkind::text FROM pg_class WHERE relname = 'pg_class'	text	r
+SELECT c.relkind, c.relkind = 'r' AS is_table FROM pg_class c WHERE c.relname = 'pg_class'	"char",boolean	r|t
+SELECT format_type(18, -1), format_type(1002, -1)	text,text	"char"|"char"[]
+SELECT max(relkind)::text FROM pg_class	text	v
+SELECT 'é'::"char", octet_length('é'::"char")	"char",integer	\303|4
+SELECT 'r'::"char"::varchar, 'r'::"char"::bpchar	character varying,bpchar	r|r
+SELECT 'r' = 'r'::"char", 'r'::text < 's'::"char"	boolean,boolean	t|t
+SELECT relkind, count(*) FROM pg_class GROUP BY relkind ORDER BY relkind	"char",bigint	I|1 ; S|237 ; i|774 ; p|1 ; r|383 ; t|221 ; v|162
+SELECT 'r'::"char" IN ('r','v')	boolean	t
+SELECT coalesce('r'::"char", 'x'::"char"), pg_typeof(coalesce('r'::"char", 'x'::"char"))	"char",regtype	r|"char"
+SELECT pg_typeof(CASE WHEN true THEN 'r'::"char" ELSE 'x'::text END)	!42804 CASE types text and "char" cannot be matched
+SELECT castsource, casttarget, castcontext FROM pg_cast WHERE castsource = 18 OR casttarget = 18 ORDER BY 1,2	oid,oid,"char"	18|23|e ; 18|25|i ; 18|1042|a ; 18|1043|a ; 23|18|e ; 25|18|a ; 1042|18|a ; 1043|18|a

@@ -3138,6 +3138,20 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                     let func = arrow_fetch(call.func, &args, scope);
                     Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall { func, args }))
                 }
+                // **A `"char"` operand makes `||` ambiguous rather than missing.** A real server
+                // has a candidate at every string width and category `Z` picks none of them, so it
+                // is `42725` and not the `42883` a wrong type gets — measured. Decided here
+                // because the evaluator sees a `Datum::Text` for a `"char"` and cannot tell.
+                (CatalogFunc::HstoreConcat, Some(_))
+                    if args
+                        .iter()
+                        .any(|arg| expr_type(arg, scope) == Ok(ColumnType::Char)) =>
+                {
+                    return Err(SqlError::AmbiguousConcat {
+                        left: concat_operand_name(args.first(), scope),
+                        right: concat_operand_name(args.get(1), scope),
+                    });
+                }
                 _ => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
                     func: call.func,
                     args,
@@ -3288,7 +3302,15 @@ fn resolve_case(
             // first — and then refused to assign `1.10` to it. `carried_type` had always answered
             // `numeric` for the same expression, so the declared type and the value path were
             // two different rules; folded through `unify` they are one.
-            Some(chosen) if same_family(chosen, ty) => {
+            //
+            // **And `unify` is the question, not `same_family`.** The two ask different things and
+            // `"char"` is what separates them: `'r'::"char" = 'r'::text` is `t` — so an operator
+            // exists and the family test says yes — while
+            // `CASE WHEN true THEN 'r'::"char" ELSE 'x'::text END` is
+            // `42804 CASE types text and "char" cannot be matched`, because their `typcategory`
+            // letters differ and PostgreSQL's `select_common_type` has nothing to pick. Measured,
+            // both halves.
+            Some(chosen) if same_family(chosen, ty) && unify(chosen, ty).is_ok() => {
                 common = Some(unify(chosen, ty).unwrap_or(chosen));
             }
             Some(chosen) => {
@@ -3443,6 +3465,7 @@ fn holds_many(ty: ColumnType) -> bool {
                 | ColumnType::Varchar
                 | ColumnType::Bpchar
                 | ColumnType::Name
+                | ColumnType::Char
         )
 }
 
@@ -3533,11 +3556,12 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // A `regclass` is in the numbers' family with them, and it is what makes
             // `WHERE attrelid = 'iv'::regclass` compare at all: measured,
             // `'pg_class'::regclass = 1259` is true against an uncast integer.
-            ColumnType::RegType | ColumnType::RegClass => family(ColumnType::Oid),
+            ColumnType::RegType | ColumnType::RegProc | ColumnType::RegClass => family(ColumnType::Oid),
             // **Text's family, because text is what they are here.** They compare as the
             // strings they print as, which is what `attnum = ANY(indkey)` already relies on.
             ColumnType::Int2Vector | ColumnType::OidVector => family(ColumnType::Text),
             ColumnType::RegTypeArray => 200,
+            ColumnType::RegProcArray => 201,
             // **A family of one each.** `'{1}'::int[] = '{1}'::int8[]` is `42883` on a real
             // server — an array's comparison is its element type's, and two element types are two
             // operators — so no two of these share a family and none shares one with a scalar.
@@ -3561,7 +3585,7 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // An `oid` is a number and compares with the integers: `26::oid = 26` is `t`.
             | ColumnType::Oid
             | ColumnType::Numeric => 0,
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Bpchar => 1,
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Char | ColumnType::Bpchar => 1,
             ColumnType::Bool => 2,
             ColumnType::Bytea => 3,
             // A `date` is in the datetime family, not one of its own: `'2020-01-01'::date =
@@ -3598,6 +3622,9 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // even though `'x'::text = ANY('{x,y}'::name[])` is `t`. An array's comparison is its
             // element type's and two element types are two operators.
             ColumnType::NameArray => 86,
+            // **`"char"[]`'s own family**, like every array's; the scalar is in text's family
+            // below, because `'r'::"char" = 'r'::text` is `t`.
+            ColumnType::CharArray => 93,
             ColumnType::DateArray => 37,
             ColumnType::TimeArray => 38,
             ColumnType::TimestampArray => 39,
@@ -4320,6 +4347,22 @@ fn retype(
         && !(low..=high).contains(&value)
     {
         return Ok(literal.clone());
+    }
+    // **A comparison against a `regproc` reads the literal as an `oid`, not as a function name.**
+    // Measured: `typinput = 'array_in'` is `22P02 invalid input syntax for type oid: "array_in"`
+    // on a real server, while `typinput = 'array_in'::regproc` answers and so does
+    // `typinput::text = 'array_in'`. The reason is the operator: `=` over a `regproc` is `oideq`,
+    // whose right operand is an `oid`, so the `unknown` literal is handed to `oidin`. An
+    // *assignment* is the other way — `regprocin` resolves a name — which is why this arm is here
+    // and not in `Literal::assign` (ADR 0098).
+    if matches!(ty, ColumnType::RegProc)
+        && let Literal::String(text) = literal
+    {
+        let oid = crate::value::oid::from_text(text)?;
+        return Ok(Literal::Typed(Box::new(Datum::RegProc {
+            oid,
+            name: crate::value::reg_proc::to_text(oid).into_boxed_str(),
+        })));
     }
     match literal.assign(ty, "?column?") {
         // Reduced to a value of the column's own type, so the comparison is between two of them.
@@ -5165,6 +5208,21 @@ fn range_bound_type(
             | ColumnType::VarcharRange
     )
     .then(|| crate::value::range_subtype(ty)))
+}
+
+/// How PostgreSQL names one `||` operand in its `42725`.
+///
+/// **An unadorned literal is `unknown` there**, which this crate has no type for — it resolves one
+/// to `text` before anything asks — so the name comes from the *expression* rather than from its
+/// resolved type. That is the one place in this message where the two differ, and it is why
+/// `'r'::"char" || 'x'` reads `"char" || unknown` on both.
+fn concat_operand_name(expr: Option<&Expr>, scope: &Scope<'_>) -> String {
+    match expr {
+        None | Some(Expr::Literal(Literal::String(_) | Literal::Null)) => "unknown".to_owned(),
+        Some(expr) => {
+            expr_type(expr, scope).map_or_else(|_| "unknown".to_owned(), |ty| ty.name().to_owned())
+        }
+    }
 }
 
 /// The `regtype` `pg_typeof` answers for one argument.

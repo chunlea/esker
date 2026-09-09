@@ -12,12 +12,14 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[
-        // `conname` is `name` and `contype` is `"char"`; this node has neither and answers `text`,
-        // whose values are identical. The same trade every `pg_catalog` column makes.
-        "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = \
-         'ck'::regclass AND contype = 'c' ORDER BY conname",
-    ],
+    // **Empty, and it took two lanes to empty it.** The one entry read `conname`, `contype` and
+    // `pg_get_constraintdef(oid)`. Its two declared types agreed once `name` (ADR 0084) and
+    // `"char"` (ADR 0095) were built, and it stayed listed all the same, because the *rows* still
+    // differed — the harness reads a `types` entry only when they agree, and this statement was
+    // also an `answers` divergence about the deparsed predicate. `exec::ddl::normalise_checks`
+    // closed that half, and the two halves were on different branches: each side was green alone
+    // and the entry only became stale on the merged tree.
+    types: &[],
     // **Nothing.** The entry that stood here said the predicate was printed as written where
     // PostgreSQL prints its deparsed tree — `CHECK ((q <> 'no'))` against
     // `CHECK ((q <> 'no'::text))` — with the reasoning that closing it meant deparsing a lowered

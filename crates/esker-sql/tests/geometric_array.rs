@@ -25,17 +25,10 @@ mod parity;
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `pg_typeof` answers a `regtype` on a real server and `text` here (ADR 0077); every row
-    // agrees. The catalog row's own columns are the `oid`/`"char"`/`regproc` families, each its
-    // own unit.
-    types: &[
-        "SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, t.typcategory, t.typlen FROM \
-         pg_type t WHERE t.typname IN \
-         ('circle','_circle','path','_path','polygon','_polygon','lseg','_lseg','line','_line','point','_point','box','_box') \
-         ORDER BY t.oid",
-        "SELECT typarray FROM pg_type WHERE typname IN \
-         ('circle','path','polygon','lseg','line') ORDER BY typname",
-    ],
+    // **Empty.** The four catalog type families closed it — `name` (ADR 0084), `"char"`
+    // (ADR 0095), `oid` (ADR 0097) and `regproc` (ADR 0098) — and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). The *values* never changed a character.
+    types: &[],
     answers: &[],
 };
 

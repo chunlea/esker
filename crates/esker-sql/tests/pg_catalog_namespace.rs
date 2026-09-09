@@ -21,18 +21,12 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **`name` and `"char"` there, `text` here** — PostgreSQL's identifier and single-byte types,
-    // which compare identically and are the standing choice every catalog view in this crate
-    // makes. Every row below has the right *rows*.
+    // **The declared types this entry named all agree now** — `name` (ADR 0084) and `"char"`
+    // (ADR 0095) — and it stays because the same statement is an `answers` divergence too: the
+    // harness reads a `types` entry only once the *rows* agree, so this one is not read at all
+    // and will be deleted with the answer it shadows.
+    // Every row below has the right *rows*.
     types: &[
-        "SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid \
-         = c.relnamespace WHERE c.relname IN \
-         ('pg_type','pg_range','pg_class','pg_namespace','pg_attribute','pg_attrdef','pg_index','pg_constraint','pg_collation','pg_extension','pg_available_extensions','pg_inherits','pg_am','pg_proc','pg_trigger','pg_language','pg_partitioned_table','pg_indexes','pg_views','pg_stat_activity','pg_database','pg_depend','pg_sequence','pg_enum') \
-         ORDER BY c.relname",
-        "SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid \
-         = c.relnamespace WHERE c.relname IN \
-         ('tables','columns','table_constraints','key_column_usage','referential_constraints') \
-         AND n.nspname = 'information_schema' ORDER BY c.relname",
         "SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE \
          a.attrelid = 'pg_namespace'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY \
          a.attnum",

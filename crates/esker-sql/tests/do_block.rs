@@ -21,12 +21,9 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `typname` is a `name` on a real server and `text` here, `typtype`/`typcategory` are
-    // `"char"` — the standing `pg_catalog` trade, with the characters identical.
-    types: &[
-        "SELECT typname, typtype, typcategory FROM pg_type WHERE typname = 'mood';",
-        "SELECT typname, typtype FROM pg_type WHERE typname = 'unused';",
-    ],
+    // **Nothing left to declare**: `typname` is a `name` here and `typtype`/`typcategory` are
+    // `"char"` (ADR 0095), so both rows agree in their declared types as well as their characters.
+    types: &[],
     // **A wrong answer, and named as one** (ADR 0031 rule 3) — and it is not this unit's.
     // `'mood'::regtype` answers `42704 type "mood" does not exist` for a type that **is** there:
     // reproduced with a bare `CREATE TYPE` and no `DO` block at all, so the block creates the type

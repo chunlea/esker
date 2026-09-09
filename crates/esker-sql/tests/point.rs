@@ -18,15 +18,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // and `data_type`, `column_default` and `udt_name` took `character varying`, which is what
     // `character_data` is on the wire — so the row agrees whole and the entry is deleted (ADR 0031
     // rule 2). What stays below is `pg_typeof`, which is a `regtype` there and `text` here.
-    types: &[
-        // `pg_typeof` answers a `regtype` there and `text` here — the trade `'x'::regtype`
-        // already makes — and the values are `point` and `point[]`, which is what these two ask.
-        // And the catalog row: `typname` is a `name`, the two oids are `oid`, `typcategory` is a
-        // `\"char\"` and `typinput` a `regproc`. Every character and every number agrees —
-        // `point` is 600 with `typarray` 1017, `typlen` **16**, category **G**, input `point_in`.
-        "SELECT 'r', t.typname, t.oid, t.typarray, t.typlen, t.typcategory, t.typinput FROM \
-         pg_type t WHERE t.typname IN ('point','_point') ORDER BY t.typname",
-    ],
+    // **Empty.** `pg_typeof` answers a `regtype` on both sides now (ADR 0093), and the catalog
+    // row ran out of differences with it: `typname` is a `name` (ADR 0084), the two oids are `oid`
+    // (ADR 0097), `typcategory` a `"char"` (ADR 0095) and `typinput` a `regproc` (ADR 0098). Every
+    // character and every number always agreed — `point` is 600 with `typarray` 1017, `typlen`
+    // **16**, category **G**, input `point_in`.
+    types: &[],
     answers: &[
         // **A geometric subscript is not an array subscript**, and this node has only the latter:
         // `p[0]` and `p[1]` are the two coordinates and are **zero-based**, where every array here

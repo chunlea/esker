@@ -39,33 +39,18 @@ const CORPUS_FIXTURE: &[&str] = &[
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `pg_typeof` answers a `regtype` on a real server and `text` here (ADR 0077); the row itself
-    // agrees. These six ask it about a shape whose *value* carries the type — an aggregate over a
-    // real `name` column, an array literal, the session's search path — so the answer this node
-    // reads off the datum is the right one.
+    // **Empty.** The four catalog type families closed it — `name` (ADR 0084), `"char"`
+    // (ADR 0095), `oid` (ADR 0097) and `regproc` (ADR 0098) — and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). The *values* never changed a character.
     types: &[
         // `oid` and `oid[]` on a real server where this node says `bigint` and `bigint[]` — the
         // catalog-oid family, its own unit. `typname` agrees on both since ADR 0084.
-        "SELECT typname AS name, oid, array_agg(oid) FROM pg_type WHERE typname = 'name' GROUP \
-         BY typname, oid",
+        // **Every row of this one agrees now**, which is why it is here rather than in `answers`:
+        // the value that differed was `name`'s `typelem`, 0 here against 18 on a real server,
+        // and it is 18 since `"char"` became a row (ADR 0095). What is left is `oid` answered as
+        // a `bigint` and `typinput` as `text` — the two families still on the type-surface queue.
     ],
     answers: &[
-        // **The catalog's own columns, and the row that is not this unit's.** `pg_type.oid` is an
-        // `oid` where this node says `bigint`, `typtype`/`typcategory`/`typdelim` are `"char"` and
-        // `typinput` a `regproc` where this node says `text` — three families the type-surface
-        // queue holds as their own units. The value that differs is **`name`'s `typelem`, 18**:
-        // `"char"` is the element a real server says a `name` is made of, and this node has no
-        // `"char"` type for that pointer to name, so it is a zero. `_name`'s own row agrees
-        // exactly, which is what this unit built.
-        (
-            "SELECT oid, typname, typlen, typtype, typcategory, typdelim, typelem, typarray, \
-             typinput FROM pg_type WHERE oid IN (19, 1003) ORDER BY oid",
-            "`name`'s `typelem` is `\"char\"` (18) on a real server and 0 here, because this node \
-             has no `\"char\"` type for the pointer to name — the same call `box`'s `typelem` \
-             already makes. The declared types of four of the nine columns are the `oid`, \
-             `\"char\"` and `regproc` families, each its own unit. `_name`'s row agrees.",
-            "pg19_name_array.txt:84",
-        ),
         // ----- `pg_typeof` over a value whose type lives in the *expression* --------------------
         //
         // **These are all one fact and it is not about `name`.** `pg_typeof` reads the datum, and
@@ -247,12 +232,12 @@ fn pg_type_has_the_array_row() {
              typinput FROM pg_type WHERE oid IN (19, 1003) ORDER BY oid"
         ),
         vec![
-            // **`typelem` is 0 here and 18 on a real server**, which says a `name` is made of
-            // `"char"`s — a type this node does not have, so the pointer is a zero rather than a
-            // link to a `pg_type` row that is not there. The same call `box`'s `typelem` makes,
-            // and it is why `tests/array_delimiter.rs` tells an array from a base type by
-            // `typinput` rather than by `typelem`. Declared in `DIVERGENCES`.
-            vec!["19", "name", "64", "b", "S", ",", "0", "1003", "namein"],
+            // **`typelem` is 18**, which says a `name` is 64 `"char"`s — and it says so because
+            // that row is there (ADR 0095). It was a zero for exactly as long as the type was
+            // missing, a pointer to nothing being worse than no pointer, which is the same call
+            // `box`'s `typelem` makes and why `tests/array_delimiter.rs` tells an array from a
+            // base type by `typinput` rather than by `typelem`.
+            vec!["19", "name", "64", "b", "S", ",", "18", "1003", "namein"],
             vec!["1003", "_name", "-1", "b", "A", ",", "19", "0", "array_in"],
         ]
     );

@@ -29,12 +29,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          pg_class c ON c.oid = s.seqrelid WHERE c.relname = 'foo_bar_baz_id_seq'",
         "SELECT 'r', seqtypid::regtype, seqstart, seqmax FROM pg_sequence s JOIN pg_class c ON \
          c.oid = s.seqrelid WHERE c.relname LIKE 'foo_bar_baz_id_seq%' ORDER BY c.relname",
-        // `pg_class.relname` is a `name` on a real server and `relkind` a `"char"`; both are
-        // `text` here, and both compare identically. **Every value agrees** — and the values are
+        // `pg_class.relname` is a `name` here (ADR 0084) and `relkind` a `"char"` (ADR 0095);
+        // what these two still declare is `seqtypid::regtype`, a `regtype` on a real server and
+        // `text` here — its own unit. **Every value agrees** — and the values are
         // the whole point of these three, which are the names the collision and the truncation
         // produced.
-        "SELECT 'r', c.relname, c.relkind FROM pg_class c WHERE c.relname LIKE \
-         'postgresql_serials%' ORDER BY c.relname",
     ],
     answers: &[
         (

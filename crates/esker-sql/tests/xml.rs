@@ -21,8 +21,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // identically. **Every value agrees** — `xml` is oid 142 with `typarray` 143, `typlen` -1,
     // `typcategory` `U` and `typinput` `xml_in`, and the column reports `xml` in all three views.
     types: &[
-        "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput, typtype, typdelim \
-         FROM pg_type WHERE typname IN ('xml','_xml') ORDER BY typname",
         // **A cast's declared type, and one reason for all nine**: an `xml` value is a
         // `Datum::Text`, as a `json` value is, so `RowDescription` carries `text`'s oid where a
         // real server carries 142. The **rows are right** in every one of them, and a *column* of

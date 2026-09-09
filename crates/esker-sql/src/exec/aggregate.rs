@@ -264,7 +264,7 @@ impl Aggregation {
                 // unit that runs *away* from the type: every other derivation keeps `name` and
                 // this one drops it, because a real server has no `min(name)` and coerces the
                 // argument (`tests/captures/pg19_name_array.txt`).
-                ColumnType::Varchar | ColumnType::Name => Ok(ColumnType::Text),
+                ColumnType::Varchar | ColumnType::Name | ColumnType::Char => Ok(ColumnType::Text),
                 // **A `cidr` decays to `inet`, which is the same rule one category along.**
                 // `inet` is the preferred type of the network category the way `text` is of the
                 // string one, and a real server has no `min(cidr)` to keep the type with —
@@ -272,6 +272,12 @@ impl Aggregation {
                 // mask included: a `cidr` through `inet`'s output function is the same characters,
                 // which is what makes this a declared type rather than an answer.
                 ColumnType::Cidr => Ok(ColumnType::Inet),
+                // **And a `regproc` decays to an `oid`**, which is the fifth member of this arm
+                // and the first whose landing type is not `text`: measured,
+                // `pg_typeof(min(typinput))` is `oid` on a real server. A `regtype` beside it does
+                // **not** decay — it keeps its own type — so the two reg* types answer differently
+                // and neither is guessable from the other (ADR 0098).
+                ColumnType::RegProc => Ok(ColumnType::Oid),
                 _ => Ok(arg),
             },
             // **Every integer width averages to `numeric`**, and so does a `numeric`. The

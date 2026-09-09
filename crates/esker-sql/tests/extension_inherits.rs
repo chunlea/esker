@@ -11,8 +11,10 @@ const CORPUS_FIXTURE: &[&str] = &["CREATE TABLE ak (id int8 PRIMARY KEY)"];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing `pg_catalog` trade: an `oid` is a `bigint` here for the reason `pg_class.oid`
-    // is one, and a `name` is `text`. The rows agree — all three are empty.
+    // **A relation's oid is a `bigint` here** (ADR 0097): `inhrelid` and `inhparent` name
+    // relations, and a catalog view's own id comes from `VIEW_ID_BASE` near `i64::MAX` while a
+    // primary key's index oid comes from `PRIMARY_KEY_OID_BASE` — neither fits four bytes. Every
+    // other oid in the catalog is declared one. The rows agree: all three are empty.
     types: &["SELECT inhrelid, inhparent FROM pg_inherits"],
     // **Two, and `plpgsql` is no longer one of them.** This file used to declare `pg_extension`
     // empty — a row would have claimed `CREATE FUNCTION … LANGUAGE plpgsql` works — and the

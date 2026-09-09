@@ -26,8 +26,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          am ON am.oid = o.opcmethod JOIN pg_type t ON t.oid = o.opcintype WHERE o.opcname IN \
          ('gin_trgm_ops','gist_trgm_ops','text_pattern_ops','varchar_pattern_ops') ORDER BY \
          o.opcname, am.amname",
-        "SELECT 'r', amname, amtype FROM pg_am WHERE amname IN ('btree','gin','gist') ORDER BY \
-         amname",
     ],
     answers: &[
         // **Four rows here and six there**, and the two that are missing are the `hash` halves of

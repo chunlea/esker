@@ -20,19 +20,20 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **`name` and `"char"` there, `text` here** — PostgreSQL's identifier and single-byte
-    // types, which compare identically and are the standing choice every catalog view in this
-    // crate makes (`tests/coalesce.rs` declares the same fact about the same columns).
+    // **The declared types this entry named all agree now** — `name` (ADR 0084) and `"char"`
+    // (ADR 0095) — and it stays because the same statement is an `answers` divergence too: the
+    // harness reads a `types` entry only once the *rows* agree, so this one is not read at all
+    // and will be deleted with the answer it shadows.
+    // (`tests/coalesce.rs` declares the same fact about the same columns.)
     types: &[
         // `is_updatable` and `is_insertable_into` are `character varying(3)` in the standard and
         // `text` here — the standing `information_schema` trade, with `YES`/`NO` identical.
-        r"SELECT 'r', relname, relkind FROM pg_class WHERE relname = 'ebooks'''",
         r"SELECT 'r', viewname, definition FROM pg_views WHERE viewname = 'ebooks'''",
         // **The same three facts about three more statements**, comparable only since the write
         // through a view stopped aborting the block: `character varying(3)` for the
-        // `information_schema` flags, and `name` / `"char"` for the `pg_catalog` ones. The values
-        // agree in every case; it is the declared type that differs.
-        "SELECT 'r', relname, relkind FROM pg_class WHERE relname = 'ebooks_mat'",
+        // `information_schema` flags, and the oids for the `pg_catalog` ones — `name`
+        // (ADR 0084) and `"char"` (ADR 0095) were named here and are types now. The values agree
+        // in every case; it is the declared type that differs.
     ],
     answers: &[
         (

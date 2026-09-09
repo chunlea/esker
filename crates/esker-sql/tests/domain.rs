@@ -19,11 +19,11 @@ mod parity;
 const CORPUS_FIXTURE: &[&str] = &[];
 
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `name` and `"char"` there, `text` here — PostgreSQL's identifier and single-byte types,
-    // which compare identically and are the standing choice every catalog view in this crate
-    // makes.
+    // **The declared types this entry named all agree now** — `name` (ADR 0084) and `"char"`
+    // (ADR 0095) — and it stays because the same statement is an `answers` divergence too: the
+    // harness reads a `types` entry only once the *rows* agree, so this one is not read at all
+    // and will be deleted with the answer it shadows.
     types: &[
-        "SELECT 'r', typname, typtype, typbasetype::regtype::text, typnotnull, typdefault FROM pg_type WHERE typname = 'dm_money'",
         "SELECT 'r', n.nspname, t.typname, t.typtype FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE t.typname = 'text' ORDER BY n.nspname",
         "SELECT 'r', format_type(a.atttypid, a.atttypmod), t.typtype FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid WHERE a.attrelid = 'dm_shadow'::regclass AND a.attname = 'c'",
     ],

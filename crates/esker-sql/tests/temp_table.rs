@@ -21,18 +21,11 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **`name` and `"char"` there, `text` here** — PostgreSQL's identifier and single-byte types,
-    // which compare identically and are the standing choice every catalog view in this crate
-    // makes. Every row below has the right rows, `relpersistence` `t` included.
-    types: &[
-        "SELECT 'r', relpersistence FROM pg_class WHERE relname = 'tt_things' AND relpersistence = 'p'",
-        "SELECT 'r', relpersistence FROM pg_class WHERE relname = 'tt_temp'",
-        "SELECT 'r', relkind FROM pg_class WHERE relname = 'tt_temp'",
-        "SELECT 'r', (n.nspname LIKE 'pg_temp%') AS in_a_temp_schema, c.relname, c.relpersistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'tt_things' ORDER BY in_a_temp_schema",
-        "SELECT 'r', (n.nspname LIKE 'pg_temp%') AS sequence_is_temp_too, c.relkind, c.relpersistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'tt_temp_id_seq'",
-        "SELECT 'r', (n.nspname LIKE 'pg_temp%') AS index_is_temp_too, c.relpersistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'tt_temp_note_idx'",
-        "SELECT 'r', relpersistence FROM pg_class WHERE relname = 'tt_short'",
-    ],
+    // **Empty.** PostgreSQL's identifier type is a `name` here (ADR 0084) and its single-byte
+    // type a `"char"` (ADR 0095), which is what these seven entries declared — six of them read
+    // `relpersistence`. Every row below has the right rows, `relpersistence` `t` included, and
+    // now the right declared types with them.
+    types: &[],
     answers: &[(
         "CREATE TEMPORARY UNLOGGED TABLE tt_both (id int)",
         "**Both refuse it and both say `42601`** — the two words cannot be combined on a real \
