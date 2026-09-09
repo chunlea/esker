@@ -130,6 +130,60 @@ fn an_index_rename_collides_only_within_its_own_schema() {
     }
 }
 
+/// **`SchemaWithDotsTest#test_rename_table`, all four statements**, which is the only assertion
+/// that covers the three faces at once: the table's rename, the sequence's, and the index's each
+/// asked `public` for a bare target, and each was closed on its own. A test per face cannot say
+/// they compose, and this sequence is what the suite actually sends.
+#[test]
+fn the_whole_rename_sequence_runs_in_a_dotted_schema() {
+    for schema in ["my.schema", "g1sd_plain"] {
+        let mut node = parity::Node::new(&[
+            "CREATE TABLE public.articles (id bigserial primary key, title character varying)",
+        ]);
+        node.run(&format!("CREATE SCHEMA \"{schema}\"")).unwrap();
+        node.run(&format!("SET search_path TO \"{schema}\""))
+            .unwrap();
+        for sql in [
+            "CREATE UNLOGGED TABLE \"posts\" (\"id\" bigserial primary key)".to_owned(),
+            "ALTER TABLE \"posts\" RENAME TO \"articles\"".to_owned(),
+            format!("ALTER TABLE \"{schema}\".\"posts_id_seq\" RENAME TO \"articles_id_seq\""),
+            "ALTER INDEX \"posts_pkey\" RENAME TO \"articles_pkey\"".to_owned(),
+        ] {
+            node.run(&sql)
+                .unwrap_or_else(|error| panic!("in {schema}: {sql}\n{error}"));
+        }
+        // The test's own assertion.
+        assert_eq!(
+            node.rows(
+                "SELECT c.relname FROM pg_class c \
+                 LEFT JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = ANY (current_schemas(false)) AND c.relkind IN ('r','p','f') \
+                 ORDER BY 1"
+            ),
+            [["articles"]],
+            "in {schema}"
+        );
+        // And `public`'s three are beside them, untouched — the collision that made each face
+        // fail is still present and no longer fires.
+        assert_eq!(
+            node.rows(
+                "SELECT n.nspname, c.relname FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relname LIKE '%articles%' ORDER BY 1, 2"
+            ),
+            [
+                vec![schema.to_owned(), "articles".to_owned()],
+                vec![schema.to_owned(), "articles_id_seq".to_owned()],
+                vec![schema.to_owned(), "articles_pkey".to_owned()],
+                vec!["public".to_owned(), "articles".to_owned()],
+                vec!["public".to_owned(), "articles_id_seq".to_owned()],
+                vec!["public".to_owned(), "articles_pkey".to_owned()],
+            ],
+            "in {schema}"
+        );
+    }
+}
+
 /// **The collision check is still real** — the half a fix must not lose. Inside the *same* schema
 /// both statements are refused, with PostgreSQL's own code and text.
 #[test]

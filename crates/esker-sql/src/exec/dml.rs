@@ -243,7 +243,10 @@ pub(super) fn column_default_value(
     let mut types = None;
     let mut failure = None;
     let _ = super::subquery::walk_mut(&mut parsed, &mut |expr| {
-        match Executor::user_cast(tenant, &mut types, txn, expr, false) {
+        // **No path here, and it is not an omission.** A stored default's cast is written as the
+        // statement wrote it and re-read per row; a bare user type in one meant `public` when it
+        // was stored, and this path has no session to ask.
+        match Executor::user_cast(tenant, &mut types, txn, expr, false, &[]) {
             Ok(Some(resolved)) => *expr = resolved,
             Ok(None) => {}
             Err(error) => failure = Some(error),

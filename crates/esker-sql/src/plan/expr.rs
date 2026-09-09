@@ -789,7 +789,18 @@ impl CatalogFuncCall {
             | CatalogFunc::Greatest
             | CatalogFunc::Least
             | CatalogFunc::Substr
-            | CatalogFunc::Substring => true,
+            | CatalogFunc::Substring
+            // **The JSON accessors, `i` on a real server** — measured through `pg_operator`
+            // rather than assumed from the family, because `concat` two lines up is `STABLE` and
+            // the guess would have gone the other way: `->`, `->>` and `||` over `json`/`jsonb`
+            // all resolve to functions whose `provolatile` is `i`. It is what
+            // `invertible_migration_test` builds a GIN index over —
+            // `add_index :settings, "(data->'foo')", using: :gin` — which a real server creates
+            // and this node refused as not immutable.
+            | CatalogFunc::JsonFetch
+            | CatalogFunc::JsonbFetch
+            | CatalogFunc::JsonFetchText
+            | CatalogFunc::JsonbConcat => true,
             _ => false,
         }
     }

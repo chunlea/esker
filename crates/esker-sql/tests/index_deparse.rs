@@ -37,13 +37,17 @@
 //! The user's own parentheses come off and the server's go on; the bare column is the one shape
 //! that gets none, at the top and inside a chain.
 //!
-//! # What is still stored as written, deliberately
+//! # What is deparsed, and what is still stored as written
 //!
-//! Only a `CASE` is deparsed here — every other index expression is stored as the user wrote it
-//! (`exec::ddl`, and the comment there says why). So `CREATE INDEX ON t ((lower(v)))` still prints
-//! `lower(v)` where a real server prints `lower((v)::text)`: the cast reaches an expression the
-//! deparser walks, and a stored one keeps its text. Widening that is a unit of its own with corpus
-//! consequences, and the Rails assertion above is inside a `CASE`.
+//! A `CASE` and a scalar call are deparsed; everything else keeps the user's text. Both are shapes
+//! where what went in cannot be what comes out — a `CASE`'s implicit `ELSE` is filled in with the
+//! resolved type, and a text function's argument shows the cast it took — and both are shapes the
+//! deparser prints faithfully. Everything else agrees once the outer parentheses are normalised
+//! and is left alone rather than passed through a deparser that still has a placeholder in it.
+//!
+//! This file first said `CREATE INDEX ON t ((lower(v)))` was a standing divergence, printing
+//! `lower(v)` where a real server prints `lower((v)::text)`. It is not one any more: the scalar
+//! call joined the `CASE`, and the four shapes are asserted below.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -72,6 +76,61 @@ fn a_case_in_an_index_key_shows_the_casts_postgresql_shows() {
             "CREATE INDEX g1b_expression_index ON public.g1b_companies USING btree ((\nCASE\n    \
              WHEN (rating > 0) THEN lower((name)::text)\n    ELSE NULL::text\nEND) DESC)"
         ]]
+    );
+}
+
+/// **A scalar call as the whole index key** shows its cast too, which this file used to record as
+/// a divergence and no longer does.
+#[test]
+fn a_scalar_index_key_shows_its_cast() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE g1b_s (v character varying, c character(3), t text, n integer)",
+        "CREATE INDEX g1b_s1 ON g1b_s ((length(v)))",
+        "CREATE INDEX g1b_s2 ON g1b_s ((upper(c)))",
+        "CREATE INDEX g1b_s3 ON g1b_s ((abs(n)))",
+        "CREATE INDEX g1b_s4 ON g1b_s ((lower(t)))",
+    ]);
+    assert_eq!(
+        node.rows(
+            "SELECT c.relname, pg_get_indexdef(i.indexrelid, 1, false) FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname LIKE 'g1b_s_' ORDER BY 1"
+        ),
+        [
+            ["g1b_s1".to_owned(), "length((v)::text)".to_owned()],
+            ["g1b_s2".to_owned(), "upper((c)::text)".to_owned()],
+            // The one scalar function that does not take text keeps its argument bare.
+            ["g1b_s3".to_owned(), "abs(n)".to_owned()],
+            ["g1b_s4".to_owned(), "lower(t)".to_owned()],
+        ]
+    );
+}
+
+/// **A generated column is normalised the same way**, once, where the table is known:
+/// `GENERATED ALWAYS AS (UPPER(name))` reads back `upper((name)::text)` — lower-cased and cast,
+/// which `virtual_column_test#test_schema_dumping` asserts — and still computes.
+#[test]
+fn a_generated_column_reads_back_deparsed_and_still_computes() {
+    let mut node = parity::Node::new(&["CREATE TABLE g1b_v (name character varying, t text, \
+         upper_name character varying GENERATED ALWAYS AS (UPPER(name)) STORED, \
+         plain_upper text GENERATED ALWAYS AS (upper(t)) STORED)"]);
+    assert_eq!(
+        node.rows(
+            "SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d \
+             JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
+             WHERE d.adrelid = 'g1b_v'::regclass ORDER BY 1"
+        ),
+        [
+            ["plain_upper".to_owned(), "upper(t)".to_owned()],
+            ["upper_name".to_owned(), "upper((name)::text)".to_owned()],
+        ]
+    );
+    // **The normalised text is still the expression**, which is what a rewrite of stored SQL has
+    // to prove: the column computes from it on the next insert.
+    node.run("INSERT INTO g1b_v (name, t) VALUES ('rails', 'x')")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT upper_name, plain_upper FROM g1b_v"),
+        [["RAILS".to_owned(), "X".to_owned()]]
     );
 }
 

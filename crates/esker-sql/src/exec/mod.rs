@@ -2986,8 +2986,10 @@ impl Executor {
         use crate::plan::Expr;
 
         let mut failure = None;
-        // One catalog read for the whole statement, whatever it names.
+        // One catalog read for the whole statement, whatever it names, and one path read beside
+        // it: an unqualified type name resolves the way an unqualified relation name does.
         let mut types = None;
+        let path = self.resolution_path(txn)?;
         if let Statement::Select(select) = statement {
             for item in &mut select.projection {
                 let crate::plan::SelectItem::Expr {
@@ -3000,8 +3002,8 @@ impl Executor {
                 // the label (ADR 0050) and the type it is told is the enum's, which is the pair
                 // `OID::Enum` is built from; taken here because this is the last place the type's
                 // name is still in the tree.
-                let named = Self::cast_target(self.tenant, &mut types, txn, expr);
-                match Self::user_cast(self.tenant, &mut types, txn, expr, true) {
+                let named = Self::cast_target(self.tenant, &mut types, txn, expr, &path);
+                match Self::user_cast(self.tenant, &mut types, txn, expr, true, &path) {
                     Ok(Some(resolved)) => {
                         *expr = resolved;
                         *user_type = named;
@@ -3013,14 +3015,20 @@ impl Executor {
                 }
             }
         }
-        let mut resolve =
-            |expr: &mut Expr| match Self::user_cast(self.tenant, &mut types, txn, expr, false) {
-                Ok(Some(resolved)) => *expr = resolved,
-                Ok(None) => {}
-                Err(error) => {
-                    failure.get_or_insert(error);
-                }
-            };
+        let mut resolve = |expr: &mut Expr| match Self::user_cast(
+            self.tenant,
+            &mut types,
+            txn,
+            expr,
+            false,
+            &path,
+        ) {
+            Ok(Some(resolved)) => *expr = resolved,
+            Ok(None) => {}
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        };
         bind::walk_mut(statement, &mut resolve);
         match failure {
             Some(error) => Err(error),
@@ -3037,18 +3045,33 @@ impl Executor {
     /// this is the other half.
     ///
     /// A stored name is `schema ++ NUL ++ name`, and `public` stores none
-    /// ([`crate::catalog::qualify`]), so an unqualified spelling finds a type in `public` and a
-    /// qualified one finds the schema it names.
+    /// ([`crate::catalog::qualify`]), so a qualified spelling finds the schema it names and an
+    /// **unqualified one walks the `search_path`** — first the schemas on it, then the bare name,
+    /// which is `public`'s. That last step is the old behaviour and is kept for a session with no
+    /// path at all.
     fn qualified_user_type<'known>(
         known: &'known [crate::catalog::TypeDef],
         spelled: &str,
+        path: &[String],
     ) -> Option<&'known crate::catalog::TypeDef> {
         let (schema, bare) = crate::value::split_type_name(spelled);
-        let stored = match &schema {
-            Some(schema) => crate::catalog::qualify(schema, &bare),
-            None => bare,
-        };
-        known.iter().find(|def| def.name == stored)
+        if let Some(schema) = &schema {
+            let stored = crate::catalog::qualify(schema, &bare);
+            return known.iter().find(|def| def.name == stored);
+        }
+        // **An unqualified name walks the `search_path`**, the way a relation's does and the way
+        // `Executor::stored_type_name` does for a column's declared type. It used to look for the
+        // bare name and nothing else, which was right while every type was in `public` and stopped
+        // being right the day a type took a schema: `'mood_in_other_schema'::regtype` then answered
+        // `42704` for a type the session could see, and `enum_test`'s
+        // `test_enum_type_scoped_to_schemas` aborted on it.
+        for schema in path {
+            let candidate = crate::catalog::qualify(schema, &bare);
+            if let Some(def) = known.iter().find(|def| def.name == candidate) {
+                return Some(def);
+            }
+        }
+        known.iter().find(|def| def.name == bare)
     }
 
     /// Which of the two things is missing when a type name does not resolve.
@@ -3082,6 +3105,7 @@ impl Executor {
         types: &mut Option<Vec<crate::catalog::TypeDef>>,
         txn: &dyn Txn,
         expr: &crate::plan::Expr,
+        path: &[String],
     ) -> Option<crate::catalog::TypeDef> {
         use crate::plan::{Expr, Literal};
 
@@ -3099,7 +3123,7 @@ impl Executor {
             Some(known) => known,
             None => types.insert(crate::catalog::user_types(txn, tenant).ok()?),
         };
-        Self::qualified_user_type(known, name).cloned()
+        Self::qualified_user_type(known, name, path).cloned()
     }
 
     /// One `UserCast` call, resolved. `printed` asks for the label rather than the ordinal.
@@ -3120,6 +3144,7 @@ impl Executor {
         txn: &dyn Txn,
         expr: &crate::plan::Expr,
         printed: bool,
+        path: &[String],
     ) -> Result<Option<crate::plan::Expr>> {
         use crate::plan::{Expr, Literal};
 
@@ -3131,7 +3156,7 @@ impl Executor {
             && matches!(&**operand, Expr::CatalogFunc(inner)
                 if inner.func == crate::plan::CatalogFunc::UserCast)
         {
-            return Self::user_cast(tenant, types, txn, operand, true);
+            return Self::user_cast(tenant, types, txn, operand, true, path);
         }
         let Expr::CatalogFunc(call) = expr else {
             return Ok(None);
@@ -3150,7 +3175,7 @@ impl Executor {
             let Some(Expr::Literal(Literal::String(name))) = inner.args.first().cloned() else {
                 return Ok(None);
             };
-            Self::user_cast(tenant, types, txn, &call.args[0].clone(), true)?;
+            Self::user_cast(tenant, types, txn, &call.args[0].clone(), true, path)?;
             return Ok(Some(Expr::Literal(Literal::String(name))));
         }
         // **`'<name>'::regtype` over a type the catalog made**, resolved in this pass because it
@@ -3170,7 +3195,7 @@ impl Executor {
                 None => types.insert(crate::catalog::user_types(txn, tenant)?),
             };
             // **One grammar, one parser — and now one lookup behind it.**
-            let Some(def) = Self::qualified_user_type(known, name) else {
+            let Some(def) = Self::qualified_user_type(known, name, path) else {
                 return Err(Self::no_such_type(txn, tenant, name)?);
             };
             // **The name unless the `::oid` was written**, which is the half `ActiveRecord`
@@ -3215,7 +3240,7 @@ impl Executor {
         };
         // The third of the three lookups, and the same one: a cast to `schema_1.text` resolves
         // where a column of it already did.
-        let Some(def) = Self::qualified_user_type(known, name) else {
+        let Some(def) = Self::qualified_user_type(known, name, path) else {
             // **Not a type anybody declared**, which is where lowering's own refusal has been
             // waiting for a catalog to confirm it: the same `0A000` naming the type that
             // `lower_type` gave before this pass existed, and the same one a column of it gets.

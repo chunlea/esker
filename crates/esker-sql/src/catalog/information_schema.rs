@@ -38,9 +38,6 @@ use crate::catalog::{ColumnDef, Identity};
 use crate::error::Result;
 use crate::value::{self, ColumnType, Datum, Rendering};
 
-/// The one schema every relation is in.
-const PUBLIC_SCHEMA: &str = "public";
-
 /// The standard's `yes_or_no` domain, which is two strings and not a boolean.
 const YES: &str = "YES";
 /// The other one.
@@ -217,9 +214,14 @@ pub fn columns(txn: &dyn Txn, tenant: u64, rendering: Rendering) -> Result<Vec<V
         for (position, (at, column)) in table.user_columns().enumerate() {
             let sequence = super::pg_relations::sequence_for(table, at);
             let identity = sequence.map(|sequence| sequence.identity);
+            let (schema, bare) = super::split_qualified(&table.name);
             rows.push(vec![
-                Datum::Text(PUBLIC_SCHEMA.to_owned()),
-                Datum::Text(table.name.clone()),
+                // **The table's own schema and its bare name.** Both were wrong together and in
+                // the same way: the schema was the constant `public` and the name was the
+                // *stored* form, so a table in a schema reported `public` | `rits\0nodes` — a NUL
+                // on the wire where a real server writes `rits` | `nodes`. Measured.
+                Datum::Text(schema.to_owned()),
+                Datum::Text(bare.to_owned()),
                 Datum::Text(column.name.clone()),
                 Datum::Int4(i32::try_from(position + 1).unwrap_or(i32::MAX)),
                 // **NULL for a generated column**, where `pg_attrdef` holds its expression:
@@ -352,9 +354,16 @@ pub fn table_constraints(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> 
             continue;
         };
         rows.push(vec![
-            Datum::Text(PUBLIC_SCHEMA.to_owned()),
-            Datum::Text(name.clone()),
-            Datum::Text(PUBLIC_SCHEMA.to_owned()),
+            // **The table's schema, not `public`.** Both columns were the constant, so a table in
+            // a schema reported its constraints under `public` and
+            // `referential_integrity_test`'s multi-schema count found none of them. A constraint
+            // lives in the schema its table does — there is no separate namespace for one.
+            Datum::Text(table.schema.clone()),
+            // **The bare name.** A *derived* constraint name is stored qualified
+            // (`plan::make_object_name` re-qualifies), so printing it raw put the NUL separator on
+            // the wire: `rits\0nodes_pkey` where a real server says `nodes_pkey`. Measured.
+            Datum::Text(super::split_qualified(name).1.to_owned()),
+            Datum::Text(table.schema.clone()),
             Datum::Text(table.name.clone()),
             Datum::Text(constraint_type(contype).to_owned()),
             // **`YES`/`NO` here is `t`/`f` there**, read from the same two `pg_constraint`
@@ -396,11 +405,14 @@ pub fn key_column_usage(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
             let Some(column) = table.columns.get(*at) else {
                 continue;
             };
+            let (schema, bare) = super::split_qualified(&table.name);
             rows.push(vec![
-                Datum::Text(PUBLIC_SCHEMA.to_owned()),
-                Datum::Text(table.primary_key_name.clone()),
-                Datum::Text(PUBLIC_SCHEMA.to_owned()),
-                Datum::Text(table.name.clone()),
+                // The same two corrections as `columns` and `table_constraints` above, and the
+                // constraint's name is bare here too: a derived one is stored qualified.
+                Datum::Text(schema.to_owned()),
+                Datum::Text(super::split_qualified(&table.primary_key_name).1.to_owned()),
+                Datum::Text(schema.to_owned()),
+                Datum::Text(bare.to_owned()),
                 Datum::Text(column.name.clone()),
                 Datum::Int4(i32::try_from(position + 1).unwrap_or(i32::MAX)),
                 Datum::Null,
