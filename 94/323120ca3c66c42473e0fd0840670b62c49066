@@ -1,0 +1,39 @@
+crates/esker-sql/tests/generated_parens.rs
+  s_e5c0c6e78b5662::t_7f055a36a9a379 27-53,55-70,74-76,79-81,84-97,100-108,113-126,128,130,132,134
+crates/esker-sql/src/exec/ddl.rs
+  s_e5c0c6e78b5662::t_0955419491eeb0 217,1610-1616,5302-5321,5327-5360,5362-5366,5409-5433,5440,5446-5529,5558-5570,5577-5589,5616-5627,5632-5643,5650-5663,5738-5758,6358-6378,6384,6396
+crates/esker-sql/src/plan/expr.rs
+  s_e5c0c6e78b5662::t_6ac548d031bf83 803-814
+crates/esker-sql/tests/captures/pg19_deparse_parens.txt
+  s_e5c0c6e78b5662::t_c5dcb47a868c49 1-144
+crates/esker-sql/tests/corpus/pg19_deparse_parens.txt
+  s_e5c0c6e78b5662::t_788a9d8424872c 1-144
+crates/esker-sql/tests/do_block.rs
+  s_e5c0c6e78b5662::t_87d7f4798e92f2 36
+crates/esker-sql/tests/drop_constraint.rs
+  s_e5c0c6e78b5662::t_12e4b86d1a07f3 20-32,35
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_e5c0c6e78b5662::t_a9335efa821dfb 565,740-766
+docs/adr/0088-a-stored-expression-is-deparsed-by-the-statement-that-writes-it.md
+  s_e5c0c6e78b5662::t_3f46ec727a3591 1-100
+docs/plans/debts-v1.1.md
+  s_e5c0c6e78b5662::t_bca524788fdc4e 3-12,40,44-47,52
+docs/plans/phase-9-rails.md
+  s_e5c0c6e78b5662::t_a7a5d5bcce23ee 1260
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "94323120ca3c66c42473e0fd0840670b62c49066",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
