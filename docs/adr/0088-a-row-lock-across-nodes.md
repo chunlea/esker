@@ -302,9 +302,55 @@ same key stop refusing each other, which ADR 0062 never needed and never claimed
 held the old line now states the new one with the reasoning, under the name
 `a_lock_kind_record_is_neither_a_version_nor_a_conflict`.
 
-**It is a semantic change to the conflict surface and not a format change**, so it is inside this
-ADR's ruling rather than a stop — but it is the one line here worth a second reading, because it
-reverses something that was written down on purpose.
+#### Why a committed lock record takes no part in first-committer-wins
+
+The rule the prewrite conflict check exists for is one sentence: **somebody wrote a version of this
+key after my snapshot, so the value I computed from it is stale.** That is what makes refusing the
+second writer correct — its `n + 1` was computed from a row that has since moved, and letting it
+land would be a lost update wearing a successful commit.
+
+A `Kind::Lock` record is the transaction saying the opposite: *I held this key and wrote nothing to
+it.* `Op::Check` stages no value, `check_prewrite` writes it as a lock record with no `short_value`
+and no `default` entry, and `commit_secondary` turns it into a `write` record whose kind is `Lock`.
+**No version was created, so no reader's value became stale, so no writer is refused by it.** The
+timestamp on the record says when the holder let go — not when the row changed, because it did not.
+
+Three questions read that column family and all three are the same question wearing different
+words, which is why one rule settles them:
+
+* `check_prewrite`'s conflict check — *may this write land?*
+* `LatestCommit`, behind `changed_since_statement` — *did this row move under my statement?*
+  (ADR 0067 §3, the `EvalPlanQual` question.) A statement re-run because a lock committed would be
+  re-run for nothing.
+* `newest_version_at`, behind a read — *what is the value?* This one already stepped past lock
+  records, and it is where the argument was already written down.
+
+The one it does **not** settle is the lock's own job: while the record is a *lock* rather than a
+*write* — that is, between the prewrite and the commit — it excludes everybody, which is what (a')
+is for. The two are different states of the same key and the rule tells them apart by which column
+family the record is in.
+
+**Both halves are pinned, and the counterfactual says which test pins which** — the old rule was put
+back and every one of these run against it:
+
+| face | test | red against the old rule? |
+|---|---|---|
+| after | `a_lock_kind_record_is_neither_a_version_nor_a_conflict` (`esker-txn`) | **yes** — one `check_prewrite` call, no cluster, and it is the layer the decision lives at. |
+| after, end to end | `a_committed_lock_record_does_not_refuse_an_older_writer` | **no**, and that is worth writing down. A `REPEATABLE READ` transaction older than a committed `FOR UPDATE` writes that row and commits under *both* rules: the SQL write path asks `changed_since_statement` before it asks to prewrite, and that question does not reach the conflict check on this shape. The test states the behaviour a user meets; it is not what discriminates the rules, and claiming it was would have been claiming a green as evidence. |
+| during | `a_write_may_not_pass_a_lock_another_node_holds` | not the *rule* — it is red against **(a') itself being absent**: before the lock existed the writer committed over the row, which is the measurement this ADR opens with. |
+| the code that made it matter | `two_nodes_crossing_a_lock_leave_one_victim` | **yes** — under the old rule the deadlock victim is told `40001 a commit at … beat this transaction`, and the assertion is that a victim is told `40P01`. This is where the old rule's damage was reachable from SQL. |
+
+So the rule is pinned at the layer that decides it, and the damage it did is pinned where a client
+sees it. The end-to-end *after* face is documentation of the behaviour, not its proof.
+
+`REPEATABLE READ` in the first is not decoration: under `READ COMMITTED` the writer takes a fresh
+snapshot per statement (ADR 0057), which is *after* the lock committed, and the question cannot be
+asked at all.
+
+**It is a semantic change to the conflict surface and not a format change**, so it was taken inside
+this ADR's ruling rather than as a stop, and put up for a second reading because it reverses
+something written down on purpose. **Ruled 2026-09-09: accepted**, on the two conditions met above —
+the argument stated, and both faces pinned by a test that is red against the other rule.
 
 ### What it does today
 
