@@ -1652,6 +1652,48 @@ pub struct ExcludeDef {
     pub deferred: bool,
 }
 
+/// The operands of a top-level `AND`/`OR` chain and the keywords between them, or `None` for a
+/// predicate that is not a chain.
+///
+/// **The scanner, extracted so there is one of it.** [`parenthesised_operands`] re-parenthesises a
+/// chain for a reader, and `exec::ddl` deparses a chain's operands for a *writer* — the two need
+/// the same split, and a second copy of "find a top-level `AND`" is the shape that cost this
+/// project 4,873 tests once already. Split on the **top level only**: a keyword inside parentheses
+/// or inside a string literal is part of an operand, not a separator.
+pub(crate) fn boolean_chain(predicate: &str) -> Option<(Vec<&str>, Vec<&str>)> {
+    let bytes = predicate.as_bytes();
+    let upper = predicate.to_ascii_uppercase();
+    let upper = upper.as_bytes();
+    let mut operands = Vec::new();
+    let mut separators = Vec::new();
+    let (mut depth, mut quoted, mut start, mut at) = (0_i32, false, 0, 0);
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\'' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => depth -= 1,
+            _ if quoted || depth != 0 => {}
+            _ => {
+                for keyword in [" AND ", " OR "] {
+                    if upper[at..].starts_with(keyword.as_bytes()) {
+                        operands.push(predicate[start..at].trim());
+                        separators.push(keyword.trim());
+                        start = at + keyword.len();
+                        at += keyword.len() - 1;
+                        break;
+                    }
+                }
+            }
+        }
+        at += 1;
+    }
+    if operands.is_empty() {
+        return None;
+    }
+    operands.push(predicate[start..].trim());
+    Some((operands, separators))
+}
+
 /// Each operand of a top-level `AND`/`OR` chain in its own parentheses — PostgreSQL's rule for
 /// re-printing a boolean expression.
 ///
@@ -1695,36 +1737,9 @@ pub(crate) fn is_column_reference(expr: &str) -> bool {
 }
 
 pub(crate) fn parenthesised_operands(predicate: &str) -> String {
-    let bytes = predicate.as_bytes();
-    let upper = predicate.to_ascii_uppercase();
-    let upper = upper.as_bytes();
-    let mut operands = Vec::new();
-    let mut separators = Vec::new();
-    let (mut depth, mut quoted, mut start, mut at) = (0_i32, false, 0, 0);
-    while at < bytes.len() {
-        match bytes[at] {
-            b'\'' => quoted = !quoted,
-            b'(' if !quoted => depth += 1,
-            b')' if !quoted => depth -= 1,
-            _ if quoted || depth != 0 => {}
-            _ => {
-                for keyword in [" AND ", " OR "] {
-                    if upper[at..].starts_with(keyword.as_bytes()) {
-                        operands.push(predicate[start..at].trim());
-                        separators.push(keyword.trim());
-                        start = at + keyword.len();
-                        at += keyword.len() - 1;
-                        break;
-                    }
-                }
-            }
-        }
-        at += 1;
-    }
-    if operands.is_empty() {
+    let Some((operands, separators)) = boolean_chain(predicate) else {
         return predicate.to_owned();
-    }
-    operands.push(predicate[start..].trim());
+    };
     // **A bare column operand takes no pair**, which is the server's own rule and not a nicety:
     // `n > 0 AND flag` comes back `((n > 0) AND flag)`, measured through a partial index and an
     // exclusion constraint both.

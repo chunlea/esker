@@ -3836,6 +3836,21 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
             Expr::Literal(blank_pad(retype(*ty, literal, op, true)?, *ty, *typmod)),
             right.clone(),
         ),
+        // **A cast types the other side exactly as a column does**, and it has to say so out loud
+        // now that a cast naming a modifier keeps its node (`parse::lower`, `debts-v1.1.md` #28).
+        // Before that, `'101'::bit(3)` folded to a typed literal and `retype` read `bit` off it —
+        // `'101'::bit(3) = '101'::text` was `42883 operator does not exist: bit = text`, which is
+        // what a real server answers. With the node kept, the pair matched no arm here, nothing
+        // typed the other side, and the comparison quietly answered `f`. One arm, and it restores
+        // the sentence the fold used to carry.
+        (Expr::Cast { to, typmod, .. }, Expr::Literal(literal)) => (
+            left.clone(),
+            Expr::Literal(blank_pad(retype(*to, literal, op, false)?, *to, *typmod)),
+        ),
+        (Expr::Literal(literal), Expr::Cast { to, typmod, .. }) => (
+            Expr::Literal(blank_pad(retype(*to, literal, op, true)?, *to, *typmod)),
+            right.clone(),
+        ),
         // **A constructor gives the other side its array type**, which is the mirror of the
         // subscript rule below and the same failure if it is missing: `ARRAY[t] = '{x}'` compared
         // a `Datum::Array` against a `Datum::Text` and answered **`f` for every row**, including
@@ -4241,7 +4256,20 @@ fn retype(
     // the literal is declared (ADR 0087), so narrowing to either is a no-op and only `smallint`
     // had a distinct one. Written as the rule rather than as the width, because a fix aimed at
     // `smallint` would be a fix to the symptom.
-    if matches!(literal, Literal::Integer(_))
+    //
+    // **And a literal that already *carries* an integer type keeps it**, which is the same
+    // sentence again and the half that was missing: `i8 > 1::bigint` folds the written cast into
+    // the constant, so the literal arrives here as `Literal::Typed(Int8(1))`, fell through to
+    // `assign` and came back `Literal::Integer(1)` — the `Datum::Int8(value) =>
+    // Literal::Integer(value)` line below, which is where the declared width went. A real server
+    // prints `(i8 > (1)::bigint)` and this node printed `(i8 > 1)`
+    // (`debts-v1.1.md` #24's `c_i8_cast` row). Measured over both signs and three widths in
+    // `tests/corpus/pg19_negative_constant.txt`: `(i2 > (1)::smallint)`,
+    // `(i2 > ('-1'::integer)::smallint)`, `(nm > ('-1'::integer)::numeric)`.
+    let carries_an_integer_type = matches!(literal, Literal::Integer(_))
+        || matches!(literal, Literal::Typed(value)
+            if matches!(**value, Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)));
+    if carries_an_integer_type
         && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
     {
         return Ok(literal.clone());
@@ -4540,9 +4568,14 @@ fn output_columns(
                 // A typmod travels only with a **plain column reference**, which is
                 // PostgreSQL's rule and the corpus's: `c || '|'` is `text` with none and
                 // `min(c)` is `bpchar` with none, where a bare `c` is `character(3)`.
-                let typmod = match expr {
-                    Expr::Column { .. } if aggregation.is_none() => typmod_of(expr, scope),
-                    _ => crate::value::NO_TYPMOD,
+                // Which expressions carry one is [`typmod_of`]'s subject, measured over every
+                // shape in `tests/corpus/pg19_expression_typmod.txt`. Not under an aggregation:
+                // the expression here is the pre-rewrite one, and `min(c)` is `bpchar` with none
+                // on a real server anyway.
+                let typmod = if aggregation.is_none() {
+                    typmod_of(expr, scope)
+                } else {
+                    crate::value::NO_TYPMOD
                 };
                 // **The type a client is told, for a column declared as a user-defined one.**
                 // A plain column reference and an aggregate over one both keep it — `min(mood)` is
@@ -4636,12 +4669,60 @@ fn projection_exprs(
 /// where a bare `c` is `character(3)`. An unresolvable column answers `NO_TYPMOD` rather than an
 /// error, because whatever is wrong with it is reported by `expr_type` beside this.
 pub(super) fn typmod_of(expr: &Expr, scope: &Scope<'_>) -> i32 {
+    let none = crate::value::NO_TYPMOD;
     match expr {
         Expr::Column { table, name } => scope
             .resolve_column(table.as_deref(), name)
-            .map_or(crate::value::NO_TYPMOD, |(_, column)| column.typmod),
-        _ => crate::value::NO_TYPMOD,
+            .map_or(none, |(_, column)| column.typmod),
+        // **A cast names its own modifier**, which is the one it was written with:
+        // `c::char(2)` is `character(2)` and `1.5::numeric(10,2)` is `numeric(10,2)`, measured.
+        Expr::Cast { typmod, .. } => *typmod,
+        // **`NULLIF` is the identity on its left argument**, so the modifier travels with it —
+        // `nullif(c, 'x')` over a `character(4)` is `character(4)` — but only while the *type* is
+        // also the left's: a `varchar` is compared as `text` (`nullif_type`), and a modifier does
+        // not follow a type change. Measured, both halves.
+        Expr::CatalogFunc(call) if call.func == CatalogFunc::NullIf && call.args.len() == 2 => {
+            let left = expr_type(&call.args[0], scope);
+            match (left, expr_type(expr, scope)) {
+                (Ok(left), Ok(whole)) if left == whole => typmod_of(&call.args[0], scope),
+                _ => none,
+            }
+        }
+        // **`GREATEST` and `LEAST` keep a modifier only when every argument has the same one** —
+        // `greatest(d, d)` is `character(2)` and `greatest(c, 'x')` is `bpchar`, because an
+        // untyped literal has none and one input without it settles the answer. Measured.
+        Expr::CatalogFunc(call)
+            if matches!(call.func, CatalogFunc::Greatest | CatalogFunc::Least) =>
+        {
+            shared_typmod(&call.args, scope)
+        }
+        // `COALESCE` is the same rule, one node over: `coalesce(c, c)` is `character(4)` and
+        // `coalesce(c, d)` is `bpchar`.
+        Expr::Coalesce(args) => shared_typmod(args, scope),
+        // **Everything else has none, and `CASE` is the one worth naming.** Two oracles disagree
+        // about it: `CREATE TABLE AS` gives the created column the *first branch's* modifier while
+        // `\gdesc` on the same expression gives none. The `RowDescription` is what a client reads
+        // and what this function answers, so `CASE` is none — which is also what it already was.
+        // `tests/corpus/pg19_expression_typmod.txt` records both readings.
+        _ => none,
     }
+}
+
+/// The modifier every one of these expressions carries, or none if they do not all carry the same.
+///
+/// PostgreSQL's rule for the productions that pick a common type: one input without a modifier —
+/// an untyped literal, a function's result — settles the answer at none, and so does two inputs
+/// that disagree. Measured over `character(n)` and `numeric(p,s)` in both directions.
+fn shared_typmod(args: &[Expr], scope: &Scope<'_>) -> i32 {
+    let mut shared = None;
+    for arg in args {
+        let typmod = typmod_of(arg, scope);
+        if typmod == crate::value::NO_TYPMOD || shared.is_some_and(|seen| seen != typmod) {
+            return crate::value::NO_TYPMOD;
+        }
+        shared = Some(typmod);
+    }
+    shared.unwrap_or(crate::value::NO_TYPMOD)
 }
 
 /// An arithmetic operator with both operands resolved and its type settled.

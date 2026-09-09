@@ -781,7 +781,158 @@ fn type_name(oid: u32, typmod: i32) -> String {
 }
 
 /// One corpus file, as `(line number, statement, what PostgreSQL answered)`.
+/// The directive a corpus file uses to say its **values are escaped**.
+///
+/// A comment line to every reader that does not know about it, so a file carrying it is still a
+/// valid corpus for anything else, and old files are untouched — which matters, because 19 rows
+/// across this directory already hold a `\\` or a `\n` inside a value and un-escaping them
+/// unconditionally would silently change what they assert. Measured before choosing opt-in.
+const ESCAPED_DIRECTIVE: &str = "#!escaped";
+
+/// **The escape contract**, which the capture tool has to write and this reads.
+///
+/// `docs/plans/debts-v1.1.md` #20: a corpus row is `statement TAB types TAB rows`, rows separated
+/// by `" ; "` and cells by `"|"`, and nothing said what happens when a *value* holds one of those.
+/// The answer was that it silently became extra cells: `to_tsquery('fat | cat')` renders
+/// `'fat' | 'cat'` and parsed as three columns where the node answered two, so a row that read
+/// identically was reported as a disagreement and declared as one. Three files declared exactly
+/// that, two of them with an `UNMEASURED` provenance.
+///
+/// In a file that declares [`ESCAPED_DIRECTIVE`], a value's `\`, `|`, `;`, newline, carriage
+/// return and tab are written as `\\`, `\|`, `\;`, `\n`, `\r` and `\t`. **An unrecognised
+/// escape is kept as written**, so `\N` — this format's NULL marker, and a value that happens to
+/// be those two characters — comes back as itself either way.
+fn unescape(cell: &str) -> String {
+    let mut out = String::with_capacity(cell.len());
+    let mut rest = cell;
+    while let Some(at) = rest.find('\\') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        let mut chars = rest.chars();
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some(c @ ('|' | ';' | '\\')) => out.push(c),
+            // Kept as written: an escape this contract does not define is not this reader's to
+            // interpret, and `\N` is the one that matters.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+        rest = chars.as_str();
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Split on `separator`, skipping any occurrence a backslash escapes.
+///
+/// Byte indices, and the step over an escape moves past one **whole character** so the slices
+/// below stay on boundaries — a `\` before a multi-byte character is otherwise a panic.
+fn split_unescaped<'a>(field: &'a str, separator: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let bytes = field.as_bytes();
+    let (mut start, mut at) = (0, 0);
+    while at < field.len() {
+        if bytes[at] == b'\\' {
+            at += 1;
+            at += field[at..].chars().next().map_or(0, char::len_utf8);
+            continue;
+        }
+        if field[at..].starts_with(separator) {
+            out.push(&field[start..at]);
+            at += separator.len();
+            start = at;
+            continue;
+        }
+        at += 1;
+    }
+    out.push(&field[start..]);
+    out
+}
+
+/// The rows of one corpus row's third field, split the way the file says it is written.
+///
+/// Unescaped files split on every `" ; "` and every `|`, which is what every corpus in this
+/// directory did before the contract existed and what all but three of them still do. An escaped
+/// file skips a separator a backslash protects and un-escapes each cell.
+fn answer_rows(field: &str, escaped: bool) -> Vec<Vec<String>> {
+    if !escaped {
+        return field
+            .split(" ; ")
+            .map(|row| row.split('|').map(str::to_owned).collect())
+            .collect();
+    }
+    split_unescaped(field, " ; ")
+        .into_iter()
+        .map(|row| {
+            split_unescaped(row, "|")
+                .into_iter()
+                .map(unescape)
+                .collect()
+        })
+        .collect()
+}
+
+/// **A row whose cells do not match its declared types, in a file that is not escaped.**
+///
+/// The decidable half of #20's loudness: a row declaring three types and parsing as four cells is
+/// malformed, and the reason is almost always a `|` inside a value. It used to read as a
+/// disagreement — the report showed two rows of text that looked identical — and cost this lane two
+/// rounds before anyone printed the raw `Answer`. Now it says which line, what the counts are, and
+/// what to do about it.
+///
+/// Only for a file without the directive, and only where the types are declared: an escaped file
+/// has no ambiguity to catch, and a row whose types field is empty pins no count.
+fn refuse_an_ambiguous_row(line: usize, statement: &str, types: &[String], rows: &[Vec<String>]) {
+    for row in rows {
+        assert!(
+            row.len() == types.len(),
+            "line {line}: this row declares {} types and parses as {} cells:\n  {statement}\n               {row:?}\nA value holding `|` or `\\n` is split by this format and there is no escape \
+             unless the file says `{ESCAPED_DIRECTIVE}` (docs/plans/debts-v1.1.md #20). Re-capture \
+             the file with escaping, or the row is asserting something other than what it reads.",
+            types.len(),
+            row.len()
+        );
+    }
+}
+
+/// The declared types of one corpus row, split on the commas that **separate** them.
+///
+/// **A type name can hold a comma**, and this used to split on every one: `numeric(10,2)` parsed
+/// as `numeric(10` and `2)`, so a row declaring three types was compared as five and could not
+/// agree whatever this node answered. `tests/numeric.rs` had six statements listed as declared-type
+/// divergences for exactly that reason, under a reason about "one of the standing declared-type
+/// families" — the exemption was real and its cause was the format
+/// (`docs/plans/debts-v1.1.md` #20).
+///
+/// **Decidable without an escape**, which is why this half needs no re-capture: a comma inside a
+/// type's modifier is inside parentheses, and a comma that separates two types never is. So the
+/// split is at parenthesis depth zero. The other two halves of #20 — a `|` inside a *value* and a
+/// newline inside one — are not decidable and need the escape [`unescape`] reads.
+fn declared_types(field: &str) -> Vec<String> {
+    let mut types = Vec::new();
+    let (mut depth, mut start) = (0_i32, 0);
+    for (at, byte) in field.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                types.push(field[start..at].to_owned());
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    types.push(field[start..].to_owned());
+    types
+}
+
 fn parse(corpus: &str) -> Vec<(usize, String, Answer)> {
+    let escaped = corpus.lines().any(|line| line.trim() == ESCAPED_DIRECTIVE);
     corpus
         .lines()
         .enumerate()
@@ -805,22 +956,20 @@ fn parse(corpus: &str) -> Vec<(usize, String, Answer)> {
                     None | Some("-") => Answer::Done,
                     Some(rows) => Answer::Rows {
                         types: Vec::new(),
-                        rows: rows
-                            .split(" ; ")
-                            .map(|row| row.split('|').map(str::to_owned).collect())
-                            .collect(),
+                        rows: answer_rows(rows, escaped),
                     },
                 },
-                None => Answer::Rows {
-                    types: second.split(',').map(str::to_owned).collect(),
-                    rows: match fields.next().unwrap_or("-") {
+                None => {
+                    let types = declared_types(second);
+                    let rows = match fields.next().unwrap_or("-") {
                         "-" => Vec::new(),
-                        rows => rows
-                            .split(" ; ")
-                            .map(|row| row.split('|').map(str::to_owned).collect())
-                            .collect(),
-                    },
-                },
+                        rows => answer_rows(rows, escaped),
+                    };
+                    if !escaped {
+                        refuse_an_ambiguous_row(index + 1, &statement, &types, &rows);
+                    }
+                    Answer::Rows { types, rows }
+                }
             };
             (index + 1, statement, answer)
         })

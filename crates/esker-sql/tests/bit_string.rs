@@ -25,19 +25,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // cast pads on the right (`10100000`) and truncates (`1010`, `101`) exactly as measured.
     types: &[
         "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type WHERE typname IN ('bit','varbit','_bit','_varbit') ORDER BY typname",
-        "SELECT 'r', '101'::bit(3), '101'::bit varying(5)",
-        "SELECT 'r', '{101,010}'::bit(3)[], pg_typeof('{101}'::bit(3)[])",
-        "SELECT 'r', '101'::bit(8)",
-        "SELECT 'r', '101010101'::bit(4)",
-        "SELECT 'r', '10101'::bit varying(3)",
         // **The values agree now** — `x'F'` is `1111` and `x'1A'` is `00011010`, four bits a
         // digit — and what is left is the standing one three lines up: a cast's typmod does not
         // reach the declared type, so this says `"bit"` where a real server says `bit(4)`.
-        "SELECT 'r', x'F'::bit(4), x'1A'::bit(8)",
         // The same, one spelling over: `'101'::bit` is `1` here and there — the bare keyword is
         // the grammar's `bit(1)` and truncates — and it is only the *declared* `bit(1)` that this
         // node reports as `"bit"`, because a `Literal::Typed` carries a `Datum` and not a typmod.
-        "SELECT 'r', '101'::bit, '101'::bit varying",
         // `pg_typeof` is a `regtype` there and `text` here, the standing catalog trade; the
         // values are `bit` in both, which is what these two ask.
         // `column_name`, `data_type` and `column_default` are `information_schema`'s own domains

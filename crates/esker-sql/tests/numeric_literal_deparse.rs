@@ -21,56 +21,21 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[
-        (
-            "SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nl'::regclass AND a.attnum > 6 ORDER BY a.attnum",
-            "**Two of this row's 32 columns differ, and neither is about the form a constant \
-         prints in** — the forms all agree. What differs is which *node* the tree holds. \
-         `c_i2_lit` was the third and is gone: `retype` no longer narrows a comparison's literal \
-         to the column's type, which is `debts-v1.1.md` #23 and the sentence that arm's `numeric` \
-         case already carried.\n\
-         \n\
-         `c_i8_cast` — `i8 > 1::bigint` is `(i8 > (1)::bigint)` there and `(i8 > 1)` here: the \
-         written cast is folded into the constant and then normalised to `Literal::Integer`, \
-         which loses the `int8`. Same cause as `k_neg_par`.\n\
-         \n\
-         `f_grt`/`f_grt_i8` — `greatest(i4, 1)` is `GREATEST(i4, 1)` there. PostgreSQL \
-         **upper-cases the four functions that are grammar productions** rather than catalog \
-         entries — `COALESCE`, `GREATEST`, `LEAST`, `NULLIF`, measured — and it coerces the \
-         literal to the common type (`GREATEST(i8, (1)::bigint)`). Here they keep their written \
-         text, because `deparse`'s `CatalogFunc` arm is a `name(...)` placeholder and \
-         `exec::ddl::reads_back` refuses to store one. Giving that arm its arguments would change \
-         the printed text of every expression over a catalog function at once, with no measurement \
-         behind most of them, so it is named as a debt rather than done here.",
-            "pg19_numeric_literal_deparse.txt:81",
-        ),
-        (
-            "SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nd'::regclass ORDER BY a.attnum",
-            "**One of nine, and it is the written text rather than a deparse.** `DEFAULT \
-         -1::bigint` is `(- (1)::bigint)` on a real server — `::` binds tighter than unary minus, \
-         so it is an operator over a cast — and `(-1::BIGINT)` here, which is `sqlparser`'s own \
-         rendering of the expression as written, type name upper-cased and the cast un-deparsed. \
-         The other eight agree, including the three forms this unit implemented and the fact that \
-         a `DEFAULT` stores the expression rather than the assignment cast to the column. Closing \
-         this row means the `DEFAULT` path deparsing a shape it currently keeps verbatim, which is \
-         the same seam [ADR 0090](../../../docs/adr/0090-a-stored-expression-is-deparsed-by-the-statement-that-writes-it.md)'s \
-         allow-list draws and the same reason: what is kept verbatim is kept because deparsing it \
-         would lose something, and here it loses the case of a type name.",
-            "pg19_numeric_literal_deparse.txt:83",
-        ),
-        (
-            "SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'g1nc'::regclass ORDER BY conname",
-            "**A `CHECK` is stored as written and is the fifth reader of this rule**, which is the \
-         shape of every bug in this family: `pg_get_constraintdef` prints \
-         `CHECK ((i8 > (1)::bigint))` there and `CHECK ((i8 > 1::BIGINT))` here — `sqlparser`'s \
-         upper-cased type name in text that never passed through `deparse`. The other two \
-         constraints in the row agree to the character, which is what says the difference is the \
-         cast and not the constraint. Routing a `CHECK` through the deparser is the fifth caller \
-         after the four ADR 0090 lists, and it carries the same read-back requirement: the text is \
-         re-parsed to evaluate the constraint on every write.",
-            "pg19_numeric_literal_deparse.txt:91",
-        ),
-    ],
+    answers: &[(
+        "SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nd'::regclass ORDER BY a.attnum",
+        "**One of nine, and after #24 the only one: the *spelling*, not the form.** \
+         `DEFAULT -1::bigint` is `(- (1)::bigint)` on a real server — `::` binds tighter than \
+         unary minus, so it is an operator over a cast, not a cast over a negative constant — and \
+         `(-1::BIGINT)` here, the expression as written with the type name upper-cased. \
+         `debts-v1.1.md` #24 closed the other two shapes in this row: `DEFAULT (-1)::bigint` is \
+         `('-1'::integer)::bigint` in both now, and so is `DEFAULT (-1.5)::double precision`. \
+         What is left is not a printer gap. Both spellings fold to the same constant here, so \
+         after lowering there is nothing to tell them apart and the printer would have to invent \
+         one; keeping the unary minus as a node is a change to what the plan holds. Measured over \
+         four target types in `tests/corpus/pg19_negative_constant.txt`, whose `u_*` rows are \
+         this shape, and #24's row carries it.",
+        "pg19_numeric_literal_deparse.txt:83",
+    )],
 };
 
 #[test]

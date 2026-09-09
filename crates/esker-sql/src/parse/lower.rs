@@ -6218,7 +6218,15 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 // The `Cast` node is kept only when the value cannot speak for itself. It is a
                 // no-op on the value — the datum below it is already this type's — and it is what
                 // `expr_type` reads.
-                if value.column_type() == Some(ty) {
+                //
+                // **A modifier is the second thing a datum cannot say.** `1.5::numeric(10,2)` fits
+                // to `1.50` and the datum is a `numeric` like any other, so the fold above used to
+                // apply and the `RowDescription` said bare `numeric` where a real server says
+                // `numeric(10,2)` — `debts-v1.1.md` #28, and the same sentence this comment
+                // already makes one clause further: a value carries its type and never its
+                // modifier. Keeping the node costs a no-op cast at evaluation and is what
+                // `exec::query::typmod_of` reads.
+                if value.column_type() == Some(ty) && typmod == NO_TYPMOD {
                     return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(value))));
                 }
                 Ok(plan::Expr::Cast {
