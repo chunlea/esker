@@ -323,36 +323,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ),
         // ---- H-case-layout: 7 statements ----
         (
-            "SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_search'::regclass",
-            "**Group H -- a `CASE`'s layout, and the leading newline belongs to the reader.** Three facts, measured: PostgreSQL's `pg_get_expr(indexprs)` gives `CASE\\n    WHEN ...` with **no** leading newline while the `CHECK` printer adds one (`CHECK (\\nCASE`), so the newline this node stores in the expression is the printer's and not the expression's; a **nested** `CASE` goes on its own line after `THEN` and is indented four further spaces, where this node inlines it at the same depth; and `pg_get_expr(indpred)` gives a bare `CASE ... END` where this node wraps it in a pair. All three are the same mistake in opposite directions -- the layout is split between the writer and the reader, and this node put all of it in the writer.",
-            "pg19_deparse_census.txt:194",
-        ),
-        (
-            "SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_fn'::regclass",
-            "**Group H -- a `CASE`'s layout, and the leading newline belongs to the reader.** Three facts, measured: PostgreSQL's `pg_get_expr(indexprs)` gives `CASE\\n    WHEN ...` with **no** leading newline while the `CHECK` printer adds one (`CHECK (\\nCASE`), so the newline this node stores in the expression is the printer's and not the expression's; a **nested** `CASE` goes on its own line after `THEN` and is indented four further spaces, where this node inlines it at the same depth; and `pg_get_expr(indpred)` gives a bare `CASE ... END` where this node wraps it in a pair. All three are the same mistake in opposite directions -- the layout is split between the writer and the reader, and this node put all of it in the writer.",
-            "pg19_deparse_census.txt:234",
-        ),
-        (
-            "SELECT pg_get_indexdef('ix_case_nest'::regclass)",
-            "**Group H -- a `CASE`'s layout, and the leading newline belongs to the reader.** Three facts, measured: PostgreSQL's `pg_get_expr(indexprs)` gives `CASE\\n    WHEN ...` with **no** leading newline while the `CHECK` printer adds one (`CHECK (\\nCASE`), so the newline this node stores in the expression is the printer's and not the expression's; a **nested** `CASE` goes on its own line after `THEN` and is indented four further spaces, where this node inlines it at the same depth; and `pg_get_expr(indpred)` gives a bare `CASE ... END` where this node wraps it in a pair. All three are the same mistake in opposite directions -- the layout is split between the writer and the reader, and this node put all of it in the writer.",
-            "pg19_deparse_census.txt:246",
-        ),
-        (
-            "SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_nest'::regclass",
-            "**Group H -- a `CASE`'s layout, and the leading newline belongs to the reader.** Three facts, measured: PostgreSQL's `pg_get_expr(indexprs)` gives `CASE\\n    WHEN ...` with **no** leading newline while the `CHECK` printer adds one (`CHECK (\\nCASE`), so the newline this node stores in the expression is the printer's and not the expression's; a **nested** `CASE` goes on its own line after `THEN` and is indented four further spaces, where this node inlines it at the same depth; and `pg_get_expr(indpred)` gives a bare `CASE ... END` where this node wraps it in a pair. All three are the same mistake in opposite directions -- the layout is split between the writer and the reader, and this node put all of it in the writer.",
-            "pg19_deparse_census.txt:250",
-        ),
-        (
-            "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cen'::regclass AND a.attname='g_case_nest'",
-            "**Group H -- a `CASE`'s layout, and the leading newline belongs to the reader.** Three facts, measured: PostgreSQL's `pg_get_expr(indexprs)` gives `CASE\\n    WHEN ...` with **no** leading newline while the `CHECK` printer adds one (`CHECK (\\nCASE`), so the newline this node stores in the expression is the printer's and not the expression's; a **nested** `CASE` goes on its own line after `THEN` and is indented four further spaces, where this node inlines it at the same depth; and `pg_get_expr(indpred)` gives a bare `CASE ... END` where this node wraps it in a pair. All three are the same mistake in opposite directions -- the layout is split between the writer and the reader, and this node put all of it in the writer.",
-            "pg19_deparse_census.txt:254",
-        ),
-        (
-            "SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_null'::regclass",
-            "**Group H -- a `CASE`'s layout, and the leading newline belongs to the reader.** Three facts, measured: PostgreSQL's `pg_get_expr(indexprs)` gives `CASE\\n    WHEN ...` with **no** leading newline while the `CHECK` printer adds one (`CHECK (\\nCASE`), so the newline this node stores in the expression is the printer's and not the expression's; a **nested** `CASE` goes on its own line after `THEN` and is indented four further spaces, where this node inlines it at the same depth; and `pg_get_expr(indpred)` gives a bare `CASE ... END` where this node wraps it in a pair. All three are the same mistake in opposite directions -- the layout is split between the writer and the reader, and this node put all of it in the writer.",
-            "pg19_deparse_census.txt:266",
-        ),
-        (
             "SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = 'ix_case_bool'::regclass",
             "**Group H -- a `CASE`'s layout, and the leading newline belongs to the reader.** Three facts, measured: PostgreSQL's `pg_get_expr(indexprs)` gives `CASE\\n    WHEN ...` with **no** leading newline while the `CHECK` printer adds one (`CHECK (\\nCASE`), so the newline this node stores in the expression is the printer's and not the expression's; a **nested** `CASE` goes on its own line after `THEN` and is indented four further spaces, where this node inlines it at the same depth; and `pg_get_expr(indpred)` gives a bare `CASE ... END` where this node wraps it in a pair. All three are the same mistake in opposite directions -- the layout is split between the writer and the reader, and this node put all of it in the writer.",
             "pg19_deparse_census.txt:286",

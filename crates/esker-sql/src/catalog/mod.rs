@@ -427,13 +427,26 @@ pub enum ExprShape {
     Operator,
 }
 
+/// A body in parentheses, with the break PostgreSQL puts after the `(` when a `CASE` follows.
+///
+/// The reader's half of `exec::ddl::parenthesise`: `btree ((\nCASE …))` and `CHECK (\nCASE …)`
+/// put the newline after the pair, not before the keyword, so a shape that adds a pair here has to
+/// add the break with it. Measured across the census's readers.
+fn wrapped(body: &str) -> String {
+    if body.starts_with("CASE") {
+        format!("(\n{body})")
+    } else {
+        format!("({body})")
+    }
+}
+
 impl ExprShape {
     /// What `pg_get_expr(indexprs, indrelid)` answers, and what a `23505` `DETAIL` names.
     #[must_use]
     pub fn printed(self, expr: &str) -> String {
         match self {
             ExprShape::Call | ExprShape::Value => expr.to_owned(),
-            ExprShape::Operator => format!("({expr})"),
+            ExprShape::Operator => wrapped(expr),
         }
     }
 
@@ -445,7 +458,7 @@ impl ExprShape {
     pub fn listed(self, expr: &str) -> String {
         match self {
             ExprShape::Call => expr.to_owned(),
-            ExprShape::Value | ExprShape::Operator => format!("({})", self.printed(expr)),
+            ExprShape::Value | ExprShape::Operator => wrapped(&self.printed(expr)),
         }
     }
 
@@ -457,7 +470,7 @@ impl ExprShape {
     pub fn per_column(self, expr: &str) -> String {
         match self {
             ExprShape::Call | ExprShape::Operator => self.printed(expr),
-            ExprShape::Value => format!("({expr})"),
+            ExprShape::Value => wrapped(expr),
         }
     }
 }

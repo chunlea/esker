@@ -366,7 +366,9 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>, pretty: bo
         // pairs, each reader adding what it adds.
         let suffix = if check.validated { "" } else { " NOT VALID" };
         return Datum::Text(if pretty {
-            format!("CHECK ({}){suffix}", super::pretty_case(&check.expr))
+            let body = super::pretty_case(&check.expr);
+            let lead = if body.starts_with("CASE") { "\n" } else { "" };
+            format!("CHECK ({lead}{body}){suffix}")
         } else {
             // **The plain form's inner pair is the *expression's* own, not the printer's.** An
             // operator node prints one — `CHECK ((price > 0))` — and a `CASE` does not:
@@ -385,7 +387,15 @@ pub fn constraint_definition(relations: &Relations, oid: Option<i64>, pretty: bo
             } else {
                 format!("({body})")
             };
-            format!("CHECK ({wrapped}){suffix}")
+            // The break PostgreSQL puts after an opening parenthesis when a `CASE` follows, which
+            // is this printer's pair rather than the expression's (`exec::ddl::parenthesise` is
+            // the same rule inside the deparser).
+            let lead = if wrapped.starts_with("CASE") {
+                "\n"
+            } else {
+                ""
+            };
+            format!("CHECK ({lead}{wrapped}){suffix}")
         });
     }
     // A `FOREIGN KEY`: the oid is the table and the constraint's position in its list.
