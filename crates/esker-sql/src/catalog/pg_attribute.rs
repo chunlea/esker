@@ -465,6 +465,22 @@ pub(crate) fn collatable(ty: ColumnType) -> bool {
     typcollation(ty) != NO_COLLATION
 }
 
+/// A stored relation name as it goes **inside a string literal**: `schema.name`, each part
+/// delimited only if it would not read back as itself.
+///
+/// `catalog::display_name` joins the two with a dot and stops there, which is right everywhere the
+/// name is prose and wrong where it is SQL a client re-parses — and a `nextval` default is the
+/// second kind. Measured on 19beta1: `"g1nv_mixed_monkeyID_seq"` quoted, `g1nv_plain_id_seq` and
+/// `g1nv_s.t_id_seq` bare.
+fn quoted_display_name(stored: &str) -> String {
+    let (schema, bare) = super::split_qualified(stored);
+    let bare = super::quote_identifier(bare);
+    if schema == super::PUBLIC_SCHEMA && !stored.contains(super::SCHEMA_SEPARATOR) {
+        return bare;
+    }
+    format!("{}.{bare}", super::quote_identifier(schema))
+}
+
 /// What `pg_get_expr(adbin, adrelid)` prints for one column, or `None` for a column with no
 /// default.
 ///
@@ -509,9 +525,16 @@ pub fn default_expression(
             // it inside the `nextval`. Measured, a real server prints a dot:
             // `nextval('g1_ns.t_id_seq'::regclass)`. Invisible in `public`, where the stored name
             // is bare and the two forms are the same string.
+            //
+            // **And each part is quoted if it needs to be**, inside the literal:
+            // `nextval('"mixed_case_monkeys_monkeyID_seq"'::regclass)` for a sequence derived
+            // from a mixed-case column, which `primary_keys_test#test_serial_with_quoted_sequence_name`
+            // asserts to the character. Measured on 19beta1 beside the two that need no quotes —
+            // `nextval('g1nv_plain_id_seq'::regclass)` and `nextval('g1nv_s.t_id_seq'::regclass)`
+            // — so the rule is `quote_identifier` per part and not a blanket pair.
             Identity::Default => Some(format!(
                 "nextval('{}'::regclass)",
-                super::display_name(&sequence.name)
+                quoted_display_name(&sequence.name)
             )),
             Identity::ByDefault | Identity::Always => None,
         };
