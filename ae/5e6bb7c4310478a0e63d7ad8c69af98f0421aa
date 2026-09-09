@@ -1,0 +1,23 @@
+crates/esker-sql/tests/type_map_reload.rs
+  s_e5c0c6e78b5662::t_3a0ca8086965dc 136-190
+crates/esker-sql/src/exec/mod.rs
+  s_e5c0c6e78b5662::t_caa1227a4056d7 1816,4069-4094,4096,4633-4634
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_e5c0c6e78b5662::t_54a721b0fcd53d 43,308-322
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "ae5e6bb7c4310478a0e63d7ad8c69af98f0421aa",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
