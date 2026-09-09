@@ -189,6 +189,10 @@ fn activerecord_s_four_type_map_queries_answer() {
         vec![
             vec!["16", "bool", "0", ",", "boolin", "\\N", "b", "0"],
             vec!["17", "bytea", "0", ",", "byteain", "\\N", "b", "0"],
+            // **`name` answers this query now** (ADR 0084). It is one of the forty names
+            // `ActiveRecord` asks for, and until the type existed the row simply was not there —
+            // the adapter saw a type map with a hole where its own catalog columns are declared.
+            vec!["19", "name", "0", ",", "namein", "\\N", "b", "0"],
             vec!["20", "int8", "0", ",", "int8in", "\\N", "b", "0"],
             vec!["21", "int2", "0", ",", "int2in", "\\N", "b", "0"],
             vec!["23", "int4", "0", ",", "int4in", "\\N", "b", "0"],

@@ -72,6 +72,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         // ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
         ColumnType::Int4 => 7,
         ColumnType::Varchar => 8,
+        // 94: the first free tag. Purely additive — every tag already written keeps its meaning.
+        ColumnType::Name => 94,
         ColumnType::Timestamp => 9,
         ColumnType::Int2 => 10,
         ColumnType::Real => 11,
@@ -169,6 +171,7 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         6 => ColumnType::Double,
         7 => ColumnType::Int4,
         8 => ColumnType::Varchar,
+        94 => ColumnType::Name,
         9 => ColumnType::Timestamp,
         10 => ColumnType::Int2,
         11 => ColumnType::Real,

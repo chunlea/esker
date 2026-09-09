@@ -1567,6 +1567,7 @@ fn placeholder(ty: ColumnType) -> Datum {
         // The empty hstore is the empty string too, and it is a real value rather than a NULL —
         // see `crate::value::hstore`.
         ColumnType::Text
+        | ColumnType::Name
         | ColumnType::Varchar
         | ColumnType::Bpchar
         | ColumnType::Hstore

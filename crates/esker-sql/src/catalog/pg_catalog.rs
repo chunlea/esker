@@ -2779,6 +2779,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Int2 => "int2",
         ColumnType::Text => "text",
         ColumnType::Varchar => "varchar",
+        ColumnType::Name => "name",
         ColumnType::Bpchar => "bpchar",
         ColumnType::Json => "json",
         ColumnType::Jsonb => "jsonb",
@@ -2920,7 +2921,11 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         ColumnType::Bit | ColumnType::VarBit => "V",
         // **`S` for citext too**, measured: it is a string type to the adapter, which is how it
         // is told apart from hstore's `U` in the boot type-map query.
-        ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Citext => "S",
+        ColumnType::Text
+        | ColumnType::Varchar
+        | ColumnType::Name
+        | ColumnType::Bpchar
+        | ColumnType::Citext => "S",
         ColumnType::Bool => "B",
         ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Date | ColumnType::Time => {
             "D"
@@ -3060,6 +3065,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Int2 => "int2in",
         ColumnType::Text => "textin",
         ColumnType::Varchar => "varcharin",
+        // Its own input function, and the one that truncates at 63 (`value::truncate_to_name`).
+        ColumnType::Name => "namein",
         ColumnType::Bpchar => "bpcharin",
         ColumnType::Json => "json_in",
         ColumnType::Jsonb => "jsonb_in",

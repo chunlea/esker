@@ -2241,7 +2241,7 @@ impl Literal {
                 )]
                 ColumnType::Real => Ok(Datum::Real(*value as f32)),
                 // PostgreSQL's assignment cast to text is the value's own text.
-                ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
+                ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Bpchar => {
                     Ok(Datum::Text(value.to_string()))
                 }
                 ColumnType::Bool
@@ -2331,7 +2331,7 @@ impl Literal {
                     )
                 }
                 // The digits as written, which is what `numeric`'s own text is.
-                ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
+                ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Bpchar => {
                     Ok(Datum::Text(digits.clone()))
                 }
                 ColumnType::Int8 => Err(SqlError::unsupported(format!(
@@ -2458,7 +2458,10 @@ impl Literal {
             Literal::Bool(value) => match ty {
                 ColumnType::Bool => Ok(Datum::Bool(*value)),
                 // `true`, not `t`: the cast, not the output function.
-                ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => Ok(Datum::Text(
+                ColumnType::Text
+                | ColumnType::Varchar
+                | ColumnType::Name
+                | ColumnType::Bpchar => Ok(Datum::Text(
                     if *value { "true" } else { "false" }.to_owned(),
                 )),
                 // A boolean is not a number, so it is not a money either: `money` takes the

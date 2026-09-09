@@ -1,0 +1,98 @@
+# **The `name` type** — PostgreSQL 19beta1, 2026-09-08. One `BEGIN … ROLLBACK`.
+#
+# `datatype_test.rb#test_name_column_type` sends `CREATE TABLE ex(data name)`, and the two
+# `compatibility_test.rb` cases reach it through `information_schema.tables.table_name`, which is
+# the `sql_identifier` domain over `name`.
+#
+# ## The catalog row
+#
+#     typname  oid  typtype  typlen  typcategory  typdelim  typcollation  typelem  array
+#     name     19   b        64      S            ,         950 (C)       18       _name = 1003
+#
+# **`typlen` is 64 and positive**: `name` is the one string type in PostgreSQL that is *fixed
+# width*, not a varlena. `format_type(19, -1)` is `name`, and it takes no typmod at all —
+# `'x'::name(10)` is `42601 type modifier is not allowed for type "name"`.
+#
+# ## It truncates at 63, not 64, and never splits a character
+#
+#     length(repeat('a',64)::name)   63          octet_length(…)  63
+#     length(repeat('a',63)::name)   63
+#     length(repeat('a',62)::name)   62
+#     repeat('a',64)::name = repeat('a',63)::name   t
+#
+# 64 bytes of storage, one of which is the terminator, so **63 is the limit**. The truncation is by
+# *bytes* and stops at a character boundary rather than cutting one in half:
+#
+#     repeat('é',64)::name    31 characters, 62 octets    <- not 63: the 32nd 'é' would cross it
+#     repeat('あ',30)::name   21 characters, 63 octets    <- exactly 63, because 21 × 3 = 63
+#
+# A value written into a `name` **column** is truncated the same way, on the way in.
+#
+# ## Its collation is C, which is a different sort order from `text`
+#
+#     ORDER BY a name column:   ''  'Apple'  'MiXeD'  'aaa…'  'apple'  'plain'
+#
+# Byte order, so every capital sorts before every lower-case letter. The column reports
+# `attcollation = 950` and `information_schema.columns.collation_name = 'C'`, where a `text` column
+# reports the database default. This is the half of `name` that is not "a short text".
+#
+# **One rule measured and deliberately not implemented**: a *cast* to `name` keeps the collation of
+# what it was cast from, so `ORDER BY x::name` over a `text` column sorts in the text column's
+# collation and not in C. Only a `name` **column** gets 950 by itself. That derivation belongs to
+# collation resolution (ADR 0076 territory), not to this type.
+#
+# ## Everything it does is text's, and everything it produces is text
+#
+#     'plain'::name = 'plain'::text     t          'plain'::name LIKE 'pl%'   t
+#     pg_typeof('x'::name || 'y')       text       pg_typeof(upper('a'::name))  text
+#     pg_typeof('x'::name::text)        text       pg_typeof('x'::text::name)   name
+#     length('abc'::name)               3          '  x  '::name keeps its spaces, length 5
+#     ''::name                          legal, length 0
+#     'x'::name::int                    22P02 invalid input syntax for type integer: "x"
+#
+# ## A column of it
+#
+#     attname  format_type  atttypid  atttypmod  attlen  attcollation
+#     data     name         19        -1         64      950
+#
+#     information_schema.columns:  data_type = 'name', character_maximum_length = NULL,
+#                                  collation_name = 'C'
+#
+# ## A note on capturing this one
+#
+# The corpus generator drops a result row that renders as an empty line, which is exactly what a
+# single-column `name` result holding `''` looks like. `SELECT data FROM … ORDER BY data` silently
+# lost its empty-string row; the statement carries `id` beside `data` for that reason. The same
+# trap ate a `\N` in an earlier capture — a generator that reads psql's text output cannot tell an
+# empty row from a blank line, so a corpus statement should never project one column that can be
+# empty.
+#
+# The rows below are the measurement, in corpus form.
+#
+SELECT typname, oid, typtype, typlen, typcategory, typdelim, typcollation FROM pg_type WHERE typname = 'name'	name,oid,"char",smallint,"char","char",oid	name|19|b|64|S|,|950
+SELECT format_type(19, -1)	text	name
+SELECT length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name)	integer	63
+SELECT length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name)	integer	63
+SELECT length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name)	integer	62
+SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name	boolean	t
+SELECT octet_length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name)	integer	63
+SELECT length('éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé'::name), octet_length('éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé'::name)	integer,integer	31|62
+SELECT ('  x  '::name)::text, length('  x  '::name)	text,integer	  x  |5
+SELECT (''::name)::text, length(''::name)	text,integer	|0
+SELECT 'a'::name < 'b'::name, 'A'::name < 'a'::name	boolean,boolean	t|t
+SELECT 'plain'::name = 'plain'::text	boolean	t
+SELECT pg_typeof('x'::name)	regtype	name
+SELECT pg_typeof('x'::name || 'y')	regtype	text
+SELECT pg_typeof('x'::name::text)	regtype	text
+SELECT pg_typeof('x'::text::name)	regtype	name
+SELECT pg_typeof(upper('a'::name))	regtype	text
+SELECT length('abc'::name)	integer	3
+SELECT 'plain'::name LIKE 'pl%'	boolean	t
+SELECT 'x'::name(10)	!42601 type modifier is not allowed for type "name"
+SELECT 'x'::name::int	!22P02 invalid input syntax for type integer: "x"
+SELECT id, length(data), data FROM b4_nm ORDER BY id	bigint,integer,name	1|5|plain ; 2|63|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; 3|0| ; 4|5|MiXeD ; 5|5|apple ; 6|5|Apple
+SELECT id, data FROM b4_nm ORDER BY data, id	bigint,name	3| ; 6|Apple ; 4|MiXeD ; 2|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; 5|apple ; 1|plain
+SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.atttypid, a.atttypmod FROM pg_attribute a WHERE a.attrelid = 'b4_nm'::regclass AND a.attnum > 0 ORDER BY a.attnum	name,text,oid,integer	id|bigint|20|-1 ; data|name|19|-1
+SELECT column_name, data_type, character_maximum_length FROM information_schema.columns WHERE table_name = 'b4_nm' ORDER BY ordinal_position	name,character varying,integer	id|bigint|\N ; data|name|\N
+SELECT id, data FROM b4_nm WHERE data = 'plain'	bigint,name	1|plain
+SELECT count(*) FROM b4_nm WHERE data > 'a'	bigint	3

@@ -558,6 +558,9 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         ColumnType::Numeric => return take_numeric(bytes),
         ColumnType::Text
         | ColumnType::Varchar
+        // `name` is stored as its text, like `varchar`; what makes it a type of its own is its
+        // OID, its positive `typlen` and the truncation applied before it ever reaches here.
+        | ColumnType::Name
         | ColumnType::Bpchar
         | ColumnType::Json
         | ColumnType::Int2Vector
@@ -966,6 +969,7 @@ fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
         },
         ColumnType::Text
         | ColumnType::Varchar
+        | ColumnType::Name
         | ColumnType::Bpchar
         | ColumnType::Json
         | ColumnType::Int2Vector
@@ -1470,6 +1474,9 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Line => Err(not_a_key())?,
         ColumnType::Text
         | ColumnType::Varchar
+        // **A `name` key sorts in byte order, which is what its C collation means** and what a
+        // memcomparable key already is (ADR 0076). So it needs no rule of its own here.
+        | ColumnType::Name
         | ColumnType::Bpchar
         | ColumnType::Citext
         | ColumnType::Ltree => {
@@ -2198,7 +2205,10 @@ mod tests {
                 .prop_map(Datum::Real),
             ]
             .boxed(),
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
+            // A `name` is text to this crate: the truncation to 63 bytes happens in the SQL
+            // layer's cast, where the character boundary is known, so the codec round-trips
+            // whatever it is handed exactly as it does for `text`.
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Bpchar => {
                 ".{0,32}".prop_map(Datum::Text).boxed()
             }
             // Valid documents, because that is what a `json` column holds — an arbitrary string

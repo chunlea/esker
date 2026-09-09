@@ -1,0 +1,45 @@
+# **The `name` type**, from PostgreSQL 19beta1.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it
+#
+# Captured in one session inside `BEGIN … ROLLBACK` over the fixture in `CORPUS_FIXTURE`. The
+# derivations are in `tests/captures/pg19_name_type.txt`.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`typlen` is 64 and positive**: `name` is the one string type that is fixed width, and it
+#     takes no typmod — `'x'::name(10)` is `42601`.
+#   * **It truncates at 63**, not 64: one byte is the terminator. By *bytes*, and never through
+#     the middle of a character — `repeat('é',64)::name` is 31 characters and 62 octets.
+#   * **Its collation is C**, so a `name` column sorts in byte order and every capital comes
+#     before every lower-case letter. That is not what a `text` column of the same values does.
+#   * Everything it produces is `text`: `name || text`, `upper(name)`, `name::text`.
+#
+SELECT typname, oid, typtype, typlen, typcategory, typdelim, typcollation FROM pg_type WHERE typname = 'name'	name,oid,"char",smallint,"char","char",oid	name|19|b|64|S|,|950
+SELECT format_type(19, -1)	text	name
+SELECT length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name)	integer	63
+SELECT length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name)	integer	63
+SELECT length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name)	integer	62
+SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name	boolean	t
+SELECT octet_length('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'::name)	integer	63
+SELECT length('éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé'::name), octet_length('éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé'::name)	integer,integer	31|62
+SELECT ('  x  '::name)::text, length('  x  '::name)	text,integer	  x  |5
+SELECT (''::name)::text, length(''::name)	text,integer	|0
+SELECT 'a'::name < 'b'::name, 'A'::name < 'a'::name	boolean,boolean	t|t
+SELECT 'plain'::name = 'plain'::text	boolean	t
+SELECT pg_typeof('x'::name)	regtype	name
+SELECT pg_typeof('x'::name || 'y')	regtype	text
+SELECT pg_typeof('x'::name::text)	regtype	text
+SELECT pg_typeof('x'::text::name)	regtype	name
+SELECT pg_typeof(upper('a'::name))	regtype	text
+SELECT length('abc'::name)	integer	3
+SELECT 'plain'::name LIKE 'pl%'	boolean	t
+SELECT 'x'::name(10)	!42601 type modifier is not allowed for type "name"
+SELECT 'x'::name::int	!22P02 invalid input syntax for type integer: "x"
+SELECT id, length(data), data FROM b4_nm ORDER BY id	bigint,integer,name	1|5|plain ; 2|63|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; 3|0| ; 4|5|MiXeD ; 5|5|apple ; 6|5|Apple
+SELECT id, data FROM b4_nm ORDER BY data, id	bigint,name	3| ; 6|Apple ; 4|MiXeD ; 2|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; 5|apple ; 1|plain
+SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.atttypid, a.atttypmod FROM pg_attribute a WHERE a.attrelid = 'b4_nm'::regclass AND a.attnum > 0 ORDER BY a.attnum	name,text,oid,integer	id|bigint|20|-1 ; data|name|19|-1
+SELECT column_name, data_type, character_maximum_length FROM information_schema.columns WHERE table_name = 'b4_nm' ORDER BY ordinal_position	name,character varying,integer	id|bigint|\N ; data|name|\N
+SELECT id, data FROM b4_nm WHERE data = 'plain'	bigint,name	1|plain
+SELECT count(*) FROM b4_nm WHERE data > 'a'	bigint	3

@@ -8447,6 +8447,24 @@ fn lower_plain_type(data_type: &DataType) -> Result<ColumnType> {
         {
             ty
         }
+        // **A known type written with a modifier it does not take** is PostgreSQL's own `42601`
+        // and not a missing-type refusal: `'x'::name(10)` is
+        // `type modifier is not allowed for type "name"`. Asked of `value::named_type`, which is
+        // the one parser that knows which types take one — a second list here would be a second
+        // place for the two to disagree.
+        DataType::Custom(name, modifiers)
+            if !modifiers.is_empty()
+                && name.0.len() == 1
+                && matches!(value::type_by_name(&name.to_string()), Ok(Some(_))) =>
+        {
+            // Asked for its *refusal*: `named_type` validates the modifier against the type and
+            // raises PostgreSQL's sentence when the type takes none. A type that does take one
+            // never arrives here — every such type has a `DataType` variant of its own — so a
+            // success falls through to the refusal below rather than inventing a typmod.
+            let spelled = format!("{}({})", name, modifiers.join(", "));
+            value::named_type(&spelled)?;
+            return Err(SqlError::unsupported(format!("the type {data_type}")));
+        }
         other => return Err(SqlError::unsupported(format!("the type {other}"))),
     })
 }

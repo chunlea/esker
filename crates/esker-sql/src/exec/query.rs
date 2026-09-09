@@ -3352,7 +3352,7 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // An `oid` is a number and compares with the integers: `26::oid = 26` is `t`.
             | ColumnType::Oid
             | ColumnType::Numeric => 0,
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => 1,
+            ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Bpchar => 1,
             ColumnType::Bool => 2,
             ColumnType::Bytea => 3,
             // A `date` is in the datetime family, not one of its own: `'2020-01-01'::date =

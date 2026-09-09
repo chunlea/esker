@@ -332,6 +332,10 @@ const TAG_REGCLASS: u8 = 90;
 /// only so that a stored column can say which it is.
 const TAG_INT2VECTOR: u8 = 91;
 const TAG_OIDVECTOR: u8 = 92;
+/// `name`, which shares `text`'s representation and needs a tag of its own only so that a stored
+/// column can say which it is. **Append-only**: 93 was free, and every tag already written keeps
+/// the meaning it had.
+const TAG_NAME: u8 = 93;
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
 const TAG_BIT_ARRAY: u8 = 71;
@@ -391,6 +395,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Double => TAG_DOUBLE,
         ColumnType::Int4 => TAG_INT4,
         ColumnType::Varchar => TAG_VARCHAR,
+        ColumnType::Name => TAG_NAME,
         ColumnType::Timestamp => TAG_TIMESTAMP,
         ColumnType::Int2 => TAG_INT2,
         ColumnType::Real => TAG_REAL,
@@ -531,6 +536,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_DOUBLE => ColumnType::Double,
         TAG_INT4 => ColumnType::Int4,
         TAG_VARCHAR => ColumnType::Varchar,
+        TAG_NAME => ColumnType::Name,
         TAG_TIMESTAMP => ColumnType::Timestamp,
         TAG_INT2 => ColumnType::Int2,
         TAG_REAL => ColumnType::Real,

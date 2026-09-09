@@ -1165,6 +1165,27 @@ impl Named {
     }
 }
 
+/// A value cut to what a `name` holds: **63 bytes**, on a character boundary.
+///
+/// `NAMEDATALEN` is 64 and the last byte is C's terminator, so 63 is the limit — the off-by-one a
+/// reader expects to be 64. The cut is by *bytes* and never through the middle of a character:
+/// `repeat('é',64)` is 31 characters and 62 octets rather than 31 and a half, measured. Truncation
+/// and not refusal is the type's own rule; a value too long for a `varchar(n)` is `22001` where
+/// this one is simply shorter.
+#[must_use]
+pub fn truncate_to_name(text: &str) -> String {
+    const LIMIT: usize = 63;
+    if text.len() <= LIMIT {
+        return text.to_owned();
+    }
+    // The last boundary at or before the limit, which is what stops a character being halved.
+    let mut end = LIMIT;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
 /// The OID of the array type PostgreSQL pairs with `ty`, from `pg_type.typarray`.
 ///
 /// An exhaustive match, measured one row at a time off a real server, so that **a type added to
@@ -1180,6 +1201,9 @@ pub fn array_oid(ty: ColumnType) -> u32 {
     match ty {
         // `regtype` is 2206 and `_regtype` is 2211.
         ColumnType::RegType => 2211,
+        // **No `_name` either**, for the same reason: a real server pairs `name` with `_name`
+        // (1003), and this node has no `ColumnType::NameArray` for that row to describe. Zero is
+        // the honest link — a pointer at a `pg_type` row that is not there is worse.
         // No `_regclass` here: an array of a regclass is not a type this node offers, so the
         // link is a zero rather than a pointer at a `pg_type` row that is not there.
         // Neither a `regclass` nor either vector has an array type on a real server.
@@ -1187,6 +1211,7 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // asking for one has no answer and `0` is `InvalidOid`, which is what a real server's
         // `typarray` holds for a type that has no array.
         ColumnType::RegClass
+        | ColumnType::Name
         | ColumnType::Int2Vector
         | ColumnType::OidVector
         | ColumnType::Int8Array
@@ -1421,6 +1446,9 @@ fn takes_typmod(ty: ColumnType) -> bool {
         | ColumnType::Int2Array
         | ColumnType::NumericArray
         | ColumnType::TextArray
+        // **Nor does `name`**, and a real server says so in its own words: `'x'::name(10)` is
+        // `42601 type modifier is not allowed for type "name"`. Fixed width is not a typmod.
+        | ColumnType::Name
         // An hstore takes no typmod either: `hstore(3)` is not a thing on a real server.
         | ColumnType::Hstore
         | ColumnType::HstoreArray
@@ -1539,6 +1567,7 @@ impl PgType for ColumnType {
         match self {
             ColumnType::Bool => 16,
             ColumnType::Bytea => 17,
+            ColumnType::Name => 19,
             ColumnType::Int8 => 20,
             // PostgreSQL's own, measured: `'regtype'::regtype::oid` is 2206.
             ColumnType::RegType => 2206,
@@ -1728,6 +1757,8 @@ impl PgType for ColumnType {
             ColumnType::Int2 => "smallint",
             ColumnType::Text => "text",
             ColumnType::Varchar => "character varying",
+            // Its own name, and the same one `format_type` gives it: there is no longer spelling.
+            ColumnType::Name => "name",
             ColumnType::Bpchar => "character",
             ColumnType::Json => "json",
             ColumnType::Jsonb => "jsonb",
@@ -1753,6 +1784,9 @@ impl PgType for ColumnType {
     fn type_len(self) -> i16 {
         match self {
             ColumnType::Bool => 1,
+            // **64 and positive**, where every other string type answers -1: `name` is fixed
+            // width. A client reads this from the `RowDescription` and from `pg_attribute.attlen`.
+            ColumnType::Name => 64,
             // Four bytes, unsigned, which is the whole of what makes it not an `int4`.
             ColumnType::Int4
             | ColumnType::Real
@@ -2069,6 +2103,11 @@ impl PgDatum for Datum {
             ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar => {
                 Datum::Text(text.to_owned())
             }
+            // **`namein` truncates**, which is the whole of what makes `name` not a `varchar`
+            // with an oid of its own: the value is cut to 63 bytes on the way in, not checked
+            // and refused. `repeat('a',64)::name = repeat('a',63)::name` is `t` because of this
+            // line (measured, `tests/captures/pg19_name_type.txt`).
+            ColumnType::Name => Datum::Text(truncate_to_name(text)),
             // `json` keeps the text exactly as sent, once it is known to be a document; `jsonb`
             // keeps the canonical form it prints as. ADR 0042 is why the two differ here and
             // nowhere else in this function.
@@ -2430,6 +2469,12 @@ impl PgDatum for Datum {
             | ColumnType::Bpchar
             | ColumnType::Citext
             | ColumnType::Ltree => binary_text(ty, bytes)?,
+            // The same truncation: a parameter sent in the binary format is still a `name`, and
+            // `namerecv` cuts it exactly as `namein` does.
+            ColumnType::Name => match binary_text(ty, bytes)? {
+                Datum::Text(text) => Datum::Text(truncate_to_name(&text)),
+                other => other,
+            },
             ColumnType::Bytea => Datum::Bytea(bytes.to_vec()),
         })
     }

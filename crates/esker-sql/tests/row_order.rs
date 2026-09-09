@@ -202,6 +202,7 @@ fn column_type(name: &str) -> ColumnType {
         // type whose key order is unchecked is a type whose range scans are unchecked — which is
         // what the exhaustiveness assertion at the end of the test is for.
         "varchar" => ColumnType::Varchar,
+        "name" => ColumnType::Name,
         // Its values are captured already padded, which is what a `character(n)` stores.
         "bpchar" => ColumnType::Bpchar,
         "timestamp" => ColumnType::Timestamp,
