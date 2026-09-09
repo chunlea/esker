@@ -39,6 +39,10 @@ mod tests {
     fn values_of(ty: ColumnType) -> BoxedStrategy<Datum> {
         use proptest::prelude::*;
         let values: BoxedStrategy<Datum> = match ty {
+            // **One value, and it is zero characters.** A `void` is never in a row, so this is the
+            // strategy for a type the round trip cannot reach — a single constant rather than a
+            // generator, which is what says so.
+            ColumnType::Void => Just(Datum::Text(String::new())).boxed(),
             // Any oid with any name: the two are independent, which is what the round trip has to
             // preserve — an oid that is no type carries its own digits, and two spellings of one
             // type carry different names for one value.
@@ -324,9 +328,12 @@ mod tests {
         // `ALL` and the user-range representations beside it: the second list is not in the
         // first for the reason `ColumnType::USER_RANGES` gives, and a codec property that
         // skipped it would leave two stored types unchecked.
+        // **`void` is not one of them**, for the reason `esker_keys::row`'s generator gives: it
+        // is a pseudo-type with a `pg_type` row and no column, so no row ever holds one.
         let every: Vec<ColumnType> = ColumnType::ALL
             .into_iter()
             .chain(ColumnType::USER_RANGES)
+            .filter(|ty| *ty != ColumnType::Void)
             .collect();
         proptest::collection::vec(proptest::sample::select(every), columns).prop_flat_map(
             move |types| {

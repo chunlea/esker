@@ -3472,6 +3472,10 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
     // the case PostgreSQL refuses.
     fn family(ty: ColumnType) -> u8 {
         match ty {
+            // **A family of one that is checked out below anyway.** A `void` has no comparison at
+            // all on a real server — it is a pseudo-type, and the only thing a client does with
+            // one is read the zero characters it prints.
+            ColumnType::Void => 92,
             // **A `regtype` is in the numbers' family**, with `oid`: measured,
             // `'text'::regtype = 25` is true against an uncast integer, so the two compare and a
             // family of its own would make that `42883`. Its array is its own, like every array.
@@ -4944,6 +4948,17 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // below with the rest. They were all `text` here while the node had no array of `name` to
         // name — `n.nspname = ANY (current_schemas(false))` is the predicate every catalog query
         // `ActiveRecord` sends is built on (`tests/captures/pg19_name_array.txt`).
+        // **A `void` for the three that cannot fail, a `boolean` for the four that can** — the
+        // split PostgreSQL's own `pg_proc.prorettype` makes, measured for all eleven of its
+        // advisory functions. This node folded every one of them to an empty string, so a client
+        // was told `text` for all seven.
+        Expr::Advisory { call, .. } => {
+            if call.is_void() {
+                ColumnType::Void
+            } else {
+                ColumnType::Bool
+            }
+        }
         Expr::CurrentSchema { all: Some(_) } => ColumnType::NameArray,
         Expr::CurrentSchema { all: None } | Expr::CurrentDatabase | Expr::CurrentUser => {
             ColumnType::Name
@@ -4953,7 +4968,6 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::Scalar { .. }
         | Expr::ToText { .. }
         | Expr::CurrentSetting { .. }
-        | Expr::Advisory { .. }
         | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
         Expr::Literal(Literal::Typed(value)) => value.column_type().unwrap_or(ColumnType::Text),
         Expr::Literal(Literal::Bool(_))

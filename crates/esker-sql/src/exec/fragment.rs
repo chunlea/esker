@@ -1038,7 +1038,9 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // **And the five geometric arrays for the same reason the shapes themselves are not
         // columnar**: `esker-columnar` has no tag for a geometric value, so an array of one has
         // nowhere to go either.
-        Row::Name
+        // **A `void` is not a column at all**, so it is not a columnar one either.
+        Row::Void
+        | Row::Name
         | Row::NameArray
         | Row::LsegArray
         | Row::PathArray

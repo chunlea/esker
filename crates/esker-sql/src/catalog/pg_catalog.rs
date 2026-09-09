@@ -2938,6 +2938,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::BpcharArray => "_bpchar",
         ColumnType::VarcharArray => "_varchar",
         ColumnType::NameArray => "_name",
+        ColumnType::Void => "void",
         ColumnType::DateArray => "_date",
         ColumnType::TimeArray => "_time",
         ColumnType::TimestampArray => "_timestamp",
@@ -2975,6 +2976,8 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
 /// (ADR 0050); this is only the types the column vocabulary has.
 fn typtype(ty: ColumnType) -> &'static str {
     match ty {
+        // The one pseudo-type, measured: `void` is `p` where every storage type here is `b`.
+        ColumnType::Void => "p",
         ColumnType::TsRange
         | ColumnType::TstzRange
         | ColumnType::Int4Range
@@ -2997,6 +3000,10 @@ fn typtype(ty: ColumnType) -> &'static str {
 /// a type added here has to answer instead of inheriting somebody else's letter.
 pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
     match ty {
+        // **`P` is the pseudo-type group and `void` is this vocabulary's only member.** Measured
+        // beside `typtype = 'p'`: the pair is what says a type is not storage, and it is why no
+        // column may be declared one and why its `typarray` is 0.
+        ColumnType::Void => "P",
         // A `regtype` sits in the `N` group below beside the `oid` it is, and its array in `A`
         // with every other array — which is the point of the model (ADR 0077) rather than an
         // exception to it.
@@ -3165,6 +3172,9 @@ fn typdelim(ty: ColumnType) -> &'static str {
 )]
 fn typinput(ty: ColumnType) -> &'static str {
     match ty {
+        // Measured, and it exists even though nothing calls it: a pseudo-type still carries an
+        // input function on a real server.
+        ColumnType::Void => "void_in",
         // PostgreSQL's own name; the array's `array_in` is in the group below with every other.
         ColumnType::RegType => "regtypein",
         ColumnType::RegClass => "regclassin",

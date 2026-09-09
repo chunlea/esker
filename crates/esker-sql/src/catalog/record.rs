@@ -350,6 +350,10 @@ const TAG_POLYGON_ARRAY: u8 = 98;
 const TAG_CIRCLE_ARRAY: u8 = 99;
 /// `line[]`, additive like every tag before it.
 const TAG_LINE_ARRAY: u8 = 100;
+/// `void`, additive like every tag before it — and no catalog record will ever carry it, because
+/// no column is declared one. The vocabulary is total, which is what keeps the two tag spaces in
+/// step.
+const TAG_VOID: u8 = 101;
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
 const TAG_BIT_ARRAY: u8 = 71;
@@ -490,6 +494,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::PolygonArray => TAG_POLYGON_ARRAY,
         ColumnType::CircleArray => TAG_CIRCLE_ARRAY,
         ColumnType::LineArray => TAG_LINE_ARRAY,
+        ColumnType::Void => TAG_VOID,
         ColumnType::NameArray => TAG_NAME_ARRAY,
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
@@ -643,6 +648,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_POLYGON_ARRAY => ColumnType::PolygonArray,
         TAG_CIRCLE_ARRAY => ColumnType::CircleArray,
         TAG_LINE_ARRAY => ColumnType::LineArray,
+        TAG_VOID => ColumnType::Void,
         TAG_NAME_ARRAY => ColumnType::NameArray,
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,
