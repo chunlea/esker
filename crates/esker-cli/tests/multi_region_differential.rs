@@ -156,9 +156,21 @@ fn a_multi_region_table_is_never_answered_wrongly() {
     let mut deferred: Vec<&str> = Vec::new();
 
     for (query, expected) in queries() {
-        let ready = guarded || cluster.columnar_within(query, READINESS);
+        // **One observation, kept.** `columnar_within` answering `true` and then planning the
+        // query again is two samples of a state that is not monotone: a learner that has caught
+        // up can fall behind under load, and the second plan then says `Engine: rows` for a query
+        // the wait had ready — which is how this assertion fired at load 12 *after* the bounded
+        // wait landed, on `SELECT count(*) FROM ledger`, the first query in the list. So the plan
+        // the wait saw is the plan this loop asserts on, and the guarded arm plans for itself.
+        let ready_plan = if guarded {
+            None
+        } else {
+            cluster.columnar_plan_within(query, READINESS)
+        };
+        let ready = guarded || ready_plan.is_some();
         let rows = rows_of(&cluster.query_on("row", query));
-        let plan = cluster.query_on("auto", &format!("EXPLAIN ANALYZE {query}"));
+        let plan = ready_plan
+            .unwrap_or_else(|| cluster.query_on("auto", &format!("EXPLAIN ANALYZE {query}")));
         let flat: Vec<String> = expected
             .iter()
             .map(|row| row.first().cloned().unwrap_or_default())
@@ -223,9 +235,17 @@ fn a_multi_region_table_is_never_answered_wrongly() {
 ///
 /// So the half that is a pure function of a string gets a test, with the strings copied from the
 /// gate logs that reddened this test six times in one night. The other half —
-/// `Cluster::columnar_within` returning `false` and the loop deferring that query — is only
+/// `Cluster::columnar_plan_within` answering `None` and the loop deferring that query — is only
 /// reachable against a cluster whose learner is behind, and is not exercised here; the guard after
 /// the loop is what stops a deferral from being silent.
+///
+/// **And the round after that one found the third state.** The wait was bounded and the deferral
+/// was recorded, and the test still failed at load 12 on `SELECT count(*) FROM ledger`: the wait
+/// saw `Engine: columnar` and the loop's own `EXPLAIN ANALYZE`, a moment later, saw
+/// `Engine: rows`. Readiness is not monotone — a learner that has caught up falls behind again —
+/// so two samples of it disagree under load. The loop keeps the plan the wait saw instead of
+/// asking twice. Nothing about the *answers* moved: `rows == expected` is still asserted in every
+/// state and the columnar arm is still compared whenever it answered at all.
 #[test]
 fn the_refusals_the_harness_waits_out_are_the_ones_it_measured() {
     for waited in [

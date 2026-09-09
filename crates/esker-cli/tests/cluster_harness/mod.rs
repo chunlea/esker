@@ -398,15 +398,31 @@ impl Cluster {
     /// comparing the answers, because the row engine is always there and the answer being right is
     /// the assertion that must not be waited out.
     pub fn columnar_within(&self, probe: &str, seconds: u64) -> bool {
+        self.columnar_plan_within(probe, seconds).is_some()
+    }
+
+    /// The same wait, **handing back the plan it saw** — which is what a caller that then asserts
+    /// on a plan has to use.
+    ///
+    /// `columnar_within` answering `true` and the caller running its own `EXPLAIN ANALYZE`
+    /// afterwards is two observations of a state that is **not monotone**: a learner that has
+    /// caught up can fall behind again under load, and then the second plan says `Engine: rows`
+    /// for a query the first one had ready. That is what reddened
+    /// `multi_region_differential` at load 12 after the bounded wait landed — the wait worked and
+    /// the re-plan raced it.
+    ///
+    /// So the observation is taken once. The bound and the answer assertions are untouched: this
+    /// removes a second sample, not a comparison.
+    pub fn columnar_plan_within(&self, probe: &str, seconds: u64) -> Option<String> {
         let deadline = Instant::now() + Duration::from_secs(seconds);
         loop {
             let plan = self.query_on("auto", &format!("EXPLAIN ANALYZE {probe}"));
             if plan.contains("Engine: columnar") {
-                return true;
+                return Some(plan);
             }
             if Instant::now() >= deadline {
                 eprintln!("harness: `{probe}` was still on the rows after {seconds}s");
-                return false;
+                return None;
             }
             std::thread::sleep(Duration::from_secs(2));
         }
