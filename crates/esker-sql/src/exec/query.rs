@@ -3412,6 +3412,9 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // early return below; this rank exists so the match stays total.
             ColumnType::Point => 57,
             ColumnType::PointArray => 58,
+            // Its own family: an array compares with an array of the same element, and 85 is the
+            // next number nothing else uses — 59 is `floatrange`'s and 77 `xml`'s.
+            ColumnType::BoxArray => 85,
             // A family each, like every other range: a `floatrange` compares with a
             // `floatrange` and `float_range = '[0.5,0.7]'::numrange` is `42883`, measured.
             ColumnType::FloatRange => 59,

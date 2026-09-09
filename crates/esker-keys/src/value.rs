@@ -250,6 +250,13 @@ pub enum ColumnType {
     Point,
     /// `point[]`. `geometric_test.rb` declares one (`t.point :array_of_points, array: true`).
     PointArray,
+    /// `box[]`, and **the one array type in all of `pg_type` whose delimiter is not a comma**.
+    ///
+    /// A `box` is written `(x1,y1),(x2,y2)` — commas inside the value — so an array of them
+    /// separates its elements with `;` instead: `{(1,1),(0,0);(3,3),(2,2)}` is two boxes.
+    /// `type_lookup_test.rb` looks this type up by oid precisely to read that delimiter back
+    /// (`tests/array_delimiter.rs`).
+    BoxArray,
     /// PostgreSQL's `money`: **a count of cents in an `i64`**, and nothing else.
     ///
     /// `typlen` is 8 and `typstorage` is `p` — plain, not a varlena — so the range is exactly
@@ -534,7 +541,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 91] = [
+    pub const ALL: [ColumnType; 92] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -603,6 +610,7 @@ impl ColumnType {
         ColumnType::Int8RangeArray,
         ColumnType::Point,
         ColumnType::PointArray,
+        ColumnType::BoxArray,
         ColumnType::Money,
         ColumnType::MoneyArray,
         ColumnType::Inet,

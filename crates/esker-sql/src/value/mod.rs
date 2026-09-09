@@ -783,6 +783,7 @@ pub fn has_equality_operator(ty: ColumnType) -> bool {
             | ColumnType::XmlArray
             | ColumnType::Point
             | ColumnType::PointArray
+            | ColumnType::BoxArray
             | ColumnType::Lseg
             | ColumnType::Box
             | ColumnType::Path
@@ -1246,6 +1247,7 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::NumRangeArray
         | ColumnType::Int8RangeArray
         | ColumnType::PointArray
+        | ColumnType::BoxArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray
         | ColumnType::CidrArray
@@ -1257,11 +1259,11 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // gap rather than a guess at an oid that is allocated per database anyway.
         | ColumnType::FloatRange
         | ColumnType::VarcharRange
-        // **And no array of a shape here.** A real server pairs each with one (`_lseg` 1018 and
-        // so on) and `geometric_test.rb` declares none, so this is a named gap rather than six
-        // more types — the same call `floatrange[]` got.
+        // **And no array of the other five shapes.** A real server pairs each with one (`_lseg`
+        // is 1018 and so on) and `geometric_test.rb` declares none, so this is a named gap rather
+        // than five more types — the same call `floatrange[]` got. `box` left this list when
+        // `type_lookup_test.rb` turned out to look `_box` up by oid for its delimiter.
         | ColumnType::Lseg
-        | ColumnType::Box
         | ColumnType::Path
         | ColumnType::Polygon
         | ColumnType::Circle
@@ -1288,6 +1290,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         ColumnType::Bit => 1561,
         ColumnType::VarBit => 1563,
         ColumnType::Point => 1017,
+        // `_box`, whose delimiter is `;` — the one array type in `pg_type` where it is not a comma.
+        ColumnType::Box => 1020,
         ColumnType::Bool => 1000,
         ColumnType::Bytea => 1001,
         ColumnType::Int8 => 1016,
@@ -1463,7 +1467,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray
         | ColumnType::Point
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
     }
 }
 
@@ -1667,7 +1671,8 @@ impl PgType for ColumnType {
             | ColumnType::DateRangeArray
             | ColumnType::NumRangeArray
             | ColumnType::Int8RangeArray
-            | ColumnType::PointArray => 0,
+            | ColumnType::PointArray
+            | ColumnType::BoxArray => 0,
         }
     }
 
@@ -1701,6 +1706,7 @@ impl PgType for ColumnType {
             ColumnType::VarcharRange => "varcharrange",
             ColumnType::Point => "point",
             ColumnType::PointArray => "point[]",
+            ColumnType::BoxArray => "box[]",
             ColumnType::Money => "money",
             ColumnType::MoneyArray => "money[]",
             ColumnType::Inet => "inet",
@@ -1834,7 +1840,7 @@ impl PgType for ColumnType {
             | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
-            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray
+            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray
             | ColumnType::Text
             | ColumnType::Varchar
             | ColumnType::Bpchar
@@ -2068,6 +2074,7 @@ impl PgDatum for Datum {
             | ColumnType::NumRangeArray
             | ColumnType::Int8RangeArray
             | ColumnType::PointArray
+            | ColumnType::BoxArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray
             | ColumnType::CidrArray
@@ -2331,6 +2338,7 @@ impl PgDatum for Datum {
             | ColumnType::NumRangeArray
             | ColumnType::Int8RangeArray
             | ColumnType::PointArray
+            | ColumnType::BoxArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray
             | ColumnType::CidrArray
@@ -3126,7 +3134,7 @@ mod tests {
                         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
-                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray
+                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray
                         | ColumnType::XmlArray
                         | ColumnType::LtreeArray
                         | ColumnType::Bytea

@@ -133,6 +133,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Int8RangeArray => 57,
         ColumnType::Point => 58,
         ColumnType::PointArray => 59,
+        // 95: the next free tag. Additive, like every one before it.
+        ColumnType::BoxArray => 95,
         ColumnType::FloatRange => 60,
         ColumnType::VarcharRange => 61,
         ColumnType::Money => 62,
@@ -226,6 +228,7 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         57 => ColumnType::Int8RangeArray,
         58 => ColumnType::Point,
         59 => ColumnType::PointArray,
+        95 => ColumnType::BoxArray,
         60 => ColumnType::FloatRange,
         61 => ColumnType::VarcharRange,
         62 => ColumnType::Money,

@@ -261,7 +261,7 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         | StoredType::NumRangeArray
         | StoredType::Int8RangeArray
         | StoredType::Point
-        | StoredType::PointArray | StoredType::BoolArray | StoredType::ByteaArray | StoredType::BpcharArray | StoredType::VarcharArray | StoredType::DateArray | StoredType::TimeArray | StoredType::TimestampArray | StoredType::TimestampTzArray | StoredType::IntervalArray | StoredType::RealArray | StoredType::DoubleArray | StoredType::UuidArray | StoredType::JsonArray | StoredType::JsonbArray | StoredType::OidArray | StoredType::CitextArray | StoredType::RegType | StoredType::RegTypeArray | StoredType::RegClass | StoredType::Int2Vector | StoredType::OidVector => return None,
+        | StoredType::PointArray | StoredType::BoxArray | StoredType::BoolArray | StoredType::ByteaArray | StoredType::BpcharArray | StoredType::VarcharArray | StoredType::DateArray | StoredType::TimeArray | StoredType::TimestampArray | StoredType::TimestampTzArray | StoredType::IntervalArray | StoredType::RealArray | StoredType::DoubleArray | StoredType::UuidArray | StoredType::JsonArray | StoredType::JsonbArray | StoredType::OidArray | StoredType::CitextArray | StoredType::RegType | StoredType::RegTypeArray | StoredType::RegClass | StoredType::Int2Vector | StoredType::OidVector => return None,
     })
 }
 

@@ -107,6 +107,11 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 // an array key is built out of its element's key encoding and a point has none.
                 | ColumnType::Point
                 | ColumnType::PointArray
+                // `box[]` is excluded for `point[]`'s reason exactly: an array key is its
+                // element's key encoding, and a `box` has none. It arrived with the delimiter
+                // unit — `type_lookup_test.rb` looks `_box` up by oid — and it is a relation a
+                // client reads about rather than one this node indexes.
+                | ColumnType::BoxArray
                 // **The other six geometric shapes, for `point`'s reason and with a real
                 // server's agreement**: `CREATE INDEX` on an `lseg` column is
                 // `42704 data type lseg has no default operator class for access method "btree"`,

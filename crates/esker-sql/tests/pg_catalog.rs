@@ -467,6 +467,20 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "b".to_owned(),
                 "0".to_owned(),
             ],
+            // **`_box` is the one array in all of `pg_type` whose delimiter is not a comma**, and
+            // it is here because `type_lookup_test.rb` looks it up by oid to read exactly that.
+            // The `;` is `box`'s own: a box is written `(x1,y1),(x2,y2)`, so a comma could not
+            // separate two of them.
+            vec![
+                "1020".to_owned(),
+                "_box".to_owned(),
+                "603".to_owned(),
+                ";".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
             vec![
                 "1021".to_owned(),
                 "_float4".to_owned(),

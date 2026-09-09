@@ -81,6 +81,7 @@ mod tests {
             | ColumnType::TsVectorArray
             | ColumnType::TsQueryArray
             | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray
+ | ColumnType::BoxArray
             | ColumnType::BoolArray
             | ColumnType::ByteaArray
             | ColumnType::BpcharArray
