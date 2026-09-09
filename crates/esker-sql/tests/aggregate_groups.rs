@@ -29,7 +29,8 @@ mod parity;
 /// enum of storage types, a domain is carried beside a column rather than as one, and the oid a
 /// client is sent has to come from the enum. Answering `_name` is the base type's array, which is
 /// the right *values* under the wrong name. Closing it is the domain half of the type surface,
-/// which is a unit with an ADR in it and not an arm in this one.
+/// which is a unit with an ADR in it and not an arm in this one — **`debts-v1.1.md` #37**, which
+/// is where the sizing lives so that this list does not have to carry it.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[

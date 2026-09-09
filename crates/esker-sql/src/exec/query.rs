@@ -3089,6 +3089,21 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                             | CatalogFunc::NullIf
                             | CatalogFunc::Greatest
                             | CatalogFunc::Least
+                            // **`pg_typeof` does not read its argument at all**, which is the
+                            // property this list is about: the exclusions are the functions whose
+                            // result is *not* `text`, and `pg_typeof`'s is a `regtype`. Reading a
+                            // `bpchar` argument as `text` on the way in made it answer `text`,
+                            // which is a report about the coercion this function inserted rather
+                            // than about the expression the user wrote — `debts-v1.1.md` #33.
+                            //
+                            // It is the same seam the three instances before it were, one layer
+                            // over: `output_columns` describes the column from the expression and
+                            // `pg_typeof` described it from the expression *plus a cast of its
+                            // own*, so one function answered two things. The wire half was right
+                            // the whole time, which is why no corpus row caught it — a corpus
+                            // compares what a column says, and both readers are only visible
+                            // together.
+                            | CatalogFunc::PgTypeof
                     ) {
                         arg
                     } else {
