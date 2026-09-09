@@ -139,10 +139,6 @@ fn every_base_type_has_an_array_or_is_listed() {
         .collect();
     // Each of these is a named gap with a reason, not an oversight:
     //
-    //   the five remaining geometric shapes  `geometric_test.rb` declares no array of one, and
-    //                                        `box[]` left this list when `type_lookup_test.rb`
-    //                                        turned out to look `_box` up by oid (ADR 0084's
-    //                                        sibling unit)
     //   regclass, int2vector, oidvector      catalog types a client reads and never stores an
     //                                        array of
     //   lquery                               `ltree`'s *pattern* type: it appears in a `WHERE`
@@ -153,17 +149,11 @@ fn every_base_type_has_an_array_or_is_listed() {
     // being decided — nine names were expected and the node answered ten. **`name` left the list**
     // when `_name` (1003) was built: run 106 lost ten tests because `array_agg` over a `name`
     // column had no array type to answer with (`tests/name_array.rs`).
-    let expected = [
-        "circle",
-        "int2vector",
-        "line",
-        "lquery",
-        "lseg",
-        "oidvector",
-        "path",
-        "polygon",
-        "regclass",
-    ];
+    // **The five geometric shapes left this list with ADR 0091.** They had been one named gap with
+    // one reason — no suite test declares an array of one — until r1's wire sweep found
+    // `array_agg` over a `circle` coming back a scalar `text`, which made the reason false for
+    // three of the five; splitting it would have left a worse gap than it closed.
+    let expected = ["int2vector", "lquery", "oidvector", "regclass"];
     assert_eq!(
         without, expected,
         "a base type gained or lost its array without this list being updated"

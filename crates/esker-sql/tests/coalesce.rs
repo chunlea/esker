@@ -19,6 +19,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // is the standing choice every catalog view in this crate makes. `current_database()` is one
     // of them, and `COALESCE` carries the type through, which is what the last line measures.
     types: &[
+        // **The two constant-width divergences this line carried are gone**, and what is left is
+        // `pg_typeof`'s own `regtype`/`text` trade (ADR 0077): the `int4` rung (ADR 0087) and the
+        // decimal-literal `numeric` closed the widths, and **the promotion itself was always
+        // right** — the integer gives way to the wider type rather than the first argument
+        // winning, which is what this line was added to measure.
+        "SELECT 'r', pg_typeof(COALESCE(NULL::int4, 0)), pg_typeof(COALESCE(NULL::text, 'x')), \
+         pg_typeof(COALESCE(1, 2.5))",
         "SELECT 'r', current_database()",
         "SELECT 'r', pg_encoding_to_char(encoding) FROM pg_database WHERE datname = current_database()",
         "SELECT 'r', COALESCE(NULL, current_database())",
@@ -45,18 +52,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'r', pg_typeof(current_database())",
             "pg_typeof answers text here, and current_database is a name there and text here",
             "pg19_coalesce_current_database.txt:55",
-        ),
-        // The two standing constant-width divergences, seen through `COALESCE`'s promotion: a bare
-        // integer constant is `int8` here and `int4` there, and a decimal constant is
-        // `double precision` here and `numeric` there. **The promotion itself is right** — the
-        // integer gives way to the wider type rather than the first argument winning — which is
-        // what this line was added to measure.
-        (
-            "SELECT 'r', pg_typeof(COALESCE(NULL::int4, 0)), pg_typeof(COALESCE(NULL::text, 'x')), \
-             pg_typeof(COALESCE(1, 2.5))",
-            "a bare integer constant is int8 here and int4 there, and a decimal is double \
-             precision here and numeric there",
-            "pg19_coalesce_current_database.txt:59",
         ),
         // Both messages are right in every part except that width: the `22P02` is the unknown
         // literal coerced to the common type, and the `42804` names `COALESCE` and the two types

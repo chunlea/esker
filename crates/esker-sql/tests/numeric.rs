@@ -25,6 +25,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // and is too narrow for a cast. Closing it means `plan::Literal::Typed` carrying the typmod
     // it was cast to, which is a change to the plan's value shape and not to this type.
     types: &[
+        // **All four answers agree now**, and it took two units: `pg_typeof` answers them at all
+        // (it was `0A000` naming itself), and the first of the four — a bare `1.5` — is a
+        // `numeric` here as it is there. What is left is `pg_typeof`'s own `regtype`/`text` trade
+        // (ADR 0077).
+        "SELECT pg_typeof(1.5), pg_typeof(1.5::numeric), pg_typeof(sum(1.5::numeric)), \
+         pg_typeof(avg(1::int8))",
         // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
@@ -59,11 +65,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT (10::numeric ^ 100)::text",
             "Arithmetic. The line's point — that a `numeric` grows to a hundred digits without a width to overflow — is the storage half, and that is built: the corpus stores and prints exact values of any length.",
             "pg19_numeric.txt:87",
-        ),
-        (
-            "SELECT pg_typeof(1.5), pg_typeof(1.5::numeric), pg_typeof(sum(1.5::numeric)), pg_typeof(avg(1::int8))",
-            "`pg_typeof` is `0A000` naming itself, for every type. The first of its four answers is also the declared bare-decimal divergence: `1.5` is a `numeric` on a real server and a `double precision` here, which is the next unit's to close now that the type exists.",
-            "pg19_numeric.txt:57",
         ),
         (
             "SELECT round(1.245, 2), trunc(1.999, 2), ceil(1.1), floor(1.9)",

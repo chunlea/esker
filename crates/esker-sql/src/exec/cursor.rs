@@ -2413,7 +2413,10 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         Expr::Literal(Literal::Null | Literal::TypedNull(_)) => Datum::Null,
         Expr::Literal(Literal::Bool(value)) => Datum::Bool(*value),
         Expr::Literal(Literal::Integer(value)) => Datum::Int8(*value),
-        Expr::Literal(Literal::Decimal(digits)) => Datum::from_text(ColumnType::Double, digits)?,
+        // **A `numeric`, not a `float8`.** The scale a literal is written with is part of its
+        // value — `1.10` is not `1.1` — and reading it as a float threw that away before anything
+        // could ask.
+        Expr::Literal(Literal::Decimal(digits)) => Datum::from_text(ColumnType::Numeric, digits)?,
         Expr::Literal(Literal::String(text)) => Datum::Text(text.clone()),
         Expr::Literal(Literal::Typed(value)) => (**value).clone(),
         Expr::Column { name, .. } => {

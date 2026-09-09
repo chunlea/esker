@@ -340,6 +340,16 @@ const TAG_NAME: u8 = 93;
 const TAG_BOX_ARRAY: u8 = 94;
 /// `name[]`, additive like every tag before it.
 const TAG_NAME_ARRAY: u8 = 95;
+/// `lseg[]`, additive like every tag before it.
+const TAG_LSEG_ARRAY: u8 = 96;
+/// `path[]`, additive like every tag before it.
+const TAG_PATH_ARRAY: u8 = 97;
+/// `polygon[]`, additive like every tag before it.
+const TAG_POLYGON_ARRAY: u8 = 98;
+/// `circle[]`, additive like every tag before it.
+const TAG_CIRCLE_ARRAY: u8 = 99;
+/// `line[]`, additive like every tag before it.
+const TAG_LINE_ARRAY: u8 = 100;
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
 const TAG_BIT_ARRAY: u8 = 71;
@@ -389,6 +399,12 @@ fn state_of(tag: u8) -> Result<SchemaState> {
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over the whole type vocabulary, and it is a list of names \
+              rather than of rules; splitting it would put half the vocabulary somewhere \
+              else and let a type be added to one half without the other"
+)]
 fn tag_of(ty: ColumnType) -> u8 {
     match ty {
         ColumnType::Int8 => TAG_INT8,
@@ -469,6 +485,11 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Point => TAG_POINT,
         ColumnType::PointArray => TAG_POINT_ARRAY,
         ColumnType::BoxArray => TAG_BOX_ARRAY,
+        ColumnType::LsegArray => TAG_LSEG_ARRAY,
+        ColumnType::PathArray => TAG_PATH_ARRAY,
+        ColumnType::PolygonArray => TAG_POLYGON_ARRAY,
+        ColumnType::CircleArray => TAG_CIRCLE_ARRAY,
+        ColumnType::LineArray => TAG_LINE_ARRAY,
         ColumnType::NameArray => TAG_NAME_ARRAY,
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
@@ -532,6 +553,11 @@ fn shape_of(tag: u8) -> Result<ExprShape> {
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the reverse of `tag_of`, and it has to stay the same shape as the table it \
+              inverts"
+)]
 fn type_of(tag: u8) -> Result<ColumnType> {
     Ok(match tag {
         TAG_INT8 => ColumnType::Int8,
@@ -612,6 +638,11 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_POINT => ColumnType::Point,
         TAG_POINT_ARRAY => ColumnType::PointArray,
         TAG_BOX_ARRAY => ColumnType::BoxArray,
+        TAG_LSEG_ARRAY => ColumnType::LsegArray,
+        TAG_PATH_ARRAY => ColumnType::PathArray,
+        TAG_POLYGON_ARRAY => ColumnType::PolygonArray,
+        TAG_CIRCLE_ARRAY => ColumnType::CircleArray,
+        TAG_LINE_ARRAY => ColumnType::LineArray,
         TAG_NAME_ARRAY => ColumnType::NameArray,
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,

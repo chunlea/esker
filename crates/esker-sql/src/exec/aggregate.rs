@@ -232,7 +232,21 @@ impl Aggregation {
                 // both work — and `min(ltree)` is still `42883 function min(ltree) does not
                 // exist`. Nothing about the ordering implies the aggregate; ADR 0031's rule, one
                 // type longer.
-                | ColumnType::Ltree => undefined(),
+                | ColumnType::Ltree
+                // **And all seven geometric shapes**, measured one at a time:
+                // `min(point)`, `min(box)`, `min(lseg)`, `min(path)`, `max(polygon)`,
+                // `min(circle)` and `max(line)` are each `42883 function min(<type>) does not
+                // exist`. The ninth entry on ADR 0031's list, and the one that shows the rule best:
+                // an `lseg`'s `=` **answers** — `'…'::lseg = '…'::lseg` is `t` — and its `min`
+                // still does not exist, because the aggregate needs a btree family and equality
+                // alone is not one (`tests/captures/pg19_geometric_array.txt`).
+                | ColumnType::Point
+                | ColumnType::Box
+                | ColumnType::Lseg
+                | ColumnType::Path
+                | ColumnType::Polygon
+                | ColumnType::Circle
+                | ColumnType::Line => undefined(),
                 // Measured: `min(varchar)` and `max(varchar)` come back as **`text`** on a real
                 // server, and `min(character(n))` comes back as **`bpchar`**. The string family
                 // does not decay uniformly — `bpchar` has a `min` of its own where `varchar`

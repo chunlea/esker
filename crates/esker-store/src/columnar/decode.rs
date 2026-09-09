@@ -202,6 +202,11 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         // `fragment::column_type` answers the same on the other side of this seam (ADR 0084).
         | StoredType::Name
         | StoredType::NameArray
+        | StoredType::LsegArray
+        | StoredType::PathArray
+        | StoredType::PolygonArray
+        | StoredType::CircleArray
+        | StoredType::LineArray
         // **An hstore column is not columnar**, the same deliberate gap an array column is: it is
         // text-shaped and `esker-columnar` could hold one, but its own `ColumnType` is a separate
         // enum and teaching it a type is that crate's unit. A table with one routes to the row

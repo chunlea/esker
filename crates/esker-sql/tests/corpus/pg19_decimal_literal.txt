@@ -1,0 +1,44 @@
+SELECT CASE WHEN true THEN 1 ELSE 1.5 END	numeric	1
+SELECT CASE WHEN false THEN 1 ELSE 1.5 END	numeric	1.5
+SELECT CASE WHEN true THEN 1 ELSE 2 END	integer	1
+SELECT COALESCE(1, 1.5)	numeric	1
+SELECT COALESCE(1.5, 1)	numeric	1.5
+SELECT COALESCE(a, 1) FROM (VALUES (1)) s(a)	integer	1
+SELECT CASE WHEN false THEN 1 ELSE 0.100000000000000000000001 END	numeric	0.100000000000000000000001
+SELECT CASE WHEN false THEN 1 ELSE 1.10 END	numeric	1.10
+SELECT COALESCE(NULL::int4, 1.10)	numeric	1.10
+SELECT pg_typeof(CASE WHEN true THEN 1 ELSE 1.5 END), pg_typeof(COALESCE(1, 1.5))	regtype,regtype	numeric|numeric
+SELECT pg_typeof(1.5), pg_typeof(1.5::float8), pg_typeof(1e3)	regtype,regtype,regtype	numeric|double precision|numeric
+SELECT pg_typeof(CASE WHEN true THEN 1::int4 ELSE 1.5::float8 END)	regtype	double precision
+SELECT pg_typeof(CASE WHEN true THEN 1.5::numeric ELSE 1.5::float8 END)	regtype	double precision
+SELECT pg_typeof(CASE WHEN true THEN 1::int8 ELSE 1::int4 END)	regtype	bigint
+SELECT pg_typeof(CASE WHEN true THEN 1::int4 ELSE 'x'::text END)	!42804 CASE types text and integer cannot be matched
+SELECT pg_typeof(COALESCE(1::int4, 1::int8))	regtype	bigint
+SELECT pg_typeof(COALESCE(1::numeric, 1::float8))	regtype	double precision
+SELECT pg_typeof(GREATEST(1, 1.5)), pg_typeof(LEAST(1, 1.5))	regtype,regtype	numeric|numeric
+SELECT GREATEST(1, 1.5), LEAST(1, 1.5)	numeric,numeric	1.5|1
+SELECT 1.5 + 1, pg_typeof(1.5 + 1)	numeric,regtype	2.5|numeric
+SELECT 1.5 * 3, pg_typeof(1.5 * 3)	numeric,regtype	4.5|numeric
+SELECT 0.1 + 0.2, pg_typeof(0.1 + 0.2)	numeric,regtype	0.3|numeric
+SELECT 1.10, pg_typeof(1.10)	numeric,regtype	1.10|numeric
+SELECT CASE WHEN true THEN 1.10 ELSE 2 END	numeric	1.10
+SELECT sum(v), pg_typeof(sum(v)) FROM (VALUES (1.10),(2.20)) t(v)	numeric,regtype	3.30|numeric
+SELECT avg(v), pg_typeof(avg(v)) FROM (VALUES (1.10),(2.20)) t(v)	numeric,regtype	1.6500000000000000|numeric
+SELECT 1.5::text, 1.5::float8::text	text,text	1.5|1.5
+SELECT 10.0/3.0, pg_typeof(10.0/3.0)	numeric,regtype	3.3333333333333333|numeric
+SELECT pg_typeof(CASE WHEN true THEN NULL ELSE 1.5 END)	regtype	numeric
+SELECT pg_typeof(COALESCE(NULL, 1.5))	regtype	numeric
+SELECT 1.5 = 1.5, 1.5 > 1, 1.5 < 2	boolean,boolean,boolean	t|t|t
+SELECT 1.5::int4, 1.5::int8, 2.5::int4	integer,bigint,integer	2|2|3
+SELECT -1.5, pg_typeof(-1.5)	numeric,regtype	-1.5|numeric
+SELECT 1.5e2, pg_typeof(1.5e2)	numeric,regtype	150|numeric
+SELECT abs(-1.5), pg_typeof(abs(-1.5))	numeric,regtype	1.5|numeric
+SELECT round(1.55, 1), pg_typeof(round(1.55, 1))	numeric,regtype	1.6|numeric
+SELECT 1.5 || 'x'	text	1.5x
+SELECT CASE WHEN true THEN 1 ELSE 1.5::float8 END, pg_typeof(CASE WHEN true THEN 1 ELSE 1.5::float8 END)	double precision,regtype	1|double precision
+SELECT ARRAY[1, 1.5], pg_typeof(ARRAY[1, 1.5])	numeric[],regtype	{1,1.5}|numeric[]
+SELECT x, pg_typeof(x) FROM (VALUES (1.5),(2)) t(x) ORDER BY x	numeric,regtype	1.5|numeric ; 2|numeric
+SELECT 1.5 + 1.5, 1.5 - 0.5, 1.5 * 2, 3.0 / 2	numeric,numeric,numeric,numeric	3.0|1.0|3.0|1.5000000000000000
+SELECT 7.5 % 2, pg_typeof(7.5 % 2)	numeric,regtype	1.5|numeric
+SELECT 2.0 ^ 3, pg_typeof(2.0 ^ 3)	numeric,regtype	8.0000000000000000|numeric
+SELECT 100000000000000000000.5, pg_typeof(100000000000000000000.5)	numeric,regtype	100000000000000000000.5|numeric
