@@ -2469,11 +2469,35 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             answer
         }
         Expr::Case {
+            operand,
             branches,
             otherwise,
         } => {
+            // **The simple form's operand is evaluated once**, not once per branch: a real server
+            // evaluates `CASE`'s `arg` a single time, and a volatile one would otherwise be a
+            // different value at every `WHEN`. `None` here is the searched form, whose `WHEN` is
+            // the condition itself.
+            let subject = match operand {
+                Some(operand) => Some(evaluate_in(operand, row, env)?),
+                None => None,
+            };
             let mut answer = Datum::Null;
             for branch in branches {
+                // **`=`, and not `IS NOT DISTINCT FROM`.** A NULL on either side makes the
+                // comparison unknown and the branch is not taken, so
+                // `CASE NULL WHEN NULL THEN 1 ELSE 2 END` is `2` — measured, and the same rule the
+                // `Binary` arm above applies to every other comparison. `pg_cmp` is the type's own
+                // equality, so `1.0` and `1.00` match.
+                if let Some(subject) = &subject {
+                    let value = evaluate_in(&branch.when, row, env)?;
+                    let same = !matches!(subject, Datum::Null)
+                        && !matches!(value, Datum::Null)
+                        && subject.pg_cmp(&value).is_eq();
+                    if same {
+                        return evaluate_in(&branch.then, row, env);
+                    }
+                    continue;
+                }
                 match evaluate_in(&branch.when, row, env)? {
                     Datum::Bool(true) => return evaluate_in(&branch.then, row, env),
                     Datum::Bool(false) | Datum::Null => {}

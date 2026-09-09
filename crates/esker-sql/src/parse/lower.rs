@@ -4139,24 +4139,40 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             low,
             high,
         } => {
+            // **The negated form is a different pair of comparisons, not a `NOT` around this
+            // one.** PostgreSQL expands `a NOT BETWEEN 1 AND 10` to `((a < 1) OR (a > 10))` and
+            // prints that back through every reader; this node wrapped the positive pair and
+            // printed `(NOT ((a >= 1) AND (a <= 10)))`, which is the same *answer* and not the
+            // same *definition*.
+            //
+            // The two agree on every NULL, which is what had to be checked before swapping them:
+            // measured on 19beta1 with a NULL value, a NULL low and a NULL high, `NOT BETWEEN`,
+            // the `OR` form and the `NOT`-wrapped form give the same three NULLs and the same
+            // trues and falses elsewhere. The doc that used to sit here said the wrap was what
+            // carried the NULL through — true of it, and true of the `OR` form as well.
             let value = lower_expr(expr)?;
-            let pair = plan::Expr::Binary {
-                op: plan::BinaryOp::And,
+            let (low, high) = (lower_expr(low)?, lower_expr(high)?);
+            let (op, first, second) = if *negated {
+                (plan::BinaryOp::Or, plan::BinaryOp::Lt, plan::BinaryOp::Gt)
+            } else {
+                (
+                    plan::BinaryOp::And,
+                    plan::BinaryOp::GtEq,
+                    plan::BinaryOp::LtEq,
+                )
+            };
+            Ok(plan::Expr::Binary {
+                op,
                 left: Box::new(plan::Expr::Binary {
-                    op: plan::BinaryOp::GtEq,
+                    op: first,
                     left: Box::new(value.clone()),
-                    right: Box::new(lower_expr(low)?),
+                    right: Box::new(low),
                 }),
                 right: Box::new(plan::Expr::Binary {
-                    op: plan::BinaryOp::LtEq,
+                    op: second,
                     left: Box::new(value),
-                    right: Box::new(lower_expr(high)?),
+                    right: Box::new(high),
                 }),
-            };
-            Ok(if *negated {
-                plan::Expr::Not(Box::new(pair))
-            } else {
-                pair
             })
         }
         Expr::UnaryOp {
@@ -4567,22 +4583,24 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             compare_op,
             right,
         } => lower_quantified(left, compare_op, right, true),
-        // `CASE WHEN … THEN … [ELSE …] END`. The **simple** form carries an operand after `CASE`
-        // and is refused by name: a real server prints it back as `CASE x WHEN 1 THEN …`, so
-        // desugaring it into `WHEN x = 1` would store a definition that is not the one written and
-        // `pg_get_indexdef` would answer with something `ActiveRecord` never wrote. Nothing in
-        // `schema.rb` uses it.
+        // `CASE WHEN … THEN … [ELSE …] END`, and the **simple** form `CASE x WHEN 1 THEN …`
+        // beside it. The operand is **carried, not desugared**: a real server keeps it in its
+        // `CaseExpr` and prints `CASE x` back, so rewriting it to `WHEN x = 1` here would store a
+        // definition nobody wrote and `pg_get_indexdef` would answer `ActiveRecord` with something
+        // it never sent. The equality is the *evaluator's* business
+        // (`exec::cursor`), and it is `=` rather than `IS NOT DISTINCT FROM`:
+        // `CASE NULL WHEN NULL THEN 1 ELSE 2 END` is `2`, measured.
+        //
+        // This was `0A000 CASE <expression> WHEN ..., the simple form is not supported` until the
+        // deparse census asked what a real server prints for it.
         Expr::Case {
             operand,
             conditions,
             else_result,
             ..
         } => {
-            refuse_if(
-                operand.is_some(),
-                "CASE <expression> WHEN ..., the simple form",
-            )?;
             Ok(plan::Expr::Case {
+                operand: operand.as_deref().map(lower_expr).transpose()?.map(Box::new),
                 branches: conditions
                     .iter()
                     .map(|branch| {
