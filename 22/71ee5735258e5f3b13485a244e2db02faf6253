@@ -1,0 +1,63 @@
+crates/esker-keys/src/value.rs
+  s_e5c0c6e78b5662::t_abb3a8d187066b 125-138,537,544,1115-1118
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_e5c0c6e78b5662::t_ebafc3236a16dd 456-460
+crates/esker-sql/src/catalog/record.rs
+  s_e5c0c6e78b5662::t_cb3c82563e9612 335-338,398,539
+crates/esker-sql/src/exec/bind.rs
+  s_e5c0c6e78b5662::t_ca474dbd714bd4 1570
+crates/esker-sql/src/exec/fragment.rs
+  s_e5c0c6e78b5662::t_f1055f472b78a7 1026-1030
+crates/esker-sql/src/exec/query.rs
+  s_e5c0c6e78b5662::t_fb9857c4e82599 3355
+crates/esker-sql/src/parse/lower.rs
+  s_e5c0c6e78b5662::t_bd71be732a4984 8450-8467
+crates/esker-sql/src/plan/expr.rs
+  s_e5c0c6e78b5662::t_43bd782656093d 2244,2334,2461-2464
+crates/esker-sql/src/row.rs
+  s_e5c0c6e78b5662::t_2f8d3d009f6dbc 183-185
+crates/esker-sql/src/value/mod.rs
+  s_e5c0c6e78b5662::t_455c1c416ab4de 1168-1188,1204-1206,1214,1449-1451,1570,1760-1761,1787-1789,2106-2110,2472-2477
+crates/esker-sql/tests/captures/pg19_name_type.txt
+  s_e5c0c6e78b5662::t_533c2e431c6206 1-98
+crates/esker-sql/tests/corpus/pg19_name_type.txt
+  s_e5c0c6e78b5662::t_4b3c2be2ca6a0a 1-45
+crates/esker-sql/tests/name_type.rs
+  s_e5c0c6e78b5662::t_1c872236692113 1-219
+crates/esker-sql/tests/row_order.rs
+  s_e5c0c6e78b5662::t_0962f4a0331df2 205
+crates/esker-keys/src/columnar.rs
+  s_e5c0c6e78b5662::t_8077c3cf172c19 75-76,174
+crates/esker-keys/src/row.rs
+  s_e5c0c6e78b5662::t_8958031130fadd 561-563,972,1477-1479,2208-2211
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_e5c0c6e78b5662::t_48775ee82bf7bd 2782,2924-2928,3068-3069
+crates/esker-sql/tests/corpus/pg19_order.txt
+  s_e5c0c6e78b5662::t_622c0508754025 18-23,50
+crates/esker-sql/tests/pg_catalog.rs
+  s_e5c0c6e78b5662::t_ae462c3c2d6430 192-195
+crates/esker-sql/tests/pg_catalog_format_type.rs
+  s_e5c0c6e78b5662::t_95a9abe343df41 36-42
+crates/esker-sql/tests/two_database_dogs.rs
+  s_e5c0c6e78b5662::t_5453034f0be953 27-31
+crates/esker-store/src/columnar/decode.rs
+  s_e5c0c6e78b5662::t_e53b72bce718e7 200-203
+docs/adr/0084-name-is-a-stored-type-and-its-tag-is-additive.md
+  s_e5c0c6e78b5662::t_3babee3b3257ff 1-85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "2271ee5735258e5f3b13485a244e2db02faf6253",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
