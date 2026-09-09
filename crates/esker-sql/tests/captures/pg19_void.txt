@@ -1,0 +1,58 @@
+# **`void` is a type, oid 2278** — PostgreSQL 19beta1, 2026-09-09. One `BEGIN … ROLLBACK`,
+# `ON_ERROR_ROLLBACK on` so a refusal cannot swallow the statements after it.
+#
+# `pg_advisory_lock(1)` returns a `void` on a real server and this node folded it to an empty
+# string, so the `RowDescription` said `text` (25) where PostgreSQL says 2278. The **value** was
+# already right — a void renders as zero characters and is *not* NULL — so this is the declared
+# type and nothing else.
+#
+# ## The catalog row, and it is a **pseudo-type**
+#
+#     oid   typname  typlen  typtype  typcategory  typdelim  typinput  typarray
+#     2278  void     4       p        P            ,         void_in   0
+#
+# `typtype` is `p` and `typcategory` `P`, which is what makes it different from every type this
+# crate has: it is not a storage type, it has no array, and no column can be declared as one.
+# `format_type(2278, -1)` is `void`.
+#
+# ## Which advisory functions are `void` and which are not
+#
+#     pg_advisory_lock(1)          void      pg_advisory_unlock(1)       boolean  t
+#     pg_advisory_unlock_all()     void      pg_try_advisory_lock(2)     boolean  t
+#     pg_notify('c','p')           void      setseed(0.5)                void
+#
+# **Half the family is a boolean**, measured from `pg_proc.prorettype` as well as from `\gdesc`:
+# `pg_advisory_lock` and `pg_advisory_unlock_all` are 2278, `pg_advisory_unlock` and
+# `pg_try_advisory_lock` are 16. A rule that made "the advisory functions" void would be wrong for
+# two of the four, and `ActiveRecord` reads the boolean ones — `test_get_and_release_advisory_lock`
+# asserts on what `pg_try_advisory_lock` returns.
+#
+# ## The value, and why it is not NULL
+#
+#     pg_advisory_unlock_all() IS NULL             f       <- it is a value, and it is empty
+#     pg_advisory_unlock_all()::text               ''      length 0
+#     count(*) over one row of it                  1
+#
+# A void column is a column: it has a row, the row has a value, and the value is zero characters.
+# `IS NULL` answering `f` is the line that separates this from "returns nothing".
+#
+# The 16 statements below are the capture itself — `statement`, `\gdesc` types, rows — taken in this
+# session against `127.0.0.1:55432` with no fixture at all. Each `SELECT` carries a leading `'r'`
+# so that a row whose only column renders as zero characters is still a line.
+
+SELECT 'r', pg_advisory_unlock_all()	text,void	r|
+SELECT 'r', pg_typeof(pg_advisory_unlock_all())	text,regtype	r|void
+SELECT 'r', pg_advisory_lock(1)	text,void	r|
+SELECT 'r', pg_typeof(pg_advisory_lock(1))	text,regtype	r|void
+SELECT 'r', pg_advisory_unlock(1)	text,boolean	r|t
+SELECT 'r', pg_typeof(pg_advisory_unlock(1))	text,regtype	r|boolean
+SELECT 'r', pg_try_advisory_lock(2), pg_typeof(pg_try_advisory_lock(2))	text,boolean,regtype	r|t|boolean
+SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput, typarray FROM pg_type WHERE typname = 'void'	oid,name,smallint,"char","char","char",regproc,oid	2278|void|4|p|P|,|void_in|0
+SELECT 'r', pg_advisory_unlock_all() IS NULL	text,boolean	r|f
+SELECT 'r', pg_advisory_unlock_all()::text, pg_typeof(pg_advisory_unlock_all()::text)	text,text,regtype	r||text
+SELECT 'r', length(pg_advisory_unlock_all()::text)	text,integer	r|0
+SELECT format_type(2278, -1)	text	void
+SELECT count(*) FROM (SELECT pg_advisory_unlock_all()) s	bigint	1
+SELECT 'r', pg_typeof(pg_notify('c','p'))	text,regtype	r|void
+SELECT proname, prorettype FROM pg_proc WHERE proname IN ('pg_advisory_lock','pg_advisory_unlock','pg_advisory_unlock_all','pg_try_advisory_lock') ORDER BY proname, prorettype	name,oid	pg_advisory_lock|2278 ; pg_advisory_lock|2278 ; pg_advisory_unlock|16 ; pg_advisory_unlock|16 ; pg_advisory_unlock_all|2278 ; pg_try_advisory_lock|16 ; pg_try_advisory_lock|16
+SELECT 'r', pg_advisory_lock(1), pg_advisory_unlock_all()	text,void,void	r||

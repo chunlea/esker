@@ -1586,6 +1586,9 @@ fn placeholder(ty: ColumnType) -> Datum {
         // The two vectors share text's representation: an empty one is an empty string.
         | ColumnType::Int2Vector
         | ColumnType::OidVector
+        // **A void's is not a stand-in at all**: the empty string is its one real value, and it
+        // lands in this arm because that is the value's representation.
+        | ColumnType::Void
         | ColumnType::Xml => Datum::Text(String::new()),
         ColumnType::Citext => Datum::Citext(String::new()),
         ColumnType::TsVector => Datum::TsVector(String::new()),

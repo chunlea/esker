@@ -166,6 +166,9 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 | ColumnType::RegTypeArray
                 // A `regclass` is not one for `regtype`'s reason — an oid that prints as a name —
                 // and `is_index_key` in `esker_keys::row` refuses it, with the decoder agreeing.
+                // **A pseudo-type is not a column**, so there is nothing for a key to order:
+                // `CREATE TABLE (c void)` is `42P16` on both servers (ADR 0092).
+                | ColumnType::Void
                 | ColumnType::RegClass
                 // **The two catalog vectors are stored as their text and are never keys**: `indkey`
                 // is what they exist for, and no index is built over an index's own column list.

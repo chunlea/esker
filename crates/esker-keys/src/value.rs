@@ -516,6 +516,17 @@ pub enum ColumnType {
     CircleArray,
     /// See [`ColumnType::LsegArray`].
     LineArray,
+    /// PostgreSQL's `void` — oid 2278, and **the one pseudo-type in this vocabulary**.
+    ///
+    /// `typtype` is `p` and `typcategory` `P`, which is what says it is not a storage type: no
+    /// column may be declared as one, there is no array of it, and no row ever holds one. It is
+    /// here because a *function* returns it — `pg_advisory_lock(1)` is a `void` on a real server —
+    /// and a client reads that off the `RowDescription`, which needs a type to name.
+    ///
+    /// **Its value is zero characters and is not NULL**: `pg_advisory_unlock_all() IS NULL` is `f`
+    /// and `length(…::text)` is `0`, both measured. A `Datum::Text("")` is what carries it, which
+    /// is why it needs no variant of its own.
+    Void,
     /// `name[]` — oid 1003, `_name`.
     ///
     /// The type `array_agg(enum.enumlabel)` has, which is how `ActiveRecord` reads an enum's
@@ -564,7 +575,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 98] = [
+    pub const ALL: [ColumnType; 99] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -611,6 +622,7 @@ impl ColumnType {
         ColumnType::BpcharArray,
         ColumnType::VarcharArray,
         ColumnType::NameArray,
+        ColumnType::Void,
         ColumnType::LsegArray,
         ColumnType::PathArray,
         ColumnType::PolygonArray,

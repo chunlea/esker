@@ -2650,7 +2650,7 @@ impl Executor {
             if matches!(call, crate::plan::AdvisoryCall::UnlockAll) {
                 if args.is_empty() {
                     self.locks.unlock_all(self.session);
-                    *expr = Expr::Literal(Literal::String(String::new()));
+                    *expr = void_value();
                 } else {
                     failed.get_or_insert(SqlError::UndefinedFunction(format!("{}()", call.name())));
                 }
@@ -2669,7 +2669,7 @@ impl Executor {
                         // `AdvisoryCall::is_void` for why not a NULL.
                         match self.wait_for_advisory(key, call.mode()) {
                             Ok(()) => {
-                                *expr = Expr::Literal(Literal::String(String::new()));
+                                *expr = void_value();
                                 return;
                             }
                             Err(error) => {
@@ -4193,6 +4193,25 @@ fn described(columns: &[query::OutputColumn]) -> Vec<FieldDescription> {
 /// The value was identical down both paths, which is why every corpus in this crate agreed with
 /// the wrong answer for three runs: a corpus replays the simple protocol, and so does `psql`.
 /// `tests/enum_extended_protocol.rs` is the test that can see it, and it asks all three paths.
+/// What an advisory call that answers `void` folds to.
+///
+/// **A `Cast` and not a bare literal**, for the reason a folded cast keeps one
+/// ([ADR 0086](../../../docs/adr/0086-a-folded-cast-keeps-the-type-it-named.md)): the value is a
+/// `Datum::Text("")` and `text` is what a bare literal of it would be declared, so the node that
+/// carries the type is the only thing telling a client 2278. Without it the *executed* path said
+/// `text` while `Describe` said `void` — one expression with two answers, which is the shape three
+/// units of this queue have now removed.
+fn void_value() -> crate::plan::Expr {
+    use crate::plan::{Expr, Literal};
+    Expr::Cast {
+        operand: Box::new(Expr::Literal(Literal::Typed(Box::new(Datum::Text(
+            String::new(),
+        ))))),
+        to: ColumnType::Void,
+        typmod: crate::value::NO_TYPMOD,
+    }
+}
+
 fn field_of(column: &query::OutputColumn) -> FieldDescription {
     match (&column.user_type, column.pseudo) {
         // The type's own oid, and the **rendered** value's width: an enum is an ordinal in the row
