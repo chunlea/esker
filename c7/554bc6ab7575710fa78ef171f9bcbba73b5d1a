@@ -1,0 +1,39 @@
+crates/esker-sql/src/exec/aggregate.rs
+  s_e5c0c6e78b5662::t_714386f6b735cd 611,619
+crates/esker-sql/src/exec/cursor.rs
+  s_e5c0c6e78b5662::t_1f6a85088f71db 37-42,77-89,100,2344-2358,2710,3704-3720
+crates/esker-sql/src/exec/ddl.rs
+  s_e5c0c6e78b5662::t_92d0bf7172bf44 6272
+crates/esker-sql/src/exec/dml.rs
+  s_e5c0c6e78b5662::t_75fcd54710c5f0 663,772,774-795,858-868,2116-2123
+crates/esker-sql/src/exec/mod.rs
+  s_e5c0c6e78b5662::t_b225a9999deec8 1470-1474,1480,1484-1498,1804-1811,2293-2294,2298
+crates/esker-sql/src/exec/query.rs
+  s_e5c0c6e78b5662::t_5cc3c1dd644e48 3002-3003,3275,3309-3335,3359
+crates/esker-sql/src/parse/lower.rs
+  s_e5c0c6e78b5662::t_8de5e2145e30e2 4420,4710-4711
+crates/esker-sql/src/plan/expr.rs
+  s_e5c0c6e78b5662::t_e082ab9251f6e5 133-141
+crates/esker-sql/src/plan/query.rs
+  s_e5c0c6e78b5662::t_8106244012483e 1379
+crates/esker-sql/tests/regclass_literal.rs
+  s_e5c0c6e78b5662::t_629d44584b2e45 25-29
+docs/plans/debts-v1.1.md
+  s_e5c0c6e78b5662::t_fa81dc5822973c 24,124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "c7554bc6ab7575710fa78ef171f9bcbba73b5d1a",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
