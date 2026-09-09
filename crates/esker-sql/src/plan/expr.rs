@@ -1960,6 +1960,18 @@ pub enum ArithOp {
     /// `^` — **left-associative** (`2 ^ 3 ^ 2` is 64) and looser than unary minus
     /// (`-2 ^ 2` is 4). Both measured, both the opposite of the mathematical convention.
     Power,
+    /// `&` — bitwise AND, integers only.
+    BitAnd,
+    /// `|` — bitwise OR, integers only. `ActiveRecord` builds every advisory-lock key with it.
+    BitOr,
+    /// `#` — bitwise XOR. **`^` is exponentiation** in this dialect, which is why the two symbols
+    /// are not the pair a reader coming from C expects.
+    BitXor,
+    /// `<<` — left shift. **Keeps the left operand's type**, and the count wraps modulo that
+    /// type's width: `1::int4 << 32` is `1`. Measured.
+    ShiftLeft,
+    /// `>>` — **arithmetic** right shift: `(-1) >> 1` is `-1`, not a large positive number.
+    ShiftRight,
 }
 
 impl ArithOp {
@@ -1973,6 +1985,11 @@ impl ArithOp {
             ArithOp::Divide => "/",
             ArithOp::Modulo => "%",
             ArithOp::Power => "^",
+            ArithOp::BitAnd => "&",
+            ArithOp::BitOr => "|",
+            ArithOp::BitXor => "#",
+            ArithOp::ShiftLeft => "<<",
+            ArithOp::ShiftRight => ">>",
         }
     }
 }

@@ -6142,8 +6142,8 @@ fn is_json_expr(expr: &Expr) -> bool {
 
 /// The arithmetic operator a token is, or `None` for one that compares or combines.
 ///
-/// `^` is here and `#`, `&`, `|`, `<<` and `>>` are not: PostgreSQL's bit operators are a separate
-/// surface with their own types, and naming them is better than approximating them.
+/// `^` is exponentiation here and `#` is the bitwise XOR, which is the one pairing a reader
+/// coming from C gets wrong: the two symbols swap meanings against every other language.
 fn arithmetic_op(op: &BinaryOperator) -> Option<plan::ArithOp> {
     Some(match op {
         BinaryOperator::Plus => plan::ArithOp::Add,
@@ -6154,6 +6154,11 @@ fn arithmetic_op(op: &BinaryOperator) -> Option<plan::ArithOp> {
         // `^` under the PostgreSQL dialect is exponentiation, not a bitwise XOR — that is `#`
         // there — so both spellings the parser can produce for the token mean the same operator.
         BinaryOperator::PGExp | BinaryOperator::BitwiseXor => plan::ArithOp::Power,
+        BinaryOperator::BitwiseAnd => plan::ArithOp::BitAnd,
+        BinaryOperator::BitwiseOr => plan::ArithOp::BitOr,
+        BinaryOperator::PGBitwiseXor => plan::ArithOp::BitXor,
+        BinaryOperator::PGBitwiseShiftLeft => plan::ArithOp::ShiftLeft,
+        BinaryOperator::PGBitwiseShiftRight => plan::ArithOp::ShiftRight,
         _ => return None,
     })
 }
@@ -7343,7 +7348,12 @@ fn references(body: &Query, name: &str) -> bool {
 }
 
 /// One lowered `WITH` item: its name, its body, its column aliases, and its recursive term.
-type LoweredItem = (String, plan::Select, Vec<String>, Option<Box<plan::RecursiveTerm>>);
+type LoweredItem = (
+    String,
+    plan::Select,
+    Vec<String>,
+    Option<Box<plan::RecursiveTerm>>,
+);
 
 /// A `WITH` item's body: the term that runs first, and the one that runs until nothing is new.
 struct RecursiveBody {

@@ -1,0 +1,55 @@
+# **The integer bitwise operators** — PostgreSQL 19beta1, 2026-09-08. One `BEGIN … ROLLBACK`.
+#
+# `connection_test.rb#test_get_and_release_advisory_lock` builds its key the way `ActiveRecord`
+# builds every advisory-lock key — `(a::bigint << 32) | b::bigint` — and this node answered
+# `the operator | is not supported`.
+#
+# ## What reasoning gets wrong
+#
+#   * **A shift keeps its LEFT operand's type**, where the other four take the wider of the two:
+#     `1::int2 << 4` is a `smallint` and `12::int2 | 10::int4` is an `integer`.
+#   * **A shift count is taken modulo the width.** `1::int4 << 32` is **1**, `1::int8 << 64` is 1,
+#     and `1::int4 << -1` is `-2147483648`, which is `1 << 31`. Nothing overflows and nothing is
+#     refused — the count wraps, which is the hardware showing through.
+#   * **`>>` is arithmetic**: `(-1) >> 1` is `-1`.
+#   * **`&` binds tighter than `|`**, and `<<` tighter than both: `2 | 3 & 1` is 1, `1 << 2 | 1`
+#     is 5.
+#   * **`^` is exponentiation in this dialect and `#` is the XOR** — the one pairing a reader
+#     coming from C has backwards.
+#   * Two unknown literals are **`42725 operator is not unique`**, not the `42883` a wrong type
+#     gets: every integer width offers a candidate and none of them wins.
+#
+# The rows below are the measurement, in corpus form.
+#
+SELECT (3::bigint << 32) | 5::bigint	bigint	12884901893
+SELECT pg_typeof((3::bigint << 32) | 5::bigint)	regtype	bigint
+SELECT 12 | 10	integer	14
+SELECT 12 & 10	integer	8
+SELECT 12 # 10	integer	6
+SELECT ~12	integer	-13
+SELECT 1 << 4	integer	16
+SELECT 256 >> 4	integer	16
+SELECT pg_typeof(12 | 10)	regtype	integer
+SELECT pg_typeof(12::int2 | 10::int2)	regtype	smallint
+SELECT pg_typeof(12::int4 | 10::int8)	regtype	bigint
+SELECT pg_typeof(12::int2 | 10::int4)	regtype	integer
+SELECT pg_typeof(~12::int2)	regtype	smallint
+SELECT pg_typeof(1::int8 << 4)	regtype	bigint
+SELECT pg_typeof(1::int2 << 4)	regtype	smallint
+SELECT (-1)::int4 >> 1	integer	-1
+SELECT (-1)::int8 >> 1	bigint	-1
+SELECT 1::int4 << 31	integer	-2147483648
+SELECT 1::int4 << 32	integer	1
+SELECT 1::int8 << 63	bigint	-9223372036854775808
+SELECT 1::int8 << 64	bigint	1
+SELECT 1::int4 << -1	integer	-2147483648
+SELECT 5 | NULL	integer	\N
+SELECT NULL::int8 & 3	bigint	\N
+SELECT 12 | 10 | 3	integer	15
+SELECT 2 | 3 & 1	integer	1
+SELECT 1 << 2 | 1	integer	5
+SELECT true | false	!42883 operator does not exist: boolean | boolean DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 'a' | 'b'	!42725 operator is not unique: unknown | unknown DETAIL: Could not choose a best candidate operator. HINT: You might need to add explicit type casts.
+SELECT 1.5 | 2	!42883 operator does not exist: numeric | integer DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 9223372036854775807::int8 | 1	bigint	9223372036854775807
+SELECT (3::bigint << 32) | 5::bigint = 12884901893	boolean	t

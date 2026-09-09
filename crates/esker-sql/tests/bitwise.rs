@@ -1,0 +1,228 @@
+//! The integer bitwise operators, against PostgreSQL 19beta1.
+//!
+//! `connection_test.rb#test_get_and_release_advisory_lock` builds its lock key the way
+//! `ActiveRecord` builds every advisory-lock key:
+//!
+//! ```sql
+//! (a::bigint << 32) | b::bigint
+//! ```
+//!
+//! and this node answered `the operator | is not supported`. The five operators are one family and
+//! land together, because a client that has `|` and not `&` is in a worse position than one that
+//! has neither: the missing one looks like a typo rather than a gap.
+//!
+//! Three of the rules are not what reasoning gives. **A shift keeps its left operand's type**
+//! where the other four take the wider of the two. **A shift count wraps modulo the width** —
+//! `1::int4 << 32` is `1` and `1::int4 << -1` is `1 << 31` — so nothing here overflows and nothing
+//! is refused. And **two unknown literals are `42725 operator is not unique`**, not the `42883` a
+//! wrong type gets, because every integer width offers a candidate and none of them wins.
+//!
+//! Measured in `tests/corpus/pg19_bitwise.txt`.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use esker_sql::sqlstate;
+
+#[path = "parity_harness/mod.rs"]
+mod parity;
+
+/// What this node answers differently, and why.
+const DIVERGENCES: parity::Divergences = parity::Divergences {
+    // **One fact, several times, and it is not about these operators**: an unadorned integer
+    // literal is an `int8` in this crate and an `integer` to PostgreSQL's resolver, so every row
+    // whose operands are bare literals is declared `bigint` here. The values are identical.
+    types: &[
+        "SELECT 12 | 10",
+        "SELECT 12 & 10",
+        "SELECT 12 # 10",
+        "SELECT 1 << 4",
+        "SELECT 256 >> 4",
+        "SELECT 5 | NULL",
+        "SELECT 12 | 10 | 3",
+        "SELECT 2 | 3 & 1",
+        "SELECT 1 << 2 | 1",
+        // And one more fact, six times: `pg_typeof` answers a `regtype` on a real server and
+        // `text` here, the trade `'x'::regtype` makes everywhere in this crate (ADR 0077). The
+        // rows are identical — these are the six that pin the operators' own typing rules.
+        "SELECT pg_typeof((3::bigint << 32) | 5::bigint)",
+        "SELECT pg_typeof(12::int2 | 10::int2)",
+        "SELECT pg_typeof(12::int4 | 10::int8)",
+        "SELECT pg_typeof(12::int2 | 10::int4)",
+        "SELECT pg_typeof(1::int8 << 4)",
+        "SELECT pg_typeof(1::int2 << 4)",
+    ],
+    answers: &[
+        // **`~` is refused by name.** Unary bitwise NOT needs an expression variant of its own —
+        // `Expr::Negate` has seventeen match sites and this would have as many — and nothing in
+        // the suite writes one: `ActiveRecord` builds its lock key from `<<` and `|`. Named
+        // rather than approximated, which is what this crate does with every operator it has not
+        // built.
+        (
+            "SELECT ~12",
+            "The unary bitwise NOT is not built: it needs its own expression variant, and the \
+             suite writes only `<<` and `|`. Refused by name rather than approximated.",
+            "pg19_bitwise.txt:29",
+        ),
+        (
+            "SELECT pg_typeof(~12::int2)",
+            "The same gap, read through pg_typeof.",
+            "pg19_bitwise.txt:36",
+        ),
+        // A decimal literal is a `double precision` in this crate and a `numeric` to PostgreSQL's
+        // resolver, so both operands of a refused operator are named differently. The refusal and
+        // its code are the same; only the two type names in the sentence differ.
+        (
+            "SELECT 1.5 | 2",
+            "An unadorned decimal literal is `double precision` here and `numeric` there, so the \
+             message names `double precision | double precision` where a real server names \
+             `numeric | integer`. Same code, same refusal, two different spellings of the \
+             operands.",
+            "pg19_bitwise.txt:53",
+        ),
+        (
+            "SELECT pg_typeof(12 | 10)",
+            "Two facts at once, neither about these operators: `pg_typeof` answers a `regtype` \
+             there and `text` here (ADR 0077), and an unadorned integer literal is an `int8` \
+             here, so the row reads `bigint` where a real server reads `integer`.",
+            "pg19_bitwise.txt:32",
+        ),
+        (
+            "SELECT 'a' | 'b'",
+            "An unadorned string literal is `text` in this crate and `unknown` to PostgreSQL's \
+             resolver. A real server then has a candidate at every integer width and cannot \
+             choose, which is `42725 operator is not unique`; here the operands already have a \
+             type and there is no `text | text`, which is `42883`. Same refusal, one class apart, \
+             and the cause is the literal rather than the operator.",
+            "pg19_bitwise.txt:52",
+        ),
+    ],
+};
+
+#[test]
+fn every_bitwise_answer_is_postgresql_19_s() {
+    let checked = parity::replay(include_str!("corpus/pg19_bitwise.txt"), &[], &DIVERGENCES);
+    assert!(
+        checked > 28,
+        "only {checked} statements ran; the corpus did not load"
+    );
+}
+
+/// **The statement the suite sends**, and the number it has to produce.
+#[test]
+fn the_advisory_lock_key_is_built_the_way_activerecord_builds_it() {
+    let mut node = parity::Node::new(&[]);
+    assert_eq!(
+        node.rows("SELECT (3::bigint << 32) | 5::bigint"),
+        vec![vec!["12884901893"]]
+    );
+    let outcome = node.run("SELECT (3::bigint << 32) | 5::bigint").unwrap();
+    let esker_sql::pgwire::session::Outcome::Rows { fields, .. } = outcome else {
+        panic!("no rows");
+    };
+    // 20 is `bigint`: a key that came back as `numeric` would be a different value to the driver.
+    assert_eq!(fields[0].type_oid, 20);
+}
+
+/// **A shift keeps its left operand's type**; the other four take the wider of the two.
+#[test]
+fn a_shift_keeps_its_left_type_and_the_rest_take_the_wider() {
+    let mut node = parity::Node::new(&[]);
+    for (statement, ty) in [
+        ("SELECT pg_typeof(1::int2 << 4)", "smallint"),
+        ("SELECT pg_typeof(1::int8 << 4)", "bigint"),
+        ("SELECT pg_typeof(12::int2 | 10::int2)", "smallint"),
+        ("SELECT pg_typeof(12::int2 | 10::int4)", "integer"),
+        ("SELECT pg_typeof(12::int4 | 10::int8)", "bigint"),
+    ] {
+        assert_eq!(
+            node.rows(statement),
+            vec![vec![ty.to_owned()]],
+            "{statement}"
+        );
+    }
+}
+
+/// **A shift count wraps modulo the width**, so nothing overflows and nothing is refused.
+#[test]
+fn a_shift_count_wraps_and_a_right_shift_keeps_the_sign() {
+    let mut node = parity::Node::new(&[]);
+    for (statement, answer) in [
+        // 32 places on a 32-bit type is no places at all.
+        ("SELECT 1::int4 << 32", "1"),
+        ("SELECT 1::int8 << 64", "1"),
+        ("SELECT 1::int4 << 31", "-2147483648"),
+        ("SELECT 1::int8 << 63", "-9223372036854775808"),
+        // -1 modulo 32 is 31, so a negative count shifts left rather than right.
+        ("SELECT 1::int4 << -1", "-2147483648"),
+        // Arithmetic, not logical: the sign bit is copied.
+        ("SELECT (-1)::int4 >> 1", "-1"),
+        ("SELECT (-1)::int8 >> 1", "-1"),
+    ] {
+        assert_eq!(
+            node.rows(statement),
+            vec![vec![answer.to_owned()]],
+            "{statement}"
+        );
+    }
+}
+
+/// `&` binds tighter than `|`, and `<<` tighter than either.
+#[test]
+fn the_precedence_is_postgresqls() {
+    let mut node = parity::Node::new(&[]);
+    assert_eq!(node.rows("SELECT 2 | 3 & 1"), vec![vec!["1"]]);
+    assert_eq!(node.rows("SELECT 1 << 2 | 1"), vec![vec!["5"]]);
+    assert_eq!(node.rows("SELECT 12 | 10 | 3"), vec![vec!["15"]]);
+}
+
+/// **Two classes of refusal**, and the one for two bare literals is the surprising one.
+#[test]
+fn the_refusals_tell_a_wrong_type_from_an_ambiguous_one() {
+    let mut node = parity::Node::new(&[]);
+
+    let error = node.run("SELECT true | false").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_FUNCTION);
+    assert_eq!(
+        error.to_string(),
+        "operator does not exist: boolean | boolean"
+    );
+
+    // **`double precision`, not `numeric`**: an unadorned decimal literal is a `float8` in this
+    // crate. The rule under test is that a non-integer operand is refused at all, which is what
+    // this asserts; the literal's type is a declared divergence of its own (see `DIVERGENCES`).
+    let error = node.run("SELECT 1.5 | 2").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_FUNCTION);
+    assert_eq!(
+        error.to_string(),
+        "operator does not exist: double precision | double precision"
+    );
+
+    // **A real server answers `42725 operator is not unique` here**, because two `unknown`
+    // literals give it a candidate at every integer width and no way to choose. This node types a
+    // bare literal as `text` before the operator is resolved, so it has no candidates rather than
+    // too many, and the refusal is the class next door. Declared in `DIVERGENCES`; asserted here
+    // as what this node actually says, so the day literals become `unknown` this line reddens.
+    let error = node.run("SELECT 'a' | 'b'").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_FUNCTION);
+    assert_eq!(error.to_string(), "operator does not exist: text | text");
+}
+
+/// NULL propagates, as it does through arithmetic.
+#[test]
+fn a_null_operand_is_a_null_answer() {
+    let mut node = parity::Node::new(&[]);
+    assert_eq!(node.rows("SELECT 5 | NULL"), vec![vec!["\\N"]]);
+    assert_eq!(node.rows("SELECT NULL::int8 & 3"), vec![vec!["\\N"]]);
+}
+
+/// **The one member of the family that is not here**, named rather than approximated.
+#[test]
+fn the_unary_not_is_refused_by_name() {
+    let mut node = parity::Node::new(&[]);
+    let error = node.run("SELECT ~12").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+    assert!(
+        error.to_string().contains('~'),
+        "the refusal did not name the operator: {error}"
+    );
+}
