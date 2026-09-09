@@ -426,6 +426,160 @@ Named so the next person can check them rather than re-derive them:
    per extra region would dominate the 36 ms the exchange is aimed at. **Measure again after
    parallel dispatch, not before.**
 
+### The re-measure, specified before it is run — 2026-09-09
+
+§10 has owed a multi-region re-measure since the split blocker was lifted, and this is what it
+consists of. Written before the numbers so that the design is not the numbers' shape.
+
+**The one fact that decides the design.** §10 item 4 says *"measure again after parallel dispatch,
+not before"*, and dispatch is still serial at HEAD — `exec::fragment::evaluate` walks `shards` in a
+`while` loop, one `source.evaluate` at a time. So at R regions a routed query pays **R sequential
+round trips** before any merging happens. A single number at 20 regions would therefore measure
+serial dispatch and be read as the exchange's verdict, which is the mistake this table exists to
+avoid.
+
+The way round it is not to wait for parallel dispatch. It is to **separate the two costs by varying
+them independently**, which needs no instrumentation that does not exist (§9a's four missing rows
+are all still missing):
+
+| # | what | statement | cluster shape | metric | prediction |
+|---|---|---|---|---|---|
+| 1 | **the dispatch slope** | `SELECT count(*) FROM t` — one group, so the finish is a single partial per region | R ∈ {1, 4, 8, 20} regions, groups fixed at 1 | wall time per query, medians | linear in R, slope ≈ one round trip. This is the term an exchange does **not** remove |
+| 2 | **the finish slope** | `SELECT g, count(*) FROM t GROUP BY g` with `g` at {1, 100, 10k} distinct values | R fixed at the largest reached, groups varied | wall time, and time minus arm 1's dispatch at that R | the term an exchange **does** remove. §10 says it is 36 ms at 20k groups on one region |
+| 3 | **the fan-out that is real** | the same query | every shape | **distinct stores holding the learners**, not the region count | §10 item 2: five regions on *two* stores. An exchange's parallelism is nodes, not regions |
+| 4 | **the row engine beside it** | the same, `esker.engine = 'row'` | every shape | wall time | the 350× the columnar path already won; the exchange is a fraction of what is left, not of this |
+| 5 | **the crossover, if any** | arms 1 and 2 together | R = 20 | is the finish larger than the dispatch? | if dispatch dominates at 20, the exchange is still negative **and the reason is item 4, not item 3** |
+
+**What each outcome means, written now so the reading is not free to drift:**
+
+* **finish < dispatch at 20 regions** — the exchange stays negative, and §10 item 4 is what stands
+  between it and a fair test. The next milestone is parallel dispatch, which is `esker-sql` and
+  `esker-client` with no wire change, and the re-measure repeats after it;
+* **finish > dispatch at 20 regions** — the exchange flips positive earlier than §10 predicted, and
+  item 3's `regions × groups` estimate was pessimistic by however much the gap is. That is a
+  milestone-5 argument, and it would need §9a's first three instrument rows to tune anything;
+* **either, with fan-out well below R** — arm 3 is the one that decides how much parallelism an
+  exchange could ever have had. A verdict that reasoned from region count would have overestimated
+  it by more than twice on the only multi-region cluster anyone has run.
+
+### The re-measure, run — 2026-09-09
+
+3,000 rows, medians of five, four clusters differing **only** in their split threshold so that the
+region count moves while the data does not. 78 seconds for the whole table.
+
+| split | regions | **stores holding learners** | `count(*)` | 3,000 groups | row engine |
+|---|---|---|---|---|---|
+| none | 1 | **1** | 43.71 ms | 59.99 ms | 120–170 ms |
+| 64 KB | 12 | **1** | 29.20 ms | 45.08 ms | 89–180 ms |
+| 16 KB | 49 | **1** | 66.98 ms | 84.29 ms | 155–172 ms |
+| 8 KB | 95 | **1** | 129.87 ms | 153.93 ms | 260–283 ms |
+
+**1. Dispatch costs about a millisecond a region, not twenty-five.** The slope from 12 to 95 regions
+is 1.21 ms/region and from 1 to 95 it is 0.92. §10 item 4 reasoned from *"a 25 ms round trip per
+extra region would dominate the 36 ms the exchange is aimed at"* — that number is **twenty times too
+big**, and the correction cuts against item 4 rather than for it: parallel dispatch buys twenty
+times less than the verdict assumed it would.
+
+**2. The finish is far smaller than the dispatch, at every region count reached.** Going from one
+group to three thousand costs 19.41 ms at one region and 28.76 ms at ninety-five. The dispatch term
+at ninety-five regions, over the one-region baseline, is **86 ms** — three times the finish. §10's
+estimate of 40 µs a group is also generous: measured here it is about 10 µs a group, and 0.1 µs a
+partial.
+
+**3. And the fan-out is one store, at every region count.** Ninety-five regions, ninety-five
+columnar learners, **all on the same store** — and the same at 49, at 12 and at 1. §10 item 2 found
+five regions on two stores and called it a warning; on this shape it is not two, it is one. The
+cause is the one that section names: `columnar_replicas = 1` puts one learner per region, PD places
+it on the healthiest store *without a peer of that region*, and with four stores and three voters
+exactly one store is free — the same one, for every region.
+
+**An exchange shuffles between nodes. There is one node.** That is not a cost argument that a bigger
+cluster could overturn by a factor; it is the absence of the thing an exchange exists to use, on the
+shape this system actually produces. A verdict reasoning from the region count would have read
+"ninety-five ways parallel" off this cluster.
+
+**So the verdict stands, and its reasons are now measured rather than estimated.** What would change
+it is unchanged in kind but not in size: the finish would have to grow past the dispatch, which at
+these slopes needs `regions × groups` far above 285,000 partials — and the placement would have to
+spread learners across stores, which is a PD scheduling question and not an exchange one.
+
+### The group axis, pushed until the harness stopped it
+
+The region axis said the finish never came near the dispatch at three thousand rows and three
+thousand groups. §10 item 3 names `regions × groups` as the shape that would change that, so the
+same measurement was run at **ten thousand rows and ten thousand groups**.
+
+| shape | 1 group | 10,000 groups | the finish | dispatch, over the 1-region baseline |
+|---|---|---|---|---|
+| 1 region | 30.17 ms | 96.57 ms | **66 ms** | — |
+| 42 regions | 361.16 ms | 471.72 ms | **110 ms** | **331 ms** |
+
+**420,000 partials, and the dispatch is still three times the finish.** The ratio is the same one
+the three-thousand-row run found at 285,000 partials, reached from a different direction — the group
+count is 3.3× larger and the finish grew by 1.7×, which is the sub-linear shape a merge of sorted
+partials should have and is the opposite of what would flip the verdict.
+
+**The third rung did not run**, and the reason is a limit of the harness rather than of the system:
+loading ten thousand rows across the ~160 regions a 16 KB threshold produces failed the fixture with
+`a lock from the transaction … could not be cleared`. Bulk-loading a table while it splits under
+itself a hundred and sixty times is its own workload, and it is not the one being measured.
+
+**One number in the two runs does not agree with itself, and it is recorded rather than explained.**
+The per-region cost is 1.2 ms at three thousand rows and 7.9 ms at ten thousand — and each region
+holds about the same amount in both, because the split threshold is a size. So the per-region term
+is not purely dispatch: something in it scales with the *table*, not with the region. Candidates
+that would need a measurement to separate — a ReadIndex round per fragment getting slower as Raft
+traffic grows, the learner's own catch-up, PD's routing lookups — and none of them is the finish,
+which is the term this section is about. **It does not move the verdict**: at both row counts the
+dispatch-shaped term is three times the finish, and it is the term an exchange does not remove.
+
+### The bulk-load failure, run down — it is `40003`, and the lock clears in 1.4 s
+
+The re-measure's ~160-region rung failed with `a lock from the transaction at … could not be
+cleared`, and that reading was wrong about which failure it was. `where_a_bulk_load_into_a_splitting_
+table_breaks` loads in batches at an 8 KB threshold and stops at the first refusal, and the first
+refusal is not a lock:
+
+```text
+2750 rows, 76 regions:
+  the transaction's outcome is unknown: the TxnPrewrite may or may not have been applied:
+  connection closed: region 307 stopped leading with this proposal in its log; it may still commit
+  [40003]
+```
+
+**A leadership change with a proposal in the log, answered honestly.** The client cannot know
+whether it applied, and `40003` is the code for exactly that. Three measurements decide the rest:
+
+1. **The lock clears in 1.4 seconds.** The retry after the ambiguous answer meets its own first
+   attempt's Percolator lock — which is what `settle`'s comment predicts — and asking again settles
+   it in 1.4 s. It is not an unclearable lock; there is no resolver race here to fix.
+2. **It is not the batch size.** One row per statement fails the same way, 150 statements later,
+   with the same `40003` at the commit rather than the prewrite. A 250-row `INSERT` across 76
+   regions is one prewrite over 76 regions, and shrinking it to one region changes nothing — so the
+   *"single transaction too wide"* hypothesis is dead by measurement rather than by argument.
+3. **It is not a fixed number of splits.** Two runs of the same test put the first refusal at 37
+   regions and at 76. What varies between them is when a region happens to change leader, which is
+   what a splitting table does while a hundred-odd Raft groups share four in-process stores with a
+   five-millisecond heartbeat tick.
+
+**So the §10 rung's failure is the harness's**, and precisely: `settle` retries an ambiguous write
+for thirty seconds, each retry can meet the previous attempt's live lock, and under a split rate
+this high the thirty seconds are spent on *fresh* churn rather than on one lock. The fix, if that
+rung is wanted, is a longer deadline or a slower load — not a change to the resolver.
+
+**What is not settled, and is not chased**: whether a split *should* cost a leadership change at
+all. The message says a region stopped leading with a proposal in its log, which under this harness
+is as likely to be election churn from a hundred Raft groups on a loaded box as anything about
+splitting. It is also the best candidate for §10's other unsmoothed number — the per-region cost
+that is 1.2 ms at three thousand rows and 7.9 ms at ten thousand — because a `ReadIndex` round per
+fragment gets slower when leadership is moving. **Both are recorded as candidates with no
+measurement behind them**, which is what they are.
+
+**(a') is unaffected, and the reason is worth stating.** The retry is *younger* than the attempt
+whose lock it meets, so wound-wait sends it to wait rather than to kill — which is the right
+answer, because the older transaction may still commit. A rule that let the retry wound its own
+predecessor would roll back a transaction whose proposal was on its way to being applied.
+
 ### Agreement is not correctness
 
 The sentence this whole thread reduces to, kept here because it was learned three times in one
@@ -775,6 +929,64 @@ ceiling is the right place to stop for a single-region table and an open questio
 The other thing recorded per row is whether the columns **actually answered**. A pushdown that
 refused and fell back is the row path timed twice, and a curve made of that would show the two paths
 identical everywhere — §10's free agreement, wearing a stopwatch.
+
+### The answer: there is no crossover, and the format's ceiling is the threshold
+
+Measured 2026-09-09 by `what_an_in_list_costs_against_the_nested_loop`: 8,000 outer rows over 4,096
+inner keys, both paths on the same data at the same node, medians of five, and each row records
+whether the columns actually answered so that a fallback cannot be timed as a pushdown.
+
+| N keys | pushdown | nested loop | ratio | pushed down? | count |
+|---|---|---|---|---|---|
+| 1 | 129.31 ms | 6,282.30 ms | **49×** | yes | 2 |
+| 8 | 127.95 ms | 6,264.30 ms | **49×** | yes | 16 |
+| 64 | 131.65 ms | 16,111.84 ms | **122×** | yes | 128 |
+| 512 | 287.98 ms | 24,067.12 ms | **84×** | yes | 1,024 |
+| 4,096 | 347.56 ms | 21,873.88 ms | **63×** | yes | 8,000 |
+
+**The prediction above was half wrong, and the half it got wrong is the answer.** The pushdown grows
+with N as expected — 129 ms to 348 ms, which is 2.7× for a 4,096× rise in keys, because the cost is
+a binary search per row over a list that only grows logarithmically in the search and linearly in the
+shipping. But the nested loop is **not flat in N**: it grows from 6.3 s to 22–24 s, because more
+inner keys mean more outer rows *survive* the join, and everything downstream pays for each one. Two
+rising lines, one rising far faster, so they never cross.
+
+At the ceiling the membership test is doing the least good it can — `count` is 8,000, every outer
+row matches, and the filter removes nothing — and the pushdown is still **63× faster**. That is the
+worst case for the rewrite by construction, and it is not close.
+
+**So no planner threshold is added.** `MAX_IN_VALUES` stays the only limit, and it stays a format
+limit: above 4,096 keys the rewrite refuses with a reason and the row plan answers at the same
+snapshot, which is what already happens. A threshold below the ceiling would be a rule that makes
+every query it fires on between 49 and 122 times slower.
+
+**How far that survives a split table**, which the fixture cannot show — one region, so the fragment
+is shipped once where R regions ship it R times. For the row path to win at 4,096 keys the pushdown
+would have to become 63× slower, and shipping is only a part of its 348 ms; even taking the whole of
+it as shipping, that is **R ≈ 63 regions** before the lines meet, and the real number is larger
+because the rest of the 348 ms does not multiply. The conclusion is not delicate.
+
+### Under a six-thread arm, the same shape
+
+Load 11.4 rising to 33.8, same fixture, same medians:
+
+| N keys | pushdown | nested loop | ratio |
+|---|---|---|---|
+| 1 | 168.18 ms | 22,634.24 ms | 135× |
+| 8 | 384.87 ms | 23,044.22 ms | 60× |
+| 64 | 418.85 ms | 12,180.12 ms | 29× |
+| 512 | 183.69 ms | 24,027.96 ms | 131× |
+| 4,096 | 530.10 ms | 23,224.70 ms | 44× |
+
+**The individual numbers are noisy and the gap is not.** Under load the pushdown's own column stops
+being monotonic — 419 ms at 64 keys against 184 ms at 512 — which is what a contended box does to a
+sub-second measurement, and it is why the ratio rather than the millisecond is what this table is
+for. The two paths never come within an order of magnitude of each other, at any N, on either box.
+
+Load slows both, and it slows the **row path** by more in absolute terms: 6.3 s becomes 22.6 s at
+N = 1, where the pushdown's 129 ms becomes 168 ms. Contention costs a nested loop over eight
+thousand rows far more than it costs one fragment, which is a second reason the threshold is not
+somewhere in the middle.
 
 ## J12. `08006 … key is not in region 0`, and what a fragment may do about it
 
