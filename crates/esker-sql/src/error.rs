@@ -207,6 +207,96 @@ pub enum SqlError {
     #[error("time zone \"{0}\" not recognized")]
     TimeZoneNotRecognized(String),
 
+    /// A value of a real type cast to a pseudo-type: `42846`.
+    ///
+    /// Its own variant beside [`SqlError::CannotCast`] because that one's types are `'static` —
+    /// it names two types this crate has — and the source here is whatever the resolver made of
+    /// what the user wrote.
+    #[error("cannot cast type {from} to {to}")]
+    CannotCastToPseudoType {
+        /// The source type, as the resolver names it.
+        from: String,
+        /// The pseudo-type.
+        to: &'static str,
+    },
+
+    /// A part of `WITH RECURSIVE` PostgreSQL has not built either: `0A000`.
+    ///
+    /// **"is not implemented", not "is not supported"** — the same code as this crate's own
+    /// refusals and a different sentence, because these are PostgreSQL's own gaps and a client
+    /// that greps the text is reading its words. `ORDER BY` and `LIMIT` inside a recursive body
+    /// and mutual recursion between two items are the three, measured.
+    #[error("{0} is not implemented")]
+    NotImplementedInRecursive(&'static str),
+
+    /// A recursive term wider than its seed: `42804`.
+    ///
+    /// **Not the ordinary union mismatch.** A plain `UNION` promotes both arms to a common type; a
+    /// recursive query does not — the non-recursive term decides, and PostgreSQL's `HINT` says to
+    /// cast *that* one. Two arms with no common type at all keep the ordinary message, because
+    /// then there is nothing to promote to. Measured, both.
+    #[error(
+        "recursive query \"{name}\" column {column} has type {declared} in non-recursive term but type {overall} overall"
+    )]
+    RecursiveColumnType {
+        /// The `WITH` item.
+        name: String,
+        /// Which column, counting from one.
+        column: usize,
+        /// The type the non-recursive term gave it.
+        declared: &'static str,
+        /// The type the two terms together would have.
+        overall: &'static str,
+    },
+
+    /// A recursive `WITH` item whose body is not `non-recursive-term UNION [ALL] recursive-term`:
+    /// `42P19`.
+    ///
+    /// One sentence for four shapes, which is PostgreSQL's own economy: a body that is not a set
+    /// operation at all, one joined by `INTERSECT`, one joined by `EXCEPT`, and one whose only
+    /// term is the recursive one. Measured, all four.
+    #[error(
+        "recursive query \"{0}\" does not have the form non-recursive-term UNION [ALL] recursive-term"
+    )]
+    RecursiveQueryShape(String),
+
+    /// The seed of a recursive `WITH` item names the item: `42P19`.
+    ///
+    /// Its own sentence rather than the shape one, because the shape is right and the *order* is
+    /// wrong — the recursive term has to be the second.
+    #[error("recursive reference to query \"{0}\" must not appear within its non-recursive term")]
+    RecursiveReferenceInSeed(String),
+
+    /// A recursive term that names its own item twice: `42P19`.
+    ///
+    /// Counted over table factors and not over the text: `JOIN t ON c.id = t.id` names `t` twice
+    /// and references the relation once, which is the statement `with_test.rb` sends.
+    #[error("recursive reference to query \"{0}\" must not appear more than once")]
+    RecursiveReferenceTwice(String),
+
+    /// A recursive reference on the **nullable** side of an outer join: `42P19`.
+    ///
+    /// Only that side. `FROM t LEFT JOIN c` keeps every row of `t` and a real server allows it —
+    /// and it is unbounded, which is how the first capture of this feature hung an oracle.
+    #[error("recursive reference to query \"{0}\" must not appear within an outer join")]
+    RecursiveReferenceInOuterJoin(String),
+
+    /// An aggregate in a recursive term: `42P19`.
+    ///
+    /// A round of the fixpoint would aggregate over the previous round rather than over the whole
+    /// relation, which is not what anybody writing it means.
+    #[error("aggregate functions are not allowed in a recursive query's recursive term")]
+    AggregateInRecursiveTerm,
+
+    /// A value written as one of the pseudo-types: `0A000`.
+    ///
+    /// **Not the same refusal as a cast between two real types.** `1::anyarray` has a source type
+    /// and so is `42846 cannot cast type integer to anyarray`; `'{1,2}'::anyarray` is an
+    /// `unknown` literal, which every type accepts as *input*, so the refusal moves to the target
+    /// and says what a pseudo-type is: nothing can be one. Measured, both.
+    #[error("cannot accept a value of type {0}")]
+    CannotAcceptPseudoType(String),
+
     /// A `SET` whose value is a bare `$name` — `SET search_path = $user,public`.
     ///
     /// **`$user` only means anything inside quotes.** PostgreSQL's `search_path` has a magic
@@ -2778,6 +2868,8 @@ impl SqlError {
             SqlError::CannotTruncateReferenced { .. }
             | SqlError::FeatureNotSupported(_)
             | SqlError::DateTruncUnitNotSupported { .. }
+            | SqlError::CannotAcceptPseudoType(_)
+            | SqlError::NotImplementedInRecursive(_)
             | SqlError::DefaultColumnReference
             | SqlError::DefaultSubquery
             | SqlError::DefaultSetReturning
@@ -2991,7 +3083,9 @@ impl SqlError {
             }
             SqlError::ComplexResult => sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
-            SqlError::CannotCast { .. } | SqlError::SetOperationCannotConvert { .. } => {
+            SqlError::CannotCast { .. }
+            | SqlError::CannotCastToPseudoType { .. }
+            | SqlError::SetOperationCannotConvert { .. } => {
                 sqlstate::CANNOT_COERCE
             }
             SqlError::DatetimeFieldOutOfRange { .. }
@@ -3008,7 +3102,8 @@ impl SqlError {
                 sqlstate::INVALID_PARAMETER_VALUE
             }
             SqlError::InvalidByteSequence(_) => sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
-            SqlError::DatatypeMismatch(_)
+            SqlError::RecursiveColumnType { .. }
+            | SqlError::DatatypeMismatch(_)
             | SqlError::NonBooleanArgument { .. }
             | SqlError::SetOperationTypes { .. }
             | SqlError::DatatypeMismatchInColumn { .. } => {
@@ -3044,6 +3139,11 @@ impl SqlError {
             }
             // `42P10`, and `ON CONFLICT` shares it for the same reason the casts do: the columns
             // exist and it is the *inference* over them that fails, so it is not `42703`.
+            SqlError::RecursiveQueryShape(_)
+            | SqlError::RecursiveReferenceInSeed(_)
+            | SqlError::RecursiveReferenceTwice(_)
+            | SqlError::RecursiveReferenceInOuterJoin(_)
+            | SqlError::AggregateInRecursiveTerm => sqlstate::INVALID_RECURSION,
             SqlError::InvalidColumnReference(_) | SqlError::NoUniqueForOnConflict => {
                 sqlstate::INVALID_COLUMN_REFERENCE
             }
@@ -3384,6 +3484,11 @@ impl SqlError {
                     .to_owned(),
             ),
             SqlError::ViewNotUpdatable { hint, .. } => Some(hint.clone()),
+            // PostgreSQL's own, and it names the term to change: the *non-recursive* one, which
+            // is the opposite of what a plain UNION mismatch would have you do.
+            SqlError::RecursiveColumnType { .. } => Some(
+                "Cast the output of the non-recursive term to the correct type.".to_owned(),
+            ),
             // PostgreSQL's own, word for word — a client that reads it knows the two ways out.
             SqlError::RangeSubtypeNotOrdered(_) => Some(
                 "You must specify an operator class for the range type or define a default \

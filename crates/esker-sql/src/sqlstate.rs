@@ -314,6 +314,14 @@ pub const GROUPING_ERROR: &str = "42803";
 /// `ORDER BY`, `GROUP BY` or `SELECT DISTINCT` naming something the target list does not have —
 /// a position out of range, or a `DISTINCT` sort key that is not selected.
 pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
+
+/// A recursive query whose shape the standard forbids: two references, a reference in the
+/// non-recursive term, a body that is not `non-recursive UNION [ALL] recursive`.
+///
+/// **Not `0A000`.** PostgreSQL keeps that one for the parts of `WITH RECURSIVE` it has not built —
+/// `ORDER BY` and `LIMIT` inside the body, and mutual recursion — and this one for shapes that are
+/// not legal to write. Measured, both classes.
+pub const INVALID_RECURSION: &str = "42P19";
 /// A `$1` with nothing bound to it.
 pub const UNDEFINED_PARAMETER: &str = "42P02";
 /// A definition that cannot be what it claims: an index expression whose value is not a function
@@ -462,6 +470,7 @@ mod tests {
         ),
         ("GROUPING_ERROR", super::GROUPING_ERROR),
         ("INVALID_COLUMN_REFERENCE", super::INVALID_COLUMN_REFERENCE),
+        ("INVALID_RECURSION", super::INVALID_RECURSION),
         ("INVALID_TABLE_DEFINITION", super::INVALID_TABLE_DEFINITION),
         ("NAME_TOO_LONG", super::NAME_TOO_LONG),
         ("UNDEFINED_PARAMETER", super::UNDEFINED_PARAMETER),

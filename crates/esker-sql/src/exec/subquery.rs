@@ -27,7 +27,7 @@ use crate::exec::cursor::{Cursor, SORT_LIMIT};
 use crate::plan::{
     AggregateSpec, BinaryOp, Expr, Literal, Node, Select, SelectItem, SubqueryExpr, SubqueryKind,
 };
-use crate::value::{ColumnType, Datum, PgDatum};
+use crate::value::{ColumnType, Datum, PgDatum, PgType};
 
 /// Whether a statement has a subquery anywhere the planner will look.
 ///
@@ -292,6 +292,8 @@ fn plan_derived(
     outer: Option<&crate::exec::query::Scope<'_>>,
 ) -> Result<()> {
     let name = entry.referred_as().to_owned();
+    // Kept for the recursive type rule below, which raises after `name` has been given away.
+    let referred_as = name.clone();
     let Some(derived) = entry.derived.as_mut() else {
         return Ok(());
     };
@@ -378,6 +380,26 @@ fn plan_derived(
         primary_key_comment: None,
         enums: std::collections::BTreeMap::new(),
     }));
+    // **The working table**, whose rows are supplied a round at a time by the fixpoint above it.
+    // Its `select` was planned for the *shape* only: a working table is as wide as the seed, which
+    // is what makes the seed's types the whole recursive query's.
+    if derived.working_table {
+        derived.plan = Some(Box::new(Node::WorkingTable { rows: Vec::new() }));
+        return Ok(());
+    }
+    // **The fixpoint.** The seed is `planned` already; the step is planned beside it.
+    if let Some(step) = derived.recursive.clone() {
+        derived.plan = Some(Box::new(plan_recursive(
+            *step,
+            &referred_as,
+            planned,
+            tenant,
+            txn,
+            tables,
+            outer,
+        )?));
+        return Ok(());
+    }
     // Wrapped rather than used bare, so `EXPLAIN` has a node to change the relation's name at:
     // the plan text threads one table name down the whole tree, and without this a scan of `dt_a`
     // inside `FROM (SELECT … FROM dt_a) AS t` prints `Seq Scan on t`.
@@ -392,6 +414,49 @@ fn plan_derived(
         input_columns: planned.column_names,
     }));
     Ok(())
+}
+
+/// The two halves of a `WITH RECURSIVE`, planned into one node.
+///
+/// Its own function because `plan_derived` is the one place every `FROM` entry passes through and
+/// the fixpoint is the one entry that plans a *second* select — keeping it here leaves that
+/// function about the shape a derived table has.
+fn plan_recursive(
+    step: crate::plan::RecursiveTerm,
+    name: &str,
+    seed: crate::exec::query::Planned,
+    tenant: u64,
+    txn: &dyn Txn,
+    tables: &dyn Tables,
+    outer: Option<&crate::exec::query::Scope<'_>>,
+) -> Result<Node> {
+    let distinct = step.distinct;
+    let mut select = step.select;
+    // The step's own `FROM` entries — the working table among them — are planned first, the way
+    // every other derived table's are: `plan_select_of` borrows the relation a derived entry
+    // stands for and expects the pass that builds it to have run.
+    plan_subqueries(&mut select, tenant, txn, tables, outer)?;
+    let stepped = plan_select_of(&select, tenant, tables, outer)?;
+    // **A recursive query does not promote its arms.** A plain `UNION` widens both sides to a
+    // common type; here the non-recursive term decides and the recursive one has to already fit,
+    // so a wider step is an error that names the *seed* as the thing to widen. Measured — and it
+    // is the one rule of this feature that reads backwards from a set operation.
+    for (at, (declared, produced)) in seed.columns.iter().zip(&stepped.columns).enumerate() {
+        let overall = crate::exec::query::unify(declared.ty, produced.ty)?;
+        if overall != declared.ty {
+            return Err(SqlError::RecursiveColumnType {
+                name: name.to_owned(),
+                column: at + 1,
+                declared: PgType::name(declared.ty),
+                overall: PgType::name(overall),
+            });
+        }
+    }
+    Ok(Node::Recursive {
+        seed: Box::new(seed.node),
+        step: Box::new(stepped.node),
+        distinct,
+    })
 }
 
 /// Plans one sub-`SELECT` against the tables it names. Shared by a subquery and a derived table.
@@ -1152,6 +1217,11 @@ fn for_each_node_expr(node: &Node, visit: &mut impl FnMut(&Expr)) {
         }
         // Every arm, because a correlated reference can be in any of them: `WHERE o.x = ANY
         // (SELECT a FROM t UNION ALL SELECT o.y)` names the outer row from the second.
+        // Both halves hold expressions, and the step's are the ones that name outer columns.
+        Node::Recursive { seed, step, .. } => {
+            for_each_node_expr(seed, visit);
+            for_each_node_expr(step, visit);
+        }
         Node::Append { arms } => {
             for arm in arms {
                 for_each_node_expr(arm, visit);
@@ -1209,6 +1279,8 @@ fn for_each_node_expr(node: &Node, visit: &mut impl FnMut(&Expr)) {
         }
         Node::Columnar(columnar) => for_each_node_expr(&columnar.fallback, visit),
         Node::OneRow
+        // A working table holds values a round put there, not expressions.
+        | Node::WorkingTable { .. }
         | Node::CatalogView { .. }
         // A sequence's one row is a counter, not an expression.
         | Node::SequenceRead { .. }
@@ -1238,6 +1310,10 @@ fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
             }
         }
         // Every arm, for the reason the immutable walk gives.
+        Node::Recursive { seed, step, .. } => {
+            for_each_node_expr_mut(seed, visit);
+            for_each_node_expr_mut(step, visit);
+        }
         Node::Append { arms } => {
             for arm in arms {
                 for_each_node_expr_mut(arm, visit);
@@ -1299,6 +1375,8 @@ fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
         // (`crate::exec::fragment::push_filter` refuses one).
         Node::Columnar(columnar) => for_each_node_expr_mut(&mut columnar.fallback, visit),
         Node::OneRow
+        // A working table holds values a round put there, not expressions.
+        | Node::WorkingTable { .. }
         | Node::CatalogView { .. }
         // A sequence's one row is a counter, not an expression.
         | Node::SequenceRead { .. }

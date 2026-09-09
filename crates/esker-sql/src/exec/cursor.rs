@@ -407,6 +407,22 @@ impl<'a> Cursor<'a> {
             // are: nothing is stored, so there is no key range to seek in and the row count is the
             // length of the list.
             Node::Values { list, .. } => Kind::Rows(super::values::rows(list, txn)?.into_iter()),
+            // **The fixpoint.** The seed is drained first and becomes the first working table;
+            // every round after it runs the step with that round's rows in place of the CTE's
+            // name. Materialised a round at a time, which is the one place this differs from a
+            // real server: PostgreSQL streams its working table, so a `LIMIT` can stop an
+            // unbounded recursion there and here the cap has to (`tests/recursive_cte.rs`).
+            Node::Recursive {
+                seed,
+                step,
+                distinct,
+                ..
+            } => Kind::Rows(
+                super::recursive::run(txn, tenant, settings, seed, step, *distinct)?.into_iter(),
+            ),
+            // Filled in by the round above it; empty anywhere else, which is what an unreferenced
+            // working table is.
+            Node::WorkingTable { rows, .. } => Kind::Rows(rows.clone().into_iter()),
             // A set-returning function in `FROM`: its rows are computed here, once, exactly as a
             // catalog view's are — there is no key range to seek in and the row count is the
             // length of one array. Its arguments are evaluated against **no row**, which is what

@@ -433,7 +433,7 @@ fn updatable(
     let mut renames = std::collections::BTreeMap::new();
     for item in &body.projection {
         match item {
-            crate::plan::SelectItem::Expr { expr, alias } => match expr {
+            crate::plan::SelectItem::Expr { expr, alias, .. } => match expr {
                 crate::plan::Expr::Column { name: column, .. } => {
                     let shown = alias.clone().unwrap_or_else(|| column.clone());
                     if &shown != column {

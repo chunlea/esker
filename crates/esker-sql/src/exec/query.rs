@@ -532,6 +532,9 @@ pub(super) struct OutputColumn {
     /// as its label (ADR 0050). Kept in the same struct as `ty` rather than in a list beside it, so
     /// that a column can never have one and not the other.
     pub(super) user_type: Option<crate::catalog::TypeDef>,
+    /// A **pseudo-type** the projection was cast to: a type no value has, reported through the
+    /// `RowDescription` and nowhere else. See [`crate::plan::PseudoType`].
+    pub(super) pseudo: Option<crate::plan::PseudoType>,
 }
 
 pub(super) struct Planned {
@@ -868,7 +871,7 @@ fn coerce_arm(node: Node, arm: &[ColumnType], columns: &[OutputColumn]) -> Node 
 /// Whether every arm can then *reach* the chosen type is [`reaches_implicitly`]'s question, asked
 /// in [`append`] once the type is known: `money` beside `numeric` and `json` beside `jsonb` agree
 /// on a category and have no implicit cast, which is `42846` there and not `42804`.
-fn unify(left: ColumnType, right: ColumnType) -> Result<ColumnType> {
+pub(super) fn unify(left: ColumnType, right: ColumnType) -> Result<ColumnType> {
     use esker_keys::array::ArrayValue;
     if left == right {
         return Ok(left);
@@ -2690,6 +2693,7 @@ pub(super) fn deshadow(expr: &Expr, select: &Select) -> Expr {
         if let SelectItem::Expr {
             expr: projected,
             alias: None,
+            ..
         } = item
             && !matches!(projected, Expr::Column { name: own, .. } if own == name)
             && figure_column_name(projected) == *name
@@ -2708,6 +2712,7 @@ pub(super) fn dealias(expr: &Expr, select: &Select) -> Expr {
         if let SelectItem::Expr {
             expr: aliased,
             alias: Some(alias),
+            ..
         } = item
             && alias == name
         {
@@ -4157,10 +4162,17 @@ fn output_columns(
                         ty: column.ty,
                         typmod: column.typmod,
                         user_type: scope.user_type_at(at).cloned(),
+                        // A `*` expands to columns, and a column's type is one the catalog holds.
+                        pseudo: None,
                     }
                 }));
             }
-            SelectItem::Expr { expr, alias } => {
+            SelectItem::Expr {
+                expr,
+                alias,
+                user_type: declared,
+                pseudo,
+            } => {
                 // With an aggregation the type comes from the rewritten expression, because an
                 // aggregate call has no type until the aggregation has resolved its argument.
                 let ty = match aggregation {
@@ -4172,7 +4184,15 @@ fn output_columns(
                 };
                 // PostgreSQL names an aggregate's column after the function -- `count`, `sum` --
                 // and not `?column?`. Measured; ActiveRecord reads results by name.
-                let name = alias.clone().unwrap_or_else(|| figure_column_name(expr));
+                // **A cast names its column after the type**, which a folded user cast cannot
+                // say for itself: by here `'good'::feeling` is the literal `good` and would be
+                // `?column?`. `test_reload_type_map_for_newly_defined_types` reads the result by
+                // that name, so the name is as load-bearing as the oid below it.
+                let name = alias.clone().unwrap_or_else(|| match (declared, pseudo) {
+                    (Some(def), _) => crate::catalog::display_name(&def.name),
+                    (None, Some(pseudo)) => pseudo.name.to_owned(),
+                    (None, None) => figure_column_name(expr),
+                });
                 // A typmod travels only with a **plain column reference**, which is
                 // PostgreSQL's rule and the corpus's: `c || '|'` is `text` with none and
                 // `min(c)` is `bpchar` with none, where a bare `c` is `character(3)`.
@@ -4185,6 +4205,9 @@ fn output_columns(
                 // `mood` on a real server — and everything else loses it, because an expression
                 // over an enum is an expression over its ordinal and has no name to give back.
                 let user_type = match expr {
+                    // **A cast to a user type declared one outright**, and it outranks anything
+                    // read off the expression: the expression is the folded value.
+                    _ if declared.is_some() => declared.clone(),
                     Expr::Column { table, name } => scope
                         .resolve_column(table.as_deref(), name)
                         .ok()
@@ -4207,6 +4230,7 @@ fn output_columns(
                     ty,
                     typmod,
                     user_type,
+                    pseudo: *pseudo,
                 });
             }
         }

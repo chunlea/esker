@@ -6184,8 +6184,8 @@ fn is_json_expr(expr: &Expr) -> bool {
 
 /// The arithmetic operator a token is, or `None` for one that compares or combines.
 ///
-/// `^` is here and `#`, `&`, `|`, `<<` and `>>` are not: PostgreSQL's bit operators are a separate
-/// surface with their own types, and naming them is better than approximating them.
+/// `^` is exponentiation here and `#` is the bitwise XOR, which is the one pairing a reader
+/// coming from C gets wrong: the two symbols swap meanings against every other language.
 fn arithmetic_op(op: &BinaryOperator) -> Option<plan::ArithOp> {
     Some(match op {
         BinaryOperator::Plus => plan::ArithOp::Add,
@@ -6196,6 +6196,11 @@ fn arithmetic_op(op: &BinaryOperator) -> Option<plan::ArithOp> {
         // `^` under the PostgreSQL dialect is exponentiation, not a bitwise XOR — that is `#`
         // there — so both spellings the parser can produce for the token mean the same operator.
         BinaryOperator::PGExp | BinaryOperator::BitwiseXor => plan::ArithOp::Power,
+        BinaryOperator::BitwiseAnd => plan::ArithOp::BitAnd,
+        BinaryOperator::BitwiseOr => plan::ArithOp::BitOr,
+        BinaryOperator::PGBitwiseXor => plan::ArithOp::BitXor,
+        BinaryOperator::PGBitwiseShiftLeft => plan::ArithOp::ShiftLeft,
+        BinaryOperator::PGBitwiseShiftRight => plan::ArithOp::ShiftRight,
         _ => return None,
     })
 }
@@ -6629,6 +6634,53 @@ fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {
 
 /// A target list, lowered — the one a `SELECT` projects and the one a `RETURNING` returns.
 ///
+/// The pseudo-type a projected cast names, and the two refusals a value of one gets.
+///
+/// **Only NULL may be cast to a pseudo-type**, which is what "no value has this type" means, and
+/// the two ways of writing a value get two different codes — measured:
+///
+/// ```text
+/// SELECT 1::anyarray        42846 cannot cast type integer to anyarray
+/// SELECT '{1,2}'::anyarray  0A000 cannot accept a value of type anyarray
+/// ```
+///
+/// A *typed* operand has no cast to offer, so it is `42846`; an unadorned literal is `unknown`,
+/// which every type accepts as input, so the refusal moves to the type itself and becomes the
+/// `0A000` that says nothing can be one of these.
+///
+/// Only the projection asks. A pseudo-type elsewhere keeps the untyped NULL it has always been:
+/// nothing in the corpus writes one, and inventing an answer for `WHERE x = NULL::anyarray` would
+/// be inventing it.
+fn pseudo_cast(expr: &Expr) -> Result<Option<plan::PseudoType>> {
+    let Expr::Cast {
+        expr: operand,
+        data_type,
+        ..
+    } = expr
+    else {
+        return Ok(None);
+    };
+    let DataType::Custom(name, _) = data_type else {
+        return Ok(None);
+    };
+    let Some(pseudo) = plan::PseudoType::by_name(&name.to_string()) else {
+        return Ok(None);
+    };
+    match operand.as_ref() {
+        Expr::Value(value) if matches!(value.value, Value::Null) => Ok(Some(pseudo)),
+        // An unadorned literal is `unknown`, and the refusal is about the target.
+        Expr::Value(value) if matches!(value.value, Value::SingleQuotedString(_)) => {
+            Err(SqlError::CannotAcceptPseudoType(pseudo.name.to_owned()))
+        }
+        // The source type as PostgreSQL's resolver names it, which is the same spelling a
+        // `42883` quotes back for a function argument.
+        other => Err(SqlError::CannotCastToPseudoType {
+            from: argument_type_name(&FunctionArg::Unnamed(FunctionArgExpr::Expr(other.clone()))),
+            to: pseudo.name,
+        }),
+    }
+}
+
 /// One function because they are one grammar: `*`, `t.*`, an expression, an expression with an
 /// alias, and the five `SELECT * EXCLUDE`-style modifiers that are each `0A000` naming themselves.
 /// Two copies of this is two places for `RETURNING *` to stop meaning what `SELECT *` means.
@@ -6637,10 +6689,15 @@ fn lower_projection(items: &[SelectItem]) -> Result<Vec<plan::SelectItem>> {
         .iter()
         .map(|item| match item {
             SelectItem::UnnamedExpr(expr) => Ok(plan::SelectItem::Expr {
+                // Filled by `Executor::resolve_user_cast`, which is where the catalog is.
+                user_type: None,
+                pseudo: pseudo_cast(expr)?,
                 expr: lower_expr(expr)?,
                 alias: None,
             }),
             SelectItem::ExprWithAlias { expr, alias } => Ok(plan::SelectItem::Expr {
+                user_type: None,
+                pseudo: pseudo_cast(expr)?,
                 expr: lower_expr(expr)?,
                 alias: Some(ident(alias)),
             }),
@@ -7332,26 +7389,130 @@ fn references(body: &Query, name: &str) -> bool {
         .any(|word| word == wanted)
 }
 
+/// One lowered `WITH` item: its name, its body, its column aliases, and its recursive term.
+type LoweredItem = (
+    String,
+    plan::Select,
+    Vec<String>,
+    Option<Box<plan::RecursiveTerm>>,
+);
+
+/// A `WITH` item's body: the term that runs first, and the one that runs until nothing is new.
+struct RecursiveBody {
+    /// The non-recursive term, or the whole body when there is no recursion.
+    body: plan::Select,
+    /// The recursive term, with its self-reference already replaced by the working table.
+    step: Option<Box<plan::RecursiveTerm>>,
+}
+
+/// Lowers a `WITH` item's body, splitting it in two when it names itself.
+///
+/// **Every refusal here is PostgreSQL's, measured** (`tests/captures/pg19_recursive_cte.txt`), and
+/// they fall in two classes that are not interchangeable: a shape the standard forbids is `42P19`,
+/// and a shape PostgreSQL has simply not built is `0A000`. `ORDER BY` and `LIMIT` *inside* the
+/// body are in the second class — not illegal, unimplemented — which is the way round reasoning
+/// does not put them.
+fn lower_recursive_or_query(
+    query: &Query,
+    recursive: bool,
+    name: &str,
+    columns: &[String],
+) -> Result<RecursiveBody> {
+    if !recursive || !references(query, name) {
+        return Ok(RecursiveBody {
+            body: lower_query(query)?,
+            step: None,
+        });
+    }
+    // `ORDER BY` and `LIMIT` belong to the body here, not to the statement: the outer query's own
+    // are lowered by whoever called this.
+    if query.order_by.is_some() {
+        return Err(SqlError::NotImplementedInRecursive(
+            "ORDER BY in a recursive query",
+        ));
+    }
+    if query.limit_clause.is_some() {
+        return Err(SqlError::NotImplementedInRecursive(
+            "LIMIT in a recursive query",
+        ));
+    }
+    let shape = || SqlError::RecursiveQueryShape(name.to_owned());
+    let SetExpr::SetOperation {
+        op,
+        set_quantifier,
+        left,
+        right,
+    } = query.body.as_ref()
+    else {
+        // A body that is not a set operation at all, which is the shape
+        // `WITH RECURSIVE t AS (SELECT n FROM t)` has.
+        return Err(shape());
+    };
+    // `INTERSECT` and `EXCEPT` are the same sentence: the form is `UNION [ALL]` and nothing else.
+    if !matches!(op, sqlparser::ast::SetOperator::Union) {
+        return Err(shape());
+    }
+    // **The seed may not name the CTE**, and that is its own sentence rather than the shape one.
+    if references_set_expr(left, name) {
+        return Err(SqlError::RecursiveReferenceInSeed(name.to_owned()));
+    }
+
+    let seed = lower_set_arm(query, left)?;
+    let mut step = lower_set_arm(query, right)?;
+
+    // Counted over **table factors**: `JOIN t ON c.firm_id = t.id` names `t` twice and references
+    // the relation once, so a word count would refuse the statement the suite sends.
+    // The alias list renames the working table's columns exactly as it renames the CTE's:
+    // `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n …)` reads `i` from the round
+    // before it, and the seed called that column `?column?`.
+    let references = plan::cte::plant_working_table(&mut step, name, &seed, columns);
+    if references == 0 {
+        // The word is in the body but no `FROM` entry is the CTE — a string literal, or a column
+        // of that name. Not recursive, so it is an ordinary item after all.
+        return Ok(RecursiveBody {
+            body: lower_query(query)?,
+            step: None,
+        });
+    }
+    if references > 1 {
+        return Err(SqlError::RecursiveReferenceTwice(name.to_owned()));
+    }
+    // **Only the nullable side is refused.** `FROM t LEFT JOIN c` keeps every row of `t` and is
+    // legal — and unbounded, which is how the first capture of this feature hung a server.
+    if plan::cte::on_a_nullable_side(&step) {
+        return Err(SqlError::RecursiveReferenceInOuterJoin(name.to_owned()));
+    }
+    if step.projection.iter().any(|item| {
+        matches!(item, plan::SelectItem::Expr { expr, .. }
+            if crate::exec::aggregate::contains_aggregate(expr))
+    }) {
+        return Err(SqlError::AggregateInRecursiveTerm);
+    }
+    Ok(RecursiveBody {
+        body: seed,
+        step: Some(Box::new(plan::RecursiveTerm {
+            select: step,
+            // `UNION` without `ALL`, which is what makes the dedup a termination rule.
+            distinct: !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All),
+        })),
+    })
+}
+
+/// Whether one arm of a set operation names `name`, by the same word match [`references`] uses.
+fn references_set_expr(body: &SetExpr, name: &str) -> bool {
+    let text = body.to_string().to_ascii_lowercase();
+    let wanted = name.to_ascii_lowercase();
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| word == wanted)
+}
+
 fn lower_with(with: Option<&sqlparser::ast::With>, into: &mut plan::Select) -> Result<()> {
     let Some(with) = with else { return Ok(()) };
     // **`RECURSIVE` is a keyword about the *bodies*, not about the list.** A `WITH RECURSIVE`
     // whose body does not reference itself is an ordinary `WITH` on a real server and answers —
-    // measured, `WITH RECURSIVE t AS (SELECT 1 AS n) SELECT n FROM t` is `1` — so the keyword
-    // alone is not the refusal. What this node cannot do is the fixpoint: a CTE here is *inlined*
-    // (`crate::plan::cte`), and a body that names itself cannot be, because substituting it would
-    // never terminate. That needs a working table iterated to a fixed point, with its own
-    // termination rule and its own memory bound, and it is refused by name below — per body, so
-    // the non-recursive ones in the same list still run.
-    if with.recursive {
-        for cte in &with.cte_tables {
-            let name = ident(&cte.alias.name);
-            if references(&cte.query, &name) {
-                return Err(SqlError::unsupported(format!(
-                    "WITH RECURSIVE over {name}, whose body names itself"
-                )));
-            }
-        }
-    }
+    // measured — so the keyword alone decides nothing. A body that *does* name itself cannot be
+    // inlined, because substituting it never terminates: it is split into its two terms below and
+    // iterated to a fixed point by `exec::recursive`.
 
     // Every name up front, because deciding whether a reference is a *forward* one needs the list
     // the body being lowered is not yet part of.
@@ -7361,7 +7522,7 @@ fn lower_with(with: Option<&sqlparser::ast::With>, into: &mut plan::Select) -> R
         .map(|cte| ident(&cte.alias.name))
         .collect();
     let mut named: Vec<String> = Vec::new();
-    let mut bodies: Vec<(String, plan::Select, Vec<String>)> = Vec::new();
+    let mut bodies: Vec<LoweredItem> = Vec::new();
     for cte in &with.cte_tables {
         // `AS MATERIALIZED` and `AS NOT MATERIALIZED` are **accepted and change nothing**, which
         // is not the usual "reject rather than ignore": both spellings return the same rows on a
@@ -7370,43 +7531,66 @@ fn lower_with(with: Option<&sqlparser::ast::With>, into: &mut plan::Select) -> R
         let name = ident(&cte.alias.name);
         plan::cte::refuse_duplicate(&named, &name)?;
         // Data-modifying CTEs are the read path's write half and are a unit of their own.
-        let body = match cte.query.body.as_ref() {
-            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) => {
-                return Err(SqlError::unsupported("a data-modifying WITH item"));
-            }
-            _ => lower_query(&cte.query)?,
-        };
-        let mut body = body;
-        // Each item sees the ones before it and **not itself**: `WITH t AS (SELECT id FROM t)` is
-        // the same `42P01` a forward reference gets, measured.
-        for (earlier, earlier_body, earlier_columns) in &bodies {
-            plan::cte::inline(&mut body, earlier, earlier_body, earlier_columns);
-        }
-        // What is left of the list is what this body may not reference -- itself included -- and a
-        // reference to one of those is only an error if the catalog has no such relation.
-        plan::cte::mark_hidden(&mut body, &all_names[bodies.len()..]);
         let columns: Vec<String> = cte
             .alias
             .columns
             .iter()
             .map(|column| ident(&column.name))
             .collect();
+        let body = match cte.query.body.as_ref() {
+            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) => {
+                return Err(SqlError::unsupported("a data-modifying WITH item"));
+            }
+            _ => lower_recursive_or_query(&cte.query, with.recursive, &name, &columns)?,
+        };
+        // **Mutual recursion**, which PostgreSQL has not built either and says so with its own
+        // sentence — not the `42P01` a forward reference gets without `RECURSIVE`. Measured.
+        if with.recursive {
+            let later = &all_names[bodies.len() + 1..];
+            for name in later {
+                if references(&cte.query, name) {
+                    return Err(SqlError::NotImplementedInRecursive(
+                        "mutual recursion between WITH items",
+                    ));
+                }
+            }
+        }
+        let RecursiveBody { mut body, step } = body;
+        // Each item sees the ones before it and **not itself**: `WITH t AS (SELECT id FROM t)` is
+        // the same `42P01` a forward reference gets, measured.
+        for (earlier, earlier_body, earlier_columns, _) in &bodies {
+            plan::cte::inline(&mut body, earlier, earlier_body, earlier_columns);
+        }
+        // What is left of the list is what this body may not reference -- itself included -- and a
+        // reference to one of those is only an error if the catalog has no such relation.
+        plan::cte::mark_hidden(&mut body, &all_names[bodies.len()..]);
         named.push(name.clone());
-        bodies.push((name, body, columns));
+        bodies.push((name, body, columns, step));
     }
 
-    for (name, body, columns) in &bodies {
-        plan::cte::inline(into, name, body, columns);
+    for (name, body, columns, step) in &bodies {
+        match step {
+            // **A recursive item is substituted like any other**, and what changes is only what
+            // the derived table is: a seed and a step, planned into a fixpoint, where an ordinary
+            // one is a body planned once. Everything above it — a qualifier, an `ORDER BY`, a
+            // second reference in the outer query — reads it as the relation it already reads a
+            // CTE as.
+            Some(step) => {
+                plan::cte::inline_recursive(into, name, body, step, columns);
+            }
+            None => {
+                plan::cte::inline(into, name, body, columns);
+            }
+        }
         // Carried whether anything referenced it or not: **an unreferenced CTE is still
         // analysed**, measured, and inlining alone would never look at one.
+        let mut derived = plan::Derived::from_cte(Box::new(body.clone()), columns.clone());
+        derived.recursive.clone_from(step);
         into.ctes.push(plan::TableRef {
             values: None,
             name: name.clone(),
             alias: None,
-            derived: Some(Box::new(plan::Derived::from_cte(
-                Box::new(body.clone()),
-                columns.clone(),
-            ))),
+            derived: Some(Box::new(derived)),
             function: None,
             hidden_cte: false,
             written: None,

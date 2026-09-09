@@ -43,7 +43,14 @@ pub(crate) struct RowLocks {
     /// `pg_cancel_backend`, and both take a backend pid. Kept beside the ids rather than widening
     /// `locks` and `waits_for`, so the graph and its deadlock walk are untouched.
     sessions: BTreeMap<u64, u32>,
-    /// `waiter -> the transaction it is waiting for`, while it waits.
+    /// `waiter -> (the transaction it is waiting for, the key it is waiting on)`, while it waits.
+    ///
+    /// **The edge names the key as well as the holder, and that is what makes a partial release
+    /// safe.** Naming only the holder cannot answer "is this edge still true after that
+    /// transaction gave one row back", and both wrong answers are real: keeping a stale edge
+    /// closes a cycle that does not exist (`40P01` to a transaction that was never in one), and
+    /// dropping a live one hides a cycle that does (two sessions hanging until a `lock_timeout`
+    /// neither set). With the key here the question is exact — an edge dies with the key it names.
     ///
     /// **The wait-for graph, and a cycle in it is a deadlock.** Without this a wait with no
     /// `lock_timeout` is a wait with no end: two transactions taking two rows in opposite orders
@@ -53,7 +60,7 @@ pub(crate) struct RowLocks {
     ///
     /// Node-local, which is every deadlock two sessions of one `esker-sql` process can make. A
     /// cycle across nodes needs a graph both can see — PD's job, and a named follow-on.
-    waits_for: BTreeMap<u64, u64>,
+    waits_for: BTreeMap<u64, (u64, Vec<u8>)>,
 }
 
 /// What one node's lock table holds, flattened for `pg_locks`.
@@ -84,7 +91,7 @@ impl RowLocks {
             waiting: self
                 .waits_for
                 .iter()
-                .map(|(waiter, holder)| (*waiter, *holder, self.session_of(*waiter)))
+                .map(|(waiter, (holder, _))| (*waiter, *holder, self.session_of(*waiter)))
                 .collect(),
         }
     }
@@ -121,7 +128,7 @@ impl RowLocks {
                     self.waits_for.remove(&id);
                     return Lock::Deadlock;
                 }
-                self.waits_for.insert(id, holder);
+                self.waits_for.insert(id, (holder, key.to_vec()));
                 Lock::Held {
                     by: holder_ts,
                     lease_ms: u64::MAX,
@@ -144,41 +151,64 @@ impl RowLocks {
         }
     }
 
-    /// Gives back every one of `held` that `id` still holds, and forgets that `id` was waiting.
+    /// **The transaction is over**: every key of `held` that `id` still holds, its wait, the
+    /// edges pointing at it, and the session behind it.
     ///
     /// Checking the holder is what makes this safe to call twice, and what makes it safe to call
     /// from a destructor: a key this transaction no longer holds belongs to somebody else.
+    ///
+    /// Use [`RowLocks::give_back`] for a transaction that carries on — the two differ in
+    /// everything except which keys they drop, and calling this one for a partial release is what
+    /// took a live transaction's pid out of `pg_locks` and a live waiter out of the graph.
     pub(crate) fn release(&mut self, id: u64, held: &[Vec<u8>]) {
         self.waits_for.remove(&id);
-        // **And every edge pointing *at* it**, which is the other half and was missing.
-        //
-        // An edge means "this transaction is waiting for that one"; a transaction that has given
-        // back everything it held cannot be waited for, so the edge is stale the instant this
-        // runs. It is cleared here rather than left for the waiter's next poll because of what
-        // lives in the gap: the waiter polls every two milliseconds, and the deadlock detector
-        // walks these edges on **every** contended attempt. A deadlock's victim gives its locks
-        // back at once (`Txn::abandon_locks`) and then retries — and in that window the survivor's
-        // edge still named the victim, so the retry walked survivor → victim → itself and was
-        // told `40P01` for a cycle that no longer existed.
-        //
-        // `transaction_nested_test.rb`'s *deadlock inside nested SavepointTransaction is
-        // recoverable* is exactly that shape: the victim rolls back to its savepoint and writes
-        // the row again, inside the same block, before the survivor has polled once. The module
-        // note above already says an edge left behind "can close a cycle that does not exist and
-        // answer `40P01` to a transaction that was never in one" — this is the second way it
-        // happens, and it needs the waiter's edge cleared rather than the holder's.
-        //
-        // Correct because every caller releases **everything** it holds — commit, rollback and
-        // `abandon_locks` all pass the whole list — so after this there is nothing left of `id` to
-        // wait for. A partial release would need the edges to name keys instead of transactions.
-        self.waits_for.retain(|_, holder| *holder != id);
-        // The transaction is over, so its row is gone from both maps above and nothing can ask
-        // whose it was. Left behind, this would grow by one entry per transaction for the life of
-        // the process.
+        // **And every edge pointing at it**, whatever key it names. `drop` below clears the edges
+        // on the keys actually given back, which is the exact rule; this is the sweep that makes
+        // the *ended* transaction unconditional, because a caller whose `held` list has drifted
+        // from what the table thinks it holds would otherwise leave an edge naming a transaction
+        // that is gone for good. `give_back` deliberately does not do this — see there.
+        self.waits_for.retain(|_, (holder, _)| *holder != id);
+        // Nothing can ask whose the transaction was, so its row goes from here too. Left behind,
+        // this would grow by one entry per transaction for the life of the process.
         self.sessions.remove(&id);
-        for key in held {
+        self.drop(id, held);
+    }
+
+    /// **Gives back part of what `id` holds and leaves it running**: `ROLLBACK TO SAVEPOINT`, and
+    /// a deadlock inside one.
+    ///
+    /// The keys go and nothing else does. A transaction that still holds a row is still a
+    /// transaction to wait for, so the edges pointing at it stand, and it is still somebody's, so
+    /// `pg_locks` keeps naming the backend that owns it. Those are the two things
+    /// [`RowLocks::release`] deliberately destroys, and they are why this is a second entry point
+    /// rather than a flag: the difference is what the caller *means*, and a bool at the call site
+    /// says it in the place where it is easiest to get backwards.
+    ///
+    /// The waiters that were queued on the keys it *does* give back lose their edges, because
+    /// `drop` clears an edge with the key it names. That is the whole of what a partial release
+    /// may conclude, and it is enough: a deadlock's victim inside a savepoint frees exactly the
+    /// rows the survivor is asleep on.
+    pub(crate) fn give_back(&mut self, id: u64, keys: &[Vec<u8>]) {
+        self.drop(id, keys);
+    }
+
+    /// The half the two share: forget the keys of `keys` that `id` actually holds, **and the
+    /// edges of the waiters that were waiting on them**.
+    ///
+    /// A freed key blocks nobody, so every edge naming it is stale the instant it is removed —
+    /// whether the transaction that held it has ended or is carrying on with the rest. Clearing
+    /// them here rather than leaving them to the waiter's next poll is what closes the two
+    /// millisecond window a deadlock's victim retries inside: the survivor's edge still named the
+    /// victim, so the retry walked survivor → victim → itself and was told `40P01` for a cycle
+    /// that had ended a moment earlier.
+    ///
+    /// The waiter is still waiting, and that is correct: it is waiting for a key **nobody holds**,
+    /// and its next attempt either takes it or draws a new edge to whoever got there first.
+    fn drop(&mut self, id: u64, keys: &[Vec<u8>]) {
+        for key in keys {
             if self.locks.get(key).map(|(holder, _)| *holder) == Some(id) {
                 self.locks.remove(key);
+                self.waits_for.retain(|_, (_, on)| on != key);
             }
         }
     }
@@ -195,7 +225,7 @@ impl RowLocks {
                 return true;
             }
             match self.waits_for.get(&at) {
-                Some(&next) => at = next,
+                Some((next, _)) => at = *next,
                 None => return false,
             }
         }
@@ -223,7 +253,11 @@ mod tests {
         let (a, b) = (locks.next_id(), locks.next_id());
         assert!(matches!(locks.take(b"k", a, 10, 101), Lock::Taken));
         assert!(matches!(locks.take(b"k", b, 20, 102), Lock::Held { .. }));
-        assert_eq!(locks.waits_for.get(&b), Some(&a), "b is waiting for a");
+        assert_eq!(
+            locks.waits_for.get(&b).map(|(holder, _)| *holder),
+            Some(a),
+            "b is waiting for a"
+        );
 
         // Both sessions are known while both are in the table, which is what `pg_locks.pid`
         // reports: the holder's row and the waiter's row name different backends.
@@ -259,7 +293,11 @@ mod tests {
         let (a, b) = (locks.next_id(), locks.next_id());
         assert!(matches!(locks.take(b"k", a, 10, 101), Lock::Taken));
         assert!(matches!(locks.take(b"k", b, 20, 102), Lock::Held { .. }));
-        assert_eq!(locks.waits_for.get(&b), Some(&a), "b waits for a");
+        assert_eq!(
+            locks.waits_for.get(&b).map(|(holder, _)| *holder),
+            Some(a),
+            "b waits for a"
+        );
 
         // `a` gives everything back — a deadlock's victim does this before it retries.
         locks.release(a, &[b"k".to_vec()]);

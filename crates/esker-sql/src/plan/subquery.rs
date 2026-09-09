@@ -266,6 +266,19 @@ impl SubqueryExpr {
     }
 }
 
+/// The recursive term of a `WITH RECURSIVE`, and which operator joined it to the seed.
+///
+/// The two travel together because the operator is not a detail of the term: `UNION` deduplicates
+/// against everything already produced and so is a **termination rule**, where `UNION ALL` leaves
+/// termination entirely to the body's own predicate. Measured.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecursiveTerm {
+    /// The term to iterate, with its self-reference already replaced by the working table.
+    pub select: Select,
+    /// `UNION` rather than `UNION ALL`.
+    pub distinct: bool,
+}
+
 /// A **derived table**: `FROM (SELECT …) AS t`, and the alias list that renames its columns.
 ///
 /// It is the same subquery the rest of this module is about, standing where a relation goes rather
@@ -298,6 +311,19 @@ pub struct Derived {
     /// columns specified` for a CTE and `table "t" has …` for a `FROM (SELECT …)`. Same SQLSTATE,
     /// two sentences, measured — and a client that greps the text sees two.
     pub cte: bool,
+    /// The **recursive term** of a `WITH RECURSIVE`, when this derived table is one.
+    ///
+    /// `select` is then the non-recursive term — the seed — and the two are planned into a
+    /// [`crate::plan::Node::Recursive`]. It hangs here rather than in a node of its own because a
+    /// recursive CTE reaches the rest of the query exactly as every other CTE does: as a derived
+    /// table standing where the name was.
+    pub recursive: Option<Box<RecursiveTerm>>,
+    /// This entry **is** the working table: the reference the recursive term makes to its own CTE.
+    ///
+    /// Its `select` is the seed, and is read for the row's *shape* only — the rows come from the
+    /// round above it, so the plan is a [`crate::plan::Node::WorkingTable`] and the seed is never
+    /// run here.
+    pub working_table: bool,
     /// The plan its rows come from, filled by `crate::exec::subquery::plan_subqueries`.
     pub plan: Option<Box<Node>>,
     /// The relation it looks like from above: one column per output column of the sub-select,
@@ -309,7 +335,11 @@ pub struct Derived {
 /// [`SubqueryExpr`]'s equality is hand-written, and the same two fields left out.
 impl PartialEq for Derived {
     fn eq(&self, other: &Self) -> bool {
-        self.select == other.select && self.columns == other.columns && self.cte == other.cte
+        self.select == other.select
+            && self.columns == other.columns
+            && self.cte == other.cte
+            && self.recursive == other.recursive
+            && self.working_table == other.working_table
     }
 }
 
@@ -321,6 +351,8 @@ impl Derived {
             select,
             columns,
             cte: false,
+            recursive: None,
+            working_table: false,
             plan: None,
             def: None,
         }
