@@ -207,6 +207,28 @@ pub enum SqlError {
     #[error("time zone \"{0}\" not recognized")]
     TimeZoneNotRecognized(String),
 
+    /// A value of a real type cast to a pseudo-type: `42846`.
+    ///
+    /// Its own variant beside [`SqlError::CannotCast`] because that one's types are `'static` —
+    /// it names two types this crate has — and the source here is whatever the resolver made of
+    /// what the user wrote.
+    #[error("cannot cast type {from} to {to}")]
+    CannotCastToPseudoType {
+        /// The source type, as the resolver names it.
+        from: String,
+        /// The pseudo-type.
+        to: &'static str,
+    },
+
+    /// A value written as one of the pseudo-types: `0A000`.
+    ///
+    /// **Not the same refusal as a cast between two real types.** `1::anyarray` has a source type
+    /// and so is `42846 cannot cast type integer to anyarray`; `'{1,2}'::anyarray` is an
+    /// `unknown` literal, which every type accepts as *input*, so the refusal moves to the target
+    /// and says what a pseudo-type is: nothing can be one. Measured, both.
+    #[error("cannot accept a value of type {0}")]
+    CannotAcceptPseudoType(String),
+
     /// A `SET` whose value is a bare `$name` — `SET search_path = $user,public`.
     ///
     /// **`$user` only means anything inside quotes.** PostgreSQL's `search_path` has a magic
@@ -2778,6 +2800,7 @@ impl SqlError {
             SqlError::CannotTruncateReferenced { .. }
             | SqlError::FeatureNotSupported(_)
             | SqlError::DateTruncUnitNotSupported { .. }
+            | SqlError::CannotAcceptPseudoType(_)
             | SqlError::DefaultColumnReference
             | SqlError::DefaultSubquery
             | SqlError::DefaultSetReturning
@@ -2991,7 +3014,9 @@ impl SqlError {
             }
             SqlError::ComplexResult => sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
-            SqlError::CannotCast { .. } | SqlError::SetOperationCannotConvert { .. } => {
+            SqlError::CannotCast { .. }
+            | SqlError::CannotCastToPseudoType { .. }
+            | SqlError::SetOperationCannotConvert { .. } => {
                 sqlstate::CANNOT_COERCE
             }
             SqlError::DatetimeFieldOutOfRange { .. }

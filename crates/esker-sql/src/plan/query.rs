@@ -364,7 +364,64 @@ pub enum SelectItem {
         expr: Expr,
         /// `AS name`.
         alias: Option<String>,
+        /// The type a **cast to a user-defined type** declared, once the catalog has resolved it.
+        ///
+        /// `'good'::feeling` is folded to its label by `Executor::resolve_user_cast` — the value a
+        /// client sees is text (ADR 0050) — and by the time the planner looks at this item the
+        /// cast is gone, so the type it named would be gone with it. It is kept here because the
+        /// `RowDescription` is the whole point: a client reads the oid, asks `pg_type` what it is,
+        /// gets `typtype = 'e'` and decodes an enum. Told `text` instead, it never asks, which is
+        /// exactly the reload three `postgresql_adapter_test.rb` tests count.
+        ///
+        /// It also carries the **name**: a cast names its column after the type, so
+        /// `SELECT 'good'::feeling` is a column called `feeling` and not `?column?`.
+        user_type: Option<crate::catalog::TypeDef>,
+        /// A **pseudo-type** the projection was cast to, which is a type no value can have.
+        ///
+        /// Separate from `user_type` because it is not a type the catalog holds — `TypeDef` is a
+        /// record with a kind and an oid the catalog assigned, and `anyarray` has neither. What a
+        /// client does with it is fail to recognise it, which is the entire reason
+        /// `test_only_reload_type_map_once_for_every_unrecognized_type` casts to one.
+        pseudo: Option<PseudoType>,
     },
+}
+
+/// A type that exists to be named and never to hold a value.
+///
+/// PostgreSQL calls these pseudo-types (`typtype = 'p'`). This crate has no [`ColumnType`] for one
+/// and should not: `pg_type`'s rows are derived from `ColumnType::ALL` precisely so that a real
+/// type cannot be forgotten, and a pseudo-type would be a row whose value layer does not exist.
+/// It reaches a client through the `RowDescription` alone.
+///
+/// [`ColumnType`]: crate::value::ColumnType
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PseudoType {
+    /// What `pg_type` on a real server calls it, and the name the column takes.
+    pub name: &'static str,
+    /// The oid a real server sends. A client that does not know it reloads its type map.
+    pub oid: u32,
+    /// `typlen`, which is `-1` for every variable-length one.
+    pub type_len: i16,
+}
+
+impl PseudoType {
+    /// The one this node answers for, measured: oid 2277, `typtype = 'p'`, `typlen = -1`.
+    ///
+    /// `anyelement` is deliberately **not** here: `SELECT NULL::anyelement` is `text` on a real
+    /// server, because an unadorned NULL resolves to `text` before the pseudo-type is reached.
+    /// Measured, and it is the one member of the family that reasoning would group with this one.
+    pub const ANYARRAY: PseudoType = PseudoType {
+        name: "anyarray",
+        oid: 2277,
+        type_len: -1,
+    };
+
+    /// The pseudo-type a cast names, if this node answers for it.
+    #[must_use]
+    pub fn by_name(name: &str) -> Option<PseudoType> {
+        name.eq_ignore_ascii_case("anyarray")
+            .then_some(Self::ANYARRAY)
+    }
 }
 
 /// How the inner side of a nested-loop join produces rows for one outer row.

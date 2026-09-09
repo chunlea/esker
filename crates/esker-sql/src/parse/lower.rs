@@ -6587,6 +6587,53 @@ fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {
 
 /// A target list, lowered — the one a `SELECT` projects and the one a `RETURNING` returns.
 ///
+/// The pseudo-type a projected cast names, and the two refusals a value of one gets.
+///
+/// **Only NULL may be cast to a pseudo-type**, which is what "no value has this type" means, and
+/// the two ways of writing a value get two different codes — measured:
+///
+/// ```text
+/// SELECT 1::anyarray        42846 cannot cast type integer to anyarray
+/// SELECT '{1,2}'::anyarray  0A000 cannot accept a value of type anyarray
+/// ```
+///
+/// A *typed* operand has no cast to offer, so it is `42846`; an unadorned literal is `unknown`,
+/// which every type accepts as input, so the refusal moves to the type itself and becomes the
+/// `0A000` that says nothing can be one of these.
+///
+/// Only the projection asks. A pseudo-type elsewhere keeps the untyped NULL it has always been:
+/// nothing in the corpus writes one, and inventing an answer for `WHERE x = NULL::anyarray` would
+/// be inventing it.
+fn pseudo_cast(expr: &Expr) -> Result<Option<plan::PseudoType>> {
+    let Expr::Cast {
+        expr: operand,
+        data_type,
+        ..
+    } = expr
+    else {
+        return Ok(None);
+    };
+    let DataType::Custom(name, _) = data_type else {
+        return Ok(None);
+    };
+    let Some(pseudo) = plan::PseudoType::by_name(&name.to_string()) else {
+        return Ok(None);
+    };
+    match operand.as_ref() {
+        Expr::Value(value) if matches!(value.value, Value::Null) => Ok(Some(pseudo)),
+        // An unadorned literal is `unknown`, and the refusal is about the target.
+        Expr::Value(value) if matches!(value.value, Value::SingleQuotedString(_)) => {
+            Err(SqlError::CannotAcceptPseudoType(pseudo.name.to_owned()))
+        }
+        // The source type as PostgreSQL's resolver names it, which is the same spelling a
+        // `42883` quotes back for a function argument.
+        other => Err(SqlError::CannotCastToPseudoType {
+            from: argument_type_name(&FunctionArg::Unnamed(FunctionArgExpr::Expr(other.clone()))),
+            to: pseudo.name,
+        }),
+    }
+}
+
 /// One function because they are one grammar: `*`, `t.*`, an expression, an expression with an
 /// alias, and the five `SELECT * EXCLUDE`-style modifiers that are each `0A000` naming themselves.
 /// Two copies of this is two places for `RETURNING *` to stop meaning what `SELECT *` means.
@@ -6595,10 +6642,15 @@ fn lower_projection(items: &[SelectItem]) -> Result<Vec<plan::SelectItem>> {
         .iter()
         .map(|item| match item {
             SelectItem::UnnamedExpr(expr) => Ok(plan::SelectItem::Expr {
+                // Filled by `Executor::resolve_user_cast`, which is where the catalog is.
+                user_type: None,
+                pseudo: pseudo_cast(expr)?,
                 expr: lower_expr(expr)?,
                 alias: None,
             }),
             SelectItem::ExprWithAlias { expr, alias } => Ok(plan::SelectItem::Expr {
+                user_type: None,
+                pseudo: pseudo_cast(expr)?,
                 expr: lower_expr(expr)?,
                 alias: Some(ident(alias)),
             }),
