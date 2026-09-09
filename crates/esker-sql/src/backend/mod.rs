@@ -980,7 +980,11 @@ impl Txn for MemoryTxn {
 
     fn unlock(&mut self, key: &[u8]) {
         self.held.retain(|held| held != key);
-        self.versions().row_locks.release(self.id, &[key.to_vec()]);
+        // `give_back` and not `release`: this transaction carries on holding whatever the
+        // savepoint did not take, so it is still somebody's and still something to wait for.
+        self.versions()
+            .row_locks
+            .give_back(self.id, &[key.to_vec()]);
     }
 
     fn read_set(&self) -> ReadSet {
@@ -1096,7 +1100,7 @@ impl Txn for MemoryTxn {
 
 #[cfg(test)]
 mod tests {
-    use super::{Backend, MemoryBackend, Txn};
+    use super::{Backend, Lock, MemoryBackend, Txn};
     use crate::error::SqlError;
     use crate::sqlstate;
 
@@ -1375,6 +1379,84 @@ mod tests {
             refused.sqlstate(),
             "40001",
             "committing 2 over 99 loses an update: the second write's stamp must not say it saw 99"
+        );
+    }
+
+    /// **A transaction that gives part of its locks back is still there**, and both maps that
+    /// answer for it have to say so.
+    ///
+    /// This is the call `ROLLBACK TO SAVEPOINT` makes: `Savepoints::rollback_to` unlocks the keys
+    /// the savepoint took and no others, so a transaction holding a row from before the mark
+    /// reaches [`Txn::unlock`] with rows still held. The lock table read it as "this transaction
+    /// is over" and forgot its session and every edge pointing at it — which is `pg_locks` losing
+    /// the pid of a lock that is still held, and the deadlock detector losing a waiter that is
+    /// still waiting.
+    #[test]
+    fn giving_one_lock_back_leaves_the_transaction_holding_the_rest() {
+        let backend = MemoryBackend::new();
+        let mut block = backend.begin().unwrap();
+        block.owned_by_session(101);
+        // One row locked before a savepoint and one inside it. Only the second is the
+        // savepoint's to give back.
+        assert!(matches!(block.lock(b"before").unwrap(), Lock::Taken));
+        assert!(matches!(block.lock(b"inside").unwrap(), Lock::Taken));
+
+        let mut other = backend.begin().unwrap();
+        other.owned_by_session(102);
+        assert!(
+            matches!(other.lock(b"before").unwrap(), Lock::Held { .. }),
+            "the other session waits for the row the savepoint did not take"
+        );
+
+        // `ROLLBACK TO SAVEPOINT`, one key at a time, which is how the savepoint log replays.
+        block.unlock(b"inside");
+
+        let view = block.locks();
+        let held: Vec<(Vec<u8>, u32)> = view
+            .held
+            .iter()
+            .map(|(key, _, _, pid)| (key.clone(), *pid))
+            .collect();
+        assert_eq!(
+            held,
+            vec![(b"before".to_vec(), 101)],
+            "the row taken before the savepoint is still held, and still by session 101"
+        );
+        let waiting: Vec<u32> = view.waiting.iter().map(|(_, _, pid)| *pid).collect();
+        assert_eq!(
+            waiting,
+            vec![102],
+            "the other session is still waiting for a row this transaction still holds"
+        );
+    }
+
+    /// And the deadlock detector can still see through it: a cycle closed by a lock the
+    /// transaction **kept** is a real deadlock.
+    ///
+    /// Without the edge above, the walk from the holder ends at once and the second waiter is told
+    /// to wait — on a transaction that is waiting for it. That is not a spurious `40P01`; it is the
+    /// opposite, and worse: two sessions that hang until a `lock_timeout` neither may have set.
+    #[test]
+    fn a_cycle_through_a_kept_lock_is_still_found() {
+        let backend = MemoryBackend::new();
+        let mut block = backend.begin().unwrap();
+        block.owned_by_session(101);
+        assert!(matches!(block.lock(b"before").unwrap(), Lock::Taken));
+        assert!(matches!(block.lock(b"inside").unwrap(), Lock::Taken));
+
+        let mut other = backend.begin().unwrap();
+        other.owned_by_session(102);
+        assert!(matches!(other.lock(b"theirs").unwrap(), Lock::Taken));
+        // `other` waits for the row the savepoint will not give back.
+        assert!(matches!(other.lock(b"before").unwrap(), Lock::Held { .. }));
+
+        block.unlock(b"inside");
+
+        // Now this block asks for the row `other` holds, and `other` is waiting for this block:
+        // a cycle, through a lock the rollback kept.
+        assert!(
+            matches!(block.lock(b"theirs").unwrap(), Lock::Deadlock),
+            "a cycle closed by a lock the transaction kept is a deadlock"
         );
     }
 }
