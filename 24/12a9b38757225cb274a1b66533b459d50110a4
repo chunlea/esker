@@ -1,0 +1,23 @@
+crates/esker-sql/tests/provenance_budget.rs
+  s_6f7019c05b578b::t_59f9ed6f7d9561 30
+docs/adr/0089-a-decimal-literal-is-a-numeric.md
+  s_6f7019c05b578b::t_896291131e1a1c 1
+docs/plans/phase-9-rails.md
+  s_6f7019c05b578b::t_c2a9d2d6158ac9 1277
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "2412a9b38757225cb274a1b66533b459d50110a4",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
