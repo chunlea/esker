@@ -111,6 +111,27 @@ impl ReservedRange {
     }
 }
 
+/// A user key as something a person reading a gate log can compare — printable bytes as
+/// themselves, the rest in hex, truncated because a message is not a dump.
+fn printable(key: &[u8]) -> String {
+    let shown: String = key
+        .iter()
+        .take(24)
+        .map(|byte| {
+            if byte.is_ascii_graphic() {
+                char::from(*byte).to_string()
+            } else {
+                format!("\\x{byte:02x}")
+            }
+        })
+        .collect();
+    if key.len() > 24 {
+        format!("{shown}…({} bytes)", key.len())
+    } else {
+        shown
+    }
+}
+
 /// The widest key range `compaction` can write: the union of its inputs, as user keys.
 ///
 /// Its outputs are the merge of those inputs, so they span this range or less. `None` when the
@@ -519,11 +540,82 @@ impl DbInner {
                 .discharge
                 .iter()
                 .any(|(level, file)| !holds(*level, file.number));
-        if stale {
+        // **And the output level must not have gained a file this plan never saw**, which is the
+        // half [ADR 0079](../../../docs/adr/0079-compaction-concurrency-reserves-the-output-range.md)'s
+        // reservation cannot reach.
+        //
+        // The reservation stops two plans *running* over one range. It cannot stop a plan that was
+        // **picked before** another one's edit landed and reserved **after** it was released: the
+        // ranges never meet in the reservation because the first plan is already gone, and the
+        // check above passes because the second plan's own inputs are all still there — the file
+        // that arrived is not one of them.
+        //
+        // Caught in the act, with the diagnostic added for it, on the tenth run of the sixty-
+        // attempt loop under a six-thread arm:
+        //
+        // ```text
+        // files 123 and 119 overlap — 123 ends at key-0199 and 119 starts at bg-000014
+        // refused for the plan cf 0 level 0 -> 1, inputs [115, 112, 111, 116, 110],
+        // outputs [123], output range bg-000000..key-0199
+        // ```
+        //
+        // 119 is an L1 file and it is not among the inputs. Had it been in L1 when this plan was
+        // picked, `Picker::assemble` would have taken it as an overlapped input; it was not, so it
+        // arrived afterwards — and the plan then wrote across it.
+        //
+        // Dropped rather than repaired, like every other staleness here: the picker offers a fresh
+        // plan against the version that moved on, and that one takes the new file as an input the
+        // way it would have all along.
+        let intruded = output_range(compaction, self.comparator.user_comparator()).is_some_and(
+            |(smallest, largest)| {
+                let user = self.comparator.user_comparator();
+                let known: BTreeSet<u64> =
+                    compaction.all_inputs().map(|file| file.number).collect();
+                current
+                    .files(compaction.cf, compaction.output_level())
+                    .iter()
+                    .any(|file| {
+                        !known.contains(&file.number)
+                            && user.cmp(extract_user_key(&file.smallest), &largest)
+                                != std::cmp::Ordering::Greater
+                            && user.cmp(&smallest, extract_user_key(&file.largest))
+                                != std::cmp::Ordering::Greater
+                    })
+            },
+        );
+        if stale || intruded {
             return Ok(false);
         }
         versions.set_last_seqno(self.visible_seqno.load(Ordering::Acquire));
-        versions.log_and_apply(edit)?;
+        // **A refused edit says which plan asked for it.** `check_disjoint` sees two file numbers
+        // and their bounds and nothing about where they came from, and a gate log keeps one line:
+        // `files 124 and 121 overlap` cannot say whether one compaction wrote both or two wrote
+        // one each, which is the first question anyone reading it has. The plan is known here, so
+        // this is where it is added. It changes no behaviour — the error is returned either way.
+        if let Err(error) = versions.log_and_apply(edit) {
+            let user = self.comparator.user_comparator();
+            let range = output_range(compaction, user).map_or_else(
+                || "empty".to_owned(),
+                |(low, high)| format!("{}..{}", printable(&low), printable(&high)),
+            );
+            let inputs: Vec<u64> = compaction.all_inputs().map(|file| file.number).collect();
+            let outputs: Vec<u64> = edit
+                .added_files
+                .iter()
+                .map(|(_, _, file)| file.number)
+                .collect();
+            return Err(Error::corruption(
+                "manifest",
+                format!(
+                    "{error} — refused for the plan cf {} level {} -> {}, inputs {inputs:?}, \
+                     outputs {outputs:?}, output range {range}, manifest {}",
+                    compaction.cf,
+                    compaction.level,
+                    compaction.output_level(),
+                    versions.manifest_number(),
+                ),
+            ));
+        }
         Ok(true)
     }
 
