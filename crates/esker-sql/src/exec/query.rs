@@ -3596,6 +3596,7 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Int2Vector | ColumnType::OidVector => family(ColumnType::Text),
             ColumnType::RegTypeArray => 200,
             ColumnType::RegProcArray => 201,
+            ColumnType::RegClassArray => 202,
             // **A family of one each.** `'{1}'::int[] = '{1}'::int8[]` is `42883` on a real
             // server — an array's comparison is its element type's, and two element types are two
             // operators — so no two of these share a family and none shares one with a scalar.

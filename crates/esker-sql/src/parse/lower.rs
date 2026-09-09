@@ -5623,6 +5623,20 @@ fn lower_array(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {
             let _ = schema_function(function)?;
             return Ok(None);
         }
+        // **A `regclass[]` keeps its cast**, because its elements are *names* and reading one
+        // needs the catalog. Dropped, `'rc'::regclass = ANY('{rc}'::regclass[])` became the `IN`
+        // list `('rc')` of bare strings, and the comparison then read `rc` at the left operand's
+        // type through `Datum::from_text`, which has no catalog to ask: `0A000` for a statement a
+        // real server answers `t`. Answering `None` here keeps it an expression, and the array is
+        // built by the resolution that *does* have one.
+        Expr::Cast {
+            data_type: DataType::Array(inner),
+            ..
+        } if array_element(inner)
+            .is_some_and(|inner| cast_target(inner) == Some(CastTarget::RegClass)) =>
+        {
+            return Ok(None);
+        }
         // `'{a,b}'::text[]` and a bare `'{a,b}'`: the cast is a no-op here, because what the array
         // holds is decided by what it is compared against, exactly as an `IN` list's elements are.
         Expr::Cast { expr, .. } => return lower_array(expr),
@@ -5886,6 +5900,17 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
     // `'{a,b}'::text[]` reported its type as `text`. Now that an array is a type, this is an
     // ordinary cast to a stored type: `Datum::from_text` is `array_in`, and it is the element
     // type that answers for a bad element.
+    // **`regclass[]` is lowered before the general path**, because its element's input function
+    // is a catalog lookup and `Datum::from_text` has no catalog. A literal's names become one
+    // `CatalogFunc::RegClass` each — the same resolution `'x'::regclass` gets, so a name nothing
+    // answers to is the same `42P01` in the same place — and anything else becomes an ordinary
+    // cast the row evaluator answers, where `env` is.
+    if let DataType::Array(inner) = data_type
+        && let Some(inner) = array_element(inner)
+        && cast_target(inner) == Some(CastTarget::RegClass)
+    {
+        return lower_regclass_array(expr).map(Some);
+    }
     if let DataType::Array(inner) = data_type
         && let Some(element) = array_element(inner)
         && let Ok((element, NO_TYPMOD)) = lower_type(element)
@@ -5920,6 +5945,65 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
     Ok(None)
 }
 
+/// `'{pg_class,pg_type}'::regclass[]`, and every other operand cast to one.
+///
+/// **Two doors, because a `regclass` has two directions and an array does not change that.** A
+/// string literal is `array_in` over `regclassin`: the text is split into element *names*, each
+/// resolved once per statement by the same [`plan::CatalogFunc::RegClass`] a scalar
+/// `'x'::regclass` lowers to. That is what keeps `'{nosuchrel}'::regclass[]` the `42P01` a real
+/// server raises, in the same place and with the same message, rather than a `22P02` from an
+/// integer parser that was handed a name.
+///
+/// Anything else — an `oid[]` column, an `array_agg` — is an ordinary cast to
+/// [`ColumnType::RegClassArray`], resolved per row in `exec::cursor`, which is the only layer that
+/// has a catalog to ask.
+///
+/// The elements are split by `array_in` itself, read at `text`: quoting, escapes, `NULL` and the
+/// `[1:2]=` bound prefix are that function's rules, and a second reader of the same grammar is how
+/// two spellings of one literal come to disagree.
+fn lower_regclass_array(expr: &Expr) -> Result<plan::Expr> {
+    // `ARRAY[]::regclass[]` is the empty array, as it is at every other element type: the
+    // constructor has no element to take a type from and the cast is what supplies one.
+    if matches!(strip_nesting(expr), Expr::Array(array) if array.elem.is_empty()) {
+        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            Datum::Array(esker_keys::array::ArrayValue::empty(ColumnType::RegClass)),
+        ))));
+    }
+    // **A string literal is a name and everything else is a value**, which is the scalar rule one
+    // dimension up. Asking `cast_literal_text` instead read through the cast in
+    // `'{1259}'::oid[]::regclass[]` and handed `1259` to the *name* lookup, which is
+    // `42P01 relation "1259" does not exist` for a statement a real server answers `{pg_class}`.
+    let Some(text) = (if is_string_literal(expr) {
+        cast_literal_text(expr)?
+    } else {
+        None
+    }) else {
+        return Ok(plan::Expr::Cast {
+            operand: Box::new(lower_expr(expr)?),
+            to: ColumnType::RegClassArray,
+            typmod: NO_TYPMOD,
+        });
+    };
+    let literal = value::array::from_text(&text, ColumnType::Text)?;
+    let elements = literal
+        .values
+        .iter()
+        .map(|value| match value {
+            None => plan::Expr::Literal(plan::Literal::Null),
+            Some(element) => plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func: plan::CatalogFunc::RegClass,
+                args: vec![plan::Expr::Literal(plan::Literal::String(
+                    element.to_text().unwrap_or_default(),
+                ))],
+            })),
+        })
+        .collect();
+    Ok(plan::Expr::Array {
+        elements,
+        element: Some(ColumnType::RegClass),
+    })
+}
+
 /// `'x'::regclass::text` — **the relation's name**, not the digits its oid prints as.
 ///
 /// A `regclass` on a real server is an oid whose *output function* is the name, so the text of one
@@ -5946,12 +6030,19 @@ fn lower_regclass_text(expr: &Expr, data_type: &DataType) -> Result<Option<plan:
     if cast_target(inner_type) != Some(CastTarget::RegClass) || !is_string_literal(inner) {
         return Ok(None);
     }
-    Ok(Some(plan::Expr::CatalogFunc(Box::new(
-        plan::CatalogFuncCall {
+    // **The `::text` is a cast now**, not the identity on what `RegClassName` answers. That
+    // function returned a `Datum::Text` while a `regclass` was described as 25; it answers a
+    // `regclass` since it had to be described as 2205, so composing the two without this would
+    // give `'x'::regclass::text` the type `regclass` — right characters, wrong declared type, in
+    // the shape `ActiveRecord`'s `foreign_keys()` reads.
+    Ok(Some(plan::Expr::Cast {
+        operand: Box::new(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
             func: plan::CatalogFunc::RegClassName,
             args: vec![lower_cast(inner, inner_type)?],
-        },
-    ))))
+        }))),
+        to: ColumnType::Text,
+        typmod: NO_TYPMOD,
+    }))
 }
 
 /// One operand of `AND`/`OR`, with an unadorned string literal read as a boolean.

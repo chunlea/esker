@@ -542,7 +542,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::JsonbArray
         | ColumnType::OidArray
         | ColumnType::RegTypeArray
-        | ColumnType::RegProcArray
+        | ColumnType::RegProcArray | ColumnType::RegClassArray
         | ColumnType::CitextArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray
@@ -1210,7 +1210,7 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::RegType
             | ColumnType::RegTypeArray
             | ColumnType::RegProc
-            | ColumnType::RegProcArray
+            | ColumnType::RegProcArray | ColumnType::RegClassArray
             | ColumnType::RegClass
             // **A pseudo-type is not a key because it is not a column.** Nothing is ever stored as
             // a `void`, so there is no order for a key to encode.
@@ -1267,7 +1267,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         ColumnType::RegType
         | ColumnType::RegTypeArray
         | ColumnType::RegProc
-        | ColumnType::RegProcArray
+        | ColumnType::RegProcArray | ColumnType::RegClassArray
         | ColumnType::RegClass
         | ColumnType::Void
         | ColumnType::Int2Vector
@@ -2210,6 +2210,7 @@ mod tests {
             | ColumnType::OidArray
             | ColumnType::RegTypeArray
             | ColumnType::RegProcArray
+            | ColumnType::RegClassArray
             | ColumnType::CitextArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray

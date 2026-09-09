@@ -1164,10 +1164,11 @@ issues the changes and might one day want to move two peers together · separate
 async commit / 1PC · leader leases vs ReadIndex only · secondary-index encoding for composite keys ·
 how much Postgres surface for the first SQL milestone.
 
-*Pending, decided elsewhere and not in this tree yet:* the `"char"` one-byte type
-(ADR 0095), `oid` as its own type rather than `bigint` (ADR 0097) and `regproc` (ADR 0098) are
-b4's, accepted and unlanded at the time of writing — the three families
-`crates/esker-sql/tests/parity_harness/mod.rs`'s standing table still counts.
+*Landed since this list was written:* the `"char"` one-byte type (ADR 0095), `oid` as its own type
+rather than `bigint` (ADR 0097) and `regproc` (ADR 0098) — b4's three families, all three in the
+tree. `regclass[]` (2210) joined them with the same five-place shape, and with it the correction to
+ADR 0098's second rule: `min`/`max` over a `regtype`, a `regproc` or a `regclass` all decay to an
+`oid`, value included (`crates/esker-sql/tests/reg_class.rs`).
 
 *Settled since this list was written:* **PD HA timing** — three placement drivers replicated with
 `esker-raft`, phase 15 ([ADR 0059](adr/0059-pd-is-a-raft-group.md), §7 above). **Dynamic PD

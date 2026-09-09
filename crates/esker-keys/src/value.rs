@@ -587,6 +587,8 @@ pub enum ColumnType {
     RegTypeArray,
     /// `regproc[]`, oid 1008 — what `array_agg(typinput)` is.
     RegProcArray,
+    /// `regclass[]`, oid 2210 — what `array_agg(c::regclass)` is.
+    RegClassArray,
 }
 
 /// The address family a `Datum::Inet` names: 4 for IPv4, 6 for IPv6, and the **first** byte of an
@@ -602,7 +604,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 103] = [
+    pub const ALL: [ColumnType; 104] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -672,6 +674,7 @@ impl ColumnType {
         ColumnType::CitextArray,
         ColumnType::RegTypeArray,
         ColumnType::RegProcArray,
+        ColumnType::RegClassArray,
         ColumnType::DateRange,
         ColumnType::NumRange,
         ColumnType::Int8Range,

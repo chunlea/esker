@@ -272,12 +272,22 @@ impl Aggregation {
                 // mask included: a `cidr` through `inet`'s output function is the same characters,
                 // which is what makes this a declared type rather than an answer.
                 ColumnType::Cidr => Ok(ColumnType::Inet),
-                // **And a `regproc` decays to an `oid`**, which is the fifth member of this arm
-                // and the first whose landing type is not `text`: measured,
-                // `pg_typeof(min(typinput))` is `oid` on a real server. A `regtype` beside it does
-                // **not** decay — it keeps its own type — so the two reg* types answer differently
-                // and neither is guessable from the other (ADR 0098).
-                ColumnType::RegProc => Ok(ColumnType::Oid),
+                // **All three `reg*` types decay to an `oid`**, which is the fifth member of this
+                // arm and the first whose landing type is not `text`: measured on a real column of
+                // each, `pg_typeof(min(t))` is `oid` for `regtype`, `regproc` and `regclass` alike
+                // (`tests/captures/pg19_reg_class.txt`). None of them has a `min` of its own — the
+                // aggregate PostgreSQL picks is `min(oid)` and the argument is coerced to reach
+                // it — which is why the *value* decays with the type below in `finish`, and why
+                // `regclass[]` beside them does **not**: an array has `array_min` and keeps
+                // `regclass[]`.
+                //
+                // ADR 0098 recorded that a `regtype` kept its own type here, from one probe over a
+                // `VALUES` row rather than the family. It does not. The rule is the whole `reg*`
+                // group, and this is the correction — the same shape as `"char"`'s four columns
+                // that were eighteen.
+                ColumnType::RegProc | ColumnType::RegType | ColumnType::RegClass => {
+                    Ok(ColumnType::Oid)
+                }
                 _ => Ok(arg),
             },
             // **Every integer width averages to `numeric`**, and so does a `numeric`. The
@@ -1379,7 +1389,23 @@ impl Accumulator {
                 seen,
             } => crate::value::numeric::mean(sum, *seen).map_or(Datum::Null, Datum::Numeric),
             State::SumFloat(total) => total.map_or(Datum::Null, Datum::Double),
-            State::Extreme(best) => best.clone().unwrap_or(Datum::Null),
+            // **A `reg*` extreme is an `oid`, value and all.** `result_type` above decays the
+            // declared type, and the datum has to follow it or the wire says `oid` while the bytes
+            // spell `int4in` — the "right bytes, wrong declared type" bug with its two halves
+            // swapped, and just as invisible until something reads the value as the type it was
+            // promised. `stored_shape` is the same conversion `regclass::oid` makes, `22003`
+            // included: a relation id past a real server's four-byte oid has no `oid` to be.
+            State::Extreme(best) => match best.clone() {
+                None => Datum::Null,
+                Some(
+                    value @ (Datum::RegType { .. } | Datum::RegProc { .. } | Datum::RegClass { .. }),
+                ) => crate::value::stored_shape(
+                    value,
+                    ColumnType::Oid,
+                    crate::value::Rendering::default(),
+                )?,
+                Some(other) => other,
+            },
             // An average over nothing is NULL, whichever accumulator held it — the same rule
             // as a sum over nothing, and the reason neither divisor is ever zero.
             State::AvgFloat { seen: 0, .. }

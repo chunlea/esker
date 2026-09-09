@@ -361,6 +361,9 @@ const TAG_CHAR_ARRAY: u8 = 103;
 /// `regproc` and `regproc[]`, additive like every tag before them.
 const TAG_REGPROC: u8 = 104;
 const TAG_REGPROC_ARRAY: u8 = 105;
+/// `regclass[]`, additive like every tag before it. `regclass` itself is [`TAG_REGCLASS`], which
+/// has been 90 since long before its array existed — a new tag is appended, never renumbered.
+const TAG_REGCLASS_ARRAY: u8 = 106;
 
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
@@ -519,6 +522,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::OidVector => TAG_OIDVECTOR,
         ColumnType::RegTypeArray => TAG_REGTYPE_ARRAY,
         ColumnType::RegProcArray => TAG_REGPROC_ARRAY,
+        ColumnType::RegClassArray => TAG_REGCLASS_ARRAY,
         ColumnType::Int8Array => TAG_INT8_ARRAY,
         ColumnType::Int4Array => TAG_INT4_ARRAY,
         ColumnType::Int2Array => TAG_INT2_ARRAY,
@@ -677,6 +681,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_OIDVECTOR => ColumnType::OidVector,
         TAG_REGTYPE_ARRAY => ColumnType::RegTypeArray,
         TAG_REGPROC_ARRAY => ColumnType::RegProcArray,
+        TAG_REGCLASS_ARRAY => ColumnType::RegClassArray,
         TAG_INT8_ARRAY => ColumnType::Int8Array,
         TAG_INT4_ARRAY => ColumnType::Int4Array,
         TAG_INT2_ARRAY => ColumnType::Int2Array,

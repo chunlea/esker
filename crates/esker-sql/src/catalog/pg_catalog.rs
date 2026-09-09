@@ -2956,6 +2956,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::OidVector => "oidvector",
         ColumnType::RegTypeArray => "_regtype",
         ColumnType::RegProcArray => "_regproc",
+        ColumnType::RegClassArray => "_regclass",
         // **An array type's internal name is the element's with a leading underscore** — `_int4`,
         // not `int4[]`. That spelling is what `pg_type.typname` holds on a real server and what a
         // client matching on it expects.
@@ -3176,7 +3177,7 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::HstoreArray
         | ColumnType::TsVectorArray
         | ColumnType::TsQueryArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
         // **`A` for the two vectors too**, measured: `int2vector` and `oidvector` are in
         // PostgreSQL's array category despite not being array types.
         | ColumnType::Int2Vector
@@ -3337,6 +3338,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::OidArray
         | ColumnType::RegTypeArray
         | ColumnType::RegProcArray
+        | ColumnType::RegClassArray
         | ColumnType::CitextArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray

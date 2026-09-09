@@ -2262,6 +2262,42 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     crate::value::Rendering::default(),
                 )?
             }
+            // **An array to `regclass[]` resolves every element**, because the type is a name per
+            // element and the names come from the catalog. `array_in` cannot do it — the input
+            // function of a `regclass` needs a relation lookup and `crate::value` has none — so it
+            // is done here, where the row evaluator already has `env`, and by the same
+            // `regclass_of` the scalar direction uses so the two cannot disagree about a name.
+            Datum::Array(mut values) if *to == ColumnType::RegClassArray => {
+                for value in &mut values.values {
+                    if let Some(element) = value
+                        && let Some(oid) = oid_argument(Some(element))?
+                    {
+                        *element = regclass_of(env, oid)?;
+                    }
+                }
+                values.element = ColumnType::RegClass;
+                Datum::Array(values)
+            }
+            // **And the inverse, element by element**: `regclass[]::oid[]` is the numbers. It is
+            // the same `stored_shape` the scalar direction uses, so the two cannot disagree about
+            // what an oid past four bytes is; going through the text handed `pg_class` to `oidin`,
+            // which is `22P02` for a statement a real server answers `{1259}`.
+            Datum::Array(mut values)
+                if matches!(
+                    values.element,
+                    ColumnType::RegType | ColumnType::RegProc | ColumnType::RegClass
+                ) && let Some(element) = esker_keys::array::ArrayValue::element_of(*to) =>
+            {
+                for datum in values.values.iter_mut().flatten() {
+                    *datum = crate::value::stored_shape(
+                        datum.clone(),
+                        element,
+                        crate::value::Rendering::default(),
+                    )?;
+                }
+                values.element = element;
+                Datum::Array(values)
+            }
             // **A `regtype` or a `regproc` to a number is the oid too**, for the same reason and
             // with one difference: their oid is already four bytes. Without this arm
             // `typinput::oid` rendered `boolin` and handed it to `oidin`, which is
@@ -2627,7 +2663,28 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             array,
         } => {
             let operand = evaluate_in(operand, row, env)?;
-            let Some(array) = read_array(&evaluate_in(array, row, env)?)? else {
+            let array_value = evaluate_in(array, row, env)?;
+            // **An array whose element type already *is* the operand's is used as it stands.**
+            // The text path below re-reads every element through the operand type's input
+            // function, which was right while an array was text and is wrong for a type whose
+            // input function needs something the evaluator cannot hand it: `regclassin` is a
+            // catalog lookup, so `'rc'::regclass = ANY('{rc}'::regclass[])` — a statement whose
+            // two sides are already the right type — came back `0A000` for want of a catalog.
+            // Rendering a datum and reading it back is a round trip, and a round trip is only
+            // ever as good as the pair of functions it goes through.
+            if let Datum::Array(value) = &array_value
+                && value.element == operand.column_type().unwrap_or(ColumnType::Text)
+            {
+                let values: Vec<Datum> = value
+                    .values
+                    .iter()
+                    .map(|element| element.clone().unwrap_or(Datum::Null))
+                    .collect();
+                return Ok(crate::exec::subquery::quantified_over(
+                    *op, *all, &operand, &values,
+                ));
+            }
+            let Some(array) = read_array(&array_value)? else {
                 // A NULL array, which is not an empty one: `1 = ANY(NULL::int[])` is NULL where
                 // `1 = ANY('{}')` is false. Measured, both.
                 return Ok(Datum::Null);
@@ -3514,25 +3571,19 @@ fn catalog_function(
         // has no match.
         CatalogFunc::RegClassName => match oid_argument(args.first())? {
             None => Datum::Null,
+            // **A `regclass`, not the name it prints as.** The three answers below are the
+            // *output function*; the datum carries the oid beside them, which is what makes
+            // `array_agg(oid::regclass)` a `regclass[]` (2210) and `min` of one an `oid`. It was a
+            // `Datum::Text` here, and every one of those read the right characters off a column
+            // described as 25 — the difference only a `Describe` sees, which is what r1's wire
+            // sweep is for.
+            //
             // **The catalog's own oids print as names too**, and they are asked for first: a
             // catalog relation is not in `Relations`, which reads the name records, so an oid of
             // one used to print its digits back. `CatalogView::name` is the printed form and
             // already carries the rule — `pg_class` bare because `pg_catalog` is in the search
             // path, `information_schema.tables` qualified because that schema is not.
-            Some(oid) => match crate::catalog::pg_catalog::view_by_oid(oid) {
-                Some(view) => Datum::Text(view.name().to_owned()),
-                None => match env.relations()?.by_oid(oid) {
-                    // **Qualified only when the schema is not on the `search_path`** — measured:
-                    // `'g1_rc.t'::regclass::text` is `g1_rc.t` under the default path and `t`
-                    // after `SET search_path = g1_rc, public`. `RelationRow::name` is the bare
-                    // name with the schema beside it, so printing `name` alone dropped the schema
-                    // for every relation outside `public` and `ActiveRecord`'s schema dump lost
-                    // the qualifier its two `dump_schemas` tests disagree about.
-                    Some(relation) => Datum::Text(qualified_for(env.settings, relation)),
-                    None if oid == 0 => Datum::Text("-".to_owned()),
-                    None => Datum::Text(oid.to_string()),
-                },
-            },
+            Some(oid) => regclass_of(env, oid)?,
         },
         // **The inverse of `'x'::regtype`, and per row**, with the three answers `RegClassName`
         // has and each of them measured: a type's printed name, `-` for oid 0 — which is what
@@ -3963,6 +4014,35 @@ fn array_concat(left: Option<&Datum>, right: Option<&Datum>) -> Datum {
         1,
         values,
     ))
+}
+
+/// One oid as the `regclass` it is: the number, and the name it prints as.
+///
+/// **The output function of a `regclass`, in one place**, because three callers need exactly the
+/// same three answers and a second copy of them is how two readers of one fact come to disagree.
+/// A catalog view is asked for first — it is not in `Relations`, which reads the name records, so
+/// an oid of one used to print its digits back. `CatalogView::name` already carries the
+/// search-path rule: `pg_class` bare because `pg_catalog` is on the path,
+/// `information_schema.tables` qualified because that schema is not.
+///
+/// A relation outside `public` is **qualified only when its schema is not on the `search_path`** —
+/// measured: `'g1_rc.t'::regclass::text` is `g1_rc.t` under the default path and `t` after
+/// `SET search_path = g1_rc, public`. Oid 0 is `-`, PostgreSQL's rendering of `InvalidOid`, and an
+/// oid naming nothing prints its digits: measured, both, and neither is an error — raising here
+/// would break a `LEFT JOIN` that legitimately has no match.
+fn regclass_of(env: Env<'_>, oid: i64) -> Result<Datum> {
+    let printed = match crate::catalog::pg_catalog::view_by_oid(oid) {
+        Some(view) => view.name().to_owned(),
+        None => match env.relations()?.by_oid(oid) {
+            Some(relation) => qualified_for(env.settings, relation),
+            None if oid == 0 => "-".to_owned(),
+            None => oid.to_string(),
+        },
+    };
+    Ok(Datum::RegClass {
+        oid,
+        name: printed.into(),
+    })
 }
 
 /// An `oid` argument, which is an integer of whatever width the column it came from has.

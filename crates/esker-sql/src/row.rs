@@ -110,7 +110,7 @@ mod tests {
             | ColumnType::JsonbArray
             | ColumnType::OidArray
             | ColumnType::RegTypeArray
-            | ColumnType::RegProcArray
+            | ColumnType::RegProcArray | ColumnType::RegClassArray
             | ColumnType::CitextArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray
