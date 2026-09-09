@@ -1,5 +1,15 @@
 # What PostgreSQL 19 answers to every full-text statement the ActiveRecord suite sends.
 #
+#!escaped
+#
+# **Re-encoded, not re-measured.** One value in this file holds a `|`, which this format uses to
+# separate cells — so the row parsed as one cell too many and was reported as a disagreement while
+# reading identically (`docs/plans/debts-v1.1.md` #20). The directive above says the values carry
+# the escape contract `tests/parity_harness/mod.rs::unescape` reads: `\`, `|`, `;`, newline,
+# carriage return and tab written as `\\`, `\|`, `\;`, `\n`, `\r`, `\t`. The affected value was
+# escaped by hand here; every other value in the file is unchanged, and an escape this contract
+# does not define — `\N`, `\x0102` — is kept as written and reads as itself.
+#
 # **Run 79 ranking: `the type TSVECTOR is not supported`, 52 tests over 2 files — the head of the
 # board since run 60, and now more than four times the next row.** The two files want quite
 # different things and only one of them is about full text:
@@ -81,7 +91,7 @@ SELECT 'r', to_tsvector('english', 'thin dog') || to_tsvector('english', 'fat ca
 SELECT 'r', numnode(to_tsquery('english', 'fat & cat'))	text,integer	r|3
 # ---- tsquery, and the @@ match operator in both argument orders ----
 SELECT 'r', to_tsquery('english', 'fat & cat')	text,tsquery	r|'fat' & 'cat'
-SELECT 'r', to_tsquery('english', 'fat | cat')	text,tsquery	r|'fat' | 'cat'
+SELECT 'r', to_tsquery('english', 'fat | cat')	text,tsquery	r|'fat' \| 'cat'
 SELECT 'r', to_tsquery('english', '!fat')	text,tsquery	r|!'fat'
 SELECT 'r', plainto_tsquery('english', 'fat cats')	text,tsquery	r|'fat' & 'cat'
 SELECT 'r', phraseto_tsquery('english', 'fat cats')	text,tsquery	r|'fat' <-> 'cat'

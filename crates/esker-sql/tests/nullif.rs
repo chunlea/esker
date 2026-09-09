@@ -52,18 +52,14 @@ const FIXTURE: &[&str] = &[
 /// rule decides and the one `ActiveRecord` reads. The oracle's own answer for the same twelve
 /// columns is `format_type(atttypid, atttypmod)` over `CREATE TABLE ... AS SELECT`.
 ///
-/// **The eleventh column is a declared divergence and it is about a typmod, not a type.** A real
-/// server answers `character(4)` for `nullif(c, 'x')` and this node answers `bpchar` — which is
-/// PostgreSQL's own spelling for a `bpchar` whose length is unknown, and it measured that beside
-/// it: `greatest(c, 'x')` is `bpchar` there too, and `greatest(v, 'x')` is `character varying`.
-/// The difference is that `NULLIF` is the *identity* on its left argument, so PostgreSQL carries
-/// that argument's `atttypmod` through where every coercing production drops it. Here an
-/// expression has no typmod at all — `exec::query::expr_type` answers a bare `ColumnType` and the
-/// `FieldDescription` for a computed column is built with `NO_TYPMOD` — so threading a length
-/// through one production would mean giving expressions a typmod, which is a seam and not this
-/// unit. Conservative in the direction that matters: a client is told the type and not the
-/// length, and `ActiveRecord` reads a column's length from `pg_attribute`, not from a
-/// `RowDescription`. `docs/plans/debts-v1.1.md` carries the row.
+/// **The eleventh column used to be a declared divergence and it was about a typmod, not a type.**
+/// A real server answers `character(4)` for `nullif(c, 'x')` and this node answered `bpchar` —
+/// PostgreSQL's own spelling for a `bpchar` whose length is unknown. `NULLIF` is the *identity* on
+/// its left argument, so that argument's `atttypmod` travels with it where every coercing
+/// production drops it (`greatest(c, 'x')` is `bpchar` there too). It agrees now:
+/// `docs/plans/debts-v1.1.md` #28 turned out to be one rule in `exec::query::typmod_of` rather
+/// than the type-surface change its row predicted, and `tests/expression_typmod.rs` is the family
+/// it was measured over.
 #[test]
 fn the_result_type_is_the_comparisons_left_input() {
     let mut node = parity::Node::new(FIXTURE);
@@ -75,7 +71,7 @@ fn the_result_type_is_the_comparisons_left_input() {
         )
         .to_string(),
         "integer,bigint,numeric,double precision,double precision,numeric,date,\
-         timestamp without time zone,text,bpchar,text,text\
+         timestamp without time zone,text,character(4),text,text\
          \t\\N|\\N|\\N|\\N|\\N|\\N|2020-01-01|2020-01-01 12:00:00|a|a   |a|\\N"
     );
 }

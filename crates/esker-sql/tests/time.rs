@@ -54,9 +54,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // declares the identical thing for `1.5::numeric(10,2)`, and a **column**'s typmod is
         // reported correctly by both (`tests/corpus/pg19_typmod.txt`). It closes when a cast
         // node carries the typmod it was written with into the row description.
-        "SELECT '12:34:56'::time(3), '12:34:56.9999'::time(3), '12:34:56.0005'::time(3)",
-        "SELECT '12:34:56.5'::time(0)",
-        "SELECT '12:34:56'::time(7)",
         // `pg_type.typlen` is a column this node's catalog view does not have at all, so the
         // statement fails before a type is reached. Not `time`'s: the same query names `timetz`
         // too, and the column is missing for all sixteen types.

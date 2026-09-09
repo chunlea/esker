@@ -49,11 +49,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "**No `\"char\"` type, so the argument shows no coercion.** PostgreSQL prints `setweight(tv, 'A'::\"char\")` -- the quoted one-byte type, which is *not* `char(n)` -- and this node keeps `setweight(tv, 'A')`. Same shape as `to_tsvector`'s `regconfig` row and the same reason: `exec::ddl::catalog_parameter_types` has no `ColumnType` whose name prints `\"char\"`, and inventing the text would put a cast in the catalog that nothing here can re-parse. The node's `char` keyword maps to `bpchar` (`value::COLUMN_TYPE_NAMES`), which is a different type with a different oid.",
             "pg19_catalog_func_deparse.txt:170",
         ),
-        (
-            "SELECT 'r', replace(pg_get_expr(x.indpred, x.indrelid), '|', '!') FROM pg_index x WHERE x.indexrelid = 'g1cf_ix3'::regclass",
-            "**A partial index's predicate is stored as written, so its literals show no coercion.** `(btrim(t, 'x'::text) = 'y'::text)` there, `(btrim(t, 'x') = 'y')` here. It is the sixth reader of the deparse rule and the one this unit did **not** route through it, after measuring what it costs: `pg_get_expr(indpred)` re-parenthesises a boolean chain's operands at read time (`catalog::parenthesised_operands`), so deparsing the chain adds a pair the reader then doubles -- `(((n > 0)) AND flag)`, caught by `tests/index_deparse.rs` -- and the `ON CONFLICT` arbiter matches an index by its predicate **text**, quotes included (`exec::dml::same_predicate`), so a deparsed predicate stops matching the `WHERE \"b\" IS NOT NULL` `ActiveRecord` writes and the statement becomes `42P10`. Both measured by making the change and reverting it; `docs/plans/debts-v1.1.md` has the row. The `CHECK` beside it *is* routed, because its reader has only the first of those two problems and a chain can be skipped.",
-            "pg19_catalog_func_deparse.txt:200",
-        ),
     ],
 };
 

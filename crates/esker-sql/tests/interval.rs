@@ -61,7 +61,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
-        "SELECT '1 second'::interval(0), '1.5 seconds'::interval(0)",
         // `typname` is a `name`, `typinput` a `regproc` and `typcategory` a `"char"` on a real
         // server; all three are `text` here with identical characters, and `typlen` agrees
         // exactly. The trade every `pg_catalog` column makes.
@@ -70,7 +69,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // The value is right — `interval(3)` trims where `numeric(p,s)` pads, so `1.5 seconds`
         // is `00:00:01.5` — and the declared type drops the precision, because a cast carries
         // no typmod here for any parameterised type (`tests/numeric.rs`, `tests/time.rs`).
-        "SELECT '1.5 seconds'::interval(3)",
     ],
     answers: &[
         (
