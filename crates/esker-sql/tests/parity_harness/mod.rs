@@ -676,11 +676,30 @@ pub(crate) fn replay_reporting(
         }
     }
 
+    // **The type divergences ride along with the value ones, because this assertion hides them.**
+    // It fires before the `type_mismatched` one below, so a corpus with any disagreeing *value*
+    // reports **no** type divergences at all — and the reader has no way to know there were any.
+    // Thirteen of them sat behind four value rows while `debts-v1.1.md` #28 was being measured,
+    // and they only came out when the four were declared by hand, one round later.
+    //
+    // The ordering stays: a value that differs is the bigger fact and belongs first, and the
+    // `{cascaded} more were swallowed` count keeps saying what it said. What changes is that the
+    // message no longer stops at the first thing wrong with the file.
+    let also_typed = if type_mismatched.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nand {} statement(s) have the right rows and an unlisted type divergence, which \
+             this assertion would otherwise hide until the values agree:\n\n{}",
+            type_mismatched.len(),
+            type_mismatched.join("\n\n")
+        )
+    };
     assert!(
         mismatched.is_empty(),
         "{} of {checked} statements disagree with PostgreSQL 19 and are not listed as \
          divergences ({cascaded} more were swallowed by the aborted transaction and are not \
-         counted):\n\n{}",
+         counted):\n\n{}{also_typed}",
         mismatched.len(),
         mismatched.join("\n\n")
     );
