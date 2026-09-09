@@ -398,6 +398,10 @@ impl Txn for GatedTxn {
     fn restore(&mut self, key: &[u8], prior: esker_sql::backend::Buffered) {
         self.inner.restore(key, prior);
     }
+    fn stop_waiting(&mut self) {
+        self.inner.stop_waiting();
+    }
+
     fn holds(&self, key: &[u8]) -> bool {
         self.inner.holds(key)
     }

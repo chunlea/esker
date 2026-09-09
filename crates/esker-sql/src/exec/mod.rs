@@ -314,6 +314,33 @@ pub(super) fn wait_for_row(executor: &Executor, txn: &mut dyn Txn, key: &[u8]) -
     // ADR 0057, and is why the levels that already worked cannot regress.
     let waits = executor.isolation().waits();
     let deadline = executor.lock_deadline();
+    // **However this wait ends, it is over — and the graph is what has to be told.**
+    //
+    // The lock table records a waiter the moment it is refused, because that edge is what
+    // *another* transaction's deadlock walk reads. Only two of the four ways out go back
+    // through it: the lock comes free, or a cycle is found. A `lock_timeout`, a
+    // `statement_timeout` and a `pg_cancel_backend` all returned straight out of the loop and
+    // left the edge behind — on a transaction that is **still open**, because a failed
+    // statement does not end a block. What the edge then does is answer for a wait that is not
+    // happening: a third transaction asking for a row this one holds walks through it and is
+    // told `40P01` for a cycle with nobody waiting in it.
+    //
+    // Cleared here, at the one exit every path takes, rather than at each `return`: there are
+    // five of those and the two that were missed are the two nobody thinks of as a wait ending.
+    // It costs a map lookup on the paths that already cleared it.
+    let answer = wait_for_the_lock(txn, key, waits, deadline);
+    txn.stop_waiting();
+    answer
+}
+
+/// The wait itself: poll until the lock is ours, the level says not to wait, or something ends
+/// it. Split out so that [`wait_for_row`] has **one** exit to tidy the wait-for graph at.
+fn wait_for_the_lock(
+    txn: &mut dyn Txn,
+    key: &[u8],
+    waits: bool,
+    deadline: Option<(u64, Deadline)>,
+) -> Result<()> {
     // **Real elapsed time, not a count of turns round the loop.** This used to add `WAIT_STEP_MS`
     // per iteration and compare that to the timeout — which assumes each iteration really takes two
     // milliseconds. On a loaded box it does not, so `lock_timeout = '150ms'` meant *seventy-five
@@ -1819,9 +1846,18 @@ impl Executor {
                 match txn.lock(&key)? {
                     crate::backend::Lock::Taken => {}
                     crate::backend::Lock::Deadlock => return Err(SqlError::Deadlock),
+                    // **`NOWAIT` and `SKIP LOCKED` ask and leave, so neither may stay in the
+                    // graph.** Being refused is what records a waiter, and these two are refused by
+                    // design — an edge from a clause whose whole meaning is "do not wait" is a
+                    // waiter that never waits, and a third transaction walking through it is told
+                    // `40P01` for a cycle nobody is in.
                     crate::backend::Lock::Held { .. } => match target.wait {
-                        crate::plan::LockWait::SkipLocked => continue 'row,
+                        crate::plan::LockWait::SkipLocked => {
+                            txn.stop_waiting();
+                            continue 'row;
+                        }
                         crate::plan::LockWait::NoWait => {
+                            txn.stop_waiting();
                             return Err(SqlError::LockNotAvailable(target.relation.clone()));
                         }
                         // The wait, and then the whole statement again: the same loop an `UPDATE`

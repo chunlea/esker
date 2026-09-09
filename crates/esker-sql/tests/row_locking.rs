@@ -256,3 +256,90 @@ fn a_locking_clause_inside_a_subquery_leaves_the_answer_alone() {
         [["3"]]
     );
 }
+
+/// **A waiter that gave up is not a waiter, and the graph has to be told.**
+///
+/// A wait ends four ways: the lock comes free, a deadlock is found, the statement is cancelled, or
+/// a timeout fires. Only the first two go back through the lock table, so a `lock_timeout` returned
+/// straight out of the wait loop and left the edge behind — on a transaction that is **still
+/// open**, because a failed statement does not end a block.
+///
+/// What that edge then does is answer for a wait that is not happening. Here B gives up waiting for
+/// A and keeps its own row; when A asks for that row the walk goes A → B → A and A is told `40P01`
+/// for a cycle with only one waiter in it. The right answer is the one PostgreSQL gives: A waits,
+/// and hits its own `lock_timeout`.
+///
+/// Straight-line and single-threaded: every wait here ends on a timeout the test sets, so there is
+/// nothing to synchronise and nothing to be flaky about.
+#[test]
+fn a_waiter_that_timed_out_does_not_close_a_cycle_for_somebody_else() {
+    let pair = Pair::new(&[
+        "CREATE TABLE lk (id bigint primary key, n bigint)",
+        "INSERT INTO lk VALUES (1, 1), (2, 2)",
+    ]);
+    let mut a = pair.session();
+    let mut b = pair.session();
+
+    a.run("BEGIN").unwrap();
+    a.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE").unwrap();
+
+    // B takes a row of its own, then gives up waiting for A's. Its block lives on.
+    b.run("BEGIN").unwrap();
+    b.run("SET lock_timeout = '100ms'").unwrap();
+    b.run("SELECT n FROM lk WHERE id = 2 FOR UPDATE").unwrap();
+    let gave_up = b
+        .run("UPDATE lk SET n = 9 WHERE id = 1")
+        .expect_err("row 1 is A's for the life of A's block");
+    assert_eq!(
+        gave_up.to_string(),
+        "canceling statement due to lock timeout"
+    );
+
+    // And now A asks for the row B is holding. B is waiting for nothing, so there is no cycle.
+    a.run("SET lock_timeout = '250ms'").unwrap();
+    let answer = a
+        .run("UPDATE lk SET n = 9 WHERE id = 2")
+        .expect_err("row 2 is B's for the life of B's block");
+    assert_eq!(
+        answer.to_string(),
+        "canceling statement due to lock timeout",
+        "B gave up waiting, so A is not in a deadlock with it"
+    );
+}
+
+/// The same edge from the other clause that never waits: `NOWAIT` asks once and leaves.
+///
+/// Being **refused** is what records a waiter, and `NOWAIT`'s whole meaning is that it will not
+/// wait — so the row it left in the graph was a waiter that never waited for a moment.
+#[test]
+fn nowait_does_not_leave_a_waiter_behind_it() {
+    let pair = Pair::new(&[
+        "CREATE TABLE lk (id bigint primary key, n bigint)",
+        "INSERT INTO lk VALUES (1, 1), (2, 2)",
+    ]);
+    let mut a = pair.session();
+    let mut b = pair.session();
+
+    a.run("BEGIN").unwrap();
+    a.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE").unwrap();
+
+    b.run("BEGIN").unwrap();
+    b.run("SELECT n FROM lk WHERE id = 2 FOR UPDATE").unwrap();
+    let refused = b
+        .run("SELECT n FROM lk WHERE id = 1 FOR UPDATE NOWAIT")
+        .expect_err("row 1 is A's");
+    assert_eq!(
+        refused.to_string(),
+        "could not obtain lock on row in relation \"lk\""
+    );
+
+    a.run("SET lock_timeout = '250ms'").unwrap();
+    let answer = a
+        .run("UPDATE lk SET n = 9 WHERE id = 2")
+        .expect_err("row 2 is B's for the life of B's block");
+    assert_eq!(
+        answer.to_string(),
+        "canceling statement due to lock timeout",
+        "B never waited, so A is not in a deadlock with it"
+    );
+}

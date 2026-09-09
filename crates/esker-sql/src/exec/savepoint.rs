@@ -315,6 +315,13 @@ impl Txn for Recording<'_> {
         self.inner.locks()
     }
 
+    /// Forwarded, and it has to be: the wait belongs to the transaction underneath, and a default
+    /// here would leave the graph naming a waiter for every statement run inside a savepoint —
+    /// which is every statement of a Rails nested block.
+    fn stop_waiting(&mut self) {
+        self.inner.stop_waiting();
+    }
+
     fn holds(&self, key: &[u8]) -> bool {
         self.inner.holds(key)
     }

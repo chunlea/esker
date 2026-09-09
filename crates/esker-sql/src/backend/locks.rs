@@ -151,6 +151,22 @@ impl RowLocks {
         }
     }
 
+    /// **`id` has stopped waiting**, whatever it is doing next.
+    ///
+    /// A waiter is recorded the moment it is refused, because that edge is what another
+    /// transaction's deadlock walk reads — and it must come out again the moment the wait ends, not
+    /// when the transaction does. A `lock_timeout`, a `statement_timeout`, a cancelled statement and
+    /// a `NOWAIT` clause all end a wait while the block lives on, and the edge left behind answers
+    /// for a wait that is not happening: the walk goes through a transaction that has given up and
+    /// closes a cycle with nobody in it.
+    ///
+    /// Idempotent, and called on paths that have already cleared it — the acquisition and the
+    /// deadlock both do — because one exit that always tidies is cheaper to keep right than five
+    /// that each have to remember.
+    pub(crate) fn stop_waiting(&mut self, id: u64) {
+        self.waits_for.remove(&id);
+    }
+
     /// **The transaction is over**: every key of `held` that `id` still holds, its wait, the
     /// edges pointing at it, and the session behind it.
     ///
@@ -327,5 +343,41 @@ mod tests {
             "the transaction that gave up is not waiting for anything: {:?}",
             locks.waits_for
         );
+    }
+
+    /// **A wait ends before its transaction does**, and the graph has to hear about it then.
+    ///
+    /// `release` is the transaction's end and cannot be the answer: a `lock_timeout` fires, the
+    /// statement fails, and the block goes on — with an edge saying it is still waiting. What that
+    /// costs is not an untidy `pg_locks` row but a wrong `40P01`: the walk below runs from the
+    /// holder, so a transaction that gave up sitting in the middle of the chain closes cycles for
+    /// everybody behind it.
+    #[test]
+    fn a_wait_that_ended_leaves_the_graph_before_the_transaction_does() {
+        let mut locks = RowLocks::default();
+        let (a, b, c) = (locks.next_id(), locks.next_id(), locks.next_id());
+        assert!(matches!(locks.take(b"a", a, 10, 101), Lock::Taken));
+        assert!(matches!(locks.take(b"b", b, 20, 102), Lock::Taken));
+        // `b` asks for `a`'s row and gives up — `lock_timeout`, and its block lives on.
+        assert!(matches!(locks.take(b"a", b, 20, 102), Lock::Held { .. }));
+        locks.stop_waiting(b);
+        assert!(
+            locks.waits_for.is_empty(),
+            "the transaction that gave up is not waiting: {:?}",
+            locks.waits_for
+        );
+
+        // So `a` asking for the row `b` holds is a wait, not a cycle.
+        assert!(matches!(locks.take(b"b", a, 10, 101), Lock::Held { .. }));
+        // And `b` is still there, holding its row and named in `pg_locks`.
+        let held: Vec<(Vec<u8>, u32)> = locks
+            .view()
+            .held
+            .iter()
+            .map(|(key, _, _, pid)| (key.clone(), *pid))
+            .collect();
+        assert_eq!(held, vec![(b"a".to_vec(), 101), (b"b".to_vec(), 102)]);
+        // A third transaction behind `b` is a real wait, and still not a cycle.
+        assert!(matches!(locks.take(b"b", c, 30, 103), Lock::Held { .. }));
     }
 }

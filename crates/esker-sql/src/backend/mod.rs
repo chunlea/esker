@@ -307,6 +307,14 @@ pub trait Txn: fmt::Debug + Send {
     /// [`Lock::Taken`] cannot answer this — it means "holds it now, **or held it already**" — and a
     /// savepoint rollback has to know the difference, or it gives back a lock the transaction took
     /// before the mark and still needs.
+    /// This transaction is no longer waiting for a row lock.
+    ///
+    /// **Required, with no default on purpose.** A wrapper that silently answered for this would
+    /// leave the wait-for graph naming a waiter that has stopped waiting, and the reader of that
+    /// graph is the deadlock detector — the failure is a `40P01` raised against a transaction in no
+    /// cycle at all, which is the shape this trait has produced twice already.
+    fn stop_waiting(&mut self);
+
     fn holds(&self, key: &[u8]) -> bool;
 
     /// Gives back one row lock, for a statement the transaction has rolled back.
@@ -972,6 +980,11 @@ impl Txn for MemoryTxn {
                 self.read_ts.remove(key);
             }
         }
+    }
+
+    fn stop_waiting(&mut self) {
+        let id = self.id;
+        self.versions().row_locks.stop_waiting(id);
     }
 
     fn holds(&self, key: &[u8]) -> bool {
