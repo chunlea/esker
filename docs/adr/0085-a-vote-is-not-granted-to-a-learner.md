@@ -75,10 +75,23 @@ the granter its own vote for the term and — for a real vote — its leader, an
 
 ## Consequences
 
-**A node being promoted is not harmed.** Its promotion reaches this node as a configuration change
-and it can ask again once it has; a peer that will be a voter here is refused only for as long as
-this node has not yet learned that it is one. That is the same window in which the promotion could
-not have succeeded anyway, because the other voters would not have counted its votes.
+**A node being promoted is not harmed, and this is a proof rather than a hope.** Three facts make
+it one:
+
+1. a configuration change takes effect on a node when it **appends** the entry (dissertation §4.1),
+   and the leader replicates it at once — so the window in which a promoted peer is a voter to
+   itself and a learner to others is one entry's replication latency;
+2. this implementation changes membership **one server at a time** (`conf.rs` refuses overlapping
+   single-server changes, "which can produce two disjoint majorities"), so there is no joint
+   configuration in which the new voter belongs to a half that a quorum needs. A promotion only
+   *adds*: every node that has not applied it still holds the previous voter set, and that set had
+   a majority before the change and still has one;
+3. so an election during the window proceeds among the nodes that agree, and the promoted peer —
+   refused — learns the configuration from the first append any leader sends it, after which it is
+   a voter here too and its next request is granted.
+
+The refusal therefore delays a peer's first election by at most the time its promotion takes to
+arrive, and only in the window where the other voters would not have counted its votes anyway.
 
 **A mis-configured peer becomes harmless rather than corrected.** This is containment. A peer that
 believes itself a voter will still campaign, and will still be told no by everyone; what it can no
