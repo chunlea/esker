@@ -1,0 +1,45 @@
+crates/esker-sql/src/exec/ddl.rs
+  s_e5c0c6e78b5662::t_ac610c55dd0830 5146-5154,5168-5276
+crates/esker-sql/src/exec/job.rs
+  s_e5c0c6e78b5662::t_7624c3aca968ac 40,102,110,115-116,118-130,133,145-149,160,170
+crates/esker-sql/src/exec/mod.rs
+  s_e5c0c6e78b5662::t_029992a16dac8a 204-212,781,1011-1016,1026-1028,1049
+crates/esker-sql/src/parameter.rs
+  s_e5c0c6e78b5662::t_b645444bb1e369 284-306
+crates/esker-sql/tests/expression_index.rs
+  s_e5c0c6e78b5662::t_7e6f62910bf93c 223-225,237-240
+crates/esker-sql/tests/invalid_index.rs
+  s_e5c0c6e78b5662::t_4b160620fe778b 1-193
+crates/esker-sql/tests/pg_catalog_index.rs
+  s_e5c0c6e78b5662::t_d7ac7014e89632 80-84
+crates/esker-sql/tests/redrive.rs
+  s_e5c0c6e78b5662::t_2a86b1c639cf3a 183,197-205
+crates/esker-sql/tests/redrive_live.rs
+  s_e5c0c6e78b5662::t_701c15e96890a5 128-132
+crates/esker-sql/tests/schema_change.rs
+  s_e5c0c6e78b5662::t_c781c39be8d5c1 45,49-58
+crates/esker-sql/tests/slt/index.slt
+  s_e5c0c6e78b5662::t_3236d9f1d4b01d 75-81
+docs/adr/0020-online-schema-change.md
+  s_e5c0c6e78b5662::t_10d3a4fc419ec4 253-262
+docs/adr/0083-a-concurrent-build-answers-when-it-is-built.md
+  s_e5c0c6e78b5662::t_5660e747d43508 1-102
+docs/plans/phase-6e.md
+  s_e5c0c6e78b5662::t_60da04e4fd6e91 288-294
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f7f64bd9f214583f449dcabbb572339196db6999",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
