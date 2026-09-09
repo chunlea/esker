@@ -1341,21 +1341,80 @@ pub struct RaftPeer {
     pool: Arc<crate::driver::DriverPool>,
     region_id: u64,
     peer_id: NodeId,
+    /// **Which registration this handle is.** Everything this peer asks the pool to do to its
+    /// region is asked in this name, so a handle that has been superseded acts on nothing
+    /// ([ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md)).
+    token: crate::driver::Token,
     leader: Arc<AtomicU64>,
     published: Arc<Published>,
     /// Whether this peer has already been retired, so `stop` and `Drop` do not both do it.
     retired: AtomicBool,
 }
 
+/// **A peer that is registered with its driver pool but is not yet the store's.**
+///
+/// The gap this closes is [ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md)'s:
+/// a peer used to be handed to the pool by [`RaftPeer::start`] and only afterwards offered to the
+/// region map, which refuses a second peer of one region, a range that overlaps one already held,
+/// and three more things a split can get wrong. Every one of those refusals left a **live core**
+/// driving the region — ticking, campaigning, answering every Raft message — while the handle the
+/// request path holds published nothing, so the store answered `NotLeader` for a region its own
+/// core was leading, for as long as the process ran.
+///
+/// So `start` returns this instead: hold it until the region map has taken the peer, then
+/// [`Reservation::commit`]. Dropping it uncommitted gives the region back. **No caller has to
+/// remember to clean up**, which is the property that matters — the branches that leaked were the
+/// ones nobody was thinking about.
+#[derive(Debug)]
+#[must_use = "an uncommitted reservation gives the region straight back"]
+pub struct Reservation {
+    peer: Arc<RaftPeer>,
+    committed: bool,
+}
+
+impl Reservation {
+    /// The peer, while it is still only reserved — enough to build the region state that the map
+    /// will be offered.
+    #[must_use]
+    pub fn peer(&self) -> &Arc<RaftPeer> {
+        &self.peer
+    }
+
+    /// The store has taken this peer: it is now the region's, and dropping the reservation is no
+    /// longer a cancellation.
+    pub fn commit(mut self) -> Arc<RaftPeer> {
+        self.committed = true;
+        Arc::clone(&self.peer)
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        tracing::debug!(
+            region_id = self.peer.region_id,
+            "a peer that was never hosted gives its region back"
+        );
+        self.peer.abandon();
+    }
+}
+
 impl RaftPeer {
-    /// Builds the peer and hands it to the pool worker its region is pinned to.
+    /// Builds the peer and hands it to the pool worker its region is pinned to, **as a
+    /// reservation**: see [`Reservation`] for why it is not the peer itself.
+    ///
+    /// Fails if the pool is already driving this region. That refusal is the first half of
+    /// [ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md) — registering claims a
+    /// place rather than overwriting whoever holds it — and the reservation is the second.
     pub fn start(
         options: PeerOptions,
         storage: RaftLogStorage,
         transport: Arc<dyn RaftTransport>,
         host: Arc<dyn RegionHost>,
         pool: Arc<crate::driver::DriverPool>,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<Reservation> {
         let region_id = options.region.id;
         let mut config = RaftConfig::new(options.peer_id, options.voters, options.seed);
         config.learners = options.learners;
@@ -1389,16 +1448,20 @@ impl RaftPeer {
             columnar: options.columnar,
         };
 
-        pool.register(region_id, Box::new(core))?;
+        let token = pool.register(region_id, Box::new(core))?;
 
-        Ok(Arc::new(Self {
-            pool,
-            region_id,
-            peer_id: options.peer_id,
-            leader,
-            published,
-            retired: AtomicBool::new(false),
-        }))
+        Ok(Reservation {
+            peer: Arc::new(Self {
+                pool,
+                region_id,
+                peer_id: options.peer_id,
+                token,
+                leader,
+                published,
+                retired: AtomicBool::new(false),
+            }),
+            committed: false,
+        })
     }
 
     /// The region this peer serves.
@@ -1712,7 +1775,26 @@ impl RaftPeer {
         if self.retired.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.pool.retire(self.region_id);
+        self.pool.retire(self.region_id, self.token);
+    }
+
+    /// Gives the region back without waiting, for a peer the store never took.
+    ///
+    /// [`RaftPeer::stop`] waits for the worker to let go, because its callers are usually about to
+    /// flush or drop the database. This one is called from [`Reservation`]'s `Drop`, whose caller
+    /// can be a **driver thread** — a split adopts its child from the parent's — so it must not
+    /// block: see [`crate::driver::DriverPool::abandon`].
+    fn abandon(&self) {
+        if self.retired.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.pool.abandon(self.region_id, self.token);
+    }
+
+    /// Which registration this handle is, for the tests that need to name a superseded one.
+    #[cfg(test)]
+    pub(crate) fn token(&self) -> crate::driver::Token {
+        self.token
     }
 
     async fn send(&self, message: PeerMsg) -> std::result::Result<(), ProtoError> {
@@ -1838,7 +1920,7 @@ mod tests {
 
     use super::{
         Applied, DiscardTransport, LogCompaction, NoHost, PEER_QUEUE_DEPTH, PeerOptions, RaftPeer,
-        RaftTransport, TICK_CATCH_UP_CAP, ticks_owed, wake,
+        RaftTransport, Reservation, TICK_CATCH_UP_CAP, ticks_owed, wake,
     };
     use crate::apply::Command;
     use crate::driver::DriverPool;
@@ -1876,6 +1958,38 @@ mod tests {
         voters: Vec<u64>,
         transport: Arc<dyn RaftTransport>,
     ) -> Arc<RaftPeer> {
+        start_on(
+            db,
+            peer_id,
+            voters,
+            transport,
+            &Arc::new(DriverPool::new(1).unwrap()),
+        )
+    }
+
+    /// [`start`], on a pool the caller names — which is the only way two peers of one region can
+    /// meet, and the only way a test can see what the store does when they do.
+    fn start_on(
+        db: &Arc<Db>,
+        peer_id: u64,
+        voters: Vec<u64>,
+        transport: Arc<dyn RaftTransport>,
+        pool: &Arc<DriverPool>,
+    ) -> Arc<RaftPeer> {
+        reserve_on(db, peer_id, voters, transport, pool)
+            .expect("the region was free")
+            .commit()
+    }
+
+    /// The reservation itself, for the tests that are about what happens when it is *not*
+    /// committed — and for the one that asks a second peer of one region to be refused.
+    fn reserve_on(
+        db: &Arc<Db>,
+        peer_id: u64,
+        voters: Vec<u64>,
+        transport: Arc<dyn RaftTransport>,
+        pool: &Arc<DriverPool>,
+    ) -> crate::error::Result<Reservation> {
         let storage = RaftLogStorage::open(
             Arc::clone(db),
             REGION,
@@ -1895,9 +2009,8 @@ mod tests {
             storage,
             transport,
             Arc::new(NoHost),
-            Arc::new(DriverPool::new(1).unwrap()),
+            Arc::clone(pool),
         )
-        .unwrap()
     }
 
     /// The rule the driver counts by, stated exactly and with no clock in sight.
@@ -2546,7 +2659,8 @@ mod tests {
             Arc::new(NoHost),
             Arc::new(DriverPool::new(1).unwrap()),
         )
-        .unwrap();
+        .unwrap()
+        .commit();
         elect_alone(&peer).await;
 
         for n in 0..24u32 {
@@ -2629,7 +2743,8 @@ mod tests {
                     Arc::new(NoHost),
                     Arc::clone(&pool),
                 )
-                .unwrap(),
+                .unwrap()
+                .commit(),
             );
         }
         for peer in &peers {
@@ -2696,7 +2811,8 @@ mod tests {
                     Arc::new(NoHost),
                     Arc::clone(&pool),
                 )
-                .unwrap(),
+                .unwrap()
+                .commit(),
             );
         }
         assert_eq!(
@@ -3203,5 +3319,147 @@ mod tests {
     #[test]
     fn the_driver_queue_is_bounded() {
         assert!(PEER_QUEUE_DEPTH > 0 && PEER_QUEUE_DEPTH <= 65_536);
+    }
+
+    /// **A handle is answered by its own core**, or a store refuses to serve a region its own peer
+    /// is leading.
+    ///
+    /// [`RaftPeer::start`] used to hand its core to the pool and return the peer, and
+    /// `DriverPool::register` was a `BTreeMap::insert`: it replaced whatever core was registered
+    /// under that id and said nothing. Both callers (`Store::host_region`, `Store::adopt_split`)
+    /// consult the region map *after* that, where `RegionMap::insert` refuses a second peer of one
+    /// region — and on that refusal the new core stayed registered, the displaced core was dropped
+    /// without failing what it owed, and the new handle stayed alive inside the ticker spawned for
+    /// it, so nothing ever stopped it. What the map kept was a handle whose `leader` and `term`
+    /// atomics nobody published into any more, and the request path reads exactly those
+    /// ([`RaftPeer::is_leader`]): the region answered `NotLeader` for the life of the store, while
+    /// its Raft group had a leader and that leader was this store's own core.
+    ///
+    /// That is the state `docs/plans/debts-v1.1.md` #9 caught: `term=7 is_leader=false
+    /// believes_leader=None` on the same line as `raft_role=Leader`, which **no single core can
+    /// produce** — `become_leader` sets `leader = Some(self.id)`, and `publish_leader` runs after
+    /// every message the driver handles as well as after every drive, so a core's own answer and
+    /// its published pair cannot disagree unless they belong to two different peers. Before
+    /// [ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md) this asserted it
+    /// directly and read `peer 1 was answered by peer 2`.
+    ///
+    /// Deterministic and clockless: a lone voter elects itself, and the second peer arrives by a
+    /// plain call rather than by a race.
+    #[tokio::test]
+    async fn a_peers_own_core_is_the_one_that_answers_it() {
+        let (_first_dir, first_db) = open_db();
+        let (_second_dir, second_db) = open_db();
+        let pool = Arc::new(DriverPool::new(1).unwrap());
+
+        let first = start_on(&first_db, 1, vec![1], Arc::new(DiscardTransport), &pool);
+        elect_alone(&first).await;
+        assert!(
+            first.is_leader(),
+            "a lone voter leads after it elects itself"
+        );
+
+        // What `host_region` does for a region this store already holds. Registering is a claim on
+        // a place, so it is refused here rather than at the map — and the region keeps its core.
+        let refused = reserve_on(&second_db, 2, vec![2], Arc::new(DiscardTransport), &pool)
+            .expect_err("a second core for one region must be refused");
+        assert!(
+            matches!(refused, crate::error::StoreError::RegionConflict(_)),
+            "the wrong refusal: {refused}"
+        );
+
+        let answered = first
+            .status()
+            .await
+            .expect("the first peer's driver still answers");
+        assert_eq!(
+            answered.id,
+            first.peer_id(),
+            "peer {} was answered by peer {}: a second peer of region {REGION} took the first \
+             one's place in the pool, and the first one's handle — the one the request path holds \
+             — now publishes nothing while another core answers for it",
+            first.peer_id(),
+            answered.id
+        );
+        // The consequence, in the terms the request path uses: what it reads and what the core
+        // says must be the same fact.
+        assert_eq!(
+            first.is_leader(),
+            answered.role == Role::Leader,
+            "the published leadership and the core's own role disagree, which is how a healthy \
+             region answers `NotLeader` for ever"
+        );
+
+        first.stop();
+    }
+
+    /// **A reservation nobody committed drives nothing**, which is what makes every refusal branch
+    /// safe without its caller thinking about it.
+    ///
+    /// `Store::host_region` and `Store::adopt_split` have five ways between them to be told this
+    /// store may not host the region — a duplicate id, an overlapping range, a parent that is not
+    /// here, a child that already is, a parent whose start key moved — and each one is a `?` that
+    /// returns before anything else runs. The property below is what those `?`s rest on: the peer
+    /// goes back on the way out, and the region is free for whoever really should have it.
+    #[tokio::test]
+    async fn a_reservation_nobody_committed_gives_its_region_back() {
+        let (_first_dir, first_db) = open_db();
+        let (_second_dir, second_db) = open_db();
+        let pool = Arc::new(DriverPool::new(1).unwrap());
+
+        {
+            let reservation =
+                reserve_on(&first_db, 1, vec![1], Arc::new(DiscardTransport), &pool).unwrap();
+            assert!(
+                pool.driving(REGION),
+                "a reserved region is driven while the reservation is held"
+            );
+            drop(reservation);
+        }
+        assert!(
+            !pool.driving(REGION),
+            "an uncommitted reservation left a core driving a region this store does not host"
+        );
+
+        // And the region is free, which is the half a leak makes impossible: the store that really
+        // is given the region can take it.
+        let second = start_on(&second_db, 2, vec![2], Arc::new(DiscardTransport), &pool);
+        assert_eq!(
+            second.status().await.unwrap().id,
+            2,
+            "the region was not free after the reservation was dropped"
+        );
+        second.stop();
+    }
+
+    /// **A stop that arrives late stops nothing.**
+    ///
+    /// `RaftPeer::stop` used to be `pool.retire(region_id)` — by the place, not by the occupant —
+    /// so a handle dropped after its region had been taken over stopped the core that had taken
+    /// it. The region then had a handle in the map and no driver at all: every request against it
+    /// fails, and the failure names the peer that is still there rather than the one that left.
+    #[tokio::test]
+    async fn a_superseded_handle_retires_nothing() {
+        let (_first_dir, first_db) = open_db();
+        let (_second_dir, second_db) = open_db();
+        let pool = Arc::new(DriverPool::new(1).unwrap());
+
+        let first = start_on(&first_db, 1, vec![1], Arc::new(DiscardTransport), &pool);
+        let superseded = first.token();
+        first.stop();
+
+        let second = start_on(&second_db, 2, vec![2], Arc::new(DiscardTransport), &pool);
+        // The late stop, in the name of a registration that is over.
+        pool.retire(REGION, superseded);
+
+        assert!(
+            pool.driving(REGION),
+            "a superseded registration retired the region that had replaced it"
+        );
+        assert_eq!(
+            second.status().await.unwrap().id,
+            2,
+            "the peer that took the region over stopped answering"
+        );
+        second.stop();
     }
 }

@@ -260,13 +260,23 @@ async fn put(stores: &[&Arc<Store>], key: Bytes, value: &[u8]) {
                 // say where the divergence comes in instead — and it cannot say that unless the
                 // peer's own answer is on the line beside the driver's.
                 let mine = peer.membership().await.ok();
+                // **Which core answered**, beside what the handle published. The two are the
+                // same peer or this store is in the state
+                // [ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md) closes: a
+                // handle whose core was displaced publishes nothing while another core answers
+                // for the region, and the request path — which reads the published pair — refuses
+                // every write for the life of the process. #9's line could not say this, and
+                // saying it is what turned that line into a mechanism.
+                let answered_by = raft.as_ref().map(|status| status.id);
                 seen.push(format!(
                     "store {id}: region {region_id} term={} is_leader={} believes_leader={:?} \
-                     raft_role={role} voted_for={voted_for:?}; membership [{membership}]; \
-                     its own core says {mine:?}; elections {counters:?}",
+                     raft_role={role} voted_for={voted_for:?} answered_by={answered_by:?} \
+                     (this handle is peer {}); membership [{membership}]; its own core says \
+                     {mine:?}; elections {counters:?}",
                     peer.term(),
                     peer.is_leader(),
-                    peer.leader()
+                    peer.leader(),
+                    peer.peer_id()
                 ));
             }
             panic!(
@@ -429,11 +439,50 @@ async fn a_learner_on_a_fresh_store_becomes_a_voter_under_load() {
     // every region held two of them for four minutes and for ever after.
     watch_until_every_learner_votes(&pd, &[&first, &second, &third], &writer, &written).await;
     writer.await.expect("the load completed");
+    every_handle_is_answered_by_its_own_core(&[&first, &second, &third]).await;
 
     first.stop().await;
     second.stop().await;
     third.stop().await;
     let _ = pd_handle.shutdown().await;
+}
+
+/// **Every region's handle is answered by that region's own core**
+/// ([ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md)), swept once over the whole
+/// cluster at the end of a run.
+///
+/// The store-level test of this walks the five ways the region map can refuse a peer and asserts
+/// nothing is left driving what it refused. This is the same property on a real cluster that has
+/// just split, placed, snapshotted and promoted under load — where the refusals actually happen.
+///
+/// Once at the end rather than in the watch loop, and deliberately: the state it looks for is
+/// **permanent** by construction — a displaced core is never un-displaced — so sampling it during
+/// the race buys nothing and costs a round trip per peer per round, on the diagnostic path of a
+/// stall that per-event tracing already displaces.
+async fn every_handle_is_answered_by_its_own_core(all: &[&Node]) {
+    let mut orphaned = Vec::new();
+    for node in all {
+        for region in node.store.regions().regions() {
+            let Some(peer) = node.store.peer_of(region.id) else {
+                continue;
+            };
+            let Ok(status) = peer.status().await else {
+                continue;
+            };
+            if status.id != peer.peer_id() {
+                orphaned.push(format!(
+                    "store {}: region {}'s handle is peer {} and the core answering for it is \
+                     peer {} — the request path reads what peer {} publishes, which is nothing",
+                    node.store.store_id(),
+                    region.id,
+                    peer.peer_id(),
+                    status.id,
+                    peer.peer_id()
+                ));
+            }
+        }
+    }
+    assert!(orphaned.is_empty(), "{}", orphaned.join("\n  "));
 }
 
 /// **One peer per region per store**, checked before anything is timed.
@@ -465,8 +514,28 @@ fn one_peer_per_store(region: &Region) {
 /// **Watched, not sampled**, which is the rule this file already lives by for learners. The driver
 /// learns of a conf change from the *leader's* region heartbeat, so between a core applying a
 /// promotion and PD hearing about it every core is ahead of the driver — a window, and a normal
-/// one at 20 ms a heartbeat. Two hundred and fifty of them is not.
-const DISAGREEMENT_ALLOWED: Duration = Duration::from_secs(5);
+/// one at 20 ms a heartbeat.
+///
+/// **Measured, since it used to be a guess.** The five seconds here were "two hundred and fifty
+/// heartbeats is not a window", written without measuring one. So the run below now records how
+/// long each disagreement it sees actually lasted, and five rounds gave:
+///
+/// ```text
+/// quiet, 5 rounds     round 1  1.319065217s     rounds 2-5  0ns (none arose at all)
+/// loaded, 20 rounds   205ms, 215ms, 452ms       the other 17  0ns
+/// ```
+///
+/// Four appearances in twenty-five rounds, the longest 1.32 s and the longest under load 452 ms —
+/// so the bar is **two** seconds: above every window ever seen, and no longer a number that would
+/// sit through a quarter of a minute of one. The loaded rounds are the ones worth weighing, since
+/// load is what stretches the gap between a core applying a promotion and PD hearing of it, and
+/// they came in at a third of the quiet round's.
+///
+/// The path by which a disagreement could have been *permanent* is closed separately, by
+/// [ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md): a store whose handle for a
+/// region had been orphaned never sent that region's leader-side heartbeat again, so PD's record
+/// froze and every later membership change was a disagreement nothing could resolve.
+const DISAGREEMENT_ALLOWED: Duration = Duration::from_secs(2);
 
 /// **No peer's own core calls itself a voter that `region` calls a learner — for long.**
 ///
