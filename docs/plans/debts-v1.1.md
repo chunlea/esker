@@ -40,6 +40,18 @@ for the second site that decides the same thing before sizing it** — three of 
 out of this register were one line once the pair was found, and none of them was findable from the
 site the symptom appeared at.
 
+A third comes from this register's own reversals, and it is a method rather than a rule about
+where a row lives:
+
+> **When a fix lives somewhere else, leave the mechanism behind as an assertion, not a comment.**
+> #40's livelock is a property of `esker-raft` and its fix is in the driver that decides how many
+> ticks travel together, so the core's test now asserts that batched delivery *still* livelocks it.
+> A comment saying "this is why the driver does that" rots in silence; an assertion that stops
+> holding tells the next person the ground moved. The same shape closed
+> [ADR 0100](../adr/0100-a-region-between-leaders-waits-on-the-callers-deadline.md): its
+> measurement refused the change, so the test that would have driven it prints the numbers and pins
+> today's behaviour instead.
+
 Two rules come from that file's own failures, and both are applied here rather than restated:
 
 > **Close a row where the row lives, in the commit that closes it.** Every lag `debts-v1.md` had
