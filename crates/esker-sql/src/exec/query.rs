@@ -4501,6 +4501,26 @@ fn retype(
             name: crate::value::reg_proc::to_text(oid).into_boxed_str(),
         })));
     }
+    // **And a `regclass` the same way, for the same reason one type over** (`debts-v1.1.md` #41).
+    // Measured: `WHERE r = 'ra'` is `22P02 invalid input syntax for type oid: "ra"` on a real
+    // server — `=` over a `regclass` is `oideq`, so the `unknown` literal goes to `oidin` — while
+    // `WHERE r = 'ra'::regclass` answers, and so does an *assignment* of the bare name, which
+    // resolves through `regclassin`. That asymmetry is the whole row: this half needs no catalog
+    // at all, and the `22P02` falls out of the oid reader rather than being written here.
+    //
+    // **`IN` is the exception and is not reproduced here.** `r IN ('ra','rb')` answers on a real
+    // server, because the list is coerced through the *type's* input function rather than through
+    // the operator's operand type — and this crate reconciles each item of an `IN` with the
+    // operand through this same function, so the two cannot be told apart until the name half of
+    // #41 gives them a catalog. Declared in `tests/regclass_literal.rs`.
+    if matches!(ty, ColumnType::RegClass)
+        && let Literal::String(text) = literal
+    {
+        let oid = crate::value::oid::from_text(text)?;
+        return Ok(Literal::Typed(Box::new(crate::value::regclass_of_oid(
+            i64::from(oid),
+        ))));
+    }
     match literal.assign(ty, "?column?") {
         // Reduced to a value of the column's own type, so the comparison is between two of them.
         Ok(value) => Ok(match value {
