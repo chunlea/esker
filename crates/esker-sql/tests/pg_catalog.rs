@@ -172,7 +172,16 @@ fn activerecord_s_four_type_map_queries_answer() {
         ]
     );
 
-    // 7 — the `LEFT JOIN pg_range` one, with `ON oid = rngtypid` unqualified. Every type this
+    // 7 — the `LEFT JOIN pg_range` one, with `ON oid = rngtypid` unqualified.
+    //
+    // **Four of these rows carry a `typelem` and this expectation used to say `0`.** It was
+    // written when `typelem` was an array's element and nothing else; a real server sets it on the
+    // fixed-length types that are internally an array of something, and answers exactly this
+    // statement with `point` 701, `lseg` 600, `box` 600 and `line` 701 — while `path`, `polygon`
+    // and `circle`, which are variable-length, stay `0`. Measured by running this query against
+    // 19beta1 rather than by reading a rule, and it is the divergence
+    // `array_delimiter.rs::every_base_type_has_an_array_or_is_listed` found its first guard
+    // resting on. Every type this
     // node has is in its list of forty names, and none of them is a range, so every `rngsubtype`
     // is NULL.
     let seven = node.rows(
@@ -207,19 +216,19 @@ fn activerecord_s_four_type_map_queries_answer() {
             // **`point` is one of the forty names this query asks for**, and it answers now: a
             // geometric type is a `b`ase type like any other, and its `typelem` is 0 because a
             // point is not an array of its coordinates.
-            vec!["600", "point", "0", ",", "point_in", "\\N", "b", "0"],
+            vec!["600", "point", "701", ",", "point_in", "\\N", "b", "0"],
             // **`cidr`, `macaddr` and `inet`** — three more names the adapter's list has always
             // held and got nothing back for. `cidr_in`, `macaddr_in`, `inet_in`.
             // **The six geometric shapes**, every one of them already in the adapter's own list
             // and every one of them answering nothing until now. `poly_in`, not `polygon_in`.
-            vec!["601", "lseg", "0", ",", "lseg_in", "\\N", "b", "0"],
+            vec!["601", "lseg", "600", ",", "lseg_in", "\\N", "b", "0"],
             vec!["602", "path", "0", ",", "path_in", "\\N", "b", "0"],
             // **`;`, alone among the seventy-eight** — a box's own text holds commas, so an array
             // of them needs another separator. Found by r1's run-75 provenance probe against the
             // oracle, and it is `pg_type.typdelim` a client reads to parse one.
-            vec!["603", "box", "0", ";", "box_in", "\\N", "b", "0"],
+            vec!["603", "box", "600", ";", "box_in", "\\N", "b", "0"],
             vec!["604", "polygon", "0", ",", "poly_in", "\\N", "b", "0"],
-            vec!["628", "line", "0", ",", "line_in", "\\N", "b", "0"],
+            vec!["628", "line", "701", ",", "line_in", "\\N", "b", "0"],
             vec!["650", "cidr", "0", ",", "cidr_in", "\\N", "b", "0"],
             vec!["700", "float4", "0", ",", "float4in", "\\N", "b", "0"],
             vec!["701", "float8", "0", ",", "float8in", "\\N", "b", "0"],
@@ -330,6 +339,32 @@ fn activerecord_s_four_type_map_queries_answer() {
              13369, 3904, 3906, 3908, 3910, 3912, 3926) ORDER BY t.oid"
         ),
         vec![
+            // **The base types whose `typelem` is not zero**, which is what puts them in an *array*
+            // query at all: `point` and `line` are two `float8`s, `lseg` and `box` two `point`s,
+            // `int2vector` `int2`s and `oidvector` `oid`s. A real server answers this same statement
+            // with exactly these rows — measured — and `ActiveRecord` has registered every one of
+            // them by *name* long before it looks at `typelem`, which is why the value can be right
+            // here without changing what the adapter does with it.
+            vec![
+                "22".to_owned(),
+                "int2vector".to_owned(),
+                "21".to_owned(),
+                ",".to_owned(),
+                "int2vectorin".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "30".to_owned(),
+                "oidvector".to_owned(),
+                "26".to_owned(),
+                ",".to_owned(),
+                "oidvectorin".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
             // **`_xml`, and it sorts first** — 143, below `_json`'s 199, which is the shape
             // `xml`'s pair has and `json`'s does not: 142 and 143 are adjacent.
             vec![
@@ -348,6 +383,46 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "114".to_owned(),
                 ",".to_owned(),
                 "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "600".to_owned(),
+                "point".to_owned(),
+                "701".to_owned(),
+                ",".to_owned(),
+                "point_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "601".to_owned(),
+                "lseg".to_owned(),
+                "600".to_owned(),
+                ",".to_owned(),
+                "lseg_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "603".to_owned(),
+                "box".to_owned(),
+                "600".to_owned(),
+                ";".to_owned(),
+                "box_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "628".to_owned(),
+                "line".to_owned(),
+                "701".to_owned(),
+                ",".to_owned(),
+                "line_in".to_owned(),
                 "\\N".to_owned(),
                 "b".to_owned(),
                 "0".to_owned(),
@@ -467,10 +542,12 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "b".to_owned(),
                 "0".to_owned(),
             ],
-            // **`_box` is the one array in all of `pg_type` whose delimiter is not a comma**, and
-            // it is here because `type_lookup_test.rb` looks it up by oid to read exactly that.
-            // The `;` is `box`'s own: a box is written `(x1,y1),(x2,y2)`, so a comma could not
-            // separate two of them.
+            // **`_box`, and the semicolon is what `type_lookup_test` reads.** A box's own text
+            // holds commas — `{(1,1),(0,0);(3,3),(2,2)}` is two boxes — so it is the only array
+            // type in the catalog whose delimiter is not one (ADR 0084's sibling unit).
+            // PostgreSQL answers five more rows here that this node names as gaps: `_lseg`,
+            // `_path`, `_polygon`, `_line`, `_circle` and `_name`
+            // (`array_delimiter.rs::every_base_type_has_an_array_or_is_listed`).
             vec![
                 "1020".to_owned(),
                 "_box".to_owned(),
@@ -641,10 +718,9 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "b".to_owned(),
                 "0".to_owned(),
             ],
-            // **Every range array joins them**, because the adapter's list holds all six
-            // range oids: an array is found by its element's oid, and these are the rows
-            // that make `t.tsrange :ranges, array: true` and `t.tstzrange :tstz_ranges,
-            // array: true` decode instead of coming back as strings.
+            // **Every range array joins them**, because the adapter's list holds all six range
+            // oids: an array is found by its element's oid, and these are the rows that make
+            // `t.tsrange :ranges, array: true` decode instead of coming back as strings.
             vec![
                 "3905".to_owned(),
                 "_int4range".to_owned(),
