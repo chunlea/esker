@@ -1,0 +1,57 @@
+crates/esker-keys/src/array.rs
+  s_6f7019c05b578b::t_aa523c0baef924 89,146
+crates/esker-keys/src/columnar.rs
+  s_6f7019c05b578b::t_c6ba13e773be30 66,71,267-268
+crates/esker-keys/src/row.rs
+  s_6f7019c05b578b::t_9cc9c831e6caee 159,489-500,545,758,1212,1268-1269,2114-2119,2211
+crates/esker-keys/src/value.rs
+  s_6f7019c05b578b::t_e84e2f17c0b6f2 463-470,588-589,605,639,674,902-913,1026-1027,1144
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_6f7019c05b578b::t_7dc396a2ea531d 541,1027-1046,2150,2213-2218,2947,2952,3119,3173,3286,3333
+crates/esker-sql/src/catalog/record.rs
+  s_6f7019c05b578b::t_8a4f4052808441 361-364,516,521,674,679
+crates/esker-sql/src/exec/aggregate.rs
+  s_6f7019c05b578b::t_10f9d0a6c47c17 275-280
+crates/esker-sql/src/exec/bind.rs
+  s_6f7019c05b578b::t_8f8294ef8d01cf 1478-1482,1489-1493
+crates/esker-sql/src/exec/cursor.rs
+  s_6f7019c05b578b::t_9327904d34c678 2265-2282
+crates/esker-sql/src/exec/fragment.rs
+  s_6f7019c05b578b::t_d066388b365cb2 1071-1072,1186
+crates/esker-sql/src/exec/query.rs
+  s_6f7019c05b578b::t_9535ed0b28ee91 3500,3505,4264-4279
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_9a1f18128b314c 6359-6370
+crates/esker-sql/src/plan/expr.rs
+  s_6f7019c05b578b::t_5f3594f2ca6335 2285,2374-2384,2471,2561,2733
+crates/esker-sql/src/row.rs
+  s_6f7019c05b578b::t_33a4ff4542191f 55-62,113
+crates/esker-sql/src/value/mod.rs
+  s_6f7019c05b578b::t_6b0f827100da57 58,345-346,348-351,385-402,1249-1251,1295,1505,1532,1649-1651,1742,1851,1884,1906,1949,2033-2035,2138-2147,2235,2338,2434-2443,2523,2790-2791,2793-2800,2935-2937,3301
+crates/esker-sql/src/value/reg_proc.rs
+  s_6f7019c05b578b::t_93c742b8451f8a 1-175
+crates/esker-sql/tests/array_delimiter.rs
+  s_6f7019c05b578b::t_5f1315c88b9e13 24-31,66,76,81,85,137,142
+crates/esker-sql/tests/captures/pg19_reg_proc.txt
+  s_6f7019c05b578b::t_a4c531c7e3d6b9 1-91
+crates/esker-sql/tests/reg_proc.rs
+  s_6f7019c05b578b::t_af8c2d69261be3 1-157
+crates/esker-store/src/columnar/decode.rs
+  s_6f7019c05b578b::t_cf8520963651e8 273,289
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "536a2bbd7e18fdfcd3074e0224a0b27e316989b4",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
