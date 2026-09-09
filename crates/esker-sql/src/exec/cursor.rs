@@ -34,6 +34,12 @@ use crate::value::{PgDatum, PgType, ltree, range};
 /// The most rows a `Sort` will hold. Past it, `53400` rather than an unbounded allocation.
 pub(super) const SORT_LIMIT: usize = 1_000_000;
 
+/// A relation name to its oid: the executor's own rule, carried to wherever a value is.
+///
+/// The mirror of `crate::row::NameOfRelation`, which goes the other way for the same reason —
+/// see `Settings::names`.
+pub(super) type OidOfRelation<'a> = &'a dyn Fn(&str) -> Result<i64>;
+
 /// A pull iterator over a plan: one call, one row.
 ///
 /// This is what makes `LIMIT` cheap. A `SELECT * FROM big LIMIT 10` opens a scan, reads one chunk
@@ -68,6 +74,19 @@ pub(super) struct Settings<'a> {
     /// The snapshot is taken inside the view rather than here, because that is where the rows are
     /// wanted and `Locks::rows` already holds the mutex for exactly as long as the copy takes.
     pub(super) advisory: Option<&'a crate::advisory::Locks>,
+    /// **A relation name to its oid** — the one direction `crate::row::decode_row`'s rule does not
+    /// go (`debts-v1.1.md` #41).
+    ///
+    /// `regclassin` resolves a name, and every rule for doing so is the executor's:
+    /// `stored_name_written` rewrites a `pg_temp` prefix and then walks the resolved `search_path`
+    /// against the catalog view. Writing a second resolver here — `Env` does carry a transaction, a
+    /// catalog snapshot and the path — would be a second reader of one name grammar, which is the
+    /// mistake this crate has already paid for. So the executor builds the rule and this carries
+    /// it, exactly as the *oid to name* direction is carried into `decode_row`.
+    ///
+    /// `None` is an evaluator with no session behind it, and it is why a `Datum::Text` cast to
+    /// `regclass` there is a refusal rather than a wrong relation.
+    pub(super) names: Option<OidOfRelation<'a>>,
 }
 
 impl Settings<'_> {
@@ -78,6 +97,7 @@ impl Settings<'_> {
             rendering: crate::value::Rendering::default(),
             prepared: &[],
             advisory: None,
+            names: None,
         }
     }
 }
@@ -2321,6 +2341,21 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     u32::try_from(*typmod).unwrap_or(1).max(1),
                 ),
             },
+            // **A name that only exists per row** (`debts-v1.1.md` #41). `'x'::regclass` is
+            // resolved once per statement, before the plan, by the pass that has a transaction; a
+            // cast whose operand is a *value* cannot be, and answered `an oid is an integer, not
+            // Text(…)` — a value arriving somewhere its type was decided without it. The rule is
+            // the executor's, carried in rather than rewritten here, and the printed form comes
+            // back through `regclass_of` so the search-path qualification is the same one every
+            // other `regclass` gets.
+            Datum::Text(name) if *to == ColumnType::RegClass => {
+                let Some(names) = env.settings.names else {
+                    return Err(SqlError::unsupported(
+                        "a relation name read as a regclass without a catalog",
+                    ));
+                };
+                regclass_of(env, names(&name)?)?
+            }
             // **An array to `regclass[]` resolves every element**, because the type is a name per
             // element and the names come from the catalog. `array_in` cannot do it — the input
             // function of a `regclass` needs a relation lookup and `crate::value` has none — so it
@@ -2672,6 +2707,7 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             operand,
             list,
             negated,
+            any: _,
         } => in_list(operand, list, *negated, row, env)?,
         // The same three-valued rule as the line above, over an array that is a value of the row
         // rather than a list the lowering could see. Shared rather than copied: `IN` and
@@ -3665,6 +3701,23 @@ fn catalog_function(
         // error: it prints the number back, and oid 0 prints `-`, PostgreSQL's rendering of
         // `InvalidOid`. Measured, both — raising here would break a `LEFT JOIN` that legitimately
         // has no match.
+        // **A `Datum::Text` means the cast was written over a value, and the direction flips.**
+        // `'x'::regclass` is a name resolved before the plan; `c::regclass` over a *text* column
+        // reaches here per row, and lowering cannot tell the two apart because it has no types —
+        // so the datum decides, exactly as it does for `RegTypeName` one arm down. Without this
+        // the text went to the oid reader and answered `an oid is an integer, not Text(…)`
+        // (`debts-v1.1.md` #41, the shape r1's wire gate found).
+        CatalogFunc::RegClassName if matches!(args.first(), Some(Datum::Text(_))) => {
+            let Some(Datum::Text(name)) = args.first() else {
+                unreachable!("the guard above matched a text argument")
+            };
+            let Some(names) = env.settings.names else {
+                return Err(SqlError::unsupported(
+                    "a relation name read as a regclass without a catalog",
+                ));
+            };
+            regclass_of(env, names(name)?)?
+        }
         CatalogFunc::RegClassName => match oid_argument(args.first())? {
             None => Datum::Null,
             // **A `regclass`, not the name it prints as.** The three answers below are the

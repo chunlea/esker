@@ -2999,7 +2999,8 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             operand,
             list,
             negated,
-        } => resolve_in_list(operand, list, *negated, scope)?,
+            any,
+        } => resolve_in_list(operand, list, *negated, *any, scope)?,
         Expr::IsNull { operand, negated } => Expr::IsNull {
             operand: Box::new(resolve(operand, scope)?),
             negated: *negated,
@@ -3271,6 +3272,7 @@ fn resolve_in_list(
     operand: &Expr,
     list: &[Expr],
     negated: bool,
+    any: bool,
     scope: &Scope<'_>,
 ) -> Result<Expr> {
     // `x IN (a, b)` is a set of `=`, so every item is typed the way `x = a` types it — but
@@ -3304,6 +3306,33 @@ fn resolve_in_list(
             operand: Box::new(operand),
             list: coerced,
             negated,
+            any,
+        });
+    }
+    // **`IN` follows the assignment rule and not the comparison's** (`debts-v1.1.md` #41).
+    // Measured: `r = 'ra'` over a `regclass` is `22P02` — `=` is `oideq`, so the literal goes to
+    // `oidin` — while `r IN ('ra','rb')` **answers**, because a list is coerced through the
+    // *type's* input function. So each string item becomes a cast the row evaluator resolves with
+    // the executor's own name rule, and it is decided **before** the common-type coercion below:
+    // that one gives every `unknown` the list's type, which for a `regclass` operand means reading
+    // the name as an oid — the comparison's rule, arriving one step too early.
+    if !any && matches!(expr_type(&operand, scope), Ok(ColumnType::RegClass)) {
+        let mut cast = Vec::with_capacity(items.len());
+        for item in items {
+            cast.push(match item {
+                Expr::Literal(Literal::String(_)) => Expr::Cast {
+                    operand: Box::new(item),
+                    to: ColumnType::RegClass,
+                    typmod: crate::value::NO_TYPMOD,
+                },
+                other => other,
+            });
+        }
+        return Ok(Expr::InList {
+            operand: Box::new(operand),
+            list: cast,
+            negated,
+            any,
         });
     }
     // The coercion happens here, at plan time, and not when a row is scanned: PostgreSQL
@@ -3327,6 +3356,7 @@ fn resolve_in_list(
         operand: Box::new(operand),
         list: resolved,
         negated,
+        any,
     })
 }
 

@@ -4417,6 +4417,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             operand: Box::new(lower_expr(expr)?),
             list: list.iter().map(lower_expr).collect::<Result<Vec<_>>>()?,
             negated: *negated,
+            any: false,
         }),
         // `INTERVAL '1 day'` and `INTERVAL '1' DAY`: SQL's typed-literal spelling for this one
         // type, which `sqlparser` gives its own node rather than a `TypedString`. A **leading
@@ -4706,6 +4707,8 @@ fn lower_quantified(
             operand,
             list,
             negated: all,
+            // The written spelling was `= ANY` / `<> ALL`, and one rule depends on knowing it.
+            any: true,
         });
     }
     // **A constructor stays a constructor**, which is the one thing `pg_get_expr` keeps that a

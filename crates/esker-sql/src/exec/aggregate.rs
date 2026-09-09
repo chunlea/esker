@@ -608,6 +608,7 @@ impl Aggregation {
                 operand,
                 list,
                 negated,
+                any,
             } => Expr::InList {
                 operand: Box::new(self.rewrite(operand, scope)?),
                 list: list
@@ -615,6 +616,7 @@ impl Aggregation {
                     .map(|item| self.rewrite(item, scope))
                     .collect::<Result<Vec<_>>>()?,
                 negated: *negated,
+                any: *any,
             },
             Expr::IsNull { operand, negated } => Expr::IsNull {
                 operand: Box::new(self.rewrite(operand, scope)?),

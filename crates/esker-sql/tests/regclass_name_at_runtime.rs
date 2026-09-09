@@ -52,7 +52,6 @@ fn node() -> parity::Node {
 }
 
 /// **An assignment resolves the name**, which is what `regclassin` is for.
-#[ignore = "debts-v1.1.md #41, assignment half: the name rule is not yet threaded to the evaluator"]
 #[test]
 fn an_assignment_takes_a_bare_name() {
     let mut node = node();
@@ -66,7 +65,6 @@ fn an_assignment_takes_a_bare_name() {
 }
 
 /// **A cast whose operand is a value, not a literal** — the shape the wire gate found.
-#[ignore = "debts-v1.1.md #41, assignment half: the name rule is not yet threaded to the evaluator"]
 #[test]
 fn a_runtime_text_becomes_a_regclass() {
     let mut node = node();
@@ -91,7 +89,6 @@ fn a_runtime_text_becomes_a_regclass() {
 }
 
 /// **`IN` resolves its list**, which is the exception the comparison half had to declare.
-#[ignore = "debts-v1.1.md #41, assignment half: the name rule is not yet threaded to the evaluator"]
 #[test]
 fn an_in_list_resolves_its_names() {
     let mut node = node();

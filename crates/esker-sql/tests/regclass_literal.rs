@@ -22,17 +22,11 @@ mod parity;
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[(
-        "SELECT id FROM rh WHERE r IN ('ra','rb') ORDER BY id",
-        "**`IN` is not `=`, and a real server coerces its list through the *type's* input \
-         function** rather than through the operator's operand type — so `r IN ('ra','rb')` \
-         resolves both names and answers where `r = 'ra'` is `22P02`. This crate reconciles each \
-         item of an `IN` with the operand through the same function that types a comparison's \
-         literal, so the two cannot be told apart here; telling them apart is not the point \
-         anyway, because the `IN` branch has to *resolve a name* and that is the half of \
-         `debts-v1.1.md` #41 which needs a catalog. It closes with that half, not before.",
-        "pg19_regclass_literal.txt:28",
-    )],
+    // **`IN` was declared here and is closed.** It answers on a real server because a list is
+    // coerced through the *type's* input function rather than the operator's operand type — so it
+    // follows the *assignment* rule, and it closed with that half (`tests/regclass_name_at_runtime.rs`)
+    // exactly as this entry said it would.
+    answers: &[],
 };
 
 #[test]
