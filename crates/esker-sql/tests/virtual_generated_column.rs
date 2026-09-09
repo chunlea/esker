@@ -110,3 +110,44 @@ fn a_column_a_generated_column_reads_is_a_dependency() {
         Some("column b of table g depends on column a of table g")
     );
 }
+
+/// **The four expressions `virtual_column_test#test_schema_dumping` matches**, to the character.
+///
+/// The suite's own table, and its four assertions are four different parenthesisations of one
+/// function: a call is printed bare with its argument's cast shown, and a bare operator is printed
+/// in one pair. This node had three of the four and answered `column1 + 1` for the fourth, which
+/// was the whole of that test's failure — the catalog was otherwise identical on both servers
+/// (run 105's capture pack). The rule and the rest of the family are in
+/// `tests/generated_parens.rs`; this is the statement the suite sends and the strings it reads.
+#[test]
+fn the_suites_own_virtual_columns_print_the_way_it_matches() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE virtual_columns (id bigserial primary key, name character varying(255), \
+         upper_name character varying(255) GENERATED ALWAYS AS (UPPER(name)) STORED, \
+         name_length integer GENERATED ALWAYS AS (LENGTH(name)) STORED, \
+         name_octet_length integer GENERATED ALWAYS AS (OCTET_LENGTH(name)) STORED, \
+         column1 integer, \
+         column2 integer GENERATED ALWAYS AS (column1 + 1) STORED, \
+         column3 integer GENERATED ALWAYS AS (column1 + 2) VIRTUAL, \
+         column4 integer GENERATED ALWAYS AS (column1 + 3) VIRTUAL)",
+    ]);
+    assert_eq!(
+        node.rows(
+            "SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a \
+             JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+             WHERE a.attrelid = 'virtual_columns'::regclass AND a.attgenerated <> '' \
+             ORDER BY a.attnum"
+        ),
+        [
+            ["upper_name".to_owned(), "upper((name)::text)".to_owned()],
+            ["name_length".to_owned(), "length((name)::text)".to_owned()],
+            [
+                "name_octet_length".to_owned(),
+                "octet_length((name)::text)".to_owned()
+            ],
+            ["column2".to_owned(), "(column1 + 1)".to_owned()],
+            ["column3".to_owned(), "(column1 + 2)".to_owned()],
+            ["column4".to_owned(), "(column1 + 3)".to_owned()],
+        ]
+    );
+}

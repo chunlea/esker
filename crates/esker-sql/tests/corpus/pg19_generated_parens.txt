@@ -1,0 +1,84 @@
+# **The parentheses `pg_get_expr` adds** — one probe per expression shape, generated columns and
+# defaults alike.
+#
+# `virtual_column_test#test_schema_dumping`, run 105. The catalog was identical on both servers and
+# the node's dump was otherwise complete — every virtual column, `stored: true`, and the nested
+# casts `length((name)::text)` and `upper((name)::text)` exactly as PostgreSQL prints them. The
+# whole of the failure was one pair of parentheses:
+#
+#   expected  /t\.virtual\s+"column2",\s+type: :integer,\s+as: "\(column1 \+ 1\)", stored: true$/i
+#   node      t.virtual "column2", type: :integer, as: "column1 + 1", stored: true
+#
+# Same family as run 102's check-constraint parenthesisation, in the opposite direction: there the
+# node added a pair PostgreSQL omits, here it omitted a pair PostgreSQL adds.
+#
+# # The rule, and it is one function's
+#
+# `pg_attrdef.adbin` holds one expression and `pg_get_expr(adbin, adrelid)` prints it, for a
+# generated column and for a default alike — so the rule is the same in both, and this file asks it
+# in both. It is [`crate::catalog::ExprShape`], already measured for an index expression:
+#
+#   operator or connective   one pair        (c1 + 1)   (c1 > 0)   (c1 IS NOT NULL)
+#   bare call                none            length(t)  COALESCE(c1, 0)  now()
+#   value, cast, CASE        none            7          c1         (1)::bigint
+#
+# A **bare column** is a value and prints bare, which is the row an index expression can never
+# reach — a column there is a column key, never an expression key — and the one this file adds.
+#
+# # THINGS REASONING WOULD GET WRONG
+#
+#   * **The written parentheses are not the printed ones.** `((c1 + 1))` prints `(c1 + 1)` and
+#     `c1 + 1` prints `(c1 + 1)`: the deparser's pair, not the user's, which is why normalising at
+#     the point the text is taken is not cosmetic.
+#   * **A function call takes none, and `COALESCE` is a call** — not an operator, even though it is
+#     spelled like a keyword.
+#   * **The pretty form drops them again**: `pg_get_expr(adbin, adrelid, true)` is `c1 + 1`. Two
+#     functions, two answers, one stored expression.
+#   * **`information_schema.columns.column_default` prints the same string** as `pg_get_expr`, so
+#     the rule reaches a second view — and for a *generated* column that view is NULL instead
+#     (`generation_expression` carries the text), which is why the generated probes here read
+#     `pg_attrdef` and not `information_schema`.
+BEGIN		-
+CREATE TABLE g1gp (c1 integer, c2 integer, name character varying(255), t text)		-
+ALTER TABLE g1gp ADD COLUMN g_plus integer GENERATED ALWAYS AS (c1 + 1) STORED		-
+ALTER TABLE g1gp ADD COLUMN g_nested integer GENERATED ALWAYS AS (c1 * 2 + 3) STORED		-
+ALTER TABLE g1gp ADD COLUMN g_paren integer GENERATED ALWAYS AS ((c1 + 1) * 2) STORED		-
+ALTER TABLE g1gp ADD COLUMN g_double integer GENERATED ALWAYS AS ((c1 + 1)) STORED		-
+ALTER TABLE g1gp ADD COLUMN g_col integer GENERATED ALWAYS AS (c1) STORED		-
+ALTER TABLE g1gp ADD COLUMN g_func integer GENERATED ALWAYS AS (length(t)) STORED		-
+ALTER TABLE g1gp ADD COLUMN g_bool boolean GENERATED ALWAYS AS (c1 > 0) STORED		-
+ALTER TABLE g1gp ADD COLUMN g_isnull boolean GENERATED ALWAYS AS (c1 IS NOT NULL) STORED		-
+ALTER TABLE g1gp ADD COLUMN g_coalesce integer GENERATED ALWAYS AS (COALESCE(c1, 0)) STORED		-
+ALTER TABLE g1gp ADD COLUMN g_const integer GENERATED ALWAYS AS (7) STORED		-
+ALTER TABLE g1gp ADD COLUMN g_and boolean GENERATED ALWAYS AS (c1 > 0 AND c2 > 0) STORED		-
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_plus'		r|(c1 + 1)
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_nested'		r|((c1 * 2) + 3)
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_paren'		r|((c1 + 1) * 2)
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_double'		r|(c1 + 1)
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_col'		r|c1
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_func'		r|length(t)
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_bool'		r|(c1 > 0)
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_isnull'		r|(c1 IS NOT NULL)
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_coalesce'		r|COALESCE(c1, 0)
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_const'		r|7
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1gp'::regclass AND a.attname = 'g_and'		r|((c1 > 0) AND (c2 > 0))
+CREATE TABLE g1dp (d_plus integer DEFAULT (1 + 1), d_col integer DEFAULT 7, d_func text DEFAULT upper('a'), d_now timestamp DEFAULT now(), d_nested integer DEFAULT (1 + 2 * 3), d_bool boolean DEFAULT (1 > 0), d_cast bigint DEFAULT 1::bigint)		-
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp'::regclass AND a.attname = 'd_plus'		r|(1 + 1)
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp'::regclass AND a.attname = 'd_col'		r|7
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp'::regclass AND a.attname = 'd_func'		r|upper('a'::text)
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp'::regclass AND a.attname = 'd_now'		r|now()
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp'::regclass AND a.attname = 'd_nested'		r|(1 + (2 * 3))
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp'::regclass AND a.attname = 'd_bool'		r|(1 > 0)
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp'::regclass AND a.attname = 'd_cast'		r|(1)::bigint
+SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_plus'	text,character varying	r|(1 + 1)
+SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_col'	text,character varying	r|7
+SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_func'	text,character varying	r|upper('a'::text)
+SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_now'	text,character varying	r|now()
+SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_nested'	text,character varying	r|(1 + (2 * 3))
+SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_bool'	text,character varying	r|(1 > 0)
+SELECT 'r', column_default FROM information_schema.columns WHERE table_name = 'g1dp' AND column_name = 'd_cast'	text,character varying	r|(1)::bigint
+SELECT 'r', pg_get_expr(d.adbin, d.adrelid, true) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'g1gp'::regclass AND a.attname = 'g_plus'		r|c1 + 1
+DROP TABLE g1dp		-
+DROP TABLE g1gp		-
+ROLLBACK		-
+SELECT 'r', count(*) FROM pg_class WHERE relname IN ('g1gp','g1dp')	text,bigint	r|0

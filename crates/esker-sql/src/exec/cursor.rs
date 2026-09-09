@@ -3342,8 +3342,22 @@ fn catalog_function(
         | CatalogFunc::Cardinality => array_function(call.func, &args)?,
         // The identity on its first argument, which is where the printed expression already is —
         // and NULL-propagating, so a `LEFT JOIN pg_attrdef` that matched nothing is NULL rather
-        // than an error. The third argument is `pretty`, which changes nothing this node prints.
-        CatalogFunc::PgGetExpr => args.first().cloned().unwrap_or(Datum::Null),
+        // than an error.
+        //
+        // **The third argument is `pretty`, and it takes the deparser's pair back off**: measured,
+        // one stored generated column prints `(c1 + 1)` from two arguments and `c1 + 1` from three.
+        // It used to change nothing here and that was right by accident — the stored text carried
+        // no pair at all, so the two-argument form was wrong and the three-argument form was
+        // right. Now the text is the printed form (`crate::catalog::ExprShape`) and the pretty
+        // form is that form with its own pair removed
+        // (`crate::catalog::unparenthesised`, `tests/generated_parens.rs`).
+        CatalogFunc::PgGetExpr => match args.first() {
+            None | Some(Datum::Null) => Datum::Null,
+            Some(Datum::Text(expr)) if pretty_argument(args.get(2))? => {
+                Datum::Text(crate::catalog::unparenthesised(expr).to_owned())
+            }
+            Some(other) => other.clone(),
+        },
         // The catalog it reads is snapshotted by the cursor, so a projection over every row of
         // `pg_index` reads it once rather than once per index.
         // **Strict in its second argument when there is one**, and that is not the same as
