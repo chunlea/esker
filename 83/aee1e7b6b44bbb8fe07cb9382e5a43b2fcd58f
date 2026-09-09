@@ -1,0 +1,19 @@
+crates/esker-sql/tests/multi_region_rows.rs
+  s_dc640bf0df4adb::t_73d1ae2d7b4160 78-86,101-102,105-107,121-123,209-226,247-248,262-302,375-451
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "83aee1e7b6b44bbb8fe07cb9382e5a43b2fcd58f",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
