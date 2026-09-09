@@ -21,6 +21,14 @@
 //! row. So this pair of assertions is the whole rule: one array that is special and one that is
 //! not.
 //!
+//! **The `::regproc` casts below are not decoration.** These queries used to read
+//! `WHERE typinput = 'array_in'`, and that is a statement a **real server refuses**:
+//! `22P02 invalid input syntax for type oid: "array_in"`, because `=` over a `regproc` is `oideq`
+//! and the unadorned literal goes to `oidin`. They passed here only because `typinput` was a
+//! `text` column — a test passing on the mechanism it was not testing — and reddened the moment
+//! the column was declared its real type (ADR 0098). `typinput = 'array_in'::regproc` is the form
+//! a real server answers, and `typinput::text = 'array_in'` is the other one; both were measured.
+//!
 //! Measured in `tests/captures/pg19_array_delimiter.txt`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -55,7 +63,7 @@ fn every_arrays_delimiter_is_its_elements() {
     let mut node = parity::Node::new(&[]);
     let mismatched = node.rows(
         "SELECT t.typname, t.typdelim, e.typdelim FROM pg_type t JOIN pg_type e \
-         ON e.oid = t.typelem WHERE t.typinput = 'array_in' AND t.typdelim <> e.typdelim",
+         ON e.oid = t.typelem WHERE t.typinput = 'array_in'::regproc AND t.typdelim <> e.typdelim",
     );
     assert!(
         mismatched.is_empty(),
@@ -65,16 +73,16 @@ fn every_arrays_delimiter_is_its_elements() {
     // table where every delimiter is a comma.
     assert_eq!(
         node.rows(
-            "SELECT t.typname FROM pg_type t WHERE t.typinput = 'array_in' AND t.typdelim <> ','"
+            "SELECT t.typname FROM pg_type t WHERE t.typinput = 'array_in'::regproc AND t.typdelim <> ','"
         ),
         vec![vec!["_box"]]
     );
     // The other half of the same measurement: on a real server `box` is the **only** base type
-    // whose delimiter is not a comma, asked with `typinput <> 'array_in'` so that `box` — whose
+    // whose delimiter is not a comma, asked with `typinput <> 'array_in'::regproc` so that `box` — whose
     // `typelem` is `point` there — is counted as the base type it is.
     assert_eq!(
         node.rows(
-            "SELECT typname FROM pg_type WHERE typtype = 'b' AND typinput <> 'array_in' \
+            "SELECT typname FROM pg_type WHERE typtype = 'b' AND typinput <> 'array_in'::regproc \
              AND typdelim <> ',' ORDER BY typname"
         ),
         vec![vec!["box"]]
@@ -126,12 +134,12 @@ fn no_typarray_dangles() {
 fn every_base_type_has_an_array_or_is_listed() {
     let mut node = parity::Node::new(&[]);
     let without: Vec<String> = node
-        // **`typinput <> 'array_in'`, not `typelem = 0`.** A `box`'s `typelem` is `point` on a
+        // **`typinput <> 'array_in'::regproc`, not `typelem = 0`.** A `box`'s `typelem` is `point` on a
         // real server and it is not an array — the input function is what says which a row is.
         // Written the other way this guard passed only because this node reports `box`'s
         // `typelem` as 0, so it was resting on a divergence rather than on the rule.
         .rows(
-            "SELECT typname FROM pg_type WHERE typtype = 'b' AND typinput <> 'array_in' \
+            "SELECT typname FROM pg_type WHERE typtype = 'b' AND typinput <> 'array_in'::regproc \
              AND typarray = 0 ORDER BY typname",
         )
         .into_iter()

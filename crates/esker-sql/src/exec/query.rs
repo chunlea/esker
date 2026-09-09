@@ -3497,11 +3497,12 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // A `regclass` is in the numbers' family with them, and it is what makes
             // `WHERE attrelid = 'iv'::regclass` compare at all: measured,
             // `'pg_class'::regclass = 1259` is true against an uncast integer.
-            ColumnType::RegType | ColumnType::RegClass => family(ColumnType::Oid),
+            ColumnType::RegType | ColumnType::RegProc | ColumnType::RegClass => family(ColumnType::Oid),
             // **Text's family, because text is what they are here.** They compare as the
             // strings they print as, which is what `attnum = ANY(indkey)` already relies on.
             ColumnType::Int2Vector | ColumnType::OidVector => family(ColumnType::Text),
             ColumnType::RegTypeArray => 200,
+            ColumnType::RegProcArray => 201,
             // **A family of one each.** `'{1}'::int[] = '{1}'::int8[]` is `42883` on a real
             // server — an array's comparison is its element type's, and two element types are two
             // operators — so no two of these share a family and none shares one with a scalar.
@@ -4259,6 +4260,22 @@ fn retype(
         && !(low..=high).contains(&value)
     {
         return Ok(literal.clone());
+    }
+    // **A comparison against a `regproc` reads the literal as an `oid`, not as a function name.**
+    // Measured: `typinput = 'array_in'` is `22P02 invalid input syntax for type oid: "array_in"`
+    // on a real server, while `typinput = 'array_in'::regproc` answers and so does
+    // `typinput::text = 'array_in'`. The reason is the operator: `=` over a `regproc` is `oideq`,
+    // whose right operand is an `oid`, so the `unknown` literal is handed to `oidin`. An
+    // *assignment* is the other way — `regprocin` resolves a name — which is why this arm is here
+    // and not in `Literal::assign` (ADR 0098).
+    if matches!(ty, ColumnType::RegProc)
+        && let Literal::String(text) = literal
+    {
+        let oid = crate::value::oid::from_text(text)?;
+        return Ok(Literal::Typed(Box::new(Datum::RegProc {
+            oid,
+            name: crate::value::reg_proc::to_text(oid).into_boxed_str(),
+        })));
     }
     match literal.assign(ty, "?column?") {
         // Reduced to a value of the column's own type, so the comparison is between two of them.

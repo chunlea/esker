@@ -63,10 +63,12 @@ fn tag_of(ty: ColumnType) -> u8 {
         // **Appended, not inserted**: 89 and 90 were the next two free, and every tag already
         // written keeps the number it had ([ADR 0077](../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
         ColumnType::RegType => 89,
+        ColumnType::RegProc => 105,
         ColumnType::RegClass => 91,
         ColumnType::Int2Vector => 92,
         ColumnType::OidVector => 93,
         ColumnType::RegTypeArray => 90,
+        ColumnType::RegProcArray => 106,
         ColumnType::Int8 => 1,
         ColumnType::Text => 2,
         ColumnType::Bool => 3,
@@ -262,6 +264,8 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         102 => ColumnType::Void,
         103 => ColumnType::Char,
         104 => ColumnType::CharArray,
+        105 => ColumnType::RegProc,
+        106 => ColumnType::RegProcArray,
         60 => ColumnType::FloatRange,
         61 => ColumnType::VarcharRange,
         62 => ColumnType::Money,

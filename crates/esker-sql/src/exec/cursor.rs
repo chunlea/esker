@@ -2262,6 +2262,24 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     crate::value::Rendering::default(),
                 )?
             }
+            // **A `regtype` or a `regproc` to a number is the oid too**, for the same reason and
+            // with one difference: their oid is already four bytes. Without this arm
+            // `typinput::oid` rendered `boolin` and handed it to `oidin`, which is
+            // `22P02 invalid input syntax for type oid: "boolin"` for a statement a real server
+            // answers with 1242 — `pg_cast` calls the pair implicit and method `b`, a
+            // reinterpretation, and a reinterpretation is what this is (ADR 0098).
+            Datum::RegType { oid, .. } | Datum::RegProc { oid, .. }
+                if matches!(
+                    to,
+                    ColumnType::Oid | ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2
+                ) =>
+            {
+                crate::value::assignment_cast(
+                    Datum::Oid(oid),
+                    *to,
+                    crate::value::Rendering::default(),
+                )?
+            }
             value => {
                 // **The session's output function, not the boot one.** A cast between two types
                 // here is a text round trip, so the text it goes through has to be the text the

@@ -86,6 +86,7 @@ impl ArrayValue {
         Some(match element {
             ColumnType::Int8 => ColumnType::Int8Array,
             ColumnType::RegType => ColumnType::RegTypeArray,
+            ColumnType::RegProc => ColumnType::RegProcArray,
             ColumnType::Int4 => ColumnType::Int4Array,
             ColumnType::Int2 => ColumnType::Int2Array,
             ColumnType::Numeric => ColumnType::NumericArray,
@@ -142,6 +143,7 @@ impl ArrayValue {
         Some(match array {
             ColumnType::Int8Array => ColumnType::Int8,
             ColumnType::RegTypeArray => ColumnType::RegType,
+            ColumnType::RegProcArray => ColumnType::RegProc,
             ColumnType::Int4Array => ColumnType::Int4,
             ColumnType::Int2Array => ColumnType::Int2,
             ColumnType::NumericArray => ColumnType::Numeric,

@@ -538,7 +538,7 @@ impl CatalogView {
                 ("typname", ColumnType::Name, NO_LENGTH),
                 ("typelem", ColumnType::Oid, NO_LENGTH),
                 ("typdelim", ColumnType::Char, NO_LENGTH),
-                ("typinput", ColumnType::Text, NO_LENGTH),
+                ("typinput", ColumnType::RegProc, NO_LENGTH),
                 ("typtype", ColumnType::Char, NO_LENGTH),
                 ("typbasetype", ColumnType::Oid, NO_LENGTH),
                 // **Last**, because `SELECT *` expands in this order (`7be39ca`) and a column
@@ -1024,11 +1024,26 @@ impl CatalogView {
         let columns = self.columns();
         for row in rows {
             for (at, datum) in row.iter_mut().enumerate() {
-                let Some((_, ColumnType::Oid, _)) = columns.get(at) else {
-                    continue;
-                };
-                if let Datum::Int8(id) = *datum {
-                    *datum = Datum::Oid(u32::try_from(id).unwrap_or(u32::MAX));
+                match columns.get(at) {
+                    Some((_, ColumnType::Oid, _)) => {
+                        if let Datum::Int8(id) = *datum {
+                            *datum = Datum::Oid(u32::try_from(id).unwrap_or(u32::MAX));
+                        }
+                    }
+                    // **A `regproc` is written as its name and read as an oid.** The builders name
+                    // the input function — that is what the column is *for* — and the oid is
+                    // looked up from the measured table rather than derived, because a function's
+                    // oid is a fact about a real server and not about this one (ADR 0098).
+                    Some((_, ColumnType::RegProc, _)) => {
+                        if let Datum::Text(name) = datum {
+                            let oid = crate::value::reg_proc::oid_of(name).unwrap_or(0);
+                            *datum = Datum::RegProc {
+                                oid,
+                                name: std::mem::take(name).into_boxed_str(),
+                            };
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2132,7 +2147,7 @@ fn pg_depend_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
 ///
 /// `(castsource, casttarget, castcontext, castmethod)`. `castcontext` is `e` explicit, `a`
 /// assignment, `i` implicit; `castmethod` is `f` a function, `b` binary-coercible, `i` I/O.
-pub const CASTS: [(i64, i64, &str, &str); 111] = [
+pub const CASTS: [(i64, i64, &str, &str); 113] = [
     // **`regclass`'s nine rows, measured** rather than reasoned: `SELECT castsource, casttarget,
     // castcontext, castmethod FROM pg_cast WHERE castsource = 2205 OR casttarget = 2205`. Six
     // types reach a `regclass` implicitly and three leave it — `regclass -> bigint` and
@@ -2195,6 +2210,12 @@ pub const CASTS: [(i64, i64, &str, &str); 111] = [
     (25, 142, "e", "f"),
     (25, 1042, "i", "b"),
     (25, 1043, "i", "b"),
+    // **`regproc` and `oid` are one representation**, implicit both ways and by reinterpretation
+    // (`b`) rather than through a function — measured. It is what makes `typinput::oid` the 42 a
+    // real server answers, and what puts an integer literal beside a `regproc` in a comparison
+    // (ADR 0098).
+    (24, 26, "i", "b"),
+    (26, 24, "i", "b"),
     (26, 20, "a", "f"),
     (26, 23, "a", "b"),
     (114, 3802, "a", "i"),
@@ -2923,10 +2944,12 @@ fn partitioned_relkind(
 pub(crate) fn typname(ty: ColumnType) -> &'static str {
     match ty {
         ColumnType::RegType => "regtype",
+        ColumnType::RegProc => "regproc",
         ColumnType::RegClass => "regclass",
         ColumnType::Int2Vector => "int2vector",
         ColumnType::OidVector => "oidvector",
         ColumnType::RegTypeArray => "_regtype",
+        ColumnType::RegProcArray => "_regproc",
         // **An array type's internal name is the element's with a leading underscore** — `_int4`,
         // not `int4[]`. That spelling is what `pg_type.typname` holds on a real server and what a
         // client matching on it expects.
@@ -3093,6 +3116,7 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         // A number, and PostgreSQL groups it with them despite being an identifier.
         | ColumnType::Oid
         | ColumnType::RegType
+        | ColumnType::RegProc
         | ColumnType::RegClass
         // **And a money**, which a real server puts here too — not in `U` with the extension
         // types and not in a category of its own. Measured.
@@ -3146,7 +3170,7 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::HstoreArray
         | ColumnType::TsVectorArray
         | ColumnType::TsQueryArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
         // **`A` for the two vectors too**, measured: `int2vector` and `oidvector` are in
         // PostgreSQL's array category despite not being array types.
         | ColumnType::Int2Vector
@@ -3259,6 +3283,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::Char => "charin",
         // PostgreSQL's own name; the array's `array_in` is in the group below with every other.
         ColumnType::RegType => "regtypein",
+        ColumnType::RegProc => "regprocin",
         ColumnType::RegClass => "regclassin",
         ColumnType::Int2Vector => "int2vectorin",
         ColumnType::OidVector => "oidvectorin",
@@ -3305,6 +3330,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::JsonbArray
         | ColumnType::OidArray
         | ColumnType::RegTypeArray
+        | ColumnType::RegProcArray
         | ColumnType::CitextArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray

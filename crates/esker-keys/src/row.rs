@@ -156,7 +156,7 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
         // **The oid and the name together**, because the name cannot be recovered from the oid
         // without a catalog and this crate must not have one (invariant 7). Four bytes then a
         // length-prefixed string, which is `Datum::Oid` followed by `Datum::Text`.
-        Datum::RegType { oid, name } => {
+        Datum::RegType { oid, name } | Datum::RegProc { oid, name } => {
             out.extend_from_slice(&oid.to_le_bytes());
             varint::put_u64(name.len() as u64, out);
             out.extend_from_slice(name.as_bytes());
@@ -486,6 +486,18 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 rest,
             )
         }
+        // The same four bytes and the same name, one catalog over.
+        ColumnType::RegProc => {
+            let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
+            let (name, rest) = reg_name(rest, "regproc")?;
+            (
+                Datum::RegProc {
+                    oid: u32::from_le_bytes(*head),
+                    name,
+                },
+                rest,
+            )
+        }
         // Eight bytes for the oid, then the same name.
         ColumnType::RegClass => {
             let (head, rest) = bytes.split_first_chunk::<8>().ok_or_else(truncated)?;
@@ -530,6 +542,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::JsonbArray
         | ColumnType::OidArray
         | ColumnType::RegTypeArray
+        | ColumnType::RegProcArray
         | ColumnType::CitextArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray
@@ -742,6 +755,7 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         | Datum::Point { .. }
         | Datum::Geometry { .. }
         | Datum::RegType { .. }
+        | Datum::RegProc { .. }
         | Datum::RegClass { .. } => {}
         Datum::Int8(v)
         | Datum::TimestampTz(v)
@@ -1195,6 +1209,7 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::Jsonb
             | ColumnType::RegType
             | ColumnType::RegTypeArray
+            | ColumnType::RegProcArray
             | ColumnType::RegClass
             // **A pseudo-type is not a key because it is not a column.** Nothing is ever stored as
             // a `void`, so there is no order for a key to encode.
@@ -1250,6 +1265,8 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         // is still refused by the other, which is the direction a disagreement has to fail in.
         ColumnType::RegType
         | ColumnType::RegTypeArray
+        | ColumnType::RegProc
+        | ColumnType::RegProcArray
         | ColumnType::RegClass
         | ColumnType::Void
         | ColumnType::Int2Vector
@@ -2094,6 +2111,12 @@ mod tests {
                     name: name.into(),
                 })
                 .boxed(),
+            ColumnType::RegProc => (any::<u32>(), "[a-z_ ]{0,12}")
+                .prop_map(|(oid, name)| Datum::RegProc {
+                    oid,
+                    name: name.into(),
+                })
+                .boxed(),
             // The same, and for the same reason: a `regclass`'s name is qualified or bare
             // depending on the search path that resolved it, so the codec must carry whatever it
             // was given rather than a shape it expects.
@@ -2185,6 +2208,7 @@ mod tests {
             | ColumnType::JsonbArray
             | ColumnType::OidArray
             | ColumnType::RegTypeArray
+            | ColumnType::RegProcArray
             | ColumnType::CitextArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray

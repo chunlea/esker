@@ -6356,7 +6356,18 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // arms above still come first, because `'x'::regtype::oid` is asking a different
         // question — what OID does this *name* have — and answers before any value is read.
         (CastTarget::Oid, _) => {
-            let text = cast_operand(expr, data_type)?;
+            // **A cast of an expression is an ordinary cast.** `oid` reaches this function at all
+            // only because `sqlparser` has no `DataType` for it, so the name arrives as a custom
+            // one; folding a literal here is a convenience, and a *column* has nothing to fold.
+            // Without this arm `typinput::oid` — a statement a real server answers — was
+            // `0A000 the cast typinput::oid is not supported` (ADR 0098).
+            let Ok(text) = cast_operand(expr, data_type) else {
+                return Ok(plan::Expr::Cast {
+                    operand: Box::new(lower_expr(expr)?),
+                    to: ColumnType::Oid,
+                    typmod: value::NO_TYPMOD,
+                });
+            };
             Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
                 Datum::Oid(value::oid::from_text(&text)?),
             ))))

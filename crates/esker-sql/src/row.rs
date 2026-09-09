@@ -52,6 +52,14 @@ mod tests {
                     name: name.into(),
                 })
                 .boxed(),
+            // The same for a `regproc`: the codec carries the name it was handed, because an oid
+            // with no function prints its digits and the pair is not derivable one from the other.
+            ColumnType::RegProc => (any::<u32>(), "[a-z_ ]{0,12}")
+                .prop_map(|(oid, name)| Datum::RegProc {
+                    oid,
+                    name: name.into(),
+                })
+                .boxed(),
             // The same for a `regclass`, whose name may carry a schema: what resolved it decides
             // whether it is qualified, so the codec carries the string it was handed.
             // Space-separated numbers, which is all a vector holds.
@@ -102,6 +110,7 @@ mod tests {
             | ColumnType::JsonbArray
             | ColumnType::OidArray
             | ColumnType::RegTypeArray
+            | ColumnType::RegProcArray
             | ColumnType::CitextArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray
