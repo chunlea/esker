@@ -521,12 +521,15 @@ fn one_peer_per_store(region: &Region) {
 /// long each disagreement it sees actually lasted, and five rounds gave:
 ///
 /// ```text
-/// round 1  1.319065217s      rounds 2-5  0ns (no disagreement arose at all)
+/// quiet, 5 rounds     round 1  1.319065217s     rounds 2-5  0ns (none arose at all)
+/// loaded, 20 rounds   205ms, 215ms, 452ms       the other 17  0ns
 /// ```
 ///
-/// One appearance in five rounds, and it cleared in a third of the old bar's *first* second — so
-/// the bar is **two** seconds: comfortably above the only window ever seen, and no longer a number
-/// that would sit through a quarter of a minute of one.
+/// Four appearances in twenty-five rounds, the longest 1.32 s and the longest under load 452 ms —
+/// so the bar is **two** seconds: above every window ever seen, and no longer a number that would
+/// sit through a quarter of a minute of one. The loaded rounds are the ones worth weighing, since
+/// load is what stretches the gap between a core applying a promotion and PD hearing of it, and
+/// they came in at a third of the quiet round's.
 ///
 /// The path by which a disagreement could have been *permanent* is closed separately, by
 /// [ADR 0099](../../../docs/adr/0099-one-core-per-region-per-store.md): a store whose handle for a
