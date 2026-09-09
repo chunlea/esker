@@ -367,12 +367,37 @@ is not told to wait and then killed, it is killed at the moment an older transac
 and finds out when it next asks the store for anything. The assertion is the outcome and not the
 site, for that reason.
 
-**What the TTL still owes.** An eager lock lives `LOCK_TTL_MS` — three seconds — and
-`TxnKv::Heartbeat` is still an RPC with a handler and no sender (`DESIGN.md` §8). A `FOR UPDATE`
-held longer than that can be resolved out from under its holder. It is loud rather than silent: the
-resolver settles the holder's **primary**, so the wounded transaction cannot commit and is told
-`40P01` — but a transaction that sat for four seconds should not lose its rows to a session that
-wanted one of them, and the sender is what closes that. It is the next thing this ADR owes.
+### What the TTL owed, and now does not
+
+An eager lock lives `LOCK_TTL_MS` — three seconds — and `TxnKv::Heartbeat` was an RPC with a
+handler and no sender, which `DESIGN.md` §8 had said since phase 5. That cost little while the only
+locks a transaction held were a commit's: those live for the length of a two-phase commit. A
+`FOR UPDATE` lock is held for the length of the **transaction**, and a client that pauses four
+seconds between two statements is ordinary — so its lock was resolved out from under it and its
+commit refused, loudly (`40P01`) and wrongly.
+
+**The sender is `esker-client`'s `renew` module**, ruled 2026-09-09 as this ADR's second unit. A
+transaction registers its **primary** when the first eager lock pins one — the only lock a resolver
+consults, so the only one that has to be told — and a background thread renews at a **third** of the
+lease, the cadence [ADR 0028](0028-the-schema-lease.md) settled for the schema lease, so a lost
+round trip still leaves two attempts. It stops at every ending, including the one that is not a
+method call: `Drop` forgets the transaction, because a renewal that outlived its transaction would
+hold a crashed client's row for ever — worse than the gap it closes.
+
+Two things it deliberately is not. The **lease is not lengthened**: a long lease is how long a *dead*
+holder blocks everybody, and the point of a short one is that a crash is cleaned up quickly. And a
+failed renewal is **not** a failed transaction: two thirds of the lease are still ahead of it by
+construction, so the round is best-effort and silent, and a transaction whose renewals all fail
+expires — which is the behaviour that existed before the sender.
+
+Red first, in one action: `crates/esker-client/tests/lock_heartbeat.rs` holds a lock across three
+leases and asserts the **holder can still commit**. Without the sender the second transaction finds
+the lock expired, settles the holder's primary and takes the row, and the holder's commit is refused
+for a transaction that did nothing wrong. Its sibling asserts the other direction — a lock stops
+being renewed when its transaction ends — because a renewal that leaks is how this fix would become
+a worse bug than the one it fixes. The test needs an oracle with a **physical** part in its
+timestamps: `CountingOracle` counts from a thousand, so `is_expired` never fires under it and a
+lease can neither run out nor be renewed.
 
 ## Consequences
 
