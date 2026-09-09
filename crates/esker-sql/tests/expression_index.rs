@@ -31,12 +31,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "UNMEASURED",
         ),
         (
-            "SELECT pg_get_indexdef('xidx_cast'::regclass)",
-            "a cast prints its target type in upper case (a::TEXT) and does not parenthesise its \
-             operand, where PostgreSQL's deparser prints (a)::text",
-            "UNMEASURED",
-        ),
-        (
             "SELECT pg_get_indexdef('xidx_cast'::regclass, 1, true)",
             "the same cast, one key part at a time",
             "UNMEASURED",

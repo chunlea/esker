@@ -214,6 +214,7 @@ pub(super) fn create_table(
     validate_checks(&table)?;
     let mut table = table;
     normalise_generated(&mut table)?;
+    normalise_defaults(&mut table);
     let table = table;
     // Resolved against a table that is not in the catalog yet, which is what lets a
     // self-reference — `CREATE TABLE t (id int8 PRIMARY KEY, parent int8 REFERENCES t)` — work
@@ -1606,7 +1607,13 @@ fn set_column_default(
             let written = expr.as_deref().unwrap_or("NULL");
             let (folded, unfolded) = crate::parse::fold_column_default(written, ty, typmod)?;
             updated.columns[at].default = folded;
-            updated.columns[at].default_expr = unfolded;
+            // The third of `deparse_default`'s three callers. `SET DEFAULT (1 + 2 * 3)` prints
+            // `(1 + (2 * 3))` for the same reason the `CREATE TABLE` spelling does: one row, one
+            // printer, and the statement that wrote it is not recorded anywhere.
+            updated.columns[at].default_expr = unfolded
+                .as_ref()
+                .and_then(|expr| deparse_default(updated, expr))
+                .or(unfolded);
         }
     }
     Ok(())
@@ -5292,22 +5299,71 @@ const OVERTAKEN_LIMIT: u32 = 64;
 /// entry is written from the value the expression had at insert and looked up from the value it
 /// has at read, and nothing ever notices they differ.
 fn index_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)> {
+    let (text, ty) = deparsed_expression(table, expr)?;
+    // **An index key is stored without its own outermost pair, because the reader puts it back.**
+    // A key part carries its [`catalog::ExprShape`] beside its text and every reader of the key
+    // list — `pg_get_indexdef`, its `pretty` form, `pg_get_expr(indexprs)`, the per-column
+    // rendering — asks the shape how many pairs to print. So the text the catalog holds is the
+    // *inside* of the expression, and [`deparse`] hands back the outside: `(b IS NULL)` stored
+    // that way read back `((b IS NULL))`, and four rows of `tests/expression_index.rs` said so
+    // within the hour. A generated column is the other convention — nothing adds a pair on the
+    // way out, so it stores the printed form as it is — which is why these are two functions.
+    Ok((catalog::unparenthesised(&text).to_owned(), ty))
+}
+
+/// One expression, checked the way an index key is checked and printed the way `pg_get_expr`
+/// prints it — **including its own outermost pair**.
+///
+/// The refusals are [`index_expression`]'s, listed in its doc comment, and they are the right ones
+/// for a generated column too: it is the same requirement (a function of the row alone) for the
+/// same reason (the value is written once and read forever), and a real server gives the same
+/// `42P17` for a generated column over `nextval`.
+fn deparsed_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)> {
     let parsed = crate::parse::parse_stored_expr(expr)?;
     let scope = crate::exec::query::Scope::single(table);
     let resolved = crate::exec::query::resolve(&parsed, &scope)?;
     refuse_unless_immutable(&resolved)?;
     let ty = crate::exec::query::expr_type(&resolved, &scope)?;
-    // **A `CASE` and a scalar call are stored deparsed; everything else is stored as written.**
-    // Both are shapes where the text that went in cannot be the text that comes out: a `CASE`'s
-    // implicit `ELSE` is filled in with the resolved type, and a text function's argument shows
-    // the cast it took — `lower(name)` over a `varchar` is `lower((name)::text)` on a real server,
-    // measured. Everything else agrees once the outer parentheses are normalised, and stays the
-    // user's own text rather than passing through a deparser that has a placeholder in it.
-    let text = match &resolved {
-        plan::Expr::Case { .. } | plan::Expr::Scalar { .. } => deparse(&resolved, table, ty),
-        _ => expr.to_owned(),
+    let printed = deparse(&resolved, table, ty);
+    if reads_back(table, &printed, ty) {
+        return Ok((printed, ty));
+    }
+    // **The written text, because the printed one could not be read back.** Not a fallback for
+    // tidiness: the stored string is *evaluated*, and by three different readers that each parse
+    // it again — `exec::index` for every index write, `exec::dml` for a default and for a
+    // generation expression — so a text that does not re-parse is a table nobody can insert into.
+    // `exec::index` says it in its own words: "the stored expression of index ... no longer
+    // resolves". This node's deparser is not total over the expression language: a `CatalogFunc`
+    // that is not an operator prints `name(...)`, a literal placeholder, and an index over
+    // `to_tsvector('english', name)` stored that way raised `XX000` on the next `INSERT` — which
+    // is what `tests/tsvector.rs` and `tests/gin_default_opclass.rs` caught within the hour.
+    //
+    // Keeping the written text is what this function did for every shape but two before the
+    // deparser reached the rest of them, so the fallback is the old behaviour and the guard is
+    // what makes reaching for the new one safe.
+    Ok((expr.to_owned(), ty))
+}
+
+/// Whether a printed expression **parses and resolves back to itself** — the invariant that makes
+/// storing a deparse instead of the user's text safe.
+///
+/// Three callers re-parse the stored string on a path where failure is an `XX000` rather than a
+/// refusal, so the question is not "is this the right text" but "can this text be read at all".
+/// The check is a **fixpoint** and not just a parse, because a string that parses to a *different*
+/// expression is the worse failure: the index key or the generated value would then be computed
+/// from something other than what the catalog shows, and nothing would say so.
+///
+/// A wrapping pair is transparent to the parser, so checking the printed form also clears the
+/// index convention's [`catalog::unparenthesised`] form of it.
+fn reads_back(table: &TableDef, printed: &str, ty: ColumnType) -> bool {
+    let Ok(parsed) = crate::parse::parse_stored_expr(printed) else {
+        return false;
     };
-    Ok((text, ty))
+    let scope = crate::exec::query::Scope::single(table);
+    let Ok(resolved) = crate::exec::query::resolve(&parsed, &scope) else {
+        return false;
+    };
+    deparse(&resolved, table, ty) == printed
 }
 
 /// Whether a scalar function takes `text`, and so shows a cast its argument needed.
@@ -5350,16 +5406,154 @@ fn column_type_of(expr: &plan::Expr, table: &TableDef) -> Option<ColumnType> {
 /// every `pg_attribute` scan.
 ///
 /// Only the shapes [`index_expression`] deparses are rewritten, and for the same reason.
+/// The same pass for a **`DEFAULT`**, which is the same `pg_attrdef` row.
+///
+/// Three statements store one, and each stores the text it was written with, so each needs this:
+/// `CREATE TABLE` here, `ALTER TABLE ... ADD COLUMN` and `ALTER TABLE ... ALTER COLUMN SET
+/// DEFAULT` at their own sites. That is the shape of every bug in this family — a rule measured
+/// once and asked in one of the places that stores the thing — and the count is written here so
+/// the next reader can check it: `grep -n 'deparse_default' src/exec/ddl.rs` must find three
+/// callers.
+///
+/// **Table-wide is safe here and nowhere else**, because every text in a table this function is
+/// handed is the text a user just wrote. Run it a second time over its own output and
+/// `upper('a'::text)` would deparse again; the two `ALTER` sites therefore normalise the *one*
+/// column the statement writes and leave the others alone.
+fn normalise_defaults(table: &mut TableDef) {
+    let snapshot = table.clone();
+    for column in &mut table.columns {
+        let Some(expr) = &column.default_expr else {
+            continue;
+        };
+        if let Some(text) = deparse_default(&snapshot, expr) {
+            column.default_expr = Some(text);
+        }
+    }
+}
+
 fn normalise_generated(table: &mut TableDef) -> Result<()> {
     let snapshot = table.clone();
     for column in &mut table.columns {
         let Some(expr) = &column.generated else {
             continue;
         };
-        let (text, _) = index_expression(&snapshot, expr)?;
+        let (text, _) = deparsed_expression(&snapshot, expr)?;
         column.generated = Some(text);
     }
     Ok(())
+}
+
+/// One `DEFAULT`, as `pg_get_expr` prints it — for the shapes where that is not what was written.
+///
+/// **A default and a generated column are the same `pg_attrdef` row**, printed by the same
+/// `pg_get_expr(adbin, adrelid)`, so the deparse rule is one rule; a generated column has been
+/// through [`deparse`] since the schema-dump unit and a default never was. Measured on 19beta1,
+/// `tests/corpus/pg19_generated_parens.txt`:
+///
+/// ```text
+/// DEFAULT (1 + 2 * 3)   ->  (1 + (2 * 3))     every operator node takes its own pair
+/// DEFAULT upper('a')    ->  upper('a'::text)  an unknown literal shows the coercion it took
+/// DEFAULT (1 + 1)       ->  (1 + 1)           already agreed, and still does
+/// DEFAULT 1::bigint     ->  (1)::bigint       already agreed, from `cast_default_text`
+/// ```
+///
+/// **`None` means "keep what was written", and that is the answer for most defaults**, because for
+/// most of them the written text *is* what a real server prints: `now()`, `CURRENT_TIMESTAMP`,
+/// `nextval('s'::regclass)`, `gen_random_uuid()`, `7`. Two of those are the reason this is an
+/// allow-list of shapes rather than "deparse everything": PostgreSQL keeps `CURRENT_TIMESTAMP` and
+/// `now()` apart in its own tree and prints each back as written — measured, and
+/// `catalog::pg_attribute::default_expression` records it — while this crate lowers both to one
+/// node and could only print one of them. Deparsing them would lose a spelling that agrees today.
+///
+/// The refusals are swallowed on purpose. This runs over text a real server has already accepted,
+/// and a shape [`crate::exec::query::resolve`] does not know is one whose written text is kept —
+/// the same answer as a shape that is deliberately out of the list. A default is refused where it
+/// is *written* (`parse::lower::refuse_default_shapes`), not here.
+fn deparse_default(table: &TableDef, expr: &str) -> Option<String> {
+    let parsed = crate::parse::parse_stored_expr(expr).ok()?;
+    let scope = crate::exec::query::Scope::single(table);
+    let resolved = crate::exec::query::resolve(&parsed, &scope).ok()?;
+    if !reprinted_by_pg_get_expr(&resolved) {
+        return None;
+    }
+    let ty = crate::exec::query::expr_type(&resolved, &scope).ok()?;
+    let printed = deparse(&resolved, table, ty);
+    // The same guard [`deparsed_expression`] carries, for the same reason and a third reader:
+    // `exec::dml::column_default_value` parses this string for every row that takes the default.
+    reads_back(table, &printed, ty).then_some(printed)
+}
+
+/// Whether PostgreSQL's deparser prints this shape differently from the way it is written.
+///
+/// Total over the expression type, like [`deparse`] itself and for the same reason: a new node has
+/// to decide before it compiles. The `false` arms are not a backlog — each is a shape whose
+/// written text already agrees, and several of them agree *because* they are not deparsed.
+///
+/// It has to be **exhaustive and not a list beside a wildcard**, and clippy is what says so:
+/// `match_same_arms` rejects an explicit group and a `_` arm that return the same value, so the
+/// choice is between listing every variant and listing none. Listing every variant is the one that
+/// keeps the promise of the sentence above, and the grouping below is where the reasons live.
+fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
+    use crate::plan::Expr;
+    match expr {
+        // Operators, which take a pair per node at every depth, and calls whose arguments show the
+        // coercion they took. These are the shapes the corpus measured a difference on.
+        Expr::Arithmetic { .. }
+        | Expr::Binary { .. }
+        | Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::Like { .. }
+        | Expr::RegexMatch { .. }
+        | Expr::InList { .. }
+        | Expr::AnyArray { .. }
+        | Expr::Cast { .. }
+        | Expr::ToText { .. }
+        | Expr::Scalar { .. }
+        | Expr::Coalesce(_)
+        | Expr::Case { .. } => true,
+        // **A catalog function whose name is an operator**, which today is `||` and which
+        // [`deparse`] prints as one. Gated on the same condition `deparse`'s own arm uses, because
+        // every other `CatalogFunc` deparses to a `name(...)` placeholder that must never be
+        // stored: `DEFAULT ('a' || 'b')` prints `('a'::text || 'b'::text)`, measured.
+        Expr::CatalogFunc(call) => call.func.name() == "||" && call.args.len() == 2,
+        // **Everything else keeps the text it was written with, and is listed rather than
+        // wildcarded** so that a new expression node has to decide before it compiles — the same
+        // reason [`deparse`] is total. One arm, because `match_same_arms` will not have two, and
+        // three reasons, which is what the comments inside it are for.
+        //
+        // *The spelling is the thing being preserved.* PostgreSQL keeps `CURRENT_TIMESTAMP` and
+        // `now()` apart in its own tree and prints each back as written; this node lowers both to
+        // one node and could only print one of them, so deparsing here would lose an agreement.
+        // `Sequence` is the same case with a stronger reason: `nextval('s'::regclass)` is
+        // assembled by `parse::lower` and `deparse` prints `nextval()`.
+        Expr::Sequence(_)
+        | Expr::Uuid(_)
+        | Expr::CurrentUser
+        | Expr::CurrentSchema { .. }
+        | Expr::CurrentDatabase
+        | Expr::CurrentSetting { .. }
+        | Expr::Advisory { .. }
+        // *There is nothing to reprint.* A bare literal is stored as a **value** and never reaches
+        // here (`parse::lower::column_default` folds it), and a folded negative literal is the
+        // same case — `DEFAULT - 1` is the `Datum` `-1`, which is why `Negate` is here and not
+        // above with the operators.
+        | Expr::Literal(_)
+        | Expr::Negate(_)
+        | Expr::Array { .. }
+        | Expr::Subscript { .. }
+        // *It cannot be written in a `DEFAULT` at all.* A column reference, a subquery and a
+        // set-returning function are the three `parse::lower::refuse_default_shapes` refuses, by
+        // PostgreSQL's own rule that a default is evaluated with no row in scope and one value
+        // out; an aggregate, a parameter and the plan-internal nodes have nowhere to come from.
+        | Expr::Column { .. }
+        | Expr::Ordinal { .. }
+        | Expr::Outer { .. }
+        | Expr::Subquery(_)
+        | Expr::Aggregate(_)
+        | Expr::SetFunc(_)
+        | Expr::Parameter(_)
+        | Expr::Default => false,
+    }
 }
 
 /// One resolved expression, as `pg_get_expr` prints it.
@@ -5390,19 +5584,38 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
                 elements.iter().map(sub).collect::<Vec<_>>().join(", ")
             )
         }
+        // **`LIKE` is printed as the operator it desugars to**, and there are four of them.
+        // Measured on 19beta1 (`tests/corpus/pg19_deparse_parens.txt`, the `c_*like` rows):
+        //
+        // ```text
+        // t LIKE 'a%'        (t ~~ 'a%'::text)
+        // t NOT LIKE 'a%'    (t !~~ 'a%'::text)
+        // t ILIKE 'a%'       (t ~~* 'a%'::text)
+        // t NOT ILIKE 'a%'   (t !~~* 'a%'::text)
+        // ```
+        //
+        // The keyword form is what a user writes and is not what `pg_get_expr` prints, which is the
+        // whole reason a printer over the tree exists: no rule about parentheses over the written
+        // text can turn `LIKE` into `~~`.
         Expr::Like {
             operand,
             pattern,
             negated,
             case_insensitive,
             ..
-        } => format!(
-            "({} {}{} {})",
-            sub(operand),
-            if *negated { "NOT " } else { "" },
-            if *case_insensitive { "ILIKE" } else { "LIKE" },
-            sub(pattern)
-        ),
+        } => {
+            // Both sides under `text`, which is the operator's argument type and not the
+            // expression's: threading the `boolean` a generated column declares printed
+            // `(t LIKE 'a%'::boolean)`.
+            let side = |expr: &Expr| deparse(expr, table, ColumnType::Text);
+            format!(
+                "({} {}{} {})",
+                side(operand),
+                if *negated { "!" } else { "" },
+                if *case_insensitive { "~~*" } else { "~~" },
+                side(pattern)
+            )
+        }
         Expr::RegexMatch {
             operand,
             pattern,
@@ -5429,23 +5642,54 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             sub(operand),
             if *negated { "NOT " } else { "" }
         ),
+        // **`IN` is printed as a quantified comparison over an array**, which is what the parser
+        // makes of it and what `pg_get_expr` prints. Measured, same corpus:
+        //
+        // ```text
+        // c1 IN (1, 2)        (c1 = ANY (ARRAY[1, 2]))
+        // c1 NOT IN (1, 2)    (c1 <> ALL (ARRAY[1, 2]))
+        // t IN ('a', 'b')     (t = ANY (ARRAY['a'::text, 'b'::text]))
+        // ```
+        //
+        // The third row is why the elements are deparsed under the **operand's** type: they are
+        // the literals being compared, and each shows the coercion it took, while the expression's
+        // own type is `boolean`.
         Expr::InList {
             operand,
             list,
             negated,
-        } => format!(
-            "({} {}IN ({}))",
-            sub(operand),
-            if *negated { "NOT " } else { "" },
-            list.iter().map(&sub).collect::<Vec<_>>().join(", ")
-        ),
+        } => {
+            let element = column_type_of(operand, table).unwrap_or(ty);
+            format!(
+                "({} {} (ARRAY[{}]))",
+                deparse(operand, table, element),
+                if *negated { "<> ALL" } else { "= ANY" },
+                list.iter()
+                    .map(|item| deparse(item, table, element))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
         // **A text function shows the cast its argument took.** `lower(v)` over a `varchar` prints
         // `lower((v)::text)` and over a `text` prints `lower(t)`; `abs(n)` prints bare, being the
         // one scalar function here that does not take text. Measured on 19beta1 across all four
         // shapes, and it is what `schema_dumper_test#test_schema_dump_expression_indices` asserts
         // — the regex names `lower((name)::text)` exactly.
         Expr::Scalar { func, operand } => {
-            let argument = sub(operand);
+            // **The argument is deparsed under the function's own parameter type**, not under the
+            // expression's. Same correction as the `||` arm below and the same measurement behind
+            // it: `upper('a')` prints `upper('a'::text)` on a real server, and threading the
+            // *result* type down printed `upper('a'::integer)` for an `integer` default whose
+            // value happened to be a call. A literal takes its cast from the parameter it fills.
+            let argument = deparse(
+                operand,
+                table,
+                if takes_text(*func) {
+                    ColumnType::Text
+                } else {
+                    ty
+                },
+            );
             let cast = takes_text(*func)
                 && matches!(column_type_of(operand, table), Some(from)
                 if matches!(from, ColumnType::Varchar | ColumnType::Bpchar));
@@ -5520,6 +5764,27 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         Expr::Outer { at, .. } => format!("<outer {at}>"),
         Expr::Default => "DEFAULT".to_owned(),
         Expr::Sequence(call) => format!("{}()", call.func.name()),
+        // **A catalog function whose name is an operator prints as one**, which is the shape
+        // `pg_get_expr` gives it: `(t || 'x'::text)` and not `||(t, 'x')`. `parse::lower` makes
+        // every `||` a `CatalogFunc` — hstore, jsonb and text alike — so the spelling has to come
+        // back from the name rather than from the variant, and `name()` is where `||` already is.
+        //
+        // Measured: `t || 'x'` is `(t || 'x'::text)` and `length(t || 'x')` is
+        // `length((t || 'x'::text))` — the argument keeps its own pair inside the call's
+        // parentheses, which is what makes this an operator arm and not a call one.
+        Expr::CatalogFunc(call) if call.func.name() == "||" && call.args.len() == 2 => {
+            // **Each operand is deparsed as `text`, which is the operator's own argument type and
+            // not the expression's.** `deparse` threads one type down to every literal, and that
+            // is right for a comparison — where `reconcile` has already retyped the literal
+            // against the column — and wrong here: `length(t || 'x')` printed
+            // `length((t || 'x'::integer))`, taking `length`'s *result* type, where a real server
+            // says `length((t || 'x'::text))`. The operator is `textcat(text, text)`, measured.
+            let operand = |expr: &Expr| deparse(expr, table, ColumnType::Text);
+            format!("({} || {})", operand(&call.args[0]), operand(&call.args[1]))
+        }
+        // Everything else a catalog function can be has no deparse of its own yet: an index or a
+        // generated column over one is refused as not immutable long before this, except the
+        // text-search family, which `tests/corpus/pg19_deparse_parens.txt` does not reach.
         Expr::CatalogFunc(call) => format!("{}(...)", call.func.name()),
         Expr::Aggregate(call) => format!("{}(...)", call.func.name()),
         Expr::Subquery(sub) => sub.kind.describe().to_owned(),
@@ -6119,12 +6384,33 @@ pub(super) fn alter_table(
             )?,
             None => column.default.clone(),
         };
+        // **A generated column added by `ALTER` is deparsed too**, which `CREATE TABLE` has done
+        // since the schema-dump unit (`normalise_generated`) and this path never did. One
+        // `pg_attrdef` row, two ways to write it, and `pg_get_expr` cannot tell which statement
+        // put it there: `ADD COLUMN g integer GENERATED ALWAYS AS (c1 * 2 + 3) STORED` prints
+        // `((c1 * 2) + 3)` on a real server exactly as the `CREATE TABLE` spelling does, measured
+        // on 19beta1 over all 32 shapes in `tests/corpus/pg19_generated_parens.txt`.
+        //
+        // Resolved against `updated` **before** the push, which is every column the expression is
+        // allowed to name: a generated column cannot reference itself, and one that names a column
+        // the table does not have is `42703` from here rather than a stored expression nothing can
+        // evaluate.
+        let generated = match &column.generated {
+            Some(expr) => Some(deparsed_expression(&updated, expr)?.0),
+            None => None,
+        };
+        // The second of `deparse_default`'s three callers: this column only, over the table as it
+        // stands, because the others are already deparsed and would deparse again.
+        let default_expr = column
+            .default_expr
+            .as_ref()
+            .map(|expr| deparse_default(&updated, expr).unwrap_or_else(|| expr.clone()));
         updated.columns.push(ColumnDef {
             collation: column.collation.clone(),
             name: column.name.clone(),
             ty,
             typmod: column.typmod,
-            default_expr: column.default_expr.clone(),
+            default_expr,
             // With a constant default, the missing value below is what every row already stored
             // holds and the decoder pads with it. Without one, the check above has already refused
             // any table that has a row — so reaching here means there are none to pad.
@@ -6136,7 +6422,7 @@ pub(super) fn alter_table(
             // (`docs/plans/phase-6e.md` §5 unit 1). One field for both would rewrite history the
             // first time somebody changed a default.
             missing: default,
-            generated: column.generated.clone(),
+            generated,
             generated_virtual: column.generated_virtual,
             comment: None,
             dropped: false,

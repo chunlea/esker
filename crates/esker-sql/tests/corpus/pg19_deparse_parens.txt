@@ -1,0 +1,144 @@
+# **Every pair of parentheses `pg_get_expr` prints**, measured shape by shape.
+#
+# `tests/generated_parens.rs`'s first corpus asks the question one column at a time and its six
+# declared divergences said the answer needed "a deparser this node does not have". This file is
+# the deparser's specification, taken from the oracle rather than reasoned about: 30 generated
+# columns and 8 defaults over one table each, every one a shape whose written text and printed
+# text differ, or might.
+#
+# The rules the answers below add up to, each readable off a row rather than asserted here:
+#
+#   * **every operator node prints inside its own pair, at every depth.** `(c1 * 2 + 3)` is
+#     `((c1 * 2) + 3)`, `(c1 > 0 AND c2 > 0)` is `((c1 > 0) AND (c2 > 0))`, and precedence is
+#     spelled out rather than relied on: `(c1 > 0 AND c2 > 0 OR c1 = 0)` is
+#     `(((c1 > 0) AND (c2 > 0)) OR (c1 = 0))`. A redundant pair a user wrote is dropped
+#     (`((c1 + 1))` is `(c1 + 1)`) and a *needed* one survives as the tree's own shape
+#     (`(c1 - (c2 - 1))`), which is what says the printer walks a tree and not the text;
+#   * **unary minus is an operator too** — `- c1 * 2` is `((- c1) * 2)` — with a space after it;
+#   * **a call and a value print bare**, and a call's argument keeps its own pair inside the
+#     call's: `abs(c1 * 2)` is `abs((c1 * 2))` and `length(t || 'x')` is `length((t || 'x'::text))`;
+#   * **a cast is `(operand)::type`, and the operand's own pair is *not* absorbed**:
+#     `(c1 + c2)::bigint` is `((c1 + c2))::bigint`, two pairs, and `c1::bigint::text` is
+#     `((c1)::bigint)::text`;
+#   * **an unknown literal carries the coercion it took**: `upper('a')` is `upper('a'::text)`,
+#     `'a' || 'b'` is `('a'::text || 'b'::text)`;
+#   * **`COALESCE` is upper-cased** where every other function keeps its own name lower-cased;
+#   * **three constructs desugar**: `BETWEEN` to `((a >= x) AND (a <= y))`, `IN` to
+#     `(a = ANY (ARRAY[...]))`, `LIKE` to `(a ~~ 'p'::text)`. The printed form is the *operator*,
+#     which is why a node that stores text cannot get these right by normalising parentheses;
+#   * **a negative constant default is folded and quoted**: `DEFAULT - 1` is `'-1'::integer`, not
+#     `(- 1)`, because coercion folds it to a `Const` and `get_const_expr` quotes a negative
+#     number so that the text re-parses.
+#
+# **Two `CASE` columns are created and not read back.** `pg_get_expr` prints a `CASE` across four
+# lines and a corpus row holds one line; the shape is asserted with its newlines escaped in
+# `corpus/pg19_case_expression.txt` instead. They are created here anyway, because accepting the
+# column is half of what the corpus tests. (`sesscap.py` cannot capture a multi-line value at all:
+# its psql-error-context filter drops any output line starting with a space, which is every
+# continuation line of one. That is a tool defect and not this file's business, but it is the
+# reason for the escape hatch above.)
+#
+# The last three rows are a **refusal**, guarded by a savepoint: PostgreSQL 19beta1 will not build
+# `GENERATED ALWAYS AS (upper('a')) STORED` at all — `42P22 could not determine which collation to
+# use for upper() function` — because a literal argument brings no collation with it. Worth having
+# because the obvious way to test "a call over a literal" as a *generated* column is refused, so
+# the literal cases have to be defaults, which is why the `g1dp3` half of this file exists.
+#
+# **Three rows read through `replace(..., '|', '!')`, and it is the corpus format that needs it.**
+# A row in these files is `statement TAB types TAB rows`, rows are split on `' ; '` and columns on
+# `'|'`, with no escape for either — so a *value* containing a pipe is parsed as three columns.
+# `||` is a value here: `length((t || 'x'::text))` came back as `length((t `, `` and ` 'x'::text))`
+# and the row "disagreed" while reading identically in the report. The three rows whose answer
+# holds the concatenation operator therefore ask for it with the pipes substituted, which keeps
+# what is being measured — the operand's own pair inside the call's, and the `::text` coercion the
+# literal took — and loses only the operator's spelling, which `pg19_concat.txt` already pins.
+#
+# Captured against esker-pg19 (PostgreSQL 19beta1, Debian 19~beta1-1.pgdg13+1) with
+# `sesscap.py captures-src/pg19_deparse_parens.txt.in`, inside one `BEGIN ... ROLLBACK`, and
+# verified idempotent by replaying `cut -f1` of the result through the same recorder.
+BEGIN		-
+CREATE TABLE g1dp2 (c1 integer, c2 integer, name character varying(255), t text)		-
+ALTER TABLE g1dp2 ADD COLUMN p_mul_add integer GENERATED ALWAYS AS (c1 * 2 + 3) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN p_add_mul integer GENERATED ALWAYS AS (c1 + 2 * 3) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN p_paren integer GENERATED ALWAYS AS ((c1 + 2) * 3) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN p_sub_sub integer GENERATED ALWAYS AS (c1 - c2 - 1) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN p_sub_par integer GENERATED ALWAYS AS (c1 - (c2 - 1)) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN p_div integer GENERATED ALWAYS AS (c1 * c2 / 2) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN p_neg_mul integer GENERATED ALWAYS AS (- c1 * 2) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN p_neg_par integer GENERATED ALWAYS AS (- (c1 * 2)) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN b_and boolean GENERATED ALWAYS AS (c1 > 0 AND c2 > 0) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN b_or boolean GENERATED ALWAYS AS (c1 > 0 OR c2 > 0) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN b_and_or boolean GENERATED ALWAYS AS (c1 > 0 AND c2 > 0 OR c1 = 0) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN b_or_and boolean GENERATED ALWAYS AS (c1 > 0 OR c2 > 0 AND c1 = 0) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN b_not boolean GENERATED ALWAYS AS (NOT (c1 > 0)) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN b_isnull boolean GENERATED ALWAYS AS (c1 IS NULL AND c2 IS NOT NULL) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN f_arg_op integer GENERATED ALWAYS AS (length(t || 'x')) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN f_two integer GENERATED ALWAYS AS (coalesce(c1 + 1, c2)) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN f_nest integer GENERATED ALWAYS AS (abs(c1 * 2)) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN f_varchar text GENERATED ALWAYS AS (upper(name)) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN f_concat text GENERATED ALWAYS AS (t || 'x') STORED		-
+ALTER TABLE g1dp2 ADD COLUMN x_col bigint GENERATED ALWAYS AS (c1::bigint) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN x_expr bigint GENERATED ALWAYS AS ((c1 + c2)::bigint) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN x_lit bigint GENERATED ALWAYS AS (1::bigint) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN x_lit_expr bigint GENERATED ALWAYS AS ((1 + 1)::bigint) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN x_call bigint GENERATED ALWAYS AS (length(t)::bigint) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN x_double text GENERATED ALWAYS AS (c1::bigint::text) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN c_case integer GENERATED ALWAYS AS (CASE WHEN c1 > 0 THEN c1 + 1 ELSE 0 END) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN c_coalesce integer GENERATED ALWAYS AS (coalesce(c1, c2 + 1)) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN c_between boolean GENERATED ALWAYS AS (c1 BETWEEN 1 AND 10) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN c_in boolean GENERATED ALWAYS AS (c1 IN (1, 2)) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN c_like boolean GENERATED ALWAYS AS (t LIKE 'a%') STORED		-
+ALTER TABLE g1dp2 ADD COLUMN c_notlike boolean GENERATED ALWAYS AS (t NOT LIKE 'a%') STORED		-
+ALTER TABLE g1dp2 ADD COLUMN c_ilike boolean GENERATED ALWAYS AS (t ILIKE 'a%') STORED		-
+ALTER TABLE g1dp2 ADD COLUMN c_notilike boolean GENERATED ALWAYS AS (t NOT ILIKE 'a%') STORED		-
+ALTER TABLE g1dp2 ADD COLUMN c_notin boolean GENERATED ALWAYS AS (c1 NOT IN (1, 2)) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN c_in_text boolean GENERATED ALWAYS AS (t IN ('a', 'b')) STORED		-
+ALTER TABLE g1dp2 ADD COLUMN c_ne boolean GENERATED ALWAYS AS (c1 <> c2) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'p_mul_add'		r|p_mul_add|((c1 * 2) + 3)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'p_add_mul'		r|p_add_mul|(c1 + (2 * 3))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'p_paren'		r|p_paren|((c1 + 2) * 3)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'p_sub_sub'		r|p_sub_sub|((c1 - c2) - 1)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'p_sub_par'		r|p_sub_par|(c1 - (c2 - 1))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'p_div'		r|p_div|((c1 * c2) / 2)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'p_neg_mul'		r|p_neg_mul|((- c1) * 2)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'p_neg_par'		r|p_neg_par|(- (c1 * 2))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'b_and'		r|b_and|((c1 > 0) AND (c2 > 0))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'b_or'		r|b_or|((c1 > 0) OR (c2 > 0))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'b_and_or'		r|b_and_or|(((c1 > 0) AND (c2 > 0)) OR (c1 = 0))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'b_or_and'		r|b_or_and|((c1 > 0) OR ((c2 > 0) AND (c1 = 0)))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'b_not'		r|b_not|(NOT (c1 > 0))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'b_isnull'		r|b_isnull|((c1 IS NULL) AND (c2 IS NOT NULL))
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'f_arg_op'		r|f_arg_op|length((t !! 'x'::text))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'f_two'		r|f_two|COALESCE((c1 + 1), c2)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'f_nest'		r|f_nest|abs((c1 * 2))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'f_varchar'		r|f_varchar|upper((name)::text)
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'f_concat'		r|f_concat|(t !! 'x'::text)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'x_col'		r|x_col|(c1)::bigint
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'x_expr'		r|x_expr|((c1 + c2))::bigint
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'x_lit'		r|x_lit|(1)::bigint
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'x_lit_expr'		r|x_lit_expr|((1 + 1))::bigint
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'x_call'		r|x_call|(length(t))::bigint
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'x_double'		r|x_double|((c1)::bigint)::text
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_coalesce'		r|c_coalesce|COALESCE(c1, (c2 + 1))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_between'		r|c_between|((c1 >= 1) AND (c1 <= 10))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_in'		r|c_in|(c1 = ANY (ARRAY[1, 2]))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_like'		r|c_like|(t ~~ 'a%'::text)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_notlike'		r|c_notlike|(t !~~ 'a%'::text)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_ilike'		r|c_ilike|(t ~~* 'a%'::text)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_notilike'		r|c_notilike|(t !~~* 'a%'::text)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_notin'		r|c_notin|(c1 <> ALL (ARRAY[1, 2]))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_in_text'		r|c_in_text|(t = ANY (ARRAY['a'::text, 'b'::text]))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'c_ne'		r|c_ne|(c1 <> c2)
+CREATE TABLE g1dp3 (d_upper text DEFAULT upper('a'), d_nested integer DEFAULT (1 + 2 * 3), d_concat text DEFAULT ('a' || 'b'), d_bool boolean DEFAULT (1 > 0 AND 2 > 1), d_cast bigint DEFAULT 1::bigint, d_call integer DEFAULT length('abc'), d_neg integer DEFAULT (- 1), d_case integer DEFAULT (CASE WHEN true THEN 1 ELSE 2 END))		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp3'::regclass AND a.attname = 'd_upper'		r|d_upper|upper('a'::text)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp3'::regclass AND a.attname = 'd_nested'		r|d_nested|(1 + (2 * 3))
+SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp3'::regclass AND a.attname = 'd_concat'		r|d_concat|('a'::text !! 'b'::text)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp3'::regclass AND a.attname = 'd_bool'		r|d_bool|((1 > 0) AND (2 > 1))
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp3'::regclass AND a.attname = 'd_cast'		r|d_cast|(1)::bigint
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp3'::regclass AND a.attname = 'd_call'		r|d_call|length('abc'::text)
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp3'::regclass AND a.attname = 'd_neg'		r|d_neg|'-1'::integer
+SAVEPOINT sp_lit		-
+ALTER TABLE g1dp2 ADD COLUMN f_literal text GENERATED ALWAYS AS (upper('a')) STORED	!42P22 could not determine which collation to use for upper() function HINT: Use the COLLATE clause to set the collation explicitly.
+ROLLBACK TO sp_lit		-
+ROLLBACK		-
+SELECT 'r', count(*) FROM pg_class WHERE relname IN ('g1dp2','g1dp3')	text,bigint	r|0

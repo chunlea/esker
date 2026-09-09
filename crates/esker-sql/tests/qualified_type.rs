@@ -39,16 +39,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "PostgreSQL deparses the coercion it inserted; this node prints the cast as written",
             "UNMEASURED",
         ),
-        // **A user type's oid is this node's own number**, which is the standing trade every
-        // relation id makes: PostgreSQL puts everything a user creates above 16383 and this
-        // node's ids start at 1. Nothing reads the number — `ActiveRecord` looks a type up by
-        // `typname` — and `tests/regtype_user.rs` checks the thing that matters instead, that the
-        // oid a `regtype` gives is the one `pg_type` reports for the same name.
-        (
-            "SELECT 'r', 'schema_9.text'::regtype::oid > 16383",
-            "a user type's oid is a relation id here, and relation ids start at 1",
-            "UNMEASURED",
-        ),
     ],
 };
 

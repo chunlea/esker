@@ -33,21 +33,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // correctly and the cast is what cannot find it. That is run 57's `type "…" does not exist`
     // row (43 tests over 5 files), which b4's `pg_enum` unit owns and lands next; the lines stay
     // here as captured rather than being edited out, so they turn green on their own when it does.
-    answers: &[
-        (
-            "SELECT enumlabel FROM pg_enum WHERE enumtypid = 'mood'::regtype ORDER BY \
-             enumsortorder;",
-            "`42704`: a user type's name does not resolve through `::regtype`, which is a gap in \
-             the cast rather than in the `DO` block — the type is in `pg_type` on the line above. \
-             Run 57's `type \"…\" does not exist` row, b4's unit.",
-            "pg19_do_create_enum.txt:44",
-        ),
-        (
-            "SELECT count(*) FROM pg_enum WHERE enumtypid = 'unused'::regtype;",
-            "The same `::regtype` gap, on the enum with an empty label list.",
-            "pg19_do_create_enum.txt:70",
-        ),
-    ],
+    answers: &[],
 };
 
 #[test]

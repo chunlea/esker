@@ -42,17 +42,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "string_agg is not built; the ordering it would show is measured by ORDER BY below",
             "UNMEASURED",
         ),
-        (
-            "SELECT 'r', length('ABC'::citext)",
-            "length is not built, for any type",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 'r', pg_typeof('x'::citext || 'y')",
-            "|| is not built over text, so the citext concatenation it would demote to has \
-             nothing to demote to",
-            "UNMEASURED",
-        ),
         // **The right refusal in the wrong sentence.** Both raise `23505` and neither builds the
         // index; PostgreSQL has a message for a *build* that finds duplicates — `could not create
         // unique index … Key (cival)=(Cased Text) is duplicated`, quoting the stored spelling —
