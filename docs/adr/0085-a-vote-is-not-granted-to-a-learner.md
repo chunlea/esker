@@ -40,12 +40,20 @@ The learner campaigned 404 times and adopted a term 81 times.
 
 Two halves, and they are on opposite sides of the wire.
 
-**The learner's own configuration has it as a voter.** `Raft::campaign` already declines when
-`!self.is_voter(self.id)`, so it is not campaigning in spite of its configuration — it is
-campaigning because of it. The placement driver and the other store hold it as a learner. That
-divergence is the *root* and is not what this ADR changes; it is the store's, and the same family as
-`promotion.rs`'s acceptance defect 6, *"a peer started from a region record dropped that record's
-learners on the floor"*.
+**The campaigning peer's own configuration has it as a voter.** `Raft::campaign` already declines
+when `!self.is_voter(self.id)`, so it is not campaigning in spite of its configuration — it is
+campaigning because of it, while the placement driver and the granting store hold it as a learner.
+
+**Whether that view is *wrong* or merely *ahead* is not settled, and this ADR does not need it to
+be.** A core that has applied a promotion is ahead of the driver until the leader's next region
+heartbeat, and that window is normal; an assertion that the two agree *instantly* fires on it, which
+is how it was measured here. With a five-second window instead, six runs at the rung that reproduced
+the stall show **no lasting disagreement** — so the lasting, wrong configuration this was first
+written as is not demonstrated, and the honest statement is the weaker one: the peer's view and the
+granter's differed.
+
+The decision below does not rest on which it was. A granter can act only on its own configuration,
+and by that configuration the asker could not win.
 
 **Nothing asked whether the sender was a voter here.** §6.2's leader lease refuses a higher-term
 vote request while the receiver can hear a leader, and that covers the ordinary case completely — a
@@ -93,10 +101,12 @@ it one:
 The refusal therefore delays a peer's first election by at most the time its promotion takes to
 arrive, and only in the window where the other voters would not have counted its votes anyway.
 
-**A mis-configured peer becomes harmless rather than corrected.** This is containment. A peer that
-believes itself a voter will still campaign, and will still be told no by everyone; what it can no
-longer do is take a term from a region that is trying to elect. The root — how the two views came
-apart — remains open and is where the next work goes.
+**A peer whose view differs becomes harmless rather than reconciled.** This is containment. A peer
+that believes itself a voter will still campaign, and will still be told no by every node that does
+not yet agree; what it can no longer do is take a term from a region that is trying to elect. How
+the two views come apart — a lag that is expected, or a divergence that is not — is still open, and
+`promotion.rs` now asserts it directly: a core and the driver disagreeing about a role for more than
+five seconds fails the test where nothing noticed it before.
 
 **Measured, either side, with a load arm proven to be applying load** (`PROMOTION_LOAD_THREADS`,
 which *fails* a run whose one-minute average did not rise, because twenty earlier runs against an
