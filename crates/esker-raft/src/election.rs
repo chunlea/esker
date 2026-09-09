@@ -242,7 +242,27 @@ impl<S: LogStorage> Raft<S> {
         let can_vote = self.vote == Some(from)
             || (self.vote.is_none() && self.leader.is_none())
             || (pre_vote && term > self.term);
-        let granted = can_vote && self.log.is_up_to_date(last_log_index, last_log_term);
+        // **And only to a peer this configuration admits as a voter.**
+        //
+        // A learner cannot reach a quorum, so a vote given to one buys nothing and costs the
+        // granter its own vote for the term — and, for a real vote, its leader. §6.2's lease
+        // already refuses a higher-term request while this node can hear a leader, and that is why
+        // a healthy group never noticed: a node that is *campaigning* has `leader = None`, so the
+        // veto does not apply and a learner's merits are good, its log being up to date.
+        //
+        // What lives in that gap is a loop that does not end. Counted on a stalling cluster: a
+        // region's one voter pre-campaigned **415** times and adopted a term twice, while the peer
+        // the placement driver held as a `Learner` campaigned **404** times and adopted **81** —
+        // the voter loses its leader, grants the learner's pre-vote, the learner takes a term and
+        // campaigns for real, the voter steps down to it, and round again. The learner can never
+        // win, so the region never gets a leader.
+        //
+        // A node being promoted is not harmed: its promotion reaches this node as a configuration
+        // change, and it can ask again once it has. `Raft::campaign` already applies the same test
+        // to *itself*; this is the other side of it.
+        let granted = can_vote
+            && self.is_voter(from)
+            && self.log.is_up_to_date(last_log_index, last_log_term);
 
         if granted && !pre_vote {
             // The vote is recorded *before* the response is queued, so both leave in the same

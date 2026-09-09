@@ -41,6 +41,38 @@ impl Harness {
     }
 
     /// A group whose nodes are configured by `tweak` before they are built.
+    /// A group of `voters` with `learners` beside them, every node built from the same
+    /// configuration.
+    ///
+    /// **The learners are in everyone's `ConfState`**, which is the shape a real cluster has and
+    /// the one an all-voter harness cannot make: a learner that campaigns, or that is granted a
+    /// vote, is a question about what the *voters* do, and it cannot be asked of a group where
+    /// nobody is a learner.
+    pub(crate) fn with_learners(voters: &[NodeId], learners: &[NodeId], seed: u64) -> Self {
+        let mut conf = ConfState::from_voters(voters.to_vec());
+        conf.learners = learners.to_vec();
+        let nodes = voters
+            .iter()
+            .chain(learners)
+            .map(|id| {
+                let mut config = Config::new(*id, voters.to_vec(), seed);
+                config.learners = learners.to_vec();
+                let storage = MemStorage::with_conf_state(conf.clone());
+                (
+                    *id,
+                    RawNode::new(config, storage).expect("valid test configuration"),
+                )
+            })
+            .collect();
+        Self {
+            nodes,
+            queue: Vec::new(),
+            severed: Vec::new(),
+            reads: Vec::new(),
+            elected: Vec::new(),
+        }
+    }
+
     pub(crate) fn with_config(ids: &[NodeId], seed: u64, tweak: impl Fn(&mut Config)) -> Self {
         let conf = ConfState::from_voters(ids.to_vec());
         let nodes = ids
