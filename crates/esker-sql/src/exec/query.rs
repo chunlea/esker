@@ -2886,6 +2886,17 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                     right: Box::new(right),
                 });
             }
+            // **An aggregate is reconciled here too, and it has to be here**: `reconcile` below
+            // is given two resolved expressions and no scope, and an aggregate's *argument* is
+            // still an unresolved column at that point — `sum(salary)` can only be typed where
+            // `salary` can, which is here.
+            if let Some((left, right)) = reconcile_aggregate(*op, &left, &right, scope)? {
+                return Ok(Expr::Binary {
+                    op: *op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                });
+            }
             let (left, right) = if op.is_comparison() {
                 // A literal has no type until something gives it one, and here that something is
                 // the other operand. Without this the comparison would run between a `text` and an
@@ -3577,6 +3588,47 @@ fn enum_labels(def: &crate::catalog::TypeDef) -> Result<&[String]> {
             "a column carrying a user type that is not an enum reached a comparison".to_owned(),
         )),
     }
+}
+
+/// Gives a literal beside an **aggregate** the aggregate's type, the way a column beside one does.
+///
+/// `None` for every pair that is not that, so the ordinary rules run untouched.
+///
+/// Separate from [`reconcile`] because of what each is given: that one takes two resolved
+/// expressions and no scope, and an aggregate's argument is *not* resolved by then — `resolve` has
+/// no arm for a call, so `sum(salary)` still holds a bare `Expr::Column`. Typing it needs the
+/// scope, which exists only here.
+///
+/// Both halves of the rule were wrong before, and both were wrong the same way — a silent `false`:
+///
+/// * `sum(salary) > 'x'` is `22P02 invalid input syntax for type bigint: "x"` on a real server,
+///   the unknown literal read by the aggregate's own input function;
+/// * `sum(salary) > 'x'::text` is `42883 operator does not exist: bigint > text`, which is byte
+///   for byte what this node already answered for `80000::int8 > 'x'::text`. The aggregate was the
+///   hole in a check that was otherwise right.
+///
+/// No `blank_pad`: an aggregate's output carries no typmod — `Aggregation::rewrite` says so, and
+/// `min(character(3))` is a `bpchar` with none on a real server too.
+fn reconcile_aggregate(
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    scope: &Scope<'_>,
+) -> Result<Option<(Expr, Expr)>> {
+    if !op.is_comparison() {
+        return Ok(None);
+    }
+    Ok(match (left, right) {
+        (Expr::Aggregate(_), Expr::Literal(literal)) => Some((
+            left.clone(),
+            Expr::Literal(retype(expr_type(left, scope)?, literal, op, false)?),
+        )),
+        (Expr::Literal(literal), Expr::Aggregate(_)) => Some((
+            Expr::Literal(retype(expr_type(right, scope)?, literal, op, true)?),
+            right.clone(),
+        )),
+        _ => None,
+    })
 }
 
 /// Gives a literal the type of whatever it is being compared against, or says the comparison is
@@ -4656,18 +4708,16 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
 
         // `abs` is the one scalar function that answers its argument's type rather than `text`.
         //
-        // **An aggregate argument is `text` here rather than an error.** `abs(min(n))` is typed
-        // while the aggregates are still un-rewritten — every other scalar function answers a
-        // fixed type and never asks — and reporting the internal "reached `expr_type`" for a
-        // statement a real server answers would be worse than reporting a type the executor then
-        // corrects. The executor's own refusal is what the caller sees.
+        // **Including an aggregate argument**, which used to be `text` here: `abs(min(n))` is
+        // typed while the aggregates are still un-rewritten, and the arm below answered the
+        // internal "reached `expr_type`" for it, so `text` was the lesser of two wrong answers.
+        // The arm answers now, so this asks it like any other operand — and measured on 19beta1,
+        // `abs(min(int4))` is `integer`, `abs(sum(int4))` is `bigint`, `abs(avg(int4))` is
+        // `numeric` and `abs(count(*))` is `bigint`, which is exactly its argument's type.
         Expr::Scalar {
             func: crate::plan::ScalarFunc::Abs,
             operand,
-        } => match operand.as_ref() {
-            Expr::Aggregate(_) => ColumnType::Text,
-            operand => expr_type(operand, scope)?,
-        },
+        } => expr_type(operand, scope)?,
         // **The three counting functions answer `integer`, whatever they count.** Measured on
         // 19beta1: `pg_typeof(length('abc'))`, `char_length` and `octet_length` are all `integer`,
         // and this node declared `text` for every one of them — the *values* were always right, so
@@ -4744,13 +4794,26 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
             .find_map(|result| branch_type(result, scope))
             .unwrap_or(ColumnType::Text),
         Expr::Parameter(number) => return Err(SqlError::UndefinedParameter(*number)),
-        // An aggregate's type is the aggregation's business, and by the time a plan is typed
-        // every one of them has been rewritten into an `Ordinal` carrying the answer. One here
-        // means the rewrite was skipped.
-        Expr::Aggregate(_) => {
-            return Err(SqlError::Internal(
-                "an aggregate reached expr_type without being rewritten".to_owned(),
-            ));
+        // **An aggregate is typed from its argument**, by the same table the aggregation itself
+        // uses — because this is asked *before* the aggregation exists.
+        //
+        // By the time a plan is executed every aggregate has been rewritten into an `Ordinal`
+        // carrying the answer, and this arm used to say so with an `XX000`. Three things asked
+        // anyway, and each was wrong in its own way: `SELECT (sum(salary) + 0) > $1` reached the
+        // internal error, `sum(salary) > 'x'::text` slipped past an operator check that already
+        // answered `42883` for `80000::int8 > 'x'::text`, and a parameter beside an aggregate
+        // fell back to `text` and compared as one — zero rows for `HAVING sum(salary) > $1`
+        // where a real server answers three (`tests/having_bind.rs`).
+        //
+        // An aggregate whose argument has no aggregate for it — `sum(text)` — has no type either,
+        // and the refusal is the aggregation's own `42883`, raised here rather than invented.
+        Expr::Aggregate(call) => {
+            let arg = match call.arg() {
+                Some(arg) => Some(expr_type(arg, scope)?),
+                // `count(*)`, which reads no value.
+                None => None,
+            };
+            aggregate::Aggregation::result_type(call.func, arg)?
         }
         // `DEFAULT` has the type of the column it is written into, and reaching here means it was
         // written somewhere with no column to take one from -- which PostgreSQL answers as a

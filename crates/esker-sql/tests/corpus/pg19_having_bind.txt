@@ -1,0 +1,90 @@
+# A bind parameter compared against an **aggregate**: `HAVING (sum(salary) > $1)`.
+#
+# `finder_test#test_find_with_group_and_sanitized_having_method` — run 104's routing table, "returns
+# 0 rows on node, rows on PG19, a wrong **answer**". The statement, traced out of the failing test
+# with the runner's SQL hook:
+#
+#   SELECT "developers"."salary" FROM "developers" GROUP BY "developers"."salary"
+#     HAVING (sum(salary) > $1)                       binds [10000]
+#
+# Four columns, like every bind corpus (`captures/pg19_bind_parameters.txt` has the argument):
+#
+#   <sql> <tab> <json params> <tab> <types> <tab> <rows | !SQLSTATE message>
+#
+# Captured with `scratchpad/bindcap.rb` against 19beta1 — libpq `exec_params`, which is
+# Parse/Bind/Execute with **untyped** parameters, where `ActiveRecord` is. `psql` cannot reach this
+# at all: it speaks the simple query protocol and never sends a `Bind`, so a parameter's inferred
+# type is not observable from it. Everything ran inside one `BEGIN … ROLLBACK` with a `SAVEPOINT`
+# per probe; the tool reports what it left behind, and it is 0.
+#
+# The fixture is five rows and the salaries are chosen to separate a **numeric** comparison from a
+# **text** one: 9000 sorts *above* 10000 as text and *below* it as a number, so a node comparing
+# these as strings cannot answer any of the four rows below correctly by accident.
+#
+# `ORDER BY 1` is on every probe that answers more than one row, and it is not decoration: a
+# grouped query without one has no row order to compare — PostgreSQL answers in its hash table's
+# order and this node in its sorted one — and a corpus row that pinned either would be asserting an
+# implementation detail on both servers. The Rails statement itself carries no `ORDER BY`; its test
+# asserts *which* three salaries come back, which is what these rows assert too.
+#
+# # THE RULE, read off `pg_prepared_statements.parameter_types` rather than assumed
+#
+#   sum(salary) > $1        bigint     the aggregate's result type, derived from its argument
+#   count(*)    > $1        bigint     a result type that does not depend on an argument
+#   avg(salary) > $1        numeric    same rule, different result type
+#   max(name)   > $1        text       and `max(character varying)` is `text`, not `varchar`
+#   (sum(salary) + 0) > $1  bigint     the *expression's* type, so the aggregate's has to survive
+#                                      being an operand
+#   salary > $1  (WHERE)    integer    the column's, which is the case that already worked
+#
+# So a parameter takes its type from the other side of the operator **including when that side is
+# an aggregate**, and an aggregate is typed from its argument.
+#
+# Those six `PREPARE`s are in `tests/captures/pg19_having_bind.txt` and not here: `PREPARE` is a
+# *session's* statement store and this harness drives an `Executor`, which answers `0A000` for it.
+# The capture is where they were measured; the table above is what they say. The `22P02` row below
+# is the assertion that carries the same fact into this file — the type's *name* is in the message.
+#
+# # THINGS REASONING WOULD GET WRONG
+#
+#   * **`count(*)` is not a witness.** It is `bigint` like `sum(int4)`, so a node that types a
+#     parameter only from aggregates with a fixed result type answers `count(*) > $1` correctly and
+#     `sum(salary) > $1` wrongly. Every probe here that uses `count` has a `sum` beside it.
+#   * **`avg(salary) > $1` answers correctly by accident** when the comparison is done as text:
+#     `avg` renders `87800.000000000000`, and `8` > `1`. It is in this file to be the row that
+#     agrees for the wrong reason.
+#   * **A value the inferred type cannot read is `22P02`, not zero rows**: `sum(salary) > $1` bound
+#     to `"abc"` is `invalid input syntax for type bigint: "abc"`. A node that leaves the parameter
+#     `text` accepts it and answers rows, which is the one shape where a wrong answer is *quieter*
+#     than the right one.
+#   * **A NULL parameter is zero rows and not an error**, which is the same answer this node gave
+#     for the whole family while it was broken — so a fix cannot be checked on the NULL row.
+#   * **The comparison a node reaches for instead does not exist.** `bigint > text` is `42883` on a
+#     real server — with an explicitly cast `'x'::text` *and* behind an aggregate
+#     (`sum(salary) > 'x'::text`). An *unknown* literal is different: `sum(salary) > 'x'` coerces
+#     the literal to the aggregate's type and is `22P02`.
+CREATE TABLE hb_developers (id bigserial primary key, name character varying(255), salary integer)	[]		-
+INSERT INTO hb_developers (name, salary) VALUES ('David', 80000), ('Jamis', 150000), ('fixture_3', 100000), ('fixture_4', 100000), ('Poor dev', 9000)	[]		-
+SELECT "hb_developers"."salary" FROM "hb_developers" GROUP BY "hb_developers"."salary" HAVING (sum(salary) > $1) ORDER BY 1	["10000"]	integer	80000 ; 100000 ; 150000
+SELECT salary FROM hb_developers GROUP BY salary HAVING sum(salary) > $1 ORDER BY 1	["10000"]	integer	80000 ; 100000 ; 150000
+SELECT salary FROM hb_developers GROUP BY salary HAVING sum(salary) < $1	["10000"]	integer	9000
+SELECT salary FROM hb_developers GROUP BY salary HAVING sum(salary) = $1	["9000"]	integer	9000
+SELECT salary FROM hb_developers GROUP BY salary HAVING $1 < sum(salary) ORDER BY 1	["10000"]	integer	80000 ; 100000 ; 150000
+SELECT count(*), count(*) > $1 FROM hb_developers	["10"]	bigint,boolean	5|f
+SELECT sum(salary), sum(salary) > $1 FROM hb_developers	["10000"]	bigint,boolean	439000|t
+SELECT max(salary), max(salary) > $1 FROM hb_developers	["10000"]	integer,boolean	150000|t
+SELECT min(salary), min(salary) > $1 FROM hb_developers	["10000"]	integer,boolean	9000|f
+SELECT avg(salary), avg(salary) > $1 FROM hb_developers	["10000"]	numeric,boolean	87800.000000000000|t
+SELECT max(name), max(name) > $1 FROM hb_developers	["Bob"]	text,boolean	Poor dev|t
+SELECT (sum(salary) + 0) > $1 FROM hb_developers	["10000"]	boolean	t
+SELECT sum(salary) > $1 + 0 FROM hb_developers	["10000"]	boolean	t
+SELECT (sum(salary) * 2) > $1 FROM hb_developers	["10000"]	boolean	t
+SELECT sum(salary) > $1::int8 FROM hb_developers	["10000"]	boolean	t
+SELECT salary FROM hb_developers GROUP BY salary HAVING sum(salary) > $1 ORDER BY 1	["abc"]		!22P02 invalid input syntax for type bigint: "abc"
+SELECT salary FROM hb_developers GROUP BY salary HAVING sum(salary) > $1 ORDER BY 1	[null]	integer	-
+SELECT count(*) FROM hb_developers HAVING count(*) > $1	[null]	bigint	-
+SELECT sum(salary) > 'x'::text FROM hb_developers	[]		!42883 operator does not exist: bigint > text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT sum(salary) > 'x' FROM hb_developers	[]		!22P02 invalid input syntax for type bigint: "x"
+SELECT max(name) > 'Bob'::text FROM hb_developers	[]	boolean	t
+SELECT 80000::int8 > 'x'::text	[]		!42883 operator does not exist: bigint > text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 80000::int8 > '10000'::text	[]		!42883 operator does not exist: bigint > text DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.

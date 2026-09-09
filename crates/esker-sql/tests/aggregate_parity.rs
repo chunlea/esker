@@ -103,8 +103,6 @@ const DIVERGENCES: &[(&str, &str, &str)] = &[
         "string_agg is not among the five aggregates",
         "UNMEASURED",
     ),
-    ("SELECT count(*) + 1 FROM agg", "arithmetic", "UNMEASURED"),
-    ("SELECT sum(n) + 0 FROM agg", "arithmetic", "UNMEASURED"),
     (
         "SELECT DISTINCT ON (g) g, n FROM agg ORDER BY g, n",
         "SELECT DISTINCT ON",
