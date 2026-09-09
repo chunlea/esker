@@ -1182,18 +1182,46 @@ fn qualified_for(
     settings: Settings<'_>,
     relation: &crate::catalog::pg_relations::RelationRow,
 ) -> String {
-    // An **unknown** path is the default one, on which `public` sits — so a caller with no session
-    // behind it prints an ordinary name bare and a schema-qualified one qualified, which is what
-    // every statement outside a session wants.
-    let visible = if settings.search_path.is_empty() {
-        relation.schema == crate::catalog::PUBLIC_SCHEMA
-    } else {
-        settings.search_path.contains(&relation.schema)
-    };
-    if visible {
+    if visible_schema(settings, &relation.schema) {
         return relation.name.clone();
     }
     crate::catalog::display_name(&crate::catalog::qualify(&relation.schema, &relation.name))
+}
+
+/// A **type's** name as `format_type` prints it for this session, which is the rule
+/// [`qualified_for`] applies to a relation and not a second one.
+///
+/// Measured on 19beta1, one table and two enums, in one session and then a narrower one:
+///
+/// ```text
+/// SET search_path = g1f_a, public    a g1f_a.mood    -> mood
+///                                    b g1f_b.hidden  -> g1f_b.hidden
+/// SET search_path = public           a g1f_a.mood    -> g1f_a.mood
+///                                    b g1f_b.hidden  -> g1f_b.hidden
+/// ```
+///
+/// It is what `ActiveRecord`'s schema dump reads as a column's `sql_type`, so a type printed
+/// qualified where a real server prints it bare puts the schema inside
+/// `t.enum "current_mood", enum_type: "…"` — which `enum_test` asserts bare while the
+/// `create_enum` line above it, built from a different query, stays qualified.
+fn type_qualified_for(settings: Settings<'_>, stored: &str) -> String {
+    let (schema, bare) = crate::catalog::split_qualified(stored);
+    if visible_schema(settings, schema) {
+        return bare.to_owned();
+    }
+    crate::catalog::display_name(stored)
+}
+
+/// Whether a schema is one this session resolves a bare name in.
+///
+/// An **unknown** path is the default one, on which `public` sits — so a caller with no session
+/// behind it prints an ordinary name bare and a schema-qualified one qualified, which is what
+/// every statement outside a session wants.
+fn visible_schema(settings: Settings<'_>, schema: &str) -> bool {
+    if settings.search_path.is_empty() {
+        return schema == crate::catalog::PUBLIC_SCHEMA;
+    }
+    settings.search_path.iter().any(|on_path| on_path == schema)
 }
 
 pub(super) fn compare_values(keys: &[SortKey], left: &[Datum], right: &[Datum]) -> Ordering {
@@ -3263,7 +3291,7 @@ fn catalog_function(
                 && crate::value::type_by_name(name)?.is_none()
                 && let Some(def) = env.relations()?.user_type_by_name(name)
             {
-                return Ok(Datum::Text(crate::catalog::display_name(&def.name)));
+                return Ok(Datum::Text(type_qualified_for(env.settings, &def.name)));
             }
             let oid = type_oid_argument(args.first())?;
             let built_in =
@@ -3277,7 +3305,7 @@ fn catalog_function(
                         // `schema ++ NUL ++ name` (`catalog::SCHEMA_SEPARATOR`), and printing it
                         // raw put a NUL on the wire where PostgreSQL writes a dot — measured,
                         // `ds_s.ds`.
-                        Some(name) => Datum::Text(crate::catalog::display_name(name)),
+                        Some(name) => Datum::Text(type_qualified_for(env.settings, name)),
                         None => built_in,
                     }
                 }
