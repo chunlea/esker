@@ -74,15 +74,32 @@ is started. The other replicas stay followers and answer the vote.
 is small (a quorum round trip), and it does it without teaching the driver to fabricate leadership.
 (b) buys the last few milliseconds for a rule that this system has twice paid to get right.
 
-## What it cost, measured either side
+## What it changes, measured either side — and what it does not
+
+**The structure, which is the property:**
+
+| | children led by the store that led their parent |
+|---|---|
+| without the campaign | **35 of 63** |
+| with it | **29 of 29**, and 130 of 130 on another run |
+
+**The wall clock, which is not:**
 
 ```text
-before   min 0 ms   median 62–73 ms   p90 77–94 ms   max 93 ms — and once 32,765 ms
-after    min 0 ms   median 10 ms      p90 35 ms      max 87 ms
+quiet box, before   median 62–73 ms   p90 77–94 ms   max 93 ms — and once 32,765 ms
+quiet box, after    median 10 ms      p90 35 ms      max 87 ms
+loaded box, after   median 87 ms      p90 150 ms     max 1,609 ms
 ```
 
-129 regions, 130 children, **zero refusals** during the load that produced them. The median is six
-times smaller and the tail that reached half a minute is gone.
+**Read those two tables together, because the second one is why the first one is the ADR.** On a
+quiet box the window is six times smaller and the half-minute tail is gone. On a loaded box it is
+*larger than the before* — 87 ms against 62 — while the structure is unchanged at 29 of 29. A
+duration here is a statement about the machine; **which store ends up leading is a statement about
+the mechanism**, and it is the same under both.
+
+So this ADR claims the second and not the first. The window shrinking is a consequence worth having
+and not a property worth asserting, which is also why the gate test asserts leadership and the
+distribution is printed by an `#[ignore]`d measurement beside it.
 
 ### Two things the build found that the design did not
 
@@ -122,9 +139,22 @@ would fail one run in three whatever the code did. Worse, the refusals it caught
 it, which is not the child that never had one. This ADR removes the second and says so above: the
 `40003` is made rare, not removed.
 
-So the assertion is the thing this changes: **a split child reaches a leader in a quorum round trip
-rather than an election timeout**, `how_long_a_split_child_has_no_leader`, median under 30 ms. It was
-red at 73 ms before the change and is green at 10 ms after, and the threshold sits with a factor of
-two either side — half the measured before, several times an in-process round trip. The ambiguous
-outcomes are still counted, in `a_bulk_load_into_a_splitting_table_is_not_told_it_does_not_know`,
-which prints them and asserts nothing.
+The assertion that replaced it was **also wrong, and for the same reason one step further in**: a
+median time-to-leader under thirty milliseconds. It passed on a quiet box, failed at 84 ms on a gate
+running two chains at once, and — measured afterwards — comes out at 87 ms on a loaded box *with the
+fix in place*. A duration is a performance property and a gate is the worst place to assert one; this
+repository had written that down for the mpp differential the same night.
+
+So the gate asserts the **structure**: `a_split_child_is_led_by_the_store_that_led_its_parent`, four
+in five children led by the store that led their parent. Without the campaign it is 35 of 63 — not
+the one-in-three a uniform election would give, because the parent's leader is likelier to win one
+anyway — and with it, 29 of 29. The bar sits far from both. The distribution and the ambiguous
+outcomes are printed by `#[ignore]`d measurements beside it.
+
+**And one trap in measuring it, which cost a wrong conclusion before it was found.** The first
+version of that test compared the parent's `leader_peer_id` with the child's and reported **1 of
+130**, which reads exactly like a mechanism that never fires. It fires every time: a trace in
+`adopt_split` showed one store per split reporting that it led the parent, on all hundred splits. A
+**peer id is numbered per region**, so the parent's and the child's are ids in two different spaces
+and comparing them answers no question. `is_leader` — each store's statement about itself — is the
+thing both halves can be in.

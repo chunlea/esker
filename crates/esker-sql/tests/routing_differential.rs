@@ -31,6 +31,7 @@
 
 mod cluster;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -771,7 +772,7 @@ impl Gate {
         let Ok(regions) = self.pd.regions() else {
             return 0;
         };
-        let mut stores: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut stores: BTreeSet<u64> = BTreeSet::new();
         for record in regions {
             for peer in &record.region.peers {
                 if peer.role == PeerRole::ColumnarLearner {
@@ -1571,20 +1572,65 @@ async fn where_a_bulk_load_into_a_splitting_table_breaks() {
     gate.stop().await;
 }
 
-/// **How long a split child has no leader, and what that costs a writer.**
+/// The writer that makes the table split under itself.
+fn spawn_loader(
+    gate: &Gate,
+    stop: &Arc<AtomicBool>,
+    refusals: &Arc<std::sync::Mutex<Vec<String>>>,
+) -> std::thread::JoinHandle<i64> {
+    let backend = Arc::clone(&gate.backend);
+    let catalog = Arc::clone(&gate.catalog);
+    let stop = Arc::clone(stop);
+    let refusals = Arc::clone(refusals);
+    std::thread::Builder::new()
+        .name("splitting-loader".to_owned())
+        .spawn(move || {
+            let mut session = Session {
+                executor: Executor::new(backend, catalog, TENANT, esker_sql::session::register()),
+            };
+            let mut id = 1_i64;
+            while !stop.load(Ordering::Relaxed) && id < 4_000 {
+                let values: Vec<String> = (id..id + 50)
+                    .map(|n| format!("({n}, 'pad-{n}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')"))
+                    .collect();
+                if let Err(error) =
+                    session.run(&format!("INSERT INTO t VALUES {}", values.join(", ")))
+                    && let Ok(mut seen) = refusals.lock()
+                {
+                    seen.push(format!("[{}] {error}", error.sqlstate()));
+                }
+                id += 50;
+            }
+            id
+        })
+        .unwrap()
+}
+
+/// What one run of a splitting load saw.
+struct Sightings {
+    /// Milliseconds from a child first being seen to its first leader.
+    led_after: Vec<f64>,
+    /// Children whose first leader was the peer that led their parent.
+    inherited: usize,
+    /// Children whose first leader was somebody else.
+    elsewhere: usize,
+    /// What the loader was refused, as `[sqlstate] message`.
+    refusals: Vec<String>,
+    rows: i64,
+    regions: usize,
+}
+
+/// Loads a table that splits under itself and watches every child's first leader.
 ///
-/// `Store::adopt_split` starts the child with `start_peer` and `spawn_ticker` and **nothing else** —
-/// no campaign, no leader inherited from the parent. So every child on every store begins as a
-/// follower and waits out an election timeout before anyone campaigns, and a write that lands in
-/// that window is answered `40003` when a proposal was already in flight, or waits.
+/// **The stores, not PD.** A child appears in its store's own map the instant `adopt_split` runs;
+/// PD learns of it at the next region heartbeat — 20 ms here — by which time the election is over.
+/// Sampling PD reported every one of 130 children as led at zero milliseconds, which is not the
+/// window being small, it is the window being invisible.
 ///
-/// This samples every two milliseconds while a loader splits the table under itself, and records
-/// for each region the interval between **first seeing it** and **first seeing a leader for it**.
-/// The number is a lower bound on the real window: the sampler learns of the child after the split
-/// has applied, so the leaderless time before that is invisible here.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn how_long_a_split_child_has_no_leader() {
-    let gate = Gate::start_splitting(8 * 1024).await;
+/// **A child's parent is the region whose `end_key` its `start_key` equals.** A split turns a parent
+/// `[a, c)` into `[a, b)` and a child `[b, c)`, so that match is exact rather than a guess, and it
+/// is what lets this say *whose* leader the child's first leader was.
+fn watch_a_splitting_load(gate: &Gate) -> Sightings {
     tokio::task::block_in_place(|| {
         let mut session = gate.session();
         settle(
@@ -1595,105 +1641,139 @@ async fn how_long_a_split_child_has_no_leader() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let refusals = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let loader = {
-        let backend = Arc::clone(&gate.backend);
-        let catalog = Arc::clone(&gate.catalog);
-        let stop = Arc::clone(&stop);
-        let refusals = Arc::clone(&refusals);
-        std::thread::Builder::new()
-            .name("splitting-loader".to_owned())
-            .spawn(move || {
-                let mut session = Session {
-                    executor: Executor::new(
-                        backend,
-                        catalog,
-                        TENANT,
-                        esker_sql::session::register(),
-                    ),
-                };
-                let mut id = 1_i64;
-                while !stop.load(Ordering::Relaxed) && id < 4_000 {
-                    let values: Vec<String> = (id..id + 50)
-                        .map(|n| format!("({n}, 'pad-{n}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')"))
-                        .collect();
-                    if let Err(error) =
-                        session.run(&format!("INSERT INTO t VALUES {}", values.join(", ")))
-                    {
-                        let said = format!("[{}] {error}", error.sqlstate());
-                        if let Ok(mut seen) = refusals.lock() {
-                            seen.push(said);
-                        }
-                    }
-                    id += 50;
-                }
-                id
-            })
-            .unwrap()
-    };
+    let loader = spawn_loader(gate, &stop, &refusals);
 
-    // The sampler: every region's first sighting, and its first sighting with a leader.
-    let mut first_seen: std::collections::BTreeMap<u64, Instant> =
-        std::collections::BTreeMap::new();
-    // **Measured once each.** Without this a region whose leader is already known is put back by
-    // the next sample's `or_insert` and measured again at zero — which is how the first two runs
-    // reported six and seven hundred thousand children on a cluster of a hundred, a number absurd
-    // enough to be caught and exactly the shape of a measurement that measures nothing.
-    let mut done: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut first_seen: BTreeMap<u64, Instant> = BTreeMap::new();
+    let mut ends_at: BTreeMap<bytes::Bytes, u64> = BTreeMap::new();
+    let mut leader_of: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut parent_led_by: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut done: BTreeSet<u64> = BTreeSet::new();
     let mut led_after: Vec<f64> = Vec::new();
+    let (mut inherited, mut elsewhere) = (0usize, 0usize);
+
     let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline && !loader.is_finished() {
-        // **The stores, not PD.** A child appears in its store's own map the instant `adopt_split`
-        // runs; PD learns of it at the next region heartbeat — 20 ms here — by which time the
-        // election is over. Sampling PD reported every one of 130 children as led at zero
-        // milliseconds, which is not the window being small, it is the window being invisible.
-        {
-            let now = Instant::now();
-            let records: Vec<esker_proto::RegionStatus> = gate
-                .nodes
-                .iter()
-                .flat_map(|node| node.store.region_statuses())
-                .collect();
-            for record in records {
-                let id = record.region.id;
-                if done.contains(&id) {
-                    continue;
-                }
-                first_seen.entry(id).or_insert(now);
-                if record.leader_peer_id != 0
-                    && let Some(seen) = first_seen.remove(&id)
+        let now = Instant::now();
+        // **Which *store* leads it, not which peer id.** A peer id is numbered per region, so the
+        // parent's `leader_peer_id` and the child's are ids in two different spaces and comparing
+        // them answers no question — measured: it matched once in a hundred and thirty while a
+        // trace of `adopt_split` showed the parent's leader campaigning its child every single
+        // time. `is_leader` is each store's statement about itself, so the store index is the
+        // thing both halves of this comparison can be in.
+        let records: Vec<(usize, esker_proto::RegionStatus)> = gate
+            .nodes
+            .iter()
+            .enumerate()
+            .flat_map(|(at, node)| {
+                node.store
+                    .region_statuses()
+                    .into_iter()
+                    .map(move |status| (at, status))
+            })
+            .collect();
+        for (at, record) in &records {
+            if record.is_leader {
+                leader_of.insert(record.region.id, *at);
+            }
+            ends_at.insert(record.region.end_key.clone(), record.region.id);
+        }
+        for (_, record) in records {
+            let id = record.region.id;
+            if done.contains(&id) {
+                continue;
+            }
+            if let std::collections::btree_map::Entry::Vacant(slot) = first_seen.entry(id) {
+                slot.insert(now);
+                // Its parent is the region its start key used to be the end of.
+                if let Some(parent) = ends_at.get(&record.region.start_key)
+                    && let Some(leader) = leader_of.get(parent)
                 {
-                    led_after.push(now.duration_since(seen).as_secs_f64() * 1000.0);
-                    done.insert(id);
+                    parent_led_by.insert(id, *leader);
                 }
+            }
+            if let Some(&leader) = leader_of.get(&id)
+                && let Some(seen) = first_seen.remove(&id)
+            {
+                led_after.push(now.duration_since(seen).as_secs_f64() * 1000.0);
+                if let Some(parent_leader) = parent_led_by.get(&id) {
+                    if *parent_leader == leader {
+                        inherited += 1;
+                    } else {
+                        elsewhere += 1;
+                    }
+                }
+                done.insert(id);
             }
         }
         std::thread::sleep(Duration::from_millis(2));
     }
     stop.store(true, Ordering::Relaxed);
     let rows = loader.join().unwrap();
-
     let refusals = refusals.lock().map(|seen| seen.clone()).unwrap_or_default();
-    let median = report(rows, gate.regions(), &mut led_after, &refusals);
+    Sightings {
+        led_after,
+        inherited,
+        elsewhere,
+        refusals,
+        rows,
+        regions: gate.regions(),
+    }
+}
+
+/// **A split child's first leader is the store that led its parent.**
+///
+/// [ADR 0094](../../../docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md)'s gate test,
+/// and it asserts a **structure** rather than a duration. The first version asserted a median
+/// time-to-leader under thirty milliseconds, which is a *performance* property: it passed on a
+/// quiet box and failed at 84 ms on a gate that was running two chains at once, which is the
+/// load-sensitive assertion this repository has been bitten by before and had just written down
+/// again for the mpp differential. The wall clock stays, in the `#[ignore]`d measurement below,
+/// where a number is information rather than a verdict.
+///
+/// What the change actually does is make the **parent's leader** the one that stands, so that is
+/// what this asks. Before it, the child elects from scratch and the winner is whichever of three
+/// voters times out first — about one in three. After it, the parent's leader campaigns before any
+/// timeout can fire and the others answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_split_child_is_led_by_the_store_that_led_its_parent() {
+    let gate = Gate::start_splitting(8 * 1024).await;
+    let seen = tokio::task::block_in_place(|| watch_a_splitting_load(&gate));
     gate.stop().await;
 
+    let decided = seen.inherited + seen.elsewhere;
     assert!(
-        led_after.len() >= 20,
-        "only {} children were measured, so this asserts nothing",
-        led_after.len()
+        decided >= 20,
+        "only {decided} children could be matched to a parent, so this asserts nothing \
+         ({} rows, {} regions)",
+        seen.rows,
+        seen.regions
     );
-    // **A quorum round trip, not an election timeout** — [ADR 0094]
-    // (../../../docs/adr/0094-a-split-childs-leader-is-the-parents-leader.md). Before it: a median
-    // of 62 ms, p90 77, max 93, because every child waited out a timeout before anyone stood. After
-    // it the parent's leader campaigns its child at once and what is left is one round trip to a
-    // quorum, which is single digits in this harness.
-    //
-    // Thirty is chosen with a factor of two either side: half the measured *before*, and several
-    // times an in-process round trip. It is a threshold on the mechanism rather than a stopwatch on
-    // the box — a timeout and a round trip are an order of magnitude apart here.
+    // Four in five, against about one in three when the child elects from scratch: the bar is far
+    // from both, so it is a statement about which mechanism ran and not about how fast the box is.
     assert!(
-        median < 30.0,
-        "a split child waited a median of {median:.0} ms for a leader, which is an election \
-         timeout and not a round trip"
+        seen.inherited * 5 >= decided * 4,
+        "only {} of {decided} split children were led by the store that led their parent, which \
+         is what an election from scratch looks like rather than a campaign the parent started",
+        seen.inherited
+    );
+}
+
+/// **The window itself, printed rather than asserted.**
+///
+/// The number ADR 0094 is about — a child's time to its first leader — measured across every split
+/// of a real load. It is `#[ignore]`d because a duration on a shared box is information and not a
+/// verdict; `a_split_child_is_led_by_the_store_that_led_its_parent` is what the gate runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "prints the leaderless-window distribution; a duration is not a gate assertion"]
+async fn how_long_a_split_child_has_no_leader() {
+    let gate = Gate::start_splitting(8 * 1024).await;
+    let mut seen = tokio::task::block_in_place(|| watch_a_splitting_load(&gate));
+    gate.stop().await;
+    report(seen.rows, seen.regions, &mut seen.led_after, &seen.refusals);
+    println!(
+        "  {} of {} children were led by their parent's leader",
+        seen.inherited,
+        seen.inherited + seen.elsewhere
     );
 }
 
@@ -1716,7 +1796,7 @@ fn report(rows: i64, regions: usize, led_after: &mut [f64], refusals: &[String])
         );
     }
     println!("  {} refusals while loading", refusals.len());
-    let mut kinds: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
     for said in refusals {
         *kinds.entry(&said[..7.min(said.len())]).or_default() += 1;
     }
