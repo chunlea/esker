@@ -194,13 +194,13 @@ fn definition(
     out
 }
 
-/// One pair of parentheses around a stored expression, and never two — **except around a bare
-/// column, which takes none**.
+/// A stored expression, printed exactly as stored — **the reader adds nothing**.
 ///
-/// The text a `WHERE` is stored with has had its own outer pair removed when it was lowered
-/// (`crate::parse::lower::unwrap_nested`), so this is where PostgreSQL's pair goes back on — and
-/// each operand of an `AND`/`OR` chain gets a pair of its own, which is the server's own rule for
-/// re-printing a boolean (`crate::catalog::parenthesised_operands`).
+/// The parentheses are the writer's: `exec::ddl::deparse` gives every operator node its own pair
+/// and a bare column none, which is the server's own rule for printing a boolean. This used to add
+/// them here instead, by splitting the chain and wrapping each operand, and a splitter cannot say
+/// which operands bind first — group A of the deparse census moved the rule to the one place that
+/// holds the tree.
 ///
 /// A predicate that is **only a column reference** is printed unadorned. Measured on 19beta1, one
 /// table and eight partial indexes:
@@ -217,11 +217,11 @@ fn definition(
 /// `postgresql_adapter_test#test_partial_index_on_column_named_like_keyword` asserts exactly it —
 /// `index.where` must be `"primary"`, quoted and unwrapped.
 fn parenthesised(expr: &str) -> String {
-    let operands = crate::catalog::parenthesised_operands(expr);
-    if super::is_column_reference(&operands) {
-        return operands;
-    }
-    format!("({operands})")
+    // **Printed as stored.** The deparser writes an operator node's own pair, so a predicate
+    // arrives here already shaped — `((a > 0) AND (b > 0))`, `(v IS NOT NULL)`, or a bare `flag`
+    // for the one shape that takes none. This used to re-parenthesise the operands, which could
+    // not express nesting; the tree has the grouping and the writer now writes it.
+    expr.to_owned()
 }
 
 /// One index's key, however it is stored.

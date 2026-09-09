@@ -38,6 +38,27 @@ Two rules come from that file's own failures, and both are applied here rather t
 > file's eight rows turned out to be closed when somebody looked. So every row below was put to the
 > tree or to a log before it was written, and each says which; the two that could only be taken
 > from another lane's evidence say that too.
+>
+> **A reader nobody wrote for is invisible to a register that reads code.** Six readers of a
+> stored expression had a writer that shaped the text they print; the seventh — an exclusion
+> constraint's predicate — had none, so `pg_get_indexdef` on the index behind it printed whatever
+> the user typed, and no row here said so because nothing in the tree looks wrong: the writer that
+> is missing has no site to inspect. It took a cross product to name it. The same shape put
+> [ADR 0090](../adr/0090-a-stored-expression-is-deparsed-by-the-statement-that-writes-it.md)'s own
+> decision — *every reader returns those bytes unchanged* — in the odd position of being **an
+> aspiration its file recorded as a fact** for as long as two of its readers were re-parenthesising
+> on the way out. A decision record is checkable: walk its sentence over every caller, not over the
+> ones it lists.
+>
+> **The direction where this node is *more permissive* than PostgreSQL had never been asked by a
+> corpus.** Every capture here was taken by writing what a real server accepts and comparing the
+> answers, so a row could only be opened where the node refused or answered differently — and a
+> shape the node accepts and a real server rejects produces no capture at all, because nobody
+> wrote the statement. The deparse census found the same blind spot one layer down, in printing:
+> a reader that was measured on the shapes that happened to reach it is **wrong and green**, and
+> stays that way until something asks it the cross product. Both are the same rule — *the corpus
+> can only answer the question it was written to ask* — and both are cheapest to fix by writing
+> the enumeration rather than the example.
 
 [`docs/acceptance/v1.1.md`](../acceptance/v1.1.md) carries the numbers — run 107 on main
 `9d642ef0`, 10,081 of 10,134 — and points back here for what is left. This file is the what

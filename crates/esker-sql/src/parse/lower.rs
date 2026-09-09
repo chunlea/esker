@@ -9121,12 +9121,22 @@ fn expr_shape(expr: &Expr) -> catalog::ExprShape {
         // prints it as: `GENERATED ALWAYS AS (c1) STORED` comes back `c1`, measured. It cannot
         // arise as an *index* key — a column there is a column key and never an expression — so
         // this arm only matters now that a generated column asks the same question.
+        // **And the two shapes that carry their own brackets**: an `ARRAY[…]` constructor and a
+        // subscript. Both were falling to the `Operator` arm below and taking a pair they do not
+        // own — `(arr[1])` where a real server prints `arr[1]`, and one more again in the key
+        // list. They are `Value` for the same reason a call is `Call`: the brackets already say
+        // where the expression ends, so nothing has to be added to keep it together. Measured
+        // through every reader — `pg_get_expr(indexprs)`, the key list, a generated column, a
+        // `DEFAULT` and a `CHECK` — in `tests/corpus/pg19_deparse_census.txt`'s group C, and
+        // `(ARRAY[a, b])[1]` is both at once and still one pair.
         Expr::Value(_)
         | Expr::Cast { .. }
         | Expr::TypedString { .. }
         | Expr::Case { .. }
         | Expr::Identifier(_)
-        | Expr::CompoundIdentifier(_) => ExprShape::Value,
+        | Expr::CompoundIdentifier(_)
+        | Expr::Array(_)
+        | Expr::CompoundFieldAccess { .. } => ExprShape::Value,
         _ => ExprShape::Operator,
     }
 }
