@@ -1,0 +1,44 @@
+# **`WITH RECURSIVE` whose body names itself**, from PostgreSQL 19beta1.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it
+#
+# Captured in one session inside `BEGIN … ROLLBACK` with `statement_timeout = '5s'`, over the
+# fixture in `CORPUS_FIXTURE`. The derivations are in `tests/captures/pg19_recursive_cte.txt`.
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The seed's type is the answer's type.** A plain `UNION` promotes both arms to a common
+#     type; a recursive query does not — a wider recursive term is `42804 … has type integer in
+#     non-recursive term but type bigint overall`, and the HINT tells you to widen the *seed*.
+#   * **`UNION` deduplicates against everything already produced**, not against the last
+#     iteration, which is what makes it a termination rule where `UNION ALL` is not.
+#   * **Two refusal classes**: the shape the standard forbids is `42P19`, what PostgreSQL has not
+#     built is `0A000`. `ORDER BY` and `LIMIT` *inside the body* are in the second class — not
+#     illegal, unimplemented.
+#   * The "must not appear more than once" rule is about the **recursive term**. The outer query
+#     may name the CTE as often as it likes.
+WITH RECURSIVE "rec_tree" AS ( SELECT "rec_co".* FROM "rec_co" WHERE "rec_co"."firm_id" IS NULL UNION ALL SELECT "rec_co".* FROM "rec_co" JOIN rec_tree ON rec_co.firm_id = rec_tree.id ) SELECT "rec_co"."id" FROM rec_tree AS rec_co ORDER BY "rec_co"."id" ASC	bigint	1 ; 2 ; 3 ; 4 ; 5 ; 6 ; 7
+WITH RECURSIVE t AS (SELECT id, firm_id, name FROM rec_co WHERE firm_id IS NULL UNION ALL SELECT c.id, c.firm_id, c.name FROM rec_co c JOIN t ON c.firm_id = t.id) SELECT * FROM t ORDER BY id	bigint,bigint,character varying(255)	1|\N|top a ; 2|\N|top b ; 3|1|child of 1 ; 4|1|child of 1 too ; 5|3|grandchild ; 6|\N|top c ; 7|6|child of 6
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 5) SELECT i FROM n	integer	1 ; 2 ; 3 ; 4 ; 5
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 5) SELECT sum(i), count(*) FROM n	bigint,bigint	15|5
+WITH RECURSIVE n(i) AS (SELECT 1 UNION SELECT 1 FROM n) SELECT i FROM n	integer	1
+WITH RECURSIVE t AS (SELECT 1 AS a, 'x'::text AS b UNION ALL SELECT a+1, b FROM t WHERE a < 2) SELECT * FROM t	integer,text	1|x ; 2|x
+WITH RECURSIVE t(p, q) AS (SELECT 1, 'x'::text UNION ALL SELECT p+1, q FROM t WHERE p < 2) SELECT * FROM t	integer,text	1|x ; 2|x
+WITH RECURSIVE plain AS (SELECT 1 AS n), rec(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM rec WHERE i < 3) SELECT (SELECT n FROM plain) AS p, i FROM rec	integer,integer	1|1 ; 1|2 ; 1|3
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 3) SELECT (SELECT count(*) FROM n) AS c, i FROM n ORDER BY i	bigint,integer	3|1 ; 3|2 ; 3|3
+WITH RECURSIVE t AS (SELECT 1::int4 AS a UNION ALL SELECT (a+1)::int8 FROM t WHERE a < 2) SELECT * FROM t	!42804 recursive query "t" column 1 has type integer in non-recursive term but type bigint overall HINT: Cast the output of the non-recursive term to the correct type.
+WITH RECURSIVE t AS (SELECT 1 AS a UNION ALL SELECT 'x'::text FROM t) SELECT * FROM t	!42804 UNION types integer and text cannot be matched
+WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n FROM t, t AS u) SELECT n FROM t	!42P19 recursive reference to query "t" must not appear more than once
+WITH RECURSIVE t AS (SELECT n FROM t) SELECT n FROM t	!42P19 recursive query "t" does not have the form non-recursive-term UNION [ALL] recursive-term
+WITH RECURSIVE t AS (SELECT n FROM t UNION ALL SELECT 1 AS n) SELECT n FROM t	!42P19 recursive reference to query "t" must not appear within its non-recursive term
+WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT count(*) FROM t) SELECT n FROM t	!42P19 aggregate functions are not allowed in a recursive query's recursive term
+WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n FROM t ORDER BY n) SELECT n FROM t	!0A000 ORDER BY in a recursive query is not implemented
+WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n FROM t LIMIT 1) SELECT n FROM t	!0A000 LIMIT in a recursive query is not implemented
+WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT t.n FROM rec_co LEFT JOIN t ON true) SELECT n FROM t	!42P19 recursive reference to query "t" must not appear within an outer join
+WITH RECURSIVE t AS (SELECT 1 AS n INTERSECT SELECT n FROM t) SELECT n FROM t	!42P19 recursive query "t" does not have the form non-recursive-term UNION [ALL] recursive-term
+WITH RECURSIVE t AS (SELECT 1 AS n EXCEPT SELECT n FROM t) SELECT n FROM t	!42P19 recursive query "t" does not have the form non-recursive-term UNION [ALL] recursive-term
+WITH RECURSIVE a AS (SELECT 1 AS n UNION ALL SELECT n FROM b), b AS (SELECT n FROM a) SELECT n FROM a	!0A000 mutual recursion between WITH items is not implemented
+WITH RECURSIVE t AS (SELECT 1 AS n) SELECT n FROM t	integer	1
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i FROM n) SELECT i FROM n LIMIT 3	integer	1 ; 1 ; 1

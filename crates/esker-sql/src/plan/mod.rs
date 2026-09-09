@@ -55,7 +55,7 @@ pub use query::{
 };
 pub use routing::{Columnar, Decision, Engine, Reason, Setting};
 pub use session::{CursorDirection, CursorStatement, DiscardTarget, SessionStatement};
-pub use subquery::{Derived, SubqueryExpr, SubqueryKind};
+pub use subquery::{Derived, RecursiveTerm, SubqueryExpr, SubqueryKind};
 pub use time_machine::TimeMachineVerb;
 
 /// One statement, lowered.

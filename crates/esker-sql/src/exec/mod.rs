@@ -43,6 +43,7 @@ mod job;
 
 pub use job::BATCH_ROWS;
 pub(crate) mod query;
+mod recursive;
 pub mod redrive;
 mod savepoint;
 mod subquery;

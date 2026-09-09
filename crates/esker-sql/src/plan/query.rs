@@ -522,6 +522,40 @@ pub enum Node {
         /// How its rows are shaped, so everything above it reads a row like any other.
         columns: RowSchema,
     },
+    /// The rows a `WITH RECURSIVE` produces, by iterating its recursive term to a fixed point.
+    ///
+    /// **The one shape a CTE cannot be inlined into.** Every other `WITH` item is substituted for
+    /// its name (`crate::plan::cte`); a body that names itself cannot be, because substituting it
+    /// never terminates. So this is a second evaluation model: run the seed, then run the step
+    /// with the previous round's rows standing in for the name, until a round produces nothing.
+    Recursive {
+        /// The non-recursive term. Its rows are the first round, and **its types and names are
+        /// the whole query's** — a recursive query does not promote its arms the way a plain
+        /// `UNION` does (measured).
+        seed: Box<Node>,
+        /// The recursive term, holding one [`Node::WorkingTable`] where the CTE named itself.
+        step: Box<Node>,
+        /// `UNION` rather than `UNION ALL`: drop rows already produced.
+        ///
+        /// **The dedup is against the whole accumulated result**, not against the last round,
+        /// which is what makes `UNION` a termination rule: a round that produces only rows already
+        /// seen produces nothing, and the loop ends.
+        distinct: bool,
+    },
+    /// The previous round's rows, where a recursive term names its own CTE.
+    ///
+    /// Filled in by [`Node::Recursive`]'s cursor before each round. It is a node rather than a
+    /// slot shared between cursors so that nothing here needs interior mutability: the step is
+    /// cloned per round with this variant's rows replaced, which is also what makes the plan
+    /// printable at every round.
+    WorkingTable {
+        /// The rows this round may read. Empty in the plan as built.
+        ///
+        /// The row's *shape* is the derived table's, built from the seed by the planner, exactly
+        /// as it is for any other `FROM` entry — so there is no schema here to fall out of step
+        /// with it.
+        rows: Vec<Vec<Datum>>,
+    },
     /// Rows written into the statement: `FROM (VALUES (1),(2))`, and `VALUES …` on its own.
     ///
     /// Its own node beside [`Node::OneRow`] for the reason that one exists: a source of rows the
@@ -861,6 +895,9 @@ impl Node {
     #[must_use]
     pub fn children_mut(&mut self) -> Vec<&mut Node> {
         match self {
+            // Both halves are children: the seed is planned like any input, and the step holds
+            // the working table a pass may need to reach.
+            Node::Recursive { seed, step, .. } => vec![seed, step],
             Node::Filter { input, .. }
             | Node::Project { input, .. }
             | Node::Sort { input, .. }
@@ -880,6 +917,8 @@ impl Node {
             Node::Append { arms } => arms.iter_mut().collect(),
             Node::OneRow
             | Node::Values { .. }
+            // A leaf: its rows are values a round put there, and it has no input.
+            | Node::WorkingTable { .. }
             | Node::SequenceRead { .. }
             | Node::TableFunction { .. }
             | Node::CatalogView { .. }
@@ -999,6 +1038,11 @@ impl Node {
     /// One node's own line, its child, and the extra lines that belong to it — split out of
     /// [`Node::explain_into`] so that the walk and the per-node description are two readable
     /// things rather than one long one.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per node kind, the same shape as `Cursor::open`; splitting it would \
+                  put half the vocabulary's plan text somewhere other than the other half"
+    )]
     fn describe(
         &self,
         table: &str,
@@ -1016,6 +1060,15 @@ impl Node {
             // PostgreSQL's own name for it, `*VALUES*` included: the rows are a relation with no
             // relation behind them, and the quoted star is what it calls that relation.
             Node::Values { .. } => ("Values Scan on \"*VALUES*\"".to_owned(), None, None),
+            // PostgreSQL's own two names for the halves of a fixpoint.
+            Node::Recursive { seed, .. } => {
+                ("Recursive Union".to_owned(), Some(seed.as_ref()), None)
+            }
+            Node::WorkingTable { rows, .. } => (
+                "WorkTable Scan".to_owned(),
+                None,
+                Some(format!("Rows: {}", rows.len())),
+            ),
             // PostgreSQL's own name for it: a sequence is a relation and the scan is its one row.
             Node::SequenceRead { .. } => (format!("Seq Scan on {table}"), None, None),
             // Named for what it is: one access path, no costs, and a row count that is the length

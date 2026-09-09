@@ -871,7 +871,7 @@ fn coerce_arm(node: Node, arm: &[ColumnType], columns: &[OutputColumn]) -> Node 
 /// Whether every arm can then *reach* the chosen type is [`reaches_implicitly`]'s question, asked
 /// in [`append`] once the type is known: `money` beside `numeric` and `json` beside `jsonb` agree
 /// on a category and have no implicit cast, which is `42846` there and not `42804`.
-fn unify(left: ColumnType, right: ColumnType) -> Result<ColumnType> {
+pub(super) fn unify(left: ColumnType, right: ColumnType) -> Result<ColumnType> {
     use esker_keys::array::ArrayValue;
     if left == right {
         return Ok(left);

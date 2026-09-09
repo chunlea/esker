@@ -71,6 +71,100 @@ pub fn inline(select: &mut Select, name: &str, body: &Select, columns: &[String]
     referenced
 }
 
+/// Substitutes a **recursive** CTE: the same derived table every other item becomes, carrying its
+/// second half.
+///
+/// `seed` is the non-recursive term and `step` the recursive one, already planted with its working
+/// table. Everything above reads the result as an ordinary derived table, which is what lets the
+/// outer query name it twice, qualify it and sort by it with no further rules.
+pub fn inline_recursive(
+    select: &mut Select,
+    name: &str,
+    seed: &Select,
+    step: &crate::plan::RecursiveTerm,
+    columns: &[String],
+) -> bool {
+    let mut referenced = false;
+    for_each_from_mut(select, &mut |entry| {
+        if entry.derived.is_some() || entry.hidden_cte || entry.name != name {
+            return;
+        }
+        referenced = true;
+        let mut derived = Derived::from_cte(Box::new(seed.clone()), columns.to_vec());
+        derived.recursive = Some(Box::new(step.clone()));
+        *entry = TableRef {
+            values: None,
+            name: entry.referred_as().to_owned(),
+            alias: None,
+            derived: Some(Box::new(derived)),
+            function: None,
+            hidden_cte: false,
+            written: None,
+        };
+    });
+    referenced
+}
+
+/// Replaces every reference to `name` with the **working table**, and answers how many there were.
+///
+/// The twin of [`inline`] for the recursive term of a `WITH RECURSIVE`: where that one substitutes
+/// the body, this one substitutes a relation whose rows the fixpoint supplies a round at a time.
+/// `seed` is carried for its *shape* only — a working table is as wide as the non-recursive term,
+/// which is what makes the seed's types the whole query's.
+///
+/// The count is the answer to PostgreSQL's `42P19 recursive reference to query "t" must not appear
+/// more than once`, and it is counted over **table factors** rather than over the rendered text:
+/// `JOIN t ON c.firm_id = t.id` writes the name twice and references the relation once.
+pub fn plant_working_table(
+    select: &mut Select,
+    name: &str,
+    seed: &Select,
+    columns: &[String],
+) -> usize {
+    let mut found = 0;
+    for_each_from_mut(select, &mut |entry| {
+        if entry.derived.is_some() || entry.hidden_cte || entry.name != name {
+            return;
+        }
+        found += 1;
+        let mut derived = Derived::from_cte(Box::new(seed.clone()), columns.to_vec());
+        derived.working_table = true;
+        *entry = TableRef {
+            values: None,
+            name: entry.referred_as().to_owned(),
+            alias: None,
+            derived: Some(Box::new(derived)),
+            function: None,
+            hidden_cte: false,
+            written: None,
+        };
+    });
+    found
+}
+
+/// Whether the working table sits on the **nullable** side of an outer join.
+///
+/// Asked *after* [`plant_working_table`] has run, so the entry to look for is the one it made and
+/// not the name it replaced.
+///
+/// PostgreSQL refuses that and only that: `FROM t LEFT JOIN c` keeps every row of `t` and is
+/// legal, while `FROM c LEFT JOIN t` invents NULL rows for the recursive term to read and is
+/// `42P19 recursive reference to query "t" must not appear within an outer join`. Measured both
+/// ways — and the legal one is *unbounded*, which is how the first capture of this feature hung.
+#[must_use]
+pub fn on_a_nullable_side(select: &Select) -> bool {
+    select.joins.iter().any(|join| {
+        matches!(
+            join.kind,
+            crate::plan::JoinKind::Left | crate::plan::JoinKind::Full
+        ) && join
+            .table
+            .derived
+            .as_ref()
+            .is_some_and(|derived| derived.working_table)
+    })
+}
+
 /// Marks every `FROM` entry in `select` that names a `WITH` item it cannot see.
 ///
 /// Called on one CTE's body once the items **before** it have been inlined, so what is left of

@@ -219,25 +219,22 @@ fn with_recursive_over_a_body_that_is_not_recursive_answers() {
     );
 }
 
-/// A body that **does** name itself is refused by name, and the name is the CTE's.
+/// A body that **does** name itself is the fixpoint, and it answers.
 ///
-/// The fixpoint is a second evaluation model, not a variation on this one: a CTE here is inlined
-/// (`plan::cte`), and a body that names itself cannot be — substituting it would never terminate.
-/// What it needs is a working table iterated to a fixed point with its own termination rule and
-/// its own memory bound.
+/// This test asserted the refusal when this file was written: a CTE here is inlined
+/// (`plan::cte`), and a body that names itself cannot be — substituting it never terminates. The
+/// second evaluation model it needed is `exec::recursive`, and the statement below is the one the
+/// old refusal quoted. Kept here rather than deleted because this file is where the reader arrives
+/// asking what a set operation inside a `WITH` can be; `tests/recursive_cte.rs` is the whole rule.
 #[test]
-fn a_body_that_names_itself_is_refused_by_name() {
+fn a_body_that_names_itself_is_the_fixpoint() {
     let mut node = parity::Node::new(FIXTURE);
-    let error = node
-        .run(
+    assert_eq!(
+        node.rows(
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 5) \
-              SELECT n FROM t",
-        )
-        .unwrap_err();
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
-    assert!(
-        error.to_string().contains("whose body names itself"),
-        "the refusal did not say why: {error}"
+              SELECT n FROM t"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"], vec!["4"], vec!["5"]]
     );
 }
 
