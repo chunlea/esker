@@ -91,6 +91,10 @@ fn how_long_a_region_has_no_leader_on_real_processes() {
         }
     }
 
+    // **Without this the zero is unreadable.** No sightings and no region count cannot tell a
+    // cluster that stayed healthy from one that never split, and only the first is an answer.
+    println!("  the load finished at {} regions", cluster.regions());
+
     let mut millis: Vec<u128> = cleared.iter().map(Duration::as_millis).collect();
     millis.sort_unstable();
     println!(

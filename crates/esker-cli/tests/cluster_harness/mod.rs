@@ -255,13 +255,24 @@ impl Cluster {
     ///       region 1
     /// ```
     ///
-    /// **All three say "not now", and none of them says "not ever".** A region mid-election has no
-    /// leader to prewrite against and a client that has spent its attempts says so; the answer a
-    /// second later is a commit. This is the same reading h1 landed inside the client — wait the
-    /// *caller's* deadline instead of a hard-coded number of attempts — applied at the layer that
-    /// has a deadline to give, and it is a **bounded** wait rather than a loop: past the deadline
-    /// the assertion fires with the server's own words, so a store that is really gone still fails
-    /// the test.
+    /// **All three say "not now", and none of them says "not ever"** — which is what this harness
+    /// acts on, and it acts on it *here* rather than in the client. It is a **bounded** wait rather
+    /// than a loop: past the deadline the assertion fires with the server's own words, so a store
+    /// that is really gone still fails the test.
+    ///
+    /// **The client was not changed to match, and this comment used to say it had been.** The
+    /// reading it named — *wait the caller's deadline instead of a hard-coded number of attempts* —
+    /// was written up as [ADR 0100](../../../../docs/adr/0100-a-region-between-leaders-waits-on-the-callers-deadline.md)
+    /// and **refuted by its own measurement**: at 192–325 regions a region that loses its leader
+    /// does not get one back inside thirty seconds, so spending the caller's whole deadline would
+    /// buy a slower failure rather than a success. `esker-client` is unchanged, and the count that
+    /// produces the third line above is still a count.
+    ///
+    /// **And the three refusals above are evidence, not just a list to wait out.** They were read
+    /// off gate logs of **these four store processes**, so the shape `docs/plans/debts-v1.1.md` #34
+    /// records — a region without a leader for far longer than an election — is not an artefact of
+    /// the in-process harness it was first measured on. `crates/esker-cli/tests/leaderless_window.rs`
+    /// is the arm that puts a number on this side of that comparison.
     ///
     /// **Why this is waiting and not a weaker assertion.** Nothing about what the statement must
     /// *do* is relaxed: every row still has to be written, and the test's `assert_eq!` on the rows

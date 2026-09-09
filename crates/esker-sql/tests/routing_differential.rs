@@ -1509,8 +1509,10 @@ async fn how_the_leaderless_window_moves_with_the_drivers() {
             }
         });
         println!(
-            "  tick {tick_ms} ms, {workers} threads: {met} met, {} cleared inside {GIVE_UP_AFTER:?}",
-            cleared.len()
+            "  tick {tick_ms} ms, {workers} threads: {met} met, {} cleared inside \
+             {GIVE_UP_AFTER:?}, load finished at {} regions",
+            cleared.len(),
+            gate.regions()
         );
         gate.stop().await;
     }
