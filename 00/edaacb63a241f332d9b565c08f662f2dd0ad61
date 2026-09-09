@@ -1,0 +1,45 @@
+crates/esker-sql/tests/captures/pg19_corpus_format.txt
+  s_6f7019c05b578b::t_50be20f4f3d44f 1-45
+crates/esker-sql/tests/captures/pg19_tsvector.txt
+  s_6f7019c05b578b::t_5a9e8aaccb0ebe 3-12,94
+crates/esker-sql/tests/captures/pg19_typmod.txt
+  s_6f7019c05b578b::t_8d68cb1582efc6 1-94
+crates/esker-sql/tests/corpus/pg19_corpus_format.txt
+  s_6f7019c05b578b::t_80307adb147522 1-45
+crates/esker-sql/tests/corpus/pg19_to_text.txt
+  s_6f7019c05b578b::t_cd170c593fed5e 3-12,45
+crates/esker-sql/tests/corpus/pg19_tsvector.txt
+  s_6f7019c05b578b::t_726581eb2669ba 3-12,94
+crates/esker-sql/tests/corpus/pg19_typmod.txt
+  s_6f7019c05b578b::t_69f38cd8f57540 2-11,71
+crates/esker-sql/tests/corpus_format.rs
+  s_6f7019c05b578b::t_f8dc28bfb36260 1-58
+crates/esker-sql/tests/numeric.rs
+  s_6f7019c05b578b::t_f529fd8c7dfe7e 13-14,16-21,23,27-30
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_6f7019c05b578b::t_4747f89988f55b 784-933,935,959,962-964,966-972
+crates/esker-sql/tests/to_text.rs
+  s_6f7019c05b578b::t_cf62cd3c9aba6d 18-23
+crates/esker-sql/tests/tsvector.rs
+  s_6f7019c05b578b::t_2e912e82e9f01d 76,85,94
+crates/esker-sql/tests/typmod.rs
+  s_6f7019c05b578b::t_c0ccea6396e007 25-37
+docs/plans/debts-v1.1.md
+  s_6f7019c05b578b::t_aa3d27d990109f 53,58-59,73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "00edaacb63a241f332d9b565c08f662f2dd0ad61",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
