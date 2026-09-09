@@ -5366,6 +5366,37 @@ fn reads_back(table: &TableDef, printed: &str, ty: ColumnType) -> bool {
     deparse(&resolved, table, ty) == printed
 }
 
+/// The type a comparison's two sides are printed under.
+///
+/// **A column decides it, then a literal that has a type of its own, and two unknowns are `text`**
+/// — which is PostgreSQL's own resolution order for the pair and is why `('a' < 'b')` prints
+/// `('a'::text < 'b'::text)` rather than carrying the `boolean` the comparison answers.
+///
+/// `None` means neither side says anything, and the caller's fallback is `text`: the only way to
+/// reach that is two unknown literals, which is exactly the case PostgreSQL resolves as `text`.
+fn comparison_operand_type(
+    left: &plan::Expr,
+    right: &plan::Expr,
+    table: &TableDef,
+) -> Option<ColumnType> {
+    column_type_of(left, table)
+        .or_else(|| column_type_of(right, table))
+        .or_else(|| decided_literal_type(left))
+        .or_else(|| decided_literal_type(right))
+}
+
+/// The type a literal carries on its own, or `None` for the two PostgreSQL calls `unknown`.
+///
+/// The same question [`crate::exec::query::literal_type`] answers, asked where only a `plan::Expr`
+/// is in hand; a quoted string and a bare `NULL` take their type from the other side, and
+/// everything else brings one.
+fn decided_literal_type(expr: &plan::Expr) -> Option<ColumnType> {
+    match expr {
+        plan::Expr::Literal(literal) => crate::exec::query::literal_type(literal),
+        _ => None,
+    }
+}
+
 /// Whether a scalar function takes `text`, and so shows a cast its argument needed.
 ///
 /// Six of the seven do; `abs` is the numeric one. Measured rather than read off the names:
@@ -5688,8 +5719,27 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             plan::regex_operator(*negated, *case_insensitive),
             sub(pattern)
         ),
+        // **A comparison's sides are deparsed under the *operand's* type, not the expression's.**
+        // The same correction the `||`, `LIKE` and `IN` arms carry: threading the `boolean` a
+        // comparison answers made `('a' < 'b')` print `('a'::boolean < 'b'::boolean)`, which
+        // `reads_back` then refused, so the written text was kept and the coercion PostgreSQL
+        // prints — `('a'::text < 'b'::text)` — was lost. Measured,
+        // `tests/corpus/pg19_collation_family.txt`'s `DEFAULT ('a' < 'b')` row.
+        //
+        // `AND` and `OR` are in this variant too and take the expression's own type: their sides
+        // *are* booleans, and giving them an operand type would be the same mistake mirrored.
         Expr::Binary { op, left, right } => {
-            format!("({} {} {})", sub(left), op.symbol(), sub(right))
+            let operand = if matches!(op, plan::BinaryOp::And | plan::BinaryOp::Or) {
+                ty
+            } else {
+                comparison_operand_type(left, right, table).unwrap_or(ColumnType::Text)
+            };
+            format!(
+                "({} {} {})",
+                deparse(left, table, operand),
+                op.symbol(),
+                deparse(right, table, operand)
+            )
         }
         Expr::Negate(operand) => format!("(- {})", sub(operand)),
         Expr::Arithmetic {
