@@ -72,6 +72,13 @@ CREATE INDEX dupes_v_idx ON dupes (v)
 # paying for it in time and in being able to leave nothing behind if it fails. Here that is four
 # states and a batched backfill, and `esker_schema_step` is the step with the wait taken out --
 # which is what makes the state machine testable without a timer.
+#
+# The statement drives its own build and answers when it is finished, which is PostgreSQL's
+# contract (tests/invalid_index.rs); `stage` is the half of esker.concurrent_index_build that
+# leaves the job for a driver, and it is the half this section is about.
+
+statement ok
+SET esker.concurrent_index_build = 'stage'
 
 statement ok
 CREATE TABLE cj (id int8 PRIMARY KEY, a int8)

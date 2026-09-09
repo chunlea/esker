@@ -37,6 +37,7 @@
 use crate::catalog::{self, JobRecord, SchemaState, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::Executor;
+use crate::exec::index::Entry;
 use crate::value::Datum;
 
 /// Rows a single backfill transaction reads and indexes.
@@ -98,7 +99,7 @@ pub(super) fn backfill_batch(executor: &Executor, index_id: u64) -> Result<bool>
     let next = crate::exec::query::successor(last);
 
     let schema = table.row_schema();
-    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(read.len());
+    let mut entries: Vec<(Entry, Vec<u8>)> = Vec::with_capacity(read.len());
     for (_, value) in &read {
         let row = crate::row::decode_row(&schema, value)?;
         if let Some(entry) = index_entry(tenant, &table, &index, &row)? {
@@ -106,20 +107,30 @@ pub(super) fn backfill_batch(executor: &Executor, index_id: u64) -> Result<bool>
         }
     }
 
-    for (key, entry) in entries {
+    for (entry, value) in entries {
         // **A duplicate is the user's, and it fails the whole change.** Checked against what is
         // already there rather than against this batch alone, because the row it collides with may
         // have been indexed by an earlier batch or written by live traffic at write-only.
         if index.unique
-            && let Some(existing) = txn.get(&key)?
-            && existing != entry
+            && let Some(existing) = txn.get(&entry.key)?
+            && existing != value
         {
-            return Err(SqlError::UniqueViolation {
-                constraint: index.name.clone(),
-                key: None,
+            // **The build's sentence, not the insert's**, and the same one the blocking backfill
+            // gives (`crate::exec::ddl::backfill`): nothing was inserted here. Measured on
+            // 19beta1 — `23505 could not create unique index "invalid_index"`, `DETAIL: Key
+            // (number)=(1) is duplicated.` — and it reaches the client because the statement
+            // waits for the change (`crate::exec::ddl::finish_concurrent_build`), which is what
+            // `postgresql_adapter_test#test_invalid_index` asserts. `duplicate key value violates
+            // unique constraint` is what a *writer* meeting the finished index is told.
+            return Err(SqlError::CouldNotCreateUniqueIndex {
+                index: index.name.clone(),
+                detail: format!(
+                    "{} is duplicated.",
+                    crate::exec::index::render_key(&table, &index.keys, &entry.values)
+                ),
             });
         }
-        txn.put(&key, &entry);
+        txn.put(&entry.key, &value);
     }
 
     let moved = JobRecord {
@@ -131,7 +142,11 @@ pub(super) fn backfill_batch(executor: &Executor, index_id: u64) -> Result<bool>
     Ok(false)
 }
 
-/// The index key and value for one row, or `None` for a row a **partial** index excludes.
+/// The index entry for one row and the value it stores, or `None` for a row a **partial** index
+/// excludes.
+///
+/// The whole [`Entry`] rather than its key alone, because a duplicate's `DETAIL` prints the key's
+/// *values* and they are gone once the key is encoded.
 ///
 /// Both come from `crate::exec::index`, which is the same code `crate::exec::dml` writes through:
 /// an entry a backfill wrote and one a writer wrote have to be the same bytes or the two would
@@ -142,7 +157,7 @@ fn index_entry(
     table: &TableDef,
     index: &catalog::IndexDef,
     row: &[Datum],
-) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+) -> Result<Option<(Entry, Vec<u8>)>> {
     let primary_key: Vec<Datum> = table
         .primary_key
         .iter()
@@ -152,7 +167,7 @@ fn index_entry(
         return Ok(None);
     };
     let value = crate::row::encode_row(&table.primary_key_types(), &primary_key)?;
-    Ok(Some((entry.key, value)))
+    Ok(Some((entry, value)))
 }
 
 /// Moves an index one state on, in a transaction of its own, **if it is still where the caller

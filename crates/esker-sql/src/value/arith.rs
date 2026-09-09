@@ -51,6 +51,26 @@ pub fn result_type(op: ArithOp, left: ColumnType, right: ColumnType) -> Result<C
     if left == ColumnType::Money || right == ColumnType::Money {
         return super::money::result_type(op, left, right).map_or_else(undefined, Ok);
     }
+    // **The bit operators are integers only**, and they do not promote the way the rest of this
+    // ladder does: a shift keeps its *left* operand's type, so `1::int2 << 4` is a `smallint`
+    // where `1::int2 + 4` is an `integer`. Measured, both.
+    if matches!(
+        op,
+        ArithOp::BitAnd
+            | ArithOp::BitOr
+            | ArithOp::BitXor
+            | ArithOp::ShiftLeft
+            | ArithOp::ShiftRight
+    ) {
+        if !integer_type(left) || !integer_type(right) {
+            return undefined();
+        }
+        // A shift keeps the left type; the other three take the wider — which is the *same*
+        // answer whenever the left is already the wider, so the two cases are one expression.
+        let keeps_left =
+            matches!(op, ArithOp::ShiftLeft | ArithOp::ShiftRight) || bits(left) >= bits(right);
+        return Ok(if keeps_left { left } else { right });
+    }
     if !numeric_type(left) || !numeric_type(right) {
         return undefined();
     }
@@ -167,6 +187,19 @@ fn integer(op: ArithOp, left: i64, right: i64, ty: ColumnType) -> Result<Datum> 
     if matches!(op, ArithOp::Divide | ArithOp::Modulo) && right == 0 {
         return Err(SqlError::DivisionByZero);
     }
+    // **The bit operators cannot overflow and are not range-checked.** A shift count is taken
+    // modulo the type's width — `1::int4 << 32` is `1`, measured — and a shift that walks a bit
+    // off the top wraps rather than raising, which is the hardware showing through PostgreSQL.
+    if matches!(
+        op,
+        ArithOp::BitAnd
+            | ArithOp::BitOr
+            | ArithOp::BitXor
+            | ArithOp::ShiftLeft
+            | ArithOp::ShiftRight
+    ) {
+        return Ok(bitwise(op, left, right, ty));
+    }
     let value = match op {
         ArithOp::Add => left.checked_add(right),
         ArithOp::Subtract => left.checked_sub(right),
@@ -175,6 +208,17 @@ fn integer(op: ArithOp, left: i64, right: i64, ty: ColumnType) -> Result<Datum> 
         // as `bigint out of range` rather than as a division error.
         ArithOp::Divide => left.checked_div(right),
         ArithOp::Modulo => left.checked_rem(right),
+        // Unreachable: answered above, before anything is range-checked, because these five do
+        // not overflow.
+        ArithOp::BitAnd
+        | ArithOp::BitOr
+        | ArithOp::BitXor
+        | ArithOp::ShiftLeft
+        | ArithOp::ShiftRight => {
+            return Err(SqlError::Internal(
+                "a bit operator reached the checked integer forms".to_owned(),
+            ));
+        }
         ArithOp::Power => {
             return Err(SqlError::Internal(
                 "integer ^ reached the integers".to_owned(),
@@ -183,6 +227,68 @@ fn integer(op: ArithOp, left: i64, right: i64, ty: ColumnType) -> Result<Datum> 
     }
     .ok_or_else(overflow)?;
     narrow(value, ty).ok_or_else(overflow)
+}
+
+/// Whether a type is one of the three the bit operators have.
+fn integer_type(ty: ColumnType) -> bool {
+    matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+}
+
+/// How many bits a value of this type has, which is also the modulus a shift count is taken in.
+fn bits(ty: ColumnType) -> u32 {
+    match ty {
+        ColumnType::Int2 => 16,
+        ColumnType::Int4 => 32,
+        _ => 64,
+    }
+}
+
+/// The five bit operators, at the declared width.
+///
+/// Computed in the *type's own* width and then widened back to an `i64`, which is what makes
+/// `~12::int2` a `smallint` of `-13` rather than an `i64` whose high bits are all set, and what
+/// makes `1::int4 << 31` the negative number PostgreSQL answers. **The shift count wraps**:
+/// `rem_euclid` rather than `%`, so a negative count shifts the other way round exactly as
+/// measured (`1::int4 << -1` is `1 << 31`).
+fn bitwise(op: ArithOp, left: i64, right: i64, ty: ColumnType) -> Datum {
+    let width = bits(ty);
+    let places = u32::try_from(right.rem_euclid(i64::from(width))).unwrap_or(0);
+    let value = match op {
+        ArithOp::BitAnd => left & right,
+        ArithOp::BitOr => left | right,
+        ArithOp::BitXor => left ^ right,
+        ArithOp::ShiftLeft => left.wrapping_shl(places),
+        // Arithmetic, so the sign bit is copied: `(-1) >> 1` is `-1`.
+        _ => sign_extend(left, width).wrapping_shr(places),
+    };
+    truncate(value, width)
+}
+
+/// An `i64` cut to `width` bits and sign-extended back, which is the value the declared type holds.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the truncation is the operation: a bit operator answers at its type's width, and \
+              a bit that walked off the top is one PostgreSQL drops too"
+)]
+fn truncate(value: i64, width: u32) -> Datum {
+    match width {
+        16 => Datum::Int2(value as i16),
+        32 => Datum::Int4(value as i32),
+        _ => Datum::Int8(value),
+    }
+}
+
+/// The same value read as a signed number of `width` bits, so a right shift copies the right bit.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "reading the low bits as the declared width is what sign-extending means"
+)]
+fn sign_extend(value: i64, width: u32) -> i64 {
+    match width {
+        16 => i64::from(value as i16),
+        32 => i64::from(value as i32),
+        _ => value,
+    }
 }
 
 /// The value as the width it was declared at, or `None` when it does not fit.
@@ -237,6 +343,20 @@ fn float(op: ArithOp, left: f64, right: f64) -> Result<f64> {
             return Err(SqlError::Internal("float % reached the floats".to_owned()));
         }
         ArithOp::Power => return power(left, right),
+        // Unreachable: `result_type` refuses a bit operator over anything but an integer, so no
+        // value of this type ever reaches one. Named rather than left to a catch-all so that a
+        // sixth operator cannot arrive here silently.
+        ArithOp::BitAnd
+        | ArithOp::BitOr
+        | ArithOp::BitXor
+        | ArithOp::ShiftLeft
+        | ArithOp::ShiftRight => {
+            return Err(SqlError::UndefinedOperator {
+                left: "double precision".to_owned(),
+                op: op.symbol(),
+                right: "double precision".to_owned(),
+            });
+        }
     })
 }
 
@@ -298,6 +418,20 @@ fn numeric(op: ArithOp, left: &Numeric, right: &Numeric) -> Result<Datum> {
         }
         ArithOp::Modulo => super::numeric::modulo(left, right).ok_or(SqlError::DivisionByZero)?,
         ArithOp::Power => return Err(SqlError::unsupported("the operator ^ over numeric")),
+        // Unreachable: `result_type` refuses a bit operator over anything but an integer, so no
+        // value of this type ever reaches one. Named rather than left to a catch-all so that a
+        // sixth operator cannot arrive here silently.
+        ArithOp::BitAnd
+        | ArithOp::BitOr
+        | ArithOp::BitXor
+        | ArithOp::ShiftLeft
+        | ArithOp::ShiftRight => {
+            return Err(SqlError::UndefinedOperator {
+                left: "numeric".to_owned(),
+                op: op.symbol(),
+                right: "numeric".to_owned(),
+            });
+        }
     };
     Ok(Datum::Numeric(Finite(value)))
 }
@@ -371,6 +505,20 @@ fn infinite(op: ArithOp, left: &Numeric, right: &Numeric) -> Result<Numeric> {
             }
         }
         ArithOp::Power => return Err(SqlError::unsupported("the operator ^ over numeric")),
+        // Unreachable: `result_type` refuses a bit operator over anything but an integer, so no
+        // value of this type ever reaches one. Named rather than left to a catch-all so that a
+        // sixth operator cannot arrive here silently.
+        ArithOp::BitAnd
+        | ArithOp::BitOr
+        | ArithOp::BitXor
+        | ArithOp::ShiftLeft
+        | ArithOp::ShiftRight => {
+            return Err(SqlError::UndefinedOperator {
+                left: "numeric".to_owned(),
+                op: op.symbol(),
+                right: "numeric".to_owned(),
+            });
+        }
     })
 }
 

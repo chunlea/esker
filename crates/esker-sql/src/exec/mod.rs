@@ -43,6 +43,7 @@ mod job;
 
 pub use job::BATCH_ROWS;
 pub(crate) mod query;
+mod recursive;
 pub mod redrive;
 mod savepoint;
 mod subquery;
@@ -201,6 +202,15 @@ pub struct Executor {
     /// rather than from the shared cache: they answer with its own uncommitted definitions, which
     /// must not reach the other sessions on this node (`crate::catalog`).
     catalog_written: bool,
+    /// The `CREATE INDEX CONCURRENTLY` this statement declared, to be driven **after** it commits.
+    ///
+    /// PostgreSQL answers a concurrent build when the build is done, and so does this node
+    /// (`esker.concurrent_index_build`). The drive cannot happen inside the statement: a job step
+    /// is a transaction of its own and would not see a declaration that is still uncommitted, so
+    /// the id is left here and `crate::exec::ddl::finish_concurrent_build` picks it up on the far
+    /// side of the commit. There is at most one, and it is only ever the implicit transaction's:
+    /// `25001` refuses the statement inside a block.
+    concurrent_build: Option<u64>,
     /// The snapshot this session reads at, when it is not reading the present.
     read_as_of: Option<ReadAsOf>,
     /// Whether the open transaction has run a statement.
@@ -796,6 +806,7 @@ impl Executor {
             last_sequence: None,
             savepoints: savepoint::Savepoints::default(),
             catalog_written: false,
+            concurrent_build: None,
             read_as_of: None,
             open_used: false,
             block_read_only: false,
@@ -1025,7 +1036,12 @@ impl Executor {
                         Ok(()) => {
                             // After the commit, and only after it.
                             self.report_columnar();
-                            Ok(outcome)
+                            // **And the concurrent build after that**, because a job step is a
+                            // transaction of its own and cannot see a declaration this one has
+                            // not committed yet. Its error is the statement's: a duplicate leaves
+                            // the invalid index behind and tells the client `23505`, which is
+                            // what a real server does (`crate::exec::ddl`).
+                            ddl::finish_concurrent_build(self).and(Ok(outcome))
                         }
                         Err(error) => Err(error),
                     };
@@ -1035,6 +1051,9 @@ impl Executor {
                     let _ = txn.rollback();
                     txn = self.open_txn()?;
                     self.catalog_written = false;
+                    // Declared by the attempt that is being thrown away, so the re-run declares
+                    // it again — and a job whose declaration was rolled back must not be driven.
+                    self.concurrent_build = None;
                 }
                 Err(error) => {
                     // The rollback's own failure is not what the client asked about; the
@@ -1055,6 +1074,7 @@ impl Executor {
         // A statement that did not commit changed nothing PD could act on, whether it was rolled
         // back or refused.
         self.columnar_changed = false;
+        self.concurrent_build = None;
         outcome
     }
 
@@ -1795,13 +1815,19 @@ impl Executor {
         let fields = planned
             .columns
             .iter()
-            .map(|column| match &column.user_type {
-                Some(def) => FieldDescription::of_user_type(
+            .map(|column| match (&column.user_type, column.pseudo) {
+                (Some(def), _) => FieldDescription::of_user_type(
                     column.name.clone(),
                     u32::try_from(def.oid).unwrap_or(0),
                     def.kind.typlen(),
                 ),
-                None => FieldDescription::of(column.name.clone(), column.ty, column.typmod),
+                // **A pseudo-type reaches a client here and nowhere else.** There is no value to
+                // render — the only one a cast to it accepts is NULL — so the oid and the length
+                // are the whole of what it is.
+                (None, Some(pseudo)) => {
+                    FieldDescription::of_user_type(column.name.clone(), pseudo.oid, pseudo.type_len)
+                }
+                (None, None) => FieldDescription::of(column.name.clone(), column.ty, column.typmod),
             })
             .collect();
         let tag = format!("SELECT {}", rows.len());
@@ -1931,7 +1957,7 @@ impl Executor {
         }
         let mut at = 0;
         for item in &mut resolved.projection {
-            let SelectItem::Expr { expr, alias } = item else {
+            let SelectItem::Expr { expr, alias, .. } = item else {
                 continue;
             };
             // PostgreSQL names the column after the function, so a bare call the user did not
@@ -2964,7 +2990,7 @@ impl Executor {
         // is what keeps `?column?` out of an answer a client reads by name.
         if let Statement::Select(select) = &mut *statement {
             for item in &mut select.projection {
-                if let crate::plan::SelectItem::Expr { expr, alias } = item
+                if let crate::plan::SelectItem::Expr { expr, alias, .. } = item
                     && alias.is_none()
                     && let Expr::CatalogFunc(call) = expr
                     && call.func == CatalogFunc::UserFunc
@@ -3021,11 +3047,22 @@ impl Executor {
         let path = self.resolution_path(txn)?;
         if let Statement::Select(select) = statement {
             for item in &mut select.projection {
-                let crate::plan::SelectItem::Expr { expr, .. } = item else {
+                let crate::plan::SelectItem::Expr {
+                    expr, user_type, ..
+                } = item
+                else {
                     continue;
                 };
+                // **What the cast named, before it is folded away.** The value a client gets is
+                // the label (ADR 0050) and the type it is told is the enum's, which is the pair
+                // `OID::Enum` is built from; taken here because this is the last place the type's
+                // name is still in the tree.
+                let named = Self::cast_target(self.tenant, &mut types, txn, expr, &path);
                 match Self::user_cast(self.tenant, &mut types, txn, expr, true, &path) {
-                    Ok(Some(resolved)) => *expr = resolved,
+                    Ok(Some(resolved)) => {
+                        *expr = resolved;
+                        *user_type = named;
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         failure.get_or_insert(error);
@@ -3109,6 +3146,39 @@ impl Executor {
             Some(schema) => format!("{schema}.{bare}"),
             None => bare,
         }))
+    }
+
+    /// The user-defined type a projection's cast names, or `None` if it is not one.
+    ///
+    /// Read **before** the cast is folded, and deliberately not part of the folding: the fold
+    /// answers a *value* and this answers the type that value is to be reported as. A composite
+    /// and a domain are types a client asks `pg_type` about exactly as an enum is, so all three
+    /// answer here; what they have in common is that the stored value's type is not the declared
+    /// one.
+    fn cast_target(
+        tenant: u64,
+        types: &mut Option<Vec<crate::catalog::TypeDef>>,
+        txn: &dyn Txn,
+        expr: &crate::plan::Expr,
+        path: &[String],
+    ) -> Option<crate::catalog::TypeDef> {
+        use crate::plan::{Expr, Literal};
+
+        // `'happy'::mood::text` is text: the outer cast is the one a client is told about.
+        let Expr::CatalogFunc(call) = expr else {
+            return None;
+        };
+        if call.func != crate::plan::CatalogFunc::UserCast {
+            return None;
+        }
+        let Some(Expr::Literal(Literal::String(name))) = call.args.first() else {
+            return None;
+        };
+        let known = match types {
+            Some(known) => known,
+            None => types.insert(crate::catalog::user_types(txn, tenant).ok()?),
+        };
+        Self::qualified_user_type(known, name, path).cloned()
     }
 
     /// One `UserCast` call, resolved. `printed` asks for the label rather than the ordinal.
