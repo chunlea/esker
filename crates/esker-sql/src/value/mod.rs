@@ -1106,37 +1106,9 @@ pub fn regclass_of_oid(oid: i64) -> Datum {
     }
 }
 
-/// The type an oid names, **including an array this node has no `ColumnType` for**.
-///
-/// Ten base types have a `typarray` on a real server and no array type here (ADR 0047), and their
-/// `pg_type` rows are derived from that link (`catalog::pg_catalog::derived_array_rows`). An oid
-/// that names one of those rows has a name, and it is the element's with `[]` after it: measured,
-/// `1020::regtype` is `box[]` and `2210::regtype` is `regclass[]`.
-///
-/// The inverse of [`Named::oid`], and it has to be asked wherever that is answered — a row in the
-/// catalog whose oid printed as its own digits was the third place this link had to reach, after
-/// `pg_type.typarray` and the row itself.
-#[must_use]
-pub fn named_by_oid(oid: u32) -> Option<Named> {
-    if let Some(ty) = type_by_oid(oid) {
-        return Some(Named::Scalar(ty));
-    }
-    // **Zero is `InvalidOid` and not a `typarray` to match against.** Every type that has no array
-    // answers `0` from [`array_oid`], so a search for `0` finds the first of them and would name
-    // an array of it: `0::regtype` answered `tsrange[][]` for exactly one probe's worth of time.
-    // It is `-` on a real server and the caller above says so; what this owes is `None`.
-    if oid == 0 {
-        return None;
-    }
-    ColumnType::ALL
-        .into_iter()
-        .find(|ty| array_oid(*ty) == oid)
-        .map(Named::Array)
-}
-
 /// A `regtype` from an oid, with the name this node's own type table gives it.
 pub fn regtype_of_oid(oid: u32) -> Datum {
-    let name = named_by_oid(oid).map_or_else(|| oid.to_string(), Named::printed);
+    let name = type_by_oid(oid).map_or_else(|| oid.to_string(), |ty| ty.name().to_owned());
     Datum::RegType {
         oid,
         name: name.into(),
@@ -1145,11 +1117,8 @@ pub fn regtype_of_oid(oid: u32) -> Datum {
 
 /// A type name, which may name an **array** of a type this node has.
 ///
-/// **Every array a column can hold is a `ColumnType`**, because a `typarray` naming a `pg_type`
-/// row that is not there is what left `ActiveRecord` unable to quote an array at all. Ten more
-/// exist in the catalog and cannot be stored — the six shapes, `regclass`, the two vectors and
-/// `lquery` — and those are [`Named::Array`] over a base type with no array `ColumnType`, which is
-/// what gives them a name and an oid without giving them a column type. So
+/// **Every array is storable now** — each of them is a `ColumnType`, because a `typarray` naming a
+/// `pg_type` row that is not there is what left `ActiveRecord` unable to quote an array at all. So
 /// `Named::Array(ty)` and `Named::Scalar(array_of(ty))` are two spellings of one type, and the
 /// variant is kept because a *name* can be written either way: `'decimal[]'::regtype` and
 /// `'_numeric'::regtype` reach it from opposite directions, and `numeric[][]` and `numeric[3]` are
@@ -1211,35 +1180,16 @@ pub fn array_oid(ty: ColumnType) -> u32 {
     match ty {
         // `regtype` is 2206 and `_regtype` is 2211.
         ColumnType::RegType => 2211,
-        // **Every base type has an array on a real server, and these ten were called gaps.** The
-        // comment here used to say "neither a `regclass` nor either vector has an array type on a
-        // real server", which is measured and false: `SELECT typname, typarray FROM pg_type` over
-        // the fifty types this node has answers a non-zero `typarray` for **all** of them.
-        //
-        // Nothing declares a column of one and nothing needs to: `typarray` is a *link*, and a
-        // client that follows it reads the array's row to learn the element type and the
-        // delimiter. `ActiveRecord` does exactly that, and it is how
-        // `type_lookup_test#test_array_delimiters_are_looked_up_correctly` fails — `_box` is the
-        // only array in the suite whose delimiter is a semicolon, so with no row for 1020 the
-        // adapter builds no type for it and dies on `undefined method 'delimiter'`. Measured, all
-        // ten (`tests/corpus/pg19_array_types.txt`):
-        ColumnType::Lseg => 1018,
-        ColumnType::Box => 1020,
-        ColumnType::Path => 1019,
-        ColumnType::Polygon => 1027,
-        ColumnType::Circle => 719,
-        ColumnType::Line => 629,
-        ColumnType::RegClass => 2210,
-        ColumnType::Int2Vector => 1006,
-        ColumnType::OidVector => 1013,
-        // **This node's own number**, like every other extension type's: a real server allocates
-        // `lquery`'s oid per database, and `hstore`, `citext` and `ltree` are each pinned here at
-        // a fixed pair with the array one above the type (`_ltree` is `ltree` + 1).
-        ColumnType::LQuery => 16407,
+        // No `_regclass` here: an array of a regclass is not a type this node offers, so the
+        // link is a zero rather than a pointer at a `pg_type` row that is not there.
+        // Neither a `regclass` nor either vector has an array type on a real server.
         // There is no array of an array: an array type is a constructor over a *scalar* here, so
         // asking for one has no answer and `0` is `InvalidOid`, which is what a real server's
         // `typarray` holds for a type that has no array.
-        ColumnType::Int8Array
+        ColumnType::RegClass
+        | ColumnType::Int2Vector
+        | ColumnType::OidVector
+        | ColumnType::Int8Array
         | ColumnType::Int4Array
         | ColumnType::Int2Array
         | ColumnType::NumericArray
@@ -1282,8 +1232,18 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // gap rather than a guess at an oid that is allocated per database anyway.
         | ColumnType::FloatRange
         | ColumnType::VarcharRange
+        // **And no array of a shape here.** A real server pairs each with one (`_lseg` 1018 and
+        // so on) and `geometric_test.rb` declares none, so this is a named gap rather than six
+        // more types — the same call `floatrange[]` got.
+        | ColumnType::Lseg
+        | ColumnType::Box
+        | ColumnType::Path
+        | ColumnType::Polygon
+        | ColumnType::Circle
+        | ColumnType::Line
         | ColumnType::XmlArray
-        | ColumnType::LtreeArray => 0,
+        | ColumnType::LtreeArray
+        | ColumnType::LQuery => 0,
         // **Every range type has its array now**, which is what run 58 was: `range_test.rb`
         // declares two range arrays and an array type is built per element type, so three of the
         // four left its 46 tests exactly where they were. The oids are PostgreSQL's own and each
