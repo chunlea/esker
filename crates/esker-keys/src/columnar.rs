@@ -147,6 +147,12 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::PolygonArray => 99,
         ColumnType::CircleArray => 100,
         ColumnType::LineArray => 101,
+        // **102, and no row will ever carry it.** `void` is a pseudo-type: no column is declared
+        // as one, so nothing is ever encoded with this tag. It is here because the vocabulary is
+        // total — a type in `ColumnType::ALL` without an arm is a compile error, which is the
+        // property that keeps the two tag spaces in step — and because a tag that exists cannot
+        // later be handed to something else by accident.
+        ColumnType::Void => 102,
         ColumnType::FloatRange => 60,
         ColumnType::VarcharRange => 61,
         ColumnType::Money => 62,
@@ -251,6 +257,7 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         99 => ColumnType::PolygonArray,
         100 => ColumnType::CircleArray,
         101 => ColumnType::LineArray,
+        102 => ColumnType::Void,
         60 => ColumnType::FloatRange,
         61 => ColumnType::VarcharRange,
         62 => ColumnType::Money,

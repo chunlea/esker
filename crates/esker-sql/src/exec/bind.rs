@@ -1472,6 +1472,9 @@ pub(super) fn substitute_placeholders(statement: &mut Statement, types: &[Column
 )]
 fn placeholder(ty: ColumnType) -> Datum {
     match ty {
+        // **A void's stand-in is its real value**, which is the empty string: unlike every other
+        // placeholder here it is not a stand-in at all, because a `void` has exactly one value.
+        ColumnType::Void => Datum::Text(String::new()),
         // Oid zero, which is `InvalidOid` and prints as its digits: what stands in is never read,
         // only its type is.
         ColumnType::RegType => crate::value::regtype_of_oid(0),

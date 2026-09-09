@@ -2668,6 +2668,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
     for column in &create.columns {
         let column_name = ident(&column.name);
         let (ty, typmod, user_type_name) = lower_column_type(&column.data_type)?;
+        refuse_pseudo_type(ty, &column_name)?;
         let mut not_null = false;
         let mut default = None;
         let mut default_expr: Option<String> = None;
@@ -2945,6 +2946,7 @@ fn lower_alter_table(
             } = op
             {
                 let (ty, typmod, user_type) = lower_column_type(data_type)?;
+                refuse_pseudo_type(ty, &ident(column_name))?;
                 if let Some(name) = user_type {
                     return Err(SqlError::unsupported(format!(
                         "ALTER TABLE ... ALTER COLUMN ... TYPE {name}"
@@ -3061,6 +3063,7 @@ fn lower_alter_table(
             "ALTER TABLE ... ADD COLUMN at a position",
         )?;
         let (ty, typmod, user_type_name) = lower_column_type(&column_def.data_type)?;
+        refuse_pseudo_type(ty, &ident(&column_def.name))?;
         let mut not_null = false;
         let mut collation: Option<String> = None;
         let mut primary_key = false;
@@ -8253,6 +8256,23 @@ fn using_cast_target<'a>(expr: &'a Expr, column: &str) -> Option<&'a DataType> {
         || matches!(unwrap_nested(inner), Expr::CompoundIdentifier(parts)
             if parts.last().is_some_and(|part| ident(part) == column));
     names_the_column.then_some(data_type)
+}
+
+/// `42P16` for a column declared as a pseudo-type, which is what `void` is.
+///
+/// Measured: `CREATE TABLE zz (c void)` is `42P16 column "c" has pseudo-type void`, and so is
+/// `ALTER TABLE ... ALTER COLUMN c TYPE void` and `ADD COLUMN d void` — the check is per column and
+/// PostgreSQL names it. `void` is in this crate's vocabulary because a *function* returns one
+/// (`pg_advisory_lock`), never because a row holds one, and this is the line that keeps those two
+/// facts from turning into each other.
+fn refuse_pseudo_type(ty: ColumnType, column: &str) -> Result<()> {
+    if ty == ColumnType::Void {
+        return Err(SqlError::PseudoTypeColumn {
+            column: column.to_owned(),
+            ty: "void",
+        });
+    }
+    Ok(())
 }
 
 fn lower_column_type(data_type: &DataType) -> Result<(ColumnType, i32, Option<String>)> {

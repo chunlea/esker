@@ -139,6 +139,20 @@ pub enum SqlError {
     #[error("cannot drop columns from view")]
     CannotDropViewColumns,
 
+    /// A column declared as a **pseudo-type**: `42P16`, and PostgreSQL names the column.
+    ///
+    /// `void` is the one this vocabulary has, and it is here because it arrived *as a type* — the
+    /// return of `pg_advisory_lock` — rather than as storage. Measured:
+    /// `CREATE TABLE zz (c void)` is `42P16 column "c" has pseudo-type void`, and the check is per
+    /// column, so `(c int, d void)` names `d`.
+    #[error("column \"{column}\" has pseudo-type {ty}")]
+    PseudoTypeColumn {
+        /// The column as written.
+        column: String,
+        /// The pseudo-type's name.
+        ty: &'static str,
+    },
+
     /// A write on a view that is not **auto-updatable**, in PostgreSQL's own three sentences.
     ///
     /// A simple view — one relation, no `DISTINCT`, no grouping, no `LIMIT`, every projection a
@@ -3177,7 +3191,8 @@ impl SqlError {
             // class PostgreSQL puts a view's shape rules in too.
             SqlError::MultiplePrimaryKeys(_)
             | SqlError::CannotRenameViewColumn { .. }
-            | SqlError::CannotDropViewColumns => sqlstate::INVALID_TABLE_DEFINITION,
+            | SqlError::CannotDropViewColumns
+            | SqlError::PseudoTypeColumn { .. } => sqlstate::INVALID_TABLE_DEFINITION,
             SqlError::ForeignKeyViolation { .. } | SqlError::ForeignKeyStillReferenced { .. } => {
                 sqlstate::FOREIGN_KEY_VIOLATION
             }

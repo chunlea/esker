@@ -1,0 +1,16 @@
+SELECT 'r', pg_advisory_unlock_all()	text,void	r|
+SELECT 'r', pg_typeof(pg_advisory_unlock_all())	text,regtype	r|void
+SELECT 'r', pg_advisory_lock(1)	text,void	r|
+SELECT 'r', pg_typeof(pg_advisory_lock(1))	text,regtype	r|void
+SELECT 'r', pg_advisory_unlock(1)	text,boolean	r|t
+SELECT 'r', pg_typeof(pg_advisory_unlock(1))	text,regtype	r|boolean
+SELECT 'r', pg_try_advisory_lock(2), pg_typeof(pg_try_advisory_lock(2))	text,boolean,regtype	r|t|boolean
+SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput, typarray FROM pg_type WHERE typname = 'void'	oid,name,smallint,"char","char","char",regproc,oid	2278|void|4|p|P|,|void_in|0
+SELECT 'r', pg_advisory_unlock_all() IS NULL	text,boolean	r|f
+SELECT 'r', pg_advisory_unlock_all()::text, pg_typeof(pg_advisory_unlock_all()::text)	text,text,regtype	r||text
+SELECT 'r', length(pg_advisory_unlock_all()::text)	text,integer	r|0
+SELECT format_type(2278, -1)	text	void
+SELECT count(*) FROM (SELECT pg_advisory_unlock_all()) s	bigint	1
+SELECT 'r', pg_typeof(pg_notify('c','p'))	text,regtype	r|void
+SELECT proname, prorettype FROM pg_proc WHERE proname IN ('pg_advisory_lock','pg_advisory_unlock','pg_advisory_unlock_all','pg_try_advisory_lock') ORDER BY proname, prorettype	name,oid	pg_advisory_lock|2278 ; pg_advisory_lock|2278 ; pg_advisory_unlock|16 ; pg_advisory_unlock|16 ; pg_advisory_unlock_all|2278 ; pg_try_advisory_lock|16 ; pg_try_advisory_lock|16
+SELECT 'r', pg_advisory_lock(1), pg_advisory_unlock_all()	text,void,void	r||

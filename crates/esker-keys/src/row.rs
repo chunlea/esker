@@ -563,6 +563,10 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         // OID, its positive `typlen` and the truncation applied before it ever reaches here.
         | ColumnType::Name
         | ColumnType::Bpchar
+        // **A `void` never reaches here**, because no column is one — but its value *is* a
+        // `Datum::Text("")`, so this is where it would land and answering anything else would be
+        // a second representation for a type that already has one.
+        | ColumnType::Void
         | ColumnType::Json
         | ColumnType::Int2Vector
         | ColumnType::OidVector
@@ -1192,6 +1196,9 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::RegType
             | ColumnType::RegTypeArray
             | ColumnType::RegClass
+            // **A pseudo-type is not a key because it is not a column.** Nothing is ever stored as
+            // a `void`, so there is no order for a key to encode.
+            | ColumnType::Void
             // The two catalog vectors, which `decode_key_column` refuses below.
             | ColumnType::Int2Vector
             | ColumnType::OidVector
@@ -1244,6 +1251,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         ColumnType::RegType
         | ColumnType::RegTypeArray
         | ColumnType::RegClass
+        | ColumnType::Void
         | ColumnType::Int2Vector
         | ColumnType::OidVector => {
             return Err(not_a_key());
@@ -2072,6 +2080,10 @@ mod tests {
     fn values_of(ty: ColumnType) -> proptest::strategy::BoxedStrategy<Datum> {
         use proptest::prelude::*;
         let values: BoxedStrategy<Datum> = match ty {
+            // **One value, and it is zero characters.** A `void` is never in a row, so this is
+            // the strategy for a type the round trip cannot reach — a single constant rather than
+            // a generator, which is what says so.
+            ColumnType::Void => Just(Datum::Text(String::new())).boxed(),
             ColumnType::Int8 => any::<i64>().prop_map(Datum::Int8).boxed(),
             // Any oid with any name, because the row codec must return both unchanged and neither
             // constrains the other: an oid with no type carries its own digits, and two spellings
@@ -2378,9 +2390,14 @@ mod tests {
         // `ALL` and the user-range representations beside it: the second list is not in the
         // first for the reason `ColumnType::USER_RANGES` gives, and a codec property that
         // skipped it would leave two stored types unchecked.
+        // **`void` is not one of them.** It is in `ALL` because it has a `pg_type` row, and it is
+        // a *pseudo*-type: no column may be declared one (`42P16`), so no row ever holds one and
+        // there is nothing here for the codec to round-trip. `Datum::fits` says the same from the
+        // other side, which is what makes this a filter rather than a special case.
         let every: Vec<ColumnType> = ColumnType::ALL
             .into_iter()
             .chain(ColumnType::USER_RANGES)
+            .filter(|ty| *ty != ColumnType::Void)
             .collect();
         proptest::collection::vec(proptest::sample::select(every), columns).prop_flat_map(
             move |types| {

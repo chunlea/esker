@@ -1219,6 +1219,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // asking for one has no answer and `0` is `InvalidOid`, which is what a real server's
         // `typarray` holds for a type that has no array.
         ColumnType::RegClass
+        // **`typarray` is 0 for a pseudo-type**, measured: there is no `_void`.
+        | ColumnType::Void
         | ColumnType::Int2Vector
         | ColumnType::OidVector
         | ColumnType::Int8Array
@@ -1471,7 +1473,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray
         | ColumnType::Point
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::Void | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
     }
 }
 
@@ -1579,6 +1581,8 @@ impl PgType for ColumnType {
             return array_oid(element);
         }
         match self {
+            // Measured: `'void'::regtype::oid`.
+            ColumnType::Void => 2278,
             ColumnType::Bool => 16,
             ColumnType::Bytea => 17,
             ColumnType::Name => 19,
@@ -1700,6 +1704,7 @@ impl PgType for ColumnType {
     )]
     fn name(self) -> &'static str {
         match self {
+            ColumnType::Void => "void",
             // What an error message calls it: the element's name with `[]`, which is how
             // PostgreSQL words `cannot cast type integer[] to uuid` — not the internal `_int4`
             // that `pg_type.typname` holds.
@@ -1817,6 +1822,9 @@ impl PgType for ColumnType {
 
     fn type_len(self) -> i16 {
         match self {
+            // **4, and positive**, which is what a real server reports for a pseudo-type whose
+            // value is nothing — measured beside `typtype = 'p'`.
+            ColumnType::Void => 4,
             ColumnType::Bool => 1,
             // **64 and positive**, where every other string type answers -1: `name` is fixed
             // width. A client reads this from the `RowDescription` and from `pg_attribute.attlen`.
@@ -2025,6 +2033,10 @@ impl PgDatum for Datum {
     )]
     fn from_text(ty: ColumnType, text: &str) -> Result<Datum> {
         Ok(match ty {
+            // **A void has one value and it is zero characters**, so its input function ignores
+            // what it was handed: `void_in` exists on a real server for the same reason, and
+            // nothing calls it either.
+            ColumnType::Void => Datum::Text(String::new()),
             // **A name, and `42704` for one that is not a type** — measured, `'nosuchtype'::regtype`
             // says `type "nosuchtype" does not exist`. The opposite direction does not match: an
             // *oid* that is no type is not an error, it prints as its digits (`999999::regtype`),
@@ -2317,6 +2329,8 @@ impl PgDatum for Datum {
             })
         };
         Ok(match ty {
+            // Its one value, whatever bytes arrived — there is no wire form to read.
+            ColumnType::Void => Datum::Text(String::new()),
             // Four bytes, the oid, which is `oidrecv`'s shape — the name is derived, exactly as it
             // is for the `<oid>::regtype` cast.
             ColumnType::RegType => {
