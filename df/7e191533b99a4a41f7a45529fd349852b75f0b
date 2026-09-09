@@ -1,0 +1,21 @@
+crates/esker-sql/src/backend/locks.rs
+  s_2bed4ac2b1c944::t_0e4013acc7b4ab 153-174,249-274
+crates/esker-sql/tests/nested_savepoint_deadlock.rs
+  s_2bed4ac2b1c944::t_c29ae4a2c7a170 1-121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "df7e191533b99a4a41f7a45529fd349852b75f0b",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
