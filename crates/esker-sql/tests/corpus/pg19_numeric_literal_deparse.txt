@@ -1,0 +1,96 @@
+# **How `pg_get_expr` prints a numeric constant**, measured in every position that reads one.
+#
+# `docs/plans/debts-v1.1.md` #22: `exec::ddl::deparse_literal` prints a number bare whatever its
+# type, and PostgreSQL does not. The row moved off #12 when b4's `int4` ladder landed — the node
+# now knows `1` is an `int4` and `1::bigint` an `int8`, so the information the printer needs is
+# there and the printer does not use it. This file is what it should do instead.
+#
+# **Three forms, and which one is used is a property of the *node*, not of the value.**
+#
+#   * **bare `N`** — a constant whose type is the one the literal form defaults to. An integer
+#     literal defaults to `integer` and a decimal literal to `numeric`, so `1` prints `1` and
+#     `1.5` prints `1.5`, and `1::integer` and `1.5::numeric` print the same because the cast names
+#     the type it already had;
+#   * **`(N)::type`** — a **cast node** over such a constant, whether a user wrote it or coercion
+#     inserted it. Written: `1::bigint` is `(1)::bigint`. Inserted: `nm > 1` is
+#     `(nm > (1)::numeric)` and `greatest(i8, 1)` is `GREATEST(i8, (1)::bigint)`, because the
+#     comparison and the function pick a common type and the literal is coerced up to it;
+#   * **`'N'::type`** — a **bare constant whose type is not the default**, which is what the scanner
+#     produces for an integer too wide for `integer` and what constant-folding produces for a
+#     signed one: `9223372036854775807` is `'9223372036854775807'::bigint`, `-1` is
+#     `'-1'::integer`, and `99999999999999999999999999` is `'…'::numeric`.
+#
+# The three compose exactly as the tree does. `-1::bigint` is `(- (1)::bigint)`, because `::` binds
+# tighter than unary minus, so it is an operator over a cast and not a signed constant; and
+# `(-1)::bigint` is `('-1'::integer)::bigint`, a cast over a folded signed constant. Neither is
+# reasoning — both are rows below.
+#
+# **`i8 > 1` prints `(i8 > 1)`.** No coercion happens: PostgreSQL has an `int8 > int4` operator, so
+# the literal stays an `integer` constant of the default type and prints bare. The same statement
+# against `numeric` or `double precision` has no such operator and the literal *is* coerced, which
+# is why `nm > 1` and `f8 > 1` show a cast and `i8 > 1` and `i2 > 1` do not. A rule about the
+# *column's* width would get all four wrong.
+#
+# **The same rule in four readers**, which is the other half of why this file exists: a generated
+# column (`pg_get_expr(adbin)`), a `DEFAULT` (the same row read the same way), an index key
+# (`pg_get_expr(indexprs)`) and a `CHECK` (`pg_get_constraintdef`) all print
+# `(i8 + (1)::bigint)`-shaped text from the same deparser.
+#
+# **A `DEFAULT` stores the expression as written and *not* the assignment cast to the column.**
+# `f8 double precision DEFAULT 1.5` prints `1.5` — a `numeric` constant of the default type — while
+# `DEFAULT 1.5::double precision` prints `(1.5)::double precision`. So the column's type is not a
+# clue about what its default prints as, and `pg_attrdef` is the expression rather than the value
+# the column will take.
+#
+# Captured against esker-pg19 (PostgreSQL 19beta1) with
+# `sesscap.py captures-src/pg19_numeric_literal_deparse.txt.in`, inside one `BEGIN ... ROLLBACK`,
+# and verified idempotent by replaying `cut -f1` of the result through the same recorder.
+BEGIN		-
+CREATE TABLE g1nl (i2 smallint, i4 integer, i8 bigint, nm numeric, f4 real, f8 double precision)		-
+ALTER TABLE g1nl ADD COLUMN k_int integer GENERATED ALWAYS AS (1) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_i2 smallint GENERATED ALWAYS AS (1::smallint) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_i4 integer GENERATED ALWAYS AS (1::integer) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_i8 bigint GENERATED ALWAYS AS (1::bigint) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_nm numeric GENERATED ALWAYS AS (1::numeric) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_f4 real GENERATED ALWAYS AS (1::real) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_f8 double precision GENERATED ALWAYS AS (1::double precision) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_dec numeric GENERATED ALWAYS AS (1.5) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_dec_nm numeric GENERATED ALWAYS AS (1.5::numeric) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_dec_f8 double precision GENERATED ALWAYS AS (1.5::double precision) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_big bigint GENERATED ALWAYS AS (9223372036854775807) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_wide numeric GENERATED ALWAYS AS (99999999999999999999999999) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_neg integer GENERATED ALWAYS AS (-1) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_neg_i8 bigint GENERATED ALWAYS AS (-1::bigint) STORED		-
+ALTER TABLE g1nl ADD COLUMN k_neg_par bigint GENERATED ALWAYS AS ((-1)::bigint) STORED		-
+ALTER TABLE g1nl ADD COLUMN c_i4_lit boolean GENERATED ALWAYS AS (i4 > 1) STORED		-
+ALTER TABLE g1nl ADD COLUMN c_i8_lit boolean GENERATED ALWAYS AS (i8 > 1) STORED		-
+ALTER TABLE g1nl ADD COLUMN c_i2_lit boolean GENERATED ALWAYS AS (i2 > 1) STORED		-
+ALTER TABLE g1nl ADD COLUMN c_nm_lit boolean GENERATED ALWAYS AS (nm > 1) STORED		-
+ALTER TABLE g1nl ADD COLUMN c_f8_lit boolean GENERATED ALWAYS AS (f8 > 1) STORED		-
+ALTER TABLE g1nl ADD COLUMN c_i8_cast boolean GENERATED ALWAYS AS (i8 > 1::bigint) STORED		-
+ALTER TABLE g1nl ADD COLUMN c_i4_wide boolean GENERATED ALWAYS AS (i4 > 9223372036854775807) STORED		-
+ALTER TABLE g1nl ADD COLUMN c_nm_dec boolean GENERATED ALWAYS AS (nm > 1.5) STORED		-
+ALTER TABLE g1nl ADD COLUMN a_i8_plus bigint GENERATED ALWAYS AS (i8 + 1) STORED		-
+ALTER TABLE g1nl ADD COLUMN a_i4_plus integer GENERATED ALWAYS AS (i4 + 1) STORED		-
+ALTER TABLE g1nl ADD COLUMN a_lit_i8 bigint GENERATED ALWAYS AS (1::bigint + 1) STORED		-
+ALTER TABLE g1nl ADD COLUMN f_abs_lit integer GENERATED ALWAYS AS (abs(1)) STORED		-
+ALTER TABLE g1nl ADD COLUMN f_abs_i8 bigint GENERATED ALWAYS AS (abs(1::bigint)) STORED		-
+ALTER TABLE g1nl ADD COLUMN f_abs_i4 integer GENERATED ALWAYS AS (abs(i4)) STORED		-
+ALTER TABLE g1nl ADD COLUMN f_grt integer GENERATED ALWAYS AS (greatest(i4, 1)) STORED		-
+ALTER TABLE g1nl ADD COLUMN f_grt_i8 bigint GENERATED ALWAYS AS (greatest(i8, 1)) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nl'::regclass AND a.attnum > 6 ORDER BY a.attnum		r|k_int|1 ; r|k_i2|(1)::smallint ; r|k_i4|1 ; r|k_i8|(1)::bigint ; r|k_nm|(1)::numeric ; r|k_f4|(1)::real ; r|k_f8|(1)::double precision ; r|k_dec|1.5 ; r|k_dec_nm|1.5 ; r|k_dec_f8|(1.5)::double precision ; r|k_big|'9223372036854775807'::bigint ; r|k_wide|'99999999999999999999999999'::numeric ; r|k_neg|'-1'::integer ; r|k_neg_i8|(- (1)::bigint) ; r|k_neg_par|('-1'::integer)::bigint ; r|c_i4_lit|(i4 > 1) ; r|c_i8_lit|(i8 > 1) ; r|c_i2_lit|(i2 > 1) ; r|c_nm_lit|(nm > (1)::numeric) ; r|c_f8_lit|(f8 > (1)::double precision) ; r|c_i8_cast|(i8 > (1)::bigint) ; r|c_i4_wide|(i4 > '9223372036854775807'::bigint) ; r|c_nm_dec|(nm > 1.5) ; r|a_i8_plus|(i8 + 1) ; r|a_i4_plus|(i4 + 1) ; r|a_lit_i8|((1)::bigint + 1) ; r|f_abs_lit|abs(1) ; r|f_abs_i8|abs((1)::bigint) ; r|f_abs_i4|abs(i4) ; r|f_grt|GREATEST(i4, 1) ; r|f_grt_i8|GREATEST(i8, (1)::bigint)
+CREATE TABLE g1nd (i4 integer DEFAULT 1, i8 bigint DEFAULT 1, i8c bigint DEFAULT 1::bigint, nm numeric DEFAULT 1.5, f8 double precision DEFAULT 1.5, f8c double precision DEFAULT 1.5::double precision, ng integer DEFAULT -1, ngc bigint DEFAULT -1::bigint, big bigint DEFAULT 9223372036854775807)		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nd'::regclass ORDER BY a.attnum		r|i4|1 ; r|i8|1 ; r|i8c|(1)::bigint ; r|nm|1.5 ; r|f8|1.5 ; r|f8c|(1.5)::double precision ; r|ng|'-1'::integer ; r|ngc|(- (1)::bigint) ; r|big|'9223372036854775807'::bigint
+CREATE INDEX g1nl_ix1 ON g1nl ((i8 + 1))		-
+CREATE INDEX g1nl_ix2 ON g1nl ((i8 + 1::bigint))		-
+CREATE INDEX g1nl_ix3 ON g1nl ((abs(1::bigint)))		-
+SELECT 'r', pg_get_expr(x.indexprs, x.indrelid) FROM pg_index x WHERE x.indexrelid = 'g1nl_ix1'::regclass		r|(i8 + 1)
+SELECT 'r', pg_get_expr(x.indexprs, x.indrelid) FROM pg_index x WHERE x.indexrelid = 'g1nl_ix2'::regclass		r|(i8 + (1)::bigint)
+SELECT 'r', pg_get_expr(x.indexprs, x.indrelid) FROM pg_index x WHERE x.indexrelid = 'g1nl_ix3'::regclass		r|abs((1)::bigint)
+CREATE TABLE g1nc (i4 integer, i8 bigint, CONSTRAINT g1nc_a CHECK (i4 > 1), CONSTRAINT g1nc_b CHECK (i8 > 1), CONSTRAINT g1nc_c CHECK (i8 > 1::bigint))		-
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'g1nc'::regclass ORDER BY conname		r|g1nc_a|CHECK ((i4 > 1)) ; r|g1nc_b|CHECK ((i8 > 1)) ; r|g1nc_c|CHECK ((i8 > (1)::bigint))
+DROP TABLE g1nc		-
+DROP TABLE g1nd		-
+DROP TABLE g1nl		-
+ROLLBACK		-
+SELECT 'r', count(*) FROM pg_class WHERE relname IN ('g1nl','g1nd','g1nc')	text,bigint	r|0
