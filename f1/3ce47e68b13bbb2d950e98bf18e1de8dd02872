@@ -1,0 +1,43 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_6f7019c05b578b::t_9b344c75188618 2244
+crates/esker-sql/src/exec/aggregate.rs
+  s_6f7019c05b578b::t_3a51f793c506c6 1120
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_b1171349ca9f90 5443
+crates/esker-sql/src/plan/expr.rs
+  s_6f7019c05b578b::t_b1a75d1828ad70 2184
+crates/esker-sql/tests/array_subquery.rs
+  s_6f7019c05b578b::t_5fab52f450da13 26
+crates/esker-sql/tests/case_expression.rs
+  s_6f7019c05b578b::t_afe5fe8db7953b 15
+crates/esker-sql/tests/int4.rs
+  s_6f7019c05b578b::t_f589f1820eb784 30
+crates/esker-sql/tests/provenance_budget.rs
+  s_6f7019c05b578b::t_bfbe20e23b0de6 26
+crates/esker-sql/tests/srf_target_list.rs
+  s_6f7019c05b578b::t_f9d99125219dc6 20
+crates/esker-sql/tests/values_relation.rs
+  s_6f7019c05b578b::t_9d9469e4980426 20
+docs/adr/0046-arithmetic-is-its-own-node-and-postgresql-s-promotion-table.md
+  s_6f7019c05b578b::t_1fe9f6a0ba97bc 87
+docs/adr/0048-a-values-list-is-a-relation-with-a-synthetic-tabledef.md
+  s_6f7019c05b578b::t_3c79fd375bea20 56
+docs/adr/0087-an-integer-literal-is-the-narrowest-type-that-holds-it.md
+  s_6f7019c05b578b::t_876f5b3d36cd30 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f13ce47e68b13bbb2d950e98bf18e1de8dd02872",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
