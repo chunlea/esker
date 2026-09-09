@@ -3118,19 +3118,29 @@ pub fn rename_sequence(
     sequence: &SequenceDef,
     to: &str,
 ) -> Result<()> {
-    if txn.get(&record::name_key(tenant, to))?.is_some() {
+    // **The new name goes in the sequence's own schema**, which is the third face of one
+    // mechanism: a table's `RENAME TO` and an index's each asked `public` for a bare target
+    // before this one did. `ALTER TABLE "my.schema"."posts_id_seq" RENAME TO "articles_id_seq"`
+    // is what `SchemaWithDotsTest#test_rename_table` sends after renaming the table, and
+    // `public.articles_id_seq` is a suite fixture's sequence that is always there — so the check
+    // fired on a name in a schema nobody had named. Measured on 19beta1: the statement succeeds
+    // and the sequence stays in `my.schema`; a collision **inside** that schema is still
+    // `42P07 relation "a_seq" already exists`.
+    let target = qualify(split_qualified(&sequence.name).0, to);
+    if txn.get(&record::name_key(tenant, &target))?.is_some() {
+        // The bare name in the message, the way every `42P07` names what the user wrote.
         return Err(SqlError::DuplicateTable(to.to_owned()));
     }
     let mut renamed = sequence.clone();
     renamed.name.clear();
-    renamed.name.push_str(to);
+    renamed.name.push_str(&target);
     txn.delete(&record::name_key(tenant, &sequence.name));
     txn.put(
         &record::sequence_key(tenant, renamed.table_id, renamed.id),
         &record::encode_sequence(&renamed),
     );
     txn.put(
-        &record::name_key(tenant, to),
+        &record::name_key(tenant, &target),
         &record::encode_relation(&Relation::Sequence {
             table_id: renamed.table_id,
             sequence_id: renamed.id,
