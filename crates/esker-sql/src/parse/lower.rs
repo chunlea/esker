@@ -45,7 +45,8 @@ impl Parsed {
     ///
     /// The option list's own refusals — an unrecognised option or value, `FORMAT` written outside
     /// the parentheses — raised here exactly as they are when the whole statement is lowered,
-    /// because it is the same reader ([`explain_settings`]).
+    /// because it is the same reader — the private `explain_settings` below, which is the one
+    /// function in this module that reads an option list.
     pub fn explain_options(&self) -> Result<Option<(bool, plan::ExplainFormat)>> {
         Ok(explain_settings(&self.statement)?.map(|settings| (settings.analyze, settings.format)))
     }
