@@ -1,0 +1,21 @@
+crates/esker-raft/src/proptests.rs
+  s_2bed4ac2b1c944::t_f42c7037662119 69-100,149-167,175-187
+docs/adr/0085-a-vote-is-not-granted-to-a-learner.md
+  s_2bed4ac2b1c944::t_19900dd932f13d 1-104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "2d5763e164383a5fb1ba42ded39eba4f2b257b3e",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
