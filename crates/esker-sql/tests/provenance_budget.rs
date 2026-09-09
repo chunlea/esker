@@ -27,8 +27,10 @@
 /// `bigint` here against a real server's `integer`; and `name[]` with the folded cast that keeps
 /// its type (ADR 0086) deleted 61 more across sixteen — and then g1's rule-4 table and these two
 /// units met in a merge, which moved another sixteen `UNMEASURED` reasons out of `answers`
-/// entirely. Set from what the scan reports, never chosen.
-const BUDGET: usize = 147;
+/// entirely. Then 147 → 140 when a bare decimal became a `numeric` (ADR 0088), which closed seven
+/// more — the counterexample `docs/plans/phase-9-rails.md` recorded against the `float8` trade
+/// among them. Set from what the scan reports, never chosen.
+const BUDGET: usize = 140;
 
 #[test]
 fn unmeasured_divergences_do_not_grow() {

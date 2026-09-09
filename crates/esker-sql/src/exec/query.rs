@@ -3190,7 +3190,15 @@ fn resolve_case(
         };
         match common {
             None => common = Some(ty),
-            Some(chosen) if same_family(chosen, ty) => {}
+            // **The wider of the two, not the first one seen.** This kept whatever the head of the
+            // list carried and only checked that the rest were in its family, so
+            // `CASE WHEN true THEN 1.10 ELSE 2 END` settled on `integer` — the `ELSE` is walked
+            // first — and then refused to assign `1.10` to it. `carried_type` had always answered
+            // `numeric` for the same expression, so the declared type and the value path were
+            // two different rules; folded through `unify` they are one.
+            Some(chosen) if same_family(chosen, ty) => {
+                common = Some(unify(chosen, ty).unwrap_or(chosen));
+            }
             Some(chosen) => {
                 // The **resolved** type first and the offending one second, which is the
                 // order the list is walked in and therefore the order PostgreSQL names
@@ -3886,10 +3894,9 @@ fn retype_subscript(expr: &Expr, ty: ColumnType) -> Expr {
 /// The type a literal already carries, or `None` for the two that carry none.
 ///
 /// `unknown` (a quoted string) is the one that takes a type from its neighbour; NULL has no type
-/// and needs none. The other four are what PostgreSQL calls them, with the two divergences this
-/// node declares: a bare integer constant is `int4` on a real server and `int8` here, and a
-/// decimal constant is `numeric` there and `double precision` here — the same choice
-/// `Literal::Decimal` already makes everywhere else in this crate, `SELECT 1.5` included.
+/// and needs none. The other four are what PostgreSQL calls them, and there is no divergence left
+/// in the list: the `int4` rung (ADR 0087) closed the integer's width and a bare decimal is a
+/// `numeric` here as it is there.
 pub(super) fn literal_type(literal: &Literal) -> Option<ColumnType> {
     match literal {
         // **The one NULL that has a type**, which is why the variant exists: everything that asks
@@ -3906,7 +3913,11 @@ pub(super) fn literal_type(literal: &Literal) -> Option<ColumnType> {
         } else {
             ColumnType::Int8
         }),
-        Literal::Decimal(_) => Some(ColumnType::Double),
+        // **A bare decimal is a `numeric`.** It was a `float8`, which was a wrong *value* and not
+        // only a wrong type — `1.10` printed `1.1`, `0.1 + 0.2` printed `0.30000000000000004` —
+        // and a `float8` beside it still wins, because the promotion table is unchanged and only
+        // the literal's own type moved.
+        Literal::Decimal(_) => Some(ColumnType::Numeric),
         Literal::Bool(_) => Some(ColumnType::Bool),
         Literal::Typed(value) => value.column_type(),
     }
@@ -4754,7 +4765,9 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // latter, the type was gone by the time anything could ask, and the two concatenations
         // were indistinguishable.
         Expr::CatalogFunc(call) => catalog_func_type(call, scope),
-        Expr::Literal(Literal::Decimal(_)) => ColumnType::Double,
+        // **A bare decimal is a `numeric`**, which `literal_type` also says — the two must agree or
+        // a client is told one type and sent another's characters.
+        Expr::Literal(Literal::Decimal(_)) => ColumnType::Numeric,
 
         // `abs` is the one scalar function that answers its argument's type rather than `text`.
         //

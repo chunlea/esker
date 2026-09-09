@@ -52,21 +52,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     answers: &[
         // --- `int4`: the type a bare integer constant is ------------------------------------
         // --- `numeric`: the type a decimal constant is ----------------------------------------
-        (
-            "SELECT 0.1 = '0.1000000000000000000001'",
-            "**the `numeric` divergence, and this is where `double precision` stops reproducing \
-             it.** A real server reads the string as `numeric` and keeps all 22 digits, so the \
-             two differ and it answers `f`; this node reads it as `double precision`, which has \
-             about 17, so both are 0.1 and it answers `t`. Every decimal in the block above \
-             agrees, because `double` reproduces `numeric` for every value it can hold — ADR \
-             0031's rule, and its backlog.",
-            "UNMEASURED",
-        ),
-        (
-            "SELECT 1.5 = 'x'",
-            "the same divergence in a message: `numeric` there, `double precision` here.",
-            "UNMEASURED",
-        ),
         // **`SELECT 1 = 1.0` stood here and is deleted** (ADR 0031, rule 2). The entry recorded
         // the promotion as unfixable without breaking its own counterexample, `9007199254740993 =
         // 9007199254740992.0`. It was not: widening the integer to `f64` is what would have broken

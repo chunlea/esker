@@ -19,11 +19,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // row and the type agree.
     types: &[],
     answers: &[
-        (
-            "SELECT '2020-01-01'::date + 1.5",
-            "**A bare decimal constant is `numeric` on a real server and `double precision` here** — the divergence `tests/unknown_literal.rs` declares. Both raise the same `42883` for the same reason: `date` has no arithmetic with either type. One word of the message differs and nothing else does.",
-            "pg19_date.txt:97",
-        ),
         // `SELECT '2020-01-01'::date + NULL::interval` was here — the one place in these three
         // corpora where this node **raised where PostgreSQL returns a row**, because a dropped
         // cast made `NULL::interval` an untyped NULL that took the other side's type and resolved

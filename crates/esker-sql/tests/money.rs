@@ -47,11 +47,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "UNMEASURED",
         ),
         (
-            "SELECT 'r', '1.00'::money = 1.00",
-            "a decimal literal is a double precision here, so the refusal names it",
-            "UNMEASURED",
-        ),
-        (
             "SELECT 'r', 6 / '2.00'::money",
             "the refusal is raised from the datums and a literal's datum is still an i64, so it \
              names bigint where the declared type is already integer",

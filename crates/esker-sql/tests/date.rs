@@ -39,11 +39,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_date.txt:95",
         ),
         (
-            "SELECT '2020-01-01'::date + 1.5",
-            "Arithmetic. PostgreSQL raises `42883` and this node `0A000`: both refuse, and the reason differs — there the operator is missing for that *pair*, here for every pair.",
-            "pg19_date.txt:97",
-        ),
-        (
             "SELECT '2020-01-01'::date * 2",
             "Arithmetic; see above.",
             "pg19_date.txt:99",
