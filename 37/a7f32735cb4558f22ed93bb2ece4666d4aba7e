@@ -1,0 +1,21 @@
+crates/esker-store/tests/promotion.rs
+  s_6f7019c05b578b::t_a6e5b7fb5d749a 437-499,619,640-652
+docs/adr/0085-a-vote-is-not-granted-to-a-learner.md
+  s_6f7019c05b578b::t_db9c725542d934 43-56,104-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "37a7f32735cb4558f22ed93bb2ece4666d4aba7e",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
