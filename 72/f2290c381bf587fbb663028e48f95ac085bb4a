@@ -1,0 +1,37 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_6f7019c05b578b::t_a68db7b9673efc 1668-1759,1824-1837,1841-1849,1887,1889-1890
+crates/esker-sql/src/catalog/pg_constraint.rs
+  s_6f7019c05b578b::t_e55219c11ac243 355-370,373,377-379,617-619,621-623,633
+crates/esker-sql/src/catalog/pg_index.rs
+  s_6f7019c05b578b::t_af018a3879bf5d 197,199-203,220-224
+crates/esker-sql/src/exec/ddl.rs
+  s_6f7019c05b578b::t_f5824fbd351f93 220,732-740,5693-5694,5696-5712,5714-5727,5758-5779,6153-6186,6188,6191,6197-6203
+crates/esker-sql/tests/captures/pg19_deparse_census.txt
+  s_6f7019c05b578b::t_d2e450f5b1b9b0 687-787
+crates/esker-sql/tests/check_constraint_pretty.rs
+  s_6f7019c05b578b::t_2b425578bf6483 192-199,201,207-210
+crates/esker-sql/tests/corpus/pg19_deparse_census.txt
+  s_6f7019c05b578b::t_786024e97506b8 8-13,690-790
+crates/esker-sql/tests/deparse_census.rs
+  s_6f7019c05b578b::t_5acfc3049db376 9-10,26,38-43,45,47-49,52-54,57-59,61,77,214,219,224,229,234,239,244,249,254,259,264,269,274,279,284,289,294,308
+docs/adr/0090-a-stored-expression-is-deparsed-by-the-statement-that-writes-it.md
+  s_6f7019c05b578b::t_e94e2fd4e5b417 52-57,85-102
+docs/plans/debts-v1.1.md
+  s_6f7019c05b578b::t_61167ac6e01a36 41-50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "72f2290c381bf587fbb663028e48f95ac085bb4a",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
