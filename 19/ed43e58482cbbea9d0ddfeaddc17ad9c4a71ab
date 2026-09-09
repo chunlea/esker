@@ -1,0 +1,190 @@
+crates/esker-keys/src/array.rs
+  h_44076b318daf9c 89,110,146,167
+crates/esker-keys/src/columnar.rs
+  h_44076b318daf9c 66,71,158-159,265-268
+crates/esker-keys/src/row.rs
+  h_44076b318daf9c 159,489-500,532,545,577,758,991,1212-1213,1269-1270,1293,1507,2115-2120,2199,2212,2258-2262
+crates/esker-keys/src/value.rs
+  h_44076b318daf9c 463-470,527-543,588-589,605,639,653-654,674,902-913,1026-1027,1144,1212
+crates/esker-sql/src/catalog/pg_attribute.rs
+  h_44076b318daf9c 460,586-588,591,602-603,605,610-613
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 523-527,537,539-543,548,555,563,568,579-580,585-592,595-596,608-610,612,619-620,622,624,634,638-639,642,644-645,652,654,657,669,678,691-692,694,699,701-702,704,710,727,730,734,781,786-790,867,886,897-902,909,913,1000-1058,2150,2173-2177,2213-2218,2947,2952,3032-3035,3098-3102,3119,3173,3223-3228,3238-3240,3283,3286,3320,3333
+crates/esker-sql/src/catalog/pg_constraint.rs
+  h_44076b318daf9c 789-790,793-794,799-800,803-804,821
+crates/esker-sql/src/catalog/pg_index.rs
+  h_44076b318daf9c 483-485
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 357-364,506-507,516,521,664-665,674,679
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 599-618,3009-3011
+crates/esker-sql/src/exec/aggregate.rs
+  h_44076b318daf9c 267,275-280
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 1478-1482,1489-1493,1561,1592
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 2265-2282
+crates/esker-sql/src/exec/fragment.rs
+  h_44076b318daf9c 1044-1047,1071-1072,1186
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 3141-3154,3305-3313,3468,3559,3564,3588,3625-3627,4351-4366,5213-5227
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 6157-6182,6370-6381,6778-6791,6809-6817,8481-8489,8769-8782
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 2306,2395-2405,2445,2492,2538,2582,2702,2754
+crates/esker-sql/src/row.rs
+  h_44076b318daf9c 55-62,100,113,199
+crates/esker-sql/src/value/char_type.rs
+  h_44076b318daf9c 1-92
+crates/esker-sql/src/value/mod.rs
+  h_44076b318daf9c 39,58,345-346,348-351,385-402,1051-1061,1064-1069,1249-1251,1257-1258,1282,1295,1427-1435,1505,1517,1532,1644,1649-1651,1729,1742,1770-1773,1851,1884,1893-1894,1906,1949,2033-2035,2108-2113,2138-2147,2222,2235,2338,2424-2427,2434-2443,2510,2523,2654-2660,2797-2798,2800-2807,2942-2944,3308
+crates/esker-sql/src/value/oid.rs
+  h_44076b318daf9c 21-22,24-41,44-50,52-62,64-79,81,83-90,93
+crates/esker-sql/src/value/reg_proc.rs
+  h_44076b318daf9c 1-175
+crates/esker-sql/tests/activerecord_schema_dump.rs
+  h_44076b318daf9c 36
+crates/esker-sql/tests/alter_index.rs
+  h_44076b318daf9c 23
+crates/esker-sql/tests/array.rs
+  h_44076b318daf9c 19-22
+crates/esker-sql/tests/array_agg.rs
+  h_44076b318daf9c 17
+crates/esker-sql/tests/array_delimiter.rs
+  h_44076b318daf9c 24-31,66,76,81,85,137,142
+crates/esker-sql/tests/array_type_map.rs
+  h_44076b318daf9c 19-21,29-36,39-40,46-48
+crates/esker-sql/tests/bit_string.rs
+  h_44076b318daf9c 16-19
+crates/esker-sql/tests/captures/pg19_char_type.txt
+  h_44076b318daf9c 1-144
+crates/esker-sql/tests/captures/pg19_oid_type.txt
+  h_44076b318daf9c 1-89
+crates/esker-sql/tests/captures/pg19_reg_proc.txt
+  h_44076b318daf9c 1-91
+crates/esker-sql/tests/char_type.rs
+  h_44076b318daf9c 1-339
+crates/esker-sql/tests/check_constraint.rs
+  h_44076b318daf9c 15-22
+crates/esker-sql/tests/citext.rs
+  h_44076b318daf9c 15-20
+crates/esker-sql/tests/corpus/pg19_char_type.txt
+  h_44076b318daf9c 1-34
+crates/esker-sql/tests/corpus/pg19_order.txt
+  h_44076b318daf9c 51-52
+crates/esker-sql/tests/create_schema_elements.rs
+  h_44076b318daf9c 15-17
+crates/esker-sql/tests/create_sequence.rs
+  h_44076b318daf9c 13-16
+crates/esker-sql/tests/ddl_cascade_fk_trigger.rs
+  h_44076b318daf9c 14-17
+crates/esker-sql/tests/do_block.rs
+  h_44076b318daf9c 24-26
+crates/esker-sql/tests/domain.rs
+  h_44076b318daf9c 22-25
+crates/esker-sql/tests/domain_schema.rs
+  h_44076b318daf9c 32-38
+crates/esker-sql/tests/drop_sequence.rs
+  h_44076b318daf9c 13-15
+crates/esker-sql/tests/extension_inherits.rs
+  h_44076b318daf9c 14-17
+crates/esker-sql/tests/foreign_key.rs
+  h_44076b318daf9c 13-16,19
+crates/esker-sql/tests/foreign_key_options.rs
+  h_44076b318daf9c 19-23
+crates/esker-sql/tests/generated_stored.rs
+  h_44076b318daf9c 13-16
+crates/esker-sql/tests/geometric.rs
+  h_44076b318daf9c 21-23,30-31
+crates/esker-sql/tests/geometric_array.rs
+  h_44076b318daf9c 28-31
+crates/esker-sql/tests/hstore.rs
+  h_44076b318daf9c 17-22
+crates/esker-sql/tests/inet.rs
+  h_44076b318daf9c 16-19,25
+crates/esker-sql/tests/inline_unique.rs
+  h_44076b318daf9c 13-15
+crates/esker-sql/tests/interval.rs
+  h_44076b318daf9c 59-64
+crates/esker-sql/tests/json.rs
+  h_44076b318daf9c 41-45
+crates/esker-sql/tests/matview.rs
+  h_44076b318daf9c 26-28
+crates/esker-sql/tests/money.rs
+  h_44076b318daf9c 16-19,23
+crates/esker-sql/tests/name_array.rs
+  h_44076b318daf9c 42-44,48-51,235-240
+crates/esker-sql/tests/name_type.rs
+  h_44076b318daf9c 34-41
+crates/esker-sql/tests/oid_type.rs
+  h_44076b318daf9c 1-234
+crates/esker-sql/tests/partition.rs
+  h_44076b318daf9c 13-16
+crates/esker-sql/tests/partition_suite.rs
+  h_44076b318daf9c 17-19,22-26
+crates/esker-sql/tests/pg_available_extensions.rs
+  h_44076b318daf9c 19-21
+crates/esker-sql/tests/pg_catalog.rs
+  h_44076b318daf9c 39-44,51-52,163-165,169-172,291,302-304,316-336,489-499
+crates/esker-sql/tests/pg_catalog_attribute.rs
+  h_44076b318daf9c 23-25
+crates/esker-sql/tests/pg_catalog_constraint.rs
+  h_44076b318daf9c 21-25,27-30,33-42
+crates/esker-sql/tests/pg_catalog_namespace.rs
+  h_44076b318daf9c 24-28
+crates/esker-sql/tests/pg_class.rs
+  h_44076b318daf9c 21-24
+crates/esker-sql/tests/point.rs
+  h_44076b318daf9c 21-26
+crates/esker-sql/tests/qualified_type.rs
+  h_44076b318daf9c 19-22
+crates/esker-sql/tests/reg_proc.rs
+  h_44076b318daf9c 1-157
+crates/esker-sql/tests/relation_resolution.rs
+  h_44076b318daf9c 22-26
+crates/esker-sql/tests/row_order.rs
+  h_44076b318daf9c 167-172,231-236
+crates/esker-sql/tests/schema_namespace.rs
+  h_44076b318daf9c 24
+crates/esker-sql/tests/serial_name.rs
+  h_44076b318daf9c 32-34
+crates/esker-sql/tests/set_default.rs
+  h_44076b318daf9c 13-15
+crates/esker-sql/tests/temp_table.rs
+  h_44076b318daf9c 24-28
+crates/esker-sql/tests/tsrange.rs
+  h_44076b318daf9c 17-19,23-24
+crates/esker-sql/tests/tsvector.rs
+  h_44076b318daf9c 41-44
+crates/esker-sql/tests/unlogged_table.rs
+  h_44076b318daf9c 18-23
+crates/esker-sql/tests/uuid.rs
+  h_44076b318daf9c 24-28
+crates/esker-sql/tests/view.rs
+  h_44076b318daf9c 23-27,34-36
+crates/esker-sql/tests/void_type.rs
+  h_44076b318daf9c 28-31
+crates/esker-store/src/columnar/decode.rs
+  h_44076b318daf9c 205-206,273,289
+crates/esker-store/tests/promotion.rs
+  h_44076b318daf9c 490,520-526,652,685-686,833
+docs/adr/0095-char-is-one-byte-and-the-quotes-are-part-of-the-name.md
+  h_44076b318daf9c 1-88
+docs/adr/0097-an-oid-is-four-bytes-and-a-derived-one-is-not.md
+  h_44076b318daf9c 1-131
+docs/adr/0098-regproc-is-an-oid-that-prints-as-a-function.md
+  h_44076b318daf9c 1-67
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 59-60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "19ed43e58482cbbea9d0ddfeaddc17ad9c4a71ab",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
