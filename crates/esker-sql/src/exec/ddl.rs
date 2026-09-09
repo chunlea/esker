@@ -212,6 +212,9 @@ pub(super) fn create_table(
     };
 
     validate_checks(&table)?;
+    let mut table = table;
+    normalise_generated(&mut table)?;
+    let table = table;
     // Resolved against a table that is not in the catalog yet, which is what lets a
     // self-reference — `CREATE TABLE t (id int8 PRIMARY KEY, parent int8 REFERENCES t)` — work
     // in the statement that declares it.
@@ -5186,8 +5189,14 @@ fn index_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)
     // first shape where they cannot agree — the implicit `ELSE` is **filled in with the resolved
     // type**, which is not in the written text at all and is not knowable until here, where the
     // expression has met the table.
+    // **A `CASE` and a scalar call are stored deparsed; everything else is stored as written.**
+    // Both are shapes where the text that went in cannot be the text that comes out: a `CASE`'s
+    // implicit `ELSE` is filled in with the resolved type, and a text function's argument shows
+    // the cast it took — `lower(name)` over a `varchar` is `lower((name)::text)` on a real server,
+    // measured. Everything else agrees once the outer parentheses are normalised, and stays the
+    // user's own text rather than passing through a deparser that has a placeholder in it.
     let text = match &resolved {
-        plan::Expr::Case { .. } => deparse(&resolved, table, ty),
+        plan::Expr::Case { .. } | plan::Expr::Scalar { .. } => deparse(&resolved, table, ty),
         _ => expr.to_owned(),
     };
     Ok((text, ty))
@@ -5219,6 +5228,30 @@ fn column_type_of(expr: &plan::Expr, table: &TableDef) -> Option<ColumnType> {
         plan::Expr::Ordinal { at, .. } => table.columns.get(*at).map(|column| column.ty),
         _ => None,
     }
+}
+
+/// Rewrites every generation expression into the form `pg_get_expr` prints, once, where the table
+/// is finally known.
+///
+/// **PostgreSQL stores a tree and prints a deparse**, so the text that comes back is never quite
+/// the text that went in: `GENERATED ALWAYS AS (UPPER(name))` over a `varchar` reads back
+/// `upper((name)::text)` — lower-cased, and with the cast the argument took — which
+/// `virtual_column_test#test_schema_dumping` asserts to the character. This crate stores text, so
+/// the normalisation happens here rather than at every reader: the catalog is a layer below the
+/// executor and cannot call a deparser, and doing it per read would deparse the same string on
+/// every `pg_attribute` scan.
+///
+/// Only the shapes [`index_expression`] deparses are rewritten, and for the same reason.
+fn normalise_generated(table: &mut TableDef) -> Result<()> {
+    let snapshot = table.clone();
+    for column in &mut table.columns {
+        let Some(expr) = &column.generated else {
+            continue;
+        };
+        let (text, _) = index_expression(&snapshot, expr)?;
+        column.generated = Some(text);
+    }
+    Ok(())
 }
 
 /// One resolved expression, as `pg_get_expr` prints it.
