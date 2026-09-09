@@ -778,9 +778,14 @@ Protocol: `start_ts` from TSO → buffered writes on the client → **Prewrite**
 each key checks `write` for commit_ts > start_ts and `lock` for any lock, then writes `lock` +
 `default` atomically) → `commit_ts` from TSO → **Commit** primary (write `write`, delete `lock`, atomic)
 → commit secondaries asynchronously. Readers that hit a lock inspect the primary: rolled forward if the
-primary is committed, rolled back if its TTL expired, else wait/backoff. The TTL is **not** extended in
-practice: `TxnKv::Heartbeat` is an RPC with a handler and no sender (`docs/plans/cross-node-deadlock.md`),
-so a lock outlives a dead holder by at most one TTL.
+primary is committed, rolled back if its TTL expired, else wait/backoff. The TTL **is** extended, since
+[ADR 0088](adr/0088-a-row-lock-across-nodes.md): a client renews the lease of every transaction
+holding a lock at a **third** of it (`esker-client`'s `renew` module, the cadence ADR 0028 settled
+for the schema lease), and stops the moment the transaction ends — commit, rollback, or being
+dropped. So a **live** holder keeps its rows however long it holds them, and a **dead** one still
+outlives its lock by at most one TTL, which is what the short lease is for. Before that sender
+existed the handler had nobody calling it, and a `SELECT … FOR UPDATE` held past three seconds lost
+its row to the next session that wanted it.
 **A row lock is not one of these yet** ([ADR 0088](adr/0088-a-row-lock-across-nodes.md), accepted
 2026-09-09): `SELECT … FOR UPDATE` takes a lock in the `esker-sql` node's own table, so today it
 excludes other sessions of the same node and **not** sessions of another node — two nodes given the
