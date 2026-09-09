@@ -1,0 +1,93 @@
+# **`regclass[]`, oid 2210** — the array of a `regclass`, against PostgreSQL 19beta1.
+#
+# Group 5 of r1's wire-108 baseline. `array_agg(c::regclass)` came back a scalar `text` (25) where
+# a real server answers `regclass[]` (2210), and the cause was that this node had no such type:
+# `regclass`'s `typarray` was a deliberate `0`, on the reasoning that "an array of a regclass is
+# not a type this node offers". A client reads that number. `ActiveRecord` decides a value is an
+# array from `pg_type`, and a `regclass[]` described as `text` is a Ruby String where the schema
+# dumper expects a list.
+#
+# **Group 7 is here too**, because it is the same measurement: `min`/`max` over a `regclass`, a
+# `regtype` or a `regproc` is an `oid` — value included, not just the declared type — and an array
+# of any of them is not. See `tests/captures/pg19_reg_class.txt`, which also corrects ADR 0098's
+# claim that a `regtype` keeps its own type here.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **2210 is not adjacent to 2205.** `_regtype` (2211) sits beside `regtype` (2206) and
+#     `_regclass` does not sit beside `regclass`: the `reg*` arrays were assigned in a later
+#     initdb than the scalars. Neither number is derivable from the other.
+#   * **A bad name inside an array literal is the element's error, not the array's.**
+#     `'{nosuchrel}'::regclass[]` is `42P01 relation "nosuchrel" does not exist` — `array_in` calls
+#     `regclassin` per element — where an integer parser handed the same text would say `22P02`.
+#   * **`to_regclass` is a `regclass` even when it finds nothing.** The miss is a `regclass` NULL.
+#   * **`min` over a `regclass[]` keeps `regclass[]`.** An array has a `min` of its own; the three
+#     scalars do not, which is why they decay and the array does not.
+#   * **`'rc'::regclass::text` is still `text`.** The output function is a name and the `::text`
+#     around it is a real cast now that the inner half answers 2205 — `ActiveRecord`'s
+#     `foreign_keys()` reads exactly that shape.
+#
+# Measured in `tests/captures/pg19_reg_class.txt`.
+
+CREATE TABLE rc (id int8 PRIMARY KEY, a int4)		-
+SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput::text, typelem, typarray FROM pg_type WHERE oid IN (2205, 2210) ORDER BY oid	oid,name,smallint,"char","char","char",text,oid,oid	2205|regclass|4|b|N|,|regclassin|0|2210 ; 2210|_regclass|-1|b|A|,|array_in|2205|0
+SELECT typarray FROM pg_type WHERE typname = 'regclass'	oid	2210
+SELECT 'rc'::regclass	regclass	rc
+SELECT pg_typeof('rc'::regclass)	regtype	regclass
+SELECT 'rc'::regclass::text	text	rc
+SELECT pg_typeof('rc'::regclass::text)	regtype	text
+SELECT to_regclass('rc')	regclass	rc
+SELECT pg_typeof(to_regclass('rc'))	regtype	regclass
+SELECT to_regclass('nosuchrel')	regclass	\N
+SELECT pg_typeof(to_regclass('nosuchrel'))	regtype	regclass
+SELECT 'nosuchrel'::regclass	!42P01 relation "nosuchrel" does not exist
+SELECT ''::regclass	!42602 invalid name syntax
+SELECT '{rc}'::regclass[]	regclass[]	{rc}
+SELECT pg_typeof('{rc}'::regclass[])	regtype	regclass[]
+SELECT '{rc,rc_pkey}'::regclass[]	regclass[]	{rc,rc_pkey}
+SELECT '{rc,NULL}'::regclass[]	regclass[]	{rc,NULL}
+SELECT '{}'::regclass[]	regclass[]	{}
+SELECT ARRAY[]::regclass[]	regclass[]	{}
+SELECT ARRAY['rc'::regclass]	regclass[]	{rc}
+SELECT pg_typeof(ARRAY['rc'::regclass])	regtype	regclass[]
+SELECT '{nosuchrel}'::regclass[]	!42P01 relation "nosuchrel" does not exist
+SELECT array_agg(c) FROM (SELECT 'rc'::regclass AS c) s	regclass[]	{rc}
+SELECT pg_typeof(array_agg(c)) FROM (SELECT 'rc'::regclass AS c) s	regtype	regclass[]
+SELECT array_agg(c.oid::regclass) FROM pg_class c WHERE c.relname = 'rc'	regclass[]	{rc}
+SELECT pg_typeof(array_agg(c.oid::regclass)) FROM pg_class c WHERE c.relname = 'rc'	regtype	regclass[]
+SELECT unnest('{rc,rc_pkey}'::regclass[])	regclass	rc ; rc_pkey
+SELECT pg_typeof(unnest('{rc}'::regclass[]))	regtype	regclass
+SELECT ('{rc,rc_pkey}'::regclass[])[2]	regclass	rc_pkey
+SELECT pg_typeof(('{rc}'::regclass[])[1])	regtype	regclass
+SELECT array_length('{rc,rc_pkey}'::regclass[], 1)	integer	2
+SELECT '{rc}'::regclass[] || 'rc_pkey'::regclass	regclass[]	{rc,rc_pkey}
+SELECT pg_typeof('{rc}'::regclass[] || 'rc_pkey'::regclass)	regtype	regclass[]
+SELECT '{rc}'::regclass[] || '{rc_pkey}'::regclass[]	regclass[]	{rc,rc_pkey}
+SELECT '{rc}'::regclass[]::text	text	{rc}
+SELECT pg_typeof('{rc}'::regclass[]::text)	regtype	text
+SELECT pg_typeof('{rc}'::regclass[]::oid[])	regtype	oid[]
+SELECT '{rc}'::regclass[]::oid[] = ARRAY['rc'::regclass::oid]	boolean	t
+SELECT '{rc}'::regclass[] = '{rc}'::regclass[]	boolean	t
+SELECT 'rc'::regclass = ANY('{rc,rc_pkey}'::regclass[])	boolean	t
+SELECT '{rc}'::regclass[] @> '{rc}'::regclass[]	boolean	t
+SELECT count(c) FROM (SELECT 'rc'::regclass AS c) s	bigint	1
+SELECT pg_typeof(count(c)) FROM (SELECT 'rc'::regclass AS c) s	regtype	bigint
+SELECT pg_typeof(min(c)) FROM (VALUES ('rc'::regclass)) s(c)	regtype	oid
+SELECT pg_typeof(max(c)) FROM (VALUES ('rc'::regclass)) s(c)	regtype	oid
+SELECT min(c) = 'rc'::regclass::oid FROM (VALUES ('rc'::regclass)) s(c)	boolean	t
+SELECT pg_typeof(min(c)) FROM (VALUES ('int4'::regtype)) s(c)	regtype	oid
+SELECT min(c) FROM (VALUES ('int4'::regtype), ('text'::regtype)) s(c)	oid	23
+SELECT max(c) FROM (VALUES ('int4'::regtype), ('text'::regtype)) s(c)	oid	25
+SELECT pg_typeof(min(c)) FROM (VALUES ('int4in'::regproc)) s(c)	regtype	oid
+SELECT min(c) FROM (VALUES ('int4in'::regproc), ('textin'::regproc)) s(c)	oid	42
+SELECT pg_typeof(min(c)) FROM (VALUES ('{rc}'::regclass[])) s(c)	regtype	regclass[]
+SELECT min(c) FROM (VALUES ('{rc}'::regclass[]), ('{rc_pkey}'::regclass[])) s(c)	regclass[]	{rc}
+SELECT 1259::regclass	regclass	pg_class
+SELECT 'pg_class'::regclass::oid	oid	1259
+SELECT 'pg_class'::regclass = 1259	boolean	t
+SELECT '{pg_class}'::regclass[] = '{1259}'::oid[]	!42883 operator does not exist: regclass[] = oid[]
+DROP TABLE rc CASCADE		-

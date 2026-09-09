@@ -62,7 +62,10 @@ fn stored(node: &Node, table: &str, key: &[Datum]) -> Option<Vec<Datum>> {
     let view = node.catalog.view(&*txn, 1).unwrap();
     let table = view.table(table).unwrap()?;
     let bytes = txn.get(&row::row_key(1, table.id, key).unwrap()).unwrap()?;
-    Some(row::decode_row(&table.row_schema(), &bytes).unwrap())
+    // `None`: this helper asserts what is **on disk**, so it must not resolve anything on the way
+    // out — a `regclass` column stores its number and no name (`debts-v1.1.md` #35), and reading
+    // it back resolved here would hide exactly that.
+    Some(row::decode_row(&table.row_schema(), &bytes, None).unwrap())
 }
 
 #[test]

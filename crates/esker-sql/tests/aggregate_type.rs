@@ -27,13 +27,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `pg_typeof` reads the **value** here and the static type there, and an aggregate over no
         // rows is NULL — which has no type. The declared type of the column is right either way;
         // it is the function that cannot see it.
-        // Two functions this node does not have. Named rather than approximated, and neither is
-        // about the result type this file is for.
-        (
-            "SELECT 'r', pg_typeof(string_agg(t, ',')) FROM ag",
-            "string_agg is not implemented",
-            "UNMEASURED",
-        ),
+        // One function this node does not have, named rather than approximated. `string_agg` was
+        // the other and is built now, so its entry came off under rule 2
+        // (`tests/aggregate_groups.rs`); its result type is `text` on both sides.
         // **A bare NULL is still resolved to `text` where PostgreSQL calls it `unknown`.** The
         // entry beside this one — `array_agg(NULL::int4)` — has gone: `Literal::TypedNull` keeps
         // the cast, so the two spellings are no longer one expression. What is left is the bare

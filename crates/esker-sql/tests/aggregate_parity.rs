@@ -101,11 +101,9 @@ const DIVERGENCES: &[(&str, &str, &str)] = &[
         "bool_and and bool_or are not among the five aggregates",
         "UNMEASURED",
     ),
-    (
-        "SELECT string_agg(g, ',') FROM agg",
-        "string_agg is not among the five aggregates",
-        "UNMEASURED",
-    ),
+    // `string_agg` **is** among them now — the sixth — so its entry came off under rule 2 with
+    // the unit that built it (`tests/aggregate_groups.rs`). `bool_and`/`bool_or` above are the
+    // pair still outside.
     (
         "SELECT DISTINCT ON (g) g, n FROM agg ORDER BY g, n",
         "SELECT DISTINCT ON",

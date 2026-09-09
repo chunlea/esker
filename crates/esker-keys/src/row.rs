@@ -161,13 +161,17 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
             varint::put_u64(name.len() as u64, out);
             out.extend_from_slice(name.as_bytes());
         }
-        // **Eight bytes, not four**: a relation's id is an `i64` here, where a real server's oid
-        // is four bytes. The name follows exactly as a `regtype`'s does.
-        Datum::RegClass { oid, name } => {
-            out.extend_from_slice(&oid.to_le_bytes());
-            varint::put_u64(name.len() as u64, out);
-            out.extend_from_slice(name.as_bytes());
-        }
+        // **Eight bytes and no name**, which is the whole of `debts-v1.1.md` #35. A relation's id
+        // is an `i64` here where a real server's oid is four bytes; what is *not* here is the name
+        // the datum carries beside it, because a name in a row goes stale the moment its relation
+        // is renamed. Measured: a stored `regclass` prints `rc_b` after `ALTER TABLE rc_a RENAME
+        // TO rc_b`, and prints its **digits** after the relation is dropped — both of which are
+        // properties of the number alone, resolved when the value is printed.
+        //
+        // A `regtype` and a `regproc` above still carry their names, and correctly: their oids
+        // name types and functions this crate resolves without a catalog, so nothing about them
+        // can go stale.
+        Datum::RegClass { oid, .. } => out.extend_from_slice(&oid.to_le_bytes()),
         Datum::Int2(v) => out.extend_from_slice(&v.to_le_bytes()),
         // Sixteen bytes, fixed, so no length precedes them.
         Datum::Uuid(v) => out.extend_from_slice(v),
@@ -498,14 +502,19 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 rest,
             )
         }
-        // Eight bytes for the oid, then the same name.
+        // **Eight bytes, and the name is the digits.** The row does not hold one, so what comes
+        // out is the *unresolved* form — and that form is not a placeholder this crate invented:
+        // it is exactly what a real server prints for an oid that names nothing, measured. So a
+        // reader that forgets to resolve degrades to a real answer for a dangling oid rather than
+        // to nonsense. `crate::row`'s wrapper in `esker-sql` is what resolves it, where there is a
+        // catalog to ask (`debts-v1.1.md` #35).
         ColumnType::RegClass => {
             let (head, rest) = bytes.split_first_chunk::<8>().ok_or_else(truncated)?;
-            let (name, rest) = reg_name(rest, "regclass")?;
+            let oid = i64::from_le_bytes(*head);
             (
                 Datum::RegClass {
-                    oid: i64::from_le_bytes(*head),
-                    name,
+                    oid,
+                    name: oid.to_string().into_boxed_str(),
                 },
                 rest,
             )
@@ -542,7 +551,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::JsonbArray
         | ColumnType::OidArray
         | ColumnType::RegTypeArray
-        | ColumnType::RegProcArray
+        | ColumnType::RegProcArray | ColumnType::RegClassArray
         | ColumnType::CitextArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray
@@ -1210,7 +1219,7 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::RegType
             | ColumnType::RegTypeArray
             | ColumnType::RegProc
-            | ColumnType::RegProcArray
+            | ColumnType::RegProcArray | ColumnType::RegClassArray
             | ColumnType::RegClass
             // **A pseudo-type is not a key because it is not a column.** Nothing is ever stored as
             // a `void`, so there is no order for a key to encode.
@@ -1267,7 +1276,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         ColumnType::RegType
         | ColumnType::RegTypeArray
         | ColumnType::RegProc
-        | ColumnType::RegProcArray
+        | ColumnType::RegProcArray | ColumnType::RegClassArray
         | ColumnType::RegClass
         | ColumnType::Void
         | ColumnType::Int2Vector
@@ -2121,10 +2130,14 @@ mod tests {
             // The same, and for the same reason: a `regclass`'s name is qualified or bare
             // depending on the search path that resolved it, so the codec must carry whatever it
             // was given rather than a shape it expects.
-            ColumnType::RegClass => (any::<i64>(), "[a-z. ]{0,12}")
-                .prop_map(|(oid, name)| Datum::RegClass {
+            // **A row holds a `regclass`'s number and not its name**, so the only value that
+            // round-trips is the unresolved one — the name *is* the digits. A named `regclass`
+            // encodes to the same bytes, which `a_regclass_row_keeps_the_number_and_not_the_name`
+            // states directly rather than leaving to this strategy.
+            ColumnType::RegClass => any::<i64>()
+                .prop_map(|oid| Datum::RegClass {
                     oid,
-                    name: name.into(),
+                    name: oid.to_string().into_boxed_str(),
                 })
                 .boxed(),
             // **Every `f64` including the ones that are not numbers**, because the round trip is
@@ -2210,6 +2223,7 @@ mod tests {
             | ColumnType::OidArray
             | ColumnType::RegTypeArray
             | ColumnType::RegProcArray
+            | ColumnType::RegClassArray
             | ColumnType::CitextArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray
@@ -2442,6 +2456,39 @@ mod tests {
     /// They are checked against each other here because a type on one list and not the other is
     /// exactly the shape of bug this crate keeps finding — a table with a second copy — and the
     /// consequence is the bad one: an index a client is allowed to create and cannot write to.
+    /// **A `regclass` row keeps the number and not the name** — `debts-v1.1.md` #35.
+    ///
+    /// The round-trip property one screen up cannot state this: it generates the *unresolved*
+    /// form, whose name already is its digits, so it would pass whether or not the name were
+    /// stored. This is the counterfactual — a named value and its unresolved twin, which differ
+    /// as `Datum`s and must not differ as bytes.
+    ///
+    /// It is what makes the name resolvable at output time rather than fixed at write time, and
+    /// it is measured: a stored `regclass` prints the **new** name after its relation is renamed,
+    /// and prints its digits after the relation is dropped.
+    #[test]
+    fn a_regclass_row_keeps_the_number_and_not_the_name() {
+        let schema = RowSchema::nullable(vec![ColumnType::RegClass]);
+        let named = Datum::RegClass {
+            oid: 16_384,
+            name: "orders".into(),
+        };
+        let bare = Datum::RegClass {
+            oid: 16_384,
+            name: "16384".into(),
+        };
+        let with_name = encode_row(&[ColumnType::RegClass], std::slice::from_ref(&named)).unwrap();
+        let without = encode_row(&[ColumnType::RegClass], std::slice::from_ref(&bare)).unwrap();
+        assert_eq!(
+            with_name, without,
+            "the name must not reach the row, or renaming the relation leaves it stale"
+        );
+        // And what comes back is the unresolved form, which is what a real server prints for an
+        // oid that names nothing — so a reader that never resolves is wrong the way a dangling
+        // oid is wrong, rather than wrong in a way no server would produce.
+        assert_eq!(decode_row(&schema, &with_name).unwrap(), vec![bare]);
+    }
+
     #[test]
     fn every_type_agrees_with_itself_about_being_an_index_key() {
         for ty in ColumnType::ALL.into_iter().chain(ColumnType::USER_RANGES) {

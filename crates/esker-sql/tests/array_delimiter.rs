@@ -147,7 +147,7 @@ fn every_base_type_has_an_array_or_is_listed() {
         .collect();
     // Each of these is a named gap with a reason, not an oversight:
     //
-    //   regclass, int2vector, oidvector      catalog types a client reads and never stores an
+    //   int2vector, oidvector                catalog types a client reads and never stores an
     //                                        array of
     //   lquery                               `ltree`'s *pattern* type: it appears in a `WHERE`
     //                                        and is not a column anybody declares, so an array of
@@ -161,7 +161,12 @@ fn every_base_type_has_an_array_or_is_listed() {
     // one reason — no suite test declares an array of one — until r1's wire sweep found
     // `array_agg` over a `circle` coming back a scalar `text`, which made the reason false for
     // three of the five; splitting it would have left a worse gap than it closed.
-    let expected = ["int2vector", "lquery", "oidvector", "regclass"];
+    // **`regclass` left this list with `_regclass` (2210).** It had been a catalog type "a client
+    // reads and never stores an array of", and r1's wire sweep found `array_agg(c::regclass)`
+    // coming back a scalar `text` — the same shape that took `name` off this list a run earlier.
+    // The reason was false for the same reason it was false there: a client does not have to
+    // *store* an array of a type to be handed one.
+    let expected = ["int2vector", "lquery", "oidvector"];
     assert_eq!(
         without, expected,
         "a base type gained or lost its array without this list being updated"

@@ -489,7 +489,7 @@ impl Gate {
                 // what a column added after a row was written should read as: `decode_row` fills
                 // a short row from the schema's missing values, so a row stored two columns wide
                 // comes back three wide with the `DEFAULT` in it.
-                let row = esker_sql::row::decode_row(&schema, value).unwrap();
+                let row = esker_sql::row::decode_row(&schema, value, None).unwrap();
                 projection
                     .iter()
                     .map(|at| match &row[*at as usize] {

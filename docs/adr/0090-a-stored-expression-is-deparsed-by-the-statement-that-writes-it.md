@@ -49,7 +49,12 @@ per shape — and it is called by:
 * `index_expression`, for an index key and an index predicate;
 * `normalise_generated`, for a generated column at `CREATE TABLE`;
 * the `ADD COLUMN` writer, for a generated column added by `ALTER`;
-* `normalise_defaults` and two `ALTER` sites, for a `DEFAULT`.
+* `normalise_defaults` and two `ALTER` sites, for a `DEFAULT`;
+* `normalise_checks` and `add_check`, for a `CHECK` — the fifth reader;
+* `normalise_index_predicates` and the `CREATE INDEX` writer, for a partial index's predicate —
+  the sixth;
+* `normalise_exclude_predicates` and `add_exclude`, for an exclusion constraint's predicate — the
+  seventh, and the last one that was still reading a text no writer had shaped.
 
 `pg_get_expr(adbin, adrelid)` is then the identity on the stored string, and its three-argument
 `pretty` form is that string with its outermost pair removed (`catalog::unparenthesised`).
@@ -77,8 +82,24 @@ the expensive one (printing a spelling the tree cannot distinguish) needs a name
 * **A rule measured for one caller reaches only that caller.** This is the third time in this
   crate: `ExprShape` was measured for an index key and asked in only that place, and the six
   divergences `tests/generated_parens.rs` used to declare were all "this node has no deparser"
-  written beside a working deparser. The four callers are listed above and the count is asserted
-  in a doc comment, so `grep -c 'deparse_default'` is a check a reader can run.
+  written beside a working deparser. The callers are listed above, and the list grew twice after
+  this ADR was written: a `CHECK` and a partial index's predicate were being re-parenthesised at
+  *read* time by a helper that split the text on the top-level `AND`, and an exclusion
+  constraint's predicate was not printed by anything. **Group A of the deparse census closed all
+  three**, which is what made the sentence above — every reader returns those bytes unchanged —
+  true rather than aspirational, and deleted the helper.
+
+  A splitter is why: it cannot say which operands bind first. `(a > 0 OR b > 0) AND flag` is
+  `(((a > 0) OR (b > 0)) AND flag)` on a real server and came back `(((a > 0)) OR ((b > 0)) AND
+  flag)` here, the grouping lost and a pair doubled in one answer. The tree has the grouping, and
+  only the writer holds the tree.
+* **The pretty spelling is derived from the stored one, and only because the stored one is
+  canonical.** `pg_get_constraintdef(oid, true)` is what `ActiveRecord` reads, and a real server
+  renders it from the same tree as the plain form. `catalog::pretty` reconstructs it instead:
+  strip the outer pair, split the chain with the same scanner the writer's callers use, and give
+  an operand its pair back only where precedence needs it — an `OR` inside an `AND`. That
+  derivation is safe *because* the writer emits a shape it produced, and would not be safe over
+  text a user wrote.
 * **Three shapes prove the tree is necessary.** `BETWEEN`, `IN` and `LIKE` print as the operators
   they desugar to. No rule about parentheses over the written text can produce `(t ~~ 'a%'::text)`
   from `t LIKE 'a%'`, which is the argument against a fourth option — normalising the string.

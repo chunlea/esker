@@ -1,0 +1,62 @@
+# **The four small aggregate groups** — against PostgreSQL 19beta1.
+#
+# Groups 8, 9, 10 and 11 of r1's wire-108 baseline: `sum`/`avg` over a `real`, `min`/`max` over
+# `tsvector` and `tsquery`, `array_agg` over a domain column, and `string_agg`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A `real` sums to a `real` and averages to a `double precision`** — the transition types
+#     are `float4` and `float8[]`, so one accumulates narrow and the other widens before dividing.
+#   * **`min`/`max` do not exist over `tsvector` or `tsquery`**, and the list of types that *do*
+#     have them is a census of `pg_proc` rather than a collection of surprises.
+#   * **`string_agg`'s NULL delimiter is an empty separator**, not a NULL answer.
+#   * **An aggregate over a domain column answers the domain's own array type**, which this node
+#     cannot express — the three rows whose *values* depend on which tables the server has are in
+#     the capture and not here.
+#
+# Measured in `tests/captures/pg19_aggregate_groups.txt`.
+CREATE TABLE ag (id int8, r real, d double precision, n numeric, t text, i int4)		-
+INSERT INTO ag VALUES (1, 1.5, 1.5, 1.5, 'a', 1), (2, 2.25, 2.25, 2.25, 'b', 2), (3, NULL, NULL, NULL, NULL, NULL)		-
+SELECT sum(r) FROM ag	real	3.75
+SELECT pg_typeof(sum(r)) FROM ag	regtype	real
+SELECT avg(r) FROM ag	double precision	1.875
+SELECT pg_typeof(avg(r)) FROM ag	regtype	double precision
+SELECT pg_typeof(sum(d)) FROM ag	regtype	double precision
+SELECT pg_typeof(avg(d)) FROM ag	regtype	double precision
+SELECT pg_typeof(sum(n)) FROM ag	regtype	numeric
+SELECT pg_typeof(avg(n)) FROM ag	regtype	numeric
+SELECT pg_typeof(sum(i)) FROM ag	regtype	bigint
+SELECT pg_typeof(avg(i)) FROM ag	regtype	numeric
+SELECT min(r) FROM ag	real	1.5
+SELECT pg_typeof(min(r)) FROM ag	regtype	real
+SELECT max(r) FROM ag	real	2.25
+SELECT count(r) FROM ag	bigint	2
+SELECT sum(r) FROM ag WHERE false	real	\N
+SELECT avg(r) FROM ag WHERE false	double precision	\N
+SELECT string_agg(t, ',') FROM ag	text	a,b
+SELECT pg_typeof(string_agg(t, ',')) FROM ag	regtype	text
+SELECT string_agg(t, ',' ORDER BY t DESC) FROM ag	text	b,a
+SELECT string_agg(DISTINCT t, ',') FROM ag	text	a,b
+SELECT string_agg(t, ',') FROM ag WHERE false	text	\N
+SELECT string_agg(t, NULL) FROM ag	text	ab
+SELECT string_agg(id::text, '-' ORDER BY id) FROM ag	text	1-2-3
+SELECT string_agg(t, ',') FILTER (WHERE t <> 'a') FROM ag	text	b
+SELECT string_agg(t) FROM ag	!42883 function string_agg(text) does not exist DETAIL: No function of that name accepts the given number of arguments.
+SELECT string_agg(r, ',') FROM ag	!42883 function string_agg(real, unknown) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT min(v) FROM (VALUES ('a b'::tsvector)) s(v)	!42883 function min(tsvector) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT max(v) FROM (VALUES ('a b'::tsvector)) s(v)	!42883 function max(tsvector) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT min(q) FROM (VALUES ('a & b'::tsquery)) s(q)	!42883 function min(tsquery) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT max(q) FROM (VALUES ('a & b'::tsquery)) s(q)	!42883 function max(tsquery) does not exist DETAIL: No function of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT count(v) FROM (VALUES ('a b'::tsvector)) s(v)	bigint	1
+SELECT array_agg(v) FROM (VALUES ('a b'::tsvector)) s(v)	tsvector[]	{"'a' 'b'"}
+SELECT pg_typeof(array_agg(v)) FROM (VALUES ('a b'::tsvector)) s(v)	regtype	tsvector[]
+SELECT pg_typeof(array_agg(table_name)) FROM (SELECT table_name FROM information_schema.tables LIMIT 2) s	regtype	information_schema.sql_identifier[]
+SELECT pg_typeof(table_name) FROM information_schema.tables LIMIT 1	regtype	information_schema.sql_identifier
+SELECT oid, typname, typtype, typbasetype, typarray FROM pg_type WHERE typname = 'sql_identifier'	oid,name,"char",oid,oid	13361|sql_identifier|d|19|13360
+SELECT oid, typname, typtype, typelem FROM pg_type WHERE typname = '_sql_identifier'	oid,name,"char",oid	13360|_sql_identifier|b|13361
+SELECT pg_typeof(min(table_name)) FROM information_schema.tables	regtype	text
+DROP TABLE ag CASCADE		-

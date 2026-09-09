@@ -101,7 +101,7 @@ pub(super) fn backfill_batch(executor: &Executor, index_id: u64) -> Result<bool>
     let schema = table.row_schema();
     let mut entries: Vec<(Entry, Vec<u8>)> = Vec::with_capacity(read.len());
     for (_, value) in &read {
-        let row = crate::row::decode_row(&schema, value)?;
+        let row = crate::row::decode_row(&schema, value, None)?;
         if let Some(entry) = index_entry(tenant, &table, &index, &row)? {
             entries.push(entry);
         }

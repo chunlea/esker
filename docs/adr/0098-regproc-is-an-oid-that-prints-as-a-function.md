@@ -30,8 +30,19 @@ Four rules carry it, and each separates `regproc` from the `regtype` it looks li
 common case rather than the corner one.
 
 **2. `min`/`max` decay to `oid`.** That makes `regproc` the fifth member of the decay arm after
-`varchar`, `name`, `cidr` and `"char"`, and **the first whose landing type is not `text`**. A
-`regtype` beside it does not decay at all. Neither answer is derivable from the other.
+`varchar`, `name`, `cidr` and `"char"`, and **the first whose landing type is not `text`**.
+
+> **Corrected 2026-09-09.** The sentence that stood here — "a `regtype` beside it does not decay at
+> all" — is wrong. It was written from one probe over a `VALUES` row rather than over the family.
+> Measured on a real column of each type, `pg_typeof(min(t))` is `oid` for `regtype`, `regproc` and
+> `regclass` alike, and so is `max`'s: none of the three has a `min` of its own, so the aggregate
+> PostgreSQL resolves is `min(oid)` and the argument is coerced to reach it. The **value** decays
+> with the declared type — `min('int4'::regtype)` is `23`, not `integer` — which is the half a
+> declared-type-only fix leaves wrong. An *array* of any of them does not decay, because an array
+> has a `min` of its own. `tests/captures/pg19_reg_class.txt` is the measurement, and
+> `tests/reg_class.rs` is the test; the rule now lives in `exec::aggregate` as one arm over all
+> three. The lesson is [measure the whole list](0075-the-oracle-captures-live-in-the-repository.md):
+> a rule read off one member of a family is a guess about the rest.
 
 **3. A comparison reads an unadorned literal as an `oid`; an assignment resolves it as a name.**
 `WHERE typinput = 'array_in'` is `22P02 invalid input syntax for type oid: "array_in"` on a real

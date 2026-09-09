@@ -2842,6 +2842,32 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             typmod,
         } => {
             let operand = resolve(operand, scope)?;
+            // **A cast to the type the operand already has is not a node.** PostgreSQL builds no
+            // `RelabelType` for it, so `pg_get_expr` has nothing to print: a generated column
+            // written `((upper(t))::text)` is stored `upper(t)`, and `((t)::text)` is stored `t`.
+            // Measured across the whole family, `tests/corpus/pg19_deparse_census.txt`'s group E —
+            // and it is not a printing rule, which is why it lives here and not in the deparser:
+            // an index key that resolves to a bare column stops being an expression key, and
+            // `pg_index.indkey`, `indexprs` and `pg_get_indexdef` all move with it.
+            //
+            // **The modifier is part of the type.** `(nn)::numeric(10,2)` over a `numeric(10,2)`
+            // is elided and `(nn)::numeric` over the same column is *kept* — dropping a typmod is
+            // a coercion, not a no-op — as are `(v)::character varying(5)` over a `varchar(10)`
+            // and `(n)::numeric(10,2)` over a bare `numeric`. Measured, all four.
+            //
+            // **An unknown literal has no type of its own**, so the cast that gives it one is the
+            // node: `('a')::text` is stored `'a'::text` and `(NULL)::text` is `NULL::text`. The
+            // exception is [`is_unknown_literal`] and it is PostgreSQL's own.
+            //
+            // Before the coercion below, not after: [`read_as_text`] turns a `bpchar` operand into
+            // something of type `text`, and `(b)::text` over a `character(4)` is a cast a real
+            // server keeps. Asking after the wrap would elide exactly the one that must stay.
+            if !is_unknown_literal(&operand)
+                && expr_type(&operand, scope).is_ok_and(|from| from == *to)
+                && typmod_of(&operand, scope) == *typmod
+            {
+                return Ok(operand);
+            }
             // **A cast *out of* `bpchar` strips the padding first, and a cast into one does not.**
             // Measured with `octet_length`, which is the only reader that can tell:
             // `c::varchar`, `c::name` and `c::text` over a `character(4)` holding `x` are 1 byte,
@@ -2869,6 +2895,19 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         }
         Expr::ToText { operand, .. } => {
             let operand = resolve(operand, scope)?;
+            // **`::text` over something already `text` is the same no-op the `Cast` arm elides**,
+            // and it arrives here rather than there because a cast whose target is `text` lowers
+            // to this node. `((upper(t))::text)` is stored `upper(t)` on a real server and
+            // `(((t)::text))` is a *column* index, not an expression one. Measured, group E.
+            //
+            // `bpchar` is the operand that must not take this exit — `(b)::text` over a
+            // `character(4)` is a cast a real server keeps, and it is what `strip_blanks` below
+            // exists for — and so is an unknown literal, whose type this cast is what gives it.
+            if !is_unknown_literal(&operand)
+                && expr_type(&operand, scope).is_ok_and(|from| from == ColumnType::Text)
+            {
+                return Ok(operand);
+            }
             let strip_blanks = matches!(expr_type(&operand, scope), Ok(ColumnType::Bpchar));
             // The operand's output function, where the operand is an enum column: the label, not
             // the ordinal the row holds.
@@ -3089,6 +3128,21 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                             | CatalogFunc::NullIf
                             | CatalogFunc::Greatest
                             | CatalogFunc::Least
+                            // **`pg_typeof` does not read its argument at all**, which is the
+                            // property this list is about: the exclusions are the functions whose
+                            // result is *not* `text`, and `pg_typeof`'s is a `regtype`. Reading a
+                            // `bpchar` argument as `text` on the way in made it answer `text`,
+                            // which is a report about the coercion this function inserted rather
+                            // than about the expression the user wrote — `debts-v1.1.md` #33.
+                            //
+                            // It is the same seam the three instances before it were, one layer
+                            // over: `output_columns` describes the column from the expression and
+                            // `pg_typeof` described it from the expression *plus a cast of its
+                            // own*, so one function answered two things. The wire half was right
+                            // the whole time, which is why no corpus row caught it — a corpus
+                            // compares what a column says, and both readers are only visible
+                            // together.
+                            | CatalogFunc::PgTypeof
                     ) {
                         arg
                     } else {
@@ -3596,6 +3650,7 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::Int2Vector | ColumnType::OidVector => family(ColumnType::Text),
             ColumnType::RegTypeArray => 200,
             ColumnType::RegProcArray => 201,
+            ColumnType::RegClassArray => 202,
             // **A family of one each.** `'{1}'::int[] = '{1}'::int8[]` is `42883` on a real
             // server — an array's comparison is its element type's, and two element types are two
             // operators — so no two of these share a family and none shares one with a scalar.
@@ -4803,9 +4858,16 @@ pub(super) fn typmod_of(expr: &Expr, scope: &Scope<'_>) -> i32 {
         Expr::Column { table, name } => scope
             .resolve_column(table.as_deref(), name)
             .map_or(none, |(_, column)| column.typmod),
-        // **A cast names its own modifier**, which is the one it was written with:
-        // `c::char(2)` is `character(2)` and `1.5::numeric(10,2)` is `numeric(10,2)`, measured.
-        Expr::Cast { typmod, .. } => *typmod,
+        // **Two shapes carry their modifier in a field of their own, and it is the answer.**
+        //
+        // A **cast** names the one it was written with: `c::char(2)` is `character(2)` and
+        // `1.5::numeric(10,2)` is `numeric(10,2)`, measured. A **resolved column** carries the
+        // column's — this is asked on both sides of resolution, a `Column` before and the
+        // `Ordinal` it becomes after, and having only the `Column` arm answered `-1` for every
+        // resolved column reference. Group E of the deparse census found it:
+        // `(nn)::numeric(10,2)` over a `numeric(10,2)` compared its cast's modifier against a
+        // column's and was told the column had none.
+        Expr::Ordinal { typmod, .. } | Expr::Cast { typmod, .. } => *typmod,
         // **`NULLIF` is the identity on its left argument**, so the modifier travels with it —
         // `nullif(c, 'x')` over a `character(4)` is `character(4)` — but only while the *type* is
         // also the left's: a `varchar` is compared as `text` (`nullif_type`), and a modifier does
@@ -5347,6 +5409,18 @@ fn arrow_fetch(func: CatalogFunc, args: &[Expr], scope: &Scope<'_>) -> CatalogFu
 fn catalog_func_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> ColumnType {
     match call.func {
         CatalogFunc::HstoreConcat => concat_type(call, scope),
+        // **`substring` over a bit string answers a bit string**, and a plain `bit` whichever of
+        // the two it was given — measured, `pg_typeof(substring('10110'::varbit from 2 for 3))` is
+        // `bit`. One name over two families, told apart by the operand, which is the same shape as
+        // `||` and `->` above; `text` is the answer for everything else.
+        CatalogFunc::Substr | CatalogFunc::Substring
+            if matches!(
+                call.args.first().map(|arg| expr_type(arg, scope)),
+                Some(Ok(ColumnType::Bit | ColumnType::VarBit))
+            ) =>
+        {
+            ColumnType::Bit
+        }
         // **`->` is the same shape as `||` above** — one symbol over several types, told apart by
         // the operand — and it needs the same arm here for the same reason that one gives: the
         // rows were already right and it was the *declared* type that said `text`, which a client

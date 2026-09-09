@@ -1491,6 +1491,11 @@ fn placeholder(ty: ColumnType) -> Datum {
             1,
             Vec::new(),
         )),
+        ColumnType::RegClassArray => Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+            ColumnType::RegClass,
+            1,
+            Vec::new(),
+        )),
         // The origin, which is a point like any other: what stands in is never read, only its
         // type is.
         ColumnType::Point => Datum::Point { x: 0.0, y: 0.0 },

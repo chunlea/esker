@@ -1,0 +1,44 @@
+# **A stored `regclass` holds its number and resolves its name on the way out** — PostgreSQL
+# 19beta1, 2026-09-09. `ON_ERROR_ROLLBACK on`, one `BEGIN … ROLLBACK`, fixture in the first two
+# statements.
+#
+# `debts-v1.1.md` #35. The row this closes said a `regclass` could not be a stored column here,
+# and the reason was the row shape: this node's `Datum::RegClass` carries the printed name beside
+# the oid, so storing one would write the name into the row — and a name in a row goes stale.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **`ALTER TABLE … RENAME` changes what an *already stored* value prints.** The row is not
+#     rewritten and nothing reconciles it: `r` is the same eight bytes before and after, and it
+#     prints `rc_a` then `rc_b`. That is the measurement that says the name is not in the row.
+#
+#   * **Dropping the relation does not NULL the value and does not raise.** The column keeps its
+#     number and prints the **digits** — `r IS NULL` is `f`, and `r::text = r::oid::text` is `t`.
+#     So "unresolved" is a real server's own rendering, not a placeholder to be avoided: a reader
+#     with no catalog to ask degrades to exactly this.
+#
+#   * **`'nosuchrel'::regclass` fails at the cast, before any row is written** — `42P01`, the same
+#     refusal the bare expression gives. The column never sees a name.
+#
+#   * **A `regclass` is a primary key**, and an index over one is ordinary.
+#
+# ## The measurements
+#
+CREATE TABLE rc_a (id int8)		-
+CREATE TABLE rc_h (id int8, r regclass)		-
+INSERT INTO rc_h VALUES (1, 'rc_a'::regclass), (2, NULL)		-
+SELECT id, r FROM rc_h ORDER BY id	bigint,regclass	1|rc_a ; 2|\N
+SELECT attname, atttypid, atttypmod FROM pg_attribute WHERE attrelid = 'rc_h'::regclass AND attnum > 0 ORDER BY attnum	name,oid,integer	id|20|-1 ; r|2205|-1
+SELECT pg_typeof(r) FROM rc_h ORDER BY id LIMIT 1	regtype	regclass
+ALTER TABLE rc_a RENAME TO rc_b		-
+SELECT id, r FROM rc_h ORDER BY id	bigint,regclass	1|rc_b ; 2|\N
+SELECT r::text, r::oid = 'rc_b'::regclass::oid FROM rc_h WHERE id = 1	text,boolean	rc_b|t
+INSERT INTO rc_h VALUES (3, 'nosuchrel'::regclass)	!42P01 relation "nosuchrel" does not exist
+SELECT r IS NULL FROM rc_h WHERE id = 2	boolean	t
+CREATE TABLE rc_i (r regclass PRIMARY KEY)		-
+INSERT INTO rc_i VALUES ('rc_b'::regclass)		-
+SELECT r FROM rc_i	regclass	rc_b
+DROP TABLE rc_b CASCADE		-
+SELECT id, r IS NULL, r::text = r::oid::text FROM rc_h ORDER BY id	bigint,boolean,boolean	1|f|t ; 2|t|\N
+DROP TABLE rc_h		-
+DROP TABLE rc_i		-

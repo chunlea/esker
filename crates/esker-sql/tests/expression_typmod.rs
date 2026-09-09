@@ -56,3 +56,64 @@ fn every_declared_typmod_is_postgresql_19_s() {
         "only {checked} statements ran; the corpus is not being read"
     );
 }
+
+/// **The two readers of one expression agree** — `debts-v1.1.md` #33.
+///
+/// The corpus above pins what a **column** says: `greatest(c, 'x')` over a `character(4)` is a
+/// `bpchar`, measured, and it was right the whole time. `pg_typeof` of the same expression
+/// answered `text`, and no corpus row could catch that, because a corpus compares one reader at a
+/// time and this defect is only visible when both are asked about the same expression.
+///
+/// The cause was one name missing from one list. `resolve` reads a `bpchar` argument as `text` on
+/// the way into a catalog function — with the blanks stripped, which is what makes `length(c)`
+/// answer 1 and not 4 — and the functions excluded from that are the ones that do not consume the
+/// value as text. `pg_typeof` does not consume it at all: it reports the argument's type, so
+/// reading it as `text` first made it report the coercion this crate had just inserted rather than
+/// the expression the user wrote.
+///
+/// **It was never only `GREATEST`.** The row was written from the one statement that found it;
+/// `LEAST`, `COALESCE`, and `greatest(c, c)` with no literal anywhere in it were all the same
+/// answer, which is what says the defect was in the argument and not in the ladder.
+#[test]
+fn pg_typeof_and_the_row_description_agree_about_a_bpchar() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE g1tm (c character(4), v character varying(4))",
+        "INSERT INTO g1tm VALUES ('x', 'x')",
+    ]);
+    for (expression, printed, oid) in [
+        // The statement the row was written from, and the three it did not name.
+        ("greatest(c, 'x')", "character", 1042),
+        ("least(c, 'x')", "character", 1042),
+        ("coalesce(c, 'x')", "character", 1042),
+        // **No literal at all**, which is what says this was never about the common-type ladder.
+        ("greatest(c, c)", "character", 1042),
+        // The adorned literal does not change it either: `text -> bpchar` is implicit too.
+        ("greatest(c, 'x'::text)", "character", 1042),
+        // And the type next door, which was right all along — `read_as_text` only ever wrapped a
+        // `bpchar`, so a `varchar` never went through the coercion that caused this.
+        ("greatest(v, 'x')", "character varying", 1043),
+    ] {
+        // What `pg_typeof` says.
+        assert_eq!(
+            node.rows(&format!("SELECT pg_typeof({expression}) FROM g1tm")),
+            vec![vec![printed.to_owned()]],
+            "pg_typeof({expression})"
+        );
+        // What the `RowDescription` says, about the same expression in the same session.
+        let outcome = node.run(&format!("SELECT {expression} FROM g1tm")).unwrap();
+        let esker_sql::pgwire::session::Outcome::Rows { fields, .. } = outcome else {
+            panic!("{expression}: no rows");
+        };
+        assert_eq!(
+            fields[0].type_oid, oid,
+            "the wire and pg_typeof must agree about {expression}"
+        );
+    }
+    // **The value is unchanged by any of this**, which is what says the defect was a report and
+    // never an answer: a `character(4)` holding `x` comes back padded, and `length` still ignores
+    // the padding the way a real server does.
+    assert_eq!(
+        node.rows("SELECT greatest(c, 'x'), length(greatest(c, 'x')) FROM g1tm"),
+        vec![vec!["x   ".to_owned(), "1".to_owned()]]
+    );
+}

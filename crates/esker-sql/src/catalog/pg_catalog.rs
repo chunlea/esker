@@ -2147,7 +2147,26 @@ fn pg_depend_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
 ///
 /// `(castsource, casttarget, castcontext, castmethod)`. `castcontext` is `e` explicit, `a`
 /// assignment, `i` implicit; `castmethod` is `f` a function, `b` binary-coercible, `i` I/O.
-pub const CASTS: [(i64, i64, &str, &str); 115] = [
+pub const CASTS: [(i64, i64, &str, &str); 123] = [
+    // **A bit string's eight rows, measured** rather than reasoned:
+    //
+    //     SELECT castsource::regtype, casttarget::regtype, castcontext, castmethod
+    //       FROM pg_cast WHERE castsource IN (1560,1562) OR casttarget IN (1560,1562);
+    //
+    // A `bit` converts with `int4` and `int8` explicitly and with **no other number** —
+    // `bit::int2`, `bit::numeric` and `bit::bool` are each `42846` — and a `bit varying`
+    // converts with no number at all, not even those two. The two self-rows are the typmod
+    // application, which is what `'10101'::varbit(3)` truncating goes through. Without these
+    // `casts_to` refused the pair `5::int4::bit(4)` needs, and the fold below it read the
+    // *digits* instead: `'101'::bit(3)::int` answered `101` where a real server says `5`.
+    (20, 1560, "e", "f"),
+    (1560, 20, "e", "f"),
+    (23, 1560, "e", "f"),
+    (1560, 23, "e", "f"),
+    (1560, 1560, "i", "f"),
+    (1560, 1562, "i", "b"),
+    (1562, 1560, "i", "b"),
+    (1562, 1562, "i", "f"),
     // **`regclass`'s nine rows, measured** rather than reasoned: `SELECT castsource, casttarget,
     // castcontext, castmethod FROM pg_cast WHERE castsource = 2205 OR casttarget = 2205`. Six
     // types reach a `regclass` implicitly and three leave it — `regclass -> bigint` and
@@ -2956,6 +2975,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::OidVector => "oidvector",
         ColumnType::RegTypeArray => "_regtype",
         ColumnType::RegProcArray => "_regproc",
+        ColumnType::RegClassArray => "_regclass",
         // **An array type's internal name is the element's with a leading underscore** — `_int4`,
         // not `int4[]`. That spelling is what `pg_type.typname` holds on a real server and what a
         // client matching on it expects.
@@ -3176,7 +3196,7 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::HstoreArray
         | ColumnType::TsVectorArray
         | ColumnType::TsQueryArray
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
         // **`A` for the two vectors too**, measured: `int2vector` and `oidvector` are in
         // PostgreSQL's array category despite not being array types.
         | ColumnType::Int2Vector
@@ -3337,6 +3357,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::OidArray
         | ColumnType::RegTypeArray
         | ColumnType::RegProcArray
+        | ColumnType::RegClassArray
         | ColumnType::CitextArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray
