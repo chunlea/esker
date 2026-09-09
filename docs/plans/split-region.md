@@ -261,3 +261,50 @@ know whether it applied: that is the `40003` the batched loads hit at 37 and at 
 So the cost is not the median, it is the tail shape: **one ambiguous outcome per split that catches
 a proposal in flight**, and a bulk load that is wide enough or fast enough to always have one in
 flight will meet it on most splits.
+
+### What was done about it, and the two ADRs the doing needed — 2026-09-09
+
+**The child is campaigned by the store that led the parent**
+([ADR 0094](../adr/0094-a-split-childs-leader-is-the-parents-leader.md)). `Store::adopt_split` asks
+the child's peer to stand as soon as this store has it, and only where this store led the parent,
+because two replicas campaigning at once is the split vote the whole thing exists to avoid. It is
+still an ordinary election — the other replicas grant or refuse by the usual rules — so nothing
+here fabricates leadership; what it removes is the waiting.
+
+**What that ADR claims is the structure and not the clock**, and the measurement above is why:
+
+```text
+children led by the store that led their parent   without 35 of 63   with 29 of 29, and 130 of 130
+quiet box    median 62-73 ms  ->  median 10 ms, and the 32,765 ms tail is gone
+loaded box                        median 87 ms — larger than the before, structure unchanged
+```
+
+A duration is a statement about the machine; which store ends up leading is a statement about the
+mechanism. So the gate test asserts leadership and the distribution is printed by an `#[ignore]`d
+measurement beside it (`how_long_a_split_child_has_no_leader`).
+
+**One campaign is not enough**, and the reason belongs to the split rather than to the election:
+every replica creates the child when *it* applies the split entry, the leader applies first, and a
+Raft batch for a region a store does not serve yet is dropped rather than refused. Campaigning once
+left the median exactly where it was, at 63 ms; `Store::campaign_the_child` asks again for a handful
+of ticks and stops at the first leader.
+
+**And the campaign runs only after the region map has taken the child**
+([ADR 0099](../adr/0099-one-core-per-region-per-store.md)). `RegionMap::apply_split` refuses three
+things — a parent this store does not host, a child it already hosts, a parent whose start key moved
+— and before 0099 the child's peer had already been built, registered with the driver pool and
+handed a ticker by then, so a refusal left it **alive**: a peer campaigning, and going on
+campaigning, for a region nothing on this store can serve. One region was found with
+`campaigns_pre: 1108` against `campaigns_real: 91` in exactly that state
+(`docs/plans/debts-v1.1.md` #9). `RaftPeer::start` now returns a reservation the caller commits once
+the map has taken the peer, so every one of those refusals gives the region straight back, and the
+ticker and the campaign both wait for the commit.
+
+**Why a split child cannot lose its group to a learner**
+([ADR 0085](../adr/0085-a-vote-is-not-granted-to-a-learner.md)). A child inherits the parent's
+membership, learners included, and a learner can never reach a quorum — so a group that grants one
+its vote loses a voter's vote and its leader for the term and elects nobody. `Raft::campaign` has
+always refused to campaign when this node is not a voter in its own configuration;
+`Raft::handle_vote_request` now applies the same test to the peer *asking*, which is the other side
+of it. That guard is why the campaign above is safe to fire at a child whose membership is still
+settling.
