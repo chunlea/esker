@@ -1,0 +1,61 @@
+crates/esker-sql/tests/geometric_array.rs
+  s_e5c0c6e78b5662::t_338be646348b91 1-203
+crates/esker-keys/src/array.rs
+  s_e5c0c6e78b5662::t_364a7ae721f1f6 109-113,164-168
+crates/esker-keys/src/columnar.rs
+  s_e5c0c6e78b5662::t_6bdde76a84fde3 55-60,145-149,178-181,249-253
+crates/esker-keys/src/row.rs
+  s_e5c0c6e78b5662::t_c8cbe122a3f6b0 516,1263,2153-2157
+crates/esker-keys/src/value.rs
+  s_e5c0c6e78b5662::t_a0f40acf5556f1 503-518,567,614-618
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_e5c0c6e78b5662::t_c9d05dfb21a05c 2840-2845,2916-2920,3056,3151-3156,3184-3188
+crates/esker-sql/src/catalog/record.rs
+  s_e5c0c6e78b5662::t_6b2e1fe0732a9c 343-352,402-407,488-492,556-560,641-645
+crates/esker-sql/src/exec/aggregate.rs
+  s_e5c0c6e78b5662::t_103cfb9fb85329 235-249
+crates/esker-sql/src/exec/bind.rs
+  s_e5c0c6e78b5662::t_931f318c69c43f 1547
+crates/esker-sql/src/exec/fragment.rs
+  s_e5c0c6e78b5662::t_03743a5d769e84 1008-1013,1036-1045
+crates/esker-sql/src/exec/query.rs
+  s_e5c0c6e78b5662::t_fb2949cafd0c3a 2908-2922,3346-3351,3463-3471
+crates/esker-sql/src/plan/expr.rs
+  s_e5c0c6e78b5662::t_128b851d041aca 2326,2413,2582
+crates/esker-sql/src/row.rs
+  s_e5c0c6e78b5662::t_adf17808f1f155 84
+crates/esker-sql/src/value/mod.rs
+  s_e5c0c6e78b5662::t_b97388e77deeed 787-791,1256,1292-1298,1474,1568-1573,1686-1691,1695-1700,1732-1736,1871,2106-2110,2376-2380,3177
+crates/esker-sql/tests/array_delimiter.rs
+  s_e5c0c6e78b5662::t_1dde2b649bd23e 152-156
+crates/esker-sql/tests/captures/pg19_geometric_array.txt
+  s_e5c0c6e78b5662::t_fa48326dfbf5ac 1-115
+crates/esker-sql/tests/corpus/pg19_geometric_array.txt
+  s_e5c0c6e78b5662::t_63eeb69277853a 1-38
+crates/esker-sql/tests/geometric.rs
+  s_e5c0c6e78b5662::t_3fb4afb566b34d 28-35,37
+crates/esker-sql/tests/pg_catalog.rs
+  s_e5c0c6e78b5662::t_df7fdbb4ca00e9 306,315-317,416-429,442-451,575-594,625-634
+crates/esker-sql/tests/row_order.rs
+  s_e5c0c6e78b5662::t_fc630044c9d1d5 115-125
+crates/esker-store/src/columnar/decode.rs
+  s_e5c0c6e78b5662::t_a608b320485cb4 205-209
+docs/adr/0091-the-five-geometric-shapes-get-their-arrays.md
+  s_e5c0c6e78b5662::t_4c9fd5db0173ff 1-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "7569da7837df2b09186a1ecccaae779ccf5046e3",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
