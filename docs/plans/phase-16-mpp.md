@@ -710,19 +710,71 @@ introduced it (`68bfdf02`) names 0073 in its message and that is now wrong; it i
 rather than rewritten, because the history is what a reader greps and a message that silently
 disagreed with the file would be worse than one that is corrected in the open.
 
-### J11. What is left, and the one thing it needs
+### J11. What was left — **built 2026-09-05, and this section did not say so**
 
-Built: the red differential, `Expr::In` with its ADR, and `EXPLAIN` naming an engine for every join
-with the rule that refused it. Left: the rewrite itself — collect the inner side's key set at
-resolve time, in the same transaction at the same snapshot, and put it into the outer fragment's
-filter as an `In`.
+> **Corrected 2026-09-09.** What follows described the state before `2e368a98`, and stayed after it.
+> The cost of that is on the record: the unit was ruled on again four days later, and it was one
+> `git log -S` away from being built twice. A plan section that names something as *left* is a
+> request for work, so it has to be closed by the commit that answers it.
 
-That needs the plan to carry **which inner table and column to read**, and the node that carries a
-routing decision is `routing::Columnar` in `crates/esker-sql/src/plan/routing.rs` — one field, in a
-directory this lane was told to stay out of. The seam itself has a precedent in the same call site:
-`subquery::resolve(&mut planned.node, &*txn, tenant)` already does exactly this shape of work with a
-transaction in hand. Asked of the coordinator and not yet answered; until it is, this file is the
-specification and the red test is the acceptance.
+Built on 2026-09-05 by `2e368a98`, all of it:
+
+* **the field** — `routing::Columnar::semi_join`, carrying the inner key plan, the outer fragment
+  slot and the inner table's name. The commit records the grant in its own words: *"the one field
+  this lane was granted in `src/plan`"*, so the permission this section asks for had already been
+  given when it was written;
+* **the rewrite** — `exec::fragment::push_the_semi_join_down`, called from `resolve` at exactly the
+  seam this section names, reading the key set through `Cursor::open` in the same transaction at
+  the same snapshot as both the fragment and the fallback, folding it into the filter as an
+  `Expr::In` and `And`-ing it with whatever filter was already there;
+* **the edges** — a NULL key dropped (it matches nothing, and `Expr::In` refuses a list holding
+  one), an inner side with no rows expressed as a literal `false` rather than an empty `IN`, the
+  values sorted and deduplicated into the strictly ascending order the decoder requires, and a key
+  of a type no fragment carries refused rather than silently turned into a NULL;
+* **the cap and the fallback** — more than `MAX_IN_VALUES` keys refuses with a reason and the row
+  plan answers, at the same snapshot;
+* **`EXPLAIN`** — `Semi Join Filter: dk in d  (2 keys)`, the inner table and the key count;
+* **the acceptance** — `a_join_over_columnar_tables_answers_what_the_row_engine_answers`, which
+  asserts its own denominator, plus `explain_shows_the_join_it_absorbed`,
+  `a_join_whose_inner_side_is_empty_answers_zero_on_both_engines` and
+  `a_join_the_rewrite_cannot_express_stays_on_the_rows`. Green in the tree.
+
+**What is actually left is the number.** `MAX_IN_VALUES` is 4,096 and it is a *format* limit — the
+most keys a fragment can carry — which is not the same question as the most keys it is *worth*
+carrying. Nothing has measured where an `In` of N keys pushed to every region stops beating a
+nested loop on the row path, and a planner-side threshold below the format's ceiling is what that
+measurement would buy. Until it is measured the cap is the format's, which is safe and possibly
+generous.
+
+### The number: what is being asked, and what the answer will be worth
+
+`MAX_IN_VALUES` is a **format** ceiling — the most keys a fragment can carry, checked by the codec
+and enforced again in `push_the_semi_join_down`. The planner has no threshold of its own, so today
+every join the rewrite can express is pushed down, up to 4,096 keys.
+
+**The two costs move in opposite directions**, which is why a crossover should exist at all:
+
+* the **pushdown** grows with N — N values encoded into the fragment, shipped to *every* region of
+  the outer table, and a binary search per scanned row over an N-value list. And the larger N is,
+  the *less* the filter removes: at the extreme it matches nearly every row, so the membership test
+  is paid on all of them and buys nothing;
+* the **nested loop** is roughly flat in N — it scans the outer table and probes the inner one per
+  row, and the inner side being narrower changes how many rows *survive*, not how many are probed.
+
+So the question is where the growing line crosses the flat one, and the answer is a planner-side
+threshold: above it, refuse the rewrite with a reason and let the row plan answer — the fallback
+that already exists, at the same snapshot, with `EXPLAIN` naming the refusal.
+
+**What the measurement will be worth, stated before it is taken.** The fixture is one region's
+worth of outer rows, so the shipping cost is paid **once**. A table spread over R regions pays it R
+times, and the per-row binary search is paid on each region's own rows — so a threshold measured
+here is an **upper bound**: the real crossover on a split table is at a *smaller* N, never a larger
+one. If the curve says "no crossover below the ceiling", that is an answer too, and it means the
+ceiling is the right place to stop for a single-region table and an open question for a wide one.
+
+The other thing recorded per row is whether the columns **actually answered**. A pushdown that
+refused and fell back is the row path timed twice, and a curve made of that would show the two paths
+identical everywhere — §10's free agreement, wearing a stopwatch.
 
 ## J12. `08006 … key is not in region 0`, and what a fragment may do about it
 
@@ -1156,6 +1208,24 @@ The load was ambient — other lanes building and a gate running — rather than
 recorded because it happens to span the band the sighting fell in and four rounds above it. Ten
 green says the window is narrow, and nothing else. *(The controlled six-thread arm is a separate
 row; see the handover for its numbers.)*
+
+### The other red this test has, and why it must not be read as this one
+
+Under a **six-thread arm on a box already at 31**, round 3 of five failed — and not as a
+disagreement:
+
+```text
+the snapshot imports: StoreUnavailable("gave up after 9 attempts: peer is not the leader of region 1")
+```
+
+That is the three-store cluster losing its leader while the box is starved, caught at
+`SET TRANSACTION SNAPSHOT` before either engine answered anything. It is an **availability**
+failure of the harness, it happens at a load band far above the one the sighting fell in (8–10),
+and in a gate log it appears under the same test name as the thing being hunted.
+
+Worth stating because the two want opposite readings: a disagreement is a wrong answer and a
+`not the leader` is a machine with nothing left. A red on this test is not evidence of the first
+until its message has been looked at.
 
 ### The instrument, so the next sighting is self-diagnosing
 
