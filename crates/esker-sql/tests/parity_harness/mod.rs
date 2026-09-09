@@ -40,7 +40,7 @@ use esker_sql::backend::{Backend, MemoryBackend};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
 use esker_sql::parse::{StatementClass, parse_statements};
-use esker_sql::pgwire::session::{Execute, Outcome, Session};
+use esker_sql::pgwire::session::{Described, Execute, Outcome, Session};
 use esker_sql::value::PgType;
 
 /// How long a test waits for the other session to reach its edge before calling it wedged. Long
@@ -303,6 +303,21 @@ impl Node {
                 .unwrap_or_else(|error| panic!("the fixture did not load: {statement}\n{error}"));
         }
         node
+    }
+
+    /// One statement's **`Describe`**, which is the extended protocol's own answer and not the
+    /// simple one's.
+    ///
+    /// The two paths derive the row shape separately, and a client that prepares — which
+    /// `ActiveRecord` does by default — only ever sees this one. A test that reads `Outcome::Rows`
+    /// is reading the simple path and cannot see a `Describe` that disagrees with it, which is how
+    /// an enum column went out as `int2` to every prepared read while `psql` showed it correct.
+    pub(crate) fn describe(&mut self, sql: &str) -> esker_sql::Result<Described> {
+        let parsed = parse_statements(sql)?;
+        let [statement] = parsed.as_slice() else {
+            panic!("describe takes one statement: {sql}");
+        };
+        self.executor.describe(statement, &[])
     }
 
     /// One statement, through the same dispatch a client's would take.
