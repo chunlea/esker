@@ -496,6 +496,39 @@ pub struct Transaction {
     state: State,
 }
 
+/// How many times a write set may be **re-cut** against a repaired region cache.
+///
+/// **Not a retry budget, and the loop does not rely on it.** A round only happens when the cut
+/// actually *changed*, and the loop stops the moment it stops changing — that is what terminates
+/// it. This is the safety net for a cluster whose regions move on every round forever.
+///
+/// It is generous because progress is per-*refusal*, not per-region: a refusal teaches the cache
+/// about the region it routed by, so a write set spread over *n* regions can need close to *n*
+/// rounds to be cut correctly. It was 8, and a 900-row write set over a dozen regions ran out —
+/// each round moved a few keys into the right group and the ninth gave up with the same
+/// `region epoch does not match` the whole fix is about. A write set that spans more regions than
+/// this is a statement whose grouping this client cannot learn in bounded time, which is a
+/// different failure and one worth reporting.
+const MAX_REGROUPINGS: usize = 64;
+
+/// Whether `error` says **this client's routing was wrong**, as opposed to the cluster being unable
+/// to answer.
+///
+/// The two look alike from a call site and mean opposite things: the first is fixed by asking again
+/// with what the refusal taught, and the second is not fixed by asking at all. Both of these arrive
+/// as a spent budget, because both are retried — see [`crate::retry::classify`].
+fn stale_routing(error: &Error) -> bool {
+    let refusal = match error {
+        Error::RetriesExhausted { source, .. } => Some(&**source),
+        Error::Store(source) => Some(source),
+        _ => None,
+    };
+    matches!(
+        refusal,
+        Some(ProtoError::EpochNotMatch { .. } | ProtoError::RegionNotFound { .. })
+    )
+}
+
 impl Transaction {
     /// The snapshot every read of this transaction sees, and its identity.
     #[must_use]
@@ -1235,9 +1268,23 @@ impl Transaction {
     ///
     /// The grouping is a **hint from the region cache**, never an authority: a key whose region
     /// the cache does not know goes in its own group, and a group that turns out to span a
-    /// region boundary is refused with `EpochNotMatch` and retried by the router with a
-    /// repaired cache. Nothing here has to be right for the result to be, which is the same
-    /// rule the cache lives under everywhere else (`docs/DESIGN.md` §10).
+    /// region boundary is refused with `EpochNotMatch`. Nothing here has to be right for the
+    /// result to be, which is the same rule the cache lives under everywhere else
+    /// (`docs/DESIGN.md` §10) — but being wrong has to be *survivable*, and for one shape it was
+    /// not.
+    ///
+    /// **A refused group is re-cut here, not re-sent by the router.** This used to say the router
+    /// retried it "with a repaired cache", which is true and not enough: the router retries *the
+    /// request it was given*, and the request carries the group. So a group built from a stale
+    /// cache that spans two regions could never succeed however often it was retried — the first
+    /// attempt repaired the cache and reset the budget, every later one learned nothing new, and
+    /// the ninth gave up. A transaction over a table that spans regions failed its `COMMIT` with
+    /// `gave up after 9 attempts: region epoch does not match`, with the splits long settled;
+    /// `esker-sql`'s `tests/multi_region_rows.rs` is where that was found, on a real cluster.
+    ///
+    /// So the loop below re-cuts the refused keys against the repaired cache and sends the pieces.
+    /// It stops when the cut stops changing, which is the difference between a boundary this
+    /// client had not seen and a cluster it cannot route to at all.
     fn grouped<F>(&self, keys: &[Bytes], send: F) -> Result<()>
     where
         F: Fn(&[Bytes]) -> Result<()> + Send + Sync,
@@ -1245,6 +1292,45 @@ impl Transaction {
         if keys.is_empty() {
             return Ok(());
         }
+        let mut pending = self.by_region(keys);
+        let mut refused = None;
+        for _ in 0..MAX_REGROUPINGS {
+            let outcomes = fan_out(pending.len(), |index| send(&pending[index]));
+            let mut stale: Vec<Vec<Bytes>> = Vec::new();
+            for (group, outcome) in pending.iter().zip(outcomes) {
+                match outcome {
+                    Ok(()) => {}
+                    // **A group the routing was wrong about, not a cluster that will not answer.**
+                    Err(error) if stale_routing(&error) => {
+                        stale.push(group.clone());
+                        refused = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if stale.is_empty() {
+                return Ok(());
+            }
+            // **Re-cut against the cache the refusal repaired.** Every attempt above left the
+            // router's cache more correct than it found it, so the same keys now group by the
+            // regions that actually exist — which is the whole of the fix. Only the keys of
+            // groups that were *refused* are re-sent: a refusal is a refusal, so nothing of
+            // theirs was applied (`error::tests::a_spent_retry_budget_never_leaves_a_write_in_doubt`
+            // is where that is pinned), and the groups that succeeded are not touched.
+            let regrouped = self.by_region(&stale.concat());
+            if regrouped == stale {
+                // The cut did not change, so sending it again would ask the same question and get
+                // the same answer. That is a cluster this client cannot route to, not a boundary
+                // it had not seen.
+                break;
+            }
+            pending = regrouped;
+        }
+        refused.map_or(Ok(()), Err)
+    }
+
+    /// One group per region the cache believes in, keys in the order they were given.
+    fn by_region(&self, keys: &[Bytes]) -> Vec<Vec<Bytes>> {
         let mut groups: BTreeMap<u64, Vec<Bytes>> = BTreeMap::new();
         for key in keys {
             // Region zero is "the cache does not know", and every such key shares one group:
@@ -1257,11 +1343,7 @@ impl Transaction {
                 .map_or(0, |route| route.region.id);
             groups.entry(region).or_default().push(key.clone());
         }
-        let groups: Vec<Vec<Bytes>> = groups.into_values().collect();
-        for outcome in fan_out(groups.len(), |index| send(&groups[index])) {
-            outcome?;
-        }
-        Ok(())
+        groups.into_values().collect()
     }
 
     /// A status that is not `Ok` is the transaction's fate, not a failure of the call.

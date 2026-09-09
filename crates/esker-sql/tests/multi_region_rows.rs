@@ -372,6 +372,87 @@ fn load(session: &mut Session) {
     }
 }
 
+/// **A transaction that writes across the boundaries commits as one, and a rollback leaves no
+/// half.**
+///
+/// Percolator picks its primary from one region and its secondaries live in the others, so a
+/// statement touching rows on both sides of a boundary is a two-phase commit *across regions* —
+/// the thing §11 said nothing exercised. The rollback is the half worth asserting: a transaction
+/// that wrote to several regions and then abandoned them must leave every one as it was, and a
+/// partial one is visible as some rows moved and some not.
+///
+/// This is the face that found `esker-client`'s re-cut defect: before it, every one of these
+/// commits died with `gave up after 9 attempts: region epoch does not match`.
+#[test]
+fn a_transaction_across_the_boundaries_commits_whole_or_not_at_all() {
+    let many = Splitting::start(SPLIT_SIZE);
+    let mut session = many.session();
+    load(&mut session);
+    wait_for(
+        "the table's region to split at least three ways",
+        60,
+        || many.regions() >= 3,
+    );
+    let regions = many.regions();
+
+    // **Spread rather than large.** `id % 97 = 0` picks a handful of rows scattered over the whole
+    // key space, so every region is written and the transaction stays small enough that what is
+    // being measured is the crossing rather than the size.
+    let spread = "WHERE id % 97 = 0";
+    let before = session.rows(&format!(
+        "SELECT id, amount FROM ledger {spread} ORDER BY id"
+    ));
+    assert!(
+        before.len() >= 3,
+        "the write set has to reach several regions: {} rows",
+        before.len()
+    );
+
+    session.run("BEGIN").unwrap();
+    session
+        .run(&format!("UPDATE ledger SET amount = amount + 1 {spread}"))
+        .unwrap();
+    session.run("COMMIT").unwrap();
+
+    let committed = session.rows(&format!(
+        "SELECT id, amount FROM ledger {spread} ORDER BY id"
+    ));
+    assert_eq!(committed.len(), before.len(), "a row went missing");
+    for (now, was) in committed.iter().zip(&before) {
+        assert_eq!(now[0], was[0], "the rows came back in a different order");
+        let moved: i64 = now[1].as_deref().unwrap().parse().unwrap();
+        let started: i64 = was[1].as_deref().unwrap().parse().unwrap();
+        assert_eq!(
+            moved,
+            started + 1,
+            "row {:?} did not move with the others across {regions} regions",
+            now[0]
+        );
+    }
+
+    // And the other half: a transaction that writes across every boundary and rolls back.
+    let whole = session.rows("SELECT id, amount FROM ledger ORDER BY id");
+    session.run("BEGIN").unwrap();
+    session
+        .run(&format!(
+            "UPDATE ledger SET amount = amount + 1000 {spread}"
+        ))
+        .unwrap();
+    session
+        .run(&format!(
+            "DELETE FROM ledger {spread} AND id > {}",
+            ROWS / 2
+        ))
+        .unwrap();
+    session.run("ROLLBACK").unwrap();
+
+    assert_eq!(
+        session.rows("SELECT id, amount FROM ledger ORDER BY id"),
+        whole,
+        "the rollback left something behind in at least one of {regions} regions"
+    );
+}
+
 /// **A node whose region cache is stale reads the whole table anyway** — no row lost, none twice.
 ///
 /// This is §11's first clause, `EpochNotMatch` and the refresh, and the only way to reach it
