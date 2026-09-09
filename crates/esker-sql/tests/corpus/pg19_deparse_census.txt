@@ -362,10 +362,10 @@ SELECT pg_get_indexdef('ix_arr_ctor'::regclass)		CREATE INDEX ix_arr_ctor ON pub
 ROLLBACK TO sp_arr_ctor		-
 SAVEPOINT sp_arr_ctor_e		-
 CREATE INDEX ix_arr_ctor ON cen ((ARRAY[a, b]))		-
-SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_arr_ctor'::regclass		ARRAY[a, b]\n!generation expression is not immutable
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_arr_ctor'::regclass		ARRAY[a, b]
 ROLLBACK TO sp_arr_ctor_e		-
 SAVEPOINT sp_arr_ctor_g		-
-ALTER TABLE cen ADD COLUMN g_arr_ctor text GENERATED ALWAYS AS ((ARRAY[a, b])::text) STORED		!current transaction is aborted, commands ignored until end of transaction block
+ALTER TABLE cen ADD COLUMN g_arr_ctor text GENERATED ALWAYS AS ((ARRAY[a, b])::text) STORED	!42P17 generation expression is not immutable
 ROLLBACK TO sp_arr_ctor_g		-
 SAVEPOINT sp_arr_ctor_v		-
 CREATE VIEW v_arr_ctor AS SELECT ARRAY[a, b] AS x FROM cen		-
@@ -397,10 +397,10 @@ SAVEPOINT sp_arr_slice_e		-
 CREATE INDEX ix_arr_slice ON cen ((arr[1:2]))		-
 # (the read-back this node cannot reach yet — PostgreSQL's answer, kept as evidence
 #  rather than as a comparison, because the refusal above swallows anything after it)
-# SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_arr_slice'::regclass		arr[1:2]\n!generation expression is not immutable
+# SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_arr_slice'::regclass		arr[1:2]
 ROLLBACK TO sp_arr_slice_e		-
 SAVEPOINT sp_arr_slice_g		-
-ALTER TABLE cen ADD COLUMN g_arr_slice text GENERATED ALWAYS AS ((arr[1:2])::text) STORED		!current transaction is aborted, commands ignored until end of transaction block
+ALTER TABLE cen ADD COLUMN g_arr_slice text GENERATED ALWAYS AS ((arr[1:2])::text) STORED	!42P17 generation expression is not immutable
 ROLLBACK TO sp_arr_slice_g		-
 SAVEPOINT sp_arr_slice_v		-
 CREATE VIEW v_arr_slice AS SELECT arr[1:2] AS x FROM cen		-
@@ -414,10 +414,10 @@ SELECT pg_get_indexdef('ix_arr_cat'::regclass)		CREATE INDEX ix_arr_cat ON publi
 ROLLBACK TO sp_arr_cat		-
 SAVEPOINT sp_arr_cat_e		-
 CREATE INDEX ix_arr_cat ON cen ((arr || ARRAY[a]))		-
-SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_arr_cat'::regclass		(arr \|\| ARRAY[a])\n!generation expression is not immutable
+SELECT pg_get_expr(indexprs, indrelid) FROM pg_index WHERE indexrelid = 'ix_arr_cat'::regclass		(arr \|\| ARRAY[a])
 ROLLBACK TO sp_arr_cat_e		-
 SAVEPOINT sp_arr_cat_g		-
-ALTER TABLE cen ADD COLUMN g_arr_cat text GENERATED ALWAYS AS ((arr || ARRAY[a])::text) STORED		!current transaction is aborted, commands ignored until end of transaction block
+ALTER TABLE cen ADD COLUMN g_arr_cat text GENERATED ALWAYS AS ((arr || ARRAY[a])::text) STORED	!42P17 generation expression is not immutable
 ROLLBACK TO sp_arr_cat_g		-
 SAVEPOINT sp_arr_cat_v		-
 CREATE VIEW v_arr_cat AS SELECT arr || ARRAY[a] AS x FROM cen		-

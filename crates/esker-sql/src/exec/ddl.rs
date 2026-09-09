@@ -5401,7 +5401,7 @@ fn deparsed_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnTy
     let parsed = crate::parse::parse_stored_expr(expr)?;
     let scope = crate::exec::query::Scope::single(table);
     let resolved = crate::exec::query::resolve(&parsed, &scope)?;
-    refuse_unless_immutable(&resolved)?;
+    refuse_unless_immutable(&resolved, &scope)?;
     let ty = crate::exec::query::expr_type(&resolved, &scope)?;
     let printed = deparse(&resolved, table, ty);
     if reads_back(table, &printed, ty) {
@@ -6656,7 +6656,7 @@ fn deparse_literal(literal: &plan::Literal, ty: ColumnType) -> String {
     }
 }
 /// Walks one resolved expression, refusing every node that may not be an index key.
-fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
+fn refuse_unless_immutable(expr: &plan::Expr, scope: &crate::exec::query::Scope<'_>) -> Result<()> {
     use crate::plan::Expr;
     let mut refusal = None;
     super::subquery::walk(expr, &mut |node| {
@@ -6664,6 +6664,36 @@ fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
             return;
         }
         refusal = match node {
+            // **A cast between `text` and a type whose text form is a *setting* is not
+            // immutable**, and this node accepted every one of them. Measured on 19beta1 by
+            // asking, in both directions and through both readers:
+            //
+            // ```text
+            // refused   date  timestamp  timestamptz  interval  money  and every array type
+            // accepted  integer  numeric  double precision  inet  uuid  boolean  json  jsonb  bytea
+            // ```
+            //
+            // `DateStyle` is what makes a `date` stable, `IntervalStyle` an `interval`,
+            // `lc_monetary` a `money`, and an array's output function is its element's plus a
+            // delimiter. `double precision` is the one a guess gets wrong — `extra_float_digits`
+            // moves its output and PostgreSQL marks `float8out` immutable anyway — which is why
+            // this list is measured and not derived.
+            //
+            // **This is the direction no corpus had asked about**: the node was *more permissive*
+            // than the server it copies, so nothing here could go red. `docs/plans/debts-v1.1.md`
+            // carries the methodology note.
+            Expr::ToText { operand, .. } if unstable_text_form(operand, scope) => {
+                Some(SqlError::NotImmutableInIndex)
+            }
+            Expr::Cast { operand, to, .. }
+                if *to == ColumnType::Text && unstable_text_form(operand, scope) =>
+            {
+                Some(SqlError::NotImmutableInIndex)
+            }
+            // And the same cast read the other way: `(t)::date` is `DateStyle` again.
+            Expr::Cast { to, .. } if has_unstable_text_form(*to) => {
+                Some(SqlError::NotImmutableInIndex)
+            }
             Expr::Aggregate(_) => Some(SqlError::AggregateNotAllowed(
                 "aggregate functions are not allowed in index expressions",
             )),
@@ -6721,6 +6751,33 @@ fn refuse_unless_immutable(expr: &plan::Expr) -> Result<()> {
     });
     refusal.map_or(Ok(()), Err)
 }
+/// Whether this expression's text form depends on a setting, so a cast to or from `text` over it
+/// is **stable rather than immutable**.
+///
+/// The measured list is in [`refuse_unless_immutable`]'s `ToText` arm. A type is named here rather
+/// than reasoned about: `double precision` is accepted by a real server even though
+/// `extra_float_digits` moves its output, and `bytea` is accepted even though `bytea_output` does
+/// — the answer is `provolatile` on the output function, and only the oracle knows it.
+fn has_unstable_text_form(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Date
+            | ColumnType::Timestamp
+            | ColumnType::TimestampTz
+            | ColumnType::Interval
+            | ColumnType::Money
+    ) || esker_keys::array::ArrayValue::element_of(ty).is_some()
+}
+
+/// [`has_unstable_text_form`] for the type an operand turns out to have.
+///
+/// An operand whose type cannot be worked out is **not** refused: this guard exists to reproduce a
+/// refusal a real server makes, and inventing one for a shape it cannot type would be the more
+/// permissive direction's mirror image.
+fn unstable_text_form(operand: &plan::Expr, scope: &crate::exec::query::Scope<'_>) -> bool {
+    crate::exec::query::expr_type(operand, scope).is_ok_and(has_unstable_text_form)
+}
+
 /// An index's key as column **names**, which is how a partition's copy is matched to its parent's.
 ///
 /// Positions cannot do it: the copy's ordinals are the partition's and the original's are the
