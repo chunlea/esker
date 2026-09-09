@@ -2810,10 +2810,19 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             case_insensitive: *case_insensitive,
         },
         // The strip is decided here, where the operand's type is still known.
-        Expr::Scalar { func, operand } => Expr::Scalar {
-            func: *func,
-            operand: Box::new(resolve(operand, scope)?),
-        },
+        // Every one of these reads its argument as `text` except `octet_length`, which reports
+        // the storage — `octet_length(c)` is `4` where `length(c)` is `1`, measured.
+        Expr::Scalar { func, operand } => {
+            let operand = resolve(operand, scope)?;
+            Expr::Scalar {
+                func: *func,
+                operand: Box::new(if *func == crate::plan::ScalarFunc::OctetLength {
+                    operand
+                } else {
+                    read_as_text(operand, scope)
+                }),
+            }
+        }
         // **Permission is checked here and not at lowering**, because the operand's type is not
         // known until it is resolved against a scope: `'2020-01-01'::date::int` folds and is
         // `42846` already, and `d::int` over a `timestamptz` column has to reach the same answer.
@@ -2824,6 +2833,17 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             typmod,
         } => {
             let operand = resolve(operand, scope)?;
+            // **A cast *out of* `bpchar` strips the padding first, and a cast into one does not.**
+            // Measured with `octet_length`, which is the only reader that can tell:
+            // `c::varchar`, `c::name` and `c::text` over a `character(4)` holding `x` are 1 byte,
+            // `c::char(2)` is 2 and `c::char(6)` is 6 — truncated or padded to the target's own
+            // width — and `c::bpchar` with no width is 4, the value unchanged. So the strip is
+            // exactly "leaving the type", which is what [`read_as_text`] inserts.
+            let operand = if *to == ColumnType::Bpchar {
+                operand
+            } else {
+                read_as_text(operand, scope)
+            };
             if let Ok(from) = expr_type(&operand, scope)
                 && !pg_catalog::casts_to(from, *to)
             {
@@ -3040,7 +3060,32 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         Expr::CatalogFunc(call) => {
             let mut args = Vec::with_capacity(call.args.len());
             for arg in &call.args {
-                args.push(resolve(arg, scope)?);
+                let arg = resolve(arg, scope)?;
+                // **A function reads a `bpchar` argument as `text` exactly when its result *is*
+                // `text`.** `upper(c)` is `X` and `substr(c, 1, 4)` is `x`; `greatest(d, d)` is a
+                // `character(2)` and comes back `y ` **padded**, because a production that keeps
+                // its argument's type never coerced it. That is the same fact as their typmod
+                // surviving (`typmod_of`, `debts-v1.1.md` #28) seen from the value side, and it
+                // is why the exclusions below are a list of type-preserving functions rather than
+                // a list of names.
+                //
+                // `concat` is the one that breaks the pattern and it is measured: its result is
+                // `text` and it still pads, because it takes `"any"` and goes through the output
+                // function — `concat(c, 'z')` is `x   z`. The type guard inside [`read_as_text`]
+                // is what leaves `->`, `||` over `jsonb` and every non-text argument alone.
+                args.push(
+                    if matches!(
+                        call.func,
+                        CatalogFunc::Concat
+                            | CatalogFunc::NullIf
+                            | CatalogFunc::Greatest
+                            | CatalogFunc::Least
+                    ) {
+                        arg
+                    } else {
+                        read_as_text(arg, scope)
+                    },
+                );
             }
             // **`pg_typeof` is answered here, from the argument's *declared* type, always.**
             //
@@ -3057,6 +3102,20 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             // folding the call to a constant would answer one. So the resolved type rides along as
             // a second argument and the evaluator answers that, leaving the first to be evaluated
             // exactly as it was.
+            // **`NULLIF` is a comparison, so it is reconciled like one.** Its two arguments meet
+            // under `=` and everything `reconcile` does for `c = 'x'` has to happen here too —
+            // the one that shows is a `character(n)`: a `bpchar` comparison ignores trailing
+            // blanks, which this crate implements by padding the *other* side to the column's
+            // width (`blank_pad`), so `nullif(c, 'x')` over a `character(4)` holding `x` is NULL
+            // on a real server and was `x   ` here. One rule, called from its second caller,
+            // rather than a second copy of it (`debts-v1.1.md` #31).
+            if call.func == CatalogFunc::NullIf && args.len() == 2 {
+                let right = args.pop().unwrap_or(Expr::Literal(Literal::Null));
+                let left = args.pop().unwrap_or(Expr::Literal(Literal::Null));
+                let (left, right) = reconcile(BinaryOp::Eq, left, right)?;
+                args.push(left);
+                args.push(right);
+            }
             match (call.func, args.first()) {
                 (CatalogFunc::PgTypeof, Some(arg)) if args.len() == 1 => {
                     let named = pg_typeof_of(arg, scope)?;
@@ -4668,6 +4727,33 @@ fn projection_exprs(
 /// `c || '|'` over a `character(3)` is `text` with no modifier and `min(c)` is `bpchar` with none,
 /// where a bare `c` is `character(3)`. An unresolvable column answers `NO_TYPMOD` rather than an
 /// error, because whatever is wrong with it is reported by `expr_type` beside this.
+/// A `bpchar` operand **read as `text`**, which is where its trailing blanks stop existing.
+///
+/// A `character(n)` is stored blank-padded and printed padded — `SELECT c` is `x   ` on a real
+/// server too — and the padding disappears the moment the value is coerced to `text`, which
+/// PostgreSQL does by inserting a cast node in front of every text operator and text function.
+/// This inserts the same node, and the cast this crate already had is what trims: `c::text` agreed
+/// with a real server before this and `upper(c)` did not.
+///
+/// **Three readers keep the padding and are not given one**, measured in
+/// `tests/corpus/pg19_bpchar_padding.txt`: `octet_length` (it reports the storage, `4`, where
+/// `length` reports the value, `1`), `concat` (it takes `"any"` and goes through the output
+/// function, so `concat(c, 'z')` is `x   z`), and `LIKE` (`c LIKE 'x'` is **false** while
+/// `c = 'x'` is true — the sharpest pair in that file). A comparison keeps them too and needs
+/// nothing here: it pads the *other* side instead (`blank_pad`), which is the same answer from the
+/// other direction.
+fn read_as_text(expr: Expr, scope: &Scope<'_>) -> Expr {
+    if matches!(expr_type(&expr, scope), Ok(ColumnType::Bpchar)) {
+        return Expr::ToText {
+            operand: Box::new(expr),
+            // The one operand type it is true for, which is the whole of this function.
+            strip_blanks: true,
+            enum_labels: None,
+        };
+    }
+    expr
+}
+
 pub(super) fn typmod_of(expr: &Expr, scope: &Scope<'_>) -> i32 {
     let none = crate::value::NO_TYPMOD;
     match expr {

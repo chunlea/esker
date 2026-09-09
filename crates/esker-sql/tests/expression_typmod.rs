@@ -37,31 +37,11 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    // **Four, and none of them is a typmod.** The type agrees in every row of this file now;
-    // what is left is a `character(n)`'s trailing blanks, which is `docs/plans/debts-v1.1.md` #31
-    // and a different rule reached by four different readers.
-    answers: &[
-        (
-            "SELECT nullif(c, 'x') FROM g1tm",
-            "**The type agrees now; the value is `docs/plans/debts-v1.1.md` #31.** `character(4)` on both sides — that is this unit — and PostgreSQL answers NULL where this node answers `x   `, because a `bpchar` comparison **ignores trailing blanks**: the padded `x   ` equals `'x'` there, so `NULLIF` returns nothing. Here they are two different strings. Same rule as the three rows below, reached through a comparison instead of a function.",
-            "pg19_expression_typmod.txt:56",
-        ),
-        (
-            "SELECT c || 'x' FROM g1tm",
-            "**#31.** `xx` there, `x   x` here. A `bpchar` is stored blank-padded and printed padded — `SELECT c` is `x   ` on both — but concatenation coerces to `text` and the coercion right-trims. This node carries the padding through.",
-            "pg19_expression_typmod.txt:70",
-        ),
-        (
-            "SELECT length(c) FROM g1tm",
-            "**#31.** `1` there, `4` here: `length` over a `character(n)` ignores the padding, which is the same rule as the concatenation above seen from the other side — the value is `x`, the storage is `x   `.",
-            "pg19_expression_typmod.txt:71",
-        ),
-        (
-            "SELECT upper(c) FROM g1tm",
-            "**#31.** `X` there, `X   ` here — a text function reads the `bpchar` as `text`, which right-trims first. Three functions, one rule, and `tests/typmod.rs` carries the row that found it.",
-            "pg19_expression_typmod.txt:75",
-        ),
-    ],
+    // **Nothing.** Four rows stood here and none of them was a typmod: they were a
+    // `character(n)`'s trailing blanks reached by a comparison, an operator and two functions,
+    // which is `docs/plans/debts-v1.1.md` #31 and closed by `exec::query::read_as_text` in the
+    // commit after this file landed.
+    answers: &[],
 };
 
 #[test]
