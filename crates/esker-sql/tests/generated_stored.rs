@@ -75,6 +75,51 @@ fn insert_and_update_refuse_it_differently() {
     );
 }
 
+/// **Every shape the deparser now stores, computed** — because the corpus only reads the catalog.
+///
+/// `tests/generated_parens.rs` asserts what `pg_get_expr` prints, and printing is not the whole
+/// contract: the stored string is parsed again to compute the column's value on every write
+/// ([ADR 0088](../../../docs/adr/0088-a-stored-expression-is-deparsed-by-the-statement-that-writes-it.md)),
+/// so a printed form that reads back as something else is a wrong *value* and not a wrong string.
+/// `exec::ddl::reads_back` is the guard on the write path; this is the assertion from the other
+/// side, and it is here rather than there because a corpus row cannot insert.
+///
+/// The shapes are the ones that unit newly routed through the deparser — an operator at depth, a
+/// concatenation, a comparison, a `LIKE`, an `IN`, a cast and a nested call — one column each and
+/// one row through all of them at once.
+#[test]
+fn every_deparsed_shape_still_computes_its_value() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE gsv (id int8 PRIMARY KEY, c1 integer, c2 integer, t text)",
+        "ALTER TABLE gsv ADD COLUMN g_depth integer GENERATED ALWAYS AS (c1 * 2 + 3) STORED",
+        "ALTER TABLE gsv ADD COLUMN g_cat text GENERATED ALWAYS AS (t || 'x') STORED",
+        "ALTER TABLE gsv ADD COLUMN g_cmp boolean GENERATED ALWAYS AS (c1 > 0 AND c2 > 0) STORED",
+        "ALTER TABLE gsv ADD COLUMN g_like boolean GENERATED ALWAYS AS (t LIKE 'a%') STORED",
+        "ALTER TABLE gsv ADD COLUMN g_in boolean GENERATED ALWAYS AS (c1 IN (1, 2)) STORED",
+        "ALTER TABLE gsv ADD COLUMN g_cast bigint GENERATED ALWAYS AS ((c1 + c2)::bigint) STORED",
+        "ALTER TABLE gsv ADD COLUMN g_call integer GENERATED ALWAYS AS (length(t || 'x')) STORED",
+        "INSERT INTO gsv (id, c1, c2, t) VALUES (1, 2, 5, 'ab')",
+    ]);
+    assert_eq!(
+        node.rows(
+            "SELECT g_depth, g_cat, g_cmp, g_like, g_in, g_cast, g_call FROM gsv WHERE id = 1"
+        ),
+        vec![vec!["7", "abx", "t", "t", "t", "7", "3"]],
+        "a shape whose printed form does not read back computes the wrong value, or none"
+    );
+    // And it recomputes, which is the half an `INSERT` alone cannot show: the expression is read
+    // out of the catalog again for the `UPDATE`, so a text that only parses once would pass above
+    // and fail here.
+    node.run("UPDATE gsv SET c1 = 9, t = 'zz' WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        node.rows(
+            "SELECT g_depth, g_cat, g_cmp, g_like, g_in, g_cast, g_call FROM gsv WHERE id = 1"
+        ),
+        vec![vec!["21", "zzx", "t", "f", "f", "14", "3"]],
+    );
+}
+
 /// It is a function of the **row**, re-evaluated on every write — not a value computed once.
 #[test]
 fn it_recomputes_when_its_source_changes() {
