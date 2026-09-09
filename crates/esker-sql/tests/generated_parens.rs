@@ -69,18 +69,11 @@ fn every_printed_expression_is_postgresql_19_s() {
 /// What this node answers differently on the shape corpus, and why.
 const SHAPE_DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[
-        (
-            "SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1dp2'::regclass AND a.attname = 'x_lit'",
-            "**One integer literal type, so a literal's cast is gone before the printer runs.**          `GENERATED ALWAYS AS (1::bigint)` prints `(1)::bigint` on a real server and `1` here.          PostgreSQL's rule is `get_const_expr`'s: a numeric `Const` shows its type when that type          is not the one the literal form defaults to, and `1` defaults to `integer`, so an `int8`          `1` needs the cast to re-parse as itself. This node resolves every integer literal to one          type (`docs/plans/debts-v1.1.md` #12, and it is b4's), so `1` and `1::bigint` are the          same resolved literal and there is nothing left to print the cast from. Not a deparser          gap: the sibling row `x_lit_expr` — `(1 + 1)::bigint` — agrees, because there the cast is          over an operator and survives as a `Cast` node. The *default* spelling agrees too          (`d_cast`), from `parse::lower::cast_default_text`, which reads the written text before          anything folds it. **It survived the landing that was supposed to close it**, and that is worth recording because the guess was reasonable and wrong: ADR 0086 (a folded cast keeps the type it named) and ADR 0087 (an integer literal is the narrowest type that holds it) are both in the tree, so `1` is an `int4` and `1::bigint` an `int8` and the two are no longer the same literal. The row still differs one layer further out, in the **printer**: `exec::ddl::deparse_literal` prints a number bare whatever its type, while PostgreSQL's `get_const_expr` shows the type whenever it is not the one the literal form defaults to. So this is now a one-arm change with its own measurement to take -- which constants show a cast, for each of the six numeric types and in each position -- and is `docs/plans/debts-v1.1.md` #22 rather than #12.",
-            "pg19_deparse_parens.txt:118",
-        ),
-        (
-            "ALTER TABLE g1dp2 ADD COLUMN f_literal text GENERATED ALWAYS AS (upper('a')) STORED",
-            "**No collation derivation, so a text call over nothing but literals is accepted          where a real server refuses it.** PostgreSQL answers `42P22 could not determine which          collation to use for upper() function`: a generated column's expression must have a          determinable collation, a literal argument carries none, and the column's own is not          consulted. Measured, and it is the reason this corpus tests a literal argument as a          *default* (`g1dp3`) rather than as a generated column. This node has no collation          inference at all — `COLLATE` is recorded per column and never derived through an          expression — so it builds the column and stores `upper('a'::text)`, which is what the          same expression prints as a default here and there. C3, in the direction that accepts          more than the oracle; the value it computes is the value a real server would compute if          it built it.",
-            "pg19_deparse_parens.txt:141",
-        ),
-    ],
+    answers: &[(
+        "ALTER TABLE g1dp2 ADD COLUMN f_literal text GENERATED ALWAYS AS (upper('a')) STORED",
+        "**No collation derivation, so a text call over nothing but literals is accepted          where a real server refuses it.** PostgreSQL answers `42P22 could not determine which          collation to use for upper() function`: a generated column's expression must have a          determinable collation, a literal argument carries none, and the column's own is not          consulted. Measured, and it is the reason this corpus tests a literal argument as a          *default* (`g1dp3`) rather than as a generated column. This node has no collation          inference at all — `COLLATE` is recorded per column and never derived through an          expression — so it builds the column and stores `upper('a'::text)`, which is what the          same expression prints as a default here and there. C3, in the direction that accepts          more than the oracle; the value it computes is the value a real server would compute if          it built it.",
+        "pg19_deparse_parens.txt:141",
+    )],
 };
 
 /// **The deparser's specification**, one row per shape, taken from the oracle.

@@ -4206,6 +4206,21 @@ fn retype(
     {
         return Ok(literal.clone());
     }
+    // **And an integer literal wider than the column is compared, not narrowed**, which is the
+    // arm above with the widths one step in: PostgreSQL has an `int4 > int8` operator, so
+    // `i4 > 9223372036854775807` is answered — `f` for every row — where narrowing the literal to
+    // the column's type is `22003 integer out of range`, a refusal for a statement a real server
+    // runs. Measured on 19beta1 while building `tests/corpus/pg19_numeric_literal_deparse.txt`,
+    // which is a corpus about *printing* and found this because the row would not build.
+    //
+    // The same sentence as the `numeric` arm applies unchanged: narrowing is what an assignment
+    // does, and `22003` is the right answer to an `INSERT` and the wrong one to a `WHERE`.
+    if let Some(value) = integer_literal_value(literal)
+        && let Some((low, high)) = integer_span(ty)
+        && !(low..=high).contains(&value)
+    {
+        return Ok(literal.clone());
+    }
     match literal.assign(ty, "?column?") {
         // Reduced to a value of the column's own type, so the comparison is between two of them.
         Ok(value) => Ok(match value {
@@ -4217,6 +4232,33 @@ fn retype(
         // A literal of the right *category* that still will not read -- `WHERE ts = 'not a date'`
         // -- keeps the error its input function raised, which says what is actually wrong.
         Err(error) => Err(error),
+    }
+}
+
+/// The value of an integer literal, whichever of the two spellings it is in.
+///
+/// `Literal::Integer` is what the parser makes and `Literal::Typed(Int2|Int4|Int8)` is what a cast
+/// or an earlier retype leaves; both are the same value and the fit question is the same question.
+fn integer_literal_value(literal: &Literal) -> Option<i64> {
+    match literal {
+        Literal::Integer(value) => Some(*value),
+        Literal::Typed(value) => match value.as_ref() {
+            Datum::Int2(value) => Some(i64::from(*value)),
+            Datum::Int4(value) => Some(i64::from(*value)),
+            Datum::Int8(value) => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The inclusive range an integer column type holds, or `None` for a type that is not one.
+fn integer_span(ty: ColumnType) -> Option<(i64, i64)> {
+    match ty {
+        ColumnType::Int2 => Some((i64::from(i16::MIN), i64::from(i16::MAX))),
+        ColumnType::Int4 => Some((i64::from(i32::MIN), i64::from(i32::MAX))),
+        ColumnType::Int8 => Some((i64::MIN, i64::MAX)),
+        _ => None,
     }
 }
 
