@@ -20,22 +20,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[(
-        "SELECT id, length(c), c || '|' FROM tm WHERE id = 1",
-        "**A `character(n)`'s trailing blanks, and the two places they are supposed to vanish.** \
-         The row reads `1|1|x|` on a real server and `1|3|x  |` here: `length(c)` over a \
-         `character(3)` holding `x` is **1** there and 3 here, and `c || '|'` is `x|` there and \
-         `x  |` here. A `bpchar` is stored blank-padded and printed padded — `SELECT c` is `x  ` \
-         in both — but `length` ignores the padding and a concatenation coerces to `text`, which \
-         strips it. This node pads on the way out and keeps the padding through both.\n\
-         \n\
-         The entry that used to stand here said these were \"two scalar operations this node does \
-         not have\", declared `UNMEASURED`, and the row *also* mis-parsed: `x|` ends in a `|`, so \
-         the format split it into an extra cell and the report showed two lines that looked the \
-         same (`docs/plans/debts-v1.1.md` #20). Escaping the value is what let the real difference \
-         be read at all. `docs/plans/debts-v1.1.md` #31.",
-        "pg19_typmod.txt:71",
-    )],
+    // **Nothing.** The entry that stood here was `SELECT id, length(c), c || '|'`, and it took three
+    // units to empty: #20 escaped the value so the row could be *read* (`x|` ends in a `|`, so it
+    // parsed as an extra cell and the report showed two lines that looked the same), which let the
+    // real difference be seen — a `character(n)`'s trailing blanks — which is #31, closed by
+    // `exec::query::read_as_text`. The reason before that said `length` and `||` were "two scalar
+    // operations this node does not have"; it had both.
+    answers: &[],
 };
 
 #[test]
