@@ -810,6 +810,11 @@ fn type_name(oid: u32, typmod: i32) -> String {
 /// One corpus file, as `(line number, statement, what PostgreSQL answered)`.
 /// The directive a corpus file uses to say its **values are escaped**.
 ///
+/// **It must be in the header comment block** — before the first line that is neither blank nor a
+/// comment — and not merely somewhere in the file. A corpus that *documents* this format writes
+/// the directive as an example (`pg19_corpus_format.txt` does, in its own header prose), and
+/// anywhere-in-the-file would make such a file silently start escaping.
+///
 /// A comment line to every reader that does not know about it, so a file carrying it is still a
 /// valid corpus for anything else, and old files are untouched — which matters, because 19 rows
 /// across this directory already hold a `\\` or a `\n` inside a value and un-escaping them
@@ -959,7 +964,12 @@ fn declared_types(field: &str) -> Vec<String> {
 }
 
 fn parse(corpus: &str) -> Vec<(usize, String, Answer)> {
-    let escaped = corpus.lines().any(|line| line.trim() == ESCAPED_DIRECTIVE);
+    // In the header block only: the directive is positional, and the rule is decidable — everything
+    // up to the first line that is neither blank nor a comment.
+    let escaped = corpus
+        .lines()
+        .take_while(|line| line.trim_start().starts_with('#') || line.trim().is_empty())
+        .any(|line| line.trim() == ESCAPED_DIRECTIVE);
     corpus
         .lines()
         .enumerate()
