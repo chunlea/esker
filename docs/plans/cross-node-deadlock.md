@@ -163,8 +163,15 @@ Several days, an ADR, and it spans `esker-proto` and `esker-pd` — pdha's groun
 `debts-v1.md` already assigns it. What belongs to this lane is the SQL end: the mapping, and the
 two-node test that says exactly one victim gets `40P01`.
 
-## Worth fixing before any of it
+## Worth fixing before any of it — **done**, and it stopped being small
 
-The heartbeat gap is its own small item and is not this debt: an RPC handler that exists on the
-store, documented as the thing keeping a live transaction's lock alive, with nobody sending it. It
-should either be sent or the comments that assume it should stop saying so.
+The heartbeat gap was written here as its own item: an RPC handler on the store, documented as the
+thing keeping a live transaction's lock alive, with nobody sending it, and *"it should either be
+sent or the comments that assume it should stop saying so"*.
+
+It is sent, as of [ADR 0088](../adr/0088-a-row-lock-across-nodes.md)'s second unit — and the reason
+it stopped being small is (a'). While the only locks a transaction held were a commit's, the gap
+cost cleanup latency and nothing else: those locks live for the length of a two-phase commit. A
+`SELECT … FOR UPDATE` lock is held for the length of the *transaction*, so under a three-second
+lease an ordinary client pausing between two statements lost its row — measured, and red in
+`crates/esker-client/tests/lock_heartbeat.rs` before the sender existed.

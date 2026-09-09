@@ -174,6 +174,9 @@ impl<T: TimestampOracle + ?Sized> TimestampOracle for Arc<T> {
 pub struct TxnClient {
     router: Arc<Router>,
     oracle: Arc<dyn TimestampOracle>,
+    /// The transactions this client is telling the store are still alive
+    /// ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)).
+    renewals: Arc<crate::renew::Renewals>,
     lock_ttl_ms: u64,
     max_lock_resolutions: u32,
     max_scan_regions: usize,
@@ -198,8 +201,10 @@ impl TxnClient {
         oracle: Arc<dyn TimestampOracle>,
         options: ClientOptions,
     ) -> Self {
+        let router = Arc::new(Router::with_options(transport, resolver, options));
         Self {
-            router: Arc::new(Router::with_options(transport, resolver, options)),
+            renewals: crate::renew::Renewals::new(Arc::clone(&router), Arc::clone(&oracle)),
+            router,
             oracle,
             lock_ttl_ms: LOCK_TTL_MS,
             max_lock_resolutions: MAX_LOCK_RESOLUTIONS,
@@ -215,6 +220,7 @@ impl TxnClient {
     #[must_use]
     pub fn on_router(router: Arc<Router>, oracle: Arc<dyn TimestampOracle>) -> Self {
         Self {
+            renewals: crate::renew::Renewals::new(Arc::clone(&router), Arc::clone(&oracle)),
             router,
             oracle,
             lock_ttl_ms: LOCK_TTL_MS,
@@ -402,6 +408,7 @@ impl TxnClient {
         Transaction {
             router: Arc::clone(&self.router),
             oracle: Arc::clone(&self.oracle),
+            renewals: Arc::clone(&self.renewals),
             start_ts,
             lock_ttl_ms: self.lock_ttl_ms,
             max_lock_resolutions: self.max_lock_resolutions,
@@ -447,6 +454,9 @@ enum State {
 pub struct Transaction {
     router: Arc<Router>,
     oracle: Arc<dyn TimestampOracle>,
+    /// Shared with the client: what keeps this transaction's lock alive while it is doing nothing
+    /// ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)).
+    renewals: Arc<crate::renew::Renewals>,
     start_ts: u64,
     lock_ttl_ms: u64,
     max_lock_resolutions: u32,
@@ -739,6 +749,11 @@ impl Transaction {
             // the buffer, so `commit` will send it again and the store will answer `AlreadyLocked`.
             self.locked.insert(primary.clone());
         }
+        // **The renewal starts here**, because this is the moment a lock of this transaction's is
+        // on the store with a lease running against it. The primary is the only one that has to be
+        // told: it is the only lock a resolver consults, and settling it is what kills the rest.
+        self.renewals
+            .register(self.start_ts, &primary, self.lock_ttl_ms);
         self.pinned = Some(primary);
         Ok(None)
     }
@@ -1271,6 +1286,7 @@ impl Transaction {
             ));
         }
         self.state = State::Finished;
+        self.renewals.forget(self.start_ts);
         Ok(())
     }
 
@@ -1884,6 +1900,19 @@ pub enum Acquired {
         /// What is left of the holder's lease, in milliseconds.
         lease_ms: u64,
     },
+}
+
+impl Drop for Transaction {
+    /// **The ending that is not a method call.** A transaction dropped without `commit` or
+    /// `rollback` — a session that disconnected, a `?` on the way out — has stopped existing, and a
+    /// renewal that outlived it would keep its lock alive for ever: a crashed client's row held
+    /// permanently, which is worse than the lease this closes the gap in.
+    ///
+    /// It only forgets. The locks themselves are left to the lease and the resolver, which is what
+    /// happens to any abandoned transaction and is not this method's business to change.
+    fn drop(&mut self) {
+        self.renewals.forget(self.start_ts);
+    }
 }
 
 /// What a resolver found when it looked at a lock's owner.

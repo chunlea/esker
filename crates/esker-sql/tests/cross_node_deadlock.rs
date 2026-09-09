@@ -211,3 +211,118 @@ fn one_half(
     }
     "ok".to_owned()
 }
+
+/// **A lock that committed did not change the row, so it refuses nobody**
+/// ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md), the rule this file's build
+/// reversed).
+///
+/// `SELECT … FOR UPDATE` leaves a `Kind::Lock` record in the `write` column family when its
+/// transaction commits, and that record used to count as a commit in the prewrite conflict check.
+/// The rule the check exists for is first-committer-wins — *somebody wrote a version of this key
+/// after my snapshot, so the value I computed from it is stale* — and a lock record is the
+/// transaction saying it held the key and wrote **nothing** to it. Nothing moved, so nothing is
+/// stale.
+///
+/// **`REPEATABLE READ` is what makes this askable at all.** Under `READ COMMITTED` the writer takes
+/// a fresh snapshot per statement (ADR 0057), which would be *after* the lock committed, and the
+/// question never arises. The older transaction here keeps one snapshot for its whole life, so the
+/// lock record is unambiguously above it.
+///
+/// **This test passes under the old rule too, and that is recorded rather than hidden.** The
+/// counterfactual — the `Kind::Lock` skip taken back out of `newest_write_after` — leaves it green,
+/// because the SQL write path asks `changed_since_statement` before it asks to prewrite and that
+/// question does not reach the conflict check on this shape. What discriminates the two rules is
+/// `esker-txn`'s `a_lock_kind_record_is_neither_a_version_nor_a_conflict` at the layer the decision
+/// lives at, and `two_nodes_crossing_a_lock_leave_one_victim` where the old rule's damage reaches a
+/// client. This one says what a user meets; it is not the proof, and calling a green a proof is the
+/// mistake this comment exists to stop.
+#[test]
+fn a_committed_lock_record_does_not_refuse_an_older_writer() {
+    let cluster = Cluster::start();
+    let mut setup = cluster.session();
+    setup
+        .run("CREATE TABLE lk (id int8 PRIMARY KEY, n int8)")
+        .unwrap();
+    setup.run("INSERT INTO lk VALUES (1, 1)").unwrap();
+
+    // The older transaction, and its snapshot is taken here and kept.
+    let mut older = cluster.session();
+    older.run("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+    assert_eq!(
+        older.rows("SELECT n FROM lk WHERE id = 1"),
+        vec![vec![Some("1".to_owned())]]
+    );
+
+    // A locking read that takes the row, holds it, and commits — leaving the record and no value.
+    let mut holder = cluster.session();
+    holder.run("BEGIN").unwrap();
+    holder
+        .run("SELECT n FROM lk WHERE id = 1 FOR UPDATE")
+        .unwrap();
+    holder.run("COMMIT").unwrap();
+
+    // And now the older transaction writes the row it read. Its snapshot is behind a commit that
+    // changed nothing, which is not a reason to refuse it.
+    older
+        .run("UPDATE lk SET n = 5 WHERE id = 1")
+        .expect("a lock that wrote nothing must not make an older writer stale");
+    older
+        .run("COMMIT")
+        .expect("and it must not refuse the commit either");
+
+    let mut after = cluster.session();
+    assert_eq!(
+        after.rows("SELECT n FROM lk WHERE id = 1"),
+        vec![vec![Some("5".to_owned())]]
+    );
+}
+
+/// **The other half: while the lock is held, a write from another node may not pass it.**
+///
+/// The face above says a lock record refuses nobody *after* it commits; this says the lock itself
+/// excludes *during*, which is the whole point of (a') and the thing measured missing. The writer
+/// is the **younger** of the two, so wound-wait sends it to wait rather than to kill — and the
+/// holder never lets go, so waiting is all it can do until its budget runs out.
+///
+/// It is a second node deliberately: the writer's own node-local table would stop it on the first
+/// node without the store being involved at all, and the store is what is on trial.
+#[test]
+fn a_write_may_not_pass_a_lock_another_node_holds() {
+    let cluster = Cluster::start();
+    let mut setup = cluster.session();
+    setup
+        .run("CREATE TABLE lk (id int8 PRIMARY KEY, n int8)")
+        .unwrap();
+    setup.run("INSERT INTO lk VALUES (1, 1)").unwrap();
+
+    // The holder, older, and it never releases inside this test.
+    let mut holder = cluster.session();
+    holder.run("BEGIN").unwrap();
+    holder
+        .run("SELECT n FROM lk WHERE id = 1 FOR UPDATE")
+        .unwrap();
+
+    // A younger writer on a second node. Its `UPDATE` is buffered — the write path takes the
+    // node's own table and Percolator's prewrite is what excludes the other node — so the wait is
+    // at the commit, which is where the lock is met.
+    let mut writer = on_a_second_node(&cluster);
+    writer.run("BEGIN").unwrap();
+    writer.run("UPDATE lk SET n = 9 WHERE id = 1").unwrap();
+    let refused = writer
+        .run("COMMIT")
+        .expect_err("a write passed a lock another node was holding");
+    assert_eq!(
+        refused.sqlstate(),
+        esker_sql::sqlstate::SERIALIZATION_FAILURE,
+        "the writer waited the holder out and then gave up, which is `40001`: {refused}"
+    );
+    let _ = writer.run("ROLLBACK");
+
+    // The holder still has the row it was holding, and nothing was written over it.
+    holder.run("ROLLBACK").unwrap();
+    let mut after = cluster.session();
+    assert_eq!(
+        after.rows("SELECT n FROM lk WHERE id = 1"),
+        vec![vec![Some("1".to_owned())]]
+    );
+}

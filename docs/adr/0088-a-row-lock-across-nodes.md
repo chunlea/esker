@@ -302,9 +302,55 @@ same key stop refusing each other, which ADR 0062 never needed and never claimed
 held the old line now states the new one with the reasoning, under the name
 `a_lock_kind_record_is_neither_a_version_nor_a_conflict`.
 
-**It is a semantic change to the conflict surface and not a format change**, so it is inside this
-ADR's ruling rather than a stop — but it is the one line here worth a second reading, because it
-reverses something that was written down on purpose.
+#### Why a committed lock record takes no part in first-committer-wins
+
+The rule the prewrite conflict check exists for is one sentence: **somebody wrote a version of this
+key after my snapshot, so the value I computed from it is stale.** That is what makes refusing the
+second writer correct — its `n + 1` was computed from a row that has since moved, and letting it
+land would be a lost update wearing a successful commit.
+
+A `Kind::Lock` record is the transaction saying the opposite: *I held this key and wrote nothing to
+it.* `Op::Check` stages no value, `check_prewrite` writes it as a lock record with no `short_value`
+and no `default` entry, and `commit_secondary` turns it into a `write` record whose kind is `Lock`.
+**No version was created, so no reader's value became stale, so no writer is refused by it.** The
+timestamp on the record says when the holder let go — not when the row changed, because it did not.
+
+Three questions read that column family and all three are the same question wearing different
+words, which is why one rule settles them:
+
+* `check_prewrite`'s conflict check — *may this write land?*
+* `LatestCommit`, behind `changed_since_statement` — *did this row move under my statement?*
+  (ADR 0067 §3, the `EvalPlanQual` question.) A statement re-run because a lock committed would be
+  re-run for nothing.
+* `newest_version_at`, behind a read — *what is the value?* This one already stepped past lock
+  records, and it is where the argument was already written down.
+
+The one it does **not** settle is the lock's own job: while the record is a *lock* rather than a
+*write* — that is, between the prewrite and the commit — it excludes everybody, which is what (a')
+is for. The two are different states of the same key and the rule tells them apart by which column
+family the record is in.
+
+**Both halves are pinned, and the counterfactual says which test pins which** — the old rule was put
+back and every one of these run against it:
+
+| face | test | red against the old rule? |
+|---|---|---|
+| after | `a_lock_kind_record_is_neither_a_version_nor_a_conflict` (`esker-txn`) | **yes** — one `check_prewrite` call, no cluster, and it is the layer the decision lives at. |
+| after, end to end | `a_committed_lock_record_does_not_refuse_an_older_writer` | **no**, and that is worth writing down. A `REPEATABLE READ` transaction older than a committed `FOR UPDATE` writes that row and commits under *both* rules: the SQL write path asks `changed_since_statement` before it asks to prewrite, and that question does not reach the conflict check on this shape. The test states the behaviour a user meets; it is not what discriminates the rules, and claiming it was would have been claiming a green as evidence. |
+| during | `a_write_may_not_pass_a_lock_another_node_holds` | not the *rule* — it is red against **(a') itself being absent**: before the lock existed the writer committed over the row, which is the measurement this ADR opens with. |
+| the code that made it matter | `two_nodes_crossing_a_lock_leave_one_victim` | **yes** — under the old rule the deadlock victim is told `40001 a commit at … beat this transaction`, and the assertion is that a victim is told `40P01`. This is where the old rule's damage was reachable from SQL. |
+
+So the rule is pinned at the layer that decides it, and the damage it did is pinned where a client
+sees it. The end-to-end *after* face is documentation of the behaviour, not its proof.
+
+`REPEATABLE READ` in the first is not decoration: under `READ COMMITTED` the writer takes a fresh
+snapshot per statement (ADR 0057), which is *after* the lock committed, and the question cannot be
+asked at all.
+
+**It is a semantic change to the conflict surface and not a format change**, so it was taken inside
+this ADR's ruling rather than as a stop, and put up for a second reading because it reverses
+something written down on purpose. **Ruled 2026-09-09: accepted**, on the two conditions met above —
+the argument stated, and both faces pinned by a test that is red against the other rule.
 
 ### What it does today
 
@@ -321,12 +367,37 @@ is not told to wait and then killed, it is killed at the moment an older transac
 and finds out when it next asks the store for anything. The assertion is the outcome and not the
 site, for that reason.
 
-**What the TTL still owes.** An eager lock lives `LOCK_TTL_MS` — three seconds — and
-`TxnKv::Heartbeat` is still an RPC with a handler and no sender (`DESIGN.md` §8). A `FOR UPDATE`
-held longer than that can be resolved out from under its holder. It is loud rather than silent: the
-resolver settles the holder's **primary**, so the wounded transaction cannot commit and is told
-`40P01` — but a transaction that sat for four seconds should not lose its rows to a session that
-wanted one of them, and the sender is what closes that. It is the next thing this ADR owes.
+### What the TTL owed, and now does not
+
+An eager lock lives `LOCK_TTL_MS` — three seconds — and `TxnKv::Heartbeat` was an RPC with a
+handler and no sender, which `DESIGN.md` §8 had said since phase 5. That cost little while the only
+locks a transaction held were a commit's: those live for the length of a two-phase commit. A
+`FOR UPDATE` lock is held for the length of the **transaction**, and a client that pauses four
+seconds between two statements is ordinary — so its lock was resolved out from under it and its
+commit refused, loudly (`40P01`) and wrongly.
+
+**The sender is `esker-client`'s `renew` module**, ruled 2026-09-09 as this ADR's second unit. A
+transaction registers its **primary** when the first eager lock pins one — the only lock a resolver
+consults, so the only one that has to be told — and a background thread renews at a **third** of the
+lease, the cadence [ADR 0028](0028-the-schema-lease.md) settled for the schema lease, so a lost
+round trip still leaves two attempts. It stops at every ending, including the one that is not a
+method call: `Drop` forgets the transaction, because a renewal that outlived its transaction would
+hold a crashed client's row for ever — worse than the gap it closes.
+
+Two things it deliberately is not. The **lease is not lengthened**: a long lease is how long a *dead*
+holder blocks everybody, and the point of a short one is that a crash is cleaned up quickly. And a
+failed renewal is **not** a failed transaction: two thirds of the lease are still ahead of it by
+construction, so the round is best-effort and silent, and a transaction whose renewals all fail
+expires — which is the behaviour that existed before the sender.
+
+Red first, in one action: `crates/esker-client/tests/lock_heartbeat.rs` holds a lock across three
+leases and asserts the **holder can still commit**. Without the sender the second transaction finds
+the lock expired, settles the holder's primary and takes the row, and the holder's commit is refused
+for a transaction that did nothing wrong. Its sibling asserts the other direction — a lock stops
+being renewed when its transaction ends — because a renewal that leaks is how this fix would become
+a worse bug than the one it fixes. The test needs an oracle with a **physical** part in its
+timestamps: `CountingOracle` counts from a thousand, so `is_expired` never fires under it and a
+lease can neither run out nor be renewed.
 
 ## Consequences
 
