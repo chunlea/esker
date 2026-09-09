@@ -710,6 +710,45 @@ impl Gate {
         self.wait_for_a_learner_that_answers("f").await;
     }
 
+    /// A join fixture with a **cost curve** in it, which `fill_join`'s twelve rows cannot have.
+    ///
+    /// `d` holds `inner` keys and `f` holds `outer` rows whose `dk` cycles over them, so a
+    /// `WHERE d.k <= N` selects exactly N keys and every one of them matches. Rows go in five
+    /// hundred at a time: one statement per row is one transaction per row, and twenty thousand of
+    /// those is the measurement's own cost rather than the thing being measured.
+    async fn fill_join_at_scale(&self, inner: i64, outer: i64) {
+        tokio::task::block_in_place(|| {
+            let mut session = self.session();
+            settle(
+                &mut session,
+                "CREATE TABLE f (id int8 PRIMARY KEY, dk int8, amount int8)",
+            );
+            settle(
+                &mut session,
+                "CREATE TABLE d (k int8 PRIMARY KEY, label text)",
+            );
+            settle(&mut session, "ALTER TABLE f SET (columnar_replicas = 1)");
+            for chunk in (1..=inner).collect::<Vec<i64>>().chunks(500) {
+                let values: Vec<String> = chunk.iter().map(|k| format!("({k}, 'l{k}')")).collect();
+                settle(
+                    &mut session,
+                    &format!("INSERT INTO d VALUES {}", values.join(", ")),
+                );
+            }
+            for chunk in (1..=outer).collect::<Vec<i64>>().chunks(500) {
+                let values: Vec<String> = chunk
+                    .iter()
+                    .map(|id| format!("({id}, {}, {id})", (id - 1) % inner + 1))
+                    .collect();
+                settle(
+                    &mut session,
+                    &format!("INSERT INTO f VALUES {}", values.join(", ")),
+                );
+            }
+        });
+        self.wait_for_a_learner_that_answers("f").await;
+    }
+
     async fn fill(&self) {
         tokio::task::block_in_place(|| {
             let mut session = self.session();
@@ -1141,4 +1180,93 @@ async fn a_pinned_snapshot_does_not_move_when_later_rows_commit() {
     );
 
     gate.stop().await;
+}
+
+/// **Where an `In` of N keys stops beating a nested loop** — the number `docs/plans/phase-16-mpp.md`
+/// §J11 says is all that is left of the join rewrite.
+///
+/// `MAX_IN_VALUES` is 4,096 and it is a **format** limit: the most keys a fragment can carry. That
+/// is not the same question as the most keys it is *worth* carrying, and nothing had measured the
+/// second. A planner-side threshold below the format's ceiling is what this buys — or the evidence
+/// that the ceiling is the right place to stop, which is also an answer.
+///
+/// Both paths, same data, same node, medians of five: `esker.engine = 'auto'` pushes the key set
+/// down as an `Expr::In`, `'row'` runs the nested loop the rewrite replaced.
+///
+/// **It records whether the columns actually answered at each N.** A pushdown that refused and fell
+/// back is the row path timed twice, and a curve made of that would say the two are identical
+/// everywhere — the free agreement §10 warns about, wearing a stopwatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, not an assertion; builds a 20k-row fixture and prints a curve"]
+async fn what_an_in_list_costs_against_the_nested_loop() {
+    const INNER: i64 = 4_096;
+    // **Eight thousand, and it was twenty.** Building the larger fixture through a three-store
+    // in-process cluster took the box from 12 to 29 on its own and the cluster lost its leader
+    // before the first query ran — the measurement's own cost becoming the thing measured. Eight
+    // thousand outer rows over four thousand keys still gives every key about two rows and leaves
+    // the per-row membership test plenty to be seen in.
+    const OUTER: i64 = 8_000;
+    const ROUNDS: usize = 5;
+
+    let gate = Gate::start().await;
+    gate.fill_join_at_scale(INNER, OUTER).await;
+
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        println!("\n  {OUTER} outer rows over {INNER} inner keys, median of {ROUNDS}\n");
+        println!("     N    pushdown      rows      pushed?   answer");
+        for n in [1_i64, 8, 64, 512, 4_096] {
+            let query = format!("SELECT count(*) FROM f JOIN d ON f.dk = d.k WHERE d.k <= {n}");
+            let (routed, routed_at, plan) = timed_engine(&mut session, "auto", &query, ROUNDS);
+            let (by_rows, rows_at, _) = timed_engine(&mut session, "row", &query, ROUNDS);
+            assert_eq!(
+                routed, by_rows,
+                "the two engines disagree at N = {n}, which is a correctness failure and not a cost"
+            );
+            println!(
+                "  {n:>4}  {:>8.2} ms  {:>8.2} ms   {:>7}   {:?}",
+                routed_at.as_secs_f64() * 1000.0,
+                rows_at.as_secs_f64() * 1000.0,
+                if plan.contains("Semi Join Filter") {
+                    "yes"
+                } else {
+                    "NO — fell back"
+                },
+                routed
+                    .first()
+                    .and_then(|row| row.first().cloned())
+                    .flatten(),
+            );
+        }
+    });
+
+    gate.stop().await;
+}
+
+/// One query on one engine, timed, with the plan that answered it.
+fn timed_engine(
+    session: &mut Session,
+    engine: &str,
+    query: &str,
+    rounds: usize,
+) -> (Vec<Vec<Option<String>>>, Duration, String) {
+    session
+        .run(&format!("SET esker.engine = '{engine}'"))
+        .expect("the override sets");
+    // One run before the clock starts: the first of anything pays for a cold region cache and a
+    // learner's first fragment, which is not what the curve is about.
+    let answer = rows(session, query);
+    let mut samples: Vec<Duration> = (0..rounds)
+        .map(|_| {
+            let at = Instant::now();
+            let _ = rows(session, query);
+            at.elapsed()
+        })
+        .collect();
+    samples.sort_unstable();
+    let plan = explain(session, &format!("EXPLAIN ANALYZE {query}"));
+    session
+        .run("RESET esker.engine")
+        .expect("the override clears");
+    (answer, samples[samples.len() / 2], plan)
 }

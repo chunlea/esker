@@ -776,6 +776,64 @@ The other thing recorded per row is whether the columns **actually answered**. A
 refused and fell back is the row path timed twice, and a curve made of that would show the two paths
 identical everywhere — §10's free agreement, wearing a stopwatch.
 
+### The answer: there is no crossover, and the format's ceiling is the threshold
+
+Measured 2026-09-09 by `what_an_in_list_costs_against_the_nested_loop`: 8,000 outer rows over 4,096
+inner keys, both paths on the same data at the same node, medians of five, and each row records
+whether the columns actually answered so that a fallback cannot be timed as a pushdown.
+
+| N keys | pushdown | nested loop | ratio | pushed down? | count |
+|---|---|---|---|---|---|
+| 1 | 129.31 ms | 6,282.30 ms | **49×** | yes | 2 |
+| 8 | 127.95 ms | 6,264.30 ms | **49×** | yes | 16 |
+| 64 | 131.65 ms | 16,111.84 ms | **122×** | yes | 128 |
+| 512 | 287.98 ms | 24,067.12 ms | **84×** | yes | 1,024 |
+| 4,096 | 347.56 ms | 21,873.88 ms | **63×** | yes | 8,000 |
+
+**The prediction above was half wrong, and the half it got wrong is the answer.** The pushdown grows
+with N as expected — 129 ms to 348 ms, which is 2.7× for a 4,096× rise in keys, because the cost is
+a binary search per row over a list that only grows logarithmically in the search and linearly in the
+shipping. But the nested loop is **not flat in N**: it grows from 6.3 s to 22–24 s, because more
+inner keys mean more outer rows *survive* the join, and everything downstream pays for each one. Two
+rising lines, one rising far faster, so they never cross.
+
+At the ceiling the membership test is doing the least good it can — `count` is 8,000, every outer
+row matches, and the filter removes nothing — and the pushdown is still **63× faster**. That is the
+worst case for the rewrite by construction, and it is not close.
+
+**So no planner threshold is added.** `MAX_IN_VALUES` stays the only limit, and it stays a format
+limit: above 4,096 keys the rewrite refuses with a reason and the row plan answers at the same
+snapshot, which is what already happens. A threshold below the ceiling would be a rule that makes
+every query it fires on between 49 and 122 times slower.
+
+**How far that survives a split table**, which the fixture cannot show — one region, so the fragment
+is shipped once where R regions ship it R times. For the row path to win at 4,096 keys the pushdown
+would have to become 63× slower, and shipping is only a part of its 348 ms; even taking the whole of
+it as shipping, that is **R ≈ 63 regions** before the lines meet, and the real number is larger
+because the rest of the 348 ms does not multiply. The conclusion is not delicate.
+
+### Under a six-thread arm, the same shape
+
+Load 11.4 rising to 33.8, same fixture, same medians:
+
+| N keys | pushdown | nested loop | ratio |
+|---|---|---|---|
+| 1 | 168.18 ms | 22,634.24 ms | 135× |
+| 8 | 384.87 ms | 23,044.22 ms | 60× |
+| 64 | 418.85 ms | 12,180.12 ms | 29× |
+| 512 | 183.69 ms | 24,027.96 ms | 131× |
+| 4,096 | 530.10 ms | 23,224.70 ms | 44× |
+
+**The individual numbers are noisy and the gap is not.** Under load the pushdown's own column stops
+being monotonic — 419 ms at 64 keys against 184 ms at 512 — which is what a contended box does to a
+sub-second measurement, and it is why the ratio rather than the millisecond is what this table is
+for. The two paths never come within an order of magnitude of each other, at any N, on either box.
+
+Load slows both, and it slows the **row path** by more in absolute terms: 6.3 s becomes 22.6 s at
+N = 1, where the pushdown's 129 ms becomes 168 ms. Contention costs a nested loop over eight
+thousand rows far more than it costs one fragment, which is a second reason the threshold is not
+somewhere in the middle.
+
 ## J12. `08006 … key is not in region 0`, and what a fragment may do about it
 
 The join differential went red on the ci-tree with a message that looks like a routing bug and is
