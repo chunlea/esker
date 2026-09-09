@@ -14,9 +14,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **The standing catalog type trade**, and nothing about hstore: `name`, `oid`, `"char"` and
-    // `regproc` are types this node does not have and answers as `text` and `bigint`, whose
-    // *values* are identical — which is why all three rows agree. These are the adapter's own boot
+    // **The standing catalog type trade**, and nothing about hstore: it is down to `oid`
+    // answered as a `bigint` and `regproc` as `text`, whose *values* are identical — which is why
+    // all three rows agree. `name` (ADR 0084) and `"char"` (ADR 0095) stood beside them here and
+    // are types now. These are the adapter's own boot
     // queries, and what it reads out of them is the typname and the typinput, both of which are
     // right.
     types: &[

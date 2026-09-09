@@ -38,8 +38,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `name` and `"char"` there, `text` here — the standing choice every catalog view in this
-    // crate makes, for columns whose comparison is identical.
+    // **The declared types this entry named all agree now** — `name` (ADR 0084) and `"char"`
+    // (ADR 0095) — and it stays because the same statement is an `answers` divergence too: the
+    // harness reads a `types` entry only once the *rows* agree, so this one is not read at all
+    // and will be deleted with the answer it shadows.
     types: &[
         "SELECT 'r', cfgname, nspname FROM pg_ts_config c JOIN pg_namespace n ON n.oid = c.cfgnamespace ORDER BY cfgname",
         "SELECT 'r', typname, typtype, typcategory, typdelim, typlen FROM pg_type WHERE typname IN ('tsvector','tsquery','_tsvector','regconfig') ORDER BY typname",

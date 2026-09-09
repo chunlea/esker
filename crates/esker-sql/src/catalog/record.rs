@@ -354,6 +354,10 @@ const TAG_LINE_ARRAY: u8 = 100;
 /// no column is declared one. The vocabulary is total, which is what keeps the two tag spaces in
 /// step.
 const TAG_VOID: u8 = 101;
+/// `"char"` and `"char"[]`, additive like every tag before them.
+const TAG_CHAR: u8 = 102;
+/// See [`TAG_CHAR`].
+const TAG_CHAR_ARRAY: u8 = 103;
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
 const TAG_BIT_ARRAY: u8 = 71;
@@ -495,6 +499,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::CircleArray => TAG_CIRCLE_ARRAY,
         ColumnType::LineArray => TAG_LINE_ARRAY,
         ColumnType::Void => TAG_VOID,
+        ColumnType::Char => TAG_CHAR,
+        ColumnType::CharArray => TAG_CHAR_ARRAY,
         ColumnType::NameArray => TAG_NAME_ARRAY,
         ColumnType::Date => TAG_DATE,
         ColumnType::Numeric => TAG_NUMERIC,
@@ -649,6 +655,8 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_CIRCLE_ARRAY => ColumnType::CircleArray,
         TAG_LINE_ARRAY => ColumnType::LineArray,
         TAG_VOID => ColumnType::Void,
+        TAG_CHAR => ColumnType::Char,
+        TAG_CHAR_ARRAY => ColumnType::CharArray,
         TAG_NAME_ARRAY => ColumnType::NameArray,
         TAG_DATE => ColumnType::Date,
         TAG_NUMERIC => ColumnType::Numeric,

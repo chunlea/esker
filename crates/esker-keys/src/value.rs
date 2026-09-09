@@ -516,6 +516,23 @@ pub enum ColumnType {
     CircleArray,
     /// See [`ColumnType::LsegArray`].
     LineArray,
+    /// PostgreSQL's `"char"` — oid 18, **one byte**, and not `character(1)`.
+    ///
+    /// The catalog's own one-character type: `pg_class.relkind`, `pg_constraint.contype`,
+    /// `pg_type.typcategory` and `typdelim` are all this. The quotes are part of how it is written,
+    /// because an unquoted `char` means `bpchar`.
+    ///
+    /// **The byte is what is kept, not the character.** `'abc'::"char"` is `a` and `'é'::"char"` is
+    /// the first *byte* of a two-byte character — which is not valid UTF-8 on its own, so it prints
+    /// as the octal escape `Ã`. Stored as a `Datum::Text` holding what the output function would
+    /// print, so that the escape is a property of the value rather than of one printer.
+    ///
+    /// **`typcategory` is `Z`**, its own group rather than `S` with the strings, and that one
+    /// letter is why `'r'::"char" = 'r'::text` is `t` while a `CASE` over the two is `42804`: they
+    /// compare and have no common type.
+    Char,
+    /// `"char"[]` — oid 1002, `_char`.
+    CharArray,
     /// PostgreSQL's `void` — oid 2278, and **the one pseudo-type in this vocabulary**.
     ///
     /// `typtype` is `p` and `typcategory` `P`, which is what says it is not a storage type: no
@@ -575,7 +592,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 99] = [
+    pub const ALL: [ColumnType; 101] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -622,6 +639,8 @@ impl ColumnType {
         ColumnType::BpcharArray,
         ColumnType::VarcharArray,
         ColumnType::NameArray,
+        ColumnType::Char,
+        ColumnType::CharArray,
         ColumnType::Void,
         ColumnType::LsegArray,
         ColumnType::PathArray,
@@ -1164,7 +1183,7 @@ fn one_representation(held: ColumnType, wanted: ColumnType) -> bool {
                 // **A `name` is its text too**, and truncated before it ever reaches a row: the
                 // 63-byte cut belongs to the cast, where the character boundary is known, so what
                 // arrives here is already a value of the type.
-                | ColumnType::Name
+                | ColumnType::Name | ColumnType::Char
                 | ColumnType::Bpchar
                 | ColumnType::Json
                 | ColumnType::Jsonb

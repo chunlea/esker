@@ -20,9 +20,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `pg_indexes.indexname` is a `name` there and `text` here — the standing catalog trade. Three
     // occurrences of the one statement.
-    types: &[
-        "SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = 'ai'::regclass AND contype = 'p'",
-    ],
+    types: &[],
     answers: &[
         // **The four forms `sqlparser` 0.62.0 cannot read.** It parses `RENAME TO` and no other
         // `ALTER INDEX` operation, so these reached `parse`'s refusal table — where they now name

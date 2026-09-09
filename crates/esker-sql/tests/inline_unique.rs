@@ -10,12 +10,9 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `conname` and `relname` are `name` on a real server and `contype` a `"char"`; all are `text`
-    // here, with identical characters. The standing trade every `pg_catalog` column makes.
-    types: &[
-        "SELECT conname, contype, condeferrable, condeferred, pg_get_constraintdef(oid) FROM \
-         pg_constraint WHERE conrelid = 'tuc'::regclass AND contype = 'u' ORDER BY conname",
-    ],
+    // **Empty.** `conname` and `relname` are `name` here (ADR 0084) and `contype` a `"char"`
+    // (ADR 0095) — the three the entry named — so the declared types agree too.
+    types: &[],
     answers: &[
         (
             "CREATE TABLE tuc3 (a integer UNIQUE NULLS NOT DISTINCT)",

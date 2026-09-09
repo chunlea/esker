@@ -264,7 +264,7 @@ impl Aggregation {
                 // unit that runs *away* from the type: every other derivation keeps `name` and
                 // this one drops it, because a real server has no `min(name)` and coerces the
                 // argument (`tests/captures/pg19_name_array.txt`).
-                ColumnType::Varchar | ColumnType::Name => Ok(ColumnType::Text),
+                ColumnType::Varchar | ColumnType::Name | ColumnType::Char => Ok(ColumnType::Text),
                 // **A `cidr` decays to `inet`, which is the same rule one category along.**
                 // `inet` is the preferred type of the network category the way `text` is of the
                 // string one, and a real server has no `min(cidr)` to keep the type with —

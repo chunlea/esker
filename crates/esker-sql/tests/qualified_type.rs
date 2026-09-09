@@ -16,14 +16,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
-        // The standing catalog trade, twice: `column_name`, `udt_name`, `udt_schema` and `typname`
-        // are `name` on a real server and `typtype` a `"char"`, and `data_type` is
-        // `information_schema`'s own domain — all `text` here, all comparing identically. **Every
+        // **Empty.** `column_name`, `udt_name`, `udt_schema` and `typname` are `name` here
+        // (ADR 0084) and `typtype` a `"char"` (ADR 0095); all five stood in this sentence before
+        // they were built, and `data_type` — `information_schema`'s own domain — left the list
+        // with the statements that read it. **Every
         // value agrees**, and the values are what these ask: a column of `schema_9.text` reports
         // `udt_name` `text` and `udt_schema` `pg_catalog`, because both name the *base* type, and
         // the domain itself is `typtype` `d` in the schema it was declared in.
-        "SELECT 'r', typname, typtype FROM pg_type WHERE typname = 'text' AND typnamespace = \
-         (SELECT oid FROM pg_namespace WHERE nspname = 'schema_9')",
     ],
     answers: &[
         // **A real server deparses the coercion it inserted, not the cast that was written.**

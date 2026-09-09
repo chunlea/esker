@@ -20,9 +20,9 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // A real server's `attname` is a `name`, `attidentity` and `attgenerated` are `"char"`, and
-    // `attrelid`, `atttypid` and `attcollation` are `oid`s. This node has none of those three
-    // types, so they are `text` and `bigint` — the trade `pg_class` and `pg_type` already make
+    // `attname` is a `name` here (ADR 0084) and `attidentity`/`attgenerated` are `"char"`
+    // (ADR 0095); what is left is `attrelid`, `atttypid` and `attcollation`, which are `oid`s on
+    // a real server and `bigint` here — the trade `pg_class` and `pg_type` already make
     // (`tests/pg_catalog.rs`). **`attnum` is an `int2` and `atttypmod` an `int4` on both**, which
     // is two fewer than `pg_class` needed.
     types: &[
@@ -32,14 +32,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // that had stopped differing.
         "SELECT attname, attcollation FROM pg_attribute WHERE attrelid = 'cb'::regclass AND attnum IN (1, 3) ORDER BY attnum",
         "SELECT typname, typcollation FROM pg_type WHERE typname IN ('int8', 'text') ORDER BY typname",
-        "SELECT attname, attnum, attnotnull, atthasdef, atttypmod, attisdropped, attidentity, attgenerated FROM pg_attribute WHERE attrelid = 'ca'::regclass AND attnum > 0 ORDER BY attnum",
         "SELECT attname, atttypid, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'ca'::regclass AND attnum > 0 ORDER BY attnum",
-        "SELECT attname, attnum, attnotnull, atthasdef, atttypmod, attidentity FROM pg_attribute WHERE attrelid = 'cb'::regclass AND attnum > 0 ORDER BY attnum",
-        "SELECT attname, attnum, attnotnull, atthasdef, attidentity, attgenerated FROM pg_attribute WHERE attrelid = 'cd'::regclass AND attnum > 0 ORDER BY attnum",
         "SELECT attname, attnum, atttypid, atttypmod FROM pg_attribute WHERE attrelid = 'cb_x_idx'::regclass AND attnum > 0 ORDER BY attnum",
         "SELECT attname, attnum, atttypid, atttypmod FROM pg_attribute WHERE attrelid = 'cb_yz_idx'::regclass AND attnum > 0 ORDER BY attnum",
         "SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '\"cb\"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
-        "SELECT a.attname, format_type(a.atttypid, a.atttypmod), pg_get_expr(d.adbin, d.adrelid), a.attnotnull, attidentity, attgenerated FROM pg_attribute a LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE a.attrelid = '\"cd\"'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
         "SELECT attname, attcollation FROM pg_attribute WHERE attrelid = 'cb'::regclass AND attnum IN (1, 3) ORDER BY attnum",
         "SELECT typname, typcollation FROM pg_type WHERE typname IN ('int8', 'text') ORDER BY typname",
     ],

@@ -19,20 +19,19 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **`name` and `"char"` there, `text` here** — PostgreSQL's identifier and single-byte types,
-    // which compare identically and are the standing choice every catalog view in this crate makes.
+    // The standing `pg_catalog` trade, down to the oids: `pg_type.oid` is an `oid` on a real
+    // server and a `bigint` here, which is the whole of what the second entry still declares.
+    // PostgreSQL's identifier type is a `name` here (ADR 0084) and its single-byte type a
+    // `"char"` (ADR 0095), and the first entry — which names neither any more — stays only
+    // because the same statement is an `answers` divergence.
     types: &[
         // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
-        "SELECT 'r', relkind, relname FROM pg_class WHERE relname IN ('pg_type','pg_range','pg_class') ORDER BY relname",
         "SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE \
          a.attrelid = 'pg_stat_activity'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER \
          BY a.attnum",
-        "SELECT 'r', relkind, relname FROM pg_class WHERE relname IN \
-         ('pg_type','pg_range','pg_class') ORDER BY relname",
-        "SELECT 'r', relkind FROM pg_class WHERE relname = 'pg_stat_activity'",
         "SELECT 'r', t.typname, t.typelem, t.typdelim, t.typtype FROM pg_type as t LEFT JOIN \
          pg_range as r ON t.oid = r.rngtypid WHERE t.typname IN ('int2','int4','int8') ORDER BY \
          t.typname",

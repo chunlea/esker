@@ -1,0 +1,144 @@
+# **`"char"` is a one-byte type, oid 18** — PostgreSQL 19beta1, 2026-09-09. One
+# `BEGIN … ROLLBACK`, `ON_ERROR_ROLLBACK on` so a refusal cannot swallow the statements after it.
+#
+# r1's wire sweep filed six rows: `pg_class.relkind`, `pg_constraint.contype`,
+# `pg_type.typcategory` and `pg_type.typdelim` are `"char"` (18) on a real server and `text` (25)
+# here. It is the catalog's own one-character type — **not** `character(1)`, which is `bpchar` —
+# and the quotes are part of how it is written, because `char` unquoted means `bpchar`.
+#
+# ## The two catalog rows
+#
+#     oid   typname  typlen  typtype  typcategory  typdelim  typinput  typarray
+#     18    char     1       b        Z            ,         charin    1002
+#     1002  _char    -1      b        A            ,         array_in  0
+#
+# **`typcategory` is `Z`**, which is its own group — not `S` with the strings. That one letter is
+# what makes `CASE WHEN true THEN 'r'::"char" ELSE 'x'::text END` a
+# `42804 CASE types text and "char" cannot be matched` **while `'r'::text = 'r'::"char"` is `t`**:
+# the two compare and have no common type, which is a pair reasoning gets backwards.
+#
+# `format_type(18, -1)` is `"char"` — with the quotes — and `format_type(1002, -1)` is `"char"[]`.
+# `pg_typeof` prints it the same way.
+#
+# ## One byte, and the byte is what is kept
+#
+#     'r'::"char"                    r      length 1   octet_length 1
+#     'abc'::"char"                  a      length 1              <- truncated to the first byte
+#     ''::"char"                     ''     length 0   IS NULL f  <- legal, and not NULL
+#     'é'::"char"                    \303   octet_length 4        <- the first *byte*, printed as
+#                                                                    an octal escape
+#     'r'::"char"::int4              114                          <- the byte's value
+#     65::int4::"char"               A
+#
+# The `é` row is the one that says this is a **byte** and not a character: `é` is two bytes, the
+# first is kept, and it is not valid UTF-8 on its own — so the output function prints `\303` and
+# `octet_length` counts the four characters of that escape rather than the one byte behind it.
+#
+# ## What it compares with, and what it decays to
+#
+#     'r'::"char" = 'r'              t        'r' = 'r'::"char"        t
+#     'r'::"char" = 'r'::text        t        'r'::text < 's'::"char"  t
+#     'r'::"char" < 's'::"char"      t        'A'::"char" < 'a'::"char" t   <- byte order
+#     'r'::"char" IN ('r','v')       t
+#     coalesce('r'::"char", 'x'::"char")      "char"
+#     CASE … 'r'::"char" ELSE 'x'::text       42804                    <- see `typcategory` above
+#
+#     pg_typeof(min(relkind))        text     <- **decays**, like varchar, name and cidr
+#     pg_typeof(array_agg(relkind))  "char"[]      the aggregate keeps it
+#     'r'::"char" || 'x'             42725 operator is not unique: "char" || unknown
+#
+# `min`/`max` decaying to `text` is the fourth member of that arm — `varchar` and `name` decay to
+# `text`, `cidr` to `inet`, and now this. `||` is the other direction: **ambiguous**, not missing.
+#
+# ## `pg_cast`, measured both ways round
+#
+#     18 -> 23   e (explicit)     23 -> 18   e
+#     18 -> 25   i (implicit)     25 -> 18   a (assignment)
+#     18 -> 1042 a                1042 -> 18 a
+#     18 -> 1043 a                1043 -> 18 a
+#
+# `"char" -> text` is **implicit** and `text -> "char"` only an assignment, which is the asymmetry
+# `cidr`/`inet` also has — and it does not give the two a common type, because the categories
+# differ.
+#
+# ## The census: which catalog columns are `"char"`
+#
+# r1 filed six rows and named four columns. The four are not the rule — the rule is every catalog
+# column a real server declares oid 18, and it is one query rather than a list to remember:
+#
+#     SELECT c.relname, a.attname
+#       FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+#      WHERE a.atttypid = 18 AND c.relnamespace = 'pg_catalog'::regnamespace
+#        AND c.relkind IN ('r','v') AND a.attnum > 0 AND NOT a.attisdropped
+#      ORDER BY c.relname, a.attnum;
+#
+# **46 columns on PG 19beta1**, of which this node declares eighteen:
+#
+#     pg_am          amtype
+#     pg_attribute   attidentity  attgenerated
+#     pg_cast        castcontext  castmethod
+#     pg_class       relpersistence  relkind
+#     pg_constraint  contype  confupdtype  confdeltype
+#     pg_depend      deptype
+#     pg_partitioned_table  partstrat
+#     pg_proc        prokind  provolatile
+#     pg_trigger     tgenabled
+#     pg_type        typtype  typcategory  typdelim
+#
+# The other 28 are columns of catalogs this node does not have (`pg_aggregate`, `pg_policy`,
+# `pg_subscription`, …) or columns of ones it has and does not carry (`typalign`, `typstorage`,
+# `attalign`, `relreplident`, `confmatchtype`). Four of the eighteen were the ones r1 measured;
+# the other fourteen were `text` here for no reason but that nobody had asked, and each of them
+# has its own recorded `\gdesc` line in a corpus already in this tree — the citations are in
+# `tests/char_type.rs::every_catalog_column_a_real_server_calls_char_is_one_here`.
+#
+# ## `name` is 64 of them
+#
+#     typname  oid   typelem  typlen
+#     char     18    0        1
+#     name     19    18       64
+#     _char    1002  18       -1
+#     _name    1003  19       -1
+#
+# **`name.typelem` is 18.** It was a zero here for exactly as long as `"char"` was missing — a
+# `typelem` naming a row that is not there is what `array_delimiter.rs::no_typarray_dangles`
+# forbids — so the gap was honest and closed the day the type arrived.
+#
+# The statements below are the capture itself — `statement`, `\gdesc` types, rows — taken in this
+# session against `127.0.0.1:55432` with no fixture at all. The rows that count `pg_class` are the
+# oracle's own catalog and are declared for that reason.
+
+SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput, typarray FROM pg_type WHERE oid IN (18, 1002) ORDER BY oid	oid,name,smallint,"char","char","char",regproc,oid	18|char|1|b|Z|,|charin|1002 ; 1002|_char|-1|b|A|,|array_in|0
+SELECT pg_typeof('r'::"char"), pg_typeof('r'::text)	regtype,regtype	"char"|text
+SELECT 'r'::"char", length('r'::"char"), octet_length('r'::"char")	"char",integer,integer	r|1|1
+SELECT 'abc'::"char", length('abc'::"char")	"char",integer	a|1
+SELECT ''::"char", length(''::"char"), ''::"char" IS NULL	"char",integer,boolean	|0|f
+SELECT 'r'::"char" = 'r', 'r'::"char" = 'r'::text	boolean,boolean	t|t
+SELECT 'r'::"char" < 's'::"char", 'A'::"char" < 'a'::"char"	boolean,boolean	t|t
+SELECT 'r'::"char"::text, 'r'::"char"::int4, 65::int4::"char"	text,integer,"char"	r|114|A
+SELECT pg_typeof(relkind), pg_typeof(relname) FROM pg_class LIMIT 1	regtype,regtype	"char"|name
+SELECT pg_typeof(contype) FROM pg_constraint LIMIT 1	regtype	"char"
+SELECT pg_typeof(typcategory), pg_typeof(typdelim) FROM pg_type LIMIT 1	regtype,regtype	"char"|"char"
+SELECT relkind FROM pg_class WHERE relname = 'pg_class'	"char"	r
+SELECT count(*) FROM pg_class WHERE relkind = 'r'	bigint	383
+SELECT count(*) FROM pg_class WHERE relkind = 'r'::"char"	bigint	383
+SELECT pg_typeof(min(relkind)) FROM pg_class	regtype	text
+SELECT pg_typeof(array_agg(relkind)) FROM (SELECT relkind FROM pg_class LIMIT 2) s	regtype	"char"[]
+SELECT array_agg(c) FROM (VALUES ('r'::"char"),('v'::"char")) s(c)	"char"[]	{r,v}
+SELECT '{r,v}'::"char"[]	"char"[]	{r,v}
+SELECT pg_typeof('{r,v}'::"char"[])	regtype	"char"[]
+SELECT typcategory, typdelim FROM pg_type WHERE typname = 'text'	"char","char"	S|,
+SELECT 'r'::"char" || 'x'	!42725 operator is not unique: "char" || unknown
+SELECT pg_typeof('r'::"char" || 'x')	!42725 operator is not unique: "char" || unknown
+SELECT relkind::text FROM pg_class WHERE relname = 'pg_class'	text	r
+SELECT c.relkind, c.relkind = 'r' AS is_table FROM pg_class c WHERE c.relname = 'pg_class'	"char",boolean	r|t
+SELECT format_type(18, -1), format_type(1002, -1)	text,text	"char"|"char"[]
+SELECT max(relkind)::text FROM pg_class	text	v
+SELECT 'é'::"char", octet_length('é'::"char")	"char",integer	\303|4
+SELECT 'r'::"char"::varchar, 'r'::"char"::bpchar	character varying,bpchar	r|r
+SELECT 'r' = 'r'::"char", 'r'::text < 's'::"char"	boolean,boolean	t|t
+SELECT relkind, count(*) FROM pg_class GROUP BY relkind ORDER BY relkind	"char",bigint	I|1 ; S|237 ; i|774 ; p|1 ; r|383 ; t|221 ; v|162
+SELECT 'r'::"char" IN ('r','v')	boolean	t
+SELECT coalesce('r'::"char", 'x'::"char"), pg_typeof(coalesce('r'::"char", 'x'::"char"))	"char",regtype	r|"char"
+SELECT pg_typeof(CASE WHEN true THEN 'r'::"char" ELSE 'x'::text END)	!42804 CASE types text and "char" cannot be matched
+SELECT castsource, casttarget, castcontext FROM pg_cast WHERE castsource = 18 OR casttarget = 18 ORDER BY 1,2	oid,oid,"char"	18|23|e ; 18|25|i ; 18|1042|a ; 18|1043|a ; 23|18|e ; 25|18|a ; 1042|18|a ; 1043|18|a

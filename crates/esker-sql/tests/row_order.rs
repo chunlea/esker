@@ -222,6 +222,12 @@ fn column_type(name: &str) -> ColumnType {
         // what the exhaustiveness assertion at the end of the test is for.
         "varchar" => ColumnType::Varchar,
         "name" => ColumnType::Name,
+        // **`"char"` sorts by byte too**, and its fixture leads with the empty string — a legal
+        // `"char"` that is zero characters and not NULL. Measured on the oracle; the digits, the
+        // capitals, the lower case and `~` fall in ASCII order, which is what a memcomparable key
+        // gives for free (ADR 0076).
+        "char" => ColumnType::Char,
+        "char[]" => ColumnType::CharArray,
         // Its values are captured already padded, which is what a `character(n)` stores.
         "bpchar" => ColumnType::Bpchar,
         "timestamp" => ColumnType::Timestamp,

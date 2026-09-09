@@ -16,18 +16,17 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **The standing catalog type trade, and every one of these rows agrees.** `typname` is a
-    // `name` on a real server, `typdelim` and `typcategory` are `"char"`, the oids are `oid` and
-    // `typinput` is a `regproc`; all of them are `text` or `bigint` here, with the same characters
-    // and the same numbers in them. `pg_typeof` is the same trade one step over — a `regtype`
-    // there, `text` here, which is what `'x'::regtype` already answers.
+    // **The standing catalog type trade, and every one of these rows agrees.** What is left of it
+    // is two families: the oids, answered as `bigint`, and `typinput`, answered as `text` where a
+    // real server says `regproc` — the same numbers and the same characters in both. `typname` is
+    // a `name` here (ADR 0084), `typdelim` and `typcategory` are `"char"` (ADR 0095), and
+    // `pg_typeof` answers a `regtype` on both sides (ADR 0093); those three were in this sentence
+    // and have closed.
     types: &[
         // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
-        "SELECT 'r', typname, typdelim FROM pg_type WHERE typname IN ('int4','text','varchar','box','_box') ORDER BY typname",
-        "SELECT 'r', b.typname, b.typdelim AS element_delim, a.typname AS array_name, a.typdelim AS array_row_delim FROM pg_type b JOIN pg_type a ON a.oid = b.typarray WHERE b.typname = 'box'",
         "SELECT 'r', t.oid, t.typname, t.typelem, t.typdelim, t.typinput, t.typtype, \
          t.typbasetype FROM pg_type as t LEFT JOIN pg_range as r ON t.oid = r.rngtypid WHERE \
          t.typname IN \

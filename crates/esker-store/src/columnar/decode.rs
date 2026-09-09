@@ -202,6 +202,8 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         // `fragment::column_type` answers the same on the other side of this seam (ADR 0084).
         | StoredType::Name
         | StoredType::NameArray
+        | StoredType::Char
+        | StoredType::CharArray
         | StoredType::LsegArray
         | StoredType::PathArray
         | StoredType::PolygonArray

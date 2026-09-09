@@ -13,9 +13,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // Two trades and both are standing. The catalog one — `typname` and `udt_name` are `name`,
-    // the oids `oid`, `typcategory` a `"char"`, `typinput` a `regproc`, `pg_typeof` a `regtype` —
-    // and the **typmod one**: a typmod travels only with a plain column reference here, so
+    // Two trades. The catalog one is down to the oids, answered as `bigint`, and `typinput`,
+    // answered as `text` where a real server says `regproc`; `typname`/`udt_name` are `name` here
+    // (ADR 0084), `typcategory` is a `"char"` (ADR 0095) and `pg_typeof` a `regtype` on both
+    // (ADR 0093). Then the **typmod one**: a typmod travels only with a plain column reference here, so
     // `'101'::bit(3)` is declared `bit(1)` where a real server keeps the 3 through the cast. The
     // *values* agree in every one of these, which is what they are here to say: `bit` is 1560
     // with array 1561 and `varbit` 1562/1563, both category `V`, inputs `bit_in`/`varbit_in`; the

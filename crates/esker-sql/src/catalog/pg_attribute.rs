@@ -457,6 +457,7 @@ pub(crate) fn typcollation(ty: ColumnType) -> i64 {
         | ColumnType::TextArray
         | ColumnType::VarcharArray
         | ColumnType::NameArray
+        | ColumnType::CharArray
         | ColumnType::BpcharArray
         | ColumnType::CitextArray => DEFAULT_COLLATION,
         // **`name`'s own collation is C**, not the database default: it is the type the catalog
@@ -595,8 +596,8 @@ pub const ATTRIBUTE_COLUMNS: &[(&str, ColumnType, i32)] = &[
     // `ALTER TABLE … ADD COLUMN` is stored on the column and padded with, and both are `t`. It is
     // the only way a client can ask whether that `ALTER` rewrote the table.
     ("atthasmissing", ColumnType::Bool, NO_LENGTH),
-    ("attidentity", ColumnType::Text, NO_LENGTH),
-    ("attgenerated", ColumnType::Text, NO_LENGTH),
+    ("attidentity", ColumnType::Char, NO_LENGTH),
+    ("attgenerated", ColumnType::Char, NO_LENGTH),
     ("attisdropped", ColumnType::Bool, NO_LENGTH),
     ("attcollation", ColumnType::Int8, NO_LENGTH),
 ];

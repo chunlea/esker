@@ -153,6 +153,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         // property that keeps the two tag spaces in step — and because a tag that exists cannot
         // later be handed to something else by accident.
         ColumnType::Void => 102,
+        ColumnType::Char => 103,
+        ColumnType::CharArray => 104,
         ColumnType::FloatRange => 60,
         ColumnType::VarcharRange => 61,
         ColumnType::Money => 62,
@@ -258,6 +260,8 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         100 => ColumnType::CircleArray,
         101 => ColumnType::LineArray,
         102 => ColumnType::Void,
+        103 => ColumnType::Char,
+        104 => ColumnType::CharArray,
         60 => ColumnType::FloatRange,
         61 => ColumnType::VarcharRange,
         62 => ColumnType::Money,

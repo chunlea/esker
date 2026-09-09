@@ -22,8 +22,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // two that remain, and the values are what they ask: `floatrange` is `typtype` `r` and
     // `typcategory` `R`, and its `rngsubtype` is `double precision`.
     types: &[
-        "SELECT 'r', typname, typtype, typcategory FROM pg_type WHERE typname IN \
-         ('floatrange','stringrange') ORDER BY typname",
         "SELECT 'r', t.typname, r.rngsubtype::regtype FROM pg_range r JOIN pg_type t ON t.oid = \
          r.rngtypid WHERE t.typname IN ('floatrange','stringrange') ORDER BY 2",
     ],

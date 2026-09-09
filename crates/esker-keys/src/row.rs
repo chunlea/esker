@@ -517,7 +517,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
-        | ColumnType::VarcharArray | ColumnType::NameArray
+        | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray
         | ColumnType::DateArray
         | ColumnType::TimeArray
         | ColumnType::TimestampArray
@@ -561,7 +561,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Varchar
         // `name` is stored as its text, like `varchar`; what makes it a type of its own is its
         // OID, its positive `typlen` and the truncation applied before it ever reaches here.
-        | ColumnType::Name
+        | ColumnType::Name | ColumnType::Char
         | ColumnType::Bpchar
         // **A `void` never reaches here**, because no column is one — but its value *is* a
         // `Datum::Text("")`, so this is where it would land and answering anything else would be
@@ -974,7 +974,7 @@ fn text_shaped(ty: ColumnType, body: &[u8]) -> Result<Datum> {
         },
         ColumnType::Text
         | ColumnType::Varchar
-        | ColumnType::Name
+        | ColumnType::Name | ColumnType::Char
         | ColumnType::Bpchar
         | ColumnType::Json
         | ColumnType::Int2Vector
@@ -1272,7 +1272,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
-        | ColumnType::VarcharArray | ColumnType::NameArray
+        | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray
         | ColumnType::DateArray
         | ColumnType::TimeArray
         | ColumnType::TimestampArray
@@ -1486,7 +1486,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::Varchar
         // **A `name` key sorts in byte order, which is what its C collation means** and what a
         // memcomparable key already is (ADR 0076). So it needs no rule of its own here.
-        | ColumnType::Name
+        | ColumnType::Name | ColumnType::Char
         | ColumnType::Bpchar
         | ColumnType::Citext
         | ColumnType::Ltree => {
@@ -2172,6 +2172,7 @@ mod tests {
             | ColumnType::BpcharArray
             | ColumnType::VarcharArray
             | ColumnType::NameArray
+            | ColumnType::CharArray
             | ColumnType::DateArray
             | ColumnType::TimeArray
             | ColumnType::TimestampArray
@@ -2229,9 +2230,11 @@ mod tests {
             // A `name` is text to this crate: the truncation to 63 bytes happens in the SQL
             // layer's cast, where the character boundary is known, so the codec round-trips
             // whatever it is handed exactly as it does for `text`.
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Bpchar => {
-                ".{0,32}".prop_map(Datum::Text).boxed()
-            }
+            ColumnType::Text
+            | ColumnType::Varchar
+            | ColumnType::Name
+            | ColumnType::Char
+            | ColumnType::Bpchar => ".{0,32}".prop_map(Datum::Text).boxed(),
             // Valid documents, because that is what a `json` column holds — an arbitrary string
             // is not one, and the row codec is only ever handed a value the SQL layer validated.
             // An hstore is a `Datum::Text` here like every other text-shaped type: this crate

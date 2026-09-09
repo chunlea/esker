@@ -13,10 +13,11 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog type trade, five times: `typname` and `udt_name` are `name`, the two
-    // oids are `oid`, `typcategory` is a `"char"` and `typinput` a `regproc`,
-    // `information_schema`'s columns are its own domains, `pg_typeof` answers a `regtype`, and a
-    // `::varchar` cast is a `character varying` — all `text` here. **Every value agrees**, and
+    // The standing catalog type trade, five times, and down to three members: the two oids are
+    // `oid` there and `bigint` here, `typinput` is a `regproc`, `information_schema`'s columns are
+    // its own domains, and a `::varchar` cast is a `character varying`. `typname`/`udt_name` are
+    // `name` here (ADR 0084), `typcategory` is a `"char"` (ADR 0095) and `pg_typeof` answers a
+    // `regtype` on both sides (ADR 0093). **Every value agrees**, and
     // the values are what these five ask: `inet` is 869 with array 1041, `cidr` 650/651 and
     // `macaddr` 829/1040; the two addresses are category `I` and the `macaddr` `U`; `macaddr`'s
     // `typlen` is 6 where the other two are varlenas; the three defaults read back

@@ -23,12 +23,9 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `name` and `"char"` there, `text` here — PostgreSQL's identifier and single-byte types,
-    // which compare identically and are the standing choice every catalog view in this crate
-    // makes.
-    types: &[
-        "SELECT 'r', relname, relkind, relispopulated FROM pg_class WHERE relname = 'mv_ebooks'",
-    ],
+    // **Empty.** PostgreSQL's identifier type is a `name` here (ADR 0084) and its single-byte
+    // type a `"char"` (ADR 0095); those two were the whole of what this list declared.
+    types: &[],
     answers: &[],
 };
 

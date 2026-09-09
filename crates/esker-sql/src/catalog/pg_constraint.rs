@@ -765,15 +765,15 @@ pub const CONSTRAINT_COLUMNS: &[(&str, ColumnType, i32)] = &[
     ("oid", ColumnType::Int8, NO_LENGTH),
     ("conname", ColumnType::Name, NO_LENGTH),
     ("connamespace", ColumnType::Int8, NO_LENGTH),
-    ("contype", ColumnType::Text, NO_LENGTH),
+    ("contype", ColumnType::Char, NO_LENGTH),
     ("condeferrable", ColumnType::Bool, NO_LENGTH),
     ("condeferred", ColumnType::Bool, NO_LENGTH),
     ("convalidated", ColumnType::Bool, NO_LENGTH),
     ("conrelid", ColumnType::Int8, NO_LENGTH),
     ("conindid", ColumnType::Int8, NO_LENGTH),
     ("confrelid", ColumnType::Int8, NO_LENGTH),
-    ("confupdtype", ColumnType::Text, NO_LENGTH),
-    ("confdeltype", ColumnType::Text, NO_LENGTH),
+    ("confupdtype", ColumnType::Char, NO_LENGTH),
+    ("confdeltype", ColumnType::Char, NO_LENGTH),
     // **`smallint[]`, which is what they are on a real server** — measured:
     // `pg_typeof(conkey)` is `smallint[]` and `pg_typeof(conkey[1])` is `smallint`. They were
     // `text` holding the same characters, which read back the same for `SELECT conkey` and was

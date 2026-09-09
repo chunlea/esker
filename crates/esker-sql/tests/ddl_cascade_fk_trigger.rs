@@ -11,12 +11,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing `pg_catalog` trade and nothing else: `conname` and `relname` are `name` on a
-    // real server — the 64-byte identifier type — and `contype` is `"char"`; all three are `text`
-    // here, which compares identically. **Every row agrees**, on all thirty-five statements.
-    types: &[
-        "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fkc'::regclass ORDER BY conname",
-    ],
+    // **Empty.** The one entry named `conname`, `relname` and `contype` — the 64-byte `name`
+    // (ADR 0084) and the one-byte `"char"` (ADR 0095) — and all three are those types here now.
+    // **Every row agrees**, on all thirty-five statements, and so does every declared type.
+    types: &[],
     answers: &[],
 };
 

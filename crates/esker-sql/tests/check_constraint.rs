@@ -13,8 +13,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
-        // `conname` is `name` and `contype` is `"char"`; this node has neither and answers `text`,
-        // whose values are identical. The same trade every `pg_catalog` column makes.
+        // **Both types this entry named agree now** — `conname` is a `name` (ADR 0084) and
+        // `contype` a `"char"` (ADR 0095). It stays because the same statement is an `answers`
+        // divergence below: a `types` entry is read only once the rows agree, and the deparsed
+        // predicate keeps them apart.
         "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = \
          'ck'::regclass AND contype = 'c' ORDER BY conname",
     ],

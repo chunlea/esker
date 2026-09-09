@@ -13,10 +13,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog type trade, six times: `typname` and `udt_name` are `name` on a real
-    // server, `typcategory` and `typinput` are `"char"` and `regproc`, `information_schema`'s
-    // three are its own domains, and `pg_typeof` answers a `regtype`. All `text` here, all
-    // comparing identically. **Every value agrees**, and the values are the whole point of these
+    // The standing catalog type trade, down to one member: `typinput` is a `regproc` on a real
+    // server and `text` here. `typname`/`udt_name` are `name` here (ADR 0084), `typcategory` is a
+    // `"char"` (ADR 0095), `pg_typeof` answers a `regtype` on both (ADR 0093), and the
+    // `information_schema` rows left this list with them. **Every value agrees**, and the values are the whole point of these
     // six: `money` is `typlen` 8 with category `N` and input `cash_in`, its precision and scale
     // are both NULL, its default reads back `'$150.55'::money`, `money / money` really is a
     // `double precision`, `money::numeric` is `567.89` with no symbol, and `money[]` exists.

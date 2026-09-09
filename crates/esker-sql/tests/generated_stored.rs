@@ -10,12 +10,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing `pg_catalog` trade: `attname` and `column_name` are `name` on a real server,
-    // `attgenerated` is a `"char"` and the `information_schema` columns are `character varying`;
-    // all of them are `text` here. **Every row agrees**, `s` and `ALWAYS` included.
-    types: &[
-        "SELECT attname, attgenerated, attnotnull FROM pg_attribute WHERE attrelid = 'gen'::regclass AND attnum > 0 ORDER BY attnum",
-    ],
+    // **Empty.** `attname` and `column_name` are `name` here (ADR 0084) and `attgenerated` a
+    // `"char"` (ADR 0095), which is what the entry was declaring. **Every row agrees**, `s` and
+    // `ALWAYS` included, and now so does every declared type.
+    types: &[],
     answers: &[],
 };
 

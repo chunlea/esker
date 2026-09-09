@@ -17,8 +17,9 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // Three statements whose **rows agree and whose declared types do not**, each the standing
-    // `pg_catalog` trade: `oid` and `name` and `"char"` are types this node does not have, and it
-    // answers `bigint` and `text` — whose values are identical. The third is `array_agg`, which
+    // `pg_catalog` trade, now down to two members: an `oid` answered as a `bigint` and a
+    // `regproc` as `text`, whose digits and characters are identical. `name` and `"char"` stood
+    // in this sentence beside them and are types here now (ADR 0084, ADR 0095). The third is `array_agg`, which
     // builds its array as text: now that an array is a type it could build one, and that is the
     // slice after the constructor rather than part of storage.
     types: &[

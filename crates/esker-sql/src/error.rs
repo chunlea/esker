@@ -596,6 +596,26 @@ pub enum SqlError {
     /// call is ambiguous rather than defaulted. Measured, and it is *not* a blanket rule: `min`,
     /// `max` and `count` resolve an unknown to `text` and answer, while `sum`, `avg` and
     /// `array_agg` are this error. Each of those six was put to a real server.
+    /// `x || y` where one side is a `"char"`: **`42725`, not `42883`**.
+    ///
+    /// A real server has a `||` candidate at every string width and an operand of category `Z`
+    /// picks none of them, so the call is *ambiguous* rather than missing — measured,
+    /// `'r'::"char" || 'x'` is `42725 operator is not unique: "char" || unknown`. The types are
+    /// named as PostgreSQL names them, which for an unadorned literal is `unknown`.
+    #[error("operator is not unique: {left} || {right}")]
+    AmbiguousConcat {
+        /// The left operand's type, as PostgreSQL names it.
+        left: String,
+        /// The right operand's.
+        right: String,
+    },
+
+    /// An aggregate whose argument has no type, for the three that cannot choose a candidate.
+    ///
+    /// `min`, `max` and `count` resolve an `unknown` to `text` and answer; `sum`, `avg` and
+    /// `array_agg` have one candidate per input type and raise `42725` instead — measured on
+    /// 19beta1 for all six, because a node that defaulted every one to `text` would answer where
+    /// three of them raise.
     #[error("function {func}(unknown) is not unique")]
     AmbiguousFunction {
         /// The aggregate's name, as the user spelled the function.
@@ -2975,7 +2995,9 @@ impl SqlError {
                 sqlstate::AMBIGUOUS_COLUMN
             }
             SqlError::AmbiguousTableReference(_) => sqlstate::AMBIGUOUS_ALIAS,
-            SqlError::AmbiguousFunction { .. } => sqlstate::AMBIGUOUS_FUNCTION,
+            SqlError::AmbiguousFunction { .. } | SqlError::AmbiguousConcat { .. } => {
+                sqlstate::AMBIGUOUS_FUNCTION
+            }
             SqlError::UndefinedIndex(_)
             | SqlError::UndefinedType(_)
             | SqlError::NoDefaultOperatorClass(_)

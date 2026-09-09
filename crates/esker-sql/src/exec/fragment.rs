@@ -1041,6 +1041,10 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // **A `void` is not a column at all**, so it is not a columnar one either.
         Row::Void
         | Row::Name
+        // **A `"char"` is not columnar either**: it is a catalog type, and `esker-columnar` has no
+        // tag for a one-byte string. The filter stays on the row side.
+        | Row::Char
+        | Row::CharArray
         | Row::NameArray
         | Row::LsegArray
         | Row::PathArray

@@ -18,20 +18,14 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `conname` is a `name`, `contype` is a `"char"` and `conrelid`, `conindid` and `confrelid` are
-    // `oid`s on a real server; this node has none of those three types, so they are `text` and
-    // `bigint`. Every value is identical.
+    // `conname` is a `name` here (ADR 0084) and `contype` a `"char"` (ADR 0095); what is left is
+    // `conrelid`, `conindid` and `confrelid`, which are `oid`s on a real server and `bigint` here.
+    // Every value is identical.
     types: &[
         // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
-        "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'kd'::regclass ORDER BY conname",
-        "SELECT conname, contype, conkey FROM pg_constraint WHERE conrelid = 'kd'::regclass ORDER BY conname",
-        "SELECT conname, contype, condeferrable, condeferred, convalidated FROM pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname",
-        "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname",
-        "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'kc'::regclass ORDER BY conname",
-        "SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'kb'::regclass ORDER BY conname",
         "SELECT conname, conrelid = 'ka'::regclass, confrelid FROM pg_constraint WHERE conrelid = 'ka'::regclass AND contype = 'p'",
         "SELECT conname, confupdtype = ' ', confdeltype = ' ', confrelid, conindid = 0 FROM pg_constraint WHERE conrelid = 'ka'::regclass ORDER BY conname",
     ],

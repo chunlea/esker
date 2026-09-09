@@ -25,8 +25,9 @@ mod parity;
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `pg_typeof` answers a `regtype` on a real server and `text` here (ADR 0077); every row
-    // agrees, and the catalog row's own columns are the `oid`/`"char"`/`regproc` families.
+    // **A declared type and nothing else.** `pg_typeof` agrees on both sides now (ADR 0093) and
+    // `typtype`/`typcategory`/`typdelim` are `"char"` here since ADR 0095; what is left of this
+    // row is the catalog's own `oid` and `regproc`, each its own unit.
     types: &[
         "SELECT oid, typname, typlen, typtype, typcategory, typdelim, typinput, typarray FROM \
          pg_type WHERE typname = 'void'",

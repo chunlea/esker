@@ -36,6 +36,7 @@ pub mod arith;
 /// `array_in` and `array_out`: an array literal read, and an array value printed.
 pub mod array;
 pub mod bit;
+pub mod char_type;
 pub mod composite;
 pub mod date;
 /// PostgreSQL's character-set names, for the two errors `convert_to` tells apart.
@@ -1025,9 +1026,25 @@ pub fn named_type(spelled: &str) -> Result<Option<Named>> {
     named_by_grammar(&lowered, sql_grammar).map(|found| found.map(Named::Scalar))
 }
 
+/// The type `pg_type.typname` holds under this name, with the SQL grammar **out** of scope.
+///
+/// What a *quoted* type name means, which is not always what the bare one means: `"char"` is oid 18
+/// and bare `char` is `bpchar`. `ObjectName`'s own `Display` drops the quote style, so the caller
+/// that has the identifier has to say which it saw — this is the half of [`type_by_name`] for the
+/// quoted one.
+#[must_use]
+pub fn internal_type_by_name(bare: &str) -> Option<ColumnType> {
+    resolve_type_name(&bare.trim().to_ascii_lowercase(), false)
+}
+
 /// The type a name means, ignoring arrays. See [`named_type`] for the whole answer.
 pub fn type_by_name(spelled: &str) -> Result<Option<ColumnType>> {
-    named_by_grammar(spelled, true)
+    // **The quoting decides the grammar here as it does in `named_type`**, and it did not before:
+    // this forced `sql_grammar` on, so a quoted name was read as SQL. The two entry points
+    // disagreeing was invisible until `"char"` arrived — the one name where the quoted and the
+    // bare spelling are *different types*, `char` being `bpchar` and `"char"` being oid 18.
+    let (_, bare, sql_grammar) = split_type_name_parts(spelled);
+    named_by_grammar(&bare, sql_grammar)
 }
 
 /// [`type_by_name`], told whether PostgreSQL's SQL names are in scope — see
@@ -1212,6 +1229,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // without the type this node answered a scalar `text` and `ActiveRecord` kept the literal
         // as a string.
         ColumnType::Name => 1003,
+        // `_char`, measured beside it.
+        ColumnType::Char => 1002,
         // No `_regclass` here: an array of a regclass is not a type this node offers, so the
         // link is a zero rather than a pointer at a `pg_type` row that is not there.
         // Neither a `regclass` nor either vector has an array type on a real server.
@@ -1235,7 +1254,7 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::BoolArray
         | ColumnType::ByteaArray
         | ColumnType::BpcharArray
-        | ColumnType::VarcharArray | ColumnType::NameArray
+        | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray
         | ColumnType::DateArray
         | ColumnType::TimeArray
         | ColumnType::TimestampArray
@@ -1379,6 +1398,15 @@ fn resolve_type_name(name: &str, sql_grammar: bool) -> Option<ColumnType> {
     if !sql_grammar {
         return internal;
     }
+    // **`char` unquoted is `bpchar`, and it is the one name where the grammar beats `typname`.**
+    // `pg_type` holds `char` for oid 18 and the SQL grammar spells that type `"char"` *with the
+    // quotes*; bare `char` is `character(1)`. Measured: `'char'::regtype::oid` is **1042** and
+    // `'"char"'::regtype::oid` is 18 — the quoted spelling is an identifier, which is the branch
+    // above. Without this line the internal lookup won and a `regtype` corpus that had agreed for
+    // fifteen ADRs started answering 18.
+    if name == "char" {
+        return Some(ColumnType::Bpchar);
+    }
     internal
         .or_else(|| ColumnType::ALL.into_iter().find(|ty| ty.name() == name))
         .or_else(|| {
@@ -1459,6 +1487,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
         // **Nor does `name`**, and a real server says so in its own words: `'x'::name(10)` is
         // `42601 type modifier is not allowed for type "name"`. Fixed width is not a typmod.
         | ColumnType::Name
+        | ColumnType::Char
         // An hstore takes no typmod either: `hstore(3)` is not a thing on a real server.
         | ColumnType::Hstore
         | ColumnType::HstoreArray
@@ -1473,7 +1502,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray
         | ColumnType::Point
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::Void | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::Void | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
     }
 }
 
@@ -1585,6 +1614,7 @@ impl PgType for ColumnType {
             ColumnType::Void => 2278,
             ColumnType::Bool => 16,
             ColumnType::Bytea => 17,
+            ColumnType::Char => 18,
             ColumnType::Name => 19,
             ColumnType::Int8 => 20,
             // PostgreSQL's own, measured: `'regtype'::regtype::oid` is 2206.
@@ -1666,6 +1696,7 @@ impl PgType for ColumnType {
             | ColumnType::BpcharArray
             | ColumnType::VarcharArray
             | ColumnType::NameArray
+            | ColumnType::CharArray
             | ColumnType::DateArray
             | ColumnType::TimeArray
             | ColumnType::TimestampArray
@@ -1705,6 +1736,10 @@ impl PgType for ColumnType {
     fn name(self) -> &'static str {
         match self {
             ColumnType::Void => "void",
+            // **With the quotes**, which is how it must be written — an unquoted `char` is
+            // `bpchar` — and how `format_type` and `pg_typeof` print it. Measured.
+            ColumnType::Char => "\"char\"",
+            ColumnType::CharArray => "\"char\"[]",
             // What an error message calls it: the element's name with `[]`, which is how
             // PostgreSQL words `cannot cast type integer[] to uuid` — not the internal `_int4`
             // that `pg_type.typname` holds.
@@ -1822,7 +1857,8 @@ impl PgType for ColumnType {
 
     fn type_len(self) -> i16 {
         match self {
-            ColumnType::Bool => 1,
+            // **One byte**, which is the whole of the type.
+            ColumnType::Bool | ColumnType::Char => 1,
             // **64 and positive**, where every other string type answers -1: `name` is fixed
             // width. A client reads this from the `RowDescription` and from `pg_attribute.attlen`.
             ColumnType::Name => 64,
@@ -1876,7 +1912,7 @@ impl PgType for ColumnType {
             | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
-            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray
+            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray
             | ColumnType::Text
             | ColumnType::Varchar
             | ColumnType::Bpchar
@@ -2033,6 +2069,12 @@ impl PgDatum for Datum {
     )]
     fn from_text(ty: ColumnType, text: &str) -> Result<Datum> {
         Ok(match ty {
+            // **The first *byte*, printed the way the output function prints it.** `'abc'` is
+            // `a` and `'é'` is the first byte of a two-byte character, which is not valid UTF-8
+            // alone — a real server writes it as the octal escape `\303`, and the escape is
+            // carried as the value so that it is a property of the value rather than of one
+            // printer. The empty string is legal and stays empty.
+            ColumnType::Char => Datum::Text(char_type::of_text(text)),
             // **A void has one value and it is zero characters**, so its input function ignores
             // what it was handed: `void_in` exists on a real server for the same reason, and
             // nothing calls it either.
@@ -2131,6 +2173,7 @@ impl PgDatum for Datum {
             | ColumnType::BpcharArray
             | ColumnType::VarcharArray
             | ColumnType::NameArray
+            | ColumnType::CharArray
             | ColumnType::DateArray
             | ColumnType::TimeArray
             | ColumnType::TimestampArray
@@ -2331,6 +2374,10 @@ impl PgDatum for Datum {
         Ok(match ty {
             // Its one value, whatever bytes arrived — there is no wire form to read.
             ColumnType::Void => Datum::Text(String::new()),
+            // One byte on the wire, rendered the way its output function renders it.
+            ColumnType::Char => {
+                Datum::Text(char_type::render(fixed(1)?.first().copied().unwrap_or(0)))
+            }
             // Four bytes, the oid, which is `oidrecv`'s shape — the name is derived, exactly as it
             // is for the `<oid>::regtype` cast.
             ColumnType::RegType => {
@@ -2403,6 +2450,7 @@ impl PgDatum for Datum {
             | ColumnType::BpcharArray
             | ColumnType::VarcharArray
             | ColumnType::NameArray
+            | ColumnType::CharArray
             | ColumnType::DateArray
             | ColumnType::TimeArray
             | ColumnType::TimestampArray
@@ -3188,7 +3236,7 @@ mod tests {
                         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
-                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray
+                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray
                         | ColumnType::XmlArray
                         | ColumnType::LtreeArray
                         | ColumnType::Bytea

@@ -41,8 +41,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 const TYPES: &[&str] = &[
     // **Moved here from `answers` by parity rule 4**: the rows agree and what still differs is the
     // declared type, which is one of the standing families — see `parity::Divergences::types`.
-    // `typlen`, `typinput` and `typcategory` are a `smallint`, a `regproc` and a `"char"` on a real
-    // server and `text` here; the catalog's own columns are their own units.
+    // `typlen` is a `smallint` and `typinput` a `regproc` on a real server and `text` here;
+    // `typcategory` was the third in that list and is a `"char"` here now (ADR 0095). The
+    // catalog's own columns are their own units.
     "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN \
      ('json','jsonb') ORDER BY oid",
 ];

@@ -2305,7 +2305,7 @@ impl Literal {
                 )]
                 ColumnType::Real => Ok(Datum::Real(*value as f32)),
                 // PostgreSQL's assignment cast to text is the value's own text.
-                ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Bpchar => {
+                ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Char | ColumnType::Bpchar => {
                     Ok(Datum::Text(value.to_string()))
                 }
                 ColumnType::Bool
@@ -2352,7 +2352,7 @@ impl Literal {
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
                 | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
-                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery
                 // **A pseudo-type takes no value at all**: no column is declared `void`, so an
                 // assignment to one is a type mismatch like any other.
                 | ColumnType::Void => mismatch(),
@@ -2398,7 +2398,7 @@ impl Literal {
                     )
                 }
                 // The digits as written, which is what `numeric`'s own text is.
-                ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Bpchar => {
+                ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Char | ColumnType::Bpchar => {
                     Ok(Datum::Text(digits.clone()))
                 }
                 ColumnType::Int8 => Err(SqlError::unsupported(format!(
@@ -2442,7 +2442,7 @@ impl Literal {
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
                 | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
-                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::RegType | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::RegType | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery
                 // **A pseudo-type takes no value at all**: no column is declared `void`, so an
                 // assignment to one is a type mismatch like any other.
                 | ColumnType::Void => mismatch(),
@@ -2562,7 +2562,7 @@ impl Literal {
                 // `true`, not `t`: the cast, not the output function.
                 ColumnType::Text
                 | ColumnType::Varchar
-                | ColumnType::Name
+                | ColumnType::Name | ColumnType::Char
                 | ColumnType::Bpchar => Ok(Datum::Text(
                     if *value { "true" } else { "false" }.to_owned(),
                 )),
@@ -2614,7 +2614,7 @@ impl Literal {
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
                 | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
-                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::RegType | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::RegType | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery
                 // **A pseudo-type takes no value at all**: no column is declared `void`, so an
                 // assignment to one is a type mismatch like any other.
                 | ColumnType::Void => mismatch(),

@@ -19,7 +19,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // differs is one of the standing declared-type families listed on
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
-        "SELECT conname, contype, conkey FROM pg_constraint WHERE conrelid = 'gsc'::regclass ORDER BY conname",
     ],
     answers: &[
         (

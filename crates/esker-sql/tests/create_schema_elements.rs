@@ -12,12 +12,11 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `name` and `"char"` there, `text` here — the standing choice, and these two rows only
-    // became visible when the `tsvector` refusal above stopped aborting the transaction.
+    // The standing `pg_catalog` trade, down to the oids: `name` (ADR 0084) and `"char"`
+    // (ADR 0095) are types here now. These two rows only became visible when the `tsvector`
+    // refusal above stopped aborting the transaction.
     types: &[
         "SELECT 'r', c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'se_multi' ORDER BY c.relname",
-        "SELECT 'r', n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'test_schema' ORDER BY c.relname",
-        "SELECT 'r', c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'se_idx' ORDER BY c.relname",
     ],
     answers: &[
         // **These three were never checked before this revision.** The declared `tsvector`

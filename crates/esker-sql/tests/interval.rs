@@ -62,9 +62,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
         "SELECT '1 second'::interval(0), '1.5 seconds'::interval(0)",
-        // `typname` is a `name`, `typinput` a `regproc` and `typcategory` a `"char"` on a real
-        // server; all three are `text` here with identical characters, and `typlen` agrees
-        // exactly. The trade every `pg_catalog` column makes.
+        // `pg_type.oid` is an `oid` on a real server and `typinput` a `regproc`, which this
+        // node answers as a `bigint` and a `text`; `typname` is a `name` (ADR 0084) and
+        // `typcategory` a `"char"` (ADR 0095), both of which stood beside them in this sentence.
+        // `typlen` agrees exactly.
         "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = \
          'interval'",
         // The value is right — `interval(3)` trims where `numeric(p,s)` pads, so `1.5 seconds`

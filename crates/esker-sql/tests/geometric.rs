@@ -18,17 +18,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // **Every value agrees**, which is what these two are for: the five columns report their own
     // type names, and a cast's `pg_typeof` names the shape rather than the text it is stored as.
     types: &[
-        // The standing `name`/`"char"` trade again, and **every value agrees**: `box` is the one
+        // The standing `pg_catalog` trade again — down to the oids and `regproc` now that `name`
+        // (ADR 0084) and `"char"` (ADR 0095) are types here — and **every value agrees**: `box` is the one
         // type in the catalog whose array delimiter is a semicolon, which r1's run-75 provenance
         // probe found answering `,` here.
-        "SELECT 'r', typname, typdelim FROM pg_type WHERE typname IN \
-         ('box','lseg','path','polygon','circle','line','point','xml') ORDER BY typname",
         // **`typarray` was `0` for all six and this was an `answers` entry**: a real server pairs
         // each shape with an array and `geometric_test.rb` declares none, so it was a named gap
         // rather than six more types. r1's wire sweep made that reason false — `array_agg` over a
         // `circle` came back a scalar `text` — and all five that were left arrived at once
         // (ADR 0091). Every value in this row agrees now; what is left is the catalog's own
-        // columns, `oid` and `"char"` and `regproc` against `bigint` and `text`, each its own unit.
+        // `oid` and `regproc` against `bigint` and `text`, each its own unit.
         "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type \
          WHERE typname IN ('lseg','box','path','polygon','circle','line') ORDER BY typname",
     ],
