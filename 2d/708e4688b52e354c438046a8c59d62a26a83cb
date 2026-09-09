@@ -1,0 +1,31 @@
+crates/esker-client/src/lib.rs
+  s_6f7019c05b578b::t_09238dd05d49ca 35
+crates/esker-client/src/renew.rs
+  s_6f7019c05b578b::t_33fdcdad0c293d 1-186
+crates/esker-client/src/txn.rs
+  s_6f7019c05b578b::t_310c6a1246d975 177-179,204,206-207,223,411,457-459,752-756,1289,1905-1917
+crates/esker-client/tests/lock_heartbeat.rs
+  s_6f7019c05b578b::t_ca485f1b261a93 1-209
+docs/DESIGN.md
+  s_6f7019c05b578b::t_6bd0e71b449868 781-788
+docs/adr/0088-a-row-lock-across-nodes.md
+  s_6f7019c05b578b::t_255aca6ae6dc3f 370-400
+docs/plans/cross-node-deadlock.md
+  s_6f7019c05b578b::t_3b3948ba7ba040 166-177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "2d708e4688b52e354c438046a8c59d62a26a83cb",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
