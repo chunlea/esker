@@ -84,8 +84,18 @@ fn run_with_learner(
     actions: &[Action],
 ) -> Result<(), TestCaseError> {
     let ids: Vec<NodeId> = voters.iter().chain(learners).copied().collect();
+    // **The confused shape, not the tidy one.** A learner whose own configuration is correct is
+    // stopped from campaigning by `Raft::campaign`'s guard, so it never asks for a vote and a
+    // property about granting one can never fail — the first version of this was exactly that,
+    // and it passed against the code the defect was in. The shape from the field is a peer that
+    // believes itself a voter while everyone else holds it as a learner.
+    let [confused] = learners else {
+        return Err(TestCaseError::fail(
+            "one learner, which is the shape from the field",
+        ));
+    };
     run_group(
-        Harness::with_learners(voters, learners, seed),
+        Harness::with_confused_learner(voters, *confused, seed),
         &ids,
         learners,
         actions,
