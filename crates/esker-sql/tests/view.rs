@@ -26,15 +26,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         // `is_updatable` and `is_insertable_into` are `character varying(3)` in the standard and
         // `text` here — the standing `information_schema` trade, with `YES`/`NO` identical.
-        "SELECT 'r', table_name, is_updatable FROM information_schema.views WHERE table_name = 'ebooks'''",
-        "SELECT 'r', is_updatable, is_insertable_into FROM information_schema.views WHERE table_name = 'ebooks_plain'",
         r"SELECT 'r', relname, relkind FROM pg_class WHERE relname = 'ebooks'''",
         r"SELECT 'r', viewname, definition FROM pg_views WHERE viewname = 'ebooks'''",
         // **The same three facts about three more statements**, comparable only since the write
         // through a view stopped aborting the block: `character varying(3)` for the
         // `information_schema` flags, and `name` / `"char"` for the `pg_catalog` ones. The values
         // agree in every case; it is the declared type that differs.
-        "SELECT 'r', is_updatable, is_insertable_into FROM information_schema.views WHERE table_name = 'ebooks_distinct'",
         "SELECT 'r', relname, relkind FROM pg_class WHERE relname = 'ebooks_mat'",
     ],
     answers: &[

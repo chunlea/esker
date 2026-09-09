@@ -21,9 +21,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `information_schema.views` declares `name` and `character varying(3)`; this node's three
     // columns are `text` (`catalog/information_schema.rs`), and every value agrees — `v_union`
     // included, now that a set operation exists to be `NO` about.
-    types: &[
-        "SELECT table_name, is_updatable, is_insertable_into FROM information_schema.views WHERE table_schema = 'public' ORDER BY table_name;",
-    ],
+    types: &[],
     answers: &[
         // **`pg_get_viewdef` and `pg_views.definition` are the text as written, on one line.** A
         // real server deparses its own parse tree — one target per line, the `FROM` indented, a

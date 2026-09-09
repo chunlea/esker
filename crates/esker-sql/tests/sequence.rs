@@ -28,17 +28,15 @@ const DIVERGENCES: &[(&str, &str, &str)] = &[
     // is not a type, and each was refused only while its integer was missing.
 ];
 
-/// **Moved out of `DIVERGENCES` by parity rule 4**: the rows agree and one typmod does not.
+/// **Empty, and the entry that was here is the record of two closures.**
 ///
-/// It was declared because `information_schema` was a later unit than this corpus — "the answer is
-/// worth having on file before the unit that serves it" — and that unit landed. What is left is
-/// `is_nullable`: it is `yes_or_no` on a real server, a domain over **`character varying(3)`**,
-/// and this node's catalog column list carries a type and no typmod, so it declares
-/// `character varying`. The base type is right and the length is not there to declare.
-const TYPE_DIVERGENCES: &[&str] = &[concat!(
-    "SELECT column_name, is_nullable FROM information_schema.columns ",
-    "WHERE table_name = 'z2' ORDER BY ordinal_position"
-)];
+/// It began as an answer divergence — `information_schema` was a later unit than this corpus, "the
+/// answer is worth having on file before the unit that serves it" — and that unit landed, so
+/// parity rule 4 moved it here as a type divergence: `is_nullable` is `yes_or_no` on a real
+/// server, a domain over `character varying(3)`, and this node declared `text`. Then the catalog's
+/// column lists learned to carry a length, the column declares `character varying(3)` too, and the
+/// row agrees whole (ADR 0031 rule 2).
+const TYPE_DIVERGENCES: &[&str] = &[];
 
 #[test]
 fn every_sequence_statement_answers_the_way_postgresql_19_does() {
