@@ -216,6 +216,7 @@ pub(super) fn create_table(
     normalise_generated(&mut table)?;
     normalise_defaults(&mut table);
     normalise_checks(&mut table);
+    normalise_index_predicates(&mut table);
     let table = table;
     // Resolved against a table that is not in the catalog yet, which is what lets a
     // self-reference — `CREATE TABLE t (id int8 PRIMARY KEY, parent int8 REFERENCES t)` — work
@@ -5141,6 +5142,17 @@ pub(super) fn create_index(
         comment: None,
     };
 
+    // **The sixth reader, at the statement that writes one.** `pg_get_expr(indpred)` prints what
+    // is stored, so the predicate is deparsed here — before the build and before either of the two
+    // pushes below, so the concurrent path stores the same text as the ordinary one.
+    let mut index = index;
+    if let Some(predicate) = &index.predicate
+        && let Some(text) = deparse_wrapped_predicate(&table, predicate)
+    {
+        index.predicate = Some(text);
+    }
+    let index = index;
+
     if create.concurrently {
         // Declared at `absent` and built by the job: no backfill here, and nothing reads it until
         // the job has taken it all the way to `public`.
@@ -5653,17 +5665,63 @@ fn normalise_defaults(table: &mut TableDef) {
 /// [`catalog::unparenthesised`] is the same helper [`index_expression`] uses, for the same reason
 /// one column over.
 fn deparse_wrapped_predicate(table: &TableDef, expr: &str) -> Option<String> {
-    // **A top-level `AND`/`OR` chain is left alone, because its reader re-parenthesises it.**
-    // `pg_get_constraintdef` prints each operand of a chain in its own pair
-    // ([`catalog::parenthesised_operands`], measured), so deparsing the chain here would give
-    // every operand a pair and the reader would add a second:
-    // `CHECK (((a > 0)) AND (b > 0))`. What is not deparsed then is the *operands*, which is a
-    // register row and not a silent gap — `tests/check_constraint_pretty.rs` pins the layout that
-    // says so.
-    if catalog::parenthesised_operands(expr) != expr.trim() {
-        return None;
+    // **A top-level `AND`/`OR` chain is deparsed operand by operand**, because its reader
+    // re-parenthesises the operands itself: `pg_get_constraintdef` and `pg_get_expr(indpred)` both
+    // print each operand of a chain in its own pair ([`catalog::parenthesised_operands`],
+    // measured). Deparsing the chain as one expression gave every operand a pair and the reader
+    // added a second — `(((n > 0)) AND flag)`, which `tests/index_deparse.rs` caught — so each
+    // operand is deparsed on its own, stripped of *its* outermost pair, and re-joined with the
+    // keywords the reader will parenthesise around. The split comes from
+    // [`catalog::boolean_chain`], the same scanner the reader uses, so the two cannot disagree
+    // about where an operand ends.
+    //
+    // An operand that does not deparse keeps its written text, which is [`deparse_default`]'s
+    // contract one level down; a chain can therefore be part deparsed and part verbatim, and each
+    // half is right for its own operand.
+    if let Some((operands, separators)) = catalog::boolean_chain(expr) {
+        let mut printed = String::new();
+        for (at, operand) in operands.iter().enumerate() {
+            if at > 0 {
+                printed.push(' ');
+                printed.push_str(separators[at - 1]);
+                printed.push(' ');
+            }
+            match deparse_default(table, operand) {
+                Some(text) => printed.push_str(catalog::unparenthesised(&text)),
+                None => printed.push_str(operand),
+            }
+        }
+        return Some(printed);
     }
     deparse_default(table, expr).map(|text| catalog::unparenthesised(&text).to_owned())
+}
+
+/// [`deparse_wrapped_predicate`] for a caller outside this module: the form a predicate is
+/// **stored** in, so that a comparison against a stored one compares like with like.
+///
+/// `ON CONFLICT` infers a partial index by comparing its predicate as *text*
+/// (`exec::dml::same_predicate`), and once a stored predicate is deparsed, the text a statement
+/// writes is no longer the text the catalog holds — `WHERE "b" IS NOT NULL` against
+/// `b IS NOT NULL`, which cost a working statement a `42P10` the first time this was tried. So the
+/// arbiter puts what the statement wrote through the same printer before comparing. `None` means
+/// the printer has nothing to say about this predicate, and the caller compares the text as
+/// written, which is what it did before.
+pub(super) fn stored_predicate_form(table: &TableDef, expr: &str) -> Option<String> {
+    deparse_wrapped_predicate(table, expr)
+}
+
+/// Every partial index's predicate on this table, printed the way `pg_get_expr(indpred)` prints
+/// one — the sixth reader, and the one `ActiveRecord` reads to dump a `WHERE`.
+fn normalise_index_predicates(table: &mut TableDef) {
+    let snapshot = table.clone();
+    for index in &mut table.indexes {
+        let Some(predicate) = &index.predicate else {
+            continue;
+        };
+        if let Some(text) = deparse_wrapped_predicate(&snapshot, predicate) {
+            index.predicate = Some(text);
+        }
+    }
 }
 
 /// Every `CHECK` on this table, printed the way `pg_get_constraintdef` prints one.
@@ -5730,29 +5788,60 @@ fn normalise_generated(table: &mut TableDef) -> Result<()> {
 /// non-default type — `(-1)::bigint` is `('-1'::integer)::bigint` on a real server, two nodes deep
 /// — and it is declared rather than approximated.
 fn numeric_constant(printed: &str, ty: ColumnType) -> String {
-    let integral = !printed.contains(['.', 'e', 'E']);
-    let negative = printed.starts_with('-');
-    let fits_int4 = integral && printed.parse::<i32>().is_ok();
-    let fits_int8 = integral && printed.parse::<i64>().is_ok();
+    // **One rule, in two steps**: print the constant under the type the *digits* would have had,
+    // then wrap that in a cast if the type wanted is not that one. The three forms fall out of it
+    // rather than being enumerated, which is what [`natural_constant_type`] and
+    // [`constant_in_its_own_type`] are between them; `tests/corpus/pg19_negative_constant.txt`
+    // is the measurement, over both signs and every target type.
+    let natural = natural_constant_type(printed);
+    let inner = constant_in_its_own_type(printed, natural);
+    if ty == natural {
+        return inner;
+    }
+    format!("({inner})::{}", ty.name())
+}
 
-    // The two canonical literal forms print bare, and nothing else does.
-    let is_literal_form = match ty {
-        ColumnType::Int4 => integral,
-        ColumnType::Numeric => !integral,
-        _ => false,
-    };
-    if is_literal_form && !negative {
+/// The type PostgreSQL's scanner gives a numeric constant written with these characters.
+///
+/// `integer` if the digits fit one, `bigint` if they fit that, `numeric` for anything wider and
+/// for anything with a decimal point (ADR 0087's ladder, read from the printing end). **The sign
+/// is part of the value here**: `-1` is an `integer` and `-9223372036854775807` a `bigint`, which
+/// is what makes the wrap below decidable — measured, `(-9223372036854775807)::numeric` is
+/// `('-9223372036854775807'::bigint)::numeric` and not `('-9223372036854775807'::integer)::…`.
+fn natural_constant_type(printed: &str) -> ColumnType {
+    if printed.contains(['.', 'e', 'E']) {
+        return ColumnType::Numeric;
+    }
+    if printed.parse::<i32>().is_ok() {
+        return ColumnType::Int4;
+    }
+    if printed.parse::<i64>().is_ok() {
+        return ColumnType::Int8;
+    }
+    ColumnType::Numeric
+}
+
+/// That constant printed under its own type: **bare** where the type has a literal syntax for the
+/// value, and quoted with a type annotation where it does not.
+///
+/// Two spellings have a literal syntax and no others: an unsigned run of digits is an `integer`
+/// and an unsigned decimal is a `numeric`. Everything else is a `Const` PostgreSQL prints as
+/// `'…'::type` — a value too wide for the literal form's type, and **every negative value**,
+/// because a negative constant is a unary minus folded into the constant by the scanner and so was
+/// never a literal at all. That is the whole reason `(-1)::bigint` is `('-1'::integer)::bigint`
+/// where `(1)::bigint` is `(1)::bigint`.
+fn constant_in_its_own_type(printed: &str, natural: ColumnType) -> String {
+    let integral = !printed.contains(['.', 'e', 'E']);
+    let literal_form = !printed.starts_with('-')
+        && match natural {
+            ColumnType::Int4 => integral,
+            ColumnType::Numeric => !integral,
+            _ => false,
+        };
+    if literal_form {
         return printed.to_owned();
     }
-    // A bare constant of a non-default type: quoted, with the type the scanner would have given
-    // it. Everything else is a cast over a constant of the literal form's type.
-    let bare_constant = negative
-        || (ty == ColumnType::Int8 && !fits_int4)
-        || (ty == ColumnType::Numeric && integral && !fits_int8);
-    if bare_constant {
-        return format!("'{printed}'::{}", ty.name());
-    }
-    format!("({printed})::{}", ty.name())
+    format!("'{printed}'::{}", natural.name())
 }
 
 /// One `DEFAULT`, as `pg_get_expr` prints it — for the shapes where that is not what was written.
@@ -5834,6 +5923,21 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
         // must never be stored: `DEFAULT ('a' || 'b')` prints `('a'::text || 'b'::text)`,
         // `btrim(t, 'x')` prints `btrim(t, 'x'::text)`, and `setweight(tv, 'A')` prints nothing
         // this node can produce, so its written text is kept.
+        // **A numeric constant on its own**, which is a shape `pg_get_expr` really does reprint:
+        // `DEFAULT (-1)::bigint` is `('-1'::integer)::bigint` there and was kept as written here,
+        // because a folded cast leaves a bare `Literal` and this list had none. `numeric_constant`
+        // is PostgreSQL's own `get_const_expr` for these, so deparsing them loses nothing — and
+        // for the constants that already agreed it prints the same characters (`7` is `7`).
+        //
+        // Numeric only. A string, a boolean and a `NULL` are left where they were: `DEFAULT 'x'`
+        // and `DEFAULT true` agree as written, and adding them would be a change with no
+        // measurement behind it.
+        Expr::Literal(literal) => matches!(
+            literal,
+            plan::Literal::Integer(_) | plan::Literal::Decimal(_)
+        ) || matches!(literal, plan::Literal::Typed(value)
+                if matches!(**value, Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)
+                    | Datum::Numeric(_) | Datum::Real(_) | Datum::Double(_))),
         Expr::CatalogFunc(call) => {
             (operator_operand_types(call.func).is_some() && call.args.len() == 2)
                 || matches!(
@@ -5862,11 +5966,12 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
         | Expr::CurrentDatabase
         | Expr::CurrentSetting { .. }
         | Expr::Advisory { .. }
-        // *There is nothing to reprint.* A bare literal is stored as a **value** and never reaches
-        // here (`parse::lower::column_default` folds it), and a folded negative literal is the
-        // same case — `DEFAULT - 1` is the `Datum` `-1`, which is why `Negate` is here and not
-        // above with the operators.
-        | Expr::Literal(_)
+        // *There is nothing to reprint.* A folded negative literal is stored as a **value** —
+        // `DEFAULT - 1` is the `Datum` `-1` — which is why `Negate` is here and not above with
+        // the operators. `Literal` used to be on this line with it, on the reasoning that a bare
+        // literal never reaches here either; that is true of the *value* and false of the text,
+        // because `parse::fold_column_default` keeps the unfolded expression beside the folded
+        // datum and `deparse_default` reads that. See the numeric arm below.
         | Expr::Negate(_)
         | Expr::Array { .. }
         | Expr::Subscript { .. }

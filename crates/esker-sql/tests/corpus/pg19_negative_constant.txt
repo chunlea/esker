@@ -1,0 +1,212 @@
+# **How `pg_get_expr` prints a *negative* numeric constant**, measured for every target type and
+# both spellings, in all five readers.
+#
+# `docs/plans/debts-v1.1.md` #24. `pg19_numeric_literal_deparse.txt` measured the three forms a
+# constant prints in and found one shape it could not decide: a negative constant of a
+# non-default type. `(-1)::bigint` is `('-1'::integer)::bigint` there -- **two** nodes -- and this
+# node folds the cast into the constant, leaving one. The row's sizing said "keeping the cast node
+# changes what every reader of a stored expression prints, so it needs its own corpus". This is
+# that corpus, and what it found is that the tree is recoverable after all.
+#
+# ## One rule, and it is decidable from the value and the type
+#
+# A negative constant has **no literal form**: the scanner reads the digits and the unary minus is
+# folded into the constant, so what PostgreSQL holds is a quoted `Const` of the type the *digits*
+# would have had. Call that the value's **natural** type -- `integer` if it fits one, `bigint` if
+# it fits that, `numeric` otherwise, and `numeric` for anything with a decimal point:
+#
+#     (-1)::integer            ->  '-1'::integer                   natural, so no cast prints
+#     (-1)::bigint             ->  ('-1'::integer)::bigint          natural is integer, so it wraps
+#     (-1)::smallint           ->  ('-1'::integer)::smallint
+#     (-1)::numeric            ->  ('-1'::integer)::numeric
+#     (-1)::real               ->  ('-1'::integer)::real
+#     (-1.5)::numeric          ->  '-1.5'::numeric                  natural is numeric
+#     (-1.5)::double precision ->  ('-1.5'::numeric)::double precision
+#     (-1.5)::integer          ->  ('-1.5'::numeric)::integer
+#     (-9223372036854775807)::bigint  ->  '-9223372036854775807'::bigint       natural is bigint
+#     (-9223372036854775807)::numeric ->  ('-9223372036854775807'::bigint)::numeric
+#
+# **And the sign is not part of the rule**, which is what the three `q_*` rows are for: the same
+# shape appears with a positive constant whose natural type is not `integer` either, and this node
+# had it wrong there too -- `(9223372036854775807)::numeric` is
+# `('9223372036854775807'::bigint)::numeric`, where the printer used to give
+# `(9223372036854775807)::numeric`. Unmeasured until this file, and closed by the same line.
+#
+# So the same three forms a *positive* constant takes, with one difference: a negative constant is
+# never the bare form, because it is never a literal. `(1)::bigint` prints `(1)::bigint` -- the
+# inner `1` bare, since an integral literal *is* an `integer` -- and `(-1)::bigint` prints
+# `('-1'::integer)::bigint`, the inner quoted. One rule, two spellings of the inner constant, and
+# both are what `numeric_constant` already decides for the constant on its own.
+#
+# **A bare `-1` into a `bigint` column is `'-1'::integer`**, not `('-1'::integer)::bigint`: the
+# assignment cast to the column is not part of the expression, which is the same fact
+# `pg19_numeric_literal_deparse.txt` measured for the positive case.
+#
+# ## The one thing that is not decidable, and it is a *spelling*
+#
+# `::` binds tighter than unary minus, so `-1::bigint` is an **operator over a cast** and not a
+# cast over a negative constant:
+#
+#     -1::bigint             ->  (- (1)::bigint)
+#     -1::numeric            ->  (- (1)::numeric)
+#     -1.5::double precision ->  (- (1.5)::double precision)
+#
+# Both spellings fold to the same constant here, so this node cannot tell them apart and prints the
+# `(-1)::bigint` form for both. That residue needs the unary minus kept as a node, which is a
+# change to what the plan holds rather than to what the printer decides -- so it stays declared,
+# with this file as its measurement.
+#
+# ## A comparison keeps the cast its literal was written with
+#
+# The `k*` rows are the same rule reached through `retype` rather than through a constant on its
+# own, and they are what says the two rules do not fight: `debts-v1.1.md` #23 made a comparison's
+# literal keep **its own** type instead of the column's, so `i2 > 1` is `(i2 > 1)`. A literal
+# written *with a cast* has a different own type, and that is the one that prints:
+#
+#     i2 > 1::smallint     ->  (i2 > (1)::smallint)
+#     i8 > 1::bigint       ->  (i8 > (1)::bigint)
+#     i4 > (-1)::integer   ->  (i4 > '-1'::integer)
+#     i2 > (-1)::smallint  ->  (i2 > ('-1'::integer)::smallint)
+#     nm > (-1)::numeric   ->  (nm > ('-1'::integer)::numeric)
+#
+# `i8 > 1::bigint` is `pg19_numeric_literal_deparse.txt`'s `c_i8_cast` row, declared there as
+# "the written cast is folded into the constant and then normalised to `Literal::Integer`, which
+# loses the `int8`" -- and that normalisation is one line of `exec::query::retype`.
+#
+# ## Five readers, one text
+#
+# `('-1'::integer)::bigint` comes back identically from a generated column, a `DEFAULT`,
+# `pg_get_expr(indexprs)`, `pg_get_indexdef`, `pg_get_constraintdef` and `pg_get_expr(indpred)`.
+# All of them are in this file, because a fix that reached one of them would look like a fix.
+#
+# **Each probe is read back inside its own savepoint** -- the discipline
+# `pg19_catalog_func_deparse.txt` had to learn: a capture is written against one server and
+# replayed against another, and only the second one's refusals cascade.
+#
+# Captured against esker-pg19 (PostgreSQL 19beta1) with
+# `sesscap.py src/pg19_negative_constant.txt.in`, inside one `BEGIN ... ROLLBACK`.
+BEGIN		-
+CREATE TABLE g1nn (i2 smallint, i4 integer, i8 bigint, nm numeric, f4 real, f8 double precision)		-
+SAVEPOINT sp_g_i2		-
+ALTER TABLE g1nn ADD COLUMN g_i2 smallint GENERATED ALWAYS AS ((-1)::smallint) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_i2'		r|g_i2|('-1'::integer)::smallint
+ROLLBACK TO sp_g_i2		-
+SAVEPOINT sp_g_i4		-
+ALTER TABLE g1nn ADD COLUMN g_i4 integer GENERATED ALWAYS AS ((-1)::integer) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_i4'		r|g_i4|'-1'::integer
+ROLLBACK TO sp_g_i4		-
+SAVEPOINT sp_g_i8		-
+ALTER TABLE g1nn ADD COLUMN g_i8 bigint GENERATED ALWAYS AS ((-1)::bigint) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_i8'		r|g_i8|('-1'::integer)::bigint
+ROLLBACK TO sp_g_i8		-
+SAVEPOINT sp_g_nm		-
+ALTER TABLE g1nn ADD COLUMN g_nm numeric GENERATED ALWAYS AS ((-1)::numeric) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_nm'		r|g_nm|('-1'::integer)::numeric
+ROLLBACK TO sp_g_nm		-
+SAVEPOINT sp_g_f4		-
+ALTER TABLE g1nn ADD COLUMN g_f4 real GENERATED ALWAYS AS ((-1)::real) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_f4'		r|g_f4|('-1'::integer)::real
+ROLLBACK TO sp_g_f4		-
+SAVEPOINT sp_g_f8		-
+ALTER TABLE g1nn ADD COLUMN g_f8 double precision GENERATED ALWAYS AS ((-1)::double precision) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_f8'		r|g_f8|('-1'::integer)::double precision
+ROLLBACK TO sp_g_f8		-
+SAVEPOINT sp_g_dec		-
+ALTER TABLE g1nn ADD COLUMN g_dec numeric GENERATED ALWAYS AS ((-1.5)::numeric) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_dec'		r|g_dec|'-1.5'::numeric
+ROLLBACK TO sp_g_dec		-
+SAVEPOINT sp_g_dec_f8		-
+ALTER TABLE g1nn ADD COLUMN g_dec_f8 double precision GENERATED ALWAYS AS ((-1.5)::double precision) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_dec_f8'		r|g_dec_f8|('-1.5'::numeric)::double precision
+ROLLBACK TO sp_g_dec_f8		-
+SAVEPOINT sp_g_dec_i4		-
+ALTER TABLE g1nn ADD COLUMN g_dec_i4 integer GENERATED ALWAYS AS ((-1.5)::integer) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_dec_i4'		r|g_dec_i4|('-1.5'::numeric)::integer
+ROLLBACK TO sp_g_dec_i4		-
+SAVEPOINT sp_g_big		-
+ALTER TABLE g1nn ADD COLUMN g_big bigint GENERATED ALWAYS AS ((-9223372036854775807)::bigint) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_big'		r|g_big|'-9223372036854775807'::bigint
+ROLLBACK TO sp_g_big		-
+SAVEPOINT sp_g_big_nm		-
+ALTER TABLE g1nn ADD COLUMN g_big_nm numeric GENERATED ALWAYS AS ((-9223372036854775807)::numeric) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_big_nm'		r|g_big_nm|('-9223372036854775807'::bigint)::numeric
+ROLLBACK TO sp_g_big_nm		-
+SAVEPOINT sp_g_wide		-
+ALTER TABLE g1nn ADD COLUMN g_wide numeric GENERATED ALWAYS AS ((-99999999999999999999999999)::numeric) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_wide'		r|g_wide|'-99999999999999999999999999'::numeric
+ROLLBACK TO sp_g_wide		-
+SAVEPOINT sp_g_bare_i8		-
+ALTER TABLE g1nn ADD COLUMN g_bare_i8 bigint GENERATED ALWAYS AS (-1) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_bare_i8'		r|g_bare_i8|'-1'::integer
+ROLLBACK TO sp_g_bare_i8		-
+SAVEPOINT sp_g_bare_nm		-
+ALTER TABLE g1nn ADD COLUMN g_bare_nm numeric GENERATED ALWAYS AS (-1) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'g_bare_nm'		r|g_bare_nm|'-1'::integer
+ROLLBACK TO sp_g_bare_nm		-
+SAVEPOINT sp_u_i8		-
+ALTER TABLE g1nn ADD COLUMN u_i8 bigint GENERATED ALWAYS AS (-1::bigint) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'u_i8'		r|u_i8|(- (1)::bigint)
+ROLLBACK TO sp_u_i8		-
+SAVEPOINT sp_u_nm		-
+ALTER TABLE g1nn ADD COLUMN u_nm numeric GENERATED ALWAYS AS (-1::numeric) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'u_nm'		r|u_nm|(- (1)::numeric)
+ROLLBACK TO sp_u_nm		-
+SAVEPOINT sp_u_i2		-
+ALTER TABLE g1nn ADD COLUMN u_i2 smallint GENERATED ALWAYS AS (-1::smallint) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'u_i2'		r|u_i2|(- (1)::smallint)
+ROLLBACK TO sp_u_i2		-
+SAVEPOINT sp_u_f8		-
+ALTER TABLE g1nn ADD COLUMN u_f8 double precision GENERATED ALWAYS AS (-1::double precision) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'u_f8'		r|u_f8|(- (1)::double precision)
+ROLLBACK TO sp_u_f8		-
+SAVEPOINT sp_u_dec		-
+ALTER TABLE g1nn ADD COLUMN u_dec double precision GENERATED ALWAYS AS (-1.5::double precision) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'u_dec'		r|u_dec|(- (1.5)::double precision)
+ROLLBACK TO sp_u_dec		-
+SAVEPOINT sp_p_i8		-
+ALTER TABLE g1nn ADD COLUMN p_i8 bigint GENERATED ALWAYS AS ((1)::bigint) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'p_i8'		r|p_i8|(1)::bigint
+ROLLBACK TO sp_p_i8		-
+SAVEPOINT sp_p_nm		-
+ALTER TABLE g1nn ADD COLUMN p_nm numeric GENERATED ALWAYS AS ((1.5)::numeric) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'p_nm'		r|p_nm|1.5
+ROLLBACK TO sp_p_nm		-
+SAVEPOINT sp_q_big_nm		-
+ALTER TABLE g1nn ADD COLUMN q_big_nm numeric GENERATED ALWAYS AS ((9223372036854775807)::numeric) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'q_big_nm'		r|q_big_nm|('9223372036854775807'::bigint)::numeric
+ROLLBACK TO sp_q_big_nm		-
+SAVEPOINT sp_q_big_f8		-
+ALTER TABLE g1nn ADD COLUMN q_big_f8 double precision GENERATED ALWAYS AS ((9223372036854775807)::double precision) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'q_big_f8'		r|q_big_f8|('9223372036854775807'::bigint)::double precision
+ROLLBACK TO sp_q_big_f8		-
+SAVEPOINT sp_q_wide_nm		-
+ALTER TABLE g1nn ADD COLUMN q_wide_nm numeric GENERATED ALWAYS AS ((99999999999999999999999999)::numeric) STORED		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nn'::regclass AND a.attname = 'q_wide_nm'		r|q_wide_nm|'99999999999999999999999999'::numeric
+ROLLBACK TO sp_q_wide_nm		-
+SAVEPOINT sp_d		-
+CREATE TABLE g1nd (a bigint DEFAULT (-1)::bigint, b numeric DEFAULT (-1.5)::double precision, c bigint DEFAULT -1::bigint)		-
+SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nd'::regclass ORDER BY a.attnum		r|a|('-1'::integer)::bigint ; r|b|('-1.5'::numeric)::double precision ; r|c|(- (1)::bigint)
+ROLLBACK TO sp_d		-
+SAVEPOINT sp_x		-
+CREATE INDEX g1nn_ix ON g1nn ((i8 + (-1)::bigint))		-
+SELECT 'r', pg_get_expr(x.indexprs, x.indrelid) FROM pg_index x WHERE x.indexrelid = 'g1nn_ix'::regclass		r|(i8 + ('-1'::integer)::bigint)
+SELECT 'r', pg_get_indexdef('g1nn_ix'::regclass)		r|CREATE INDEX g1nn_ix ON public.g1nn USING btree (((i8 + ('-1'::integer)::bigint)))
+ROLLBACK TO sp_x		-
+SAVEPOINT sp_c		-
+ALTER TABLE g1nn ADD CONSTRAINT g1nn_ck CHECK (i8 > (-1)::bigint)		-
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'g1nn'::regclass AND contype = 'c'		r|g1nn_ck|CHECK ((i8 > ('-1'::integer)::bigint))
+ROLLBACK TO sp_c		-
+SAVEPOINT sp_p		-
+CREATE INDEX g1nn_ixp ON g1nn (i4) WHERE i8 > (-1)::bigint		-
+SELECT 'r', pg_get_expr(x.indpred, x.indrelid) FROM pg_index x WHERE x.indexrelid = 'g1nn_ixp'::regclass		r|(i8 > ('-1'::integer)::bigint)
+ROLLBACK TO sp_p		-
+SAVEPOINT sp_k		-
+CREATE TABLE g1cc (i2 smallint, i4 integer, i8 bigint, nm numeric)		-
+ALTER TABLE g1cc ADD CONSTRAINT k1 CHECK (i2 > 1::smallint)		-
+ALTER TABLE g1cc ADD CONSTRAINT k2 CHECK (i8 > 1::bigint)		-
+ALTER TABLE g1cc ADD CONSTRAINT k3 CHECK (nm > (-1)::numeric)		-
+ALTER TABLE g1cc ADD CONSTRAINT k4 CHECK (i4 > (-1)::integer)		-
+ALTER TABLE g1cc ADD CONSTRAINT k5 CHECK (i2 > (-1)::smallint)		-
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'g1cc'::regclass AND contype = 'c' ORDER BY conname		r|k1|CHECK ((i2 > (1)::smallint)) ; r|k2|CHECK ((i8 > (1)::bigint)) ; r|k3|CHECK ((nm > ('-1'::integer)::numeric)) ; r|k4|CHECK ((i4 > '-1'::integer)) ; r|k5|CHECK ((i2 > ('-1'::integer)::smallint))
+ROLLBACK TO sp_k		-
+ROLLBACK		-

@@ -1,5 +1,15 @@
 # `::text` — the cast every type has, and the two that are not their own output function
 #
+#!escaped
+#
+# **Re-encoded, not re-measured.** One value in this file holds a `|`, which this format uses to
+# separate cells — so the row parsed as one cell too many and was reported as a disagreement while
+# reading identically (`docs/plans/debts-v1.1.md` #20). The directive above says the values carry
+# the escape contract `tests/parity_harness/mod.rs::unescape` reads: `\`, `|`, `;`, newline,
+# carriage return and tab written as `\\`, `\|`, `\;`, `\n`, `\r`, `\t`. The affected value was
+# escaped by hand here; every other value in the file is unchanged, and an escape this contract
+# does not define — `\N`, `\x0102` — is kept as written and reads as itself.
+#
 # Three of `ActiveRecord`'s boot statements die on `a cast to TEXT is not supported` before they
 # reach anything else. This is that cast: for a **column**, evaluated per row, which is the part
 # the literal-folding path could not do.
@@ -32,6 +42,6 @@ SELECT a::text FROM tt WHERE id = 2	text	\N
 SELECT 42::text, (-7)::text, true::text, false::text	text,text,text,text	42|-7|true|false
 SELECT 1.5::text, 'x'::text, NULL::text	text,text,text	1.5|x|\N
 SELECT 42::text || '!', length(123::text)	text,integer	42!|3
-SELECT f::text, length(f::text), f::text || '|' FROM tt WHERE id = 1	text,integer,text	x|1|x|
+SELECT f::text, length(f::text), f::text || '|' FROM tt WHERE id = 1	text,integer,text	x|1|x\|
 SELECT '2020-01-01 12:00:00.123456'::timestamp(3)::text	text	2020-01-01 12:00:00.123
 SELECT 1.0::float8::text, 1.5::real::text	text,text	1|1.5
