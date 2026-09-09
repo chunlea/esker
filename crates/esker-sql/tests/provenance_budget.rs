@@ -27,10 +27,12 @@
 /// `bigint` here against a real server's `integer`; and `name[]` with the folded cast that keeps
 /// its type (ADR 0086) deleted 61 more across sixteen — and then g1's rule-4 table and these two
 /// units met in a merge, which moved another sixteen `UNMEASURED` reasons out of `answers`
-/// entirely. Then 147 → 140 when a bare decimal became a `numeric` (ADR 0089), which closed seven
+/// entirely. Then 140 → 124 when `pg_typeof` stopped reading the datum (ADR 0093): 179 entries went
+/// across 57 files, which is the largest single deletion this number has seen and the reason to
+/// keep it — four units had each declared a slice of one fact before the shape was one rule. Then 147 → 140 when a bare decimal became a `numeric` (ADR 0089), which closed seven
 /// more — the counterexample `docs/plans/phase-9-rails.md` recorded against the `float8` trade
 /// among them. Set from what the scan reports, never chosen.
-const BUDGET: usize = 140;
+const BUDGET: usize = 124;
 
 #[test]
 fn unmeasured_divergences_do_not_grow() {

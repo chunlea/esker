@@ -10,9 +10,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog trade: `pg_typeof` answers a `regtype` on a real server and `text`
-    // here, with the same characters in it. The row agrees — `boolean`, both.
-    types: &["SELECT 'r', pg_typeof('abc' ~ 'b')"],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
     answers: &[
         (
             "SELECT 'r', E'a\\nb' ~ 'a.b', E'a\\nb' ~ '^a.b$'",

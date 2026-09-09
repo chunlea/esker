@@ -23,7 +23,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput, typtype, typdelim \
          FROM pg_type WHERE typname IN ('xml','_xml') ORDER BY typname",
-        "SELECT 'r', '{\"<a/>\"}'::xml[], pg_typeof('{\"<a/>\"}'::xml[])",
         // **A cast's declared type, and one reason for all nine**: an `xml` value is a
         // `Datum::Text`, as a `json` value is, so `RowDescription` carries `text`'s oid where a
         // real server carries 142. The **rows are right** in every one of them, and a *column* of
@@ -38,11 +37,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // *column* is an `xml` everywhere it is asked — `pg_type`, `information_schema` and
         // `format_type` all say so three statements above — and it is the value that carries no
         // type of its own. The same trade `varchar` makes, arriving one type later.
-        (
-            "SELECT 'r', pg_typeof(payload) FROM xml_data_type ORDER BY id LIMIT 1",
-            "pg_typeof reads the value, and an xml value is a Datum::Text",
-            "UNMEASURED",
-        ),
         // **An `E'…'` literal is not lowered here at all**, whatever it is cast to: the parser
         // gives it as an `EscapedStringLiteral` and nothing in this crate reads one, so the cast
         // is `0A000` before the text is looked at. Nothing to do with `xml` — these two

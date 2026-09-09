@@ -28,31 +28,10 @@ mod parity;
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `pg_typeof` answers a `regtype` on a real server and `text` here (ADR 0077); every row
-    // agrees. These are the statements that ask it and nothing else.
-    types: &[
-        "SELECT pg_typeof(CASE WHEN true THEN 1 ELSE 1.5 END), pg_typeof(COALESCE(1, 1.5))",
-        "SELECT pg_typeof(1.5), pg_typeof(1.5::float8), pg_typeof(1e3)",
-        "SELECT pg_typeof(CASE WHEN true THEN 1::int8 ELSE 1::int4 END)",
-        "SELECT pg_typeof(GREATEST(1, 1.5)), pg_typeof(LEAST(1, 1.5))",
-        "SELECT 1.5 + 1, pg_typeof(1.5 + 1)",
-        "SELECT 1.5 * 3, pg_typeof(1.5 * 3)",
-        "SELECT 0.1 + 0.2, pg_typeof(0.1 + 0.2)",
-        "SELECT 1.10, pg_typeof(1.10)",
-        "SELECT sum(v), pg_typeof(sum(v)) FROM (VALUES (1.10),(2.20)) t(v)",
-        "SELECT avg(v), pg_typeof(avg(v)) FROM (VALUES (1.10),(2.20)) t(v)",
-        "SELECT 10.0/3.0, pg_typeof(10.0/3.0)",
-        "SELECT pg_typeof(COALESCE(NULL, 1.5))",
-        "SELECT -1.5, pg_typeof(-1.5)",
-        "SELECT 1.5e2, pg_typeof(1.5e2)",
-        "SELECT abs(-1.5), pg_typeof(abs(-1.5))",
-        "SELECT CASE WHEN true THEN 1 ELSE 1.5::float8 END, pg_typeof(CASE WHEN true THEN 1 ELSE \
-         1.5::float8 END)",
-        "SELECT ARRAY[1, 1.5], pg_typeof(ARRAY[1, 1.5])",
-        "SELECT x, pg_typeof(x) FROM (VALUES (1.5),(2)) t(x) ORDER BY x",
-        "SELECT 7.5 % 2, pg_typeof(7.5 % 2)",
-        "SELECT 100000000000000000000.5, pg_typeof(100000000000000000000.5)",
-    ],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
     answers: &[
         // ----- `pg_typeof` over a branch whose type is the *common* one ---------------------------
         //
@@ -64,35 +43,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `a_float_beside_a_numeric_is_still_a_float` assert below. Same seam as
         // `tests/name_array.rs`: closing it means resolving `pg_typeof` against the declared type
         // at plan time, which is its own unit and would close ADR 0077's half with it.
-        (
-            "SELECT pg_typeof(CASE WHEN true THEN 1::int4 ELSE 1.5::float8 END)",
-            "`pg_typeof` reads the datum, which is the chosen branch's `Int4`; the column is \
-             declared `double precision`, which is what a client is told.",
-            "pg19_decimal_literal.txt:73",
-        ),
-        (
-            "SELECT pg_typeof(CASE WHEN true THEN 1.5::numeric ELSE 1.5::float8 END)",
-            "The same: the datum is the chosen branch's `Numeric` and the column is declared \
-             `double precision`.",
-            "pg19_decimal_literal.txt:74",
-        ),
-        (
-            "SELECT pg_typeof(COALESCE(1::int4, 1::int8))",
-            "The same, through `COALESCE`: the datum is the first branch's `Int4` and the column \
-             is declared `bigint`.",
-            "pg19_decimal_literal.txt:77",
-        ),
-        (
-            "SELECT pg_typeof(COALESCE(1::numeric, 1::float8))",
-            "The same, through `COALESCE`.",
-            "pg19_decimal_literal.txt:78",
-        ),
-        (
-            "SELECT pg_typeof(CASE WHEN true THEN NULL ELSE 1.5 END)",
-            "The same over a NULL, which carries no type at all: the column is declared `numeric` \
-             and `pg_typeof` has nothing to read it from.",
-            "pg19_decimal_literal.txt:90",
-        ),
         // **`^` is a `double precision` whatever it is given** in this crate — the one exception
         // `value::arith::result_type` writes down — where a real server's `numeric ^ integer` is a
         // `numeric` and carries `div_scale`'s sixteen digits. `8` against `8.0000000000000000`:

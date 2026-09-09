@@ -45,11 +45,6 @@ const TYPES: &[&str] = &[
     // server and `text` here; the catalog's own columns are their own units.
     "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN \
      ('json','jsonb') ORDER BY oid",
-    // `pg_typeof`'s own `regtype`/`text` trade (ADR 0077). The two type names it answers are right
-    // since a folded cast started keeping the type it named (ADR 0086), and both `format_type`
-    // calls always were.
-    "SELECT pg_typeof('{}'::json), pg_typeof('{}'::jsonb), format_type(114, -1), \
-     format_type(3802, -1)",
 ];
 
 /// One of `DIVERGENCES`' seven reasons.

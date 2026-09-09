@@ -9,11 +9,6 @@ mod bind;
 const DIVERGENCES: bind::Divergences = bind::Divergences {
     types: &[],
     answers: &[
-        (
-            "SELECT pg_typeof($1::int8)",
-            "The same cast, and the same unit",
-            "pg19_bind_parameters.txt:79",
-        ),
         // **An entry stood here and is deleted** (ADR 0031, rule 2): `IS NOT DISTINCT FROM` was
         // an operator this node did not have. It arrived with the `upsert_all` template that
         // needed it (`tests/values_catalog_function.rs`), and the parameter half had always

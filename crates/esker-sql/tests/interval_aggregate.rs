@@ -26,14 +26,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **One fact, five times**: `pg_typeof` answers a `regtype` on a real server and `text` here,
-    // the trade `'x'::regtype` makes everywhere in this crate. The rows are identical.
-    types: &[
-        "SELECT pg_typeof(sum(v)), pg_typeof(avg(v)) FROM ia",
-        "SELECT pg_typeof(min(v)), pg_typeof(max(v)) FROM ia",
-        "SELECT pg_typeof(sum(t)), pg_typeof(avg(t)) FROM ia",
-        "SELECT pg_typeof(min(t)), pg_typeof(max(t)) FROM ia",
-    ],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
     answers: &[],
 };
 

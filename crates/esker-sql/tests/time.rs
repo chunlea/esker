@@ -47,7 +47,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // **Moved from `answers` by parity rule 4.** Its reason was `pg_typeof` not being
         // implemented; it answers now, and what is left is the standing one — `pg_typeof` is a
         // `regtype` there and `text` here (ADR 0077).
-        "SELECT pg_typeof('12:34:56'::time)",
         // **A cast's declared type carries no typmod here**, for any parameterised type: the
         // three below answer the right *values* — the rounding is exact, including `time(7)`
         // clamping to six digits — and report `time without time zone` where a real server

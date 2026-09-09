@@ -41,33 +41,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // the catalog says its own columns are. Now that the type exists, switching them over is a
     // change to the catalog views (g1's ground), and it is listed in the handover.
     types: &[
-        "SELECT pg_typeof('x'::name || 'y')",
-        "SELECT pg_typeof('x'::name::text)",
-        "SELECT pg_typeof(upper('a'::name))",
         "SELECT typname, oid, typtype, typlen, typcategory, typdelim, typcollation FROM pg_type \
          WHERE typname = 'name'",
         "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.atttypid, a.atttypmod FROM \
          pg_attribute a WHERE a.attrelid = 'b4_nm'::regclass AND a.attnum > 0 ORDER BY a.attnum",
     ],
-    answers: &[
-        // **A cast to `name` folds to a `Datum::Text`**, and `pg_typeof` reads the datum. This
-        // crate has one representation for `text`, `varchar`, `bpchar` and now `name` — what
-        // tells them apart is the *column's* declared type, which a bare cast in a target list
-        // does not have. A `name` column answers correctly (`the_catalog_describes_the_column`);
-        // it is the cast on its own that cannot. The same is true of `'x'::varchar` today.
-        (
-            "SELECT pg_typeof('x'::name)",
-            "A cast to `name` folds to a `Datum::Text` and `pg_typeof` reads the datum, which \
-             has one representation for all four string types. A `name` column reports `name` \
-             correctly; a bare cast has no column to read it from.",
-            "pg19_name_type.txt:84",
-        ),
-        (
-            "SELECT pg_typeof('x'::text::name)",
-            "The same, through two casts.",
-            "pg19_name_type.txt:87",
-        ),
-    ],
+    answers: &[],
 };
 
 #[test]

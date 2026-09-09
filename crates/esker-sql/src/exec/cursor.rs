@@ -3353,20 +3353,18 @@ fn catalog_function(
         // `RowDescription` for the same expression says `integer`. One expression with two
         // answers is the shape the enum unit removed from this crate, and this is where it would
         // have come straight back in.
-        CatalogFunc::PgTypeof
-            if matches!(
-                call.args.first(),
-                Some(Expr::Literal(crate::plan::Literal::Integer(v)))
-                    if i32::try_from(*v).is_ok()
-            ) =>
-        {
-            Datum::Text(ColumnType::Int4.name().to_owned())
-        }
-        CatalogFunc::PgTypeof => Datum::Text(
+        // **The type `exec::query::resolve` worked out, carried as the second argument.** It is
+        // the argument's *declared* type — a datum cannot say which of the types sharing its
+        // representation it is — and it rides here rather than replacing the call so that a
+        // set-returning first argument still produces its rows.
+        CatalogFunc::PgTypeof if args.len() == 2 => args[1].clone(),
+        // A `pg_typeof` that never reached `resolve` — there is no such path in the executor
+        // today, and a datum's own type is the honest answer if one appears.
+        CatalogFunc::PgTypeof => crate::value::regtype_of_oid(
             args.first()
                 .and_then(Datum::column_type)
-                .map_or("text", PgType::name)
-                .to_owned(),
+                .unwrap_or(ColumnType::Text)
+                .oid(),
         ),
         // **Per call, and the corpus pins the consequence rather than a value**: two calls in one
         // statement differ, and every draw is inside `[0, 1)`. The bytes come from the OS pool

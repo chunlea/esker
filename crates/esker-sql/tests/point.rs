@@ -21,8 +21,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         // `pg_typeof` answers a `regtype` there and `text` here — the trade `'x'::regtype`
         // already makes — and the values are `point` and `point[]`, which is what these two ask.
-        "SELECT 'r', pg_typeof('(1,2)'::point), '(1,2)'::point::text",
-        "SELECT 'r', ARRAY['(1,2)'::point, '(3,4)'::point], pg_typeof(ARRAY['(1,2)'::point])",
         // And the catalog row: `typname` is a `name`, the two oids are `oid`, `typcategory` is a
         // `\"char\"` and `typinput` a `regproc`. Every character and every number agrees —
         // `point` is 600 with `typarray` 1017, `typlen` **16**, category **G**, input `point_in`.

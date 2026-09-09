@@ -3042,39 +3042,31 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             for arg in &call.args {
                 args.push(resolve(arg, scope)?);
             }
-            // **`pg_typeof` of an enum column is folded here, where the type has a name.** The
-            // evaluator reads a `Datum`'s own type and a `Datum` is an `int2`, so it would answer
-            // `smallint` — the storage, which is the one thing about an enum a client must not be
-            // told, and a *wrong value* rather than a refusal (ADR 0031's worst class). The name is
-            // known at plan time and nowhere else, so this is where it is answered.
+            // **`pg_typeof` is answered here, from the argument's *declared* type, always.**
+            //
+            // It used to read the datum with three exceptions carved out of it — an enum column,
+            // whose storage is an `int2` and whose name is the one thing a client must not be told
+            // wrong (ADR 0050); and `hstore[]`, `json` and `jsonb`, which are canonical
+            // `Datum::Text`s. Every exception was the same fact and the list was never going to
+            // stop growing: `name`, `varchar` and `bpchar` are that `Datum::Text` too, a `cidr` and
+            // an `inet` are one `Datum::Inet`, a `void` is an empty string. Four units of this
+            // queue each declared a slice of it before the shape was one rule.
+            //
+            // **The argument stays an argument**, which the folded exceptions did not manage:
+            // `pg_typeof(unnest(ARRAY['a','b']))` is **two** rows on a real server, measured, and
+            // folding the call to a constant would answer one. So the resolved type rides along as
+            // a second argument and the evaluator answers that, leaving the first to be evaluated
+            // exactly as it was.
             match (call.func, args.first()) {
-                (CatalogFunc::PgTypeof, Some(Expr::Ordinal { at, .. })) if args.len() == 1 => {
-                    match scope.user_type_at(*at) {
-                        Some(def) => Expr::Literal(Literal::String(def.name.clone())),
-                        None => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
-                            func: call.func,
-                            args,
-                        })),
-                    }
-                }
-                // **`hstore[]` alone still needs the static type**: an array's elements carry
-                // theirs and the array does not, so the value cannot say which array it is.
-                // `hstore` itself no longer needs this — `Datum::Hstore` says so — and neither
-                // does `citext`, which is why the list is one entry rather than three.
                 (CatalogFunc::PgTypeof, Some(arg)) if args.len() == 1 => {
-                    match expr_type(arg, scope) {
-                        // **`json` and `jsonb` join it, and for exactly the same reason**: both
-                        // are a canonical `Datum::Text`, so the evaluator would answer `text` for
-                        // `pg_typeof(payload->'b')` where a real server says `jsonb`. The static
-                        // type knows and the value does not.
-                        Ok(
-                            ty @ (ColumnType::HstoreArray | ColumnType::Json | ColumnType::Jsonb),
-                        ) => Expr::Literal(Literal::String(ty.name().to_owned())),
-                        _ => Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
-                            func: call.func,
-                            args,
-                        })),
-                    }
+                    let named = pg_typeof_of(arg, scope)?;
+                    Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                        func: CatalogFunc::PgTypeof,
+                        args: vec![
+                            args.swap_remove(0),
+                            Expr::Literal(Literal::Typed(Box::new(named))),
+                        ],
+                    }))
                 }
                 // **A `->` over a json or jsonb column**, which lowered to the hstore spelling
                 // because only the plan knows the type — a `jsonb` is a canonical `Datum::Text`
@@ -4210,6 +4202,23 @@ fn retype(
     {
         return Ok(literal.clone());
     }
+    // **And an integer literal against an integer column, which is the same sentence at every
+    // width.** PostgreSQL picks an operator — `int24gt` for `i2 > 1` — and leaves the constant an
+    // `integer`; narrowing it here built a `smallint` node, and the printed tree said so:
+    // `(i2 > (1)::smallint)` where a real server prints `(i2 > 1)`
+    // (`tests/captures/pg19_numeric_literal_deparse.txt`, `debts-v1.1.md` #23). The **values** are
+    // unaffected — `Datum`'s ordering compares the integer widths against each other — which is
+    // why the only place it showed was a deparse.
+    //
+    // `int4` and `int8` were already right *by accident*: the datum stays an `i64` whatever width
+    // the literal is declared (ADR 0087), so narrowing to either is a no-op and only `smallint`
+    // had a distinct one. Written as the rule rather than as the width, because a fix aimed at
+    // `smallint` would be a fix to the symptom.
+    if matches!(literal, Literal::Integer(_))
+        && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+    {
+        return Ok(literal.clone());
+    }
     // **And an integer literal wider than the column is compared, not narrowed**, which is the
     // arm above with the widths one step in: PostgreSQL has an `int4 > int8` operator, so
     // `i4 > 9223372036854775807` is answered — `f` for every row — where narrowing the literal to
@@ -4954,6 +4963,62 @@ fn array_element_type(
     Ok(widest)
 }
 
+/// The type `lower` or `upper` answers when its operand is a **range**, or `None` for the rest.
+///
+/// The two names are overloaded on a real server exactly as they are here: over a string they fold
+/// case and answer `text`, over a range they are the bounds and answer the **subtype** —
+/// `lower(ts_range)` is a `timestamp`, measured. The evaluator has told them apart by the operand
+/// since the range unit; this is the same rule on the side that says what a client is told.
+///
+/// **The eight range types are written out** rather than asked of `crate::value::range_subtype`,
+/// which answers `timestamp` for everything it does not know: a guard written as "its subtype is
+/// not `text`" made `lower('MiXeD')` a `timestamp`, which is the second time in this queue that a
+/// helper's fallback has been read as an answer.
+fn range_bound_type(
+    func: crate::plan::ScalarFunc,
+    operand: &Expr,
+    scope: &Scope<'_>,
+) -> Result<Option<ColumnType>> {
+    if !matches!(
+        func,
+        crate::plan::ScalarFunc::Lower | crate::plan::ScalarFunc::Upper
+    ) {
+        return Ok(None);
+    }
+    let ty = expr_type(operand, scope)?;
+    Ok(matches!(
+        ty,
+        ColumnType::TsRange
+            | ColumnType::TstzRange
+            | ColumnType::Int4Range
+            | ColumnType::Int8Range
+            | ColumnType::DateRange
+            | ColumnType::NumRange
+            | ColumnType::FloatRange
+            | ColumnType::VarcharRange
+    )
+    .then(|| crate::value::range_subtype(ty)))
+}
+
+/// The `regtype` `pg_typeof` answers for one argument.
+///
+/// **A user-defined type names itself**, which the declared type alone cannot give: an enum's
+/// storage is an `int2` (ADR 0050) and a `floatrange`'s is a range representation, and `pg_typeof`
+/// reports what the column was *declared* as. `Scope::user_type_at` is the same lookup
+/// `OutputColumn::user_type` uses, so this function and the `RowDescription` beside it cannot
+/// disagree — which is the property the datum-reading version could not have.
+fn pg_typeof_of(expr: &Expr, scope: &Scope<'_>) -> Result<Datum> {
+    if let Expr::Ordinal { at, .. } = expr
+        && let Some(def) = scope.user_type_at(*at)
+    {
+        return Ok(Datum::RegType {
+            oid: u32::try_from(def.oid).unwrap_or(0),
+            name: def.name.clone().into(),
+        });
+    }
+    Ok(crate::value::regtype_of_oid(expr_type(expr, scope)?.oid()))
+}
+
 fn arrow_fetch(func: CatalogFunc, args: &[Expr], scope: &Scope<'_>) -> CatalogFunc {
     if func != CatalogFunc::HstoreFetch {
         return func;
@@ -5038,6 +5103,11 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // latter, the type was gone by the time anything could ask, and the two concatenations
         // were indistinguishable.
         Expr::CatalogFunc(call) => catalog_func_type(call, scope),
+        // **`lower` and `upper` are overloaded on a range**, which is how a real server spells them
+        // too: over a string they fold case and answer `text`, over a range they are the bounds and
+        // answer the **subtype** — `lower(ts_range)` is a `timestamp`, measured. The evaluator has
+        // told them apart by the operand since the range unit; this is the same rule, on the side
+        // that says what a client is told.
         // **A bare decimal is a `numeric`**, which `literal_type` also says — the two must agree or
         // a client is told one type and sent another's characters.
         Expr::Literal(Literal::Decimal(_)) => ColumnType::Numeric,
@@ -5090,8 +5160,13 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         }
         // Whatever the operand is, a cast to `text` answers `text` — that is what it is for.
         // The two text functions take text and answer text.
-        Expr::Scalar { .. }
-        | Expr::ToText { .. }
+        // **`lower` and `upper` over a range answer the subtype**, and every other scalar
+        // function that reaches here answers `text`. Placed after the arms that name a
+        // function, so those keep deciding first.
+        Expr::Scalar { func, operand } => {
+            range_bound_type(*func, operand, scope)?.unwrap_or(ColumnType::Text)
+        }
+        Expr::ToText { .. }
         | Expr::CurrentSetting { .. }
         | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
         Expr::Literal(Literal::Typed(value)) => value.column_type().unwrap_or(ColumnType::Text),

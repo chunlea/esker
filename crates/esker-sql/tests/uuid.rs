@@ -23,7 +23,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // **Moved from `answers` by parity rule 4.** Its reason was `pg_typeof` not being
         // implemented for any type; it answers now, and the `regtype`-versus-`text` half is
         // what remains (ADR 0077). `format_type(2950, -1)` always agreed.
-        "SELECT pg_typeof('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid), format_type(2950, -1)",
         // `typname` is a `name` and `typcategory` a `"char"` on a real server; both are `text`
         // here with identical characters. `typlen` agrees exactly, as a `smallint`.
         "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname = 'uuid'",

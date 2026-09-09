@@ -15,43 +15,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **One fact, fourteen times**: `pg_typeof` answers a `regtype` on a real server and `text`
-    // here, which is the trade `'x'::regtype` already makes everywhere in this crate. Every row
-    // below is identical; only the column's declared type differs, and the day `regtype` becomes
-    // a type of its own these entries fail rather than pass quietly.
-    types: &[
-        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
-        // differs is one of the standing declared-type families listed on
-        // `parity::Divergences::types`. The reason each one used to carry described an answer
-        // that had stopped differing.
-        // `array_agg(1)` joined them with the literal ladder's `int4` rung: its rows used to
-        // differ too — `bigint[]` against a real server's `integer[]` — and now only `pg_typeof`'s
-        // own answer does.
-        "SELECT 'r', pg_typeof(array_agg(1)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(i2)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(d)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(b)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(ts)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(u)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(t || 'x')) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(i4)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(id)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(t)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(n)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(DISTINCT i4)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(i4 ORDER BY i4 DESC)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(i4 + 1)) FROM ag",
-        "SELECT 'r', pg_typeof(min(i4)), pg_typeof(max(i2)), pg_typeof(count(*)) FROM ag",
-        "SELECT 'r', pg_typeof(sum(i4)), pg_typeof(sum(i2)), pg_typeof(sum(id)), pg_typeof(sum(n)), pg_typeof(sum(d)) FROM ag",
-        "SELECT 'r', pg_typeof(avg(i4)), pg_typeof(avg(id)), pg_typeof(avg(n)), pg_typeof(avg(d)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(i4)::text) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg('lit'::text)) FROM ag",
-        // Moved up from `answers` by `Literal::TypedNull`: the cast survives lowering, so the
-        // argument is an `int4` and the aggregate declares `integer[]` — the row PostgreSQL
-        // gives. Only the `regtype` trade above it is left, which is what this list is.
-        "SELECT 'r', pg_typeof(array_agg(NULL::int4)) FROM ag",
-        "SELECT 'r', pg_typeof(array_agg(i4)) FROM ag GROUP BY t",
-    ],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
     answers: &[
         // **This node has four array types** (ADR 0047: `bigint[]`, `integer[]`, `numeric[]`,
         // `text[]`), which is what the Rails schema needs and no more. `array_agg` over any other
@@ -60,11 +27,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `pg_typeof` reads the **value** here and the static type there, and an aggregate over no
         // rows is NULL — which has no type. The declared type of the column is right either way;
         // it is the function that cannot see it.
-        (
-            "SELECT 'r', pg_typeof(array_agg(i4)) FROM ag WHERE false",
-            "pg_typeof reads the value, and an aggregate over no rows is NULL",
-            "UNMEASURED",
-        ),
         // Two functions this node does not have. Named rather than approximated, and neither is
         // about the result type this file is for.
         (

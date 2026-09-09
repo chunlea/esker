@@ -20,16 +20,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // below still name a relation. `indnatts` is an `int2` on both.
     // Every *value* is identical — the harness only reaches this list when the rows agree — and
     // `indkey`'s characters are the ones `ActiveRecord` splits on.
-    types: &[
-        "SELECT pg_typeof(indkey), pg_typeof(indisunique), pg_typeof(indnatts) FROM pg_index WHERE indexrelid = 'ia_pkey'::regclass",
-    ],
-    answers: &[(
-        "SELECT pg_typeof(indkey), pg_typeof(indisunique), pg_typeof(indnatts) FROM pg_index WHERE indexrelid = 'ia_pkey'::regclass",
-        "`pg_typeof` is a function this node does not have, so the statement is `0A000` \
-             naming it rather than answering `int2vector`. What it would have said is the type \
-             divergence above, which is declared there.",
-        "UNMEASURED",
-    )],
+    types: &[],
+    // **Empty.** The one entry read `pg_typeof(indkey), …` and its reason — "`pg_typeof` is a
+    // function this node does not have" — had been false for a long time; what was left was the
+    // function reading the datum, and it answers `int2vector` since ADR 0093.
+    answers: &[],
 };
 
 #[test]

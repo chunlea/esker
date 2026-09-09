@@ -11,26 +11,11 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // The standing catalog trade: `pg_typeof` answers a `regtype` on a real server and `text`
-    // here, with the same characters in it. The row agrees — `bigint`, both.
-    types: &["SELECT 'r', pg_typeof(id) FROM \"books\" LIMIT 1"],
-    answers: &[
-        // **Two more entries stood here and are deleted** (ADR 0031, rule 2). They were the
-        // partial-index arbiter — `ON CONFLICT ("a") WHERE "b" IS NOT NULL DO UPDATE …` at
-        // `pg19_on_conflict.txt:137` and the `SELECT` one line later that read the row it would
-        // have updated. The entry called it a C1 parser gap, which it was: `sqlparser` 0.62.0
-        // expects `DO` after the target list and its `ConflictTarget::Columns` has nowhere to put
-        // a predicate. The clause now comes off the source before the parse
-        // (`parse::strip_on_conflict_predicate`) and selects the index it names, so both
-        // statements answer what a real server answers and the harness said so before this comment
-        // was written.
-        // **A third entry stood here and is deleted** (ADR 0031, rule 2): the `upsert_all`
-        // template's `IS NOT DISTINCT FROM` was an operator this node did not have, so the
-        // statement was refused by name and the `SELECT` after it was swallowed by the aborted
-        // block. Both run now — the operator is a `BinaryOp` and the row's `updated_at` is
-        // untouched, which is the whole point of the template
-        // (`tests/values_catalog_function.rs` carries the shape it came from).
-    ],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
+    answers: &[],
 };
 
 #[test]

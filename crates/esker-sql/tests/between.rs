@@ -16,9 +16,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `regtype` there and `text` here, which is what `'x'::regtype` is everywhere in this crate:
-    // the printed name is identical and the declared type is not.
-    types: &["SELECT 'r', pg_typeof(1 BETWEEN 1 AND 2)"],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
     answers: &[
         (
             "SELECT 'r', id FROM bt WHERE id BETWEEN SYMMETRIC 3 AND 2 ORDER BY id",

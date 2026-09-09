@@ -33,12 +33,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // declared type* that differs: `Datum::Text` is what a `varchar` is here, and
         // `pg_typeof(upper(string_range))` reads the value's own type. The same trade every
         // `varchar` in this node makes, arriving one level deeper.
-        (
-            "SELECT 'r', pg_typeof(lower(string_range)), pg_typeof(upper(string_range)) FROM fr \
-             WHERE id = 109",
-            "a varchar bound is a Datum::Text, which reports text",
-            "UNMEASURED",
-        ),
         // **The refusal is right and the type name in it is the representation.** A user range
         // column holds `ColumnType::FloatRange`, whose `name()` is `float8range` — deliberately
         // not a PostgreSQL type name, because PostgreSQL has none for a range over `float8` and

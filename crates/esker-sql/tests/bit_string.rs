@@ -25,7 +25,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
         "SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type WHERE typname IN ('bit','varbit','_bit','_varbit') ORDER BY typname",
         "SELECT 'r', '101'::bit(3), '101'::bit varying(5)",
-        "SELECT 'r', pg_typeof('101'::bit(3)), pg_typeof('101'::bit varying(5))",
         "SELECT 'r', '{101,010}'::bit(3)[], pg_typeof('{101}'::bit(3)[])",
         "SELECT 'r', '101'::bit(8)",
         "SELECT 'r', '101010101'::bit(4)",
@@ -40,8 +39,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', '101'::bit, '101'::bit varying",
         // `pg_typeof` is a `regtype` there and `text` here, the standing catalog trade; the
         // values are `bit` in both, which is what these two ask.
-        "SELECT 'r', B'00000011', pg_typeof(B'00000011')",
-        "SELECT 'r', X'F', X'ff', X'0', pg_typeof(X'ff')",
         // `column_name`, `data_type` and `column_default` are `information_schema`'s own domains
         // and `text` here. **Every value agrees** — including `'00000011'::"bit"` and
         // `'0011'::"bit"`, which is the quoted spelling a real server prints for a `B'…'` default

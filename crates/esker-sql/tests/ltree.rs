@@ -22,7 +22,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
          WHERE typname IN ('ltree','_ltree') ORDER BY typname",
         // `pg_typeof` is a `regtype` there and `text` here; the value beside it agrees, and it is
         // the one this asks — an `ltree[]` literal is an `ltree[]`.
-        "SELECT 'r', '{a.b,c.d}'::ltree[], pg_typeof('{a.b}'::ltree[])",
     ],
     answers: &[
         // **`COLLATE` used to be the reason both of these were here**, and it is not any more:

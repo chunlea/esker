@@ -15,13 +15,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `information_schema` reports `name` and `character varying(3)` where this node answers `text` — the trade every catalog column makes, with identical values. The row agrees, `is_deferrable` and `initially_deferred` included, which is what this unit changed: they were hardcoded `NO` while nothing could be deferred.
-    types: &[
-        // `pg_constraint.conname` is a `name` there and `text` here, and `pg_typeof` answers a
-        // `regtype` where this node says `text` — the two standing catalog trades. These lines
-        // were **swallowed by an aborted block** until `ALTER TABLE … ADD CONSTRAINT … UNIQUE`
-        // landed and stopped aborting it, so they are newly *reached* rather than newly wrong.
-        "SELECT 'r', pg_typeof(condeferrable), pg_typeof(condeferred), pg_typeof(pg_get_constraintdef(oid)) FROM pg_constraint WHERE conname = 'test_unique_constraints_position_deferrable_false'",
-    ],
+    types: &[],
     answers: &[(
         "ALTER TABLE \"test_unique_constraints\" ADD CONSTRAINT \"u_nnd_deferred\" UNIQUE NULLS NOT DISTINCT (\"position_2\") DEFERRABLE INITIALLY DEFERRED",
         "**A wrong answer, and named as one.** `ALTER TABLE … ADD CONSTRAINT … UNIQUE` now runs \

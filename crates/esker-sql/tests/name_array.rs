@@ -44,18 +44,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // real `name` column, an array literal, the session's search path — so the answer this node
     // reads off the datum is the right one.
     types: &[
-        "SELECT pg_typeof(array_agg(c::name)) FROM (VALUES ('x')) s(c)",
-        "SELECT pg_typeof(ARRAY[c::name]) FROM (VALUES ('x')) s(c)",
-        "SELECT pg_typeof(ARRAY['a'::name,'b'::name])",
-        "SELECT pg_typeof(array_agg(relname)) FROM (SELECT relname FROM pg_class LIMIT 2) s",
-        "SELECT pg_typeof(array_agg(attname)) FROM (SELECT attname FROM pg_attribute LIMIT 2) s",
-        "SELECT pg_typeof(current_schemas(false))",
-        "SELECT pg_typeof(array_agg(data)) FROM b4_nm",
-        "SELECT pg_typeof(array_agg(nspname)) FROM pg_namespace",
-        "SELECT pg_typeof(min(c::name)) FROM (VALUES ('x')) s(c)",
-        "SELECT pg_typeof(max(c::name)) FROM (VALUES ('x')) s(c)",
-        "SELECT pg_typeof(CASE WHEN true THEN 'a'::name ELSE 'b'::text END)",
-        "SELECT pg_typeof('{a,b}'::name[])",
         // `oid` and `oid[]` on a real server where this node says `bigint` and `bigint[]` — the
         // catalog-oid family, its own unit. `typname` agrees on both since ADR 0084.
         "SELECT typname AS name, oid, array_agg(oid) FROM pg_type WHERE typname = 'name' GROUP \
@@ -89,48 +77,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // declared type at plan time, where a scope exists — its own unit, and it would close the
         // `regtype`/`text` half (ADR 0077) at the same time.
         (
-            "SELECT pg_typeof('x'::name)",
-            "`pg_typeof` reads the datum and a `name` is a `Datum::Text`. The `RowDescription` \
-             for the same expression says 19, which is what a client reads.",
-            "pg19_name_array.txt:85",
-        ),
-        (
-            "SELECT pg_typeof(array_agg(enumlabel)) FROM pg_enum",
-            "The same: the aggregate's declared type is `name[]` and the array datum it built \
-             holds `Datum::Text` elements, which is what `pg_typeof` answers from.",
-            "pg19_name_array.txt:97",
-        ),
-        (
-            "SELECT pg_typeof(unnest('{a,b}'::name[]))",
-            "The same, through `unnest`.",
-            "pg19_name_array.txt:105",
-        ),
-        (
             "SELECT pg_typeof('{a,b}'::name[] || 'c'::name)",
             "The same, through the array `||`.",
             "pg19_name_array.txt:112",
-        ),
-        (
-            "SELECT pg_typeof(coalesce('a'::name, 'b'::name))",
-            "The same, through `COALESCE`.",
-            "pg19_name_array.txt:113",
-        ),
-        (
-            "SELECT pg_typeof(coalesce('a'::name, 'b'::text))",
-            "The same, and the pair is worth reading beside the `CASE` two lines down: a real \
-             server resolves `name` beside `text` to **`name`** under `COALESCE` and to `text` \
-             under `CASE`, which is measured rather than reasoned.",
-            "pg19_name_array.txt:114",
-        ),
-        (
-            "SELECT pg_typeof(CASE WHEN true THEN 'a'::name ELSE 'b'::name END)",
-            "The same, through `CASE`.",
-            "pg19_name_array.txt:115",
-        ),
-        (
-            "SELECT pg_typeof(x) FROM unnest('{a,b}'::name[]) AS x LIMIT 1",
-            "The same, through a set-returning function in the `FROM` list.",
-            "pg19_name_array.txt:122",
         ),
         // ----- two array functions this node does not have ---------------------------------------
         (

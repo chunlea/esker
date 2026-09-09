@@ -15,13 +15,7 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
     // here and an `integer` there, so `1 + $1` is `5` on both sides and is called `bigint` on one.
     // The standing divergence `tests/unknown_literal.rs` holds. What matters for this unit is on
     // the other side of it — the parameter resolved to a *number* at all.
-    types: &[
-        // **The values agree and only the column type does not**: `pg_typeof` answers a `regtype`
-        // on a real server and `text` here, the standing `pg_catalog` trade. It was an *answer*
-        // divergence until `||` over text was built — `numeric|text` is now right on both, and
-        // `pg_typeof(1::text || '2')` saying `text` is the half that was missing.
-        "SELECT 'r', pg_typeof(1 + '2'::numeric), pg_typeof(1::text || '2')",
-    ],
+    types: &[],
     answers: &[
         // **`||` over text is not built**, which is the debt `tests/aggregate_type.rs` has
         // declared since the array unit — three statements here, and none of them is about
@@ -66,12 +60,6 @@ const DIVERGENCES: bind::Divergences = bind::Divergences {
             "SELECT 'r', '2'::text + 1",
             "the same constant width",
             "pg19_integer_plus_text.txt:68",
-        ),
-        (
-            "SELECT 'r', 1 + NULL IS NULL, pg_typeof(1 + NULL)",
-            "the row agrees; a NULL beside a constant is text here and integer there, which is the \
-             constant-width divergence with a NULL in it",
-            "pg19_integer_plus_text.txt:76",
         ),
         // **`pg_operator` is not a relation this node has.** The statement is in the capture
         // because it is where "does not exist" is read out of on a real server — there are no `+`

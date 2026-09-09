@@ -50,11 +50,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_current_schemas.txt:65",
         ),
         (
-            "SELECT pg_typeof(current_schemas(false)), pg_typeof(current_schema)",
-            "`pg_typeof` is not implemented, `0A000` naming it.",
-            "pg19_current_schemas.txt:54",
-        ),
-        (
             "SELECT current_catalog, current_database()",
             "The database's own name, which this node does not model: it serves one database and \
              has no name for it. A session-identity unit, not this one.",

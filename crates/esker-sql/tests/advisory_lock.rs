@@ -16,19 +16,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[
-        // **`void` is the one thing left, and it is a type this node does not have.** Every
-        // advisory function that returns `void` on a real server answers an **empty string** here:
-        // the value prints the same, and `pg_advisory_unlock_all() IS NULL` is `f` on both, which
-        // a NULL would have got wrong. What still differs is the name of the type, and closing it
-        // means a `ColumnType::Void` — a type-surface change, which is not this unit's to make.
-        (
-            "SELECT 'r', pg_typeof(pg_advisory_unlock_all())::text",
-            "`text`, because this node has no `void` type. The function runs and releases the \
-             locks — the two lines around this one measure that — and only the type name differs.",
-            "UNMEASURED",
-        ),
-    ],
+    answers: &[],
 };
 
 #[test]

@@ -24,16 +24,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     answers: &[
         (
             "SELECT 'r', a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1nl'::regclass AND a.attnum > 6 ORDER BY a.attnum",
-            "**Three of this row's 32 columns differ, and none of the three is about the form a \
-         constant prints in** — the forms all agree now. What differs is which *node* the tree \
-         holds:\n\
-         \n\
-         `c_i2_lit` — `i2 > 1` is `(i2 > 1)` there and `(i2 > (1)::smallint)` here, because \
-         `exec::query::retype` narrows a comparison's literal to the column's type while \
-         PostgreSQL picks an `int24` operator and leaves the literal an `integer`. The values \
-         compare identically; only the printed text sees it. Narrowing is right for an assignment \
-         and this is a comparison, which is the sentence `retype`'s own `numeric` arm already \
-         carries — extending it to every width is its own unit, and it is b4's literal ladder.\n\
+            "**Two of this row's 32 columns differ, and neither is about the form a constant \
+         prints in** — the forms all agree. What differs is which *node* the tree holds. \
+         `c_i2_lit` was the third and is gone: `retype` no longer narrows a comparison's literal \
+         to the column's type, which is `debts-v1.1.md` #23 and the sentence that arm's `numeric` \
+         case already carried.\n\
          \n\
          `c_i8_cast` — `i8 > 1::bigint` is `(i8 > (1)::bigint)` there and `(i8 > 1)` here: the \
          written cast is folded into the constant and then normalised to `Literal::Integer`, \
@@ -139,4 +134,55 @@ fn the_form_is_a_property_of_the_node() {
     );
     assert_eq!(printed(&mut node, "f"), "'-1'::integer");
     assert_eq!(printed(&mut node, "g"), "'9223372036854775807'::bigint");
+}
+
+/// **A comparison's literal keeps its own type**, which is `debts-v1.1.md` #23.
+///
+/// PostgreSQL picks an operator — `int24gt` for `i2 > 1` — and leaves the constant an `integer`;
+/// this node narrowed it to the column's type, so the tree held a `smallint` node and the printed
+/// text said so. The **values** compared identically either way, which is why the only place it
+/// showed is a deparse, and why `retype`'s own `numeric` arm already carried the sentence for it:
+/// narrowing is what an *assignment* does, and `22003` is the right answer to an `INSERT` and the
+/// wrong one to a `WHERE`.
+///
+/// `int4` and `int8` were already right and are asserted with it: their narrowing is a no-op
+/// because the datum stays an `i64` whatever width the literal is *declared* (ADR 0087), so
+/// `smallint` was the only width where the rule was visible — and a fix that only looked at
+/// `smallint` would be a fix to the symptom.
+#[test]
+fn a_comparisons_literal_keeps_its_own_type() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE c23 (id int8 PRIMARY KEY, i2 smallint, i4 integer, i8 bigint)",
+        "ALTER TABLE c23 ADD COLUMN c_i2 boolean GENERATED ALWAYS AS (i2 > 1) STORED",
+        "ALTER TABLE c23 ADD COLUMN c_i4 boolean GENERATED ALWAYS AS (i4 > 1) STORED",
+        "ALTER TABLE c23 ADD COLUMN c_i8 boolean GENERATED ALWAYS AS (i8 > 1) STORED",
+        // Wider than the column, which is the case that was a **wrong refusal** — `22003 integer
+        // out of range` — until the batch that measured this corpus.
+        "ALTER TABLE c23 ADD COLUMN c_i2w boolean GENERATED ALWAYS AS (i2 > 100000) STORED",
+    ]);
+    assert_eq!(
+        node.rows(
+            "SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a \
+             JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+             WHERE a.attrelid = 'c23'::regclass AND a.attnum > 4 ORDER BY a.attnum"
+        ),
+        vec![
+            vec!["c_i2", "(i2 > 1)"],
+            vec!["c_i4", "(i4 > 1)"],
+            vec!["c_i8", "(i8 > 1)"],
+            vec!["c_i2w", "(i2 > 100000)"],
+        ]
+    );
+    // **The values are what the narrowing was for**, so they are asserted beside the text: a
+    // `smallint` compared against a literal too wide for it answers rather than raising, and the
+    // one that fits answers the same as it always did.
+    node.run("INSERT INTO c23 VALUES (1, 5, 5, 5)").unwrap();
+    assert_eq!(
+        node.rows("SELECT i2 > 1, i2 > 100000, i2 < 100000, i2 = 5 FROM c23"),
+        vec![vec!["t", "f", "t", "t"]]
+    );
+    assert_eq!(
+        node.rows("SELECT c_i2, c_i4, c_i8, c_i2w FROM c23"),
+        vec![vec!["t", "t", "t", "f"]]
+    );
 }

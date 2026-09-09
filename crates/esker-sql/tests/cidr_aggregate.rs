@@ -29,51 +29,11 @@ mod parity;
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // `pg_typeof` answers a `regtype` on a real server and `text` here (ADR 0077); every row
-    // agrees.
-    types: &[
-        "SELECT pg_typeof(min(c::inet)) FROM (VALUES ('127.0.0.1')) s(c)",
-        "SELECT pg_typeof('127.0.0.0/24'::cidr), pg_typeof('127.0.0.1'::inet)",
-        "SELECT '127.0.0.0/24'::cidr::inet, pg_typeof('127.0.0.0/24'::cidr::inet)",
-        "SELECT pg_typeof(array_agg(c::cidr)) FROM (VALUES ('127.0.0.0/24')) s(c)",
-        "SELECT pg_typeof(greatest('10.0.0.0/8'::cidr, '127.0.0.0/24'::cidr))",
-    ],
-    answers: &[
-        // **One fact, five times, and it is not about `cidr`.** `pg_typeof` reads the *datum*, and
-        // a `cidr` and an `inet` are one `Datum::Inet` told apart by a flag — so where the type is
-        // carried by the *expression* rather than by the value, this function cannot see it. The
-        // `RowDescription` for every one of these is PostgreSQL's, which is what a client reads and
-        // what the tests below assert. The same seam ADR 0086 and ADR 0089 named; closing it means
-        // resolving `pg_typeof` against the declared type at plan time, its own unit, and it would
-        // take ADR 0077's `regtype`/`text` half with it.
-        (
-            "SELECT pg_typeof(min(c::cidr)) FROM (VALUES ('127.0.0.0/24')) s(c)",
-            "`pg_typeof` reads the datum, which the aggregate hands back as the `cidr` it was \
-             given; the column is declared `inet`, which is what a client is told.",
-            "pg19_cidr_aggregate.txt:36",
-        ),
-        (
-            "SELECT pg_typeof(max(c::cidr)) FROM (VALUES ('127.0.0.0/24')) s(c)",
-            "The same, through `max`.",
-            "pg19_cidr_aggregate.txt:37",
-        ),
-        (
-            "SELECT pg_typeof(min(c::cidr)) FROM (SELECT '127.0.0.0/24'::cidr AS c) s",
-            "The same, over a column rather than a cast in the target list.",
-            "pg19_cidr_aggregate.txt:51",
-        ),
-        (
-            "SELECT pg_typeof(coalesce('10.0.0.0/8'::cidr, '127.0.0.1'::inet))",
-            "The same, through `COALESCE`: the datum is the first branch's `cidr` and the column \
-             is declared `inet`.",
-            "pg19_cidr_aggregate.txt:48",
-        ),
-        (
-            "SELECT pg_typeof(CASE WHEN true THEN '10.0.0.0/8'::cidr ELSE '127.0.0.1'::inet END)",
-            "The same, through `CASE`.",
-            "pg19_cidr_aggregate.txt:49",
-        ),
-    ],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
+    answers: &[],
 };
 
 #[test]

@@ -14,23 +14,11 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **One entry, and there were thirteen.** Every one of the other twelve said that a bare
-    // integer constant was an `int8` here where a real server's is an `int4`, so a
-    // `generate_series` or an `unnest` over one declared `bigint`; the literal ladder's `int4` rung
-    // (ADR 0087) closed all of them. What is left is `pg_typeof`, which answers a `regtype` there
-    // and `text` here (ADR 0077), with the row identical.
-    types: &["SELECT 'r', pg_typeof(unnest(ARRAY['a','b']::text[]))"],
-    answers: &[
-        // `generate_series` takes its arguments' type and this node's integer constants are `int8`
-        // where a real server's are `int4` — the standing constant-width divergence, showing
-        // through the one function that reports a type as a value. The three rows and their values
-        // are identical; `pg_typeof` itself also answers `text` here rather than `regtype`.
-        (
-            "SELECT 'r', pg_typeof(generate_series(1, 3))",
-            "a bare integer constant is int8 here and int4 there, and pg_typeof answers text",
-            "UNMEASURED",
-        ),
-    ],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
+    answers: &[],
 };
 
 #[test]

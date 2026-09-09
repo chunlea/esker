@@ -10,13 +10,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    types: &[
-        // **Moved here from `answers` by parity rule 4**: the rows agree, and what still
-        // differs is one of the standing declared-type families listed on
-        // `parity::Divergences::types`. The reason each one used to carry described an answer
-        // that had stopped differing.
-        "SELECT pg_typeof(random()), pg_typeof(concat('a','b')), pg_typeof(convert_to('A','UTF8')), pg_typeof(CURRENT_DATE)",
-    ],
+    types: &[],
     answers: &[
         (
             "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON \

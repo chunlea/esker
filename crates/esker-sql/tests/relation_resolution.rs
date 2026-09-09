@@ -30,8 +30,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE \
          a.attrelid = 'pg_stat_activity'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER \
          BY a.attnum",
-        "SELECT 'r', pg_typeof(pid), pg_typeof(datname), pg_typeof(state), pg_typeof(query) FROM \
-         pg_stat_activity LIMIT 1",
         "SELECT 'r', relkind, relname FROM pg_class WHERE relname IN \
          ('pg_type','pg_range','pg_class') ORDER BY relname",
         "SELECT 'r', relkind FROM pg_class WHERE relname = 'pg_stat_activity'",
@@ -42,12 +40,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `current_schemas` answers an array on a real server and this node prints the `{a,b}`
         // literal it renders as. The rows are byte-identical, which is what a client reads.
     ],
-    answers: &[
-        (
-            "SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+    answers: &[(
+        "SELECT 'r', a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
              WHERE a.attrelid = 'pg_stat_activity'::regclass AND a.attnum > 0 AND NOT \
              a.attisdropped ORDER BY a.attnum",
-            "**A catalog view's columns are not in `pg_attribute` here**, and that is true of all \
+        "**A catalog view's columns are not in `pg_attribute` here**, and that is true of all \
              twenty-nine of them rather than of this one: `pg_attribute`'s rows are built from the \
              column lists of the *records* a `CREATE TABLE` wrote, and a catalog view has no \
              record. The view itself answers `SELECT *` with all twenty-two columns in a real \
@@ -55,18 +52,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              description of the catalog. Closing it would not close this row: five of the \
              twenty-two type names are types this node does not have (`name`, `inet`, `xid` \
              twice), so the answer would still differ, in five cells instead of all of them.",
-            "pg19_relation_resolution.txt:54",
-        ),
-        (
-            "SELECT 'r', pg_typeof(pid), pg_typeof(datname), pg_typeof(state), pg_typeof(query) \
-             FROM pg_stat_activity LIMIT 1",
-            "The same fact as the `types` entry above, in the *rows* rather than the header: \
-             `datname` is a `name` there and a `text` here, and `pg_typeof` reports what the \
-             column is. The other three agree, which is what says the divergence is the one string \
-             type and not the view.",
-            "pg19_relation_resolution.txt:57",
-        ),
-    ],
+        "pg19_relation_resolution.txt:54",
+    )],
 };
 
 #[test]

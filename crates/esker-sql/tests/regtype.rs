@@ -31,11 +31,6 @@ const FLOAT_PRECISION: &str = "**A precision on `float` selects the type**: `flo
      one), so the whole spelling is `42704`. The only typmod in PostgreSQL that changes which \
      type you get, and it needs the float pair to be modelled as one type to close.";
 
-/// `pg_typeof` is not implemented for any type.
-const PG_TYPEOF: &str = "`pg_typeof` is not implemented at all, so this is `0A000` naming the \
-     function rather than a wrong type — the honest answer under contract C2. Several of these \
-     lines would *prove* the `regtype`-is-`text` divergence above if the function existed.";
-
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[
@@ -52,7 +47,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT 23::regtype, 1043::regtype",
         "SELECT 1007::regtype, 1009::regtype",
         "SELECT 999999::regtype",
-        "SELECT pg_typeof('integer'::regtype), pg_typeof('integer'::regtype::oid)",
         "SELECT oid, typname, typlen, typcategory FROM pg_type WHERE typname IN ('date','time','numeric','uuid','json','jsonb','interval') ORDER BY oid",
         // A real server's `regtype` is a type of its own — four bytes holding an OID that print as
         // the type's name. This node has no `regtype`, so `'x'::regtype` answers the **name**, as
@@ -118,17 +112,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT 'float(54)'::regtype::oid",
             FLOAT_PRECISION,
             "pg19_regtype.txt:77",
-        ),
-        (
-            "SELECT pg_typeof(NULL::float), pg_typeof(NULL::float(24)), pg_typeof(NULL::float(25))",
-            FLOAT_PRECISION,
-            "pg19_regtype.txt:78",
-        ),
-        (
-            "SELECT 'decimal'::regtype::oid, pg_typeof(NULL::decimal), \
-             pg_typeof(NULL::decimal(10,2))",
-            PG_TYPEOF,
-            "pg19_regtype.txt:79",
         ),
         (
             "SELECT 'time without time zone'::regtype::oid, 'timetz'::regtype::oid, \

@@ -16,7 +16,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // `parity::Divergences::types`. The reason each one used to carry described an answer
         // that had stopped differing.
         "SELECT oid, typname, typlen, typinput, typelem, typcategory FROM pg_type WHERE typname = 'date'",
-        "SELECT pg_typeof('2020-01-01'::date)",
     ],
     // Nineteen, and **every one is a refusal or a feature this node does not have** — not one is a
     // value where PostgreSQL answers something else. Every `date` this node stores, orders,

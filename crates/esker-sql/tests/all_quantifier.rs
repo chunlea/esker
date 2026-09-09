@@ -23,11 +23,10 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // **The standing `regtype`-is-`text` trade**, and the row underneath it agrees: `pg_typeof` of
-    // a quantified comparison is `boolean` on both servers, declared `regtype` there and `text`
-    // here ([ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
-    // Listed for its *type* rather than as an answer, which is parity rule 4's whole subject.
-    types: &["SELECT 'r', pg_typeof(1 = ALL (ARRAY[1]))"],
+    // **`pg_typeof` answers a `regtype` on both now** (ADR 0093): it is resolved at plan
+    // time from the argument's declared type, so what this list recorded has no difference
+    // left in it.
+    types: &[],
     answers: &[(
         "SELECT 'r', 1 = ALL (ARRAY[ARRAY[1,1], ARRAY[1,1]])",
         "**A multidimensional array, which this node's type surface does not have.** PostgreSQL's \
