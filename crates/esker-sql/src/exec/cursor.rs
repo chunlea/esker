@@ -1080,7 +1080,13 @@ fn fold(
             for key in &spec.order_by {
                 sort_key.push(evaluate_in(&key.expr, &row, env)?);
             }
-            accumulator.push(&value, sort_key)?;
+            // `string_agg`'s delimiter, read from the same row as its value — see
+            // `plan::AggregateFunc::StringAgg` for why it is not folded once.
+            let delimiter = match &spec.delimiter {
+                None => None,
+                Some(expr) => Some(evaluate_in(expr, &row, env)?),
+            };
+            accumulator.push(&value, sort_key, delimiter.as_ref())?;
         }
     }
 

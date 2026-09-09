@@ -812,6 +812,12 @@ pub struct AggregateSpec {
     pub distinct: bool,
     /// The argument's type — what decides the accumulator. `None` for `count(*)`.
     pub arg_type: Option<ColumnType>,
+    /// `string_agg`'s **second** argument, resolved against the same input row as the first.
+    ///
+    /// `None` for every other aggregate. It is a per-row expression rather than a constant folded
+    /// once because PostgreSQL's transition function reads it with each value — see
+    /// [`AggregateFunc::StringAgg`].
+    pub delimiter: Option<Expr>,
     /// `ORDER BY` **inside the parentheses**: `array_agg(x ORDER BY y DESC)`.
     ///
     /// Not the query's `ORDER BY` and not `SortKey`'s usual home — this one sorts the values *of

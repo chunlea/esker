@@ -159,6 +159,21 @@ impl Aggregation {
             // an `int4` is an `integer[]`. This node has four array types (ADR 0047), so an
             // aggregate over any other element has no type to name and keeps `text` — the value is
             // the same array either way, and only the declared type differs.
+            // **`string_agg` answers what it was given**, and it has exactly two overloads:
+            // `string_agg(text, text)` is a `text` and `string_agg(bytea, bytea)` a `bytea` —
+            // `pg_proc` holds those two rows and nothing else, so a `real` first argument is
+            // `42883 function string_agg(real, unknown) does not exist` rather than a coercion.
+            // `varchar`, `name` and `"char"` reach the `text` one the way they reach `min`'s.
+            AggregateFunc::StringAgg => match arg {
+                ColumnType::Text
+                | ColumnType::Varchar
+                | ColumnType::Name
+                | ColumnType::Char
+                | ColumnType::Bpchar
+                | ColumnType::Citext => Ok(ColumnType::Text),
+                ColumnType::Bytea => Ok(ColumnType::Bytea),
+                _ => undefined(),
+            },
             AggregateFunc::ArrayAgg => {
                 Ok(esker_keys::array::ArrayValue::array_of(arg).unwrap_or(ColumnType::Text))
             }
@@ -175,6 +190,14 @@ impl Aggregation {
                 ColumnType::Int2 | ColumnType::Int4 => Ok(ColumnType::Int8),
                 ColumnType::Int8 | ColumnType::Numeric => Ok(ColumnType::Numeric),
                 ColumnType::Double => Ok(arg),
+                // **A `real` sums to a `real` and averages to a `double precision`**, which is
+                // the pair that says the result type is per (aggregate, type) rather than per
+                // type — the same sentence `min(time)` and `sum(time)` make three lines down.
+                // `pg_aggregate` says why: `sum(float4)`'s transition type is `float4`, so it
+                // accumulates and answers in single precision, while `avg(float4)`'s is
+                // `float8[]` — the sum and the count are widened before a single division.
+                // Measured, both, and this node refused the pair outright before.
+                ColumnType::Real => Ok(ColumnType::Real),
                 // **A `time` sums to an `interval`, and so does an `interval`.** Measured, and it
                 // is the pair that says the aggregate set is not per type but per (aggregate,
                 // type): `min(time)` is a `time` where `sum(time)` is an `interval`, because
@@ -233,6 +256,24 @@ impl Aggregation {
                 // exist`. Nothing about the ordering implies the aggregate; ADR 0031's rule, one
                 // type longer.
                 | ColumnType::Ltree
+                // **And `tsvector` and `tsquery`**, measured: `min(tsvector)` and `min(tsquery)`
+                // are each `42883 function min(<type>) does not exist`. This node *answered*
+                // them, which ADR 0031 ranks as the worst class — a wrong answer where a real
+                // server refuses — and it is the last pair r1's wire sweep found.
+                //
+                // **The list is a census now.** `pg_proc` holds twenty-five one-argument `min`s
+                // and they are the whole of it: `anyarray`, `anyenum`, `bigint`, `bytea`,
+                // `character`, `date`, `double precision`, `inet`, `integer`, `interval`,
+                // `money`, `numeric`, `oid`, `oid8`, `pg_lsn`, `real`, `record`, `smallint`,
+                // `text`, `tid`, `timestamp`, `timestamptz`, `time`, `timetz`, `xid8`. Every
+                // other type of this node's is refused above or decays into one of those
+                // (`varchar`, `name` and `"char"` into `text`, `cidr` into `inet`, the three
+                // `reg*` into `oid`), which is what makes this a list that can be checked rather
+                // than one that grows a type at a time. The three extension types this node has
+                // and the oracle does not — `citext`, `hstore`, `ltree`'s `lquery` — are the only
+                // members not settled by that query.
+                | ColumnType::TsVector
+                | ColumnType::TsQuery
                 // **And all seven geometric shapes**, measured one at a time:
                 // `min(point)`, `min(box)`, `min(lseg)`, `min(path)`, `max(polygon)`,
                 // `min(circle)` and `max(line)` are each `42883 function min(<type>) does not
@@ -296,7 +337,11 @@ impl Aggregation {
             // `numeric::div_scale`'s — sixteen *significant* digits, not sixteen fractional
             // ones, which is why `3/3` prints twenty places and `5/3` sixteen.
             AggregateFunc::Avg => match arg {
-                ColumnType::Double => Ok(ColumnType::Double),
+                // **And a `real` averages to a `double precision`**, where its sum stays a
+                // `real`: `avg(float4)` accumulates in `float8[]`, so the widening happens before
+                // the division rather than after it. Measured — `pg_typeof(avg(r))` is
+                // `double precision` and `pg_typeof(sum(r))` is `real` over the same column.
+                ColumnType::Double | ColumnType::Real => Ok(ColumnType::Double),
                 ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Numeric => {
                     Ok(ColumnType::Numeric)
                 }
@@ -386,7 +431,9 @@ impl Aggregation {
                 // Every one of the five takes exactly one argument, and PostgreSQL's refusal for
                 // any other arity names the **types** of what was written -- which is why the
                 // check is here, where they are known, rather than in the lowering.
-                if !call.star && call.args.len() != 1 {
+                if !call.star
+                    && call.args.len() != usize::from(call.func == AggregateFunc::StringAgg) + 1
+                {
                     let mut arguments = Vec::with_capacity(call.args.len());
                     for arg in &call.args {
                         let resolved = super::query::resolve(arg, scope)?;
@@ -988,8 +1035,18 @@ pub(super) struct Accumulator {
 enum State {
     /// `count(*)` and `count(col)`, which differ only in whether a NULL reaches here.
     Count(i64),
+    /// `string_agg`: every value with the separator that **precedes** it, folded at the end.
+    ///
+    /// Kept rather than folded for the same reason `array_agg` keeps its values — the `ORDER BY`
+    /// inside the parentheses is not known until the group is complete — and the delimiter travels
+    /// with the value because it is read per row.
+    Join(Vec<(Vec<Datum>, String, String)>),
     /// `sum(float8)`, and the running half of `avg(float8)`.
     SumFloat(Option<f64>),
+    /// `sum(float4)`, which accumulates in **single** precision because that is the transition
+    /// type a real server uses — so a long sum rounds where the `float8` one would not, and this
+    /// answers what that answers rather than something more accurate.
+    SumReal(Option<f32>),
     /// `min`/`max`, holding the best value seen.
     Extreme(Option<Datum>),
     /// `avg(float8)`: the sum, and how many values went into it.
@@ -1071,11 +1128,23 @@ fn resolve_aggregate(call: &AggregateCall, scope: &Scope<'_>) -> Result<Aggregat
     {
         return Err(SqlError::NoEqualityOperator(ty.name()));
     }
+    // **`string_agg`'s second argument is resolved like its first**, against the same input row:
+    // it is read per value rather than folded once, because that is what PostgreSQL's transition
+    // function does.
+    let delimiter = match call.func {
+        AggregateFunc::StringAgg => call
+            .args
+            .get(1)
+            .map(|arg| super::query::resolve(arg, scope))
+            .transpose()?,
+        _ => None,
+    };
     Ok(AggregateSpec {
         func: call.func,
         arg,
         distinct: call.distinct,
         arg_type,
+        delimiter,
         order_by: resolve_aggregate_order_by(call, scope)?,
     })
 }
@@ -1184,6 +1253,36 @@ fn exact_addend(value: &Datum) -> Result<esker_keys::numeric::Numeric> {
     })
 }
 
+/// One value into a `string_agg`'s state, with the separator that will **precede** it.
+///
+/// Its own function because [`Accumulator::push`] is a match over every state and this arm is the
+/// only one that reads a second argument; inlining it put that function over the size lint.
+///
+/// **A NULL delimiter is an empty separator, not a NULL answer** — measured,
+/// `string_agg(t, NULL)` over `a` and `b` is `ab`. The value is a `Datum::Text` or a
+/// `Datum::Bytea` and its *text* is what is joined, which for a `bytea` is the `\x…` form a real
+/// server joins too. The separator travels with the value rather than being kept once, because
+/// PostgreSQL's transition function reads the delimiter argument on every row.
+fn join_one(
+    values: &mut Vec<(Vec<Datum>, String, String)>,
+    value: &Datum,
+    sort_key: Vec<Datum>,
+    delimiter: Option<&Datum>,
+) -> Result<()> {
+    if values.len() == GROUP_LIMIT {
+        return Err(SqlError::ConfigurationLimitExceeded(format!(
+            "a string_agg over more than {GROUP_LIMIT} values needs more memory than this node \
+             will use; add a WHERE"
+        )));
+    }
+    let separator = match delimiter {
+        None | Some(Datum::Null) => String::new(),
+        Some(other) => other.to_text().unwrap_or_default(),
+    };
+    values.push((sort_key, separator, value.to_text().unwrap_or_default()));
+    Ok(())
+}
+
 impl Accumulator {
     /// A fresh accumulator for one group.
     pub(super) fn new(spec: &AggregateSpec) -> Self {
@@ -1208,8 +1307,10 @@ impl Accumulator {
                 Some(ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Numeric),
             ) => State::AvgNumeric { sum: None, seen: 0 },
             (AggregateFunc::Avg, _) => State::AvgFloat { sum: 0.0, seen: 0 },
+            (AggregateFunc::Sum, Some(ColumnType::Real)) => State::SumReal(None),
             (AggregateFunc::Sum, _) => State::SumFloat(None),
             (AggregateFunc::Min | AggregateFunc::Max, _) => State::Extreme(None),
+            (AggregateFunc::StringAgg, _) => State::Join(Vec::new()),
             (AggregateFunc::ArrayAgg, element) => State::Gather {
                 element,
                 values: Vec::new(),
@@ -1225,7 +1326,12 @@ impl Accumulator {
 
     /// Folds one value in. `Datum::Null` is the argument's value, not its absence: `count(*)`
     /// passes a non-NULL placeholder, so a NULL here always means the column was NULL.
-    pub(super) fn push(&mut self, value: &Datum, sort_key: Vec<Datum>) -> Result<()> {
+    pub(super) fn push(
+        &mut self,
+        value: &Datum,
+        sort_key: Vec<Datum>,
+        delimiter: Option<&Datum>,
+    ) -> Result<()> {
         // Every aggregate but `count(*)` skips NULLs, and `count(*)` never sees one — **except
         // `array_agg`, which collects them.** It is the one aggregate whose result has a place to
         // put a NULL, so dropping them would silently shorten the array: measured,
@@ -1306,11 +1412,21 @@ impl Accumulator {
                 *sum = Some(add_numeric(sum.as_ref(), &exact_addend(value)?));
                 *seen += 1;
             }
+            (State::SumReal(total), Datum::Real(value)) => {
+                *total = Some(total.unwrap_or(0.0) + value);
+            }
             (State::SumFloat(total), Datum::Double(value)) => {
                 *total = Some(total.unwrap_or(0.0) + value);
             }
             (State::AvgFloat { sum, seen }, Datum::Double(value)) => {
                 *sum += value;
+                *seen += 1;
+            }
+            // **A `real` averages in double precision**, which is not the width its *sum* uses:
+            // `avg(float4)`'s transition type is `float8[]` on a real server where `sum(float4)`'s
+            // is `float4`, so the widening happens before the division rather than after it.
+            (State::AvgFloat { sum, seen }, Datum::Real(value)) => {
+                *sum += f64::from(*value);
                 *seen += 1;
             }
             // **Every value kept, with the key it sorts under** — the fold happens at `finish`,
@@ -1323,6 +1439,7 @@ impl Accumulator {
                 }
                 values.push((sort_key, value.clone()));
             }
+            (State::Join(values), value) => join_one(values, value, sort_key, delimiter)?,
             (State::Extreme(best), value) => {
                 let replace = match best {
                     None => true,
@@ -1389,6 +1506,28 @@ impl Accumulator {
                 seen,
             } => crate::value::numeric::mean(sum, *seen).map_or(Datum::Null, Datum::Numeric),
             State::SumFloat(total) => total.map_or(Datum::Null, Datum::Double),
+            State::SumReal(total) => total.map_or(Datum::Null, Datum::Real),
+            // **Over no rows it is NULL, not the empty string** — the same answer `array_agg`
+            // gives, and the same reason: an empty string is a value and a group with no rows has
+            // none. Measured.
+            State::Join(values) if values.is_empty() => Datum::Null,
+            State::Join(values) => {
+                let mut values = values.clone();
+                values.sort_by(|(left, ..), (right, ..)| {
+                    super::cursor::compare_values(&self.order_by, left, right)
+                });
+                let mut joined = String::new();
+                for (at, (_, separator, text)) in values.iter().enumerate() {
+                    // **The first value carries no separator**, whatever its row's delimiter was:
+                    // the transition function only writes one when there is something to separate
+                    // from.
+                    if at > 0 {
+                        joined.push_str(separator);
+                    }
+                    joined.push_str(text);
+                }
+                Datum::Text(joined)
+            }
             // **A `reg*` extreme is an `oid`, value and all.** `result_type` above decays the
             // declared type, and the datum has to follow it or the wire says `oid` while the bytes
             // spell `int4in` — the "right bytes, wrong declared type" bug with its two halves

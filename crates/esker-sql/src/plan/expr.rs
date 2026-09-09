@@ -2030,6 +2030,17 @@ pub enum AggregateFunc {
     /// `ORDER BY` clause. Over **no rows it is NULL**, not an empty array, which is the answer
     /// that surprises: `array_agg(id) FROM t WHERE false` is NULL and `count(id)` is 0.
     ArrayAgg,
+    /// `string_agg(expr, delimiter [ORDER BY …])`: every value of the group, joined.
+    ///
+    /// The second aggregate here that takes **two** arguments' worth of input, and the only one
+    /// whose second is read per row: PostgreSQL's transition function takes the delimiter with
+    /// each value, so the separator between rows *i* and *i+1* is the delimiter row *i+1* carried.
+    /// Constant in every statement anybody writes, and not constant by rule.
+    ///
+    /// A **NULL delimiter is not a NULL answer** — it is an empty separator, measured:
+    /// `string_agg(t, NULL)` over `a` and `b` is `ab`. Over no rows the answer is NULL, as it is
+    /// for `array_agg` and for every fold but `count`.
+    StringAgg,
 }
 
 impl AggregateFunc {
@@ -2055,6 +2066,7 @@ impl AggregateFunc {
             "max" => Some(AggregateFunc::Max),
             "avg" => Some(AggregateFunc::Avg),
             "array_agg" => Some(AggregateFunc::ArrayAgg),
+            "string_agg" => Some(AggregateFunc::StringAgg),
             _ => None,
         }
     }
@@ -2069,6 +2081,7 @@ impl AggregateFunc {
             AggregateFunc::Max => "max",
             AggregateFunc::Avg => "avg",
             AggregateFunc::ArrayAgg => "array_agg",
+            AggregateFunc::StringAgg => "string_agg",
         }
     }
 }
