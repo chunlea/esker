@@ -1,0 +1,29 @@
+crates/esker-sql/src/parse/lower.rs
+  s_2d916f5f540186::t_fee2048359135d 6145-6146,6157-6161,7351-7356
+crates/esker-sql/src/plan/expr.rs
+  s_2d916f5f540186::t_58735993d95573 1963-1974,1988-1992
+crates/esker-sql/src/value/arith.rs
+  s_2d916f5f540186::t_1fbb3968584318 54-73,190-202,211-221,232-293,346-359,421-434,508-521
+crates/esker-sql/tests/bitwise.rs
+  s_2d916f5f540186::t_cf6cd5d9bfd814 1-228
+crates/esker-sql/tests/captures/pg19_bitwise.txt
+  s_2d916f5f540186::t_8b16096921d135 1-55
+crates/esker-sql/tests/corpus/pg19_bitwise.txt
+  s_2d916f5f540186::t_2525b1e5d5d364 1-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "b72d0073d61657b692797bc8e41dd283136f9765",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
