@@ -47,6 +47,29 @@ What is at stake is what a client asked for. `SELECT … FOR UPDATE` is how an a
 going to write this row after reading it, hold it for me". Two application servers behind two
 `esker-sql` nodes each get that promise and neither gets it.
 
+## The record this ADR joins
+
+Half of #4 was already worked, from the other end. `docs/plans/cross-node-deadlock.md` (`28ec2474`)
+argues by code read that a cross-node cycle **on the write path** cannot be built: a transaction's
+write buffer is a `BTreeMap`, its `primary()` is `self.buffer.keys().next()` — the smallest key it
+writes — and the secondaries follow sorted, so two transactions acquire in one total order; and
+`prewrite_or_roll_back` answers a definite failure with `undo`, so a prewriting transaction holds
+all its locks or none and is never in the "holds X, waits for Y" state a cycle needs.
+`crates/esker-client/tests/prewrite_ordering.rs` (`758e7223`) pins both halves, red-first, with the
+lock-resolution budget at zero so that "exactly one wins" is decided by the acquisition order rather
+than by a stopwatch.
+
+**That argument stands, and this measurement does not touch it** — they are different mechanisms.
+There, Percolator's lock, taken at commit, on keys the transaction *writes*. Here, the SQL row lock,
+taken at `SELECT … FOR UPDATE`, on a row the transaction has only *read*. Read together they say the
+same thing twice: on the write path there is no cycle because acquisition is ordered, and on the
+row-lock path there is no cycle because there is no lock.
+
+Which is why the register's row is aimed one problem too far along. **`debts-v1.1.md` #4 — "large —
+needs a PD-held graph", owner PD / pdha — is a sizing of option (b)**, the one this ADR recommends
+against. If (a') is ruled, the row belongs to whoever owns the lock, and the graph PD would have
+held has nothing to hold.
+
 ## Options
 
 ### (a) The lock goes to the store
