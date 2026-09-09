@@ -2069,7 +2069,7 @@ fn pg_depend_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
 ///
 /// `(castsource, casttarget, castcontext, castmethod)`. `castcontext` is `e` explicit, `a`
 /// assignment, `i` implicit; `castmethod` is `f` a function, `b` binary-coercible, `i` I/O.
-pub const CASTS: [(i64, i64, &str, &str); 109] = [
+pub const CASTS: [(i64, i64, &str, &str); 111] = [
     // **`regclass`'s nine rows, measured** rather than reasoned: `SELECT castsource, casttarget,
     // castcontext, castmethod FROM pg_cast WHERE castsource = 2205 OR casttarget = 2205`. Six
     // types reach a `regclass` implicitly and three leave it — `regclass -> bigint` and
@@ -2156,6 +2156,15 @@ pub const CASTS: [(i64, i64, &str, &str); 109] = [
     (1043, 1042, "i", "b"),
     (1043, 1043, "i", "f"),
     (1082, 1114, "i", "f"),
+    // **The network pair, measured both ways round and asymmetric**:
+    // `SELECT castsource, casttarget, castcontext, castmethod FROM pg_cast WHERE castsource IN
+    // (650,869) OR casttarget IN (650,869)`. `cidr -> inet` is **implicit** and by *binary
+    // coercion*, `inet -> cidr` is only an **assignment** — which is what makes `inet` the type a
+    // `COALESCE` of the two settles on, and the reason `min(cidr)` is an `inet` rather than the
+    // other way round. Their four casts to the string types are already licensed by
+    // `casts_to`'s I/O rule and are not rows here.
+    (650, 869, "i", "b"),
+    (869, 650, "a", "f"),
     (1082, 1184, "i", "f"),
     (1083, 1083, "i", "f"),
     (1083, 1186, "i", "f"),

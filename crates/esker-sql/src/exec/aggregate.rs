@@ -246,7 +246,13 @@ impl Aggregation {
                 | ColumnType::Path
                 | ColumnType::Polygon
                 | ColumnType::Circle
-                | ColumnType::Line => undefined(),
+                | ColumnType::Line
+                // **And a `macaddr`**, which is the one in this family reasoning gets wrong:
+                // `ORDER BY` over one works on both servers and `min(macaddr)` is still
+                // `42883 function min(macaddr) does not exist`. Not derivable from its two
+                // neighbours either — a `cidr` decays and an `inet` keeps itself, three rules for
+                // three types (`tests/captures/pg19_cidr_aggregate.txt`).
+                | ColumnType::MacAddr => undefined(),
                 // Measured: `min(varchar)` and `max(varchar)` come back as **`text`** on a real
                 // server, and `min(character(n))` comes back as **`bpchar`**. The string family
                 // does not decay uniformly — `bpchar` has a `min` of its own where `varchar`
@@ -259,6 +265,13 @@ impl Aggregation {
                 // this one drops it, because a real server has no `min(name)` and coerces the
                 // argument (`tests/captures/pg19_name_array.txt`).
                 ColumnType::Varchar | ColumnType::Name => Ok(ColumnType::Text),
+                // **A `cidr` decays to `inet`, which is the same rule one category along.**
+                // `inet` is the preferred type of the network category the way `text` is of the
+                // string one, and a real server has no `min(cidr)` to keep the type with —
+                // measured, `pg_typeof(min(c::cidr))` is `inet` there. The **value** is unchanged,
+                // mask included: a `cidr` through `inet`'s output function is the same characters,
+                // which is what makes this a declared type rather than an answer.
+                ColumnType::Cidr => Ok(ColumnType::Inet),
                 _ => Ok(arg),
             },
             // **Every integer width averages to `numeric`**, and so does a `numeric`. The
