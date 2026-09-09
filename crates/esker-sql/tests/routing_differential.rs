@@ -1570,3 +1570,138 @@ async fn where_a_bulk_load_into_a_splitting_table_breaks() {
     });
     gate.stop().await;
 }
+
+/// **How long a split child has no leader, and what that costs a writer.**
+///
+/// `Store::adopt_split` starts the child with `start_peer` and `spawn_ticker` and **nothing else** —
+/// no campaign, no leader inherited from the parent. So every child on every store begins as a
+/// follower and waits out an election timeout before anyone campaigns, and a write that lands in
+/// that window is answered `40003` when a proposal was already in flight, or waits.
+///
+/// This samples every two milliseconds while a loader splits the table under itself, and records
+/// for each region the interval between **first seeing it** and **first seeing a leader for it**.
+/// The number is a lower bound on the real window: the sampler learns of the child after the split
+/// has applied, so the leaderless time before that is invisible here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "an investigation: samples leadership while a table splits"]
+async fn how_long_a_split_child_has_no_leader() {
+    let gate = Gate::start_splitting(8 * 1024).await;
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, pad text)",
+        );
+    });
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let refusals = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let loader = {
+        let backend = Arc::clone(&gate.backend);
+        let catalog = Arc::clone(&gate.catalog);
+        let stop = Arc::clone(&stop);
+        let refusals = Arc::clone(&refusals);
+        std::thread::Builder::new()
+            .name("splitting-loader".to_owned())
+            .spawn(move || {
+                let mut session = Session {
+                    executor: Executor::new(
+                        backend,
+                        catalog,
+                        TENANT,
+                        esker_sql::session::register(),
+                    ),
+                };
+                let mut id = 1_i64;
+                while !stop.load(Ordering::Relaxed) && id < 4_000 {
+                    let values: Vec<String> = (id..id + 50)
+                        .map(|n| format!("({n}, 'pad-{n}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')"))
+                        .collect();
+                    if let Err(error) =
+                        session.run(&format!("INSERT INTO t VALUES {}", values.join(", ")))
+                    {
+                        let said = format!("[{}] {error}", error.sqlstate());
+                        if let Ok(mut seen) = refusals.lock() {
+                            seen.push(said);
+                        }
+                    }
+                    id += 50;
+                }
+                id
+            })
+            .unwrap()
+    };
+
+    // The sampler: every region's first sighting, and its first sighting with a leader.
+    let mut first_seen: std::collections::BTreeMap<u64, Instant> =
+        std::collections::BTreeMap::new();
+    // **Measured once each.** Without this a region whose leader is already known is put back by
+    // the next sample's `or_insert` and measured again at zero — which is how the first two runs
+    // reported six and seven hundred thousand children on a cluster of a hundred, a number absurd
+    // enough to be caught and exactly the shape of a measurement that measures nothing.
+    let mut done: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut led_after: Vec<f64> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < deadline && !loader.is_finished() {
+        // **The stores, not PD.** A child appears in its store's own map the instant `adopt_split`
+        // runs; PD learns of it at the next region heartbeat — 20 ms here — by which time the
+        // election is over. Sampling PD reported every one of 130 children as led at zero
+        // milliseconds, which is not the window being small, it is the window being invisible.
+        {
+            let now = Instant::now();
+            let records: Vec<esker_proto::RegionStatus> = gate
+                .nodes
+                .iter()
+                .flat_map(|node| node.store.region_statuses())
+                .collect();
+            for record in records {
+                let id = record.region.id;
+                if done.contains(&id) {
+                    continue;
+                }
+                first_seen.entry(id).or_insert(now);
+                if record.leader_peer_id != 0
+                    && let Some(seen) = first_seen.remove(&id)
+                {
+                    led_after.push(now.duration_since(seen).as_secs_f64() * 1000.0);
+                    done.insert(id);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    stop.store(true, Ordering::Relaxed);
+    let rows = loader.join().unwrap();
+
+    let refusals = refusals.lock().map(|seen| seen.clone()).unwrap_or_default();
+    report(rows, gate.regions(), &mut led_after, &refusals);
+    gate.stop().await;
+}
+
+/// The distribution and the refusals, lifted out of the test that takes them.
+fn report(rows: i64, regions: usize, led_after: &mut [f64], refusals: &[String]) {
+    led_after.sort_by(f64::total_cmp);
+    println!("\n  {rows} rows loaded, {regions} regions");
+    println!(
+        "  {} children measured from first sighting to first leader",
+        led_after.len()
+    );
+    if !led_after.is_empty() {
+        let at = |num: usize, den: usize| led_after[(led_after.len() - 1) * num / den];
+        println!(
+            "  min {:.0} ms   median {:.0} ms   p90 {:.0} ms   max {:.0} ms",
+            led_after[0],
+            at(1, 2),
+            at(9, 10),
+            led_after[led_after.len() - 1]
+        );
+    }
+    println!("  {} refusals while loading", refusals.len());
+    let mut kinds: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for said in refusals {
+        *kinds.entry(&said[..7.min(said.len())]).or_default() += 1;
+    }
+    for (code, count) in kinds {
+        println!("    {code} x{count}");
+    }
+}
