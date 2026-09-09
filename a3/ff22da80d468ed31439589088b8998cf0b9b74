@@ -1,0 +1,21 @@
+docs/DESIGN.md
+  s_2bed4ac2b1c944::t_a12754b9aa4f6a 380-384,430-434,1038-1055,1167-1171
+docs/plans/phase-9-rails.md
+  s_2bed4ac2b1c944::t_1b5b8d5f99f729 1278-1279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "a3ff22da80d468ed31439589088b8998cf0b9b74",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
