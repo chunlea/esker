@@ -4204,10 +4204,10 @@ fn described(columns: &[query::OutputColumn]) -> Vec<FieldDescription> {
 fn void_value() -> crate::plan::Expr {
     use crate::plan::{Expr, Literal};
     Expr::Cast {
-        operand: Box::new(Expr::Literal(Literal::Typed(Box::new(
-            crate::value::Datum::Text(String::new()),
-        )))),
-        to: crate::value::ColumnType::Void,
+        operand: Box::new(Expr::Literal(Literal::Typed(Box::new(Datum::Text(
+            String::new(),
+        ))))),
+        to: ColumnType::Void,
         typmod: crate::value::NO_TYPMOD,
     }
 }

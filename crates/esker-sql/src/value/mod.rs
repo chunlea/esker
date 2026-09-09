@@ -1822,9 +1822,6 @@ impl PgType for ColumnType {
 
     fn type_len(self) -> i16 {
         match self {
-            // **4, and positive**, which is what a real server reports for a pseudo-type whose
-            // value is nothing — measured beside `typtype = 'p'`.
-            ColumnType::Void => 4,
             ColumnType::Bool => 1,
             // **64 and positive**, where every other string type answers -1: `name` is fixed
             // width. A client reads this from the `RowDescription` and from `pg_attribute.attlen`.
@@ -1837,7 +1834,10 @@ impl PgType for ColumnType {
             // Four on the wire as well: what a client reads is the oid's width, and the name is
             // the output function's business.
             | ColumnType::RegType
-            | ColumnType::RegClass => 4,
+            | ColumnType::RegClass
+            // **And a `void`, positive and four**, which reasoning would make -1 or 0 for a value
+            // that is nothing — measured beside its `typtype = 'p'`.
+            | ColumnType::Void => 4,
             ColumnType::Int2 => 2,
             // Sixteen fixed bytes, which is what `pg_type.typlen` says.
             // Sixteen fixed bytes each: a uuid is one value, an interval is three fields.
