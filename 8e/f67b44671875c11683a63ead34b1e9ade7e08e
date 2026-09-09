@@ -1,0 +1,43 @@
+crates/esker-sql/src/exec/query.rs
+  s_e5c0c6e78b5662::t_58863988241be6 3193-3201,3897-3899,3916-3920,4768-4770
+crates/esker-sql/tests/bitwise.rs
+  s_e5c0c6e78b5662::t_a405a2adce5a3c 70-74,178-183,188
+crates/esker-sql/tests/coalesce.rs
+  s_e5c0c6e78b5662::t_9f7ffec6933e66 22-28
+crates/esker-sql/tests/decimal_literal.rs
+  s_e5c0c6e78b5662::t_c7f95a34d76f72 1-245
+crates/esker-sql/tests/numeric.rs
+  s_e5c0c6e78b5662::t_439c672473a67b 28-33
+crates/esker-sql/tests/values_relation.rs
+  s_e5c0c6e78b5662::t_81fb468b325029 25-27
+crates/esker-sql/src/exec/assign.rs
+  s_e5c0c6e78b5662::t_2de402d2cf47df 227-228,230-234
+crates/esker-sql/src/exec/cursor.rs
+  s_e5c0c6e78b5662::t_3d542ce8ccebcf 2416-2419
+crates/esker-sql/tests/captures/pg19_decimal_literal.txt
+  s_e5c0c6e78b5662::t_e2e7d32b50402f 1-105
+crates/esker-sql/tests/corpus/pg19_decimal_literal.txt
+  s_e5c0c6e78b5662::t_0527fa6ddfa46b 1-44
+crates/esker-sql/tests/provenance_budget.rs
+  s_e5c0c6e78b5662::t_5022b7c6e4bd31 30-33
+docs/adr/0088-a-decimal-literal-is-a-numeric.md
+  s_e5c0c6e78b5662::t_98abeb0b76f3c3 1-71
+docs/plans/phase-9-rails.md
+  s_e5c0c6e78b5662::t_57f4fb67820c3e 1277
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "8ef67b44671875c11683a63ead34b1e9ade7e08e",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
