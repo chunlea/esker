@@ -211,36 +211,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         if !self.startup().await? {
             return Ok(());
         }
-        // **After the startup packet, because the database it names is what decides the tenant.**
-        // A name the directory does not have is `3D000` here and the connection ends, which is
-        // what tells `rake db:create` it has work to do.
-        // The identity announced at startup, not a fresh one: `BackendKeyData` already told the
-        // client this pid and key.
-        let identity = self
-            .backend
-            .clone()
-            .unwrap_or_else(crate::session::register);
-        // **Onto a blocking thread, and this is the second time this class of bug has been found
-        // in this file.** `for_session` looks like bookkeeping and is not: against a real cluster
-        // it begins a transaction and reads the catalog, which goes `StoreTxn` -> `Router` ->
-        // `TcpStores` -> `BlockingTransport::call` -> `Runtime::block_on`, and building a runtime
-        // inside `#[tokio::main]`'s panics with "Cannot start a runtime from within a runtime".
-        // Every connection completed its startup burst and then died, on every real cluster, from
-        // 0510b44e (the startup packet selects the database) onwards — v1.0.0 included.
-        //
-        // The statement path sixty lines below has been on the blocking pool since it was written,
-        // with a comment saying why; session *creation* was not, and no test started a real node
-        // from a shell until the mpp lane did.
-        let database = self.database.clone();
-        let made = tokio::task::spawn_blocking(move || executors.for_session(&database, identity))
-            .await
-            .map_err(std::io::Error::other)?;
-        let executor = match made {
-            Ok(executor) => executor,
-            Err(error) => {
-                self.send_error(&error).await?;
-                return Ok(());
-            }
+        let Some(executor) = self.open_session(executors).await? else {
+            return Ok(());
         };
         let mut work = Work {
             session: Session::new(),
@@ -477,10 +449,76 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             key: backend.key,
         }
         .encode(&mut self.out);
-        Message::ReadyForQuery(TransactionStatus::Idle).encode(&mut self.out);
+        // **`ReadyForQuery` is not sent here**, and that is the whole of `test_bad_connection`.
+        // It is the message that tells a client its connection is established: libpq's `PQconnect`
+        // returns when it arrives, and an error after it is an error on a *live* connection —
+        // which the client meets later, as `PQconsumeInput() FATAL: …`, from wherever it happens
+        // to be reading. `ActiveRecord`'s `new_client` rescues `PG::Error` **from the connect**
+        // and reads the database name out of the message; an error that arrives afterwards never
+        // reaches it and becomes a `ConnectionNotEstablished` from somewhere else entirely.
+        //
+        // So readiness waits until the session exists, which is where the database this packet
+        // named is resolved (`Connection::run`). A real server validates it earlier still, before
+        // authentication; here it needs the executor, and anywhere before `ReadyForQuery` is
+        // early enough for every client.
         self.stream.write_all(&self.out).await?;
         self.stream.flush().await?;
         Ok(true)
+    }
+
+    /// The session this connection runs as, or `None` when the client has been told why not.
+    ///
+    /// **After the startup packet, because the database it names is what decides the tenant.** A
+    /// name the directory does not have is `3D000` here and the connection ends, which is what
+    /// tells `rake db:create` it has work to do — and it is answered **before readiness**, so it
+    /// is a connection that never opened rather than one that opened and died. `ActiveRecord`'s
+    /// `NoDatabaseError` and `rake db:create` both look at the connect.
+    ///
+    /// **Onto a blocking thread, and this is the second time this class of bug has been found in
+    /// this file.** `for_session` looks like bookkeeping and is not: against a real cluster it
+    /// begins a transaction and reads the catalog, which goes `StoreTxn` -> `Router` ->
+    /// `TcpStores` -> `BlockingTransport::call` -> `Runtime::block_on`, and building a runtime
+    /// inside `#[tokio::main]`'s panics with "Cannot start a runtime from within a runtime". Every
+    /// connection completed its startup burst and then died, on every real cluster, from 0510b44e
+    /// (the startup packet selects the database) onwards — v1.0.0 included.
+    ///
+    /// The statement path has been on the blocking pool since it was written, with a comment
+    /// saying why; session *creation* was not, and no test started a real node from a shell until
+    /// the mpp lane did.
+    async fn open_session(
+        &mut self,
+        executors: Arc<dyn Executors>,
+    ) -> std::io::Result<Option<Box<dyn Execute + Send>>> {
+        // The identity announced at startup, not a fresh one: `BackendKeyData` already told the
+        // client this pid and key.
+        let identity = self
+            .backend
+            .clone()
+            .unwrap_or_else(crate::session::register);
+        let database = self.database.clone();
+        let made = tokio::task::spawn_blocking(move || executors.for_session(&database, identity))
+            .await
+            .map_err(std::io::Error::other)?;
+        match made {
+            Ok(executor) => {
+                self.announce_ready().await?;
+                Ok(Some(executor))
+            }
+            Err(error) => {
+                self.send_error(&error).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Tells the client its connection is established.
+    ///
+    /// Sent once the session exists, never before: see the note at the end of `complete_startup`.
+    async fn announce_ready(&mut self) -> std::io::Result<()> {
+        self.out.clear();
+        Message::ReadyForQuery(TransactionStatus::Idle).encode(&mut self.out);
+        self.stream.write_all(&self.out).await?;
+        self.stream.flush().await
     }
 
     /// Returns false when authentication failed and the connection should close.

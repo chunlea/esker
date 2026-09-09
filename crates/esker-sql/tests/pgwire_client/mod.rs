@@ -20,6 +20,9 @@ pub struct Answer {
     pub tags: String,
     pub rows: Vec<Vec<String>>,
     pub sqlstate: Option<String>,
+    /// The `M` field of that same response — what a client shows, and what `ActiveRecord`'s
+    /// `new_client` searches for the database name in.
+    pub error: Option<String>,
 }
 
 /// A client that speaks just enough of the protocol: startup, `Query`, and reading to readiness.
@@ -27,9 +30,25 @@ pub struct Client(tokio::net::TcpStream);
 
 impl Client {
     pub async fn connect(address: std::net::SocketAddr) -> Self {
+        Client::connect_to(address, "esker")
+            .await
+            .expect("the default database is there")
+    }
+
+    /// The same, naming the database — and reporting a startup that **failed**.
+    ///
+    /// `Err` is an `ErrorResponse` that arrived before `ReadyForQuery`, which is the difference
+    /// between a connection that never opened and one that opened and then died: libpq's
+    /// `PQconnect` returns when `ReadyForQuery` arrives, so anything after it is an error on a
+    /// live connection and reaches the client from wherever it is reading.
+    ///
+    /// # Errors
+    ///
+    /// The message of that `ErrorResponse`.
+    pub async fn connect_to(address: std::net::SocketAddr, database: &str) -> Result<Self, String> {
         let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
         let mut body = 0x0003_0000u32.to_be_bytes().to_vec();
-        for (name, value) in [("user", "esker"), ("database", "esker")] {
+        for (name, value) in [("user", "esker"), ("database", database)] {
             body.extend_from_slice(name.as_bytes());
             body.push(0);
             body.extend_from_slice(value.as_bytes());
@@ -43,8 +62,11 @@ impl Client {
         packet.extend_from_slice(&body);
         socket.write_all(&packet).await.unwrap();
         let mut client = Client(socket);
-        client.read_until_ready().await;
-        client
+        let answer = client.read_until_ready().await;
+        match answer.error {
+            Some(message) => Err(message),
+            None => Ok(client),
+        }
     }
 
     pub async fn query(&mut self, sql: &str) -> Answer {
@@ -119,9 +141,16 @@ impl Client {
                 b'D' => answer.rows.push(data_row(&body)),
                 b'E' => {
                     for field in body.split(|byte| *byte == 0) {
-                        if field.first() == Some(&b'C') {
-                            answer.sqlstate =
-                                Some(String::from_utf8_lossy(&field[1..]).into_owned());
+                        match field.first() {
+                            Some(&b'C') => {
+                                answer.sqlstate =
+                                    Some(String::from_utf8_lossy(&field[1..]).into_owned());
+                            }
+                            Some(&b'M') => {
+                                answer.error =
+                                    Some(String::from_utf8_lossy(&field[1..]).into_owned());
+                            }
+                            _ => {}
                         }
                     }
                 }
