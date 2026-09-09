@@ -106,37 +106,54 @@ fn a_type_dependent_volatility_is_refused_conservatively() {
     );
 }
 
-/// **A function this node does not have is refused for the wrong reason inside an index**, and
-/// this is where that is written down.
+/// **A function this node does not have is now named in an index too**, which it was not.
 ///
-/// The same name, one statement apart, gets two different answers from this node:
+/// This test used to be called `an_unknown_function_in_an_index_blames_volatility` and asserted
+/// the mislabelling, with the reasoning for leaving it. The reasoning is kept because it is the
+/// thing worth reading:
 ///
-/// ```text
-/// SELECT no_such_fn(data) FROM ex           0A000 the function no_such_fn is not supported
-/// CREATE INDEX … ((no_such_fn(data)))       42P17 functions in index expression must be marked IMMUTABLE
-/// ```
+/// > Lowering carries an unresolved name as `CatalogFunc::UserFunc` on purpose, so the *executor*
+/// > can look it up in the catalog and give the honest message; `refuse_unless_immutable` runs
+/// > earlier, in `index_expression`, which has a `TableDef` and no catalog. Telling "absent" from
+/// > "present and volatile" there needs the catalog at that layer — a seam change, not a
+/// > one-liner.
 ///
-/// PostgreSQL says `function no_such_fn(text) does not exist` — measured. The second answer blames
-/// volatility for a function that is simply absent, which is what `mod` did until this unit
-/// implemented it, and it is how the census found `mod` at all: the headline error named the wrong
-/// cause.
+/// **What changed is that the distinction turned out not to be needed.** The two cases a
+/// `UserFunc` can be — a name nobody declared, and a user function the catalog does hold — get the
+/// *same* answer from this node, because it cannot evaluate a user function in a stored expression
+/// either way (`docs/plans/phase-9-rails.md`'s `my_uuid_generator` row). So the guard can name the
+/// function without knowing which case it is, and the message the query path already gives is the
+/// one it gives now. `docs/plans/debts-v1.1.md` #26 is the row, and it was found by a corpus about
+/// *collations*: `md5('a')` in a generated column answered `42P17` where a real server answers the
+/// value, and the reason a reader was handed named the wrong thing.
 ///
-/// **Why it is recorded rather than fixed here.** Lowering carries an unresolved name as
-/// `CatalogFunc::UserFunc` on purpose, so the *executor* can look it up in the catalog and give
-/// the honest message; `refuse_unless_immutable` runs earlier, in `index_expression`, which has a
-/// `TableDef` and no catalog. Telling "absent" from "present and volatile" there needs the catalog
-/// at that layer — a seam change, not a one-liner, and the corpus has no case that reaches it now
-/// that `mod` works.
+/// **The guard still blames volatility where volatility is the reason** — the assertion above this
+/// one, `date_trunc('day', remind_at)`, is a function this node *has* and PostgreSQL calls
+/// `STABLE`, and it is still `42P17`. That pair is the point: one refusal per cause.
+///
+/// Still open, and not this unit's: a user function declared `IMMUTABLE` should eventually be
+/// **accepted** here rather than refused, by inlining it the way a query does. A refusal that
+/// names the function is a smaller thing to change later than one that names the wrong cause.
 #[test]
-fn an_unknown_function_in_an_index_blames_volatility() {
+fn an_unknown_function_in_an_index_is_named_rather_than_blamed() {
     let mut node = parity::Node::new(FIXTURE);
+    let expected = "!0A000 the function no_such_fn is not supported";
     assert_eq!(
         node.answer("SELECT no_such_fn(data) FROM ex").to_string(),
-        "!0A000 the function no_such_fn is not supported"
+        expected
     );
     assert_eq!(
         node.answer("CREATE INDEX i_nf ON ex ((no_such_fn(data)))")
             .to_string(),
-        "!42P17 functions in index expression must be marked IMMUTABLE"
+        expected,
+        "the same name, one statement apart, now gets one answer"
+    );
+    // And a generated column, which is where the corpus found it.
+    assert_eq!(
+        node.answer(
+            "ALTER TABLE ex ADD COLUMN nf text GENERATED ALWAYS AS (no_such_fn(data)) STORED"
+        )
+        .to_string(),
+        expected
     );
 }
