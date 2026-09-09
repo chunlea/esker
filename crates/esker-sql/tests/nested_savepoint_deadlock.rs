@@ -28,7 +28,7 @@ use std::time::Duration;
 #[path = "parity_harness/mod.rs"]
 mod parity;
 
-use parity::Pair;
+use parity::{Pair, edge, reached};
 
 /// Both sides arrive before either goes on, which is `Concurrent::CyclicBarrier.new(2)`.
 fn meet(mine: &Sender<&'static str>, theirs: &Receiver<&'static str>, what: &'static str) {
@@ -118,4 +118,94 @@ fn run_half(
     .expect("the recovered block must be able to write");
     node.run("COMMIT").expect("and to commit");
     victim
+}
+
+/// **The block's own rows survive the deadlock its savepoint died of.**
+///
+/// A savepoint is a subtransaction, and a `40P01` inside one kills the subtransaction. The rows the
+/// outer block locked *before* the mark are the rows it is going to write after the `rescue`, so
+/// giving them back is ending the transaction without saying so — another session can take one,
+/// write it, and commit under a block that is still open and still going to write it.
+///
+/// The Rails test above cannot see this: every lock it takes is inside the savepoint, where
+/// "release everything" and "release the savepoint's own" are the same act. This is the sequence
+/// that separates them, and the victim is not a coin toss — the transaction that closes the cycle
+/// is the one that is told, so B asking last makes B the victim every time.
+#[test]
+fn the_rows_a_block_held_before_its_savepoint_are_still_its_own() {
+    let pair = Pair::new(&[
+        "CREATE TABLE lk (id bigint primary key, n bigint)",
+        "INSERT INTO lk VALUES (0, 0), (1, 1), (2, 2)",
+    ]);
+    let (a_says, hears_a) = channel();
+    let (b_says, hears_b) = channel();
+    let sessions = pair.sessions();
+
+    // A is the survivor: it holds row 1 and then waits for row 2, which B is holding.
+    let survivor = std::thread::spawn(move || {
+        let mut a = sessions.session();
+        a.run("BEGIN").unwrap();
+        a.run("SET lock_timeout = '20s'").unwrap();
+        a.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE").unwrap();
+        reached(&a_says, "A holds row 1");
+        edge(&hears_b, "B holds rows 0 and 2");
+        // Blocks behind B's savepoint lock, which is the edge that makes B's next ask a cycle.
+        let _ = a.run("SELECT n FROM lk WHERE id = 2 FOR UPDATE");
+        a.run("ROLLBACK").unwrap();
+    });
+
+    let mut b = pair.session();
+    b.run("BEGIN").unwrap();
+    b.run("SET lock_timeout = '20s'").unwrap();
+    // **Before the savepoint**, which is the whole point: this is the outer block's row.
+    b.run("SELECT n FROM lk WHERE id = 0 FOR UPDATE").unwrap();
+    b.run("SAVEPOINT sp").unwrap();
+    b.run("SELECT n FROM lk WHERE id = 2 FOR UPDATE").unwrap();
+    reached(&b_says, "B holds rows 0 and 2");
+    edge(&hears_a, "A holds row 1");
+
+    // A is *waiting*, not merely started — a third session reading `pg_locks` is the only way to
+    // know that, and waiting is what makes the next statement close a cycle rather than block.
+    let mut watcher = pair.session();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline
+        && watcher
+            .rows("SELECT pid FROM pg_locks WHERE granted = false")
+            .is_empty()
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // **An `UPDATE` and not a `SELECT … FOR UPDATE`, and the difference is the whole test.** There
+    // are two places a `40P01` is raised: the row-locking clause raises it on the spot, holding
+    // everything until the client's `ROLLBACK TO` gives the savepoint's locks back, and the write
+    // path raises it from inside the wait loop, which gives them back at once so the survivor stops
+    // waiting. Only the second releases anything, so only the second can release too much — and it
+    // is the one Rails reaches, through `s2.update value: 4`.
+    let deadlocked = b
+        .run("UPDATE lk SET n = 4 WHERE id = 1")
+        .expect_err("the session that closes the cycle is the one told about it");
+    assert_eq!(deadlocked.to_string(), "deadlock detected");
+    b.run("ROLLBACK TO SAVEPOINT sp").unwrap();
+
+    // The assertion the gap was hiding: row 0 is still B's, and B's block is still open.
+    let refused = watcher
+        .run("SELECT n FROM lk WHERE id = 0 FOR UPDATE NOWAIT")
+        .expect_err("row 0 was locked before the savepoint, so the deadlock did not free it");
+    assert_eq!(
+        refused.to_string(),
+        "could not obtain lock on row in relation \"lk\"",
+        "another session must not be able to take a row this block still holds"
+    );
+
+    // And the block goes on to do exactly what the lock was for.
+    b.run("UPDATE lk SET n = 10 WHERE id = 0").unwrap();
+    b.run("COMMIT").unwrap();
+    survivor.join().unwrap();
+
+    let mut after = pair.session();
+    assert_eq!(
+        after.rows("SELECT n FROM lk WHERE id = 0"),
+        vec![vec!["10".to_string()]]
+    );
 }
