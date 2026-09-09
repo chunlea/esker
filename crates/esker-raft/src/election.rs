@@ -86,8 +86,10 @@ impl<S: LogStorage> Raft<S> {
         // it must not panic trying (`CLAUDE.md` invariant 9).
         let vote_term = self.term.saturating_add(1);
         if pre_vote {
+            self.counters.campaigns_pre += 1;
             self.become_pre_candidate();
         } else {
+            self.counters.campaigns_real += 1;
             self.become_candidate();
         }
 
@@ -107,6 +109,7 @@ impl<S: LogStorage> Raft<S> {
             if peer == self.id {
                 continue;
             }
+            self.counters.vote_requests_sent += 1;
             self.send(Message::RequestVote {
                 from: self.id,
                 to: peer,
@@ -248,6 +251,10 @@ impl<S: LogStorage> Raft<S> {
             self.vote = Some(from);
             self.election_elapsed = 0;
         }
+        self.counters.vote_responses_sent += 1;
+        if granted {
+            self.counters.vote_responses_granted += 1;
+        }
         self.send(Message::RequestVoteResponse {
             from: self.id,
             to: from,
@@ -279,9 +286,13 @@ impl<S: LogStorage> Raft<S> {
         let expected = match self.role {
             Role::PreCandidate => true,
             Role::Candidate => false,
-            Role::Follower | Role::Leader => return Ok(()),
+            Role::Follower | Role::Leader => {
+                self.counters.vote_responses_ignored += 1;
+                return Ok(());
+            }
         };
         if pre_vote != expected {
+            self.counters.vote_responses_ignored += 1;
             return Ok(());
         }
         match self.poll(from, granted) {
