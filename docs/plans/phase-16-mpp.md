@@ -360,6 +360,18 @@ would be an argument for instrumenting it too.
 > verdict" is now a list of two rather than three. **Re-measuring on the multi-region cluster is
 > the next thing this file owes**, and until that is done the numbers below are single-region and
 > say so.
+>
+> **Amended 2026-09-08.** The *row* path across a multi-region table is now proved end to end on a
+> real cluster (`crates/esker-sql/tests/multi_region_rows.rs`, and
+> `docs/plans/split-region.md` §11 for what it does and does not cover): scans, point reads, ranges,
+> a secondary index, aggregates, a cross-region transaction, and the client's cache refresh on
+> `EpochNotMatch`. **This changes nothing about the verdict below**, which is about the columnar
+> arm and its economics — item 3's `regions × groups` is still four orders of magnitude away, and
+> item 4's parallel dispatch is still unwritten. What it does change is that the row half of the
+> cluster this file would re-measure on is now known to be correct rather than assumed: a
+> re-measure that produced a wrong answer can no longer be blamed on the row path. It also found
+> and fixed a client defect that would have made any such re-measure impossible — a transaction
+> across a boundary could not commit at all.
 
 **Not yet — and not because the finish is cheap, though it is. Because there is nothing to shuffle.**
 

@@ -200,11 +200,33 @@ message that carries the test:
 `a_lock_is_not_a_regions_size` is the exception and says so in its own doc comment: it passed
 before the fix, because everything reported zero.
 
-## 11. What this does not cover
+## 11. What this covers, and what it still does not
 
-The store now splits a region of transactional rows, and every assertion above is at that layer.
-What no test here exercises is a **SQL query against a table that spans several regions** — the
-client's region-cache refresh on `EpochNotMatch`, `esker-sql`'s scan across two regions, and the
-one-columnar-fragment-per-region path of [ADR 0040](../adr/0040-the-engine-a-query-runs-on.md).
-Those are the consequence this unblocks, and re-measuring them is `docs/plans/phase-16-mpp.md`
-§10's own list, starting with its item 3.
+The store splits a region of transactional rows, and every assertion in §5 is at that layer. The
+consequence — **a SQL query against a table that spans several regions** — was named here as
+uncovered and is now covered by `crates/esker-sql/tests/multi_region_rows.rs`, on a real cluster:
+real `esker-pd`, real stores splitting on their own measurement, and the client routed through
+`PdConn`, the resolver the binary builds. Nothing there places a boundary; the store chooses where.
+
+**Proved.** Nine faces. Seven are compared byte-for-byte against a control cluster that *cannot*
+split (`region_split_size: u64::MAX`) carrying the same DDL and the same rows: a full ordered scan,
+`count(*)`, a point read at each end of the key space, a range with `ORDER BY` and `LIMIT` across
+boundaries, a secondary-index scan whose index range spans regions, and a `GROUP BY` with `count`
+and `sum`. The eighth is the client's refresh: a node whose region cache was built before a second
+node grew the table past another split still reads every id exactly once. The ninth is a
+transaction — a write set spread across every region commits whole, and one that rolls back leaves
+every region as it was.
+
+**What it found.** The first cross-boundary transaction could not commit at all:
+`TxnClient::grouped` cut the write set by the region cache and the router retried *the group it was
+given*, so a group that spanned a boundary could never succeed however often it was retried. The
+fix re-cuts a refused group against the cache the refusal repaired.
+
+**Still not covered**, and each is a face rather than a layer:
+
+* a split that happens **while a scan is running**, rather than between statements;
+* the one-columnar-fragment-per-region path of
+  [ADR 0040](../adr/0040-the-engine-a-query-runs-on.md), which is the columnar arm and belongs to
+  `docs/plans/phase-16-mpp.md` §10 item 3;
+* replication: `multi_region_rows.rs` runs one store, because what it is about is routing across a
+  boundary and a second copy of every region proves that no better.
