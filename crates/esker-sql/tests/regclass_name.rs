@@ -9,11 +9,14 @@ mod parity;
 const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
+/// **None.** The one that stood here said a `regclass` was `text` in this node — "an oid that
+/// prints as a name, and `text` here, which is what it prints as" — on the reasoning that
+/// `ActiveRecord` writes `::regclass::text` and never reads the bare form. It is 2205 since
+/// `regclass[]` arrived (`tests/reg_class.rs`): the inverse direction has to carry the oid beside
+/// the name for `array_agg` over one to be a `regclass[]`, and once it does, the declared type is
+/// a real server's. The `::text` after it is a cast now rather than the identity.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // One: a `regclass` on a real server is an **oid that prints as a name**, and `text` here,
-    // which is what it prints as. `ActiveRecord` writes `::regclass::text` and never reads the
-    // bare form, so the `::text` after it is the identity on what this already answers.
-    types: &["SELECT c.oid::regclass FROM pg_class c WHERE c.relname = 'rc'"],
+    types: &[],
     answers: &[],
 };
 
