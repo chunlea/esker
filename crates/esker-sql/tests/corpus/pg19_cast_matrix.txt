@@ -215,7 +215,7 @@ SAVEPOINT sp_text_name		-
 SELECT (c_text)::name FROM castprobe		42
 ROLLBACK TO sp_text_name		-
 SAVEPOINT sp_text_regclass		-
-SELECT (c_text)::regclass FROM castprobe	!relation "42" does not exist
+SELECT (c_text)::regclass FROM castprobe	!42P01 relation "42" does not exist
 ROLLBACK TO sp_text_regclass		-
 SAVEPOINT sp_text_varchar		-
 SELECT (c_text)::varchar FROM castprobe		42
@@ -272,7 +272,7 @@ SAVEPOINT sp_varchar_name		-
 SELECT (c_varchar)::name FROM castprobe		42
 ROLLBACK TO sp_varchar_name		-
 SAVEPOINT sp_varchar_regclass		-
-SELECT (c_varchar)::regclass FROM castprobe	!relation "42" does not exist
+SELECT (c_varchar)::regclass FROM castprobe	!42P01 relation "42" does not exist
 ROLLBACK TO sp_varchar_regclass		-
 SAVEPOINT sp_varchar_text		-
 SELECT (c_varchar)::text FROM castprobe		42
