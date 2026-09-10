@@ -2999,7 +2999,13 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             {
                 return Err(SqlError::UndefinedOperator {
                     left: ty.name().to_owned(),
-                    op: op.symbol(),
+                    // **`IS DISTINCT FROM` names `=`**, because `=` is the operator it is missing:
+                    // a real server says `operator does not exist: json = json` for it and not the
+                    // spelling the user wrote. `IS NOT DISTINCT FROM` the same. Measured.
+                    op: match op {
+                        BinaryOp::Distinct | BinaryOp::NotDistinct => BinaryOp::Eq.symbol(),
+                        other => other.symbol(),
+                    },
                     right: expr_type(&right, scope).unwrap_or(ty).name().to_owned(),
                 });
             }
