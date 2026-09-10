@@ -1,0 +1,21 @@
+crates/esker-sql/src/value/mod.rs
+  s_6f7019c05b578b::t_82e1f65f21d9af 902-945
+crates/esker-sql/tests/bind_infers_over_the_wire.rs
+  s_6f7019c05b578b::t_ac754dc11ff86f 160-246
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "ba1a5225b777383a8b4ceec978aa1fdd6e7f16ff",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
