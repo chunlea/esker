@@ -1,11 +1,46 @@
-# ADR 0102 — The catalog's read path (draft, no decision)
+# ADR 0102 — The catalog's read path
 
-Status: **proposed, with a measurement plan and its criteria fixed in advance** (2026-09-09) ·
-Number 0102 reserved by the coordinator. The instrument is built (`751e2299`); **nothing else is
-decided here**, and the criteria below are written before the numbers exist so that reading them
-cannot choose the answer — the same discipline that refuted
+Status: **answered — nothing is built** (2026-09-10). The measurement plan and its criteria were
+fixed in advance on 2026-09-09 so that reading the numbers could not choose the answer; the numbers
+came in on run 113 and criterion ④.1 is met with two orders of magnitude to spare. **Option (a) is
+not built** and stays here as a record of what was considered; `view_pinned`, which is a different
+thing and was already in the tree, stays. The same discipline refuted
 [ADR 0100](0100-a-region-between-leaders-waits-on-the-callers-deadline.md) and closed
-`docs/plans/debts-v1.1.md` #40.
+`docs/plans/debts-v1.1.md` #40 — and this is the first time it has closed a question by saying the
+thing is not worth doing.
+
+## The answer, and the numbers it rests on
+
+Measured by r1 from run 113's node log, on the **real topology**
+(`esker-rails-harness/results/run-113.md`, appendix):
+
+| | measured | what it decides |
+|---|---:|---|
+| catalog views | 48,084 | the denominator below |
+| statements | 4,249 | |
+| **views per statement** | **11.3** | how many times a statement asks |
+| mean per view | 197 µs | what one ask costs |
+| **catalog cost per statement** | **≈2.2 ms** | 11.3 × 197 µs |
+| measured latency per statement | 506 ms | the real topology's own number |
+| **catalog share of statement latency** | **≈0.4%** | ④.1's first bar is **2%** |
+| repeats a cache could remove | 83.9% | the most option (a) could ever take away |
+| **best case after (a)** | **0.34 percentage points** | what building it would buy |
+
+**The share is an over-estimate and the direction is known**: the view count and the latency come
+from windows that do not align, and the misalignment inflates the numerator. So 0.4% is a ceiling.
+
+**Criterion ④.1 has two halves and only one of them decides this.** The latency half is measured
+and is 0.4% against a 2% bar. The store-side half — the share of those reads that reach the store
+rather than a cache — is not separately reported in the appendix, and **the decision does not turn
+on it**: even if *every* catalog read reached the store, the whole of what options (a) and (b) can
+remove is 0.4% of a statement, and (a)'s own ceiling is 0.34 percentage points. The second number
+exists in ④.2 to choose *between* the shapes once the first bar is breached. It is not breached.
+
+**What that does not say.** It does not say the catalog is fast; it says it is not where a
+statement's half-second goes. The half-second itself is now `docs/plans/debts-v1.1.md` **#49**,
+which is a different question with a different instrument — and one this ADR's instrument cannot
+see, because the statements that take 0.5–0.8 s are slow *outside* the read path this file
+measures.
 
 ## Context — one region is on the path of every statement, and that is the key space, not a bug
 
@@ -295,9 +330,16 @@ looks like a fix, ships a smaller number, and leaves the question unanswered.
    never empty is a different system from a flat 200 µs, and the second is the one nothing needs to
    be done about.
 
-## Not decided here — and the number that would change that is now collectable
+## Decided: nothing is built, and the three shapes stay as a record
 
-This file exists so the choice is made against the same facts by whoever makes it, and so that the
-consequence recorded in #34 has somewhere to point. **It decides nothing**, and each of the three
-shapes above needs its own ADR when it is chosen — (a) in particular is two decisions wearing one
-name, since the lease is where its correctness lives.
+This file existed so the choice would be made against the same facts by whoever made it. The facts
+arrived on 2026-09-10 and the choice is **none of the three** — ④.1's first branch, verbatim: *the
+row is recorded as measured and not worth moving, and ADR 0102 closes as answered.*
+
+Each shape stays written down rather than deleted, because a rejected option that was costed is
+worth more than a blank page the next time the question is asked — and each would still need its
+own ADR if it were ever chosen, (a) in particular being two decisions wearing one name.
+
+**What would reopen this**: a statement mix whose catalog share rises above 2%, which means either
+many more views per statement or a much cheaper statement. Both are measurable with the instrument
+that is already built, and neither is a guess anybody has to make in advance.
