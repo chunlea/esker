@@ -899,6 +899,18 @@ fn walk_table_ref_mut(table: &mut crate::plan::TableRef, visit: &mut impl FnMut(
             }
         }
     }
+    // **And a set-returning function's arguments, which were the third thing in a `FROM` and were
+    // not walked.** Everything `Executor::bound` does runs through this walker — `::regclass`,
+    // `current_schema()`, a cast to a user type, a user function, and the parameter substitution
+    // itself — so all of them were blind to `FROM unnest(…)`'s argument. Measured:
+    // `SELECT u FROM unnest(ARRAY['t'::regclass]) u` was
+    // `XX000 internal error: regclass() reached the row evaluator unresolved`, where the same call
+    // one clause over answered, because the projection's copy *was* walked (wire v3 family F10).
+    if let Some(function) = &mut table.function {
+        for arg in &mut function.args {
+            walk_expr_mut(arg, visit);
+        }
+    }
 }
 
 /// The read-only twin of [`walk_select_mut`], and it has to agree with it clause for clause.
@@ -946,6 +958,13 @@ fn for_each_in_table_ref<'a>(table: &'a crate::plan::TableRef, each: &mut impl F
     }
     if let Some(derived) = &table.derived {
         for_each_in_select(&derived.select, each);
+    }
+    // **The third `FROM` shape, and the pair rule above is why it is here too**: this one sizes
+    // the parameter list and `walk_table_ref_mut` substitutes, so a clause in one and not the
+    // other is a parameter counted and never filled, or filled and never counted.
+    // `SELECT u FROM unnest(ARRAY[$1]) u` was in neither.
+    if let Some(function) = &table.function {
+        function.args.iter().for_each(&mut *each);
     }
 }
 

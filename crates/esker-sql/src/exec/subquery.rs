@@ -252,20 +252,58 @@ pub(super) fn table_function_def(
 
 /// The element type an `unnest`'s argument is over, for the column its relation reports.
 fn unnest_element(arg: Option<&Expr>, tables: &dyn Tables) -> Option<ColumnType> {
+    match arg? {
+        // **`ARRAY[…]` says its element outright — when it has been told.** Before resolution the
+        // field is often `None`, so the elements are asked instead: the first one that carries a
+        // type syntactically is the array's element, which is what `array_element_type` settles
+        // later against a scope this function does not have.
+        Expr::Array { element, elements } => {
+            let held = element.or_else(|| {
+                elements
+                    .iter()
+                    .find_map(|element| syntactic_type(element, tables))
+            })?;
+            // **An array of arrays is one array with another dimension**, so `unnest` of it
+            // yields the *element*, not the inner array: `unnest(ARRAY['{1}'::bit[]])` is a `bit`
+            // on 19beta1 and was a `bit[]` here. PostgreSQL has no nested array types, only more
+            // dimensions — the same fact `ARRAY[bigint[]]` being `bigint[]` records from the
+            // constructor's side.
+            Some(esker_keys::array::ArrayValue::element_of(held).unwrap_or(held))
+        }
+        other => esker_keys::array::ArrayValue::element_of(syntactic_type(other, tables)?),
+    }
+}
+
+/// The type an expression carries **without a scope** — a qualified column through the catalog, a
+/// folded literal through its value, a cast through its target.
+///
+/// [`table_function_def`] is what a scope is built *from*, so `expr_type` is not available to it,
+/// and these are the shapes that need no resolution to answer. Everything else is `None` and the
+/// caller falls back.
+///
+/// **The same call had two readers and they were two answers.**
+/// `SELECT u FROM unnest(ARRAY['2020-01-01'::date]) u` described `u` as `text` while
+/// `SELECT unnest(ARRAY['2020-01-01'::date])` — one clause over — described it as `date`: the
+/// projection asks `table_function::result_type`, which asks `expr_type` and is complete, and this
+/// read a qualified column and a folded literal and nothing else. Measured over the wire v3 probe
+/// list's 100 spellings, **50 of them** took `text` here
+/// (`tests/captures/pg19_array_of_void.txt`), and the first field of a `RowDescription` is what
+/// `ActiveRecord` decodes by (wire v3 family F10).
+fn syntactic_type(expr: &Expr, tables: &dyn Tables) -> Option<ColumnType> {
     use crate::plan::Literal;
-    let array = match arg? {
+    match expr {
         Expr::Column {
             table: Some(table),
             name,
         } => {
             let def = tables.get(table).ok()?;
             let at = def.column(name)?;
-            def.columns.get(at)?.ty
+            Some(def.columns.get(at)?.ty)
         }
-        Expr::Literal(Literal::Typed(value)) => value.column_type()?,
-        _ => return None,
-    };
-    esker_keys::array::ArrayValue::element_of(array)
+        Expr::Literal(Literal::Typed(value)) => value.column_type(),
+        Expr::Cast { to, .. } => Some(*to),
+        _ => None,
+    }
 }
 
 fn plan_table_function(entry: &mut crate::plan::TableRef) {
