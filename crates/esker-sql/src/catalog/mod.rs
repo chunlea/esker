@@ -2456,6 +2456,27 @@ impl Catalog {
         self.view_at(txn, tenant, false)
     }
 
+    /// The view a transaction has **already paid for**, at a version it read earlier.
+    ///
+    /// **Safe because a transaction's snapshot is fixed.** Every read in one transaction sees one
+    /// state of the store, so the two counters cannot move between two views of it and neither can
+    /// the layout marker — which makes reading them again per statement a cost and not a check.
+    /// Measured on the real topology (`docs/adr/0102-the-catalogs-read-path.md`): **232 µs a read**,
+    /// and 77% of the reads in a `run 112` calibration returned the version the one before them
+    /// had.
+    ///
+    /// The caller owns the pinning, because only it knows when the transaction ended or ran DDL:
+    /// see `Executor::catalog_view`.
+    #[must_use]
+    pub fn view_pinned<'a>(&'a self, txn: &'a dyn Txn, tenant: u64, version: u64) -> View<'a> {
+        View {
+            catalog: Some(self),
+            txn,
+            tenant,
+            version,
+        }
+    }
+
     fn view_at<'a>(&'a self, txn: &'a dyn Txn, tenant: u64, cached: bool) -> Result<View<'a>> {
         // **Two counters, and the sum is the version.** This tenant's own, which its DDL bumps,
         // and the cluster's, which role and database DDL bumps because those objects belong to no
@@ -4569,6 +4590,19 @@ fn stamp_layout(txn: &mut dyn Txn) -> Result<()> {
     Ok(())
 }
 
+/// How many catalog writes this process has made.
+///
+/// A pinned catalog version is only usable while this has not moved since it was taken — the whole
+/// of what makes `Catalog::view_pinned` safe against a statement that writes the catalog in the
+/// middle of itself.
+static PINS_STALE_AFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The generation a pinned catalog version has to still match to be usable.
+#[must_use]
+pub fn generation() -> u64 {
+    PINS_STALE_AFTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Moves the catalog version forward, which is what makes every node's cache notice.
 ///
 /// Every DDL statement writes **its tenant's** key, so two concurrent DDL statements *in one
@@ -4584,7 +4618,23 @@ fn stamp_layout(txn: &mut dyn Txn) -> Result<()> {
 ///
 /// Cluster-scoped objects — roles, databases — pass `record::CLUSTER_TENANT`, which every view
 /// reads beside its own.
+///
+/// Bumping it also invalidates every pinned catalog version in this process: see
+/// [`generation`] and `Executor::catalog_view`.
 pub fn bump_version(txn: &mut dyn Txn, tenant: u64) -> Result<()> {
+    // **Every pinned version in this process is now stale, and this is the only place that can
+    // say so.** `Executor::catalog_view` may answer a second view of one transaction from the
+    // version the first read — safe while the transaction's snapshot is fixed, and *not* safe
+    // across a write this transaction itself makes. A statement can make one without being a DDL
+    // statement: `SELECT esker_schema_step(…)` reads the catalog, writes it, and reads it again,
+    // and a pin taken before the write answered the read after it with the state before it
+    // (`XX000 … cannot go from write-only to absent in one step`, two tests, deterministic).
+    //
+    // A counter here rather than a flag on the transaction: `Txn` is a trait with wrappers —
+    // `savepoint::Recording` among them — and a defaulted method is a silent opt-out for every
+    // one of them. Bumping across sessions is over-invalidation, which costs a read and cannot be
+    // wrong.
+    PINS_STALE_AFTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     stamp_layout(txn)?;
     let key = record::version_key(tenant);
     let current = match txn.get(&key)? {
