@@ -1,0 +1,27 @@
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_97169aa6a9192d 6420-6482
+crates/esker-sql/tests/captures/pg19_deparse_census.txt
+  s_6f7019c05b578b::t_004dfe130ab77e 927-959
+crates/esker-sql/tests/column_names.rs
+  s_6f7019c05b578b::t_1e4a11f9c985f7 118-121,123-143
+crates/esker-sql/tests/corpus/pg19_deparse_census.txt
+  s_6f7019c05b578b::t_ebf20d8e0dc9ea 8-9,937-969
+crates/esker-sql/tests/deparse_census.rs
+  s_6f7019c05b578b::t_52881ef3218071 9-10,40,90,93-94,99,104,109,114,119,124,129,134,139,144,149,154,159,164,169,174,179,184,189,194,199,204,209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "313228107d41697aa0fe7af1789856193886f85b",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
