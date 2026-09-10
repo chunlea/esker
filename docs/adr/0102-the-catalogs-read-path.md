@@ -115,6 +115,25 @@ read needs the client's routing to report what it chose, which is a larger chang
 instrument. The fourth row above therefore needs a second instrument, and until it exists (c) is
 argued from the key space rather than measured.
 
+### ①b What the two runs actually measured, and on which topology
+
+| | run 111 (Rails suite) | run 112's calibration (two files) |
+|---|---|---|
+| backend | **`MemoryBackend`** — `esker-sql HOST:PORT` with no store addresses: an in-process `BTreeMap`, no store, no PD, no Raft, no socket | **the real topology**, node `534604a5` |
+| catalog views | 4,790,406 | 53,387 |
+| mean per read | **≤0.5 µs** — a table lookup | **232 µs** |
+| distribution | `<100us` 4,790,317 · `<1ms` 86 · `<10ms` 3 | `<100us` 903 · `<1ms` 52,183 |
+| repeats of the same version | not measured — the field was a constant then | **41,061, or 77%** |
+
+**Three things follow, and the third is the one that decides.** The read is **not free** once a
+store is under it. The distribution **moved as a whole** rather than growing a tail — 52,183 of
+53,387 land in the same bucket — so this is a cost, not a stall. And **three quarters of the reads
+return the version the read before them returned.**
+
+For scale beside it: the same calibration puts the real topology at about **110× the wall clock of
+the fake backend per file** (229 s against 2 s). The Raft round trip a statement makes is the bulk
+of that; a catalog read is one of its parts.
+
 ### ② Where the instrument lives
 
 `crates/esker-sql/src/catalog/stats.rs`, counting at `Catalog::view_at` — **the one place every
@@ -197,7 +216,30 @@ The shape of the unit, in the order this lane has learned to do them: **count th
 statement class first** — done, above — **then merge them**, **then count again**, so the change is
 reported as a difference and not as an intention.
 
-**And the middle step now waits on a number this ADR does not have.** Halving a read is worth
+**Done, and measured on both sides** (`crates/esker-sql/tests/catalog_reads.rs`, the same
+instrument):
+
+| statement | before | after |
+|---|---:|---:|
+| `CREATE TABLE` | 1 | 1 |
+| `INSERT`, one row | 2 | **1** |
+| `SELECT`, point | 2 | **1** |
+| `SELECT`, range | 2 | **1** |
+| `UPDATE` / `DELETE`, point | 2 | **1** |
+| `ALTER TABLE ADD COLUMN` | 3 | 3 |
+| `SELECT`, self join | 4 | **1** |
+| **the whole run** | **22** | **12** |
+
+**An ordinary statement now reads the catalog version once, and a self-join once instead of four
+times.** `ALTER TABLE` is unchanged and must be: a transaction that has written the catalog reads
+its own uncommitted DDL, so it takes an uncached view every time. At run 112's 232 µs a read that
+is about **232 µs saved per ordinary statement** and 700 µs on the self-join.
+
+**Why it is safe, in one sentence**: the version is a property of the transaction's snapshot, so it
+cannot move while the transaction lives — and the pin is dropped at every place `catalog_written`
+is set or cleared, which is every point a transaction begins, ends, or becomes a DDL one.
+
+**What the middle step waited on, and no longer does.** Halving a read is worth
 building when the read costs something; run 111's half-microsecond is a `MemoryBackend` table
 lookup and says nothing about a read that crosses a socket and Raft. Building the merge before that
 number exists would be the mistake

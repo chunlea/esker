@@ -202,6 +202,11 @@ pub struct Executor {
     /// rather than from the shared cache: they answer with its own uncommitted definitions, which
     /// must not reach the other sessions on this node (`crate::catalog`).
     catalog_written: bool,
+    /// The catalog version this transaction has already read, if it has read one.
+    ///
+    /// A `Cell` because `catalog_view` takes `&self` — it hands out a view that borrows the
+    /// transaction — and because an executor belongs to one session and one thread.
+    catalog_version: std::cell::Cell<Option<u64>>,
     /// The `CREATE INDEX CONCURRENTLY` this statement declared, to be driven **after** it commits.
     ///
     /// PostgreSQL answers a concurrent build when the build is done, and so does this node
@@ -818,6 +823,7 @@ impl Executor {
             last_sequence: None,
             savepoints: savepoint::Savepoints::default(),
             catalog_written: false,
+            catalog_version: std::cell::Cell::new(None),
             concurrent_build: None,
             read_as_of: None,
             open_used: false,
@@ -1017,6 +1023,7 @@ impl Executor {
 
         let mut txn = self.open_txn()?;
         self.catalog_written = false;
+        self.forget_the_catalog_version();
         txn.validate_reads(self.isolation() == crate::parameter::Isolation::Serializable);
         let bound = match self.bound(&*txn, statement, params) {
             Ok(bound) => bound,
@@ -1063,6 +1070,7 @@ impl Executor {
                     let _ = txn.rollback();
                     txn = self.open_txn()?;
                     self.catalog_written = false;
+                    self.forget_the_catalog_version();
                     // Declared by the attempt that is being thrown away, so the re-run declares
                     // it again — and a job whose declaration was rolled back must not be driven.
                     self.concurrent_build = None;
@@ -1083,6 +1091,7 @@ impl Executor {
             }
         };
         self.catalog_written = false;
+        self.forget_the_catalog_version();
         // A statement that did not commit changed nothing PD could act on, whether it was rolled
         // back or refused.
         self.columnar_changed = false;
@@ -1115,6 +1124,7 @@ impl Executor {
         // Before the statement rather than after it: a DDL statement that fails part-way has
         // still written, and the reads it makes on the way are its own uncommitted catalog.
         self.catalog_written |= statement.writes_catalog();
+        self.forget_the_catalog_version();
         match statement {
             // The `DO` block's whole effect: the message reaches the client at the severity that
             // was written, and the statement's tag is `DO`.
@@ -3858,12 +3868,36 @@ impl Executor {
         Ok(found)
     }
 
-    /// This transaction's view of the catalog, pinned to one version.
+    /// This transaction's view of the catalog, pinned to one version — and **read from the store
+    /// once per transaction rather than once per view**.
+    ///
+    /// The version is a property of the transaction's snapshot, so it cannot move while the
+    /// transaction lives: reading it again for the second and third view of one statement buys
+    /// nothing and costs a round trip. Measured on the real topology
+    /// ([ADR 0102](../../../docs/adr/0102-the-catalogs-read-path.md), run 112's calibration): a
+    /// catalog read is **232 µs**, an ordinary statement took **two** of them, and **77%** of all
+    /// reads returned the version the read before them had.
+    ///
+    /// **Two states are not pinned, and both are the same rule.** A transaction that has written
+    /// the catalog reads its own uncommitted DDL, so it takes an uncached view every time; and the
+    /// pin is dropped wherever `catalog_written` is set or cleared, which is every place a
+    /// transaction begins, ends or turns into a DDL one.
     fn catalog_view<'a>(&'a self, txn: &'a dyn Txn) -> Result<crate::catalog::View<'a>> {
         if self.catalog_written {
             return self.catalog.view_uncached(txn, self.tenant);
         }
-        self.catalog.view(txn, self.tenant)
+        if let Some(version) = self.catalog_version.get() {
+            return Ok(self.catalog.view_pinned(txn, self.tenant, version));
+        }
+        let view = self.catalog.view(txn, self.tenant)?;
+        self.catalog_version.set(Some(view.version()));
+        Ok(view)
+    }
+
+    /// Forgets the pinned catalog version, because the transaction it belonged to is over — or has
+    /// just written the catalog and can no longer be answered from a version it read before.
+    fn forget_the_catalog_version(&self) {
+        self.catalog_version.set(None);
     }
 
     /// A table by name, or `42P01`.
@@ -4457,6 +4491,7 @@ impl Execute for Executor {
         self.open_used = false;
         self.written = Written::default();
         self.catalog_written = false;
+        self.forget_the_catalog_version();
         Ok(())
     }
 
@@ -4548,6 +4583,7 @@ impl Execute for Executor {
         self.savepoints.clear();
         let written = std::mem::take(&mut self.written);
         self.catalog_written = false;
+        self.forget_the_catalog_version();
         self.end_of_block();
         let Some(txn) = self.open.take() else {
             self.columnar_changed = false;
@@ -4580,6 +4616,7 @@ impl Execute for Executor {
         self.savepoints.clear();
         self.written = Written::default();
         self.catalog_written = false;
+        self.forget_the_catalog_version();
         self.columnar_changed = false;
         self.end_of_block();
         let Some(txn) = self.open.take() else {

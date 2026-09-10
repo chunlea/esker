@@ -2456,6 +2456,27 @@ impl Catalog {
         self.view_at(txn, tenant, false)
     }
 
+    /// The view a transaction has **already paid for**, at a version it read earlier.
+    ///
+    /// **Safe because a transaction's snapshot is fixed.** Every read in one transaction sees one
+    /// state of the store, so the two counters cannot move between two views of it and neither can
+    /// the layout marker — which makes reading them again per statement a cost and not a check.
+    /// Measured on the real topology (`docs/adr/0102-the-catalogs-read-path.md`): **232 µs a read**,
+    /// and 77% of the reads in a `run 112` calibration returned the version the one before them
+    /// had.
+    ///
+    /// The caller owns the pinning, because only it knows when the transaction ended or ran DDL:
+    /// see `Executor::catalog_view`.
+    #[must_use]
+    pub fn view_pinned<'a>(&'a self, txn: &'a dyn Txn, tenant: u64, version: u64) -> View<'a> {
+        View {
+            catalog: Some(self),
+            txn,
+            tenant,
+            version,
+        }
+    }
+
     fn view_at<'a>(&'a self, txn: &'a dyn Txn, tenant: u64, cached: bool) -> Result<View<'a>> {
         // **Two counters, and the sum is the version.** This tenant's own, which its DDL bumps,
         // and the cluster's, which role and database DDL bumps because those objects belong to no
