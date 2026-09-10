@@ -1,0 +1,68 @@
+# The cast matrix's pairs written as **literals** — PostgreSQL 19beta1.
+#
+# The twin of `pg19_cast_matrix.txt`, which probes every pair with a column. Here the operand is a
+# constant, so the answer comes from `parse::lower`'s fold rather than from `exec::cursor`'s
+# `Expr::Cast` arm, and the two files together are what says a conversion cannot be right in one
+# caller and wrong in the other. Both have been, in both directions.
+#
+# Things reasoning would get wrong:
+#
+#   * **A float into an integer rounds half to EVEN and a `numeric` rounds half AWAY from zero.**
+#     `2.5::float8::int4` is 2 and `2.5::numeric::int4` is 3, in one statement each.
+#   * **A `"char"` is a signed byte.** `chr(200)::"char"::int4` is -61, not 195.
+#   * **`200::int4::"char"` is `22003`**, not the byte 200: only -128..127 is a `"char"`.
+#   * **A `bytea` and an integer are the same bytes, big-endian**, padded on the left with zeros
+#     to the *target's* width — so `'\xff'::bytea::int2` is 255 and `'\xffff'::bytea::int2` is -1,
+#     and one byte too many is `22003` rather than a truncation.
+#   * **`65::int4::bytea` is `\x00000041`**, the number's four bytes, not `\x3635` — which is what
+#     the ASCII of the digits `6` and `5` would give, and what a text round trip does give.
+BEGIN		-
+SAVEPOINT v1		-
+SELECT 'r', 1.5::float8::int4, 2.5::float8::int4, 0.5::float8::int4, (-1.5)::float8::int4, (-2.5)::float8::int4	text,integer,integer,integer,integer,integer	r|2|2|0|-2|-2
+ROLLBACK TO v1		-
+SAVEPOINT v2		-
+SELECT 'r', 1.5::float4::int2, 1.5::float8::int2, 1.5::float4::int8, 1.5::float8::int8	text,smallint,smallint,bigint,bigint	r|2|2|2|2
+ROLLBACK TO v2		-
+SAVEPOINT v3		-
+SELECT 'r', 2.5::numeric::int4, 2.5::float8::int4	text,integer,integer	r|3|2
+ROLLBACK TO v3		-
+SAVEPOINT v4		-
+SELECT 'r', true::int4, false::int4, 0::int4::bool, 1::int4::bool, 65::int4::bool	text,integer,integer,boolean,boolean,boolean	r|1|0|f|t|t
+ROLLBACK TO v4		-
+SAVEPOINT v5		-
+SELECT 'r', 'a'::"char"::int4, 'A'::"char"::int4, 65::int4::"char", (-1)::int4::"char"	text,integer,integer,"char","char"	r|97|65|A|\377
+ROLLBACK TO v5		-
+SAVEPOINT v6		-
+SELECT 'r', '\x4142'::bytea::int4, '\xff'::bytea::int2, '\xffff'::bytea::int2, ''::bytea::int4, '\xffffffff'::bytea::int4	text,integer,smallint,smallint,integer,integer	r|16706|255|-1|0|-1
+ROLLBACK TO v6		-
+SAVEPOINT v7		-
+SELECT 'r', 65::int2::bytea, 65::int4::bytea, 65::int8::bytea, (-1)::int4::bytea	text,bytea,bytea,bytea,bytea	r|\x0041|\x00000041|\x0000000000000041|\xffffffff
+ROLLBACK TO v7		-
+SAVEPOINT v8		-
+SELECT 'r', '00000000-0000-0000-0000-000000000001'::uuid::bytea	text,bytea	r|\x00000000000000000000000000000001
+ROLLBACK TO v8		-
+SAVEPOINT v9		-
+SELECT 'r', '\303'::"char"::int4	text,integer	r|-61
+ROLLBACK TO v9		-
+SAVEPOINT r1		-
+SELECT 'r', 1e20::float8::int4	!22003 integer out of range
+ROLLBACK TO r1		-
+SAVEPOINT r2		-
+SELECT 'r', 'NaN'::float8::int4	!22003 integer out of range
+ROLLBACK TO r2		-
+SAVEPOINT r3		-
+SELECT 'r', 'Infinity'::float8::int2	!22003 smallint out of range
+ROLLBACK TO r3		-
+SAVEPOINT r4		-
+SELECT 'r', 200::int4::"char"	!22003 "char" out of range
+ROLLBACK TO r4		-
+SAVEPOINT r5		-
+SELECT 'r', '\x4142434445'::bytea::int4	!22003 integer out of range
+ROLLBACK TO r5		-
+SAVEPOINT r6		-
+SELECT 'r', 2::int2::"char"	!42846 cannot cast type smallint to "char"
+ROLLBACK TO r6		-
+SAVEPOINT r7		-
+SELECT 'r', 2::int8::"char"	!42846 cannot cast type bigint to "char"
+ROLLBACK TO r7		-
+ROLLBACK		-

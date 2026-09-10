@@ -2432,16 +2432,6 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     crate::value::Rendering::default(),
                 )?
             }
-            // **A `numeric` to an integer rounds; it does not go through text.** `numeric`'s
-            // output function writes `2.5` and `int4in` refuses it, so the round trip made a
-            // conversion a real server performs into a `22P02`. It became reachable when a lossy
-            // cast started keeping its node and converting per row (`debts-v1.1.md` #30) — before
-            // that the fold did it at parse time and nothing asked the evaluator.
-            value @ Datum::Numeric(_)
-                if matches!(to, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8) =>
-            {
-                crate::value::assignment_cast(value, *to, crate::value::Rendering::default())?
-            }
             // **The fourteen geometric conversions are computed, not read back through the text.**
             // A `box` to a `circle` is the circumscribed one and a `polygon` to a `point` the mean
             // of its vertices; none of that is anywhere in the source's *output*, so the round
@@ -2457,6 +2447,17 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 crate::value::geometric_cast(&value, *to)?
             }
             value => {
+                // **Ask whether a real server would have rendered anything at all, first.**
+                // `pg_cast.castmethod` says: `i` is this arm's text round trip and `f` and `b` are
+                // conversions where the text is never written. Reading a `numeric`'s `2.5` with
+                // `int4in` was a `22P02` for a value a real server rounds to `2`; so were a
+                // float's `1.5`, a `bool`'s `t`, and a `bytea`'s hex — and `65::int4::bytea` did
+                // not refuse at all, it answered `\x3635`, the ASCII of the digits, where a real
+                // server gives the number's four bytes. `crate::value::convert_without_text` holds
+                // the pairs and `tests/cast_matrix.rs` holds the ones still missing from it.
+                if let Some(converted) = crate::value::convert_without_text(&value, *to) {
+                    return converted;
+                }
                 // **The session's output function, not the boot one.** A cast between two types
                 // here is a text round trip, so the text it goes through has to be the text the
                 // session would see: under `SET TimeZone = 'Pacific/Auckland'`,

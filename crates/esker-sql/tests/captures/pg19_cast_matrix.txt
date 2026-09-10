@@ -245,7 +245,7 @@ SAVEPOINT sp_timestamptz_timestamptz		-
 SELECT (c_timestamptz)::timestamptz FROM castprobe		2020-01-02 03:04:05+00
 ROLLBACK TO sp_timestamptz_timestamptz		-
 SAVEPOINT sp_uuid_bytea		-
-SELECT (c_uuid)::bytea FROM castprobe		\\x00000000000000000000000000000001
+SELECT (c_uuid)::bytea FROM castprobe		\x00000000000000000000000000000001
 ROLLBACK TO sp_uuid_bytea		-
 SAVEPOINT sp_varbit_bit		-
 SELECT (c_varbit)::bit FROM castprobe		1

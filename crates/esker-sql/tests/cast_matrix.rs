@@ -27,8 +27,21 @@
 //! `bpchar`, which is a pair this file probes anyway, and the four real `"char"` targets are in
 //! the second half with their quotes. That is why 157 pairs are covered by 160 probes.
 //!
-//! 63 of the 157 disagree, in five groups, and **there is still no pair where this node answers
-//! and PostgreSQL refuses**.
+//! **33 of the 157 still disagree**, and there is still no pair anywhere where this node answers
+//! and PostgreSQL refuses. It was 49 before the conversions that do not go through the text
+//! landed (`value::convert_without_text`), and 63 before the geometric fourteen. What is left:
+//!
+//! ```text
+//! 13  a conversion this node does not have    money 2, interval -> time, nine pg_cast rows
+//!                                             `CASTS` lacks, and `"char" -> int4`   (#43)
+//!  7  both answer, the values differ          inet, boolean, and the rest of #44's renderings
+//! 10  both refuse, the sentence differs       jsonb's shape, refused after the input function
+//!  3  ADR 0097's oid space                    regclass -> oid, int4, int8           (#45)
+//! ```
+//!
+//! `"char" -> int4` is the odd one and its reason says why: a `"char"` and a `text` are both a
+//! `Datum::Text`, so the *evaluator* cannot tell them apart, and the same cast over a **literal**
+//! is right because the fold knows the type that was written. `cast_fold.rs` is that half.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -132,11 +145,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_cast_matrix.txt:164",
         ),
         (
-            "SELECT (c_uuid)::bytea FROM castprobe",
-            "**#43 group 4 -- both answer and the values differ.** Eight pairs, and they are renderings rather than conversions: `inet` loses its prefix length (`10.0.0.1` for `10.0.0.1/32`), `boolean` renders `t` where a real server writes `true` into a character type, `uuid -> bytea` gives the *text* of the uuid where a real server gives its sixteen bytes. Each is one output function, and none of them is the `Expr::Cast` arm being absent.",
-            "pg19_cast_matrix.txt:248",
-        ),
-        (
             "SELECT (c_int8)::regproc FROM castprobe2",
             "**#43 first mechanism -- nine `pg_cast` rows this node's `CASTS` table does not have.** `65::regproc` is `int4eq` on a real server and `42846 cannot cast type integer to regproc` here; so are both integers to `money`, and `regproc` and `regtype` back to an integer. Same shape as the geometric fourteen, and the same cause: permission is `pg_cast`'s, `casts_to` is the one gate, and a pair with no row is refused before any value is read. Only reachable once the matrix grew integer columns -- `pg_cast`'s largest family had never been probed.",
             "pg19_cast_matrix.txt:313",
@@ -182,84 +190,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_cast_matrix.txt:475",
         ),
         (
-            "SELECT (c_bool)::int4 FROM castprobe",
-            "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
-            "pg19_cast_matrix.txt:289",
-        ),
-        (
-            "SELECT (c_bytea)::int8 FROM castprobe",
-            "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
-            "pg19_cast_matrix.txt:292",
-        ),
-        (
-            "SELECT (c_bytea)::int2 FROM castprobe",
-            "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
-            "pg19_cast_matrix.txt:295",
-        ),
-        (
-            "SELECT (c_bytea)::int4 FROM castprobe",
-            "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
-            "pg19_cast_matrix.txt:298",
-        ),
-        (
             "SELECT (c_char)::int4 FROM castprobe",
             "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
             "pg19_cast_matrix.txt:301",
-        ),
-        (
-            "SELECT (c_int4)::bool FROM castprobe2",
-            "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
-            "pg19_cast_matrix.txt:370",
-        ),
-        (
-            "SELECT (c_float4)::int8 FROM castprobe",
-            "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
-            "pg19_cast_matrix.txt:427",
-        ),
-        (
-            "SELECT (c_float4)::int2 FROM castprobe",
-            "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
-            "pg19_cast_matrix.txt:430",
-        ),
-        (
-            "SELECT (c_float4)::int4 FROM castprobe",
-            "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
-            "pg19_cast_matrix.txt:433",
-        ),
-        (
-            "SELECT (c_float8)::int8 FROM castprobe",
-            "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
-            "pg19_cast_matrix.txt:436",
-        ),
-        (
-            "SELECT (c_float8)::int2 FROM castprobe",
-            "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
-            "pg19_cast_matrix.txt:439",
-        ),
-        (
-            "SELECT (c_float8)::int4 FROM castprobe",
-            "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
-            "pg19_cast_matrix.txt:442",
-        ),
-        (
-            "SELECT (c_int8)::bytea FROM castprobe2",
-            "**#44's rendering family, four more.** Both servers answer and the *value* differs, because this node's cast reaches for the source's **text** where a real server reinterprets its bytes: `65::bytea` is `\\x00000041` there and `\\x3635` here -- the ASCII of the digits `6` and `5` -- and `65::\"char\"` is `A` there and `6` here, the first character of that same text. Exactly `uuid -> bytea`'s shape, which is where #44 started. Not a missing conversion: the conversion happens and answers something else.",
-            "pg19_cast_matrix.txt:304",
-        ),
-        (
-            "SELECT (c_int2)::bytea FROM castprobe2",
-            "**#44's rendering family, four more.** Both servers answer and the *value* differs, because this node's cast reaches for the source's **text** where a real server reinterprets its bytes: `65::bytea` is `\\x00000041` there and `\\x3635` here -- the ASCII of the digits `6` and `5` -- and `65::\"char\"` is `A` there and `6` here, the first character of that same text. Exactly `uuid -> bytea`'s shape, which is where #44 started. Not a missing conversion: the conversion happens and answers something else.",
-            "pg19_cast_matrix.txt:340",
-        ),
-        (
-            "SELECT (c_int4)::bytea FROM castprobe2",
-            "**#44's rendering family, four more.** Both servers answer and the *value* differs, because this node's cast reaches for the source's **text** where a real server reinterprets its bytes: `65::bytea` is `\\x00000041` there and `\\x3635` here -- the ASCII of the digits `6` and `5` -- and `65::\"char\"` is `A` there and `6` here, the first character of that same text. Exactly `uuid -> bytea`'s shape, which is where #44 started. Not a missing conversion: the conversion happens and answers something else.",
-            "pg19_cast_matrix.txt:373",
-        ),
-        (
-            "SELECT (c_int4)::\"char\" FROM castprobe2",
-            "**#44's rendering family, four more.** Both servers answer and the *value* differs, because this node's cast reaches for the source's **text** where a real server reinterprets its bytes: `65::bytea` is `\\x00000041` there and `\\x3635` here -- the ASCII of the digits `6` and `5` -- and `65::\"char\"` is `A` there and `6` here, the first character of that same text. Exactly `uuid -> bytea`'s shape, which is where #44 started. Not a missing conversion: the conversion happens and answers something else.",
-            "pg19_cast_matrix.txt:376",
         ),
         (
             "SELECT (c_jsonb)::int8 FROM castprobe",
