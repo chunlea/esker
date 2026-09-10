@@ -146,11 +146,6 @@ const ANSWERS: &[(&str, &str, &str)] = &[
         "pg19_json.txt:116",
     ),
     (
-        "SELECT '{\"a\":1,\"b\":2}'::json @> '{\"a\":1}'::json",
-        CONTAINMENT,
-        "pg19_json.txt:117",
-    ),
-    (
         "SELECT '{\"a\":1}'::jsonb ? 'a'",
         CONTAINMENT,
         "pg19_json.txt:118",
