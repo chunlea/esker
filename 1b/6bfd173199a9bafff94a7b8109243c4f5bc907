@@ -1,0 +1,23 @@
+crates/esker-raft/src/election/tests.rs
+  s_2bed4ac2b1c944::t_16e49350bda088 152-251
+crates/esker-sql/tests/routing_differential.rs
+  s_2bed4ac2b1c944::t_846398c746976c 1456-1483
+docs/plans/debts-v1.1.md
+  s_2bed4ac2b1c944::t_9ed5c8320e1f0f 119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "1b6bfd173199a9bafff94a7b8109243c4f5bc907",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
