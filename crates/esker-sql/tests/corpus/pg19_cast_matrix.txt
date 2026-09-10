@@ -283,4 +283,204 @@ ROLLBACK TO sp_xml_text		-
 SAVEPOINT sp_xml_varchar		-
 SELECT (c_xml)::varchar FROM castprobe		<a/>
 ROLLBACK TO sp_xml_varchar		-
+CREATE TABLE castprobe2 (c_int2 int2, c_int4 int4, c_int8 int8)		-
+INSERT INTO castprobe2 VALUES (65, 65, 65)		-
+SAVEPOINT sp2_bool_int4		-
+SELECT (c_bool)::int4 FROM castprobe		1
+ROLLBACK TO sp2_bool_int4		-
+SAVEPOINT sp2_bytea_int8		-
+SELECT (c_bytea)::int8 FROM castprobe		16706
+ROLLBACK TO sp2_bytea_int8		-
+SAVEPOINT sp2_bytea_int2		-
+SELECT (c_bytea)::int2 FROM castprobe		16706
+ROLLBACK TO sp2_bytea_int2		-
+SAVEPOINT sp2_bytea_int4		-
+SELECT (c_bytea)::int4 FROM castprobe		16706
+ROLLBACK TO sp2_bytea_int4		-
+SAVEPOINT sp2_char_int4		-
+SELECT (c_char)::int4 FROM castprobe		97
+ROLLBACK TO sp2_char_int4		-
+SAVEPOINT sp2_int8_bytea		-
+SELECT (c_int8)::bytea FROM castprobe2		\x0000000000000041
+ROLLBACK TO sp2_int8_bytea		-
+SAVEPOINT sp2_int8_int2		-
+SELECT (c_int8)::int2 FROM castprobe2		65
+ROLLBACK TO sp2_int8_int2		-
+SAVEPOINT sp2_int8_int4		-
+SELECT (c_int8)::int4 FROM castprobe2		65
+ROLLBACK TO sp2_int8_int4		-
+SAVEPOINT sp2_int8_regproc		-
+SELECT (c_int8)::regproc FROM castprobe2		int4eq
+ROLLBACK TO sp2_int8_regproc		-
+SAVEPOINT sp2_int8_oid		-
+SELECT (c_int8)::oid FROM castprobe2		65
+ROLLBACK TO sp2_int8_oid		-
+SAVEPOINT sp2_int8_float4		-
+SELECT (c_int8)::float4 FROM castprobe2		65
+ROLLBACK TO sp2_int8_float4		-
+SAVEPOINT sp2_int8_float8		-
+SELECT (c_int8)::float8 FROM castprobe2		65
+ROLLBACK TO sp2_int8_float8		-
+SAVEPOINT sp2_int8_money		-
+SELECT (c_int8)::money FROM castprobe2		$65.00
+ROLLBACK TO sp2_int8_money		-
+SAVEPOINT sp2_int8_bit		-
+SELECT (c_int8)::bit FROM castprobe2		1
+ROLLBACK TO sp2_int8_bit		-
+SAVEPOINT sp2_int8_numeric		-
+SELECT (c_int8)::numeric FROM castprobe2		65
+ROLLBACK TO sp2_int8_numeric		-
+SAVEPOINT sp2_int8_regclass		-
+SELECT (c_int8)::regclass FROM castprobe2		65
+ROLLBACK TO sp2_int8_regclass		-
+SAVEPOINT sp2_int8_regtype		-
+SELECT (c_int8)::regtype FROM castprobe2		65
+ROLLBACK TO sp2_int8_regtype		-
+SAVEPOINT sp2_int2_bytea		-
+SELECT (c_int2)::bytea FROM castprobe2		\x0041
+ROLLBACK TO sp2_int2_bytea		-
+SAVEPOINT sp2_int2_int8		-
+SELECT (c_int2)::int8 FROM castprobe2		65
+ROLLBACK TO sp2_int2_int8		-
+SAVEPOINT sp2_int2_int4		-
+SELECT (c_int2)::int4 FROM castprobe2		65
+ROLLBACK TO sp2_int2_int4		-
+SAVEPOINT sp2_int2_regproc		-
+SELECT (c_int2)::regproc FROM castprobe2		int4eq
+ROLLBACK TO sp2_int2_regproc		-
+SAVEPOINT sp2_int2_oid		-
+SELECT (c_int2)::oid FROM castprobe2		65
+ROLLBACK TO sp2_int2_oid		-
+SAVEPOINT sp2_int2_float4		-
+SELECT (c_int2)::float4 FROM castprobe2		65
+ROLLBACK TO sp2_int2_float4		-
+SAVEPOINT sp2_int2_float8		-
+SELECT (c_int2)::float8 FROM castprobe2		65
+ROLLBACK TO sp2_int2_float8		-
+SAVEPOINT sp2_int2_numeric		-
+SELECT (c_int2)::numeric FROM castprobe2		65
+ROLLBACK TO sp2_int2_numeric		-
+SAVEPOINT sp2_int2_regclass		-
+SELECT (c_int2)::regclass FROM castprobe2		65
+ROLLBACK TO sp2_int2_regclass		-
+SAVEPOINT sp2_int2_regtype		-
+SELECT (c_int2)::regtype FROM castprobe2		65
+ROLLBACK TO sp2_int2_regtype		-
+SAVEPOINT sp2_int4_bool		-
+SELECT (c_int4)::bool FROM castprobe2		t
+ROLLBACK TO sp2_int4_bool		-
+SAVEPOINT sp2_int4_bytea		-
+SELECT (c_int4)::bytea FROM castprobe2		\x00000041
+ROLLBACK TO sp2_int4_bytea		-
+SAVEPOINT sp2_int4_char		-
+SELECT (c_int4)::"char" FROM castprobe2		A
+ROLLBACK TO sp2_int4_char		-
+SAVEPOINT sp2_int4_int8		-
+SELECT (c_int4)::int8 FROM castprobe2		65
+ROLLBACK TO sp2_int4_int8		-
+SAVEPOINT sp2_int4_int2		-
+SELECT (c_int4)::int2 FROM castprobe2		65
+ROLLBACK TO sp2_int4_int2		-
+SAVEPOINT sp2_int4_regproc		-
+SELECT (c_int4)::regproc FROM castprobe2		int4eq
+ROLLBACK TO sp2_int4_regproc		-
+SAVEPOINT sp2_int4_oid		-
+SELECT (c_int4)::oid FROM castprobe2		65
+ROLLBACK TO sp2_int4_oid		-
+SAVEPOINT sp2_int4_float4		-
+SELECT (c_int4)::float4 FROM castprobe2		65
+ROLLBACK TO sp2_int4_float4		-
+SAVEPOINT sp2_int4_float8		-
+SELECT (c_int4)::float8 FROM castprobe2		65
+ROLLBACK TO sp2_int4_float8		-
+SAVEPOINT sp2_int4_money		-
+SELECT (c_int4)::money FROM castprobe2		$65.00
+ROLLBACK TO sp2_int4_money		-
+SAVEPOINT sp2_int4_bit		-
+SELECT (c_int4)::bit FROM castprobe2		1
+ROLLBACK TO sp2_int4_bit		-
+SAVEPOINT sp2_int4_numeric		-
+SELECT (c_int4)::numeric FROM castprobe2		65
+ROLLBACK TO sp2_int4_numeric		-
+SAVEPOINT sp2_int4_regclass		-
+SELECT (c_int4)::regclass FROM castprobe2		65
+ROLLBACK TO sp2_int4_regclass		-
+SAVEPOINT sp2_int4_regtype		-
+SELECT (c_int4)::regtype FROM castprobe2		65
+ROLLBACK TO sp2_int4_regtype		-
+SAVEPOINT sp2_regproc_int8		-
+SELECT (c_regproc)::int8 FROM castprobe		42
+ROLLBACK TO sp2_regproc_int8		-
+SAVEPOINT sp2_regproc_int4		-
+SELECT (c_regproc)::int4 FROM castprobe		42
+ROLLBACK TO sp2_regproc_int4		-
+SAVEPOINT sp2_text_char		-
+SELECT (c_text)::"char" FROM castprobe		4
+ROLLBACK TO sp2_text_char		-
+SAVEPOINT sp2_oid_int8		-
+SELECT (c_oid)::int8 FROM castprobe		16384
+ROLLBACK TO sp2_oid_int8		-
+SAVEPOINT sp2_oid_int4		-
+SELECT (c_oid)::int4 FROM castprobe		16384
+ROLLBACK TO sp2_oid_int4		-
+SAVEPOINT sp2_float4_int8		-
+SELECT (c_float4)::int8 FROM castprobe		2
+ROLLBACK TO sp2_float4_int8		-
+SAVEPOINT sp2_float4_int2		-
+SELECT (c_float4)::int2 FROM castprobe		2
+ROLLBACK TO sp2_float4_int2		-
+SAVEPOINT sp2_float4_int4		-
+SELECT (c_float4)::int4 FROM castprobe		2
+ROLLBACK TO sp2_float4_int4		-
+SAVEPOINT sp2_float8_int8		-
+SELECT (c_float8)::int8 FROM castprobe		2
+ROLLBACK TO sp2_float8_int8		-
+SAVEPOINT sp2_float8_int2		-
+SELECT (c_float8)::int2 FROM castprobe		2
+ROLLBACK TO sp2_float8_int2		-
+SAVEPOINT sp2_float8_int4		-
+SELECT (c_float8)::int4 FROM castprobe		2
+ROLLBACK TO sp2_float8_int4		-
+SAVEPOINT sp2_bpchar_char		-
+SELECT (c_bpchar)::"char" FROM castprobe		a
+ROLLBACK TO sp2_bpchar_char		-
+SAVEPOINT sp2_varchar_char		-
+SELECT (c_varchar)::"char" FROM castprobe		4
+ROLLBACK TO sp2_varchar_char		-
+SAVEPOINT sp2_bit_int8		-
+SELECT (c_bit)::int8 FROM castprobe		5
+ROLLBACK TO sp2_bit_int8		-
+SAVEPOINT sp2_bit_int4		-
+SELECT (c_bit)::int4 FROM castprobe		5
+ROLLBACK TO sp2_bit_int4		-
+SAVEPOINT sp2_numeric_int8		-
+SELECT (c_numeric)::int8 FROM castprobe		12
+ROLLBACK TO sp2_numeric_int8		-
+SAVEPOINT sp2_numeric_int2		-
+SELECT (c_numeric)::int2 FROM castprobe		12
+ROLLBACK TO sp2_numeric_int2		-
+SAVEPOINT sp2_numeric_int4		-
+SELECT (c_numeric)::int4 FROM castprobe		12
+ROLLBACK TO sp2_numeric_int4		-
+SAVEPOINT sp2_regclass_int8		-
+SELECT (c_regclass)::int8 FROM castprobe		1259
+ROLLBACK TO sp2_regclass_int8		-
+SAVEPOINT sp2_regclass_int4		-
+SELECT (c_regclass)::int4 FROM castprobe		1259
+ROLLBACK TO sp2_regclass_int4		-
+SAVEPOINT sp2_regtype_int8		-
+SELECT (c_regtype)::int8 FROM castprobe		23
+ROLLBACK TO sp2_regtype_int8		-
+SAVEPOINT sp2_regtype_int4		-
+SELECT (c_regtype)::int4 FROM castprobe		23
+ROLLBACK TO sp2_regtype_int4		-
+SAVEPOINT sp2_jsonb_int8		-
+SELECT (c_jsonb)::int8 FROM castprobe	!22023 cannot cast jsonb object to type bigint
+ROLLBACK TO sp2_jsonb_int8		-
+SAVEPOINT sp2_jsonb_int2		-
+SELECT (c_jsonb)::int2 FROM castprobe	!22023 cannot cast jsonb object to type smallint
+ROLLBACK TO sp2_jsonb_int2		-
+SAVEPOINT sp2_jsonb_int4		-
+SELECT (c_jsonb)::int4 FROM castprobe	!22023 cannot cast jsonb object to type integer
+ROLLBACK TO sp2_jsonb_int4		-
 ROLLBACK		-
