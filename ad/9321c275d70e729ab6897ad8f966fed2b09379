@@ -1,0 +1,23 @@
+crates/esker-proto/src/lib.rs
+  s_e59614afdddccb::t_6741e6d3f66cac 46,64
+crates/esker-proto/src/pd_leader.rs
+  s_e59614afdddccb::t_e7064ff1ac06c6 1-458
+crates/esker-store/src/pd_remote.rs
+  s_e59614afdddccb::t_65b299210de3d1 36-41,43-45,48,52-53,68-71,76,78-80,112,115,118,126,135,141,147,150,152-159,161,179,187,199-200,330,353-357
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ad9321c275d70e729ab6897ad8f966fed2b09379",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
