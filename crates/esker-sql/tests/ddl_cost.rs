@@ -125,5 +125,30 @@ fn what_each_ddl_statement_costs() {
     s.run("CREATE INDEX d2_c ON d2 (c)").unwrap();
     println!("  {}", priced(&mut s, "DROP TABLE d2"));
 
+    // **Does the scan count track the *kinds* of record a table has, or their number?** The catalog
+    // is kind-major — `'m' ++ "sql" ++ KIND ++ tenant ++ id` — so "everything belonging to table X"
+    // is one prefix per kind, not one prefix. If that is what the scans are, adding a record of a
+    // *new* kind costs a scan and adding more of the same kind costs none.
+    println!("\n  -- does a DROP's scan count track kinds or counts? --");
+    s.run("CREATE TABLE k0 (id bigint primary key)").unwrap();
+    println!("  {}", priced(&mut s, "DROP TABLE k0"));
+
+    // A sequence: a record of a kind `k0` did not have (`'q'`, and its value under `'e'`).
+    s.run("CREATE TABLE k1 (id bigserial primary key, a bigint)")
+        .unwrap();
+    println!("  {}", priced(&mut s, "DROP TABLE k1"));
+
+    // Two sequences: more of the same kind.
+    s.run("CREATE TABLE k2 (id bigserial primary key, b bigserial)")
+        .unwrap();
+    println!("  {}", priced(&mut s, "DROP TABLE k2"));
+
+    // A foreign key: a back-reference, under `'k'`, another kind again.
+    s.run("CREATE TABLE parent (id bigint primary key)")
+        .unwrap();
+    s.run("CREATE TABLE child (id bigint primary key, p bigint references parent (id))")
+        .unwrap();
+    println!("  {}", priced(&mut s, "DROP TABLE child"));
+
     println!("\n  {}\n", esker_sql::stmt_stats::summary());
 }
