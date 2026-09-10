@@ -403,6 +403,8 @@ dependencies = [
  "esker-store",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

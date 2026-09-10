@@ -192,8 +192,8 @@ Commands:
   cluster start|stop    Start or stop a local cluster replicating one region;
                         `start` restarts a store that exits unless --no-respawn
                         (--nodes, --data-dir, --base-port, --seed, --sst-store,
-                        --write-buffer-size; each node gets its own prefix under
-                        the one given). --pd also starts a placement driver on
+                        --write-buffer-size, --region-census-ms; each node gets
+                        its own prefix under the one given). --pd also starts a placement driver on
                         the port above the nodes and points every node at it,
                         which is what a SQL node needs to be given with --pd
   pd serve|inspect|status
@@ -328,6 +328,13 @@ Server options:
                         in these ticks (default 1000). An interval below one tick is
                         rounded up to one, so shortening an interval without also
                         shortening the tick does nothing
+      --region-census-ms N
+                        Log what each region's peer believes every N milliseconds:
+                        term, role, who it thinks leads, which core answered, the
+                        membership from both sources, and the election counters. Off
+                        by default. A diagnostic and nothing reads it — it exists so
+                        a run that stops serving can be explained from the stores'
+                        own beliefs instead of from a client's refusals
       --sst-store URL   Tier this store's SSTs into s3://bucket/prefix, keeping the
                         WAL and the Raft log local. The endpoint and credentials
                         come from ESKER_S3_ENDPOINT, ESKER_S3_KEY, ESKER_S3_SECRET
@@ -1188,6 +1195,7 @@ fn set_server_knob(
         "--region-split-size" => options.region_split_size = value,
         "--store-heartbeat-ms" => options.store_heartbeat_ms = value,
         "--region-heartbeat-ms" => options.region_heartbeat_ms = value,
+        "--region-census-ms" => options.region_census_ms = value,
         _ => options.heartbeat_tick_ms = value,
     }
     Ok(())
@@ -1202,6 +1210,7 @@ fn server_knob(flag: &str) -> &'static str {
         "--region-split-size" => "--region-split-size",
         "--store-heartbeat-ms" => "--store-heartbeat-ms",
         "--region-heartbeat-ms" => "--region-heartbeat-ms",
+        "--region-census-ms" => "--region-census-ms",
         _ => "--heartbeat-tick-ms",
     }
 }
@@ -1261,11 +1270,12 @@ fn parse_server(arguments: &[String]) -> Result<Command, ParseError> {
                     },
                 )?);
             }
-            // The four `StoreOptions` knobs `docs/bench/phase-4.md` had to wrap this binary to
-            // reach. Each takes the same shape, so they take one arm.
+            // The `StoreOptions` knobs `docs/bench/phase-4.md` had to wrap this binary to
+            // reach, plus the census. Each takes the same shape, so they take one arm.
             "--region-split-size"
             | "--store-heartbeat-ms"
             | "--region-heartbeat-ms"
+            | "--region-census-ms"
             | "--heartbeat-tick-ms" => {
                 let named = server_knob(flag);
                 let raw = take_value(arguments, &mut index, inline, named)?;
@@ -1441,6 +1451,7 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
     let mut write_buffer_size: Option<usize> = None;
     let mut pd = false;
     let mut no_respawn = false;
+    let mut region_census_ms: Option<u64> = None;
     let mut index = 0;
 
     while index < rest.len() {
@@ -1497,6 +1508,10 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
             // one it also has to be able to stop.
             "--pd" => pd = true,
             "--no-respawn" => no_respawn = true,
+            "--region-census-ms" => {
+                let raw = take_value(rest, &mut index, inline, "--region-census-ms")?;
+                region_census_ms = Some(positive_u64(&raw, "--region-census-ms")?);
+            }
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
             }
@@ -1514,6 +1529,7 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
             write_buffer_size,
             pd,
             no_respawn,
+            region_census_ms,
         })),
         "stop" => Ok(Command::Cluster(ClusterOptions::Stop { data_dir })),
         other => Err(ParseError::UnknownCommand(format!("cluster {other}"))),
@@ -2384,6 +2400,7 @@ mod tests {
             write_buffer_size,
             pd,
             no_respawn,
+            region_census_ms,
         }) = parse_ok(&[
             "cluster",
             "start",
@@ -2410,6 +2427,22 @@ mod tests {
             !no_respawn,
             "a store that exits is restarted unless the operator says otherwise — a chaos run \
              needs something to wait for"
+        );
+        assert_eq!(
+            region_census_ms, None,
+            "the census is a diagnostic and stays off until it is asked for"
+        );
+
+        let Command::Cluster(ClusterOptions::Start {
+            region_census_ms, ..
+        }) = parse_ok(&["cluster", "start", "--region-census-ms", "250"])
+        else {
+            panic!("expected a cluster start");
+        };
+        assert_eq!(region_census_ms, Some(250));
+        assert!(
+            parse(["cluster", "start", "--region-census-ms", "0"].into_iter()).is_err(),
+            "a census every zero milliseconds is a busy loop, not a cadence"
         );
 
         let Command::Cluster(ClusterOptions::Start { no_respawn, .. }) =

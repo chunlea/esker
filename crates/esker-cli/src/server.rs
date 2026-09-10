@@ -94,6 +94,14 @@ pub(crate) struct ServerOptions {
     /// counted in these ([`esker_store::Heartbeats`]), so an interval below one tick is rounded up
     /// to one and setting a short interval without also shortening the tick does nothing.
     pub(crate) heartbeat_tick_ms: Option<u64>,
+    /// How often each region's peer says what it believes, in milliseconds, or `None` for never.
+    ///
+    /// **A diagnostic, off by default.** Nothing reads what it emits; it exists so that a run
+    /// which stops serving can be diagnosed from the stores' own beliefs rather than from a
+    /// client's refusals (`esker_store::census`). One `info` event per region per period, and
+    /// never one per election event — an instrument that logged each event would displace the
+    /// race it was built to find.
+    pub(crate) region_census_ms: Option<u64>,
 }
 
 impl Default for ServerOptions {
@@ -111,6 +119,7 @@ impl Default for ServerOptions {
             store_heartbeat_ms: None,
             region_heartbeat_ms: None,
             heartbeat_tick_ms: None,
+            region_census_ms: None,
             sst_store: None,
             adopt_sst_store: false,
             pd: None,
@@ -142,7 +151,33 @@ pub(crate) fn pd_endpoints(listed: &str) -> Result<Vec<SocketAddr>, String> {
 }
 
 /// Opens the store, serves it, and returns when it has stopped cleanly.
+/// Sends what the store logs to stderr, at `info` unless `RUST_LOG` says otherwise.
+///
+/// **This binary had no subscriber at all**, so every `tracing` event `esker-store` and
+/// `esker-raft` emit went nowhere — which was survivable while nothing depended on one and is not
+/// now: `esker_store::census` exists to be read out of a real run's log
+/// (`esker-coord/h1-52-hypotheses.md`), and an instrument that emits into a void is worse than no
+/// instrument, because it looks like a cluster with nothing to say.
+///
+/// `try_init` and not `init`: this is called once per process today, and a second call must not
+/// take the process down over a log line.
+fn install_logging() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        // **No colour.** This output is a record before it is a display: `esker cluster start`
+        // redirects it into a file and the people who read it use `grep`. With ANSI on, a field
+        // arrives as `\u{1b}[3mregion\u{1b}[0m\u{1b}[2m=\u{1b}[0m1` and a search for `region=1`
+        // finds nothing in a log that says it perfectly.
+        .with_ansi(false)
+        .try_init();
+}
+
 pub(crate) fn run(options: &ServerOptions) -> Result<(), String> {
+    install_logging();
     let address: SocketAddr = options
         .listen
         .parse()
@@ -281,6 +316,9 @@ fn store_options(
         heartbeat_tick: ms(options.heartbeat_tick_ms, defaults.heartbeat_tick),
         store_heartbeat: ms(options.store_heartbeat_ms, defaults.store_heartbeat),
         region_heartbeat: ms(options.region_heartbeat_ms, defaults.region_heartbeat),
+        region_census: options
+            .region_census_ms
+            .map(std::time::Duration::from_millis),
         ..defaults
     }
 }

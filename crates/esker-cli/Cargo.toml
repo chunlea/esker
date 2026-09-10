@@ -44,6 +44,12 @@ esker-s3.workspace = true
 # The runtime `server` runs on, and the ctrl-c it stops on. This is the only command that
 # builds one: `raw` and `bench --remote` go through the client's blocking transport.
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros"] }
+# `server` is the only command that runs a library which *logs*: `esker-store`'s region census
+# is a `tracing` event, and without a subscriber in this binary it would be emitted into
+# nothing — which is the one place it has to arrive. Both are already runtime dependencies of
+# `esker-sql`, so the workspace's transitive crate budget does not move (`deny.toml`).
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 # `pd inspect`'s tests drive a clock by hand rather than sleeping, the same way `esker-pd`'s
