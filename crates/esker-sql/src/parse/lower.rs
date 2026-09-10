@@ -5505,12 +5505,25 @@ fn stack_folded_arrays(
     )))))
 }
 
-/// `ARRAY[…]` as a **value**, folded where every element is a constant.
+/// `ARRAY[…]` lowered — **the node is kept and the element type is settled here**.
 ///
 /// The constructor builds an array from expressions where a literal builds one from text, and the
-/// element type is the elements' — PostgreSQL's `select_common_type`, narrowed to the four array
-/// types this node has. A constructor over anything but constants is refused by name: building one
-/// per row is a node of its own, and none of the statements this node is measured against has one.
+/// element type is the elements' — PostgreSQL's `select_common_type`, narrowed to the array types
+/// this node has. Every element that is a constant is read here, where what was *written* is still
+/// visible; an element that needs a row is left to `exec::query::resolve`, which settles the type
+/// only when this function could not (`debts-v1.1.md` #42).
+///
+/// **It used to fold the whole thing into a `Literal::Typed(Datum::Array)`**, and that was the
+/// last entry of the deparse census's group D: `(ARRAY[1, 2])::text` printed
+/// `('{1,2}'::integer[])::text` where a real server prints the constructor it kept, because after
+/// the fold the two spellings are the same value and nothing can tell them apart. Keeping the node
+/// cost three other rules that had been leaning on the fold, each measured before it was changed:
+/// `resolve` re-settling an element type the fold had already decided, `= ANY`'s reader expecting
+/// a folded value, and the `unknown` rule below.
+///
+/// **An array of arrays still folds**, through [`stack_folded_arrays`]: the outer array is built
+/// from the inner values rather than from their printed form, which is what makes
+/// `ARRAY['{1,2}'::int[]]` an `integer[]` (`tests/array_of_array.rs`).
 ///
 /// **`ARRAY[]` is an error and `'{}'::int[]` is not.** An empty constructor has no elements to take
 /// a type from, so PostgreSQL answers `42P18` with a hint; an empty *literal* has its type from the
@@ -5601,8 +5614,29 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
                     Err(_) => ColumnType::Int8,
                 }),
             ),
+            // **A quoted string is `unknown` and contributes *no* type**, which is
+            // `select_common_type`'s own rule and the one `exec::query::quantified_element_type`
+            // already states one file over: an unknown takes the type the typed elements settle,
+            // and only an array of nothing but unknowns is `text`. Measured on 19beta1, 2026-09-10:
+            // `ARRAY['1 month'::interval, '1 year', '1 hour']` is `interval[]`,
+            // `ARRAY['a'::name, 'b']` is `name[]`, `ARRAY['2020-01-01'::date, '2020-01-02']` is
+            // `date[]`, `ARRAY[1, '2']` is `integer[]` with `[2]` reading `2`, and `ARRAY['x','y']`
+            // and `ARRAY[NULL]` are both `text[]`.
+            //
+            // It said `Some(Text)` here, and "a string makes the whole array `text`" was the
+            // widening rule below — so a constructor mixing a cast with a bare string came out a
+            // `text[]`, which is what made
+            // `INSERT INTO iv(terms) VALUES (ARRAY['1 month'::interval, '1 year'])` a
+            // `42804 column "terms" is of type interval[] but expression is of type text[]` the
+            // moment the constructor stopped folding into a value that `assign` could re-read.
+            // Two readers of one fact, and the folded one was the one nobody had put to the
+            // oracle.
+            //
+            // **The value is still read with the settled type**, which is what makes
+            // `ARRAY[true, 'x']` `22P02 invalid input syntax for type boolean: "x"` here as it is
+            // there: the texts are collected now and `Datum::from_text` runs after the loop.
             Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
-                (Some(text.clone()), Some(ColumnType::Text))
+                (Some(text.clone()), None)
             }
             // **`ARRAY[true,false]` is a `boolean[]`**, and the keyword is the value: a boolean
             // literal is not an `unknown` string that happens to read as one, which is why it
@@ -5618,7 +5652,9 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             }
         };
         element = match (element, wanted) {
-            (Some(ColumnType::Text), _) | (_, Some(ColumnType::Text)) => Some(ColumnType::Text),
+            // `text` used to win over everything here, which was the other half of the arm above:
+            // a bare string said `text` and `text` then swallowed the array. A `text` that arrives
+            // now was **written** — `'x'::text` — and takes its turn like any other type.
             (Some(ColumnType::Numeric), _) | (_, Some(ColumnType::Numeric)) => {
                 Some(ColumnType::Numeric)
             }
@@ -5633,9 +5669,13 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
         };
         texts.push(text);
     }
-    let Some(element) = element else {
+    // **All-unknown is `text`, and only an *empty* constructor has no type at all.**
+    // `ARRAY['x','y']`, `ARRAY[NULL]` and `ARRAY[NULL,'x']` are each `text[]` on 19beta1;
+    // `ARRAY[]` is `42P18 cannot determine type of empty array`, which is what this error says.
+    if elements.is_empty() {
         return Err(SqlError::EmptyArrayType);
-    };
+    }
+    let element = element.unwrap_or(ColumnType::Text);
     let mut values = Vec::with_capacity(texts.len());
     for text in texts {
         values.push(match text {
@@ -5646,11 +5686,18 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
     if let Some(stacked) = stack_folded_arrays(element, &values)? {
         return Ok(stacked);
     }
-    Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-        Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
-            element, 1, values,
-        )),
-    ))))
+    Ok(plan::Expr::Array {
+        elements: values
+            .into_iter()
+            .map(|value| {
+                plan::Expr::Literal(match value {
+                    None => plan::Literal::Null,
+                    Some(value) => plan::Literal::Typed(Box::new(value)),
+                })
+            })
+            .collect(),
+        element: Some(element),
+    })
 }
 
 /// The elements of an array expression, for the right-hand side of `= ANY(…)`.
@@ -5683,25 +5730,30 @@ fn lower_array_constructor_elements(expr: &Expr) -> Result<Option<Vec<plan::Expr
     if array.elem.is_empty() {
         return Ok(Some(Vec::new()));
     }
-    let plan::Expr::Literal(plan::Literal::Typed(value)) = lower_array_constructor(&array.elem)?
-    else {
-        return Ok(None);
-    };
-    let Datum::Array(array) = *value else {
-        return Ok(None);
-    };
-    Ok(Some(
-        array
-            .values
-            .into_iter()
-            .map(|element| {
-                plan::Expr::Literal(match element {
-                    Some(value) => plan::Literal::Typed(Box::new(value)),
-                    None => plan::Literal::Null,
-                })
-            })
-            .collect(),
-    ))
+    // **Two shapes come back, and both are the constructor's own elements.** A constructor over
+    // constants keeps its node now (`debts-v1.1.md` #42), so its elements are already the list
+    // this side wants; an array *of arrays* still folds to one value, and taking that apart is
+    // the second arm. Anything else — a runtime constructor over columns — is `None`, and the
+    // caller lowers each element itself.
+    Ok(match lower_array_constructor(&array.elem)? {
+        plan::Expr::Array { elements, .. } => Some(elements),
+        plan::Expr::Literal(plan::Literal::Typed(value)) => match *value {
+            Datum::Array(array) => Some(
+                array
+                    .values
+                    .into_iter()
+                    .map(|element| {
+                        plan::Expr::Literal(match element {
+                            Some(value) => plan::Literal::Typed(Box::new(value)),
+                            None => plan::Literal::Null,
+                        })
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 fn lower_array(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {

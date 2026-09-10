@@ -120,18 +120,23 @@ fn the_element_type_survives_every_array_shape() {
     }
 }
 
-/// **The literal half of the same twelve — red, and handed over rather than deleted.**
+/// **The literal half of the same twelve, and it is green.**
 ///
-/// r1's v3 smoke found the node does not degrade uniformly by operand provenance, and it is right:
-/// with the operand written as a literal, `ARRAY['{1,2}'::int[]]` answers a scalar `text` holding
-/// `{"{1,2}"}` where the runtime form answered `text[]`. **A different mechanism from the one this
-/// unit fixed.** The type rule is `array_over` and it is in place; what defeats it here is earlier
-/// — the fold turns a typed array literal into its text in `parse/lower.rs` before any constructor
-/// rule can see an array at all. For `regclass[]` the same fold is the `0A000 a relation name read
-/// as a regclass without a catalog` this register already met as #38, whose cause was also a fold.
+/// r1's v3 smoke found the node did not degrade uniformly by operand provenance, and it was right:
+/// with the operand written as a literal, `ARRAY['{1,2}'::int[]]` answered a scalar `text` holding
+/// `{"{1,2}"}` where the runtime form already answered `text[]` — **a different mechanism from the
+/// one the test above fixed**. The type rule is `array_over` and it was in place; what defeated it
+/// was earlier, `lower_array_constructor` folding a typed array literal to its text before any
+/// constructor rule could see an array at all. `stack_folded_arrays` is what closed it: the fold
+/// keeps the element type and builds the outer array from the inner one instead of reading the
+/// inner one's printed form. For `regclass[]` the same fold was the `0A000 a relation name read as
+/// a regclass without a catalog` this register met as #38, and it went with it.
 ///
-/// Delete the `#[ignore]` when that fold is fixed; the expectations are already measured, in
-/// `tests/captures/pg19_array_of_array.txt`.
+/// **This doc carried "red, and handed over" and a "delete the `#[ignore]`" instruction for a day
+/// after the `#[ignore]` was gone and all twelve were passing.** A stale sentence in a doc comment
+/// is invisible to the gate — nothing compiles it, nothing runs it — and it is how a register
+/// comes to claim more work than the tree has. The expectations are measured in
+/// `tests/captures/pg19_array_of_array.txt`; the oids below are the assertion.
 #[test]
 fn the_element_type_survives_a_literal_operand_too() {
     let mut node = parity::Node::new(&["CREATE TABLE rc (id int8)"]);

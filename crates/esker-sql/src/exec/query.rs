@@ -2776,16 +2776,21 @@ const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tabl
 )]
 pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
     Ok(match expr {
-        // **The element type is settled here and nowhere else.** A constructor over constants
-        // never reaches this arm — it folded at lowering, where what was written settles the type
-        // — so every element here is an expression whose type needs a scope. The widest wins in
-        // PostgreSQL's order, which is the same rule the folded path applies to literals.
-        Expr::Array { elements, .. } => {
+        // **A type lowering already settled is kept; the rest is settled here.** A constructor
+        // over constants now reaches this arm too — it keeps its node so that a real server's
+        // `ARRAY[1, 2]` prints as one (`debts-v1.1.md` #42) — and what it carries is what was
+        // *written*, which a recomputation cannot get back: every element of
+        // `ARRAY['a'::name, 'b'::name]` is a `Datum::Text` by the time it is an expression, so
+        // widening over them answered `text[]` where a real server says `name[]`. Passing `None`
+        // here was correct exactly while this arm could not see a folded constructor.
+        //
+        // An element whose type needs a scope still settles here, which is what `None` means.
+        Expr::Array { elements, element } => {
             let mut resolved = Vec::with_capacity(elements.len());
             for expr in elements {
                 resolved.push(resolve(expr, scope)?);
             }
-            let element = array_element_type(&resolved, None, scope)?;
+            let element = array_element_type(&resolved, *element, scope)?;
             Expr::Array {
                 elements: resolved,
                 element,

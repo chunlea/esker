@@ -87,12 +87,15 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "**Group C -- an array slice is `0A000` here and a working index key there.** `arr[1:2]` is refused by name (`an array slice is not supported`), so the four readers that would print it are never reached: measured, PostgreSQL takes `CREATE INDEX ON cen ((arr[1:2]))` and prints it back `USING btree ((arr[1:2]))`, stores `arr[1:2]` in `indexprs`, and refuses only the *generated column* over `(arr[1:2])::text` -- for the immutability reason, not the slice. A feature gap and not a printing one, which is what is left of a group that was four mechanisms wearing one word: the pair on a constructor and a subscript, the immutability refusal, the viewdef rows that were never C's, and this.",
             "pg19_deparse_census.txt:391",
         ),
-        // ---- D-fold: 1 statement ----
-        (
-            "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'",
-            "**Group D -- a constant array literal is folded to its own text, and the element type goes with it.** `lower_array_constructor` folds `ARRAY[1, 2]` into a `Literal::Typed(Datum::Array)`, so `(ARRAY[1, 2])::text` prints `('{1,2}'::integer[])::text` where a real server prints the constructor it kept. **The rest of this group is closed**: `lower_cast` no longer discards a cast node whose target is not the literal's own type (`debts-v1.1.md` #42), which closed `(42)::text`, `(-1)::text`, `((1)::bigint)::text` and `((-1)::bigint)::text`. Those were four entries sharing one matcher -- the SQL is the same `pg_get_expr` read for every `DEFAULT` probe on this column -- so they are one entry now, and it is the array occurrence that still disagrees. What is left is a **different fold at a different site**, the same mechanism the wire census found as 196 array rows, and it is b4's: `tests/array_of_array.rs` pins it with `#[ignore]`d expectations.",
-            "pg19_deparse_census.txt:661",
-        ),
+        // ---- D-fold: 0 statements, and the group is closed ----
+        //
+        // **Group D was "a fold at plan time destroys a node PostgreSQL keeps and prints"**
+        // (`debts-v1.1.md` #42) and it had five entries. Four went when `lower_cast` stopped
+        // discarding a cast whose target is not the literal's own type; the fifth was the
+        // array constructor's own fold one site down, `(ARRAY[1, 2])::text` printing
+        // `('{1,2}'::integer[])::text`, and it went when `lower_array_constructor` stopped
+        // folding a constant constructor into a value. The group is kept as this note rather
+        // than deleted: a census whose closed groups vanish cannot say what it used to cover.
         // ---- G-viewdef: 23 statements ----
         (
             "SELECT pg_get_viewdef('v_case_simple'::regclass)",
