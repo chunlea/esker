@@ -4187,23 +4187,26 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             op: UnaryOperator::Not,
             expr,
         } => Ok(plan::Expr::Not(Box::new(lower_expr(expr)?))),
-        // A comparison over `json` or `jsonb` is refused — and **the two are refused differently**,
-        // for the reason the `||` arm above parts them: `json` has no comparison operator on a
-        // real server, so the honest answer is the one a real server gives, while `jsonb` has a
-        // complete btree and *answers*, so refusing it is this node's own gap and says so.
+        // **A comparison over `json` is refused and one over `jsonb` is not**, for the reason the
+        // `||` arm above parts them: `json` has no comparison operator on a real server, so the
+        // honest answer is the one a real server gives, while `jsonb` has a complete btree and
+        // *answers*. One sentence would have to be wrong about one of them.
         //
-        // One sentence would have to be wrong about one of them. `0A000 the operator = over json
-        // or jsonb` was wrong about `json`, which is a `42883 operator does not exist: json =
-        // json` on 19beta1 — eighteen rows of the no-equality census.
-        Expr::BinaryOp { left, op, right } if is_comparison(op) && either_is_json(left, right) => {
-            match (json_cast_name(left), json_cast_name(right)) {
-                (Some("json"), _) | (_, Some("json")) => Err(SqlError::UndefinedOperator {
-                    left: json_cast_name(left).unwrap_or("json").to_owned(),
-                    op: comparison_symbol(op),
-                    right: json_cast_name(right).unwrap_or("json").to_owned(),
-                }),
-                _ => Err(refuse_json_comparison(op)),
-            }
+        // `jsonb` therefore falls through to the ordinary lowering and `exec::query` rewrites it
+        // into a `jsonb_compare` against zero, where the operand's type is known — the parser
+        // cannot see a column's.
+        Expr::BinaryOp { left, op, right }
+            if is_comparison(op)
+                && matches!(
+                    (json_cast_name(left), json_cast_name(right)),
+                    (Some("json"), _) | (_, Some("json"))
+                ) =>
+        {
+            Err(SqlError::UndefinedOperator {
+                left: json_cast_name(left).unwrap_or("json").to_owned(),
+                op: comparison_symbol(op),
+                right: json_cast_name(right).unwrap_or("json").to_owned(),
+            })
         }
         // `date + time` and `time + date`, the one arithmetic in this type that answers a type
         // this node has. Folded here, over **constants only**, which is the same boundary
@@ -4330,6 +4333,16 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 // call and the evaluator dispatches on the operands — the rule the `||` regression
                 // taught: an operator this crate carries for one type must not answer for
                 // another's, and the only place that can be decided is where the values are.
+                // **`~=` is carried, not refused here.** Which types have it is the opposite of
+                // which types have the operators around it — the geometric shapes do and the
+                // document types do not — so the answer needs the operand's type, and the parser
+                // has none for a column.
+                BinaryOperator::TildeEq => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::SameAs,
+                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
                 BinaryOperator::AtArrow => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::HstoreContains,
@@ -6794,30 +6807,6 @@ fn lower_regclass(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
     })))
 }
 
-/// `0A000` for a comparison over `json` or `jsonb`.
-///
-/// Refused **in the lowering**, where the operand still says which type it is. Once a cast has
-/// been lowered a `jsonb` is a `Datum::Text` and the type is gone: `Datum` has no json variant,
-/// because these two share `text`'s representation. That sharing is exactly what `varchar` and
-/// `bpchar` do and it is safe for them, because their comparison *is* text comparison. `jsonb`'s
-/// is not — `'1.0'::jsonb = '1.00'::jsonb` is `t` on a real server and byte comparison says `f`,
-/// and `ORDER BY` sorts by kind before value. Answering either from the bytes would be a wrong
-/// answer, so both are `0A000` until `jsonb` has a `Datum` of its own.
-///
-/// That is the `real` unit's lesson one layer up: **a type may share another's representation only
-/// if it shares its comparison.** `json` has no comparison operators at all on a real server, so
-/// refusing there is closer still. [ADR 0042](../../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md).
-fn refuse_json_comparison(op: &BinaryOperator) -> SqlError {
-    SqlError::unsupported(format!("the operator {op} over json or jsonb"))
-}
-
-/// Whether either operand of a comparison is written as a `json` or `jsonb` value.
-///
-/// Syntactic, and it has to be: after lowering, a `jsonb` is a `Datum::Text` like any other.
-fn either_is_json(left: &Expr, right: &Expr) -> bool {
-    is_json_expr(left) || is_json_expr(right)
-}
-
 /// Which of `json` and `jsonb` a cast wrote, for the `->` that has to answer one of them.
 ///
 /// The **outermost** cast wins, which is what `'{"a":1}'::json::jsonb -> 'a'` asks for.
@@ -6832,16 +6821,6 @@ fn json_cast_type(expr: &Expr) -> Option<ColumnType> {
             _ => json_cast_type(expr),
         },
         _ => None,
-    }
-}
-
-fn is_json_expr(expr: &Expr) -> bool {
-    match expr {
-        Expr::Nested(inner) => is_json_expr(inner),
-        Expr::Cast {
-            expr, data_type, ..
-        } => matches!(data_type, DataType::JSON | DataType::JSONB) || is_json_expr(expr),
-        _ => false,
     }
 }
 

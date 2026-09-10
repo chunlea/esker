@@ -3215,6 +3215,24 @@ fn catalog_function(
         args.push(evaluate_in(arg, row, env)?);
     }
     Ok(match call.func {
+        // **Reached only for the types that *have* `~=` on a real server**, since resolution has
+        // already refused the rest with PostgreSQL's own sentence. `point` and `polygon` answer it
+        // there and this node does not implement it, so the refusal is the one it always was — a
+        // gap a client can read, and a row of `pg19_no_equality_types.txt` in the (b) direction.
+        CatalogFunc::SameAs => return Err(SqlError::unsupported("the operator ~=")),
+        // **A `jsonb` comparison, as `-1`, `0` or `1`.** Both operands are the canonical text the
+        // type stores, so re-parsing them is faithful — `crate::value::json::canonicalise` ran on
+        // the way in. NULL in, NULL out, as every comparison is.
+        CatalogFunc::JsonbCompare => match (args.first(), args.get(1)) {
+            (Some(Datum::Text(left)), Some(Datum::Text(right))) => {
+                Datum::Int4(match crate::value::json::compare(left, right)? {
+                    Ordering::Less => -1,
+                    Ordering::Equal => 0,
+                    Ordering::Greater => 1,
+                })
+            }
+            _ => Datum::Null,
+        },
         // **Sleeps in short steps and checks between them.** A single `sleep` for the whole
         // duration would ignore `statement_timeout` and a cancel until it was over, and being
         // interruptible is the entire reason this node has `pg_sleep` — it is how a test makes a

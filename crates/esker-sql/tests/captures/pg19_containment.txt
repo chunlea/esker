@@ -1,0 +1,71 @@
+# **Containment: `@>`, `<@` and `&&` over `jsonb` and `polygon`** — PostgreSQL 19beta1, 2026-09-09.
+# `ON_ERROR_ROLLBACK on`, one `BEGIN … ROLLBACK`, no fixture.
+#
+# The second (b) family: PostgreSQL answers these and this node refuses them. Both provenances are
+# here, literal and column, because which one a fix reaches has been this lane's recurring defect.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **Nesting must match, in both directions.** `'[[1,2]]' @> '[1,2]'` is `f` **and**
+#     `'[1,2]' @> '[[1,2]]'` is `f`. A containment that flattens is wrong twice over.
+#   * **The scalar exception runs one way only.** `'[2]' @> '2'` is `t` — an array contains a bare
+#     scalar — while `'2' @> '[2]'` is `f`. It is not a symmetric "a scalar is a one-element
+#     array" rule, and this is the second family in a row where that model looks right and is not.
+#   * **Order and duplicates in an array are free**: `'[1,2]' @> '[1,1,1]'` is `t` and
+#     `'{"a":[1,2]}' @> '{"a":[2,1]}'` is `t`. Containment asks whether every element of the right
+#     is contained in *some* element of the left, not whether the arrays line up.
+#   * **`'[1,2]' @> '[]'` is `t`** — the empty array is contained in every array, which is the
+#     opposite end of the same value that broke the ordering rank in `pg19_jsonb_order.txt`.
+#   * **Objects and objects inside arrays are recursive**: `'{"a":{"b":1,"c":2}}' @> '{"a":{"b":1}}'`
+#     and `'[{"a":1,"b":2}]' @> '[{"a":1}]'` are both `t`.
+#   * **`<@` is `@>` with the operands the other way round** and nothing else — measured for both
+#     types, which is what lets one implementation answer both, exactly as `parse::lower` already
+#     assumes when it flips the arguments.
+#   * **`polygon @> polygon` is geometric containment**, not a comparison of the point lists: a
+#     4×4 square contains a 1×1 one, the reverse is `f`, and a polygon contains itself.
+#
+# ## The measurements
+#
+SELECT ('{"a":1,"b":2}'::jsonb @> '{"a":1}'::jsonb) AS v	boolean	t
+SELECT ('{"a":1,"b":2}'::jsonb <@ '{"a":1}'::jsonb) AS v	boolean	f
+SELECT ('{"a":1}'::jsonb @> '{"a":1,"b":2}'::jsonb) AS v	boolean	f
+SELECT ('{"a":1}'::jsonb <@ '{"a":1,"b":2}'::jsonb) AS v	boolean	t
+SELECT ('[1,2,3]'::jsonb @> '[1,3]'::jsonb) AS v	boolean	t
+SELECT ('[1,2,3]'::jsonb <@ '[1,3]'::jsonb) AS v	boolean	f
+SELECT ('[1,2]'::jsonb @> '[1,1,1]'::jsonb) AS v	boolean	t
+SELECT ('[1,2]'::jsonb <@ '[1,1,1]'::jsonb) AS v	boolean	f
+SELECT ('[1,2]'::jsonb @> '[]'::jsonb) AS v	boolean	t
+SELECT ('[1,2]'::jsonb <@ '[]'::jsonb) AS v	boolean	f
+SELECT ('[1,2,3]'::jsonb @> '3'::jsonb) AS v	boolean	t
+SELECT ('[1,2,3]'::jsonb <@ '3'::jsonb) AS v	boolean	f
+SELECT ('3'::jsonb @> '3'::jsonb) AS v	boolean	t
+SELECT ('3'::jsonb <@ '3'::jsonb) AS v	boolean	t
+SELECT ('2'::jsonb @> '[2]'::jsonb) AS v	boolean	f
+SELECT ('2'::jsonb <@ '[2]'::jsonb) AS v	boolean	t
+SELECT ('[2]'::jsonb @> '2'::jsonb) AS v	boolean	t
+SELECT ('[2]'::jsonb <@ '2'::jsonb) AS v	boolean	f
+SELECT ('[[1,2]]'::jsonb @> '[1,2]'::jsonb) AS v	boolean	f
+SELECT ('[[1,2]]'::jsonb <@ '[1,2]'::jsonb) AS v	boolean	f
+SELECT ('[1,2]'::jsonb @> '[[1,2]]'::jsonb) AS v	boolean	f
+SELECT ('[1,2]'::jsonb <@ '[[1,2]]'::jsonb) AS v	boolean	f
+SELECT ('[[1,2]]'::jsonb @> '[[1]]'::jsonb) AS v	boolean	t
+SELECT ('[[1,2]]'::jsonb <@ '[[1]]'::jsonb) AS v	boolean	f
+SELECT ('{"a":{"b":1,"c":2}}'::jsonb @> '{"a":{"b":1}}'::jsonb) AS v	boolean	t
+SELECT ('{"a":{"b":1,"c":2}}'::jsonb <@ '{"a":{"b":1}}'::jsonb) AS v	boolean	f
+SELECT ('{"a":[1,2]}'::jsonb @> '{"a":[2,1]}'::jsonb) AS v	boolean	t
+SELECT ('{"a":[1,2]}'::jsonb <@ '{"a":[2,1]}'::jsonb) AS v	boolean	t
+SELECT ('[{"a":1,"b":2}]'::jsonb @> '[{"a":1}]'::jsonb) AS v	boolean	t
+SELECT ('[{"a":1,"b":2}]'::jsonb <@ '[{"a":1}]'::jsonb) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((1,1),(2,1),(2,2),(1,2))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon <@ '((1,1),(2,1),(2,2),(1,2))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon && '((1,1),(2,1),(2,2),(1,2))'::polygon) AS v	boolean	t
+SELECT ('((1,1),(2,1),(2,2),(1,2))'::polygon @> '((0,0),(4,0),(4,4),(0,4))'::polygon) AS v	boolean	f
+SELECT ('((1,1),(2,1),(2,2),(1,2))'::polygon <@ '((0,0),(4,0),(4,4),(0,4))'::polygon) AS v	boolean	t
+SELECT ('((1,1),(2,1),(2,2),(1,2))'::polygon && '((0,0),(4,0),(4,4),(0,4))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((0,0),(4,0),(4,4),(0,4))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon <@ '((0,0),(4,0),(4,4),(0,4))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon && '((0,0),(4,0),(4,4),(0,4))'::polygon) AS v	boolean	t
+SELECT (a @> b) AS v FROM (VALUES ('{"a":1,"b":2}'::jsonb, '{"a":1}'::jsonb)) s(a,b)	boolean	t
+SELECT (a <@ b) AS v FROM (VALUES ('{"a":1}'::jsonb, '{"a":1,"b":2}'::jsonb)) s(a,b)	boolean	t
+SELECT (a @> b) AS v FROM (VALUES ('((0,0),(4,0),(4,4),(0,4))'::polygon, '((1,1),(2,1),(2,2),(1,2))'::polygon)) s(a,b)	boolean	t
+SELECT (a <@ b) AS v FROM (VALUES ('((1,1),(2,1),(2,2),(1,2))'::polygon, '((0,0),(4,0),(4,4),(0,4))'::polygon)) s(a,b)	boolean	t

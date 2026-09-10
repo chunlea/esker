@@ -2988,6 +2988,24 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             {
                 return Err(SqlError::NoEqualityOperator(element.name()));
             }
+            // **A `jsonb` comparison becomes `jsonb_compare(a, b) <op> 0`.** All six operators are
+            // then one implementation and the ordinary `int4` comparison does the rest. It is
+            // rewritten here and not at lowering because the parser sees a *cast* and this sees a
+            // *type*, so a `jsonb` column compares like a `jsonb` literal — the provenance split
+            // that has cost this lane four units.
+            if op.is_comparison()
+                && let Ok(ty) = expr_type(&left, scope)
+                && ty == ColumnType::Jsonb
+            {
+                return Ok(Expr::Binary {
+                    op: *op,
+                    left: Box::new(Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                        func: CatalogFunc::JsonbCompare,
+                        args: vec![left, right],
+                    }))),
+                    right: Box::new(Expr::Literal(Literal::Typed(Box::new(Datum::Int4(0))))),
+                });
+            }
             // **And a scalar whose `=` does not exist at all**, which is a different list from
             // the one above and from `same_family`: `same_family(polygon, polygon)` is true —
             // they are the same type — and there is still no `polygon = polygon` on a real
@@ -3183,24 +3201,37 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             // agree about which types have them: `polygon @> polygon` answers where
             // `point @> point` does not, and `polygon && polygon` answers where `jsonb && jsonb`
             // does not (`value::operator_exists`, measured cell by cell).
-            if matches!(
-                call.func,
-                CatalogFunc::RangeOverlaps
-                    | CatalogFunc::RangeContains
-                    | CatalogFunc::HstoreContains
-            ) && let Some(first) = args.first()
-                && let Ok(left) = expr_type(first, scope)
-                && !crate::value::operator_exists(call.func.name(), left)
-            {
-                let right = args
-                    .get(1)
-                    .and_then(|arg| expr_type(arg, scope).ok())
-                    .unwrap_or(left);
-                return Err(SqlError::UndefinedOperator {
-                    left: left.name().to_owned(),
-                    op: call.func.name(),
-                    right: right.name().to_owned(),
-                });
+            // **The spelling the user wrote is recoverable here**, though `CatalogFunc::name`
+            // collapses both containments to `@>` for the evaluator's dispatch: `parse::lower`
+            // sends a written `@>` to `HstoreContains` and a written `<@` to `RangeContains`
+            // **with its arguments flipped**, and each of the two has exactly one origin. So the
+            // refusal can say `json <@ json`, which is what a real server says, rather than naming
+            // the operator this crate rewrote it into.
+            let containment = match call.func {
+                CatalogFunc::RangeContains => Some(("<@", true)),
+                CatalogFunc::HstoreContains => Some(("@>", false)),
+                CatalogFunc::RangeOverlaps | CatalogFunc::SameAs => Some((call.func.name(), false)),
+                _ => None,
+            };
+            if let Some((symbol, flipped)) = containment {
+                let (written_left, written_right) = if flipped {
+                    (args.get(1), args.first())
+                } else {
+                    (args.first(), args.get(1))
+                };
+                if let Some(operand) = written_left
+                    && let Ok(left) = expr_type(operand, scope)
+                    && !crate::value::operator_exists(symbol, left)
+                {
+                    let right = written_right
+                        .and_then(|arg| expr_type(arg, scope).ok())
+                        .unwrap_or(left);
+                    return Err(SqlError::UndefinedOperator {
+                        left: left.name().to_owned(),
+                        op: symbol,
+                        right: right.name().to_owned(),
+                    });
+                }
             }
             // **`pg_typeof` is answered here, from the argument's *declared* type, always.**
             //
@@ -4198,12 +4229,17 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
         // neither side is a column, and without it `'2020-01-01'::date = 1` compares a `Datum` to
         // a `Datum`, falls through `pg_cmp`'s cross-variant order and answers **`f`** — a value
         // where a real server raises, which is the worst class ADR 0031 ranks.
+        // **The two sites below name `missing_symbol`, not the spelling.** `IS DISTINCT FROM` is
+        // built on `=` and a real server refusing it says `operator does not exist: json = json`.
+        // Found by marking every `UndefinedOperator` in this crate with its own line and running
+        // the census once — three readings of the code had blamed three other sites, and these two
+        // are the pair that fires.
         (Expr::Literal(left_literal), Expr::Literal(right_literal)) => {
             match (literal_type(left_literal), literal_type(right_literal)) {
                 (Some(a), Some(b)) if !same_family(a, b) => {
                     return Err(SqlError::UndefinedOperator {
                         left: a.name().to_owned(),
-                        op: op.symbol(),
+                        op: op.missing_symbol(),
                         right: b.name().to_owned(),
                     });
                 }
@@ -4229,7 +4265,7 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
             };
             return Err(SqlError::UndefinedOperator {
                 left: a.name().to_owned(),
-                op: op.symbol(),
+                op: op.missing_symbol(),
                 right: b.name().to_owned(),
             });
         }
