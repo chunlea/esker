@@ -248,7 +248,7 @@ fn point(x: f64, y: f64) -> String {
 /// the radius `centre <-> high corner` and not half the diagonal (500 random boxes, no
 /// exceptions), a `polygon`'s circle is centred on the mean of its vertices with the mean distance
 /// for a radius (150), and a `circle`'s polygon is twelve vertices at
-/// `(cx - r·cos θ, cy + r·sin θ)` (200). `tests/captures/pg19_cast_matrix.txt` holds one probe per
+/// `(cx - r·cos θ, cy + r·sin θ)` (200). `tests/corpus/pg19_cast_matrix.txt` holds one probe per
 /// pair and `tests/corpus/pg19_geometric.txt` the literal forms of all fourteen.
 pub fn convert(from: Kind, to: Kind, text: &str) -> Result<String> {
     let parts = coordinates(from, text)?;

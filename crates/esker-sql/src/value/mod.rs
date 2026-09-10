@@ -88,7 +88,7 @@ pub use esker_keys::value::{ColumnType, Datum, f64_of_sort_bits, sort_bits_of_f6
 /// `exec::cursor`'s `ToText` arm had the rule (`SELECT true::text` is `true`) and so did `||`
 /// (`'a' || true` is `atrue`), both measured; the evaluator's `Expr::Cast` arm fell through to the
 /// output function and wrote `t` into a `varchar` or a `bpchar` — two rows of
-/// `tests/captures/pg19_cast_matrix.txt`, and the one an application sees, because a client that
+/// `tests/corpus/pg19_cast_matrix.txt`, and the one an application sees, because a client that
 /// writes a boolean into a character column gets `t` here and `true` there
 /// (`debts-v1.1.md` #44). The `::text` spelling was right the whole time, which is what made it
 /// invisible: `bool::text` lowers to `ToText` and never reaches the cast.

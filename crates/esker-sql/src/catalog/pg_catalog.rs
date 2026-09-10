@@ -2327,7 +2327,7 @@ pub const CASTS: [(i64, i64, &str, &str); 148] = [
     //
     // Without these rows `casts_to` refused all fourteen — `42846 cannot cast type box to circle`
     // for a statement a real server answers — which is the first mechanism of `debts-v1.1.md`
-    // #43, and `crates/esker-sql/tests/captures/pg19_cast_matrix.txt` holds one probe per pair.
+    // #43, and `crates/esker-sql/tests/corpus/pg19_cast_matrix.txt` holds one probe per pair.
     (600, 603, "a", "f"),
     (601, 600, "e", "f"),
     (602, 604, "a", "f"),
