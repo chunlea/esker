@@ -3267,8 +3267,65 @@ impl PgDatum for Datum {
                 float::pg_cmp_int(i64::from(*b), f64::from(*a)).reverse()
             }
             (Datum::Int2(a), Datum::Real(b)) => float::pg_cmp_int(i64::from(*a), f64::from(*b)),
+            // **An oid-ish value against every integer width, and against another oid-ish
+            // value.** The arms above were written one pair at a time — `oid` against `int8`,
+            // `int4` and `int2`, `regclass` against `oid` and `int8` — and the pairs nobody
+            // wrote fell through to [`variant_rank`], where every oid-ish value ranks *as* an
+            // `Oid` and every integer ranks with it: the fallback then answered `Equal`, so
+            // `'pg_class'::regclass = 1::int2` was **`t`**, and so was every other regclass
+            // against every other `int2` or `int4`. A wrong value rather than a missing
+            // feature, and the class ADR 0031 ranks worst.
+            //
+            // Measured on 19beta1, 2026-09-10: `'int4'::regtype = 1::int2` is `f` and
+            // `= 23::int2` is `t` — `int4`'s own oid is 23, which is what makes the pair
+            // discriminating — `'pg_class'::regclass = 1::int2` and `'int4in'::regproc = 1::int2`
+            // are `f`, `'pg_class'::regclass = 'int4'::regtype` is `f`, and `1::oid = 1::int2`
+            // is `t`.
+            //
+            // **Written as one rule rather than as the eight missing pairs**, because that is how
+            // the pairs went missing: a rule aimed at the pair in front of it reaches only that
+            // pair, and `regclass` holds its oid in an `i64` where the others hold a `u32`, which
+            // is what kept them in separate arms long enough for the gaps to open.
+            (a, b)
+                if let Some(left) = oid_ish_number(a)
+                    && let Some(right) = oid_ish_number(b).or_else(|| integer_number(b)) =>
+            {
+                left.cmp(&right)
+            }
+            (a, b)
+                if let Some(left) = integer_number(a)
+                    && let Some(right) = oid_ish_number(b) =>
+            {
+                left.cmp(&right)
+            }
             (a, b) => variant_rank(a).cmp(&variant_rank(b)),
         }
+    }
+}
+
+/// The oid an oid-ish value holds, widened to the type `regclass` keeps its in.
+///
+/// The four spellings are one number to every operator PostgreSQL has for them — `oideq` takes an
+/// `oid` and the `reg*` types reach it through their binary-coercible casts — so the comparison
+/// wants one reader rather than one arm per pairing.
+fn oid_ish_number(value: &Datum) -> Option<i64> {
+    match value {
+        Datum::Oid(oid) | Datum::RegType { oid, .. } | Datum::RegProc { oid, .. } => {
+            Some(i64::from(*oid))
+        }
+        Datum::RegClass { oid, .. } => Some(*oid),
+        _ => None,
+    }
+}
+
+/// The value an integer holds, widened. `numeric` and the floats are deliberately not here: an
+/// `oid` compares with the integer widths and with neither of those, measured.
+fn integer_number(value: &Datum) -> Option<i64> {
+    match value {
+        Datum::Int2(value) => Some(i64::from(*value)),
+        Datum::Int4(value) => Some(i64::from(*value)),
+        Datum::Int8(value) => Some(*value),
+        _ => None,
     }
 }
 

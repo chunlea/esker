@@ -2460,6 +2460,40 @@ impl Literal {
                         | ColumnType::Numeric
                 )
             }
+            // **An `oid` value compares with the integer widths and with the other oid-ish
+            // types, and with nothing else** — `same_family`'s own rule, read from the literal's
+            // side. Measured, one statement per cell: `'1'::oid = '1'::bigint`, `= '1'::integer`,
+            // `= '1'::smallint` and `= 'int4'::regtype` all answer, `'1'::oid = '1.5'::numeric`,
+            // `= '1.5'::double precision` and `= '1.5'::real` are each `42883`, and `regclass`,
+            // `regproc` and `regtype` behave as `oid` does against all three integer widths
+            // (`tests/captures/pg19_comparison_matrix.txt`).
+            //
+            // Without it a folded `1::oid` beside a *cast* to an integer width fell through to
+            // [`Datum::fits`] — the **assignment** rule, which says an `oid` is not a `bigint` —
+            // and `1::oid = 1::int8` was `42883 operator does not exist: oid = bigint`. That is
+            // the third of the three reds `parse::lower::lower_cast`'s comment names as the
+            // boundary of `debts-v1.1.md` #42's remaining half, and it is the same shape as the
+            // rest of #43: one fact, two readers, and only the reader it was written for knew it.
+            Literal::Typed(value)
+                if matches!(
+                    **value,
+                    Datum::Oid(_)
+                        | Datum::RegType { .. }
+                        | Datum::RegProc { .. }
+                        | Datum::RegClass { .. }
+                ) =>
+            {
+                matches!(
+                    ty,
+                    ColumnType::Int2
+                        | ColumnType::Int4
+                        | ColumnType::Int8
+                        | ColumnType::Oid
+                        | ColumnType::RegType
+                        | ColumnType::RegProc
+                        | ColumnType::RegClass
+                )
+            }
             Literal::Typed(value) => value.fits(ty),
         }
     }

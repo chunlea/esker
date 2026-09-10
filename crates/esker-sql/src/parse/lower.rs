@@ -6614,12 +6614,13 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 // is `0A000`. Same shape as the rule above, different site, and it is b4's —
                 // pinned by the `#[ignore]`d expectations in `tests/array_of_array.rs`, which is
                 // the file to read before touching the fold below.
-                // **Only where the target is `text`**, and the boundary is measured rather than
-                // cautious. `ToText` is the target type's *output* function, which every type has,
-                // so deferring the conversion to evaluation costs nothing. A cast to anything else
-                // has to be performed by the evaluator's own `Cast` arm, and that arm knows fewer
-                // conversions than this fold does — keeping the node for those turned three green
-                // tests red at once, each naming a different half of the same gap:
+                // **For every target, and it used to be only `text`.** `ToText` is the target
+                // type's *output* function, which every type has, so deferring a cast to `text`
+                // to evaluation always cost nothing; a cast to anything else has to be performed
+                // by the evaluator's own `Cast` arm, and that arm once knew fewer conversions
+                // than this fold did. Keeping the node for those turned three green tests red at
+                // once, each naming a different half of the same gap, and they were left written
+                // here so the next attempt would start from them:
                 //
                 // ```text
                 // 567.89::numeric::money   42846 cannot cast type numeric to money
@@ -6627,19 +6628,38 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 // 1::oid = 1::int8         42883 operator does not exist: oid = bigint
                 // ```
                 //
-                // The last one is not an evaluator gap at all: a comparison retypes a *literal*
+                // **All three are paid, and re-measuring is what said so** rather than reading:
+                // widening the guard again turned **one** of the three red, not three. The first
+                // two went when `debts-v1.1.md` #43's first mechanism closed — the evaluator has
+                // every `pg_cast` conversion now, all 38 — and nobody had gone back to say the
+                // blocker had shrunk.
+                //
+                // The third was never an evaluator gap at all: a comparison retypes a *literal*
                 // against the other side, and a `Cast` node is not a literal, so `1::int8` stopped
-                // being something `reconcile` could meet an `oid` with. **The fold is load-bearing
-                // for more than printing**, and the non-`text` half of #42 waits on that being
-                // true in the evaluator and the resolver first. The census carries the measurement.
+                // being something `reconcile` could meet an `oid` with. It cost three fixes, each
+                // hidden behind the one before it and each a second reader of one measured fact —
+                // `Literal::comparable_with` and `exec::query::retype` both asked the
+                // **assignment** rule about an oid-ish literal, and `Datum::pg_cmp` had no arm for
+                // an oid against an `int2` or an `int4` at all. That last one was answering
+                // `Equal` for every such pair, which `tests/oid_type.rs` now pins.
+                //
+                // So this is `debts-v1.1.md` #42's remaining half: a cast whose operand is not
+                // already of the target type keeps its node, and the constant under it is the one
+                // that was written.
                 if let Some(from) = source_type(expr)?
                     && from != ty
-                    && ty == ColumnType::Text
                 {
-                    return Ok(plan::Expr::ToText {
+                    if ty == ColumnType::Text {
+                        return Ok(plan::Expr::ToText {
+                            operand: Box::new(lower_expr(expr)?),
+                            strip_blanks: false,
+                            enum_labels: None,
+                        });
+                    }
+                    return Ok(plan::Expr::Cast {
                         operand: Box::new(lower_expr(expr)?),
-                        strip_blanks: false,
-                        enum_labels: None,
+                        to: ty,
+                        typmod,
                     });
                 }
                 if value.column_type() == Some(ty) && typmod == NO_TYPMOD {

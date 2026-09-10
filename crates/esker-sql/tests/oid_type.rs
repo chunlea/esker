@@ -160,9 +160,47 @@ fn it_orders_numerically_and_compares_with_the_integers() {
     assert_eq!(node.rows("SELECT '10'::oid < '9'::oid"), vec![vec!["f"]]);
     assert_eq!(node.rows("SELECT 1::oid < 2::oid"), vec![vec!["t"]]);
     assert_eq!(
-        node.rows("SELECT 1::oid = 1::int4, 1::oid = 1::int8"),
-        vec![vec!["t", "t"]]
+        node.rows("SELECT 1::oid = 1::int4, 1::oid = 1::int8, 1::oid = 1::int2"),
+        vec![vec!["t", "t", "t"]]
     );
+    // **And the reg* types compare with the integers by their oid, not by their rank.** Every
+    // oid-ish value ranks *as* an `Oid` in `pg_cmp`'s total order and every integer ranks with it,
+    // so a pair with no arm of its own came back `Equal`: `'pg_class'::regclass = 1::int2` was
+    // **`t`**, and so was every regclass against every `int2` or `int4`. The arms had been written
+    // one pairing at a time — `oid` against all three widths, `regclass` against `oid` and `int8`
+    // — and the eight nobody wrote are where a wrong *value* came out.
+    //
+    // `int4`'s own oid is 23, which is what makes the second column discriminating: a row that is
+    // `t` for the right reason beside rows that must be `f`.
+    //
+    // Measured on 19beta1, 2026-09-10, inside `BEGIN … ROLLBACK`.
+    assert_eq!(
+        node.rows(
+            "SELECT 'int4'::regtype = 1::int2, 'int4'::regtype = 23::int2, \
+             'pg_class'::regclass = 1::int2, 'int4in'::regproc = 1::int2, \
+             'pg_class'::regclass = 'int4'::regtype"
+        ),
+        vec![vec!["f", "t", "f", "f", "f"]]
+    );
+    // **And against an integer the fold could not swallow**, which is the same comparison with one
+    // side arriving as a `Cast` node rather than as a constant: `(23.4)::integer` keeps its node
+    // because rounding is not invertible (`debts-v1.1.md` #30), so the oid-ish literal is retyped
+    // against the cast. It was `42883 operator does not exist: regtype = integer` —
+    // `Literal::comparable_with` fell through to `Datum::fits`, the *assignment* rule, which says
+    // an `oid` is not an `integer` — and then `42804 ... is of type integer but expression is of
+    // type regtype`, because `retype` went on to narrow it as an assignment too. Two readers of
+    // one fact, one behind the other, and both are `debts-v1.1.md` #43's shape.
+    assert_eq!(
+        node.rows(
+            "SELECT 'int4'::regtype = (99.4)::integer, 'int4'::regtype = (23.4)::integer, \
+             1::oid = (1.5)::integer"
+        ),
+        vec![vec!["f", "t", "f"]]
+    );
+    // And the widening stops where a real server stops it: an `oid` has no operator against a
+    // `numeric` or either float, which is the family table's rule and is measured beside the rows
+    // above.
+    assert!(node.run("SELECT 1::oid = (1.5)::numeric").is_err());
 }
 
 /// **Unsigned, and the two directions are not symmetric** — measured, both.

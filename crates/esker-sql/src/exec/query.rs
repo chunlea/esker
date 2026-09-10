@@ -4703,6 +4703,30 @@ fn retype(
     {
         return Ok(literal.clone());
     }
+    // **And an oid-ish literal against an integer width is compared, not narrowed**, which is the
+    // arm above one type over and the last of the three reds `parse::lower::lower_cast`'s comment
+    // names. `1::oid = 1::int8` arrives here as an `oid` value against a `bigint` once the fold
+    // keeps the cast node, and `assign` is the wrong question for it: assigning an `oid` into a
+    // `bigint` is `42804 column "?column?" is of type bigint but expression is of type oid`, a
+    // refusal for a comparison a real server answers — `'1'::oid = '1'::bigint` is measured
+    // `boolean`, as are `= '1'::integer` and `= '1'::smallint`, and `regclass`, `regproc` and
+    // `regtype` behave the same against all three widths
+    // (`tests/captures/pg19_comparison_matrix.txt`).
+    //
+    // The **values** are unaffected: `Datum`'s ordering has an arm for an `oid` against each
+    // integer width, which is what already makes `26::oid = 26` answer with a folded literal on
+    // one side. Narrowing is what an assignment does, and this is not one.
+    if matches!(literal, Literal::Typed(value)
+    if matches!(
+        **value,
+        Datum::Oid(_)
+            | Datum::RegType { .. }
+            | Datum::RegProc { .. }
+            | Datum::RegClass { .. }
+    )) && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+    {
+        return Ok(literal.clone());
+    }
     // **And an integer literal wider than the column is compared, not narrowed**, which is the
     // arm above with the widths one step in: PostgreSQL has an `int4 > int8` operator, so
     // `i4 > 9223372036854775807` is answered — `f` for every row — where narrowing the literal to
