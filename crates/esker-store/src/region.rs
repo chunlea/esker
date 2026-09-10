@@ -246,6 +246,7 @@ pub fn txn_request_range(request: &esker_proto::TxnKvReq) -> (Bytes, Bytes) {
         }
         TxnKvReq::Commit { keys, .. }
         | TxnKvReq::Rollback { keys, .. }
+        | TxnKvReq::ReleaseLock { keys, .. }
         | TxnKvReq::ResolveLock { keys, .. } => span(keys.iter().map(|key| &key[..])),
         TxnKvReq::Heartbeat { primary, .. } => {
             (Bytes::copy_from_slice(primary), successor(primary))

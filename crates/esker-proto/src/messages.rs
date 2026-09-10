@@ -162,6 +162,9 @@ pub enum Method {
     /// drop's commit timestamp, which is why that timestamp is on the request rather than left to
     /// the caller's timing.
     TxnReclaimRange = 0x020A,
+    /// `TxnKv::ReleaseLock` — give one transaction's own locks back without ending it
+    /// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+    TxnReleaseLock = 0x020B,
 
     /// `Fragment::Evaluate` — run a plan fragment against a node's columnar copy of a region
     /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md), [`crate::fragment`]).
@@ -208,7 +211,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -243,6 +246,7 @@ impl Method {
         Self::TxnGcSafepoint,
         Self::TxnLatestCommit,
         Self::TxnReclaimRange,
+        Self::TxnReleaseLock,
         Self::AdminSplit,
         Self::AdminTransferLeader,
         Self::AdminRegions,
@@ -296,6 +300,7 @@ impl Method {
             0x0208 => Some(Self::TxnGcSafepoint),
             0x0209 => Some(Self::TxnLatestCommit),
             0x020A => Some(Self::TxnReclaimRange),
+            0x020B => Some(Self::TxnReleaseLock),
             0x0501 => Some(Self::AdminSplit),
             0x0502 => Some(Self::AdminTransferLeader),
             0x0503 => Some(Self::AdminRegions),
@@ -362,6 +367,7 @@ impl Method {
             Self::TxnGcSafepoint => "TxnKv::GcSafepoint",
             Self::TxnLatestCommit => "TxnKv::LatestCommit",
             Self::TxnReclaimRange => "TxnKv::ReclaimRange",
+            Self::TxnReleaseLock => "TxnKv::ReleaseLock",
         }
     }
 
@@ -393,6 +399,8 @@ impl Method {
                 // It deletes data. That it deletes it by range rather than key by key does not
                 // make it a read.
                 | Self::TxnReclaimRange
+                // It deletes a lock record, which every replica has to agree about.
+                | Self::TxnReleaseLock
         )
     }
 
@@ -1609,7 +1617,8 @@ mod tests {
                 | Method::TxnHeartbeat
                 | Method::TxnGcSafepoint
                 | Method::TxnLatestCommit
-                | Method::TxnReclaimRange => SERVICE_TXN_KV,
+                | Method::TxnReclaimRange
+                | Method::TxnReleaseLock => SERVICE_TXN_KV,
                 Method::FragmentEvaluate => crate::messages::SERVICE_FRAGMENT,
                 Method::SchemaFetch => crate::messages::SERVICE_SCHEMA,
                 _ => SERVICE_RAW_KV,
@@ -1641,12 +1650,38 @@ mod tests {
 
     #[test]
     fn an_unknown_method_is_an_error_not_a_skipped_frame() {
-        // **`0x020B` is the first code this service has not issued**, and keeping the first
-        // *unused* one here is what makes this a test about an older peer meeting a newer method
-        // rather than a test about four numbers that were free the day it was written. Every
-        // method added to a service takes one of these boundaries away, so the next one replaces
-        // it — `0x020A` was in this list until `TxnKv::ReclaimRange` claimed it.
-        for tag in [0x0000u16, 0x0109, 0x0200, 0x020B, 0xFFFF] {
+        // **The boundaries are computed, not listed.** This test is about an older peer meeting a
+        // newer method, so the interesting tag is the first code each service has *not* issued —
+        // and every method added takes one of those away. Written out, the list goes stale the
+        // next time anyone adds a method, and it did twice: `0x020A` was in it until
+        // `TxnKv::ReclaimRange` claimed it, and `0x020B` until `TxnKv::ReleaseLock` did. A list
+        // that has to be edited by whoever extends the enum is a list that reddens the gate
+        // instead of testing anything, so this asks the enum.
+        //
+        // Two boundaries per service and both are unissued by construction: **index zero**, which
+        // no service starts at, and **one past its highest** — skipped where that would carry into
+        // the next service's number space, because there it would not be this service's boundary
+        // at all.
+        let mut unknown = vec![0x0000u16, 0xFFFF];
+        let mut highest: std::collections::BTreeMap<u8, u8> = std::collections::BTreeMap::new();
+        for method in Method::ALL {
+            let tag = method as u16;
+            let entry = highest.entry((tag >> 8) as u8).or_default();
+            *entry = (*entry).max((tag & 0xFF) as u8);
+        }
+        for (service, top) in &highest {
+            unknown.push(u16::from(*service) << 8);
+            if let Some(next) = top.checked_add(1) {
+                unknown.push(u16::from(*service) << 8 | u16::from(next));
+            }
+        }
+        unknown.sort_unstable();
+        unknown.dedup();
+        assert!(
+            unknown.len() > 2,
+            "the enum named no services, so this test checked nothing"
+        );
+        for tag in unknown {
             assert_eq!(Method::from_u16(tag), None, "{tag:#06x}");
             assert!(Request::decode(&tag.to_le_bytes()).is_err(), "{tag:#06x}");
             assert!(Response::decode(&tag.to_le_bytes()).is_err(), "{tag:#06x}");

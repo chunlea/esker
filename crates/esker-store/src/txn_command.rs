@@ -22,7 +22,8 @@
 //! # Format (*fixed*, version 1)
 //!
 //! ```text
-//! verb:u8      1 Prewrite, 2 Commit, 3 Rollback, 4 ResolveLock, 5 Heartbeat
+//! verb:u8      1 Prewrite, 2 Commit, 3 Rollback, 4 ResolveLock, 5 Heartbeat,
+//!              6 ReleaseLock
 //! fields       as each verb documents
 //! ```
 //!
@@ -43,6 +44,12 @@ const VERB_COMMIT: u8 = 2;
 const VERB_ROLLBACK: u8 = 3;
 const VERB_RESOLVE_LOCK: u8 = 4;
 const VERB_HEARTBEAT: u8 = 5;
+/// **An addition to the verb space, not a change to it**
+/// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2):
+/// every byte an earlier verb produced still decodes to the same command. A peer that does not
+/// know verb 6 refuses to decode it, which is the same rolling-upgrade rule every replicated
+/// addition in this format carries.
+const VERB_RELEASE_LOCK: u8 = 6;
 
 /// One key's worth of a [`TxnCommand::Prewrite`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +158,18 @@ pub enum TxnCommand {
         /// The user keys.
         keys: Vec<Bytes>,
     },
+    /// Give **this** transaction's own locks on these keys back, and leave it running
+    /// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+    ///
+    /// Replicated, and it has to be: it deletes a lock record, and a follower that never learned
+    /// of the deletion would still refuse a reader for a lock the leader gave back — and would go
+    /// on refusing after it became leader.
+    ReleaseLock {
+        /// The transaction's snapshot, and the owner every lock is checked against.
+        start_ts: u64,
+        /// The user keys.
+        keys: Vec<Bytes>,
+    },
     /// Apply a verdict about **another** transaction to the keys of it that live here.
     ResolveLock {
         /// The stuck transaction's snapshot.
@@ -234,6 +253,10 @@ impl TxnCommand {
                 start_ts: *start_ts,
                 keys: keys.clone(),
             }),
+            TxnKvReq::ReleaseLock { start_ts, keys } => Some(Self::ReleaseLock {
+                start_ts: *start_ts,
+                keys: keys.clone(),
+            }),
             TxnKvReq::ResolveLock {
                 start_ts,
                 commit_ts,
@@ -271,6 +294,7 @@ impl TxnCommand {
             Self::Prewrite { writes, .. } => (writes, &[], None),
             Self::Commit { keys, .. }
             | Self::Rollback { keys, .. }
+            | Self::ReleaseLock { keys, .. }
             | Self::ResolveLock { keys, .. } => (&[], keys, None),
             Self::Heartbeat { primary, .. } => (&[], &[], Some(primary)),
         };
@@ -363,6 +387,11 @@ impl TxnCommand {
                 out.put_varint(*start_ts);
                 put_keys(out, keys);
             }
+            Self::ReleaseLock { start_ts, keys } => {
+                out.put_u8(VERB_RELEASE_LOCK);
+                out.put_varint(*start_ts);
+                put_keys(out, keys);
+            }
             Self::ResolveLock {
                 start_ts,
                 commit_ts,
@@ -451,6 +480,10 @@ impl TxnCommand {
                 keys: get_keys(input)?,
             },
             VERB_ROLLBACK => Self::Rollback {
+                start_ts: varint(input, "txn.start_ts")?,
+                keys: get_keys(input)?,
+            },
+            VERB_RELEASE_LOCK => Self::ReleaseLock {
                 start_ts: varint(input, "txn.start_ts")?,
                 keys: get_keys(input)?,
             },

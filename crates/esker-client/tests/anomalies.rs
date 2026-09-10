@@ -312,3 +312,231 @@ fn two_inserts_of_one_new_key_leave_one_winner() {
 
     cluster.shutdown();
 }
+
+/// **A range check meets a lock, waits for it, and is refused when it commits** — and never
+/// wounds it ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
+/// §1).
+///
+/// The store answers `Locked` for a lock inside a checked range, because a transaction that has
+/// prewritten into the range but not committed is a phantom in flight. What the client owes it is
+/// a wait, not a wound: a range check **acquires nothing**, so it cannot be half of a cycle, and
+/// killing the holder to make "this range did not move" true would abort a transaction that did
+/// nothing wrong. The holder here is *younger* than the checker, which is exactly the case the
+/// wound rule would kill.
+///
+/// The assertion is in two halves and both are needed: the checker is refused, **and the holder's
+/// lock is still there afterwards**. Only the second one can tell a wait from a wound.
+#[test]
+fn a_range_check_waits_for_a_lock_it_may_not_wound() {
+    let cluster = cluster(0xa0_0104);
+    let client = client(&cluster, 104);
+    let router = cluster.router(104).expect("a router");
+
+    // The checker's snapshot is taken first, so the holder below is younger than it.
+    let mut checker = client.begin().unwrap();
+    let holder_ts = cluster.oracle().tso_one();
+    assert!(
+        holder_ts > checker.start_ts(),
+        "the holder must be the younger of the two for the wound rule to have an opinion"
+    );
+
+    let held = router
+        .call(&Body::Txn(TxnKvReq::Prewrite {
+            start_ts: holder_ts,
+            primary: Bytes::from_static(b"a7"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::Put {
+                key: Bytes::from_static(b"a7"),
+                value: Bytes::from_static(b"in flight"),
+                read_ts: None,
+            }],
+        }))
+        .unwrap()
+        .into_txn_kv()
+        .unwrap();
+    assert_eq!(held, TxnKvResp::prewrite_ok(1));
+
+    // `a7`, not something past `m`: the topology's boundary is `b"m"`, and a range check is
+    // answered by the region its **lower bound** falls in and no further (ADR 0067 §3). A holder
+    // on the far side of the boundary is a limitation this test must not accidentally measure.
+    checker.put(b"a5", b"mine");
+    checker.checking(
+        [],
+        vec![(Bytes::from_static(b"a"), Bytes::from_static(b"z"))],
+    );
+    let refused = checker
+        .commit()
+        .expect_err("a lock inside the read range is a phantom this transaction cannot rule out");
+    assert!(
+        matches!(refused, Error::LockNotCleared { start_ts, .. } if start_ts == holder_ts),
+        "{refused}"
+    );
+
+    // **The half that proves it waited rather than wounded.** A wound would have left a rollback
+    // marker on the holder's primary and taken its lock away.
+    let still = router
+        .call(&Body::Txn(TxnKvReq::Prewrite {
+            start_ts: cluster.oracle().tso_one(),
+            primary: Bytes::from_static(b"a"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::CheckRange {
+                start: Bytes::from_static(b"a"),
+                end: Bytes::from_static(b"z"),
+            }],
+        }))
+        .unwrap()
+        .into_txn_kv()
+        .unwrap();
+    let TxnKvResp::Prewrite { keys } = still else {
+        panic!("a prewrite answers a prewrite")
+    };
+    assert!(
+        matches!(&keys[..], [TxnStatus::Locked(lock)] if lock.start_ts == holder_ts),
+        "the holder is untouched: {keys:?}"
+    );
+
+    cluster.shutdown();
+}
+
+/// **And when the lock turns out to be nobody's, the check is asked again and passes.**
+///
+/// The counterfactual of the test above, and the reason the store answers `Locked` rather than
+/// `Conflict`: a lock is a question, not a verdict. This holder's lease runs out, so the checker
+/// settles it — leaving a rollback marker, which ADR 0078 already says is not a phantom — asks the
+/// range again, and commits. A client that read `Locked` as "you lost" would refuse this
+/// transaction for a row that never existed.
+#[test]
+fn a_range_check_that_outlives_the_lock_commits() {
+    let cluster = cluster(0xa0_0105);
+    let client = client(&cluster, 105);
+    let router = cluster.router(105).expect("a router");
+
+    // A lease short enough that the resolution loop outlives it, on this side of the `b"m"`
+    // boundary so that the range check actually reaches it.
+    let abandoned = router
+        .call(&Body::Txn(TxnKvReq::Prewrite {
+            start_ts: cluster.oracle().tso_one(),
+            primary: Bytes::from_static(b"a7"),
+            ttl_ms: 1,
+            mutations: vec![TxnMutation::Put {
+                key: Bytes::from_static(b"a7"),
+                value: Bytes::from_static(b"abandoned"),
+                read_ts: None,
+            }],
+        }))
+        .unwrap()
+        .into_txn_kv()
+        .unwrap();
+    assert_eq!(abandoned, TxnKvResp::prewrite_ok(1));
+
+    let mut checker = client.begin().unwrap();
+    checker.put(b"a5", b"mine");
+    checker.checking(
+        [],
+        vec![(Bytes::from_static(b"a"), Bytes::from_static(b"z"))],
+    );
+    checker
+        .commit()
+        .expect("the lock was settled and left a marker, which is not a phantom");
+
+    cluster.shutdown();
+}
+
+/// Whether `key` is free of any lock, asked by the only thing a `FOR UPDATE` lock excludes.
+///
+/// **Not a `Get`.** A lock taken by `Transaction::lock` carries `Kind::Lock`, and
+/// `percolator::read` steps past those on purpose: a locking read must not block a plain reader,
+/// which is what a real server does too. What such a lock excludes is another *acquirer*, so that
+/// is what asks.
+///
+/// The probe is younger than any holder, so it waits rather than wounding, and it gives back
+/// whatever it took — with the very call under test, which is the cheapest way to keep the probe
+/// from becoming a second holder.
+fn is_free(client: &TxnClient, key: &'static [u8]) -> bool {
+    let mut probe = client.begin().expect("a probe transaction");
+    let taken = matches!(
+        probe.lock(key).expect("the probe reaches the store"),
+        esker_client::Acquired::Taken
+    );
+    if taken {
+        probe
+            .release(&[Bytes::from_static(key)])
+            .expect("the probe gives back what it took");
+    }
+    taken
+}
+
+/// **A savepoint gives its eager lock back, and the transaction goes on**
+/// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+///
+/// The case that made ADR 0104 §2 necessary and the case the obvious guard would have missed:
+/// the released key is the transaction's own **primary**. `pin_primary` takes *the smallest key
+/// already buffered, or the key being locked when nothing is*, so a savepoint whose first act is
+/// `SELECT … FOR UPDATE` over a transaction that has written nothing pins that very row — which is
+/// Rails' shape exactly. A rule of "never release the primary" would leave the savepoint's own
+/// lock behind, which is the bug this closes.
+///
+/// Released with nothing else naming it, the transaction is unpinned and carries on: it locks
+/// another row, which pins a new primary by the ordinary rule, and commits.
+#[test]
+fn a_transaction_releases_its_own_primary_when_nothing_else_names_it() {
+    let cluster = cluster(0xa0_0106);
+    let client = client(&cluster, 106);
+
+    let mut txn = client.begin().unwrap();
+    txn.lock(b"a7").unwrap();
+    assert!(!is_free(&client, b"a7"), "the lock is on the store");
+
+    txn.release(&[Bytes::from_static(b"a7")]).unwrap();
+    assert!(
+        is_free(&client, b"a7"),
+        "the savepoint gave it back, and it was the primary"
+    );
+
+    // Still a live transaction: a new lock pins a new primary, and the commit lands.
+    txn.lock(b"a8").unwrap();
+    txn.put(b"a8", b"after the rescue");
+    txn.commit().expect("the transaction was never ended");
+
+    let reader = client.begin().unwrap();
+    assert_eq!(
+        reader.get(b"a8").unwrap(),
+        Some(Bytes::from_static(b"after the rescue"))
+    );
+
+    cluster.shutdown();
+}
+
+/// **And keeps it while another of its locks still names it.**
+///
+/// Every lock record of one transaction names the same primary, and a resolver reads that primary
+/// to decide the fate of all of them. Releasing it under a live secondary would leave that
+/// secondary pointing at a record that is not there — a transaction that reads as `Missing`, which
+/// anyone may roll back. So one row of one transaction stays held to the end of the block, which is
+/// the declared remainder: not every row of every savepoint.
+#[test]
+fn a_primary_is_kept_while_another_lock_still_names_it() {
+    let cluster = cluster(0xa0_0107);
+    let client = client(&cluster, 107);
+
+    let mut txn = client.begin().unwrap();
+    txn.lock(b"a7").unwrap();
+    txn.lock(b"a8").unwrap();
+
+    txn.release(&[Bytes::from_static(b"a7")]).unwrap();
+    assert!(
+        !is_free(&client, b"a7"),
+        "a8's lock still names a7 as its primary, so a7 stays"
+    );
+
+    // With the secondary gone the primary is releasable, in the same call or a later one.
+    txn.release(&[Bytes::from_static(b"a8"), Bytes::from_static(b"a7")])
+        .unwrap();
+    assert!(is_free(&client, b"a8"), "the secondary went");
+    assert!(
+        is_free(&client, b"a7"),
+        "and then nothing named the primary"
+    );
+
+    cluster.shutdown();
+}

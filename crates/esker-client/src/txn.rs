@@ -720,6 +720,92 @@ impl Transaction {
         }
     }
 
+    /// **Gives back locks this transaction placed, and stays running**
+    /// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+    ///
+    /// `ROLLBACK TO SAVEPOINT`, and the deadlock victim inside one. A real server releases a
+    /// subtransaction's row locks when it aborts; before this, the SQL layer released its
+    /// node-local half and nothing reached the store, so the lock a `SELECT … FOR UPDATE` left
+    /// there outlived the savepoint that took it and blocked every other session until the whole
+    /// transaction ended.
+    ///
+    /// Only keys this transaction actually holds a *store* lock on are sent: a buffered write has
+    /// no lock yet, and a key we never locked has nothing to give back.
+    ///
+    /// # The primary
+    ///
+    /// The primary is what every resolver consults, so releasing it while another of this
+    /// transaction's locks still names it would leave those locks pointing at a record that is not
+    /// there — a transaction that reads as `Missing` and can be rolled back by anyone.
+    ///
+    /// **But it cannot simply be refused**, and that is the case this method exists for: the
+    /// primary is *the smallest key already buffered, or the key being locked when nothing is* —
+    /// `pin_primary`, private to this module and so named rather than linked — and a savepoint
+    /// whose first act is `SELECT … FOR UPDATE`
+    /// over a transaction that has written nothing — which is precisely Rails' shape — pins that
+    /// very row. Refusing it would leave the savepoint's own lock behind, which is the bug.
+    ///
+    /// So the rule is exact rather than cautious: the primary goes when **nothing else names it**,
+    /// and the transaction is unpinned so that the next eager lock or the commit picks a new one by
+    /// the ordinary rule. The renewal stops with it — a heartbeat for a lock that is not there
+    /// keeps nothing alive.
+    ///
+    /// # Errors
+    ///
+    /// Any transport or region failure the router could not retry away. A key whose lock turned out
+    /// to be somebody else's is **not** an error: the caller wanted it free of *this* transaction's
+    /// lock and it is.
+    pub fn release(&mut self, keys: &[Bytes]) -> Result<()> {
+        // Everything but the primary first, so that releasing the primary in the same call sees a
+        // transaction that no longer holds anything else.
+        let pinned = self.pinned.clone();
+        let mut others: Vec<Bytes> = keys
+            .iter()
+            .filter(|key| self.locked.contains(*key) && Some(*key) != pinned.as_ref())
+            .cloned()
+            .collect();
+        others.sort();
+        others.dedup();
+        if !others.is_empty() {
+            self.release_keys(&others)?;
+            for key in &others {
+                self.locked.remove(key);
+            }
+        }
+
+        // The primary, if it was asked for and nothing of ours is left to name it.
+        let Some(primary) = pinned else {
+            return Ok(());
+        };
+        if !keys.contains(&primary) || !self.locked.contains(&primary) {
+            return Ok(());
+        }
+        if self.locked.iter().any(|held| *held != primary) {
+            // Another eager lock still points at it. One row of one transaction stays held to the
+            // end of the block, which is the declared remainder — not every row of every savepoint.
+            return Ok(());
+        }
+        self.release_keys(std::slice::from_ref(&primary))?;
+        self.locked.remove(&primary);
+        self.pinned = None;
+        self.renewals.forget(self.start_ts);
+        Ok(())
+    }
+
+    /// One `ReleaseLock` per region the keys fall in.
+    fn release_keys(&self, keys: &[Bytes]) -> Result<()> {
+        self.grouped(keys, |group| {
+            let request = TxnKvReq::ReleaseLock {
+                start_ts: self.start_ts,
+                keys: group.to_vec(),
+            };
+            match self.call(&request)? {
+                TxnKvResp::ReleaseLock { .. } => Ok(()),
+                other => Err(unexpected(Method::TxnReleaseLock, &other)),
+            }
+        })
+    }
+
     /// Fixes the primary and puts its lock on the store, which every later lock of this
     /// transaction points at.
     ///
@@ -1502,16 +1588,40 @@ impl Transaction {
                     end: end.clone(),
                 }],
             };
-            match self.call_resolving(&request)? {
-                TxnKvResp::Prewrite { keys } => {
-                    if let Some(status) = keys.first() {
-                        // The range's lower bound is the key the conflict is reported against: it
-                        // is what the request routed by, and it is the only key of the range this
-                        // client can name.
-                        self.check(status.clone(), Some(start))?;
-                    }
+            // **A lock inside the range is resolved here, and never wounded**
+            // ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
+            // §1). Without this loop the `Locked` the store now answers falls through to
+            // `check`, whose `Locked` arm reports `LockNotCleared` on sight — a `40001` for a
+            // holder that may be about to roll back, which is a phantom that never existed.
+            for round in 0..=self.max_lock_resolutions {
+                let status = match self.call_resolving(&request)? {
+                    TxnKvResp::Prewrite { keys } => keys.into_iter().next(),
+                    other => return Err(unexpected(Method::TxnPrewrite, &other)),
+                };
+                let Some(status) = status else { break };
+                let TxnStatus::Locked(lock) = status else {
+                    // The range's lower bound is the key the conflict is reported against: it
+                    // is what the request routed by, and it is the only key of the range this
+                    // client can name.
+                    self.check(status, Some(start))?;
+                    break;
+                };
+                if round == self.max_lock_resolutions {
+                    return Err(Error::LockNotCleared {
+                        start_ts: lock.start_ts,
+                        key: lock.key.clone(),
+                    });
                 }
-                other => return Err(unexpected(Method::TxnPrewrite, &other)),
+                // **`may_wound: false`, and that is the decision this loop exists to make.** A
+                // wound is for an *acquirer* — a transaction that holds locks and wants one more,
+                // which is half of a cycle. A range check acquires nothing: it asserts that a
+                // range it read has not moved. Killing the holder to make that assertion true
+                // would abort a transaction that did nothing wrong and would answer `40P01` where
+                // the condition is `40001`. So this waits, the way a reader waits, and asks again
+                // — and when the holder commits, the write scan sees it and the answer becomes
+                // the `Conflict` it always was.
+                let last = round + 1 == self.max_lock_resolutions;
+                self.resolve(&lock, vec![lock.key.clone()], round, last, false)?;
             }
         }
         Ok(())

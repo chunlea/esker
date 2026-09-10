@@ -1,7 +1,7 @@
 //! The `TxnKv` service — service `0x02`, reserved since phase 2 and filled in here
 //! (`docs/DESIGN.md` §9, `docs/txn-spec.md`).
 //!
-//! Eight methods, in the order `docs/DESIGN.md` §9 lists them:
+//! The methods, in the order `docs/DESIGN.md` §9 lists them:
 //!
 //! ```text
 //! 0x0201 Get           read one key at a timestamp
@@ -14,6 +14,7 @@
 //! 0x0208 GcSafepoint   publish the timestamp below which old versions may go
 //! 0x0209 LatestCommit  the newest commit_ts for one key
 //! 0x020A ReclaimRange  clear the storage under a dropped database's key range
+//! 0x020B ReleaseLock   give one transaction's own locks back without ending it
 //! ```
 //!
 //! # What is here and what is not
@@ -461,6 +462,24 @@ pub enum TxnKvReq {
         /// region", which is what a reader that met one lock asks for.
         keys: Vec<Bytes>,
     },
+    /// Give **this** transaction's own locks on `keys` back, and leave it running
+    /// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+    ///
+    /// `ROLLBACK TO SAVEPOINT`, and the deadlock victim inside one: a real server releases a
+    /// subtransaction's row locks when it aborts and keeps the transaction alive.
+    ///
+    /// **Not [`TxnKvReq::Rollback`]**, which writes a marker and so kills the transaction on
+    /// those keys for ever — a savepoint's victim very often writes the row it locked once its
+    /// `rescue` is done. This writes nothing down: the lock record goes and the key returns to
+    /// the state it was in before.
+    ///
+    /// A key whose lock belongs to another transaction is left alone and not counted.
+    ReleaseLock {
+        /// The transaction's snapshot — and the owner every lock is checked against.
+        start_ts: u64,
+        /// The user keys to give back.
+        keys: Vec<Bytes>,
+    },
     /// Extend a live transaction's lock TTL.
     Heartbeat {
         /// The transaction's snapshot.
@@ -523,6 +542,7 @@ impl TxnKvReq {
             Self::Commit { .. } => Method::TxnCommit,
             Self::Rollback { .. } => Method::TxnRollback,
             Self::ResolveLock { .. } => Method::TxnResolveLock,
+            Self::ReleaseLock { .. } => Method::TxnReleaseLock,
             Self::Heartbeat { .. } => Method::TxnHeartbeat,
             Self::GcSafepoint { .. } => Method::TxnGcSafepoint,
             Self::ReclaimRange { .. } => Method::TxnReclaimRange,
@@ -547,7 +567,8 @@ impl TxnKvReq {
             Self::Prewrite { mutations, .. } => mutations.first().map_or(&[][..], |m| m.key()),
             Self::Commit { keys, .. }
             | Self::Rollback { keys, .. }
-            | Self::ResolveLock { keys, .. } => keys.first().map_or(&[][..], |key| &key[..]),
+            | Self::ResolveLock { keys, .. }
+            | Self::ReleaseLock { keys, .. } => keys.first().map_or(&[][..], |key| &key[..]),
             Self::Heartbeat { primary, .. } => primary,
             Self::GcSafepoint { .. } => &[],
         }
@@ -604,7 +625,11 @@ impl TxnKvReq {
                 out.put_varint(*commit_ts);
                 put_keys(out, keys);
             }
-            Self::Rollback { start_ts, keys } => {
+            // `Rollback` and `ReleaseLock` carry the same two fields. Two methods and one
+            // encoding, for the reason `Commit` and `ResolveLock` are two: they are different
+            // acts — one ends the transaction on those keys, the other hands them back to a
+            // transaction that is still running — and the store decides them differently.
+            Self::Rollback { start_ts, keys } | Self::ReleaseLock { start_ts, keys } => {
                 out.put_varint(*start_ts);
                 put_keys(out, keys);
             }
@@ -672,6 +697,10 @@ impl TxnKvReq {
             Method::TxnResolveLock => Self::ResolveLock {
                 start_ts: input.get_varint("start_ts")?,
                 commit_ts: input.get_varint("commit_ts")?,
+                keys: get_keys(input)?,
+            },
+            Method::TxnReleaseLock => Self::ReleaseLock {
+                start_ts: input.get_varint("start_ts")?,
                 keys: get_keys(input)?,
             },
             Method::TxnHeartbeat => Self::Heartbeat {
@@ -751,6 +780,16 @@ pub enum TxnKvResp {
         /// transaction" learns whether there is more to do.
         resolved: u64,
     },
+    /// **How many of the asked-for keys this transaction actually held**, and so gave back.
+    ///
+    /// Not the number asked for: a key whose lock is somebody else's, or whose lock is already
+    /// gone, is left alone and not counted. The caller wanted those keys free of *its* lock and
+    /// they are, so a short count is information rather than a failure — the same reading
+    /// [`TxnKvResp::ResolveLock`]'s `resolved` gets.
+    ReleaseLock {
+        /// How many locks were removed.
+        released: u64,
+    },
     /// **The newest `commit_ts` for the key, or `None` for a key never committed.**
     ///
     /// `None` and `Some(0)` are different answers and both are possible: a key nobody has written
@@ -807,6 +846,7 @@ impl TxnKvResp {
             Self::Commit { .. } => Method::TxnCommit,
             Self::Rollback { .. } => Method::TxnRollback,
             Self::ResolveLock { .. } => Method::TxnResolveLock,
+            Self::ReleaseLock { .. } => Method::TxnReleaseLock,
             Self::Heartbeat { .. } => Method::TxnHeartbeat,
             Self::GcSafepoint { .. } => Method::TxnGcSafepoint,
             Self::ReclaimRange { .. } => Method::TxnReclaimRange,
@@ -833,7 +873,10 @@ impl TxnKvResp {
             // A refusal to *serve* went out as an error frame; what is left is the
             // transaction's own fate, which no retry changes and the caller must act on.
             Self::Commit { status } | Self::Rollback { status } => status.encode(out),
+            // One varint each, and the two counts mean different things: one is how many of
+            // somebody else's locks were finished, the other how many of our own were handed back.
             Self::ResolveLock { resolved } => out.put_varint(*resolved),
+            Self::ReleaseLock { released } => out.put_varint(*released),
             Self::Heartbeat { ttl_ms } => out.put_varint(*ttl_ms),
             Self::GcSafepoint { safepoint } => out.put_varint(*safepoint),
             Self::ReclaimRange {
@@ -906,6 +949,9 @@ impl TxnKvResp {
                     }
                 },
                 safepoint: input.get_varint("reclaim.safepoint")?,
+            },
+            Method::TxnReleaseLock => Self::ReleaseLock {
+                released: input.get_varint("released")?,
             },
             Method::TxnLatestCommit => Self::LatestCommit {
                 newest: match input.get_u8("latest_commit.present")? {

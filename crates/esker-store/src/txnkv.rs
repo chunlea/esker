@@ -201,6 +201,45 @@ impl TxnSnapshot for EngineSnapshot<'_> {
         Ok(None)
     }
 
+    /// The first lock in `[start, end)` that is not `mine`.
+    ///
+    /// The mirror of the scan above over the other column family, and the bounds are the same
+    /// bytes: a `lock` key is `'x' ++ enc(user_key)` with no timestamp suffix, which is exactly
+    /// the prefix a `write` key carries in front of its suffix. **First and not newest** — a lock
+    /// has no version to be newest of, and any one of them is enough to refuse the check.
+    fn foreign_lock_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        mine: u64,
+    ) -> esker_txn::Result<Option<(Vec<u8>, LockRecord)>> {
+        if start >= end {
+            return Ok(None);
+        }
+        let mut iter = self
+            .db
+            .iter(cf::LOCK, &self.options)
+            .map_err(|error| storage(&error))?;
+        iter.seek(&key::prefix(start));
+        let upper = key::prefix(end);
+        while iter.valid() {
+            if iter.key() >= &upper[..] {
+                break;
+            }
+            let record = LockRecord::decode(iter.value())?;
+            // **Our own lock is not a phantom.** The client prewrites its keys before it sends
+            // the range checks, so the row this transaction just inserted into the range it read
+            // is locked and sitting here — see the trait's note.
+            if record.start_ts != mine {
+                let user_key = key::split_lock(iter.key())?;
+                return Ok(Some((user_key, record)));
+            }
+            iter.next();
+        }
+        iter.status().map_err(|error| storage(&error))?;
+        Ok(None)
+    }
+
     fn write_of_txn(&self, user_key: &[u8], start_ts: u64) -> esker_txn::Result<Option<Version>> {
         // Bounded below by `start_ts`: a transaction's own record is a commit above it or its
         // rollback marker exactly at it, so there is nothing to find further down.
@@ -416,7 +455,23 @@ pub fn prewrite(
                         commit_ts: version.commit_ts,
                     });
                 }
-                None => statuses.push(TxnStatus::Ok),
+                // **A commit is a verdict; a lock is a question** ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §1).
+                // Asked in this order because a commit inside the range is decided — this
+                // transaction has lost, whatever anyone else is holding — and the lock below is
+                // not: its owner may still roll back, in which case nothing was ever in the range
+                // and refusing over it would be a `40001` for a phantom that never existed. So a
+                // lock is answered the way a key-level check answers one, and the client does with
+                // it what it already does: settle the holder, then ask again.
+                None => match snapshot
+                    .foreign_lock_in_range(start, end, start_ts)
+                    .map_err(txn_to_proto)?
+                {
+                    Some((user_key, lock)) => {
+                        refused = true;
+                        statuses.push(TxnStatus::Locked(lock_info(&user_key, &lock)));
+                    }
+                    None => statuses.push(TxnStatus::Ok),
+                },
             }
             continue;
         }
@@ -560,6 +615,45 @@ pub fn rollback(
     Ok(TxnKvResp::Rollback {
         status: TxnStatus::Ok,
     })
+}
+
+/// Gives **this** transaction's own locks on `keys` back, leaving it running
+/// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+///
+/// `ROLLBACK TO SAVEPOINT`, and the deadlock victim inside one: a real server releases a
+/// subtransaction's row locks when it aborts and keeps the transaction alive. Until this existed
+/// the node released the node-local half and nothing reached the store, so a `SELECT … FOR UPDATE`
+/// taken inside a savepoint held its row until the whole transaction ended — and the survivor of
+/// a deadlock met that lock at its own commit and was told `40001`.
+///
+/// **Not [`rollback`]**, which leaves a marker and so kills the transaction on those keys for
+/// ever; a savepoint's victim very often writes the row it locked once its `rescue` is done.
+/// Nothing is written down here: the lock record goes and the key is as it was.
+///
+/// The count is how many locks were actually this transaction's. A key held by somebody else, or
+/// no longer held at all, is left alone and not counted — the caller wanted the keys free of *its*
+/// lock and they are, which is the same reading [`resolve_lock`]'s count gets.
+pub fn release_lock(
+    db: &Db,
+    batch: &mut WriteBatch,
+    start_ts: u64,
+    keys: &[Bytes],
+) -> Result<TxnKvResp, ProtoError> {
+    let snapshot = EngineSnapshot::new(db);
+    let mut staged = Mutations::new();
+    let mut released = 0u64;
+
+    for user_key in keys {
+        let (mutations, gave_back) =
+            esker_txn::release(&snapshot, user_key, start_ts).map_err(txn_to_proto)?;
+        if gave_back {
+            staged.extend(mutations);
+            released += 1;
+        }
+    }
+
+    stage(db, batch, &staged)?;
+    Ok(TxnKvResp::ReleaseLock { released })
 }
 
 /// Applies a verdict about someone else's transaction to the keys of it that live here
