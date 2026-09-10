@@ -2796,6 +2796,24 @@ pub enum SqlError {
         right: &'static str,
     },
 
+    /// The same `42846` a set operation gets, for a `COALESCE` or a `CASE` — one category, no
+    /// implicit cast to the type the branches settled on.
+    ///
+    /// **`kind` because the word differs and the code does not**: measured,
+    /// `COALESCE could not convert type citext to character` and
+    /// `CASE/WHEN could not convert type character to citext`. A `CASE` says `CASE/WHEN` here and
+    /// plain `CASE` in the `42804` sentence, which is PostgreSQL's own inconsistency and not this
+    /// crate's.
+    #[error("{kind} could not convert type {from} to {to}")]
+    CannotConvertBranch {
+        /// `COALESCE` or `CASE/WHEN`.
+        kind: &'static str,
+        /// The branch's type.
+        from: &'static str,
+        /// The type the construct settled on.
+        to: &'static str,
+    },
+
     /// Two arms of a set operation in one category with no implicit cast between them.
     ///
     /// A different sentence and a different code from [`SqlError::SetOperationTypes`], measured:
@@ -3311,9 +3329,8 @@ impl SqlError {
             SqlError::InvalidDatetimeFormat { .. } => sqlstate::INVALID_DATETIME_FORMAT,
             SqlError::CannotCast { .. }
             | SqlError::CannotCastToPseudoType { .. }
-            | SqlError::SetOperationCannotConvert { .. } => {
-                sqlstate::CANNOT_COERCE
-            }
+            | SqlError::CannotConvertBranch { .. }
+            | SqlError::SetOperationCannotConvert { .. } => sqlstate::CANNOT_COERCE,
             SqlError::DatetimeFieldOutOfRange { .. }
             | SqlError::IntervalOutOfRange
             | SqlError::DatetimeOutOfRange { .. }
