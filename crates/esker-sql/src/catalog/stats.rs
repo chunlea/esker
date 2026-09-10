@@ -17,6 +17,7 @@
 //! change than an instrument. This counts the reads and times them; the share is the next
 //! instrument, not this one.
 
+use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -27,10 +28,29 @@ fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("ESKER_CATALOG_STATS").is_some())
 }
 
-/// Views taken, which is once per transaction by `Catalog::view_at`'s contract.
+thread_local! {
+    /// The version this thread's last view read, so a repeat can be told from a first read.
+    ///
+    /// Per thread rather than global: the executor runs one statement per blocking thread, so a
+    /// thread's previous view is the same session's, and a global would call two sessions'
+    /// unrelated reads a repeat of each other.
+    static LAST_VERSION: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// Views taken. **Not once per transaction**, whatever `Catalog::view_at`'s doc says: the executor
+/// reaches `catalog_view` from thirteen call sites, and each one reads the two counters again.
 static VIEWS: AtomicU64 = AtomicU64::new(0);
-/// Of those, the ones that read the version from the store rather than answering from the cache.
-static FROM_THE_STORE: AtomicU64 = AtomicU64::new(0);
+/// Of those, the ones that read **the same version this thread read last time**.
+///
+/// **This field replaced one that lied.** It used to be "of the store", and the call site passed a
+/// literal `true` — so run 111 reported `views == of the store` on all 164 lines and was read as a
+/// cache hit rate of exactly zero. That was this constant, not a measurement. What can honestly be
+/// seen from here is repetition: `Executor::catalog_view` is reached from thirteen places, so one
+/// statement re-reads the two counters several times and every read after the first returns the
+/// version the last one did. That repetition is precisely what a cached version with an
+/// invalidation would remove, which makes it the number
+/// [ADR 0102](../../../../docs/adr/0102-the-catalogs-read-path.md)'s option (a) is about.
+static REPEATS: AtomicU64 = AtomicU64::new(0);
 /// Total microseconds spent reading the version, and the worst one seen.
 static MICROS: AtomicU64 = AtomicU64::new(0);
 static WORST: AtomicU64 = AtomicU64::new(0);
@@ -46,14 +66,16 @@ static BUCKETS: [AtomicU64; 4] = [
 ///
 /// Called from `Catalog::view_at` with the time the two counter reads took. Cheap enough to leave
 /// in the path unconditionally — an `enabled()` load and, when off, nothing else.
-pub(super) fn record(took: Duration, from_the_store: bool) {
+pub(super) fn record(took: Duration, version: u64) {
     if !enabled() {
         return;
     }
     VIEWS.fetch_add(1, Ordering::Relaxed);
-    if from_the_store {
-        FROM_THE_STORE.fetch_add(1, Ordering::Relaxed);
-    }
+    LAST_VERSION.with(|last| {
+        if last.replace(Some(version)) == Some(version) {
+            REPEATS.fetch_add(1, Ordering::Relaxed);
+        }
+    });
     let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
     MICROS.fetch_add(micros, Ordering::Relaxed);
     WORST.fetch_max(micros, Ordering::Relaxed);
@@ -96,14 +118,14 @@ fn start_reporting() {
 #[must_use]
 pub fn summary() -> String {
     let views = VIEWS.load(Ordering::Relaxed);
-    let store = FROM_THE_STORE.load(Ordering::Relaxed);
+    let repeats = REPEATS.load(Ordering::Relaxed);
     let micros = MICROS.load(Ordering::Relaxed);
     let counts: Vec<u64> = BUCKETS.iter().map(|b| b.load(Ordering::Relaxed)).collect();
     // Integer arithmetic, because a mean in microseconds needs no float and a `u64 as f64` is a
     // lint this workspace refuses on purpose.
     let mean = micros.checked_div(views).unwrap_or(0);
     format!(
-        "catalog views {views}, of the store {store}, mean {mean} us, worst {} us, \
+        "catalog views {views}, repeats of the same version {repeats}, mean {mean} us, worst {} us, \
          buckets <100us {} <1ms {} <10ms {} rest {}",
         WORST.load(Ordering::Relaxed),
         counts[0],
@@ -143,7 +165,7 @@ mod tests {
             return;
         }
         assert!(!enabled());
-        record(Duration::from_millis(5), true);
+        record(Duration::from_millis(5), 7);
         assert!(
             summary().contains("catalog views 0"),
             "a disabled instrument counted a read: {}",

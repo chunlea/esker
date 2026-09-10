@@ -2478,7 +2478,7 @@ impl Catalog {
         let began = std::time::Instant::now();
         let version = counter(&record::version_key(tenant))?
             .saturating_add(counter(&record::version_key(record::CLUSTER_TENANT))?);
-        stats::record(began.elapsed(), true);
+        stats::record(began.elapsed(), version);
         // **Once per transaction, beside the counter it already reads.** Every catalog view comes
         // through here, so this is where a database whose keys this build cannot read is turned
         // away — before a single name is looked up in the wrong place.
