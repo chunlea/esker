@@ -168,9 +168,30 @@ prefix instead of sixty reads.
 ### B. A node-side catalog cache, validated by the version counter
 
 Keep the decoded catalog in memory on the node and validate it with **one** point read of
-`version(t1)` per statement: unchanged means the cache stands, changed means reload. This is what
-`catalog::record::version_key`'s comment already describes as *"read once per transaction"*, taken
-literally.
+`version(t1)` per statement: unchanged means the cache stands, changed means reload.
+
+**And most of that is already built, which is the correction this ADR's first draft needed.**
+`catalog::Catalog` holds a `Cache` of `names` and `tables` keyed on the summed version, `View`
+answers `relation()` and `table_by_id()` from it, `usable_at` drops it when the version moves, and
+a transaction that has written the catalog gets `catalog: None` so it reads its own DDL. The
+mechanism is there, the invalidation is there, and the version read is the one ADR 0102 timed.
+
+**What the census shows is who goes around it**, and that is a different and much smaller change
+than building a cache:
+
+* **`catalog::schema_exists(txn, …)`** is a free function on `&dyn Txn` with no cache behind it —
+  the sixteen identical `schema(t1,"esker")` reads;
+* **`pg_relations::Relations::read(txn, tenant)`** loads the tenant's whole catalog itself, scan
+  and per-table `hydrate` included, without ever touching `View` — **27 call sites**, and the five
+  catalog views in `pk_and_sequence_for`'s `FROM` list are five of them. That is the bundle that
+  repeats five times;
+* **`catalog::views`, `user_types`, `schemas`, `table_sequences`** are free functions on
+  `&dyn Txn` too, called from inside `hydrate` and from `pg_catalog`'s row builders — the
+  tenant-wide scans.
+
+So option B is *"give the cache the readers it does not have"*, not *"add a cache"*. Same numbers,
+a fraction of the risk, and it is the shape this project keeps meeting: one mechanism, and a
+second reader that never learned about it.
 
 * **Round trips saved** — `pk_and_sequence_for` 60 → **2** (`version(t1)` and the cluster's);
   a point select 9 → **3** (two versions and the row), and **2** if the cluster version is
@@ -182,8 +203,10 @@ literally.
   invalidation is the schema lease ([ADR 0028](0028-the-schema-lease.md)) and is already there —
   the cache's lifetime is the lease's; (4) the cluster-tenant version (`version(t<cluster>)`)
   covers databases and roles and needs the same treatment or it becomes the new floor.
-* **Change surface** — `esker-sql/src/catalog/mod.rs` (a `View` that holds a cached snapshot),
-  `catalog/pg_relations.rs`, `exec::mod`'s per-statement view, and the lease in `backend`.
+* **Change surface** — `esker-sql/src/catalog/mod.rs` (`Cache` gains schemas, views, types and
+  sequences; `schema_exists` and the four free functions take a `&View`), `catalog/pg_relations.rs`
+  (`Relations::read` takes a `&View`), and its **27 call sites**. No new mechanism and no change to
+  the lease. `docs/plans/debt-49-catalog-cache.md` is the file list and the API sketch.
 * **Risks** — a stale cache is a **wrong answer**, not a slow one, which is the class this project
   refuses everywhere else; the failure mode is invisible until the *next* statement, which is
   exactly what `a-catalog-write-must-bump-the-version` records. Mitigated by the fact that the
