@@ -28,6 +28,12 @@
 //! What the census called a *parameter* defect was a **comparison** one: the literal and the
 //! bound parameter behave identically and the `INSERT` takes the name either way. The shape of
 //! the probe is what made it look otherwise.
+//!
+//! **The array-cast row that was pinned here is closed and its tests moved.** `'{1}'::bit[]::money[]`
+//! answered `{$1.00}` where 19beta1 refuses `42846`; `parse::lower`'s literal-array arm read the
+//! value's text through the target's `array_in` and returned before the `casts_to` guard.
+//! `tests/cast_matrix.rs` is that unit — one check, 3,504 of the matrix's 4,013 diverging rows,
+//! none regressed.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -155,28 +161,5 @@ fn a_parameter_that_cannot_reach_the_column_still_refuses() {
     assert!(
         answer.contains("42846") || answer.contains("42883"),
         "a money[] beside a bit[] column has no operator and no cast on either server: {answer}"
-    );
-}
-
-/// **Found beside this unit and not part of it: an array cast this node answers and 19beta1
-/// refuses.**
-///
-/// Measured today — `'{1}'::bit[]::money[]` is `42846 cannot cast type bit[] to money[]` on
-/// 19beta1, and so are `bit[]::inet[]`, `money[]::bit[]` and `inet[]::bit[]`. This node **answers**
-/// `money[]` with `{$1.00}`, which is the direction ADR 0031 ranks worst: a value where a real
-/// server raises.
-///
-/// It is older than the stand-in fix — that one only changes what `Describe` puts where a
-/// parameter will go — and it is a different place: `casts_to` recurses into elements for a pair
-/// of arrays, so whatever admits `bit -> money` admits `bit[] -> money[]`. Pinned at today's
-/// answer so it cannot change quietly, and written into
-/// `esker-coord/b4-wire-v3-families.md` as its own item.
-#[test]
-fn an_array_cast_this_node_answers_and_postgresql_refuses() {
-    let mut node = parity::Node::new(&[]);
-    assert_eq!(
-        node.answer("SELECT '{1}'::bit[]::money[]").to_string(),
-        "money[]\t{$1.00}",
-        "19beta1 refuses this with 42846 cannot cast type bit[] to money[]"
     );
 }
