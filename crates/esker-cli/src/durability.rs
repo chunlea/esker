@@ -493,7 +493,7 @@ fn probe(client: &TxnClient, keyspace: &str, round: u64) -> Result<(), String> {
     txn.commit().map_err(|error| format!("{error}")).map(|_| ())
 }
 
-/// Sends `SIGKILL` to one pid./// Sends `SIGKILL` to one pid.
+/// Sends `SIGKILL` to one pid.
 ///
 /// `kill(2)` through `libc` is not available — this workspace compiles no C — so this spends a
 /// process on `/bin/kill`, which is what a shell would do and costs nothing at this cadence.
