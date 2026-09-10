@@ -1,0 +1,46 @@
+crates/esker-client/src/error.rs
+  h_44076b318daf9c 15-42,153,157-166
+crates/esker-client/src/lib.rs
+  h_44076b318daf9c 46
+crates/esker-client/src/txn.rs
+  h_44076b318daf9c 65,867,1064,1092,1098-1155,1283,1487,1501,1573,1584,1656,1665,1672,1785,1811,1836,1850
+crates/esker-client/tests/anomalies.rs
+  h_44076b318daf9c 371-379,550-601
+crates/esker-client/tests/txn.rs
+  h_44076b318daf9c 1062-1071,1454-1463
+crates/esker-sql/src/backend/mod.rs
+  h_44076b318daf9c 246-264,843-850
+crates/esker-sql/src/backend/store.rs
+  h_44076b318daf9c 272-278,616-630
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 2513-2517,2519,4574-4576,4583-4587
+crates/esker-sql/src/exec/savepoint.rs
+  h_44076b318daf9c 271-274
+crates/esker-sql/tests/catalog_contention.rs
+  h_44076b318daf9c 1-216
+crates/esker-sql/tests/cluster/mod.rs
+  h_44076b318daf9c 246-269
+crates/esker-sql/tests/joint_gate.rs
+  h_44076b318daf9c 215-216
+crates/esker-sql/tests/redrive.rs
+  h_44076b318daf9c 360-365
+crates/esker-sql/tests/store_locking.rs
+  h_44076b318daf9c 533-732
+docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md
+  h_44076b318daf9c 20-22,406-430,436-467,469-474,476-480,482-485,487-490,566-567,590-592,636-637
+docs/adr/0105-a-catalog-read-never-waits.md
+  h_44076b318daf9c 1-138
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0081adcb0d95ec3d806871a844052534d3912b9a",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
