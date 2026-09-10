@@ -1,0 +1,27 @@
+crates/esker-sql/src/exec/cursor.rs
+  s_2bed4ac2b1c944::t_b2a0c7d93981cd 3244-3266
+crates/esker-sql/src/exec/query.rs
+  s_2bed4ac2b1c944::t_f9ce7121280f71 3231-3250
+crates/esker-sql/src/plan/expr.rs
+  s_2bed4ac2b1c944::t_3f8cbad9c83995 1085-1090,1644-1645,1747-1748,1958-1960
+crates/esker-sql/src/value/geometric.rs
+  s_2bed4ac2b1c944::t_673e0bbb289b84 198-323,457-516
+crates/esker-sql/tests/captures/pg19_polygon_contains.txt
+  s_2bed4ac2b1c944::t_56c9760228ae02 1-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0578b2ae76c47d338166e400991d15a79643f0c5",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
