@@ -32,8 +32,9 @@ impl Client {
         Client {
             node: parity::Node::new(&[
                 "CREATE EXTENSION IF NOT EXISTS hstore",
-                "CREATE TABLE h (id bigint, t text, data hstore)",
-                "INSERT INTO h VALUES (1, 'x', 'a=>1'), (2, 'y', 'b=>2')",
+                "CREATE TABLE h (id bigint, t text, data hstore, j jsonb, d json, x xml)",
+                "INSERT INTO h VALUES (1, 'x', 'a=>1', '{\"a\":1}', '{\"a\":1}', '<a/>'), \
+                 (2, 'y', 'b=>2', '{\"b\":2}', '{\"b\":2}', '<b/>')",
             ]),
             session: Session::new(),
         }
@@ -148,7 +149,16 @@ fn a_parameter_on_the_left_takes_the_columns_type_too() {
 #[test]
 fn describe_infers_a_parameter_from_the_column_for_every_type() {
     let mut client = Client::new();
-    for (column, value) in [("id", "1"), ("t", "x"), ("data", "a=>1")] {
+    for (column, value) in [
+        ("id", "1"),
+        ("t", "x"),
+        ("data", "a=>1"),
+        // **`jsonb` is the one run 116 found**, and it is the same mechanism `hstore` was: a
+        // parameter compared against the column takes the column's type, and a placeholder that
+        // borrows `text`'s representation reports `text` instead — so the comparison resolves as
+        // `jsonb = text` and refuses. `query_cache_test#test_query_cache_handles_mutated_binds`.
+        ("j", r#"{"a": 1}"#),
+    ] {
         let answer = client.ask(
             &format!("SELECT id FROM h WHERE {column} = $1"),
             vec![0],
@@ -156,6 +166,65 @@ fn describe_infers_a_parameter_from_the_column_for_every_type() {
         );
         assert!(!answer.contains("ERROR"), "{column}: {answer}");
     }
+}
+
+/// **The same for `jsonb` on the prepared shape**, because run 116's red is reachable from both
+/// `Parse` forms and a pin on one of them can go green while the other refuses.
+///
+/// `query_cache_test#test_query_cache_handles_mutated_binds` is the failure; the mechanism is that
+/// a bound value carries a *representation* and the parameter has a **type**, and `jsonb` shares
+/// `text`'s representation. `8dd0b4a8` taught the `Describe` placeholder to carry the type and
+/// left the bound value behind.
+#[test]
+fn a_jsonb_parameter_is_inferred_on_both_parse_forms() {
+    let mut client = Client::new();
+    for param_types in [vec![0], vec![]] {
+        let answer = ask_portal_described(
+            &mut client,
+            "SELECT id FROM h WHERE j = $1",
+            param_types.clone(),
+            r#"{"a": 1}"#,
+        );
+        assert!(
+            !answer.contains("ERROR"),
+            "param_types={param_types:?}: {answer}"
+        );
+        assert!(answer.contains('1'), "the row is the answer: {answer}");
+    }
+}
+
+/// **The lower bound the fix above needs**: a type with no equality operator must still refuse,
+/// or the inference has bought its green by comparing everything as text.
+///
+/// `json` does. **`xml` does not, and that is a pre-existing divergence this test found rather
+/// than caused** — measured on 19beta1, `SELECT 1 FROM t WHERE x = $1` over an `xml` column is
+/// `42883 operator does not exist: xml = unknown`, and this node answers no rows. It answered
+/// before the parameter fix too, checked by reverting it, so it belongs to the wire v3 comparison
+/// family (`esker-coord/b4-wire-v3-families.md`) and not here. Pinned as it is so the day that
+/// family lands, this line goes red and says where to look.
+#[test]
+fn a_parameter_over_a_type_with_no_equality_still_refuses() {
+    let mut client = Client::new();
+    let ask = |client: &mut Client, column: &str, value: &str| {
+        client.ask(
+            &format!("SELECT id FROM h WHERE {column} = $1"),
+            vec![0],
+            value,
+        )
+    };
+    let json = ask(&mut client, "d", r#"{"a": 1}"#);
+    assert!(
+        json.contains("operator does not exist"),
+        "json has no equality on either server: {json}"
+    );
+    // **Today's answer, and PostgreSQL's is a refusal.** Not asserted as correct — asserted so it
+    // cannot change silently.
+    let xml = ask(&mut client, "x", "<a/>");
+    assert!(
+        !xml.contains("operator does not exist"),
+        "if this now refuses, the wire v3 comparison family has landed and this pin is the record \
+         of what it fixed: {xml}"
+    );
 }
 
 /// **The shape libpq actually sends**: `Parse` naming *no* types, `Bind`, then a `Describe` of the

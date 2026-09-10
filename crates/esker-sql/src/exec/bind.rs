@@ -178,7 +178,44 @@ pub(super) fn substitute(
             },
         };
         match value {
-            Ok(value) => *expr = Expr::Literal(Literal::Typed(Box::new(value))),
+            // **The same rule [`substitute_placeholders`] applies, and for the same reason.** A
+            // bound value carries a *representation*; the parameter has a **type**. For the kinds
+            // that share `text`'s storage — `json`, `jsonb`, `xml`, `hstore`'s array, `void`, the
+            // two vectors — `Datum::from_text` answers a `Datum::Text`, so `column_type()` says
+            // `text` and `WHERE jsonb_col = $1` becomes `42883 operator does not exist:
+            // jsonb = text`. That is `Execute` answering something `Describe` does not, which is
+            // the mirror of the defect `8dd0b4a8` fixed one function along: it taught the
+            // *placeholder* to carry the type and left the bound value behind, because the census
+            // that found it was a `Describe` census.
+            //
+            // Run 116's `query_cache_test#test_query_cache_handles_mutated_binds` is the red, and
+            // `jsonb` is the type it names — `hstore` was already covered by the other half.
+            //
+            // The cast carries the type the representation cannot, and only where they differ, so
+            // a parameter whose datum already answers its own type gains no node.
+            Ok(value) => {
+                // **Only where the two would not resolve against each other anyway.** A NULL
+                // has no type to lose (`column_type()` is `None`), and a `varchar` parameter is a
+                // `Datum::Text` whose family *is* text — wrapping either adds a node for nothing,
+                // and the first one broke `LIMIT $1` with a NULL bound, which reaches
+                // `Expr::evaluate` where only a literal is allowed. `same_family` is the measured
+                // authority here for the reason `debts-v1.1.md` #43 made it one everywhere else:
+                // it is the table that says which pairs a comparison resolves.
+                let carries_its_type = match value.column_type() {
+                    None => true,
+                    Some(actual) => actual == ty || crate::exec::query::same_family(actual, ty),
+                };
+                let literal = Expr::Literal(Literal::Typed(Box::new(value)));
+                *expr = if carries_its_type {
+                    literal
+                } else {
+                    Expr::Cast {
+                        operand: Box::new(literal),
+                        to: ty,
+                        typmod: crate::value::NO_TYPMOD,
+                    }
+                };
+            }
             Err(error) => {
                 failure.get_or_insert(error);
             }
