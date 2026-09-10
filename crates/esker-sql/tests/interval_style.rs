@@ -96,7 +96,7 @@ fn every_path_to_the_client_uses_the_style() {
     );
 }
 
-/// **A cast to `text` does not move with the style yet, and this test asserts that on purpose.**
+/// **A cast to `text` moves with the style**, over a column and over a literal alike.
 ///
 /// `interval_out` is one function on a real server, so *everything* that turns an interval into a
 /// string follows the setting — measured under `iso_8601`, all seven answering `P1Y`:
@@ -111,31 +111,48 @@ fn every_path_to_the_client_uses_the_style() {
 /// jsonb_build_object('a', ...)      {"a": "P1Y"}
 /// ```
 ///
-/// The setting **does** reach expression evaluation now — `SELECT term::text FROM iv` answers
-/// `P6Y5M4DT3H2M1S` — because `cursor::Settings` carries it beside `search_path`. What is left is
-/// narrower and is what this test pins: a cast whose operand is a **literal** is folded at
-/// lowering, where there is no session at all, so `('1 year'::interval)::text` is decided before
-/// any of this runs. `||` is the other one, evaluated in a function that has no `Env`.
-///
-/// The value below is **this node's, not PostgreSQL's**, with PostgreSQL's in the message: a
-/// placeholder that can only be got rid of by being deleted, which is the shape g1 handed this
-/// lane for `interval(p)` and the reason that one could not be quietly edited away.
+/// **This test used to assert the opposite of its second line**, and said so: a cast whose operand
+/// was a *literal* was folded at lowering, where there is no session, so
+/// `('1 year'::interval)::text` was decided before any of this ran. `debts-v1.1.md` #42 stopped
+/// that fold discarding the node when the target is `text`, so the output function now runs where
+/// the session is — and the entry the old test carried was written to be deleted rather than
+/// edited, which is what happened.
 #[test]
-fn a_cast_to_text_does_not_move_with_the_style_yet() {
+fn a_cast_to_text_moves_with_the_style() {
     let mut node = parity::Node::new(FIXTURE);
     node.run("SET intervalstyle = 'iso_8601'").unwrap();
-    // The column case, which is what the session now reaches.
     assert_eq!(
         node.rows("SELECT term::text FROM iv"),
-        [["P6Y5M4DT3H2M1S".to_owned()]]
+        [["P6Y5M4DT3H2M1S".to_owned()]],
+        "a cast over a column has followed the setting since `cursor::Settings` carried it"
     );
     assert_eq!(
         node.rows("SELECT ('1 year'::interval)::text"),
+        [["P1Y".to_owned()]],
+        "and a cast over a literal follows it now that the fold keeps the node (#42)"
+    );
+}
+
+/// **Concatenation still does not move with the style**, which is the other half of the row above
+/// and the half `debts-v1.1.md` #42 did not reach.
+///
+/// `'1 year'::interval || ''` is `P1Y` on 19beta1 under `iso_8601` — measured, and it is the third
+/// line of the table above. Here it is `1 year`: `||` is evaluated in a function that has no `Env`,
+/// so the setting cannot reach it. That is a different mechanism from the fold — nothing is
+/// discarded, the value simply renders where the session is not — and it wants its own change.
+///
+/// The value below is **this node's, not PostgreSQL's**, with PostgreSQL's in the message: a
+/// placeholder that can only be got rid of by being deleted, which is the shape that made the cast
+/// half impossible to edit away quietly.
+#[test]
+fn concatenation_does_not_move_with_the_style_yet() {
+    let mut node = parity::Node::new(FIXTURE);
+    node.run("SET intervalstyle = 'iso_8601'").unwrap();
+    assert_eq!(
+        node.rows("SELECT '1 year'::interval || ''"),
         [["1 year".to_owned()]],
-        "PostgreSQL 19beta1 answers P1Y here: `interval_out` is one function and every cast, \
-         concatenation and format call goes through it. A cast over a COLUMN follows the \
-         setting here; this one is folded at lowering, where there is no session. When lowering \
-         stops folding an interval's output function, delete this test rather than editing it."
+        "PostgreSQL 19beta1 answers P1Y here; `||` is evaluated where there is no `Env`. When it \
+         reaches the session, delete this test rather than editing it."
     );
 }
 
