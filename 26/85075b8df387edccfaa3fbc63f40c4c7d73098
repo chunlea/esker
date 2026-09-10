@@ -1,0 +1,21 @@
+docs/adr/0097-an-oid-is-four-bytes-and-a-derived-one-is-not.md
+  s_dc640bf0df4adb::t_2cca5e723f640f 117-125
+docs/plans/debts-v1.1.md
+  s_dc640bf0df4adb::t_c8a8cdef5b6070 24,124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "2685075b8df387edccfaa3fbc63f40c4c7d73098",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
