@@ -151,6 +151,29 @@ about a real workload's shape.
      read, which needs no new tag and does need the client to be able to address a replica;
    * neither, and the pain is that one region carries everything → **(c)**, which is the cheapest
      and the only one that removes the coupling rather than the round trip.
+### A unit that is not this ADR's, and comes before it
+
+**`Executor::catalog_view` is reached from thirteen places, and each one re-reads the two version
+counters.** Run 111 counted **4,790,406** views in one ActiveRecord pass. That is not this ADR's
+question — every one of its three shapes changes *where* the version is read from, and this changes
+*how many times* — and it should be a small unit of its own, for three reasons:
+
+* **it is cheaper than any shape here**: caching the view per transaction inside the executor needs
+  no wire tag, no placement-driver change, no lease and no ADR;
+* **it comes first, or this ADR measures the wrong thing.** A statement that reads the version
+  thirteen times multiplies whatever a read costs by a number that belongs to the executor's
+  structure and not to the catalog's read path. Measuring (a), (b) or (c) against that is measuring
+  the executor;
+* **and the obvious worry is already answered, which is why this is a cost question and not a
+  correctness one**: every one of those reads goes through the same `txn`, and a transaction's
+  snapshot is fixed, so the version cannot move between them. A statement cannot see two shapes of
+  one table by taking two views. What it can do is pay for the same answer thirteen times.
+
+The shape of the unit, in the order this lane has learned to do them: **count the reads per
+statement class first** (the instrument already does, and `repeats of the same version` is exactly
+the redundant part), **then merge them**, **then count again** — so the change is reported as a
+difference and not as an intention.
+
 3. **The tail is what decides against the median.** A mean of 200 µs with a `rest` bucket that is
    never empty is a different system from a flat 200 µs, and the second is the one nothing needs to
    be done about.
