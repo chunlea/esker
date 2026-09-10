@@ -8694,26 +8694,6 @@ fn is_serial_spelling(data_type: &DataType) -> bool {
     serial_identity(data_type).is_some()
 }
 
-/// **A `regclass[]` is an expression type and not yet a column type.**
-///
-/// A narrower statement than it looks: `'{t}'::regclass[]`, `array_agg(c::regclass)` and
-/// `ARRAY[c::regclass]` all answer 2210 and none of them reaches [`lower_type`] — what is refused
-/// is the *declaration*. A scalar `regclass` column stores its number and resolves the name on the
-/// way out (`debts-v1.1.md` #35); the array's write path still rebuilds its elements through the
-/// element type's input function, and `regclassin` needs a catalog it cannot be handed there.
-///
-/// Refused by name rather than accepted and then failing on the first `INSERT`, which is what it
-/// did for as long as the declaration was allowed.
-fn refuse_a_regclass_array_column(element: ColumnType) -> Result<()> {
-    if element == ColumnType::RegClass {
-        return Err(SqlError::unsupported(
-            "a column of type regclass[] -- the scalar is a column type, and the array is an \
-             expression type until its write path stops reading its elements from text",
-        ));
-    }
-    Ok(())
-}
-
 #[expect(
     clippy::too_many_lines,
     reason = "one function per spelling a type can be written in, over the whole vocabulary: the \
@@ -8800,7 +8780,6 @@ pub(super) fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
                 return Err(SqlError::unsupported(format!("the type {data_type}")));
             };
             let (element, typmod) = lower_type(element)?;
-            refuse_a_regclass_array_column(element)?;
             let Some(array) = esker_keys::array::ArrayValue::array_of(element) else {
                 return Err(SqlError::unsupported(format!("the type {data_type}")));
             };

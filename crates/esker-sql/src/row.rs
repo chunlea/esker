@@ -47,12 +47,33 @@ pub fn decode_row(
     let mut row = esker_keys::row::decode_row(schema, bytes)?;
     if let Some(name_of) = name_of {
         for value in &mut row {
-            if let Datum::RegClass { oid, name } = value {
-                *name = name_of(*oid);
-            }
+            resolve(value, name_of);
         }
     }
     Ok(row)
+}
+
+/// One decoded value's `regclass` names, **including the ones inside an array**.
+///
+/// The scalar half is `debts-v1.1.md` #35 and the array half is #38, and they are one rule: an
+/// array is a container, so every question about an element is the element type's to answer
+/// (`esker_keys::array`). The row codec already writes a `regclass[]` element by element, so what
+/// a `regclass[]` column holds is a list of numbers and nothing else — and this is where the names
+/// go back in.
+///
+/// One level deep is the whole of it: this crate has no array of an array.
+fn resolve(value: &mut Datum, name_of: NameOfRelation<'_>) {
+    match value {
+        Datum::RegClass { oid, name } => *name = name_of(*oid),
+        Datum::Array(array) if array.element == crate::value::ColumnType::RegClass => {
+            for element in array.values.iter_mut().flatten() {
+                if let Datum::RegClass { oid, name } = element {
+                    *name = name_of(*oid);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
