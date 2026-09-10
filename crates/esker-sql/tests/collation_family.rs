@@ -10,12 +10,24 @@
 //!   `btrim`, `CASE`, `COALESCE`, a cast) is accepted. `replace` compares and `substr` does not,
 //!   which is the pair that says this is not a rule about names;
 //! * only a **column** settles it. An explicit `COLLATE` on a literal does not, in any placement;
-//! * and a `DEFAULT` is **not** a collation-requiring context, while a generated column, an index
-//!   key and a `CHECK` are — the three whose values get compared.
+//! * and **one context asks**: a generated column. A `DEFAULT`, an index expression, an index
+//!   predicate and a `CHECK` all accept `upper('a')` — corrected 2026-09-10 against this file's
+//!   own corpus rows, which said so from the start while its header said `42P22` for three of
+//!   them. The reading that came with the wrong table — *"the three whose values get compared"* —
+//!   is refuted by it, an index key and a `CHECK` being compared and not asking.
+//!
+//! **And there are two mechanisms, which an empty table cannot tell apart.** A conflict between
+//! two *implicit* collations (`u < v`, `C` against `POSIX`) is an **evaluation-time** error, in a
+//! query and in a generated column alike, and never fires on an empty table; a generated column's
+//! expression needing a collation derivable from a column is a **DDL** check, with rows or
+//! without. Every probe in this corpus ran against an empty table, which is why the first reading
+//! merged them.
 //!
 //! This node has no collation derivation at all, so every refusal above is a divergence in the
 //! **accepting** direction: it builds what a real server declines. Each is declared below rather
-//! than fixed, because deriving a collation is a type-system change with its own decision to take.
+//! than fixed until
+//! [ADR 0096](../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md),
+//! which is the decision and which is written from this file's measurements.
 //! The value the node computes is the value a real server would compute if it built the column —
 //! `C` and `POSIX` are the only collations it has
 //! ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)) and both
