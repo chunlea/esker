@@ -4330,6 +4330,16 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 // call and the evaluator dispatches on the operands — the rule the `||` regression
                 // taught: an operator this crate carries for one type must not answer for
                 // another's, and the only place that can be decided is where the values are.
+                // **`~=` is carried, not refused here.** Which types have it is the opposite of
+                // which types have the operators around it — the geometric shapes do and the
+                // document types do not — so the answer needs the operand's type, and the parser
+                // has none for a column.
+                BinaryOperator::TildeEq => {
+                    return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                        func: plan::CatalogFunc::SameAs,
+                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                    })));
+                }
                 BinaryOperator::AtArrow => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::HstoreContains,

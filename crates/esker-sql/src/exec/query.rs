@@ -3192,7 +3192,7 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             let containment = match call.func {
                 CatalogFunc::RangeContains => Some(("<@", true)),
                 CatalogFunc::HstoreContains => Some(("@>", false)),
-                CatalogFunc::RangeOverlaps => Some((call.func.name(), false)),
+                CatalogFunc::RangeOverlaps | CatalogFunc::SameAs => Some((call.func.name(), false)),
                 _ => None,
             };
             if let Some((symbol, flipped)) = containment {

@@ -38,25 +38,30 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     answers: &[],
 };
 
-/// **The whole measured table**, replayed against the corpus — red, and handed over measured.
+/// **The whole measured table**, replayed against the corpus.
 ///
-/// 88 of the 150 rows disagree, in **four** ways facing **two** directions, which is why this is
-/// not one commit's work:
+/// It began at 88 disagreements in four shapes facing two directions. **(a) — everything
+/// PostgreSQL refuses — is closed**: 64 rows, in seven pieces, each one a place that asked the
+/// question differently or not at all.
 ///
 /// ```text
-/// 20  PG 42883, node 42883   the direction is right and the sentence is not
-/// 18  PG 42883, node 0A000   right direction, wrong SQLSTATE
-/// 18  PG 42883, node ANSWERS the worse direction (ADR 0031)
-///  8  PG 42704, node ANSWERS an index PostgreSQL will not build
-/// 16  PG ANSWERS, node 0A000 `~=`, `@>`, `<@`, `&&` — refused where a real server answers
-///  8  PG ANSWERS, node 42883 the same, with the other code
+///  8  PRIMARY KEY / UNIQUE never asked `refuse_unindexable` at all
+/// 10  `polygon` is the only geometric shape with no `=`, and needed a third predicate
+///  2  `IN` is `=` with the operator implied, and asked nothing
+///  4  `UNION` deduplicates, and read no list
+/// 18  `json` and `jsonb` had to be refused differently — one is PostgreSQL's answer,
+///     the other is this node's gap
+/// 16  `&&` and `@>` are catalog functions, so the comparison check could not see them
+///  6  `IS DISTINCT FROM` names the operator it is missing, `=`
 /// ```
 ///
-/// So the node is wrong in both directions at once: it answers 26 things PostgreSQL refuses and
-/// refuses 24 it accepts. A fix that only made these types refuse would close the first half and
-/// widen the second, which is the trade the capture header warns about.
+/// The 24 that remain are **(b)**, the other direction: PostgreSQL answers and this node refuses —
+/// `~=` over a `point` or a `polygon`, `@>`/`<@` over `polygon` and `jsonb`, `jsonb`'s comparisons
+/// and its index. Every one of them is this node's own unimplemented rather than a copy of a real
+/// server's refusal, and they are deliberately untouched: a fix in the (a) direction that widened
+/// this one would be the same defect facing the other way.
 #[test]
-#[ignore = "measured and sized, not fixed: 88 rows, four sub-mechanisms, two directions"]
+#[ignore = "(a) is closed; the 24 that remain are (b) — PostgreSQL answers and this node refuses"]
 fn every_no_equality_answer_is_postgresql_19_s() {
     let checked = parity::replay(
         include_str!("corpus/pg19_no_equality_types.txt"),
