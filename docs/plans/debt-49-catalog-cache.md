@@ -1,6 +1,9 @@
 # #49, option (b): give the catalog cache the readers it does not have
 
-Status: **proposed, 2026-09-10 — waiting on the user.** Nothing here is built.
+Status: **proposed, 2026-09-10 — waiting on the user.** Nothing here is built. Its target was
+re-priced by run 117 the same day and the plan survived it; the last section is where that is
+recorded.
+
 [ADR 0106](../adr/0106-what-a-statement-reads-below-the-sql.md) is the decision document and this is
 the plan for its option (b), written so that a lane can start on the day it is chosen.
 
@@ -10,7 +13,8 @@ the plan for its option (b), written so that a lane can start on the day it is c
 summed catalog version; `View::relation` and `View::table_by_id` answer from it; `usable_at` drops
 it when the version moves; a transaction that has written the catalog gets `catalog: None` and
 reads its own DDL. The version read is the one [ADR 0102](../adr/0102-the-catalogs-read-path.md)
-timed at 0.4% of a statement.
+timed at **0.4%** of a statement, and run 117 measured at **2.3%** of a whole file — small either
+way, and **not** the reads this plan removes.
 
 **What the census found is who goes around it** ([`docs/bench/statement-reads.md`](../bench/statement-reads.md)):
 
@@ -164,9 +168,32 @@ a passing test would otherwise prove nothing.
   not, and only a real-topology run says what the counts bought. r1's is the number that closes
   this, not mine.
 
-## What would make this plan the wrong one
+## What would have made this plan the wrong one, and what run 117 said instead
 
-If run 117's per-statement prices show the 907 ordinary statements dominated by the TSO, the commit
-or the wire rather than by their reads, then eight catalog reads out of nine is a true fact about a
-cost that does not matter, and this plan should not be started. That is written into ADR 0106 and
-is repeated here because a plan file is what a lane reads first.
+**Written before the numbers:** *"if run 117's per-statement prices show the 907 ordinary statements
+dominated by the TSO, the commit or the wire rather than by their reads, then eight catalog reads
+out of nine is a true fact about a cost that does not matter, and this plan should not be
+started."*
+
+**Run 117 answered it 2026-09-10, and the answer was neither of the two this expected.** Transaction
+control is 0.8% of the file at p50 0.1 ms, so nothing is TSO- or commit-bound; but the ordinary
+statements are not where the time is either — **catalog introspection is 72.4%** and
+`pk_and_sequence_for` alone is **71.8%**, 483 statements at p50 2,382 ms. So *"eight of nine reads
+are catalog"* is indeed a true fact about a cheap statement, **and the plan is still the right one**
+— for the statement it now turns out to be about.
+
+**Two things in this plan change because of that, and neither is its shape:**
+
+1. **The first test is the one that matters most, not the ratio test.** `pk_and_sequence_for` in
+   `transactions_test` is the target: 483 x 2.4 s. Test 1's five-relation ratio is the mechanism;
+   the acceptance number is r1's, and it is **1,466 s → 496 s** at 35 → 3 round trips.
+2. **The `other` bucket is the second thing to look at and is nobody's row yet.** 592 statements,
+   median 8.2 ms, **p95 1,078 ms** — 184 of its 189 seconds are in a tail nobody has opened. That
+   is larger than `app SELECT` and `DDL DROP TABLE` put together and it is not this plan's; it
+   wants one `sort` before it wants a design.
+
+**And the risk this plan carries because of run 117**: the report's own catalog-stats section reads
+*"the catalog READ is 2.3% of this file"*, which taken alone would say none of this is worth doing.
+It is the **version** read — the one ADR 0102 instrumented — and `pk_and_sequence_for` makes 60 KV
+reads of which two are it. The other 58 are what this plan removes. Anyone picking this up will meet
+that 2.3% and should meet the explanation with it.
