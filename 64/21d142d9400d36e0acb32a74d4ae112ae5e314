@@ -1,0 +1,29 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_6f7019c05b578b::t_a64d0e32744106 1996-2001
+crates/esker-sql/src/exec/redrive.rs
+  s_6f7019c05b578b::t_4276f2fae6b14e 135-158,165-168,175,320-324,378-384
+crates/esker-sql/src/pgwire/server.rs
+  s_6f7019c05b578b::t_74d61e73cbd2a4 551-552
+crates/esker-sql/src/session.rs
+  s_6f7019c05b578b::t_15ccecd86e0842 74-77,83,96-105,122-137
+crates/esker-sql/tests/redrive.rs
+  s_6f7019c05b578b::t_8de94d2544183c 1059-1130
+docs/plans/debts-v1.1.md
+  s_6f7019c05b578b::t_72c6f9fa2ffb37 24,122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6421d142d9400d36e0acb32a74d4ae112ae5e314",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
