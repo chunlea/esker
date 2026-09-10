@@ -1637,9 +1637,35 @@ async fn what_a_catalog_read_costs_with_stores_under_it() {
         // One statement per round trip on purpose: each takes its own catalog view, which is the
         // thing being counted. A batched insert would count one view for five hundred rows.
         for n in 1..=ROWS {
-            session
-                .run(&format!("INSERT INTO t VALUES ({n}, {n})"))
-                .expect("the insert lands");
+            // **The transients a splitting, electing cluster answers with are waited out, not
+            // failed on.** `40003` is an outcome nobody can know, `08006` is a client that spent
+            // its attempts, and both mean *not now*. The retry is safe here for the reason
+            // `cluster_harness::run` gives: every insert names its own primary key, so a second
+            // attempt either writes the row or meets `23505` on the row its first attempt wrote —
+            // and that is a success, accepted only *after* an ambiguous answer.
+            let statement = format!("INSERT INTO t VALUES ({n}, {n})");
+            let mut unknown = false;
+            for attempt in 0..40 {
+                match session.run(&statement) {
+                    Ok(_) => break,
+                    Err(error) => {
+                        let text = error.to_string();
+                        if unknown && text.contains("23505") {
+                            break;
+                        }
+                        unknown |= text.contains("may or may not have been applied");
+                        assert!(
+                            unknown
+                                || text.contains("not the leader")
+                                || text.contains("could not reach the store"),
+                            "`{statement}` was refused by something this measurement is not \
+                             about: {error}"
+                        );
+                        assert!(attempt < 39, "`{statement}` never landed: {error}");
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
         }
         let after_writes = esker_sql::catalog::stats::summary();
         for n in 1..=ROWS {
