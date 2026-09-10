@@ -3183,24 +3183,37 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             // agree about which types have them: `polygon @> polygon` answers where
             // `point @> point` does not, and `polygon && polygon` answers where `jsonb && jsonb`
             // does not (`value::operator_exists`, measured cell by cell).
-            if matches!(
-                call.func,
-                CatalogFunc::RangeOverlaps
-                    | CatalogFunc::RangeContains
-                    | CatalogFunc::HstoreContains
-            ) && let Some(first) = args.first()
-                && let Ok(left) = expr_type(first, scope)
-                && !crate::value::operator_exists(call.func.name(), left)
-            {
-                let right = args
-                    .get(1)
-                    .and_then(|arg| expr_type(arg, scope).ok())
-                    .unwrap_or(left);
-                return Err(SqlError::UndefinedOperator {
-                    left: left.name().to_owned(),
-                    op: call.func.name(),
-                    right: right.name().to_owned(),
-                });
+            // **The spelling the user wrote is recoverable here**, though `CatalogFunc::name`
+            // collapses both containments to `@>` for the evaluator's dispatch: `parse::lower`
+            // sends a written `@>` to `HstoreContains` and a written `<@` to `RangeContains`
+            // **with its arguments flipped**, and each of the two has exactly one origin. So the
+            // refusal can say `json <@ json`, which is what a real server says, rather than naming
+            // the operator this crate rewrote it into.
+            let containment = match call.func {
+                CatalogFunc::RangeContains => Some(("<@", true)),
+                CatalogFunc::HstoreContains => Some(("@>", false)),
+                CatalogFunc::RangeOverlaps => Some((call.func.name(), false)),
+                _ => None,
+            };
+            if let Some((symbol, flipped)) = containment {
+                let (written_left, written_right) = if flipped {
+                    (args.get(1), args.first())
+                } else {
+                    (args.first(), args.get(1))
+                };
+                if let Some(operand) = written_left
+                    && let Ok(left) = expr_type(operand, scope)
+                    && !crate::value::operator_exists(symbol, left)
+                {
+                    let right = written_right
+                        .and_then(|arg| expr_type(arg, scope).ok())
+                        .unwrap_or(left);
+                    return Err(SqlError::UndefinedOperator {
+                        left: left.name().to_owned(),
+                        op: symbol,
+                        right: right.name().to_owned(),
+                    });
+                }
             }
             // **`pg_typeof` is answered here, from the argument's *declared* type, always.**
             //
