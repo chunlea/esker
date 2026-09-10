@@ -2081,6 +2081,26 @@ pub(super) fn evaluate_in_txn(expr: &Expr, row: &[Datum], txn: &dyn Txn) -> Resu
     evaluate_in(expr, row, Env::in_txn(txn))
 }
 
+/// What the **plan** says an expression's type is, for the one question a `Datum` cannot answer.
+///
+/// Several types share one `Datum` — `text`, `varchar`, `bpchar`, `name` and `"char"` are all a
+/// `Datum::Text` — and that is fine everywhere except a cast, where `"char" -> int4` is a function
+/// and `text -> int4` is the target's input function over the printed value. The plan knows: a
+/// column reference carries its column's type, a cast carries the type it named, and a folded
+/// literal carries its own. Answers `None` for everything else, which leaves the ordinary road.
+///
+/// **Narrow on purpose.** The general fix is a `Cast` node carrying the type it casts *from*, or a
+/// `"char"` carrying its own type the way `Datum::Geometry` and `Datum::Bit` carry theirs
+/// (ADR 0050); both are wider than the one pair that needs them today.
+fn declared_type_of(expr: &Expr) -> Option<ColumnType> {
+    match expr {
+        Expr::Ordinal { ty, .. } => Some(*ty),
+        Expr::Cast { to, .. } => Some(*to),
+        Expr::Literal(crate::plan::Literal::Typed(value)) => value.column_type(),
+        _ => None,
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one arm per expression shape; splitting it would hide the vocabulary rather than clarify it"
@@ -2427,6 +2447,22 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 if crate::value::is_geometric(*to) =>
             {
                 crate::value::geometric_cast(&value, *to)?
+            }
+            // **A `"char"` to an `int4` is the byte, and only the *plan* knows it is a `"char"`.**
+            // A `"char"` and a `text` are the same `Datum::Text` here, and `text -> int4` really is
+            // the I/O conversion it looks like — `'42'::text::int4` is 42 — so the value alone
+            // cannot say which cast this is. The operand can: a column reference carries the
+            // column's type (`Expr::Ordinal`), a cast carries the type it named, and a folded
+            // literal carries its own. `parse::lower` had this pair right for a literal from the
+            // day `"char"` arrived and the evaluator answered
+            // `22P02 invalid input syntax for type integer: "r"` per row, for two years of
+            // corpora, because nothing asked the plan. `debts-v1.1.md` #43, the last row of its
+            // first mechanism.
+            Datum::Text(ref text)
+                if *to == ColumnType::Int4
+                    && declared_type_of(operand) == Some(ColumnType::Char) =>
+            {
+                Datum::Int4(crate::value::char_type::to_int4(text))
             }
             value => {
                 // **Ask whether a real server would have rendered anything at all, first.**

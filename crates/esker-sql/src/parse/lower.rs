@@ -6323,9 +6323,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             // `chr(200)::"char"::int4` is `-61` on 19beta1, not `195`. A `"char"` is one *byte*
             // and PostgreSQL's `chartoi4` reads it as `int8`, the C type, which is signed.
             return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-                Datum::Int4(i32::from(i8::from_ne_bytes([value::char_type::to_byte(
-                    &text,
-                )]))),
+                Datum::Int4(value::char_type::to_int4(&text)),
             ))));
         }
         // The other direction, and it is the same fact: the number **is** the byte, so `65` is `A`

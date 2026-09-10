@@ -27,13 +27,12 @@
 //! `bpchar`, which is a pair this file probes anyway, and the four real `"char"` targets are in
 //! the second half with their quotes. That is why 157 pairs are covered by 160 probes.
 //!
-//! **24 of the 157 still disagree**, and there is still no pair anywhere where this node answers
+//! **23 of the 157 still disagree**, and there is still no pair anywhere where this node answers
 //! and PostgreSQL refuses. It was 33 before `money`, `regproc`, `regtype` and `interval -> time`,
 //! 49 before the conversions that do not go through the text (`value::convert_without_text`), and
 //! 63 before the geometric fourteen. What is left:
 //!
 //! ```text
-//!  1  a conversion this node does not have    `"char" -> int4`, and it is a missing *type*  (#43)
 //!  3  the two catalogs differ                 int2/int4/int8 -> regproc: the oid is right and
 //!                                             this node's `pg_proc` has fifteen functions
 //!  7  both answer, the values differ          inet, boolean, and the rest of #44's renderings
@@ -41,11 +40,13 @@
 //!  3  ADR 0097's oid space                    regclass -> oid, int4, int8                   (#45)
 //! ```
 //!
-//! **The first mechanism is one row from done, and that row is not a conversion.** A `"char"` and
-//! a `text` are both a `Datum::Text`, so the *evaluator* cannot tell which cast it is being asked
-//! for, where `text -> int4` really is the I/O conversion it looks like; the same cast over a
-//! **literal** is right because the fold knows the type that was written. `cast_fold.rs` is that
-//! half, and the fix is a type carrying itself rather than a conversion being written.
+//! **#43's first mechanism is done**: every `pg_cast` pair this node and the oracle share either
+//! answers what a real server answers or is declared above with a reason that is not a missing
+//! conversion. The last one to go was `"char" -> int4`, which is the shape worth remembering: a
+//! `"char"` and a `text` are the same `Datum::Text`, so the *value* could not say which cast it
+//! was — the **plan** could, and `exec::cursor::declared_type_of` asks it. The general fix, a
+//! `Cast` node carrying the type it casts *from*, is still the right one and is still unwritten;
+//! this is the one pair that needed it.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -132,11 +133,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT (c_oid)::regclass FROM castprobe",
             "**#43 group 4 -- both answer and the values differ.** Eight pairs, and they are renderings rather than conversions: `inet` loses its prefix length (`10.0.0.1` for `10.0.0.1/32`), `boolean` renders `t` where a real server writes `true` into a character type, `uuid -> bytea` gives the *text* of the uuid where a real server gives its sixteen bytes. Each is one output function, and none of them is the `Expr::Cast` arm being absent.",
             "pg19_cast_matrix.txt:164",
-        ),
-        (
-            "SELECT (c_char)::int4 FROM castprobe",
-            "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
-            "pg19_cast_matrix.txt:301",
         ),
         (
             "SELECT (c_jsonb)::int8 FROM castprobe",
