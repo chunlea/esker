@@ -2425,76 +2425,44 @@ impl Literal {
                     | ColumnType::Numeric
             ),
             Literal::Bool(_) => matches!(ty, ColumnType::Bool),
-            // **A `numeric` literal compares like any other number**, which is the set above and
-            // not what `fits` answers. `fits` is the *assignment* rule — what may be stored in a
-            // column of that type — and using it here would make `id = 9223372036854775808`
-            // against a `bigint` key `42883 operator does not exist: bigint = numeric`, where
-            // PostgreSQL promotes the column and answers false. An integer past `int8` is the only
-            // way to write this literal without a cast, and it is what `or_test.rb` sends.
-            Literal::Typed(value) if matches!(**value, Datum::Numeric(_)) => matches!(
-                ty,
-                ColumnType::Int8
-                    | ColumnType::Int4
-                    | ColumnType::Int2
-                    | ColumnType::Double
-                    | ColumnType::Real
-                    | ColumnType::Numeric
-            ),
-            // **An integer value compares like an integer literal, whatever width it arrived as.**
-            // `fits` is the *assignment* rule and is deliberately strict — an `int4` is not an
-            // `int8` and does not go into one without a conversion — but comparison is a different
-            // question and PostgreSQL has `int84eq`: `id = 1::int4` against a `bigint` key is a
-            // row, not a `42883`. It became reachable when `ARRAY[1,3]` started folding to `int4`
-            // elements (ADR 0087) and `id = ANY(ARRAY[1,3])` refused itself.
-            Literal::Typed(value)
-                if matches!(**value, Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)) =>
-            {
-                matches!(
-                    ty,
-                    ColumnType::Int8
-                        | ColumnType::Int4
-                        | ColumnType::Int2
-                        | ColumnType::Double
-                        | ColumnType::Real
-                        | ColumnType::Oid
-                        | ColumnType::Numeric
-                )
-            }
-            // **An `oid` value compares with the integer widths and with the other oid-ish
-            // types, and with nothing else** — `same_family`'s own rule, read from the literal's
-            // side. Measured, one statement per cell: `'1'::oid = '1'::bigint`, `= '1'::integer`,
-            // `= '1'::smallint` and `= 'int4'::regtype` all answer, `'1'::oid = '1.5'::numeric`,
-            // `= '1.5'::double precision` and `= '1.5'::real` are each `42883`, and `regclass`,
-            // `regproc` and `regtype` behave as `oid` does against all three integer widths
-            // (`tests/captures/pg19_comparison_matrix.txt`).
+            // **Three arms used to stand here, one per `Datum` family, and the measured table
+            // subsumes all three.** They were a `numeric` value's list, an integer value's list
+            // and an oid-ish value's list, each written the day a pair of its own was found and
+            // each stopping where its author stopped: the integer one reached `oid` and not
+            // `regclass`, `regproc` or `regtype`, so `regtype_col = 1::bigint` was
+            // `42883 operator does not exist: regtype = bigint` for a comparison a real server
+            // answers — nine rows of `tests/captures/pg19_comparison_matrix_column.txt`, and they
+            // were the last nine, found only after the other seventy-six had gone. `same_family`
+            // gives each of the three lists exactly the answers it gave, and gives the nine the
+            // right one.
             //
-            // Without it a folded `1::oid` beside a *cast* to an integer width fell through to
-            // [`Datum::fits`] — the **assignment** rule, which says an `oid` is not a `bigint` —
-            // and `1::oid = 1::int8` was `42883 operator does not exist: oid = bigint`. That is
-            // the third of the three reds `parse::lower::lower_cast`'s comment names as the
-            // boundary of `debts-v1.1.md` #42's remaining half, and it is the same shape as the
-            // rest of #43: one fact, two readers, and only the reader it was written for knew it.
-            Literal::Typed(value)
-                if matches!(
-                    **value,
-                    Datum::Oid(_)
-                        | Datum::RegType { .. }
-                        | Datum::RegProc { .. }
-                        | Datum::RegClass { .. }
-                ) =>
-            {
-                matches!(
-                    ty,
-                    ColumnType::Int2
-                        | ColumnType::Int4
-                        | ColumnType::Int8
-                        | ColumnType::Oid
-                        | ColumnType::RegType
-                        | ColumnType::RegProc
-                        | ColumnType::RegClass
-                )
-            }
-            Literal::Typed(value) => value.fits(ty),
+            // **A range goes through the same arm, and the representative is the right answer
+            // here.** `Datum::Range` carries its *subtype*, so `column_type` names a set — but
+            // only one pair shares one, `int4range` and `int8range`, both being ranges of an
+            // `int8` in this crate. Every other range spelling has a subtype of its own and so a
+            // representative that is exactly itself. An `int8range` **literal** cannot reach this
+            // arm at all: `column_type` disagrees with the type it was cast to, so
+            // `parse::lower::lower_cast` keeps the `Cast` node and the pair takes `reconcile`'s
+            // two-typed arm instead. So the family test is right for every range that gets here,
+            // and it is what refuses `r = '[1,3)'::int4range` over an `int8range` column — the
+            // last of the 86 and the one `Datum::fits` cannot see, because `fits` compares
+            // subtypes and these two share one.
+            // **And everything else asks the measured table, where it used to ask `fits`.** `fits`
+            // is the **assignment** rule — this function's own first paragraph says that is the
+            // wrong question for a comparison — and it was still the last arm here, so a literal
+            // written with a cast was admitted or refused by whether it could be *stored* in the
+            // column. That refused 31 comparisons a real server answers, one per pair whose two
+            // types are related by an operator and not by a coercion: `bigint = double precision`,
+            // `date = timestamp`, `citext = text`, `inet = cidr`, `interval = time`,
+            // `regtype = bigint`.
+            //
+            // `same_family` is the authority `exec::query::reconcile`'s two-column arm and its
+            // two-literal arm already ask, and it is measured twice over — 2,704 pairs as two
+            // columns and 2,704 as two literals. Three readers of one question, and this was the
+            // last one still answering it its own way (`debts-v1.1.md` #43).
+            Literal::Typed(value) => value
+                .column_type()
+                .is_none_or(|held| crate::exec::query::same_family(held, ty)),
         }
     }
 

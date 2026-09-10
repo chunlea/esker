@@ -43,31 +43,27 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_assignment_cast_date.txt:43",
         ),
         // **Both of these came out from behind the `SET TimeZone` refusal** that ADR 0080 closed,
-        // and neither is a time-zone gap: the zone reaches the renderer and the second column of
-        // the first row proves it — `2011-01-02 12:30:00+13` agrees exactly. What does not agree
-        // is what the cast is *applied to*.
+        // and neither was a time-zone gap: the zone reaches the renderer and the second column of
+        // the first row proved it — `2011-01-02 12:30:00+13` agreed exactly. What did not agree
+        // was what the cast is *applied to*.
         //
-        // **A cast over a literal is folded at lowering, where there is no session.**
-        // `'2011-01-01 23:30:00+00'::timestamptz::date` is `2011-01-02` on a real server and
-        // `2011-01-01` here, because the fold renders the instant with the boot output function
-        // and reads the day off that text. The **column** form is right — `cursor::evaluate`'s
-        // cast renders under the session (`tests/time_zone.rs`) — so this is the literal fold and
-        // not the conversion, and it is the same gap `tests/interval_style.rs` declares for
-        // `'1 mon'::interval::text`. One fix closes both.
-        (
-            "SELECT 'r', '2011-01-01 23:30:00+00'::timestamptz::date, '2011-01-01 \
-             23:30:00+00'::timestamptz",
-            "a cast over a literal is folded at lowering, where there is no session to render the \
-             instant in",
-            "pg19_assignment_cast_date.txt:69",
-        ),
-        // **The `INSERT` above is taken now** — `has_assignment_cast` learned the pair and
-        // `value::assignment_cast` learned the zone — and these two reads of what it stored are
-        // the *same literal fold* as the row above, one statement later. The value written is the
-        // UTC day because the operand `'2011-01-01 23:30:00+00'::timestamptz` was folded at
-        // lowering, where there is no session; an instant that arrives as an **expression** takes
-        // the session's day, which `tests/time_zone.rs` asserts against a column. One fix closes
-        // this, the row above it, and `tests/interval_style.rs`'s literal cast.
+        // **The `SELECT` half is closed, by `debts-v1.1.md` #42's remaining half.**
+        // `'2011-01-01 23:30:00+00'::timestamptz::date` was `2011-01-01` here and `2011-01-02` on
+        // a real server, because the fold rendered the instant with the boot output function and
+        // read the day off that text. `lower_cast` now keeps the `Cast` node whenever the
+        // operand's type is not the target's, so the conversion happens in `cursor::evaluate`,
+        // under the session — which is where the **column** form was right all along
+        // (`tests/time_zone.rs`). The entry is gone rather than reworded: a listed divergence
+        // that starts agreeing is deleted, and this one was named after its cause, so its cause
+        // closing is the whole of it.
+        //
+        // **The `INSERT` is not closed, and it is now clear that it never was the same row.**
+        // The two below read what an earlier `INSERT` *stored*, and the value it stored is the
+        // UTC day: that write took the operand through the assignment path, not through the
+        // comparison the row above took. `tests/interval_style.rs`'s `'1 mon'::interval::text`
+        // is a third site and also still open. The note here used to say one fix closes all
+        // three; one fix closed one, which is the useful correction — they share a *symptom*,
+        // a value rendered without the session, and not a caller.
         (
             "SELECT 'r', name, updated_on FROM bk WHERE name = 'tz probe'",
             "the instant was folded to a date at lowering, where there is no session zone",

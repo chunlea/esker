@@ -122,35 +122,40 @@ fn every_comparison_pair_agrees_with_postgresql_19() {
 /// the reason this capture exists at all.
 ///
 /// 52 columns against 53 literals — `void` is the one spelling that cannot be a column — and
-/// PostgreSQL answers 153 of the 2,756. **86 of them disagree**, and they are three mechanisms:
+/// PostgreSQL answers 153 of the 2,756. **86 disagreed when it was first measured**, in three
+/// mechanisms, and they came out in that order — each one only visible once the one in front of
+/// it had gone:
 ///
 /// ```text
-/// 44  PG refuses, node ANSWERS   41 of them a `tsrange` literal against every column there is
-///  1                             '[1,3)'::int4range against an int8range column
-///  2                             int2vector and oidvector against a text literal
-/// 31  PG answers, node refuses   42883, `comparable_with` ending in `Datum::fits`
-/// 11  PG answers, node refuses   42804, `retype` narrowing where it should compare
+/// 44 -> 3   PG refuses, node ANSWERS   a range value `fits` every column there is
+///  3 -> 0                              …and `same_family` finishes the job
+/// 31 ->     PG answers, node refuses   42883, `comparable_with` ending in `Datum::fits`
+/// 11 ->     PG answers, node refuses   42804, `retype` narrowing where it should compare
+///  9 -> 0   PG answers, node refuses   an integer value's list that stopped at `oid`
 /// ```
 ///
-/// **The 41 are one line.** `Datum::fits` answers a range by `row::range_subtype(ty) == subtype`,
-/// and `range_subtype` returns `Timestamp` for every type that is not a range — so a `tsrange`
-/// value fits *every* non-range column, and `c = '…'::tsrange` answers for a `boolean`, a `box`,
-/// an `xml`. The `int4range` row is the same function's other face: an `int4range` and an
-/// `int8range` are both ranges of an `int8` here, so each fits the other's column.
+/// **The 41 were one line.** `Datum::fits` answered a range by
+/// `row::range_subtype(ty) == subtype`, and `range_subtype` is total with `Timestamp` as its
+/// fallback — so a `tsrange` value fitted *every* non-range column and `c = '…'::tsrange`
+/// answered for a `boolean`, a `box`, an `xml`. `esker_keys::row::is_range` is the question it
+/// was missing.
 ///
-/// **The 31 and the 11 are the two gates in order.** `comparable_with`'s last arm is
+/// **The 31 and the 11 were two gates in order.** `comparable_with`'s last arm was
 /// `value.fits(ty)` — the **assignment** rule, which its own doc comment says is the wrong
 /// question for a comparison — so `bigint_col = 1.5::float8`, `date_col = '…'::timestamp`,
-/// `citext_col = 'x'::text`, `inet_col = '…'::cidr` and `regtype_col = 1::int8` are each `42883`
-/// where a real server answers. Fix that and the 11 appear behind it: `retype` goes on to
-/// `literal.assign(ty)`, and assigning an `oid` into a `regproc` is
-/// `42804 column "?column?" is of type regproc but expression is of type oid`.
+/// `citext_col = 'x'::text`, `inet_col = '…'::cidr` and `regtype_col = 1::int8` were each
+/// `42883`. Behind them `retype` went on to `literal.assign(ty)`, and assigning an `oid` into a
+/// `regproc` is `42804 column "?column?" is of type regproc but expression is of type oid`.
 ///
-/// It is the same pair of readers `debts-v1.1.md` #43's second mechanism was, one arm over: the
-/// cast arms were fixed by asking `same_family`, which is the measured table, and these arms
-/// still ask `fits`.
+/// **And behind those, nine more from a fourth list.** `comparable_with` had three arms of its
+/// own for a typed `Datum` — a `numeric`'s, an integer's, an oid-ish one's — each a hand-written
+/// set. The integer one reached `oid` and stopped there, so `regtype_col = 1::bigint` was
+/// `42883`. All three are gone: `same_family` gives each of them the answers it gave and gives
+/// the nine the right one.
+///
+/// The whole of it is one sentence — **ask the measured table, not the assignment rule** — and it
+/// is the sentence `debts-v1.1.md` #43's second mechanism made one arm over.
 #[test]
-#[ignore = "86 of 2,756: comparable_with ends in the assignment rule, and a range fits every column"]
 fn every_column_against_a_typed_literal_agrees_with_postgresql_19() {
     let capture = include_str!("captures/pg19_comparison_matrix_column.txt");
     let fixture: Vec<&str> = capture

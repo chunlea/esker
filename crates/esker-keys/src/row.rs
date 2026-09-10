@@ -1039,6 +1039,32 @@ pub fn range_subtype(ty: ColumnType) -> ColumnType {
     }
 }
 
+/// Whether `ty` is a range type at all — the question [`range_subtype`] cannot answer.
+///
+/// `range_subtype` is total and its fallback is `Timestamp`, which is right for its own callers
+/// (they have already decided they hold a range) and wrong for anyone asking whether a value
+/// *belongs* to a column: `range_subtype(text)` is `Timestamp`, so a `tsrange` value satisfied
+/// `range_subtype(ty) == subtype` for **every** non-range type and `Datum::fits` said yes. That
+/// made `c = '[2020-01-01,2020-01-02)'::tsrange` answer over a `boolean`, a `box` and an `xml`
+/// — 41 of the 86 rows in `esker-sql`'s `pg19_comparison_matrix_column.txt`.
+///
+/// Beside `range_subtype` and not beside its callers, for the reason that one is `pub` and single:
+/// a list of the range types kept anywhere else is a list that can disagree with this one.
+#[must_use]
+pub fn is_range(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::TsRange
+            | ColumnType::TstzRange
+            | ColumnType::Int4Range
+            | ColumnType::Int8Range
+            | ColumnType::DateRange
+            | ColumnType::NumRange
+            | ColumnType::FloatRange
+            | ColumnType::VarcharRange
+    )
+}
+
 /// A text-shaped index key column.
 ///
 /// **A citext key holds the folded value**, so it decodes to a folded one — that is what makes a

@@ -4703,27 +4703,26 @@ fn retype(
     {
         return Ok(literal.clone());
     }
-    // **And an oid-ish literal against an integer width is compared, not narrowed**, which is the
-    // arm above one type over and the last of the three reds `parse::lower::lower_cast`'s comment
-    // names. `1::oid = 1::int8` arrives here as an `oid` value against a `bigint` once the fold
-    // keeps the cast node, and `assign` is the wrong question for it: assigning an `oid` into a
-    // `bigint` is `42804 column "?column?" is of type bigint but expression is of type oid`, a
-    // refusal for a comparison a real server answers — `'1'::oid = '1'::bigint` is measured
-    // `boolean`, as are `= '1'::integer` and `= '1'::smallint`, and `regclass`, `regproc` and
-    // `regtype` behave the same against all three widths
-    // (`tests/captures/pg19_comparison_matrix.txt`).
+    // **A literal that was written with a cast is compared, not narrowed** — the arms above are
+    // this same sentence for the three spellings that carry *no* cast, and this is the general
+    // one. `assign` is the wrong question for a comparison, and its failure says so out loud:
+    // `1::oid = 1::int8` is `42804 column "?column?" is of type bigint but expression is of type
+    // oid` and `regproc_col = 1::oid` is the same sentence one type over, both for comparisons a
+    // real server answers. Nothing here needs narrowing: the pair has already passed
+    // `comparable_with`, which is `same_family` now, and `Datum::pg_cmp` has an arm for every
+    // pair a family holds — the integer widths, `date` against `timestamp`, `inet` against
+    // `cidr`, `citext` against `text`, an `oid` against each integer width.
     //
-    // The **values** are unaffected: `Datum`'s ordering has an arm for an `oid` against each
-    // integer width, which is what already makes `26::oid = 26` answer with a folded literal on
-    // one side. Narrowing is what an assignment does, and this is not one.
-    if matches!(literal, Literal::Typed(value)
-    if matches!(
-        **value,
-        Datum::Oid(_)
-            | Datum::RegType { .. }
-            | Datum::RegProc { .. }
-            | Datum::RegClass { .. }
-    )) && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+    // **Only `Literal::Typed`**, and that boundary is the point: a bare `1`, `1.5` or `'x'` has no
+    // type of its own and *should* take the column's, which is what the arms above and
+    // `literal.assign` below are for. A cast keeps what it was given (ADR 0086).
+    //
+    // Measured across all 2,756 column-against-literal pairs
+    // (`tests/captures/pg19_comparison_matrix_column.txt`): eleven of them were this `42804`, and
+    // they became visible only once `comparable_with` stopped refusing them one gate earlier.
+    if let Literal::Typed(value) = literal
+        && let Some(held) = value.column_type()
+        && held != ty
     {
         return Ok(literal.clone());
     }

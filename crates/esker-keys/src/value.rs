@@ -1172,7 +1172,8 @@ impl Datum {
         // subtype names a *set* of column types and not one. Asked from the column's side, where
         // the answer is single-valued.
         if let Datum::Range { subtype, .. } = self {
-            return crate::row::range_subtype(ty) == **subtype
+            return crate::row::is_range(ty)
+                && crate::row::range_subtype(ty) == **subtype
                 && crate::array::ArrayValue::element_of(ty).is_none();
         }
         let Some(actual) = self.column_type() else {
