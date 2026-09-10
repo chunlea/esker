@@ -1,0 +1,29 @@
+crates/esker-client/src/txn.rs
+  s_6f7019c05b578b::t_9c9a774d01e7d2 1505-1527,1529-1538
+crates/esker-client/tests/anomalies.rs
+  s_6f7019c05b578b::t_c486361169ac76 315-443
+crates/esker-store/src/txnkv.rs
+  s_6f7019c05b578b::t_c6268ef8cebbfa 204-242,458-474
+crates/esker-store/tests/txnkv.rs
+  s_6f7019c05b578b::t_efbf3e3da84bca 1128-1245
+crates/esker-txn/src/snapshot.rs
+  s_6f7019c05b578b::t_27c25be6389415 1,9,12-13,22-23,108-138,164-171,285-308
+docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md
+  s_6f7019c05b578b::t_dbe77ef70f833e 264,266-281,290-303,308-313
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "028e0071674a281ad7f02922dcab461c3a3d48a3",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
