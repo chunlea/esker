@@ -84,6 +84,16 @@ one below the floor is the largest batch for which that is true.
   asserting that batched delivery still livelocks it. If that ever stops holding, the core has
   grown a defence of its own and this rule can be revisited — which is why it is an assertion
   rather than a comment.
+* **It guards the leader as well as the election, which this file did not set out to claim.** A
+  driver's queue carries ticks and messages alike, so a follower can advance `election_elapsed`
+  past its own draw on ticks queued *in front of* the heartbeat that would have reset it — and
+  §6.2's lease is no defence, since a follower starved alike has spent its own window and grants
+  what it would otherwise refuse. Measured on both sides of the cap in
+  `a_batch_that_puts_ticks_before_a_heartbeat_deposes_a_live_leader`: at the pre-cap width of 21 a
+  live leader is deposed and the term moves; **at the capped 9 it survives**, because every drive
+  delivers a heartbeat before nine ticks can reach a draw of ten. The field's *a leader is elected
+  and does not survive*, seen at a HEAD that already has this rule, is therefore **not** this
+  mechanism — which is what makes the note worth keeping.
 * What this does **not** claim: that #34's stall is gone. That stall was separated to an overloaded
   in-process harness — four real store processes reached 663 regions without one — and this removes
   the mechanism the sweep found inside it. The next run of `how_the_leaderless_window_moves_with_the_drivers`
