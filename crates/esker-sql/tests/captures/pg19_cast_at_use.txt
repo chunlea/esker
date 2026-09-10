@@ -1,0 +1,143 @@
+# **`'<value>'::text::<T>`** — the conversion at the use site, over the whole probe list.
+#
+# PostgreSQL 19beta1, 2026-09-10, `127.0.0.1:55432`, one `BEGIN … ROLLBACK` with a
+# `SAVEPOINT`/`ROLLBACK TO` per probe and `statement_timeout` set. Wire v3 family **F7**, whose
+# shape `wire-v3-format.md` calls `cast_at_use`: the operand's type is `text` and the **template**
+# does the converting, which is the split the list was extended for after run 110's regclass
+# defect.
+#
+# Each of the 100 distinct type spellings asked once, value bound rather than spliced:
+#
+#     SELECT pg_typeof($1::text::<type>)
+#
+# ## The finding: 19beta1 accepts all 100
+#
+# **Zero refusals.** An explicit cast out of a string type is always allowed — it goes through the
+# target's **input function**, and `pg_cast` needing a row for the pair is not the question. So a
+# node that refuses one of these is refusing a statement a real server answers, whatever its cast
+# table says.
+#
+# The only two answers that are not the spelling asked for are `time` and `timestamp`, which come
+# back canonicalised (`time without time zone`, `timestamp without time zone`) — the same rendering
+# everywhere else in these captures, not a different type.
+#
+# ## What this node refused, before the fix
+#
+#     '1 2'::text::oidvector      42846 cannot cast type text to oidvector          PG oidvector
+#     '{…}'::text::regclass[]     0A000 a relation name read as a regclass without
+#                                       a catalog is not supported                 PG regclass[]
+#
+# **`int2vector` was already right**, and the asymmetry is the tell: it has a `sqlparser`
+# `DataType` and reaches `lower_type` and the ordinary literal path, while `oidvector` is a
+# `CastTarget` and goes down a path written for `ARRAY[…]::oidvector`. That path read a string only
+# when the operand was a **bare quoted literal**, so a `text` column, a `::text::` cast and a
+# concatenation all fell into the evaluator arm that raises "this array has an element with no oid
+# to render" — a sentence about arrays, for a value that is not one.
+#
+# **The second row is family F8's**, not this one: `0A000` there is the same runtime `reg*`
+# resolution hole as its `regclass`/`regclass[]` parameter rows.
+#
+# ## The raw answers, one line per distinct spelling
+#
+#     <type> <TAB> ok=<answer>   |   <type> <TAB> !<sqlstate> <message>
+#
+"char"	ok="char"
+"char"[]	ok="char"[]
+bigint	ok=bigint
+bigint[]	ok=bigint[]
+bit	ok=bit
+bit[]	ok=bit[]
+boolean	ok=boolean
+boolean[]	ok=boolean[]
+box	ok=box
+box[]	ok=box[]
+bytea	ok=bytea
+bytea[]	ok=bytea[]
+character	ok=character
+character varying	ok=character varying
+character varying[]	ok=character varying[]
+character[]	ok=character[]
+cidr	ok=cidr
+cidr[]	ok=cidr[]
+circle	ok=circle
+circle[]	ok=circle[]
+citext	ok=citext
+citext[]	ok=citext[]
+date	ok=date
+date[]	ok=date[]
+daterange	ok=daterange
+daterange[]	ok=daterange[]
+double precision	ok=double precision
+double precision[]	ok=double precision[]
+hstore	ok=hstore
+hstore[]	ok=hstore[]
+inet	ok=inet
+inet[]	ok=inet[]
+int2vector	ok=int2vector
+int4range	ok=int4range
+int4range[]	ok=int4range[]
+int8range	ok=int8range
+int8range[]	ok=int8range[]
+integer	ok=integer
+integer[]	ok=integer[]
+interval	ok=interval
+interval[]	ok=interval[]
+json	ok=json
+json[]	ok=json[]
+jsonb	ok=jsonb
+jsonb[]	ok=jsonb[]
+line	ok=line
+line[]	ok=line[]
+lquery	ok=lquery
+lseg	ok=lseg
+lseg[]	ok=lseg[]
+ltree	ok=ltree
+ltree[]	ok=ltree[]
+macaddr	ok=macaddr
+macaddr[]	ok=macaddr[]
+money	ok=money
+money[]	ok=money[]
+name	ok=name
+name[]	ok=name[]
+numeric	ok=numeric
+numeric[]	ok=numeric[]
+numrange	ok=numrange
+numrange[]	ok=numrange[]
+oid	ok=oid
+oid[]	ok=oid[]
+oidvector	ok=oidvector
+path	ok=path
+path[]	ok=path[]
+point	ok=point
+point[]	ok=point[]
+polygon	ok=polygon
+polygon[]	ok=polygon[]
+real	ok=real
+real[]	ok=real[]
+regclass	ok=regclass
+regclass[]	ok=regclass[]
+regproc	ok=regproc
+regproc[]	ok=regproc[]
+regtype	ok=regtype
+regtype[]	ok=regtype[]
+smallint	ok=smallint
+smallint[]	ok=smallint[]
+text	ok=text
+text[]	ok=text[]
+time	ok=time without time zone
+timestamp	ok=timestamp without time zone
+timestamp with time zone	ok=timestamp with time zone
+timestamp with time zone[]	ok=timestamp with time zone[]
+tsquery	ok=tsquery
+tsquery[]	ok=tsquery[]
+tsrange	ok=tsrange
+tsrange[]	ok=tsrange[]
+tstzrange	ok=tstzrange
+tstzrange[]	ok=tstzrange[]
+tsvector	ok=tsvector
+tsvector[]	ok=tsvector[]
+uuid	ok=uuid
+uuid[]	ok=uuid[]
+void	ok=void
+xml	ok=xml
+xml[]	ok=xml[]
