@@ -3228,6 +3228,26 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 // by evaluation a `jsonb` is a `Datum::Text`. Rewritten here, where the operand's
                 // type is known, exactly as the six comparisons are. `args` is already in
                 // `@>` order, so the flip is undone once, here, and never again.
+                // The polygon half of the same seam: `@>`, `<@` and `&&` all reach here as one
+                // of the three shared catalog functions, and a polygon is canonical text by
+                // evaluation just as a `jsonb` is.
+                if let Some(operand) = written_left
+                    && let Ok(ColumnType::Polygon) = expr_type(operand, scope)
+                {
+                    let (left, right) = if flipped {
+                        (args[1].clone(), args[0].clone())
+                    } else {
+                        (args[0].clone(), args[1].clone())
+                    };
+                    return Ok(Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                        func: if symbol == "&&" {
+                            CatalogFunc::PolygonOverlaps
+                        } else {
+                            CatalogFunc::PolygonContains
+                        },
+                        args: vec![left, right],
+                    })));
+                }
                 if matches!(symbol, "@>" | "<@")
                     && let Some(operand) = written_left
                     && let Ok(ColumnType::Jsonb) = expr_type(operand, scope)

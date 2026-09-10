@@ -3241,6 +3241,29 @@ fn catalog_function(
         // there and this node does not implement it, so the refusal is the one it always was — a
         // gap a client can read, and a row of `pg19_no_equality_types.txt` in the (b) direction.
         CatalogFunc::SameAs => return Err(SqlError::unsupported("the operator ~=")),
+        // **Polygon containment and overlap**, over the canonical text the type stores — the
+        // predicates and the epsilon they share live in `crate::value::geometric`. A value this
+        // pass cannot read as a ring is NULL rather than a wrong answer.
+        CatalogFunc::PolygonContains | CatalogFunc::PolygonOverlaps => {
+            match (args.first(), args.get(1)) {
+                // **A geometric value carries its own type**, unlike a `jsonb`: `Datum::Geometry`
+                // holds the `ColumnType` beside the canonical text. The rewrite at resolution is
+                // still what picks this function — `@>` is spelled the same for four types — but
+                // the value needs no help saying which it is.
+                (
+                    Some(Datum::Geometry { text: left, .. }),
+                    Some(Datum::Geometry { text: right, .. }),
+                ) => {
+                    let answer = if call.func == CatalogFunc::PolygonContains {
+                        crate::value::geometric::polygon_contains(left, right)
+                    } else {
+                        crate::value::geometric::polygons_overlap(left, right)
+                    };
+                    answer.map_or(Datum::Null, Datum::Bool)
+                }
+                _ => Datum::Null,
+            }
+        }
         // **A `jsonb` containment.** Both operands are the canonical text the type stores, so
         // re-parsing is faithful. NULL in, NULL out.
         CatalogFunc::JsonbContains => match (args.first(), args.get(1)) {

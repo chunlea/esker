@@ -1,0 +1,64 @@
+# **`polygon` containment and overlap** — PostgreSQL 19beta1, 2026-09-10.
+#
+# The polygon half of the (b) direction. `value::geometric` parses and formats and has no
+# predicates at all, so this is the specification for writing them.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **It checks edges, not vertices.** In the concave outer below, both vertices of an inner
+#     edge are inside and the midpoint of that edge is outside, and the containment is `f`. "All
+#     points of B are inside A" — which is what the operator reads like — answers `t` there.
+#   * **Every geometric comparison is fuzzy, epsilon `1e-6`**, and it is the same constant
+#     `point_ne` uses (`pg19_point_ne.txt`): a point `1e-6` *outside* an edge is contained, and one
+#     `1e-5` outside is not. A polygon whose edge lies `1e-7` outside is contained. An exact
+#     predicate written against the reals is wrong on every cell inside that band.
+#   * **The boundary is inside**: a vertex, an edge midpoint, a polygon sharing a vertex, one whose
+#     edge is collinear with an outer edge, and a polygon identical to the outer are all contained.
+#   * **`&&` includes touching**: two squares sharing only an edge overlap, and so do two sharing
+#     only a vertex. It is not "share interior area".
+#   * A one-vertex polygon is legal and is contained when that point is.
+#
+# ## The measurements
+#
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '(0,0)'::point) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '(2,0)'::point) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '(2,2)'::point) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '(2,-0.0000001)'::point) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '(2,-0.000001)'::point) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '(2,-0.00001)'::point) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '(5,5)'::point) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(2,1),(0,4))'::polygon @> '(1,2)'::point) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(2,1),(0,4))'::polygon @> '(3,2)'::point) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(2,1),(0,4))'::polygon @> '(2,2)'::point) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((1,1),(3,1),(3,3),(1,3))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon <@ '((1,1),(3,1),(3,3),(1,3))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon && '((1,1),(3,1),(3,3),(1,3))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((0,0),(1,0),(1,1),(0,1))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon <@ '((0,0),(1,0),(1,1),(0,1))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon && '((0,0),(1,0),(1,1),(0,1))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((1,0),(3,0),(3,1),(1,1))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon <@ '((1,0),(3,0),(3,1),(1,1))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon && '((1,0),(3,0),(3,1),(1,1))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((0,0),(4,0),(4,4),(0,4))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon <@ '((0,0),(4,0),(4,4),(0,4))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon && '((0,0),(4,0),(4,4),(0,4))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((2,2))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon <@ '((2,2))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon && '((2,2))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((2,2),(6,2),(6,6),(2,6))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon <@ '((2,2),(6,2),(6,6),(2,6))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon && '((2,2),(6,2),(6,6),(2,6))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((5,5),(6,5),(6,6),(5,6))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon <@ '((5,5),(6,5),(6,6),(5,6))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon && '((5,5),(6,5),(6,6),(5,6))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((1,-0.0000001),(3,-0.0000001),(3,1),(1,1))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon <@ '((1,-0.0000001),(3,-0.0000001),(3,1),(1,1))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon && '((1,-0.0000001),(3,-0.0000001),(3,1),(1,1))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((1,-0.00001),(3,-0.00001),(3,1),(1,1))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon <@ '((1,-0.00001),(3,-0.00001),(3,1),(1,1))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon && '((1,-0.00001),(3,-0.00001),(3,1),(1,1))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(2,1),(0,4))'::polygon @> '((1,2),(3,2),(3,2.2),(1,2.2))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(2,0),(2,2),(0,2))'::polygon && '((2,0),(4,0),(4,2),(2,2))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(2,0),(2,2),(0,2))'::polygon && '((2,2),(4,2),(4,4),(2,4))'::polygon) AS v	boolean	t
+SELECT (a @> b) AS v FROM (VALUES ('((0,0),(4,0),(4,4),(0,4))'::polygon, '((1,1),(3,1),(3,3),(1,3))'::polygon)) s(a,b)	boolean	t
+SELECT (a <@ b) AS v FROM (VALUES ('((1,1),(3,1),(3,3),(1,3))'::polygon, '((0,0),(4,0),(4,4),(0,4))'::polygon)) s(a,b)	boolean	t
