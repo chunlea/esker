@@ -97,9 +97,10 @@ pub fn engine_to_proto(error: &EngineError) -> ProtoError {
         // Reachable only from an open, which a store does once before it serves — so no request
         // can produce this and none should be told it might. Mapped anyway, because a variant
         // that reached a client as something vaguer would be a worse answer than the true one.
-        EngineError::InUse { dir } => {
-            ProtoError::internal(format!("{} is open in another process", dir.display()))
-        }
+        EngineError::InUse { dir, holder } => ProtoError::internal(format!(
+            "{} is open in another process ({holder})",
+            dir.display()
+        )),
     }
 }
 

@@ -252,11 +252,72 @@ impl WriteOptions {
     }
 }
 
+/// Whether an open may write to the database, or only read it.
+///
+/// A mode and not a `bool` because it is read at a dozen decision points and `read_only: false`
+/// at a call site says less than [`OpenMode::ReadWrite`] does — and because `Options` had reached
+/// the four booleans clippy counts as too many, which was a fair thing to be told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenMode {
+    /// The open that serves: it replays the log, **creates a fresh write-ahead segment**, appends
+    /// a manifest edit, claims the directory and starts the flusher and the compactors.
+    #[default]
+    ReadWrite,
+    /// **Read it without writing to it, and without claiming it.**
+    ///
+    /// An ordinary open is not a read, which is why `esker pd inspect` — whose own documentation
+    /// says it reads *"a stopped placement driver's files"* — was writing into the database of a
+    /// running one. A read-only open therefore:
+    ///
+    /// * **takes no claim on the directory**, so it can read one a writer holds. A shared lock
+    ///   would not do: `flock`'s shared and exclusive modes exclude each other, so a reader that
+    ///   took one would be refused by exactly the live writer it exists to look at.
+    /// * **creates nothing**: no log segment, no manifest edit, and no column family — a family
+    ///   the caller named and the database does not have stays absent rather than being made by
+    ///   the act of looking.
+    /// * **starts no thread**, so nothing flushes or compacts behind the reader.
+    /// * **refuses every write**, and every flush, compaction, sweep, column-family change and
+    ///   checkpoint with it ([`crate::Error::Unsupported`]).
+    ///
+    /// What it shows is **a moment**: the version `CURRENT` named when it opened, plus whatever
+    /// the log held then. A writer that compacts afterwards can delete a file that version
+    /// referenced, and a read that meets one fails saying so — the answer is never wrong, it can
+    /// only stop being available. For the same reason a torn record is where this reader's view
+    /// of a segment ends rather than a corruption: a reader that is not the owner cannot tell a
+    /// writer mid-record from a damaged file, and must not call the database corrupt on the
+    /// strength of a race it was never party to.
+    ReadOnly,
+}
+
 /// How a database is opened.
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Create the database if the directory does not hold one.
     pub create_if_missing: bool,
+    /// Whether this open may write. See [`OpenMode`].
+    ///
+    /// An ordinary open is not a read: it replays the log, creates a fresh write-ahead segment,
+    /// appends a manifest edit and starts the flusher and the compactors. That is right for the
+    /// process that is about to serve and wrong for a tool that is about to print — and it is why
+    /// `esker pd inspect`, whose own documentation says it reads *"a stopped placement driver's
+    /// files"*, was writing into the database of a running one.
+    ///
+    /// A read-only open therefore:
+    ///
+    /// * **takes no claim on the directory**, so it can read one a writer holds. A shared lock
+    ///   would not do: `flock`'s shared and exclusive modes exclude each other, so a reader that
+    ///   took one would be refused by exactly the live writer it exists to look at.
+    /// * **creates nothing**: no log segment, no manifest edit, and no column family — a family
+    ///   the caller named and the database does not have stays absent rather than being made by
+    ///   the act of looking.
+    /// * **starts no thread**, so nothing flushes or compacts behind the reader.
+    /// * **refuses a write**, with [`crate::Error::Unsupported`].
+    ///
+    /// What it shows is **a moment**: the version `CURRENT` named when it opened, plus whatever
+    /// the log held then. A writer that compacts afterwards can delete a file that version
+    /// referenced, and a read that meets one fails saying so — the answer is never wrong, it can
+    /// only stop being available.
+    pub mode: OpenMode,
     /// Which of the two durability calls the write-ahead log makes.
     pub sync_call: SyncCall,
     /// Fail if it does. Useful when a caller means "this must be new".
@@ -305,10 +366,19 @@ pub struct Options {
     pub pause_hook: Option<Arc<dyn crate::testing::PauseHook>>,
 }
 
+impl Options {
+    /// Whether this open may only read. See [`OpenMode::ReadOnly`].
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        matches!(self.mode, OpenMode::ReadOnly)
+    }
+}
+
 impl Default for Options {
     fn default() -> Self {
         Self {
             create_if_missing: false,
+            mode: OpenMode::default(),
             sync_call: SyncCall::default(),
             error_if_exists: false,
             paranoid_checks: true,

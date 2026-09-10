@@ -61,6 +61,11 @@ impl Db {
         dir: impl AsRef<Path>,
         only: Option<CheckpointRange<'_>>,
     ) -> Result<()> {
+        // **Refused from a reader**, although it writes only into `dir`. A checkpoint pins the
+        // source's live files and then links them, and a reader does not own the source: the
+        // process that does can sweep a file between the pin and the link, and the copy would be
+        // missing a table its own manifest names.
+        self.inner.writable("be checkpointed")?;
         let dir = dir.as_ref();
         let inner = &self.inner;
 

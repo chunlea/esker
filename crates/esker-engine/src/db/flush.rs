@@ -98,6 +98,7 @@ impl Db {
     /// Mostly for tests and for `esker-cli`: the engine flushes on its own when a memtable
     /// fills up.
     pub fn flush(&self, cf: &str) -> Result<()> {
+        self.inner.writable("flush")?;
         let cf = self.inner.cf_by_name(cf)?;
         // **Sampled before anything is signalled**, because the wait below is "one more flush of
         // this family has finished" and a mark taken afterwards could already include the flush
@@ -117,6 +118,7 @@ impl Db {
 
     /// Flushes every column family.
     pub fn flush_all(&self) -> Result<()> {
+        self.inner.writable("flush")?;
         for name in self.cf_names() {
             self.flush(&name)?;
         }

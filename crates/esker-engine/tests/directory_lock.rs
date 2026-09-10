@@ -39,7 +39,15 @@ fn a_second_open_of_one_directory_is_refused_and_the_first_keeps_working() {
 
     let refused = Db::open(dir.path(), options());
     match refused {
-        Err(Error::InUse { dir: held }) => assert_eq!(held, dir.path()),
+        Err(Error::InUse { dir: held, holder }) => {
+            assert_eq!(held, dir.path());
+            // **The refusal names who to look for.** A gate archived `InUse { dir }` and nothing
+            // else, and the next question — who had it — had no answer anywhere.
+            assert!(
+                holder.contains(&format!("pid {}", std::process::id())),
+                "the refusal must name the holder, and it said: {holder}"
+            );
+        }
         Err(other) => panic!("the second open failed, but not as a claim: {other}"),
         Ok(_) => panic!(
             "two databases are open on {} — this is the two-writers case, and nothing stopped it",

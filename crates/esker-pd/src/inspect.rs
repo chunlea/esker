@@ -1,4 +1,4 @@
-//! A **read-only** view of a stopped placement driver's files, for `esker pd inspect`.
+//! A **read-only** view of a placement driver's files, for `esker pd inspect`.
 //!
 //! Its own type rather than a flag on [`Pd`](crate::pd::Pd), because opening a placement driver
 //! now *does something*: a member of one campaigns inside `Pd::open` and wins with a quorum of
@@ -6,6 +6,16 @@
 //! for a process that is about to serve and wrong for a tool that is about to print — an inspector
 //! must not create or move what it was asked to look at, and a typo in a path should be an error
 //! rather than a database that looks like a wiped cluster.
+//!
+//! # It used to say "a *stopped* driver", and that was the honest half of a lie
+//!
+//! Everything below was true of this type and false of the engine underneath it: `Db::open_with`
+//! replays the log, **creates a fresh write-ahead segment** and appends a manifest edit, so
+//! inspecting a running driver wrote into the database it was reading — which
+//! `esker-cli/tests/cluster_start.rs` did every 200 ms for up to a minute. The directory claim of
+//! #116 turned that into a refusal, and `OpenMode::ReadOnly` is what makes it an answer: an open
+//! that takes no claim, writes nothing and starts nothing, so **a running driver can be inspected**
+//! and what comes back is the moment its files described.
 //!
 //! So this opens the files, reads them, and writes nothing:
 //!
@@ -44,12 +54,14 @@ pub struct PdInspector {
 impl PdInspector {
     /// Opens `path` without creating anything.
     ///
-    /// The engine options are the caller's, minus the one decision this type exists to make:
-    /// `create_if_missing` is forced off, because an inspector that created a database would
-    /// answer "empty cluster" to a mistyped path.
+    /// The engine options are the caller's, minus the two decisions this type exists to make:
+    /// `create_if_missing` is forced **off**, because an inspector that created a database would
+    /// answer "empty cluster" to a mistyped path; and `read_only` **on**, because an inspector
+    /// that wrote would be the thing this type's name denies.
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         let options = Options {
             create_if_missing: false,
+            mode: esker_engine::OpenMode::ReadOnly,
             ..options
         };
         // No families named, so none is created: what is there is what is reported.

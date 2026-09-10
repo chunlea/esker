@@ -137,8 +137,12 @@ pub(crate) struct DbInner {
     pub(crate) dir: PathBuf,
     /// This process's claim on [`dir`](Self::dir), held for as long as the database is open and
     /// released when it closes — or when the process dies, which is the case that matters.
+    ///
+    /// `None` for a read-only open, which takes nothing: see [`crate::Options::read_only`].
     #[expect(dead_code, reason = "held for its lifetime, never read")]
-    pub(crate) directory: Box<dyn crate::fs::DirectoryLock>,
+    pub(crate) directory: Option<Box<dyn crate::fs::DirectoryLock>>,
+    /// Whether this database refuses every write ([`crate::Options::read_only`]).
+    pub(crate) read_only: bool,
     pub(crate) options: Options,
     pub(crate) comparator: Arc<InternalKeyComparator>,
     pub(crate) versions: Mutex<VersionSet>,
@@ -364,6 +368,7 @@ impl Db {
     /// family that took writes and then vanished on reopen would lose them, while one the
     /// manifest knows about and this process does not is fixed by opening the database again.
     pub fn create_cf(&self, name: &str, options: CfOptions) -> Result<u32> {
+        self.inner.writable("create a column family")?;
         let id = {
             let mut versions = lock(&self.inner.versions)?;
             // The manifest may roll on this edit, and a rolled manifest is the only remaining
@@ -388,6 +393,7 @@ impl Db {
     /// Writes already queued for it are logged and then skipped, exactly as replay skips log
     /// records for a family that no longer exists.
     pub fn drop_cf(&self, name: &str) -> Result<()> {
+        self.inner.writable("drop a column family")?;
         let id = self.inner.cf_by_name(name)?.id();
         {
             let mut versions = lock(&self.inner.versions)?;

@@ -72,7 +72,26 @@ impl Db {
 }
 
 impl DbInner {
+    /// Refuses `what` if this database was opened read-only.
+    ///
+    /// **Every path that changes a byte goes through this**, and they are not only the obvious
+    /// ones: a flush writes a table and a manifest edit, a compaction writes tables, the sweep
+    /// *deletes* them, and `create_cf` writes an edit. A read-only open has no log to write to
+    /// and no claim on the directory, so any of those is not a write that fails — it is a write
+    /// into a database another process owns.
+    pub(crate) fn writable(&self, what: &str) -> Result<()> {
+        if self.read_only {
+            return Err(Error::Unsupported(format!(
+                "{} is open read-only, so it cannot {what}",
+                self.dir.display()
+            )));
+        }
+        Ok(())
+    }
+
     fn write(&self, batch: WriteBatch, options: WriteOptions) -> Result<SeqNo> {
+        // **First, before the batch is even checked.** See [`DbInner::writable`].
+        self.writable("write")?;
         self.check_batch(&batch)?;
         // The whole precedence rule is [`WriteOptions::wants_sync`], in one place so that the
         // mode and the per-write demand cannot drift apart. Before debt wave c3 this line was

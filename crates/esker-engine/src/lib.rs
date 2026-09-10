@@ -83,7 +83,7 @@ pub use fs::{DirectoryLock, FileSystem, LocalFileSystem, RandomAccessFile, Writa
 pub use iterator::Cursor;
 pub use memtable::MemTable;
 pub use options::{
-    CfOptions, Compression, Durability, Options, PrefixExtractor, ReadOptions, SyncCall,
+    CfOptions, Compression, Durability, OpenMode, Options, PrefixExtractor, ReadOptions, SyncCall,
     WalSyncMode, WriteOptions,
 };
 pub use version::{FileMeta, VersionEdit, VersionSet};
