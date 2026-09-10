@@ -1276,6 +1276,7 @@ impl Store {
                 // reported, because "this store hosts a region with no consensus" is a fact a
                 // reader of this log would otherwise have to infer from an absence.
                 taken.push(census::RegionCensus {
+                    store_id: self.store_id,
                     region_id: region.id,
                     epoch: region.epoch,
                     handle_peer: 0,
@@ -1300,6 +1301,7 @@ impl Store {
             // request path itself reads, so they are the store's answer even when its driver
             // cannot give one.
             let mut census = census::RegionCensus {
+                store_id: self.store_id,
                 region_id: region.id,
                 epoch: region.epoch,
                 handle_peer: peer.peer_id(),

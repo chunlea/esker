@@ -140,6 +140,25 @@ impl Drop for Supervisor {
     }
 }
 
+/// What the **driver** says about itself, read from its files while it is running.
+///
+/// Safe since `Options::read_only`: no claim on the directory, no log segment, no manifest edit.
+/// Before that it was a second writer, and between the two it was a refusal.
+fn inspect(pd_dir: &Path) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_esker-cli"))
+        .arg("pd")
+        .arg("inspect")
+        .arg("--data-dir")
+        .arg(pd_dir)
+        .output()
+        .expect("`pd inspect` runs");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
 /// What the cluster has said so far, as the supervisor and its children wrote it.
 fn said(log: &Path) -> String {
     std::fs::read_to_string(log).unwrap_or_default()
@@ -147,19 +166,17 @@ fn said(log: &Path) -> String {
 
 /// How many stores have told the driver they exist, from the line each one prints when it has.
 ///
-/// **This used to be `esker pd inspect` on the running driver's data directory**, which is the
-/// count as PD holds it — a better place to read it from, and one that is no longer readable
-/// while the driver is up. `pd inspect` opens the directory with `Db::open_with`, and an engine
-/// open is not read-only: it replays the log, writes a fresh WAL segment and appends a manifest
-/// edit. So a poll every 200 ms for a minute was writing into the database a live driver was
-/// writing to, which is the two-writers case that `esker-engine`'s directory claim now refuses —
-/// see `esker-cli/tests/data_dir_lock.rs`. The tool's own module doc has always said it is for a
-/// *stopped* driver (`esker-pd/src/inspect.rs`); nothing enforced it.
+/// **The wait, and not the assertion** — the assertion asks PD itself, through [`inspect`].
 ///
-/// What is left is the same fact one hop later: `esker server` prints this line **after** the
-/// driver has answered its registration, so a store that has printed it is a store PD recorded.
-/// The gap between the two readings is a driver that answered and then lost the record, which
-/// invariant 1 does not allow.
+/// This used to be `esker pd inspect` on the running driver's directory, three hundred times a
+/// run: an engine open is not read-only — it replays the log, writes a fresh WAL segment and
+/// appends a manifest edit — so a poll every 200 ms was writing into the database a live driver
+/// was writing to. `Options::read_only` fixed the tool; polling it three hundred times is still
+/// three hundred subprocesses and three hundred opens of a live database, so the *wait* reads
+/// what the stores print and the *assertion* asks PD once.
+///
+/// The line a store prints is the same fact one hop later: it is printed **after** the driver has
+/// answered its registration, so a store that has printed it is a store PD recorded.
 fn registered_stores(seen: &str) -> u64 {
     seen.lines()
         .filter(|line| line.contains("registered with the placement driver"))
@@ -248,6 +265,14 @@ fn a_four_node_cluster_with_a_driver_registers_four_stores() {
         seen = said(&log);
         let count = registered_stores(&seen);
         if count >= NODES {
+            // **And now PD's own count**, once, from the live driver — which is where every later
+            // operator decision is made from, and which reading a store's stdout only implies.
+            let inspected = inspect(&data_dir.path().join("pd"));
+            assert!(
+                inspected.contains(&format!("stores ({NODES})")),
+                "every store said it registered, and the driver's own records say otherwise:\n\
+                 {inspected}"
+            );
             return;
         }
         let now = Instant::now();

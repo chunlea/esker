@@ -108,6 +108,16 @@ static MICROS: AtomicU64 = AtomicU64::new(0);
 /// The worst statement seen, and what it did — kept as four numbers rather than a string so that
 /// nothing here allocates on the path.
 static WORST_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Calls that never left this node because a store's connection was closed, and the connections
+/// rebuilt to stores that had gone away.
+///
+/// **Totals and not a map**, here where the map would be the wrong shape: a node's report is a
+/// rate per statement, and *which* store went away is the census's question and the cluster log's.
+/// What this answers is the one a run cannot answer without it — whether any store was ever
+/// unreachable to this node, and whether it was found again. A green run of run 124 with both at
+/// zero is a run that never tested the thing it was built to test.
+static NOT_SENT: AtomicU64 = AtomicU64::new(0);
+static REDIALS: AtomicU64 = AtomicU64::new(0);
 
 /// Records one point read at the store boundary.
 pub(crate) fn record_point(key: &[u8]) {
@@ -232,6 +242,8 @@ impl Drop for Guard {
         COMMITS.fetch_add(cost.commits, Ordering::Relaxed);
         KEYS.fetch_add(cost.keys, Ordering::Relaxed);
         WAITED_MICROS.fetch_add(waited, Ordering::Relaxed);
+        NOT_SENT.fetch_add(cost.not_sent.values().sum::<u64>(), Ordering::Relaxed);
+        REDIALS.fetch_add(cost.redials.values().sum::<u64>(), Ordering::Relaxed);
         MICROS.fetch_add(micros, Ordering::Relaxed);
         WORST_MICROS.fetch_max(micros, Ordering::Relaxed);
         if tracing_reads() {
@@ -345,7 +357,7 @@ pub fn summary() -> String {
     format!(
         "statements {statements}, mean {} us, worst {} us, per statement: point reads {}, \
          range scans {}, round trips {}, regions {}, tso {}, prewrites {}, commits {}, keys {}, \
-         waited {} us",
+         waited {} us; stores unreachable {}, reconnected {}",
         micros.checked_div(statements).unwrap_or(0),
         WORST_MICROS.load(Ordering::Relaxed),
         per(points),
@@ -360,6 +372,10 @@ pub fn summary() -> String {
             .load(Ordering::Relaxed)
             .checked_div(statements)
             .unwrap_or(0),
+        // **Totals and not rates.** One unreachable store in a whole run is the interesting
+        // number, and dividing it by the statements would round it to nothing.
+        NOT_SENT.load(Ordering::Relaxed),
+        REDIALS.load(Ordering::Relaxed),
     )
 }
 

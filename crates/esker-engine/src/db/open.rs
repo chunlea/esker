@@ -62,32 +62,11 @@ impl Db {
     ) -> Result<Self> {
         let dir = path.as_ref().to_path_buf();
         let dir_for_error = dir.clone();
+        let read_only = options.is_read_only();
         let comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&options.comparator)));
         let (mut versions, directory) = open_versions(&fs, &dir, &comparator, &options, cfs)?;
 
-        // Build a column family for every family the manifest knows about, not only the ones
-        // the caller named. The log number is filled in below, once replay has said which
-        // segment the recovered data came from.
-        let mut families: BTreeMap<u32, Arc<ColumnFamily>> = BTreeMap::new();
-        for (id, name) in versions.column_families().clone() {
-            // A named override, or the defaults. Families are not interchangeable, and the
-            // MVCC collector is the setting that must reach exactly one of them.
-            let cf_options = options
-                .cf_overrides
-                .get(&name)
-                .cloned()
-                .unwrap_or_else(|| options.cf_options.clone());
-            families.insert(
-                id,
-                Arc::new(ColumnFamily::new(
-                    id,
-                    name,
-                    cf_options,
-                    &comparator,
-                    versions.log_number(),
-                )),
-            );
-        }
+        let families = column_families(&versions, &options, &comparator);
 
         let replayed = replay_logs(fs.as_ref(), &dir, &versions, &options, &families)?;
         let last_seqno = versions.last_seqno().max(replayed.max_seqno);
@@ -95,7 +74,14 @@ impl Db {
         // Writes go to a fresh segment. The log number stays at the oldest segment whose
         // contents are still only in memory, so a crash before the first flush replays them
         // again; the flush that follows moves it forward.
-        let wal_number = versions.new_file_number();
+        // A reader takes the number the recovered version already names rather than minting one:
+        // minting is harmless in memory, and asking for a file number a reader will never use is
+        // the kind of thing that stops being harmless the day somebody persists it.
+        let wal_number = if read_only {
+            versions.log_number()
+        } else {
+            versions.new_file_number()
+        };
         let log_number = replayed.oldest_segment.unwrap_or(wal_number);
         for cf in families.values() {
             let mut mem = cf.mem.write().map_err(|_| {
@@ -103,18 +89,16 @@ impl Db {
             })?;
             mem.active_log = log_number;
         }
-        let wal_path = filename::wal(&dir, wal_number);
-        let mut writer = LogWriter::new(
-            fs.create(&wal_path).at(&wal_path)?,
-            wal_path.display().to_string(),
-        );
+        let mut writer = log_writer(fs.as_ref(), &dir, read_only, wal_number)?;
         writer.set_sync_call(options.sync_call);
 
         versions.set_last_seqno(last_seqno);
-        versions.set_log_number(log_number);
-        let mut edit = VersionEdit::new();
-        edit.log_number = Some(log_number);
-        versions.log_and_apply(&mut edit)?;
+        if !read_only {
+            versions.set_log_number(log_number);
+            let mut edit = VersionEdit::new();
+            edit.log_number = Some(log_number);
+            versions.log_and_apply(&mut edit)?;
+        }
 
         let table_cache = Arc::new(TableCache::new(
             Arc::clone(&fs),
@@ -126,6 +110,7 @@ impl Db {
             fs,
             dir,
             directory,
+            read_only,
             options,
             comparator,
             versions: Mutex::new(versions),
@@ -159,6 +144,18 @@ impl Db {
             snapshots: SnapshotList::new(),
         });
 
+        // **A reader starts nothing and deletes nothing.** Both of those are the writer's, and a
+        // reader that swept would delete files out from under the process that owns them.
+        if read_only {
+            return Ok(Self {
+                inner,
+                flusher: None,
+                compactors: Vec::new(),
+                uploader: None,
+                syncer: None,
+            });
+        }
+
         let (flusher, compactors, uploader, syncer) = spawn_background(&inner, &dir_for_error)?;
 
         let db = Self {
@@ -175,6 +172,7 @@ impl Db {
     /// Deletes files no live version needs. Called at open, and after every flush and
     /// compaction from step 6b on.
     pub fn purge_obsolete_files(&self) -> Result<Vec<std::path::PathBuf>> {
+        self.inner.writable("sweep its obsolete files")?;
         let mut versions = super::lock(&self.inner.versions)?;
         versions.purge_obsolete_files()
     }
@@ -287,6 +285,127 @@ fn spawn_background(inner: &Arc<DbInner>, dir: &Path) -> Result<Background> {
 /// waits before reading the message; the refusal, when it comes, says the same thing it always did.
 const CLAIM_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Who holds `dir`'s claim, from the note the holder left in the lock file.
+///
+/// Best effort by construction: the file is written after the lock is taken and read without one,
+/// so a reader can meet it empty or half-written. Every one of those answers is "not known", and
+/// none of them changes what the caller is told to do.
+fn holder_of(fs: &dyn FileSystem, dir: &Path) -> String {
+    let path = dir.join(crate::fs::LOCK_FILE);
+    let Ok(file) = fs.open(&path) else {
+        return "no holder record".to_owned();
+    };
+    let mut bytes = [0_u8; 256];
+    let Ok(read) = file.read_at(0, &mut bytes) else {
+        return "no holder record".to_owned();
+    };
+    let line = String::from_utf8_lossy(&bytes[..read]);
+    let Some(line) = line.lines().next().filter(|line| !line.is_empty()) else {
+        return "no holder record".to_owned();
+    };
+    let field = |name: &str| {
+        line.split_whitespace()
+            .find_map(|part| part.strip_prefix(name))
+            .map(str::to_owned)
+    };
+    let (Some(pid), Some(exe)) = (field("pid="), field("exe=")) else {
+        // Something is in the file and it is not ours to interpret. Said verbatim, because a
+        // reader chasing this would rather see the bytes than a summary of them.
+        return format!("the lock file says {line:?}");
+    };
+    match field("since_unix=").and_then(|since| since.parse::<u64>().ok()) {
+        Some(since) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |now| now.as_secs());
+            format!(
+                "pid {pid}, {exe}, holding it for {}s",
+                now.saturating_sub(since)
+            )
+        }
+        None => format!("pid {pid}, {exe}"),
+    }
+}
+
+/// The log this open writes to, or one that refuses every byte.
+///
+/// **A read-only open creates no segment.** The writer exists because the database has one; every
+/// path that would use it is refused before it gets here ([`DbInner::writable`]), and if one ever
+/// is not, [`RefusesToWrite`] says so rather than dropping the bytes.
+fn log_writer(
+    fs: &dyn FileSystem,
+    dir: &Path,
+    read_only: bool,
+    wal_number: u64,
+) -> Result<LogWriter> {
+    if read_only {
+        return Ok(LogWriter::new(
+            Box::new(RefusesToWrite) as Box<dyn crate::fs::WritableFile>,
+            "a read-only database has no log".to_owned(),
+        ));
+    }
+    let path = filename::wal(dir, wal_number);
+    Ok(LogWriter::new(
+        fs.create(&path).at(&path)?,
+        path.display().to_string(),
+    ))
+}
+
+/// One [`ColumnFamily`] per family the **manifest** knows about, not per family the caller named.
+///
+/// Hiding data a database contains is worse than opening more than was asked for.
+fn column_families(
+    versions: &VersionSet,
+    options: &Options,
+    comparator: &Arc<InternalKeyComparator>,
+) -> BTreeMap<u32, Arc<ColumnFamily>> {
+    let mut families = BTreeMap::new();
+    for (id, name) in versions.column_families().clone() {
+        // A named override, or the defaults. Families are not interchangeable, and the MVCC
+        // collector is the setting that must reach exactly one of them.
+        let cf_options = options
+            .cf_overrides
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| options.cf_options.clone());
+        families.insert(
+            id,
+            Arc::new(ColumnFamily::new(
+                id,
+                name,
+                cf_options,
+                comparator,
+                versions.log_number(),
+            )),
+        );
+    }
+    families
+}
+
+/// A writable file that refuses every byte, for a database opened read-only.
+///
+/// The log writer is a field of the database, so a read-only open has to have one; it must never
+/// have anything to write. If a path is ever found that reaches it, this says so loudly rather
+/// than silently accepting bytes nobody will ever read back.
+#[derive(Debug)]
+struct RefusesToWrite;
+
+impl crate::fs::WritableFile for RefusesToWrite {
+    fn append(&mut self, _data: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "this database is open read-only and has no log",
+        ))
+    }
+
+    fn sync_data(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Claims `dir` for this process, or says who has it.
 ///
 /// Never a permanent block: [`CLAIM_WITHIN`] bounds it, and past that the answer is
@@ -301,6 +420,7 @@ fn claim(fs: &dyn FileSystem, dir: &Path) -> Result<Box<dyn DirectoryLock>> {
                 if std::time::Instant::now() >= deadline {
                     return Err(Error::InUse {
                         dir: dir.to_path_buf(),
+                        holder: holder_of(fs, dir),
                     });
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -328,11 +448,14 @@ fn open_versions(
     comparator: &Arc<InternalKeyComparator>,
     options: &Options,
     cfs: &[&str],
-) -> Result<(VersionSet, Box<dyn DirectoryLock>)> {
-    let claimed = if fs.exists(dir).at(dir)? {
-        Some(claim(fs.as_ref(), dir)?)
-    } else {
+) -> Result<(VersionSet, Option<Box<dyn DirectoryLock>>)> {
+    // **A reader takes nothing.** See [`OpenMode::ReadOnly`]: a shared lock would be refused by
+    // the very writer this open exists to look at, and a reader that writes nothing has nothing
+    // to protect from one.
+    let claimed = if options.is_read_only() || !fs.exists(dir).at(dir)? {
         None
+    } else {
+        Some(claim(fs.as_ref(), dir)?)
     };
     let current = filename::current(dir);
     let exists = fs.exists(&current).at(&current)?;
@@ -365,6 +488,10 @@ fn open_versions(
         )));
     };
 
+    if options.is_read_only() {
+        // No claim and no family: what is there is what is reported.
+        return Ok((versions, None));
+    }
     // Before `create_cf` below, which writes a manifest edit.
     let directory = match claimed {
         Some(lock) => lock,
@@ -376,7 +503,7 @@ fn open_versions(
             versions.create_cf(name)?;
         }
     }
-    Ok((versions, directory))
+    Ok((versions, Some(directory)))
 }
 
 /// What replaying the log found.
@@ -427,8 +554,11 @@ fn replay_logs(
                 ReadOutcome::Eof => break,
                 ReadOutcome::Torn(why) => {
                     // Legal at the tail of the segment that was open when the process died,
-                    // and nowhere else.
-                    if Some(*number) == last {
+                    // and nowhere else — **unless this open is a reader**, which cannot tell a
+                    // writer that is mid-record from a file that is damaged. A reader that is
+                    // not the owner reports what it could read and does not call the database
+                    // corrupt on the strength of a race it was never party to.
+                    if Some(*number) == last || options.is_read_only() {
                         tracing::info!(segment = number, reason = %why, "log ends in a torn record");
                         break;
                     }
