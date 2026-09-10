@@ -2791,6 +2791,15 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 resolved.push(resolve(expr, scope)?);
             }
             let element = array_element_type(&resolved, *element, scope)?;
+            // **`void` has no array type**, and a subscript and an `unnest` both need an array
+            // built first, so three of the four array shapes are gated right here. Measured over
+            // the probe list's 100 spellings: `void` is the only one 19beta1 refuses
+            // (`tests/captures/pg19_array_of_void.txt`), so the test is the type and not
+            // `ArrayValue::array_of(ty).is_none()` — that would also refuse `lquery`,
+            // `int2vector` and `oidvector`, which a real server builds arrays of.
+            if element == Some(ColumnType::Void) {
+                return Err(SqlError::NoArrayType(ColumnType::Void.name()));
+            }
             Expr::Array {
                 elements: resolved,
                 element,

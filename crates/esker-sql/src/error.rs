@@ -904,6 +904,19 @@ pub enum SqlError {
     #[error("could not identify a comparison function for type {0}")]
     NoComparisonFunction(&'static str),
 
+    /// `ARRAY[NULL::void]`: a type with **no array type in `pg_type`**. `42704`, and on 19beta1
+    /// `void` is the only one of the wire v3 probe list's 100 spellings that raises it — measured
+    /// over four array shapes each (`tests/captures/pg19_array_of_void.txt`). No `DETAIL`, no
+    /// `HINT`.
+    ///
+    /// **A fact about PostgreSQL's catalog, not about this crate's enum.**
+    /// `ArrayValue::array_of` answers `None` for `lquery`, `int2vector` and `oidvector` as well,
+    /// and a real server builds `lquery[]`, `int2vector[]` and `oidvector[]` for those. Raising
+    /// this for "an array type this node does not have" would refuse three statements a real
+    /// server answers, which is the worse direction.
+    #[error("could not find array type for data type {0}")]
+    NoArrayType(&'static str),
+
     /// `'<a>'::xml`: text that is not well-formed XML content. **`2200N`, its own class**, where
     /// every other input function raises `22P02` — and the DETAIL names the line, which is
     /// `libxml`'s own message reaching the client through PostgreSQL.
@@ -3171,7 +3184,8 @@ impl SqlError {
             | SqlError::CascadeDropsColumn { .. }
             | SqlError::CascadeDropsView(_)
             | SqlError::UndefinedTablespace(_)
-            | SqlError::UndefinedTextSearchConfig(_) => sqlstate::UNDEFINED_OBJECT,
+            | SqlError::UndefinedTextSearchConfig(_)
+            | SqlError::NoArrayType(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::RaisedException(_) => sqlstate::RAISE_EXCEPTION,
             SqlError::SystemCatalog(_) | SqlError::CreateInSystemSchema(_) => {
                 sqlstate::INSUFFICIENT_PRIVILEGE
