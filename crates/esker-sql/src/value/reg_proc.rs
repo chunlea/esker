@@ -30,6 +30,14 @@ use crate::error::{Result, SqlError};
 /// the list of names is exactly what `pg_catalog::typinput` can return, so a type added there
 /// without a row here prints its digits and is caught by
 /// `tests/reg_proc.rs::every_typinput_resolves_to_a_function`.
+///
+/// **`domain_in`, `enum_in` and `record_in` were the three that got away**, and the way they did
+/// is worth keeping: `TypeKind::typinput` started answering them for a **user** type, and the test
+/// above reads `pg_type`, where a fresh node has no user types at all — so the rule was already
+/// broken and nothing could see it. It went red the day the five `information_schema` domains
+/// became *built-in* rows (`debts-v1.1.md` #37, ADR 0103) and one of those four names finally
+/// appeared in a row the test reads. `range_in` was here only because a range is also a built-in
+/// type. Their oids are 19beta1's own, measured with the same one query.
 const BUILT_IN: &[(&str, u32)] = &[
     ("array_in", 750),
     ("bit_in", 1564),
@@ -42,6 +50,8 @@ const BUILT_IN: &[(&str, u32)] = &[
     ("cidr_in", 1267),
     ("circle_in", 1450),
     ("date_in", 1084),
+    ("domain_in", 2597),
+    ("enum_in", 3506),
     ("float4in", 200),
     ("float8in", 214),
     ("inet_in", 910),
@@ -63,6 +73,7 @@ const BUILT_IN: &[(&str, u32)] = &[
     ("point_in", 117),
     ("poly_in", 347),
     ("range_in", 3834),
+    ("record_in", 2290),
     ("regclassin", 2218),
     // **`regprocin` is in this list because `regproc` is a type this node has**, and its own
     // `typinput` is itself. `tests/reg_proc.rs::every_typinput_resolves_to_a_function` found it
