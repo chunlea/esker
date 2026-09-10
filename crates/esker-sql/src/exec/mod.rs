@@ -2176,7 +2176,21 @@ impl Executor {
         let mut planned = vec![(None, self.plan_select(txn, &first)?)];
         for arm in &select.set_arms {
             set_arm_supported(arm)?;
-            planned.push((Some((arm.op, arm.all)), self.plan_select(txn, &arm.select)?));
+            let arm_plan = self.plan_select(txn, &arm.select)?;
+            // **`UNION` deduplicates, and that needs an equality operator class per column** —
+            // the same question `DISTINCT` and `GROUP BY` ask, so it reads the same list. `UNION
+            // ALL` keeps duplicates and asks nothing, which is why the check hangs on `all` and
+            // not on the operator: measured, `SELECT json UNION ALL SELECT json` answers on a
+            // real server and `UNION` is
+            // `42883 could not identify an equality operator for type json`.
+            if !arm.all {
+                for column in &arm_plan.columns {
+                    if !crate::value::has_equality_operator(column.ty) {
+                        return Err(SqlError::NoEqualityOperator(column.ty.name()));
+                    }
+                }
+            }
+            planned.push((Some((arm.op, arm.all)), arm_plan));
         }
         query::append(select, planned)
     }

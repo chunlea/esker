@@ -153,6 +153,11 @@ pub(super) fn create_table(
             .iter()
             .map(key_position)
             .collect::<Result<Vec<_>>>()?;
+        // The same question again: a primary key is a unique index, and a `json` column is no more
+        // orderable because the word `PRIMARY` was used.
+        for &at in &primary_key {
+            refuse_unindexable_type(columns[at].ty, catalog::BTREE_ACCESS_METHOD)?;
+        }
         // **`<partition>_pkey`, not the parent's name.** A partition's key is its own relation and
         // its own `pg_index` row, and it is that name a duplicate row quotes back — measured,
         // `pk_part_1_pkey` rather than `pk_part_pkey`.
@@ -535,6 +540,53 @@ pub(super) fn range_representation(subtype: ColumnType) -> Option<ColumnType> {
     })
 }
 
+/// **The built-in half of [`refuse_unindexable`]: types with no default `btree` operator class.**
+///
+/// Split out because it had **two readers and only one asker**. `CREATE INDEX` asked it and
+/// `PRIMARY KEY`/`UNIQUE` did not, so this node built a key over a `json` column that a real
+/// server refuses — eight rows of r1's census, and the plain `CREATE INDEX` beside them was
+/// already right. A constraint's key is an index; the question is the same question.
+///
+/// Takes the type rather than the column so the `CREATE TABLE` path, which has no `TableDef` yet,
+/// can ask it too. The user-defined-type half stays with its caller, which has the table.
+fn refuse_unindexable_type(ty: ColumnType, method: &str) -> Result<()> {
+    // **A `tsvector` column is a `gin` or `gist` key.** `tsvector_ops` is the default operator
+    // class for both — measured, `pg_opclass` where `opcdefault` — so `USING gin (tsv)` is exactly
+    // what a real server accepts and what `schema_test.rb` builds. Neither method reads the index
+    // in key order, which is the whole of why they are safe here and `btree` is not: there the
+    // order of the key *is* the index, and this node's order for a `tsvector` is its bytes' rather
+    // than `tsvector_ops`'
+    // ([ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md), amended).
+    if ty == ColumnType::TsVector
+        && matches!(
+            method,
+            catalog::GIN_ACCESS_METHOD | catalog::GIST_ACCESS_METHOD
+        )
+    {
+        return Ok(());
+    }
+    if matches!(
+        ty,
+        ColumnType::Json
+            | ColumnType::Point
+            // **And the other six geometric shapes**, measured one at a time: `CREATE INDEX` on
+            // an `lseg` column is the same `42704` with the same HINT. The list that started as
+            // "exactly two" is eight now, and every one of them was probed.
+            | ColumnType::Lseg
+            | ColumnType::Box
+            | ColumnType::Path
+            | ColumnType::Polygon
+            | ColumnType::Circle
+            | ColumnType::Line
+            // **And `xml`**, measured: `data type xml has no default operator class for access
+            // method "btree"`, the same `42704` with the same HINT.
+            | ColumnType::Xml
+    ) {
+        return Err(SqlError::NoDefaultOperatorClass(ty.name()));
+    }
+    Ok(())
+}
+
 /// **`json` and `point` cannot be indexed on a real server**, and they are the only two —
 /// measured, one type at a time: `jsonb`, every range, `hstore` and every array all have a default
 /// btree operator class there and index fine.
@@ -563,33 +615,7 @@ fn refuse_unindexable(table: &TableDef, column: &ColumnDef, method: &str) -> Res
     //
     // An *expression* of this type was already accepted, because `index_expression` has no gate of
     // its own; admitting the column is what makes the two paths agree.
-    if ty == ColumnType::TsVector
-        && matches!(
-            method,
-            catalog::GIN_ACCESS_METHOD | catalog::GIST_ACCESS_METHOD
-        )
-    {
-        return Ok(());
-    }
-    if matches!(
-        ty,
-        ColumnType::Json
-            | ColumnType::Point
-            // **And the other six geometric shapes**, measured one at a time: `CREATE INDEX` on
-            // an `lseg` column is the same `42704` with the same HINT. The list that started as
-            // "exactly two" is eight now, and every one of them was probed.
-            | ColumnType::Lseg
-            | ColumnType::Box
-            | ColumnType::Path
-            | ColumnType::Polygon
-            | ColumnType::Circle
-            | ColumnType::Line
-            // **And `xml`**, measured: `data type xml has no default operator class for access
-            // method "btree"`, the same `42704` with the same HINT.
-            | ColumnType::Xml
-    ) {
-        return Err(SqlError::NoDefaultOperatorClass(ty.name()));
-    }
+    refuse_unindexable_type(ty, method)?;
     // **A composite is stored as `text` and must not be indexed as one.** `is_index_key` sees the
     // storage type and cannot tell it apart, so the question is asked here, where the column's
     // declared type is known. PostgreSQL orders a record **field by field**; this node's key would
@@ -932,6 +958,10 @@ fn unique_indexes(
             .iter()
             .map(key_position)
             .collect::<Result<Vec<_>>>()?;
+        // A constraint's key is an index, so it asks the same question `CREATE INDEX` asks.
+        for &at in &ordinals {
+            refuse_unindexable_type(columns[at].ty, catalog::BTREE_ACCESS_METHOD)?;
+        }
         indexes.push(IndexDef {
             id: catalog::allocate_id(txn, executor.tenant)?,
             // A `UNIQUE` constraint's index takes no `USING`, so it is a btree by construction.
