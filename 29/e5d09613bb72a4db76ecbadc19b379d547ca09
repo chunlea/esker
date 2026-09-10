@@ -1,0 +1,19 @@
+crates/esker-sql/src/stmt_stats.rs
+  s_e5c0c6e78b5662::t_dcee1a03fb5f5d 262-268
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "29e5d09613bb72a4db76ecbadc19b379d547ca09",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
