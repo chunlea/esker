@@ -262,6 +262,71 @@ So the cost is not the median, it is the tail shape: **one ambiguous outcome per
 a proposal in flight**, and a bulk load that is wide enough or fast enough to always have one in
 flight will meet it on most splits.
 
+### How `debts-v1.1.md` #40 gets closed — the design, before the run
+
+**The one question left.** The livelock reproduces deterministically in `esker-raft` and
+[ADR 0101](../adr/0101-a-batch-of-ticks-never-carries-a-whole-election.md) caps the batch that
+causes it. The in-process harness still stalls past thirty seconds when the box is busy and not
+when it is quiet. Four real `esker server` processes reached **663 regions with no sighting at
+all** — on a quiet box. So: **do real processes stall when the box is loaded?** Yes is a system
+debt and needs its own ADR; no closes #40 as in-process-harness capacity, keeping 0101's core
+characterisation test.
+
+**The measurement** is `crates/esker-cli/tests/leaderless_window.rs`'s
+`how_long_a_region_has_no_leader_on_real_processes`, unchanged: four store processes, a real
+placement driver, a real SQL node, 8 KiB split threshold, ten thousand rows, and on every refusal
+that says `peer is not the leader` it asks again until the statement lands, recording how long the
+caller would have had to wait.
+
+**The arms**, three rounds each, and the load lives **inside the same container invocation as the
+test** so that nothing outside can reap it and nothing outlives it — the rule
+`docs/plans/debt-c7.md` earned when 134 orphaned busy loops drove this machine to a load of 237:
+
+| arm | load | how |
+|---|---|---|
+| control | quiet | the test alone |
+| A | moderate | **6** spinners, `( end=$((SECONDS+N)); while [ $SECONDS -lt $end ]; do :; done ) &` |
+| B | heavy | **12** spinners, the same shape |
+
+Each spinner carries its own `SECONDS`-bounded deadline, and the arm's script kills the group on
+`EXIT` as well — a load arm that can outlive its round is the one failure mode this lane has
+already paid for twice.
+
+**Not a host-side `cargo build`, although that is what the confound turned out to be.** It cannot
+be dialled to a level, it contends for the shared target volume and registry, and it would land on
+whichever other lane is compiling at the time. The spinners are the controlled version of the same
+pressure; the host compilers are what the sampler *watches for* rather than what this arm creates.
+
+**What each round must report, or it does not count**: the region count its load reached, and the
+`load1` actually observed inside the container. A round that did not pass **300 regions**, or that
+did not raise `load1` above the control's, is discarded rather than counted as a zero — the lane
+has already produced one unreadable zero by not printing the region count, and one non-detector
+that never fired in six opportunities.
+
+**The criteria, written before the numbers:**
+
+1. **primary** — the number of waits longer than **30 s**, summed over each arm's three rounds;
+2. **secondary** — the longest wait in each arm;
+3. **tertiary** — the term climb, which `who_answers_for`'s per-store snapshot prints whenever a
+   wait passes the give-up.
+
+**The verdict rule**, also written first: **one or more 30-second waits on the real binaries in
+either loaded arm → a system debt**, and the fix needs its own ADR (0104 is reserved). **Zero
+across all six loaded rounds, with both arms shown to have raised the load above the control →
+#40 closes as in-process-harness capacity**, and what stays is
+`a_batch_of_ticks_flattens_the_randomised_timeout` plus 0101's rule.
+
+**The control round is also a free experiment.** When the two 400 s timeouts happened this
+lane's build volume held 331 GB on a disk 86% full; it holds 1 GB now. The same test, on the same
+box, back near its 214 s is evidence that the disk was the drag; still past 400 s says it was not.
+Either way the number is worth reading before the loaded arms, because a control that is itself
+slow makes every comparison after it meaningless.
+
+**Budget: 25 minutes.** The control round took 19.45 s of test time at 663 regions, so nine rounds
+plus cluster setup, teardown and a 25-second load ramp each fits with slack. `env-sampler.sh` runs
+beside it at ten-second resolution, so every duration carries the box it was taken on — including
+the host compilers a container's `/proc` cannot see.
+
 ### What was done about it, and the two ADRs the doing needed — 2026-09-09
 
 **The child is campaigned by the store that led the parent**

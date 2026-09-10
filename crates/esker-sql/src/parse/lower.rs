@@ -4425,6 +4425,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             operand: Box::new(lower_expr(expr)?),
             list: list.iter().map(lower_expr).collect::<Result<Vec<_>>>()?,
             negated: *negated,
+            any: false,
         }),
         // `INTERVAL '1 day'` and `INTERVAL '1' DAY`: SQL's typed-literal spelling for this one
         // type, which `sqlparser` gives its own node rather than a `TypedString`. A **leading
@@ -4714,6 +4715,8 @@ fn lower_quantified(
             operand,
             list,
             negated: all,
+            // The written spelling was `= ANY` / `<> ALL`, and one rule depends on knowing it.
+            any: true,
         });
     }
     // **A constructor stays a constructor**, which is the one thing `pg_get_expr` keeps that a
@@ -5949,7 +5952,7 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
     if let DataType::Array(inner) = data_type
         && let Some(element) = array_element(inner)
         && let Ok((element, NO_TYPMOD)) = lower_type(element)
-        && let Some(array) = esker_keys::array::ArrayValue::array_of(element)
+        && let Some(array) = esker_keys::array::ArrayValue::array_over(element)
     {
         // **`ARRAY[]::int[]` is the empty array and `ARRAY[]` is an error**, and the difference
         // is exactly this cast: the constructor has no element to take a type from, and the cast
@@ -8851,7 +8854,7 @@ pub(super) fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
                 return Err(SqlError::unsupported(format!("the type {data_type}")));
             };
             let (element, typmod) = lower_type(element)?;
-            let Some(array) = esker_keys::array::ArrayValue::array_of(element) else {
+            let Some(array) = esker_keys::array::ArrayValue::array_over(element) else {
                 return Err(SqlError::unsupported(format!("the type {data_type}")));
             };
             Ok((array, typmod))

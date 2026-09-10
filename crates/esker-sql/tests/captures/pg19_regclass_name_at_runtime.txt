@@ -1,0 +1,35 @@
+# **A relation name reaches a `regclass` wherever the value does** — PostgreSQL 19beta1, 2026-09-09.
+# `ON_ERROR_ROLLBACK on`, `BEGIN … ROLLBACK`.
+#
+# `debts-v1.1.md` #41, the half that needs a catalog. Three shapes, and the third is the one r1's
+# run-110 wire gate found rather than the row:
+#
+#     INSERT INTO rh VALUES (1, 'ra')                    stores the relation
+#     UPDATE rh SET r = 'rb'                             stores the relation
+#     SELECT c::regclass FROM (VALUES ('pg_class')) s    answers `pg_class`, declared 2205
+#
+# The node answers `0A000 a relation name read as a regclass without a catalog` for the first two
+# and `an oid is an integer, not Text("pg_class")` for the third — a value arriving somewhere its
+# type was decided without it.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **A comparison is the other way**, and that half is closed: `WHERE r = 'ra'` is `22P02`
+#     because `=` is `oideq` (`tests/regclass_literal.rs`). Assignment resolves, comparison does not.
+#   * **`IN` follows the assignment rule, not the comparison's**: `r IN ('ra','rb')` answers.
+#   * **It is the relation and not the characters**: a value stored from a bare name follows a
+#     later `ALTER TABLE … RENAME`, exactly as one stored from `'ra'::regclass` does.
+#
+# ## The measurements
+#
+CREATE TABLE ra (id int8)		-
+CREATE TABLE rb (id int8)		-
+CREATE TABLE rh (id int8, r regclass)		-
+INSERT INTO rh VALUES (1, 'ra')		-
+SELECT id, r FROM rh	bigint,regclass	1|ra
+UPDATE rh SET r = 'rb' WHERE id = 1		-
+SELECT r FROM rh	regclass	rb
+ALTER TABLE rb RENAME TO rz		-
+SELECT r FROM rh	regclass	rz
+SELECT c::regclass FROM (VALUES ('ra')) s(c)	regclass	ra
+SELECT id FROM rh WHERE r IN ('rz','ra') ORDER BY id	bigint	1

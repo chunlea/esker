@@ -1376,6 +1376,7 @@ fn render(expr: &Expr, columns: &[String]) -> String {
             operand,
             list,
             negated,
+            any: _,
         } => format!(
             "{} {}IN ({})",
             render(operand, columns),

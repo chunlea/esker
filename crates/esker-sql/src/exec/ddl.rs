@@ -6269,6 +6269,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             operand,
             list,
             negated,
+            any: _,
         } => {
             let element = column_type_of(operand, table).unwrap_or(ty);
             format!(
