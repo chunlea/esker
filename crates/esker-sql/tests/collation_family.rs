@@ -168,6 +168,54 @@ fn a_clause_that_wins_is_not_a_mismatch() {
     assert_eq!(node.rows("SELECT t COLLATE \"C\" FROM g"), vec![vec!["a"]]);
 }
 
+/// **Two disagreeing *implicit* collations, which is ADR 0096's third rule and is not built** —
+/// pinned here so that the day it lands, the pair that has to change is named and not searched
+/// for, and so that "#19 is paid" cannot quietly mean four rules out of four.
+///
+/// Measured on 19beta1, 2026-09-10, and it is the measurement that separated this from the
+/// generated-column rule in the first place:
+///
+/// ```text
+///                                      empty table   one row
+///   SELECT u < v          (C vs POSIX)  0 rows        42P22 string comparison
+///   GENERATED AS (u < v)  (C vs POSIX)  accepted      42P22 string comparison
+/// ```
+///
+/// **It is an evaluation-time error**, in a query and in a generated column alike: it fires when a
+/// row reaches the operator and never on an empty table. This node answers instead, and the
+/// *value* is right either way — `C` and `POSIX` both order by byte (ADR 0076), so nothing here is
+/// a wrong answer; what differs is that a statement a real server refuses is answered.
+///
+/// **Why it is not built with the other three**: the refusal has to be raised *per row*, and the
+/// plan has nowhere to carry "this operator's operands disagree" to the evaluator —
+/// `plan::Expr::Binary` holds an operator and two operands and no seam. The three rules that are
+/// built need no such seam: two are decided from the expression's shape and one from a
+/// `TableDef`. What this costs is that seam, and it should be sized before it is cut rather than
+/// bolted onto a comparison arm.
+///
+/// **And nothing measured asks for it**: comparing two *differently collated* columns to each
+/// other is a statement no captured suite sends — `collation_test.rb` reads a column's collation
+/// back and `unsafe_raw_sql_test.rb` writes `title COLLATE "C" DESC`, neither of which is this.
+#[test]
+fn two_disagreeing_implicit_collations_are_answered_here_and_refused_there() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE ci (u text COLLATE \"C\", v text COLLATE \"POSIX\")",
+        "INSERT INTO ci VALUES ('a', 'b')",
+    ]);
+    // 19beta1: `42P22 could not determine which collation to use for string comparison`.
+    assert_eq!(node.rows("SELECT u < v FROM ci"), vec![vec!["t"]]);
+    // And the same inside a generated column, where the DDL is accepted on both servers and only
+    // the **write** differs — which is the half that makes this an evaluation-time rule.
+    assert_eq!(
+        node.answer("ALTER TABLE ci ADD COLUMN g boolean GENERATED ALWAYS AS ((u < v)) STORED")
+            .to_string(),
+        "(a command, no result set)"
+    );
+    // **Both collations order by byte here**, so the value is the value a real server would have
+    // computed if it had answered: this is a statement that exists rather than a wrong answer.
+    assert_eq!(node.rows("SELECT g FROM ci"), vec![vec!["t"]]);
+}
+
 #[test]
 fn every_collation_answer_is_postgresql_19_s() {
     let checked = parity::replay(
