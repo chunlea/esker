@@ -115,19 +115,35 @@ fn a_target_list_entry_is_named_the_way_postgresql_names_it() {
 /// text literal `1` and there is no cast node left to read — so the name cannot be figured where
 /// every other name in this file is figured, from the expression.
 ///
-/// Closing it is a plan change rather than a rule change: either the lowering carries the figured
-/// name beside the expression, or a folded cast keeps a marker saying what it was. Neither is worth
-/// doing on a guess about which client needs it; nothing in the Rails suite reads a literal cast by
-/// name, and what run 75 stopped on was a **function**, which this rule now names.
+/// Closing it was a plan change rather than a rule change, exactly as this entry predicted: the
+/// fold now keeps the node where a real server keeps it (`debts-v1.1.md` #42). **Half of it
+/// closed** — a cast to `text` — and the half that did not is not a naming problem at all, which
+/// is why the two are now two tests.
 #[test]
-fn a_cast_over_a_literal_is_the_one_name_this_node_does_not_figure() {
+fn a_cast_to_text_over_a_literal_is_named_the_way_postgresql_names_it() {
+    let mut node = parity::Node::new(&[]);
+    for sql in ["SELECT 1::text", "SELECT CAST(1 AS text)"] {
+        assert_eq!(
+            names(&mut node, sql),
+            Some(vec!["text".to_owned()]),
+            "{sql} is `text` on PostgreSQL 19, and is here too since #42 stopped the fold \
+             discarding the node"
+        );
+    }
+}
+
+/// **The two shapes the fold still swallows**, and neither is waiting on a naming rule.
+///
+/// `1::numeric(5,2)` keeps folding because the target is not `text`: the node would have to be
+/// evaluated by the `Cast` arm, and that arm knows fewer conversions than the fold does — #42's
+/// comment in `parse::lower::lower_cast` carries the three tests that drew the line.
+/// `ARRAY[1,2]` is `lower_array_constructor`'s fold, a different site with its own owner
+/// (`tests/array_of_array.rs` pins it).
+#[test]
+fn the_two_folds_that_still_leave_nothing_to_name() {
     let mut node = parity::Node::new(&[]);
     for (sql, postgresql) in [
-        ("SELECT 1::text", "text"),
-        ("SELECT CAST(1 AS text)", "text"),
         ("SELECT 1::numeric(5,2)", "numeric"),
-        // The same cause with a different keyword: an array constructor over constants is folded
-        // to its value too, so there is no `ARRAY[…]` left to name.
         ("SELECT ARRAY[1,2]", "array"),
     ] {
         assert_eq!(

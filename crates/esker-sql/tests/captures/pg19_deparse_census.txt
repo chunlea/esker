@@ -924,4 +924,37 @@ ROLLBACK TO sp_case_simple_badtype		-
 SAVEPOINT sp_case_simple_badvalue		-
 ALTER TABLE cen ADD CONSTRAINT kf7 CHECK (CASE a WHEN 'x' THEN true ELSE false END)	!22P02 invalid input syntax for type integer: "x"
 ROLLBACK TO sp_case_simple_badvalue		-
+CREATE TABLE cenf (fb bigint, fn numeric, ff float8, fs smallint, fnb bigint, fnt text, fns numeric, fcc text)		-
+SAVEPOINT sp_fold_int_to_big		-
+ALTER TABLE cenf ALTER COLUMN fb SET DEFAULT (1)::bigint		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cenf'::regclass AND a.attname='fb'		(1)::bigint
+ROLLBACK TO sp_fold_int_to_big		-
+SAVEPOINT sp_fold_int_to_num		-
+ALTER TABLE cenf ALTER COLUMN fn SET DEFAULT (1)::numeric		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cenf'::regclass AND a.attname='fn'		(1)::numeric
+ROLLBACK TO sp_fold_int_to_num		-
+SAVEPOINT sp_fold_num_to_f8		-
+ALTER TABLE cenf ALTER COLUMN ff SET DEFAULT (1.5)::float8		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cenf'::regclass AND a.attname='ff'		(1.5)::double precision
+ROLLBACK TO sp_fold_num_to_f8		-
+SAVEPOINT sp_fold_int_to_small		-
+ALTER TABLE cenf ALTER COLUMN fs SET DEFAULT (1)::smallint		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cenf'::regclass AND a.attname='fs'		(1)::smallint
+ROLLBACK TO sp_fold_int_to_small		-
+SAVEPOINT sp_fold_neg_to_big		-
+ALTER TABLE cenf ALTER COLUMN fnb SET DEFAULT (-1)::bigint		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cenf'::regclass AND a.attname='fnb'		('-1'::integer)::bigint
+ROLLBACK TO sp_fold_neg_to_big		-
+SAVEPOINT sp_fold_neg_to_text		-
+ALTER TABLE cenf ALTER COLUMN fnt SET DEFAULT (-1)::text		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cenf'::regclass AND a.attname='fnt'		('-1'::integer)::text
+ROLLBACK TO sp_fold_neg_to_text		-
+SAVEPOINT sp_fold_num_same		-
+ALTER TABLE cenf ALTER COLUMN fns SET DEFAULT (-1.5)::numeric		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cenf'::regclass AND a.attname='fns'		'-1.5'::numeric
+ROLLBACK TO sp_fold_num_same		-
+SAVEPOINT sp_fold_cast_chain		-
+ALTER TABLE cenf ALTER COLUMN fcc SET DEFAULT ((1)::bigint)::text		-
+SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cenf'::regclass AND a.attname='fcc'		((1)::bigint)::text
+ROLLBACK TO sp_fold_cast_chain		-
 ROLLBACK		-
