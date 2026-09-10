@@ -99,9 +99,20 @@ impl Db {
     /// fills up.
     pub fn flush(&self, cf: &str) -> Result<()> {
         let cf = self.inner.cf_by_name(cf)?;
+        // **Sampled before anything is signalled**, because the wait below is "one more flush of
+        // this family has finished" and a mark taken afterwards could already include the flush
+        // it is meant to wait for.
+        let (mark, idle) = {
+            let mem = read_lock(&cf.mem)?;
+            (mem.swept, mem.active.is_empty() && mem.immutable.is_empty())
+        };
+        // Nothing to write: no job will run, so no completion will ever arrive to wait for.
+        if idle {
+            return Ok(());
+        }
         self.inner.switch_memtable_of(&cf)?;
         self.inner.signal_flush();
-        self.inner.wait_for_flush(&cf)
+        self.inner.wait_for_flush(&cf, mark)
     }
 
     /// Flushes every column family.
@@ -206,10 +217,20 @@ impl DbInner {
     }
 
     /// Waits until `cf` has no immutable memtables left.
-    pub(crate) fn wait_for_flush(&self, cf: &Arc<ColumnFamily>) -> Result<()> {
+    pub(crate) fn wait_for_flush(&self, cf: &Arc<ColumnFamily>, mark: u64) -> Result<()> {
         loop {
-            if read_lock(&cf.mem)?.immutable.is_empty() {
-                return Ok(());
+            // **Both halves, and the second is the one that was missing.** `immutable` empties at
+            // `flush_one`'s step 4 and the obsolete-file sweep runs at step 7, with a durable
+            // manifest edit in between — so a caller that watched only the memtable was told its
+            // flush had finished while the segment that flush reclaims was still on disk. Under
+            // load that window holds an fsync, which is why it went red at load 12 and green when
+            // idle. `swept` is bumped after the sweep, so waiting for it to pass `mark` is waiting
+            // for the whole job.
+            {
+                let mem = read_lock(&cf.mem)?;
+                if mem.immutable.is_empty() && mem.swept > mark {
+                    return Ok(());
+                }
             }
             self.check_flush_error()?;
             if self.shutdown.load(Ordering::Acquire) {
@@ -337,6 +358,9 @@ impl DbInner {
         self.advance_log_number()?;
         self.drop_pending(number)?;
         self.purge_and_evict()?;
+        // **After the sweep and before the wake-up**: this is what `wait_for_flush` returns on, so
+        // it must not be visible until everything a caller is entitled to assume is true.
+        write_lock(&cf.mem)?.swept += 1;
         // A new L0 file may have pushed the level over its trigger.
         self.signal_compaction();
         self.flush_done.notify_all();
