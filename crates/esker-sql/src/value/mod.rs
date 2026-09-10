@@ -96,6 +96,24 @@ pub use esker_keys::value::{ColumnType, Datum, f64_of_sort_bits, sort_bits_of_f6
 pub fn cast_text_under(value: &Datum, rendering: Rendering) -> Option<String> {
     match value {
         Datum::Bool(flag) => Some((if *flag { "true" } else { "false" }).to_owned()),
+        // **An address keeps the prefix its output function hides**, which is the same split one
+        // type over: `SELECT c_inet` is `10.0.0.1` and `SELECT c_inet::text` is `10.0.0.1/32`,
+        // measured. A `cidr` shows no difference because its *output* already carries the prefix,
+        // which is why the four `c_cidr` rows of `pg19_cast_matrix.txt` agreed all along and the
+        // three `c_inet` ones did not — and is why this arm builds the text from the parts rather
+        // than appending to the printed form.
+        //
+        // `parse::lower::lower_cast` has had this rule since the address unit, for a cast over a
+        // **literal**; the evaluator's cast, which is every cast over a *column*, fell through to
+        // the output function. One fact, and the reader that had it was the one no application
+        // reaches (`debts-v1.1.md` #44).
+        Datum::Inet {
+            family, bits, addr, ..
+        } => Some(inet::to_cast_text(&inet::Address {
+            family: *family,
+            bits: *bits,
+            addr: *addr,
+        })),
         other => to_text_under(other, rendering),
     }
 }
