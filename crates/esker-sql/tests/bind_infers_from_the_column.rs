@@ -129,3 +129,45 @@ fn a_parameter_declared_text_refuses_the_way_postgresql_does() {
     );
     assert_eq!(refused.sqlstate(), esker_sql::sqlstate::UNDEFINED_FUNCTION);
 }
+
+/// **An explicitly zero OID is not the same as no OID at all** — which is what a driver sends.
+///
+/// The wire's `Parse` carries one type OID per parameter and **zero means "you decide"**. A client
+/// that names no types at all sends an empty list; `ActiveRecord`'s driver sends a list of zeros.
+/// Those are the same request and this node must answer them the same way.
+#[test]
+fn a_zero_oid_infers_the_same_as_no_oid_at_all() {
+    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let mut executor = Executor::new(
+        backend,
+        Arc::new(Catalog::new()),
+        1,
+        esker_sql::session::register(),
+    );
+    let mut run = |sql: &str, values: &[Option<Vec<u8>>], declared: &[u32]| {
+        let parsed = parse_statements(sql)?;
+        let mut last = None;
+        for one in &parsed {
+            last = Some(executor.execute(
+                one,
+                &Params {
+                    values,
+                    formats: &[],
+                    declared,
+                    bound: !values.is_empty(),
+                },
+            )?);
+        }
+        Ok::<_, esker_sql::SqlError>(last.unwrap())
+    };
+    run("CREATE EXTENSION IF NOT EXISTS hstore", &[], &[]).unwrap();
+    run("CREATE TABLE h (id bigint, data hstore)", &[], &[]).unwrap();
+    run("INSERT INTO h VALUES (1, 'a=>1')", &[], &[]).unwrap();
+
+    let answered = run("SELECT id FROM h WHERE data = $1", &one("a=>1"), &[0])
+        .expect("a zero OID means the node decides, and the column says hstore");
+    let esker_sql::pgwire::session::Outcome::Rows { rows, .. } = answered else {
+        panic!("no rows");
+    };
+    assert_eq!(rows.len(), 1);
+}
