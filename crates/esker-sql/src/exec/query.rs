@@ -2876,7 +2876,19 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             // `c::char(2)` is 2 and `c::char(6)` is 6 — truncated or padded to the target's own
             // width — and `c::bpchar` with no width is 4, the value unchanged. So the strip is
             // exactly "leaving the type", which is what [`read_as_text`] inserts.
-            let operand = if *to == ColumnType::Bpchar {
+            // **And `xml` is the second target that does not strip**, measured on 19beta1,
+            // 2026-09-10: `'<' || 'ab'::character(4)::xml || '>'` is `<ab  >` and
+            // `octet_length('ab'::character(4)::xml::text)` is **4**. The original measurement
+            // covered `varchar`, `name`, `text`, `char(n)` and bare `bpchar` — every target that
+            // *is* a character type — and read the rule off them as "everything but `bpchar`".
+            // `xml` is not a character type and keeps the value it was given.
+            //
+            // **Named rather than generalised.** The honest statement of what is measured is
+            // "`bpchar` and `xml` do not strip"; whether a cast to a `date` or an `int4` should
+            // see the padding has not been put to the oracle, and those targets' parsers tolerate
+            // trailing blanks either way, so nothing here turns on a guess
+            // (`debts-v1.1.md` #44, group 4).
+            let operand = if matches!(*to, ColumnType::Bpchar | ColumnType::Xml) {
                 operand
             } else {
                 read_as_text(operand, scope)
