@@ -156,3 +156,91 @@ fn a_client_finds_a_store_that_was_killed_and_came_back() {
         Some(bytes::Bytes::from_static(b"the kill"))
     );
 }
+
+/// **The instrument that tells a recovered outage from no outage at all**, on the same
+/// arrangement.
+///
+/// A failed attempt is a round trip like any other, so the statement tap counted a statement that
+/// met a dead store and recovered exactly as it counted one that never met a store at all. run 124
+/// asks a question that difference is the whole of: with a store killed every sixty seconds, was
+/// any store unreachable, and was every such moment recovered from? A green run with both numbers
+/// at zero is a run that never tested what it was built to test.
+///
+/// Kept in this file rather than in `esker-client`'s own tests, because the only arrangement that
+/// produces both counts is a real store that goes away and comes back.
+#[test]
+#[ignore = "starts a store process and kills it; run with --run-ignored all"]
+fn a_statement_that_met_a_dead_store_says_so_and_says_it_recovered() {
+    // A run turns the tap on with `ESKER_STMT_STATS`; a test cannot — setting an environment
+    // variable is `unsafe` in this edition, and racy in fact. This is the same switch.
+    esker_client::stmt_stats::force_on();
+
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("node");
+    let log = dir.path().join("server.log");
+    let address: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+
+    let first = start(&data, address, &log);
+    wait_until_up(address);
+    let stores = TcpStores::connect(address).expect("the client connects");
+    let store_id = stores.only_store().expect("the store named itself");
+    let client = RawClient::new(
+        Arc::new(stores),
+        Arc::new(StaticRegion::whole_key_space(REGION, store_id, 0)),
+    );
+    client.put(b"before", b"the kill").unwrap();
+
+    // **The control, and it comes first**: a statement that met nothing reports nothing. Without
+    // it, a counter that always fired would pass every assertion below.
+    esker_client::stmt_stats::reset();
+    client.put(b"quiet", b"no chaos here").unwrap();
+    let quiet = esker_client::stmt_stats::taken();
+    assert!(
+        quiet.not_sent.is_empty() && quiet.redials.is_empty(),
+        "a statement against a live store reported {quiet:?}"
+    );
+
+    // **Phase two: the store is gone and stays gone.** A call cannot be made at all, and
+    // `not_sent` is the only place that fact is recorded — the error reaches the caller as one
+    // failed statement among many, and the round-trip count cannot tell it from a slow one.
+    let pid = first.0.id();
+    Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status()
+        .unwrap();
+    drop(first);
+
+    esker_client::stmt_stats::reset();
+    let away = client
+        .put(b"while-it-is-gone", b"no")
+        .expect_err("a store that is not there cannot take a write");
+    let cost = esker_client::stmt_stats::taken();
+    assert!(
+        cost.not_sent.get(&store_id).copied().unwrap_or(0) > 0,
+        "the client could not reach store {store_id} ({away}) and the tap did not say so: {cost:?}"
+    );
+    assert!(
+        cost.redials.is_empty(),
+        "nothing was reconnected to, because nothing came back yet: {cost:?}"
+    );
+
+    // **Phase three: it comes back.** The recovery is what `redials` counts, and it is the number
+    // that separates "no store was ever unreachable" from "every unreachable store was silently
+    // recovered from" — which is the whole question run 124 asks.
+    let _second = start(&data, address, &log);
+    wait_until_up(address);
+
+    esker_client::stmt_stats::reset();
+    let deadline = Instant::now() + RECOVER_WITHIN;
+    while client.put(b"after", b"the restart").is_err() {
+        assert!(Instant::now() < deadline, "the client never recovered");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let cost = esker_client::stmt_stats::taken();
+    assert_eq!(
+        cost.redials.get(&store_id).copied().unwrap_or(0),
+        1,
+        "one reconnection to store {store_id} is what recovering from one kill costs: {cost:?}"
+    );
+}

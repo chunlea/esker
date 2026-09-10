@@ -176,6 +176,11 @@ impl TcpStores {
                 return Ok(Arc::clone(&link.connection));
             }
             if Instant::now() < link.redial_after {
+                // **The only place a statement can learn it met a store that was not there.**
+                // A failed attempt is a round trip like any other, so without this a statement
+                // that met a dead store and recovered is indistinguishable from one that never
+                // met one — see `crate::stmt_stats`.
+                crate::stmt_stats::record_not_sent(store_id);
                 return Err(ProtoError::not_sent(format!(
                     "the connection to store {store_id} at {} is closed",
                     link.address
@@ -187,6 +192,7 @@ impl TcpStores {
 
         let fresh = BlockingTransport::connect_with_tls(address, self.config, &self.tls, None)
             .map_err(|error| {
+                crate::stmt_stats::record_not_sent(store_id);
                 ProtoError::not_sent(format!(
                     "reconnecting to store {store_id} at {address}: {error}"
                 ))
@@ -200,6 +206,8 @@ impl TcpStores {
                 "{address} answers as store {answered} now, not store {store_id}"
             )));
         }
+        // **The recovery itself**, recorded where it happens and nowhere else.
+        crate::stmt_stats::record_redial(store_id);
         let fresh = Arc::new(fresh);
         let mut links = self.lock();
         if let Some(link) = links.get_mut(&store_id)
