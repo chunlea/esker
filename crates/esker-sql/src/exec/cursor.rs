@@ -3232,6 +3232,11 @@ fn catalog_function(
         args.push(evaluate_in(arg, row, env)?);
     }
     Ok(match call.func {
+        // **Reached only for the types that *have* `~=` on a real server**, since resolution has
+        // already refused the rest with PostgreSQL's own sentence. `point` and `polygon` answer it
+        // there and this node does not implement it, so the refusal is the one it always was — a
+        // gap a client can read, and a row of `pg19_no_equality_types.txt` in the (b) direction.
+        CatalogFunc::SameAs => return Err(SqlError::unsupported("the operator ~=")),
         // **Sleeps in short steps and checks between them.** A single `sleep` for the whole
         // duration would ignore `statement_timeout` and a cancel until it was over, and being
         // interruptible is the entire reason this node has `pg_sleep` — it is how a test makes a
