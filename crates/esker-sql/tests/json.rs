@@ -80,11 +80,6 @@ const CASTS: &str = "**Both refuse a `jsonb` *object* cast to a scalar; the code
 /// Every statement this node answers differently, each pointing at one reason above.
 const ANSWERS: &[(&str, &str, &str)] = &[
     ("SELECT id, b FROM js ORDER BY b", ORDER, "pg19_json.txt:69"),
-    (
-        "SELECT id FROM js WHERE b @> '{\"a\":2}'",
-        CONTAINMENT,
-        "pg19_json.txt:72",
-    ),
     ("SELECT '{bad}'::json", MESSAGES, "pg19_json.txt:90"),
     ("SELECT ''::json", MESSAGES, "pg19_json.txt:91"),
     ("SELECT '{bad}'::jsonb", MESSAGES, "pg19_json.txt:92"),

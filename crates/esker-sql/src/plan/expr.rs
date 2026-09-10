@@ -1075,6 +1075,13 @@ pub enum CatalogFunc {
     /// is what ADR 0042 left open, and it needs no `Datum` of its own because
     /// `crate::value::json` already canonicalises on the way in.
     JsonbCompare,
+    /// `jsonb_contains(a, b)`: whether `a` contains `b`, as `@>` means for a document.
+    ///
+    /// Not an operator a user can write, for the same reason [`Self::JsonbCompare`] is not: `@>`
+    /// is spelled the same for an hstore, a range and a document, and by evaluation a `jsonb` is a
+    /// `Datum::Text` with nothing to say which it is. `<@` is this with the operands the other way
+    /// round — measured, not assumed.
+    JsonbContains,
     /// `a ~= b`: whether two geometric values are the same.
     ///
     /// **Carried rather than refused at lowering, so that it can be refused with a type.** A
@@ -1627,6 +1634,7 @@ impl CatalogFunc {
             CatalogFunc::HstoreHasKey => "?",
             CatalogFunc::SameAs => "~=",
             CatalogFunc::JsonbCompare => "jsonb_compare",
+            CatalogFunc::JsonbContains => "jsonb_contains",
             // One symbol, two containments — see `exec::cursor`, where the operand decides.
             CatalogFunc::RangeContains | CatalogFunc::HstoreContains => "@>",
             CatalogFunc::HstoreConcat | CatalogFunc::JsonbConcat => "||",
@@ -1727,6 +1735,7 @@ impl CatalogFunc {
             | CatalogFunc::HstoreHasKey
             | CatalogFunc::SameAs
             | CatalogFunc::JsonbCompare
+            | CatalogFunc::JsonbContains
             | CatalogFunc::HstoreContains
             | CatalogFunc::HstoreConcat
             | CatalogFunc::JsonbConcat
@@ -1935,7 +1944,8 @@ impl CatalogFunc {
             | CatalogFunc::HstoreContains
             | CatalogFunc::TsMatch
             | CatalogFunc::PgCancelBackend
-            | CatalogFunc::PgTerminateBackend => ColumnType::Bool,
+            | CatalogFunc::PgTerminateBackend
+            | CatalogFunc::JsonbContains => ColumnType::Bool,
             CatalogFunc::TextToLtree => ColumnType::Ltree,
             // Measured: `akeys` is `text[]`, and `||` and `hstore(…)` are hstores. `->`'s `text`
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.

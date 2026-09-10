@@ -1058,7 +1058,8 @@ pub fn has_equality_operator(ty: ColumnType) -> bool {
     )
 }
 
-/// Whether `=` exists for the type **at all** — a third question, and neither of the two above.
+/// Whether `=` exists for the type **at all** — the equality half of [`operator_exists`], which is
+/// the only caller and the only authority: everything outside this module asks that.
 ///
 /// [`has_equality_operator`] asks whether there is an equality *operator class*, which `DISTINCT`
 /// and `GROUP BY` need. `esker_sql::exec::query::same_family` asks whether two types are
@@ -1074,7 +1075,7 @@ pub fn has_equality_operator(ty: ColumnType) -> bool {
 /// not a widening of either: the doc above records that sharing the first two was tried and the
 /// geometric corpus refused it in one run, and this would have been the second such attempt.
 #[must_use]
-pub fn has_equality_at_all(ty: ColumnType) -> bool {
+fn has_equality_at_all(ty: ColumnType) -> bool {
     !matches!(
         ty,
         ColumnType::Json | ColumnType::Xml | ColumnType::Point | ColumnType::Polygon
