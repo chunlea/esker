@@ -194,8 +194,8 @@ Options:
 
 Bench options:
   <workload>            fillseq | fillrandom | overwrite | readrandom | readmissing
-                        | readseq | txnput | txnget | tso | allocid (default
-                        fillrandom)
+                        | readseq | scanrange | txnput | txnget | tso | allocid
+                        (default fillrandom)
       --num N           Keys in the database, and operations measured (default 100000)
       --value-size N    Value size in bytes (default 100)
       --batch-size N    Entries per write batch; entries read per scan for scanrange;
@@ -230,6 +230,10 @@ Bench options:
                         re-run against a named prefix meets objects it did not write.
                         Off by default: a benchmark pointed at a stale prefix should get
                         a fresh one
+      --pd HOST:PORT    Drive the workload through a placement driver, which routes
+                        every key to whichever store holds it. This is how a
+                        cluster is measured; --remote names one store and routes
+                        nothing, and the two are refused together
       --remote HOST:PORT  Drive the workload over the network against a running
                         server instead of an in-process database. The engine
                         options above belong to that server and are ignored.
@@ -506,6 +510,10 @@ fn parse_bench(arguments: &[String]) -> Result<Command, ParseError> {
         }
         if flag == "--remote" {
             options.remote = Some(take_value(arguments, &mut index, inline, "--remote")?);
+            continue;
+        }
+        if flag == "--pd" {
+            options.pd = Some(take_value(arguments, &mut index, inline, "--pd")?);
             continue;
         }
         if flag == "--sst-store" {
@@ -1772,6 +1780,14 @@ mod tests {
 
     #[test]
     fn bench_sync_is_a_flag_without_a_value() {
+        let Command::Bench(options) = parse_ok(&["bench", "scanrange", "--pd", "127.0.0.1:2379"])
+        else {
+            panic!("not a bench command");
+        };
+        assert_eq!(options.workload, Workload::ScanRange);
+        assert_eq!(options.pd.as_deref(), Some("127.0.0.1:2379"));
+        assert_eq!(options.remote, None);
+
         let Command::Bench(options) = parse_ok(&["bench", "fillseq", "--sync"]) else {
             panic!("expected a bench command");
         };
