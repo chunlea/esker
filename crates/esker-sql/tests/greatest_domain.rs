@@ -20,11 +20,17 @@
 //! mechanism, different domain: sharing a list between them would close one family and open
 //! another.
 //!
-//! **The list here is measured whole, not extended one type at a time**: `GREATEST` and `LEAST`
-//! were asked of all **166** type spellings the probe list has, and exactly **20** refuse — eleven
-//! scalars and their arrays. Everything else answers its own type, `int2vector`, `oidvector`,
-//! `hstore`, `tsvector`, `tsquery`, `money`, `macaddr`, `bit`, `citext`, `ltree`, `jsonb`, `uuid`
-//! and every range included.
+//! **The list here is measured whole, not extended one type at a time**
+//! (`tests/captures/pg19_greatest_least_all_types.txt`): `GREATEST` and `LEAST` were asked of
+//! every row of the probe list's type column — **166 rows, 100 distinct spellings**, the
+//! difference being the 67 rows that carry `type=text` because their conversion lives in the
+//! template — and exactly **20** spellings refuse, eleven scalars and the nine arrays of them this
+//! node has. Everything else answers its own type, `int2vector`, `oidvector`, `hstore`,
+//! `tsvector`, `tsquery`, `money`, `macaddr`, `bit`, `citext`, `ltree`, `jsonb`, `uuid` and every
+//! range included.
+//!
+//! **`GREATEST` and `LEAST` agreed on all 166 rows**, which is what makes them one arm — and is
+//! why `least` went into the probe list beside `greatest` rather than being assumed to follow it.
 //!
 //! **No `DETAIL` and no `HINT`**, measured — which is what tells this sentence from its two
 //! neighbours in `error.rs`, `could not identify an equality operator` and `… an ordering
@@ -42,8 +48,10 @@ fn refusal(ty: &str) -> String {
 
 /// **The eleven scalars with no comparison function, and the nine arrays of them the node has.**
 ///
-/// `lquery[]` refuses on 19beta1 too and is not here because this node has no such type; `void`
-/// has no array on either server (`type "void[]" does not exist`).
+/// Both spellings the probe list does not carry were asked separately and are written down in the
+/// capture: `lquery[]` refuses on 19beta1 too and is not here because **this node has no
+/// `LQueryArray`**, and `void[]` is `42704 type "void[]" does not exist` on 19beta1, so nothing
+/// can ask it.
 #[test]
 fn greatest_and_least_refuse_a_type_with_no_comparison_function() {
     let mut node = parity::Node::new(&["CREATE EXTENSION IF NOT EXISTS ltree"]);
@@ -58,6 +66,10 @@ fn greatest_and_least_refuse_a_type_with_no_comparison_function() {
         ("'<(0,0),1>'::circle", "circle"),
         ("'{1,-1,0}'::line", "line"),
         ("'a.*'::lquery", "lquery"),
+        // **`void` is the eleventh** and it needs a `NULL` because it has no value form. Measured
+        // in the direct shape as well as the subquery one, in case the constant resolved
+        // differently: `SELECT GREATEST(NULL::void, NULL::void)` refuses on 19beta1 too.
+        ("NULL::void", "void"),
         ("ARRAY['{\"a\":1}'::json]", "json[]"),
         ("ARRAY['<a/>'::xml]", "xml[]"),
         ("ARRAY['(1,1)'::point]", "point[]"),
