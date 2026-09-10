@@ -832,6 +832,18 @@ pub struct AggregateSpec {
 pub struct SortKey {
     /// What to sort on.
     pub expr: Expr,
+    /// **The declared type of `expr`**, for the families whose value cannot say what it is.
+    ///
+    /// A `jsonb` is a `Datum::Text` and its order is the *document's* — kind first, numbers
+    /// numerically — which the canonical text does not reproduce; so a comparator handed only two
+    /// datums sorts it as text and is wrong. This is the type travelling with the key instead, and
+    /// it is not `jsonb`'s alone: `hstore`, `xml`, `void` and the two vectors are that same
+    /// `Datum::Text`, and every one of them will reach a comparator eventually. Carrying the type
+    /// once here is what keeps that from being five more units.
+    ///
+    /// `None` where the sort is over something this pass could not type, which sorts by the value
+    /// as it always did.
+    pub ty: Option<ColumnType>,
     /// `DESC`.
     pub descending: bool,
     /// Whether NULLs come first, already resolved from the default.

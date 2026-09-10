@@ -1307,7 +1307,17 @@ pub(super) fn compare_values(keys: &[SortKey], left: &[Datum], right: &[Datum]) 
             (true, false) => nulls(key.nulls_first, Ordering::Less, Ordering::Greater),
             (false, true) => nulls(key.nulls_first, Ordering::Greater, Ordering::Less),
             (false, false) => {
-                let ordering = a.pg_cmp(b);
+                // **The key's declared type first, where the value cannot say what it is.** A
+                // `jsonb` is a `Datum::Text` and its order is the document's — kind before value,
+                // numbers as `numeric` — so `pg_cmp` sorts it as text and is wrong. The type rides
+                // on the key for exactly this, and the same seam is waiting for every other family
+                // whose representation is borrowed.
+                let ordering = match (key.ty, a, b) {
+                    (Some(ColumnType::Jsonb), Datum::Text(left), Datum::Text(right)) => {
+                        crate::value::json::compare(left, right).unwrap_or_else(|_| a.pg_cmp(b))
+                    }
+                    _ => a.pg_cmp(b),
+                };
                 if key.descending {
                     ordering.reverse()
                 } else {

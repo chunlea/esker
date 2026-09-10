@@ -55,13 +55,15 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 ///  6  `IS DISTINCT FROM` names the operator it is missing, `=`
 /// ```
 ///
-/// The 24 that remain are **(b)**, the other direction: PostgreSQL answers and this node refuses —
-/// `~=` over a `point` or a `polygon`, `@>`/`<@` over `polygon` and `jsonb`, `jsonb`'s comparisons
-/// and its index. Every one of them is this node's own unimplemented rather than a copy of a real
-/// server's refusal, and they are deliberately untouched: a fix in the (a) direction that widened
-/// this one would be the same defect facing the other way.
+/// The 24 that were **(b)** — PostgreSQL answers and this node refused — are down to **one**:
+/// building an index on a `jsonb` column, which needs an order-preserving key and is its own step.
+/// Everything else in that direction now answers, in five pieces: `jsonb`'s six comparisons and
+/// its containment over the `Json` the value layer already parses; `point <>`, fuzzy; `polygon`
+/// containment and overlap, fuzzy and edge-aware; `~=` for the shapes that have it; and ordering a
+/// `jsonb` column, which took the declared type travelling on the `SortKey` rather than a `Datum`
+/// of its own.
 #[test]
-#[ignore = "(a) is closed; the 24 that remain are (b) — PostgreSQL answers and this node refuses"]
+#[ignore = "one row left: an index on a jsonb column, which needs an order-preserving key"]
 fn every_no_equality_answer_is_postgresql_19_s() {
     let checked = parity::replay(
         include_str!("corpus/pg19_no_equality_types.txt"),

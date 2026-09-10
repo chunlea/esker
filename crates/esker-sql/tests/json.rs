@@ -47,9 +47,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 const TYPES: &[&str] = &[];
 
 /// One of `DIVERGENCES`' seven reasons.
-const ORDER: &str = "The same refusal for the same reason: a byte sort is not `jsonb`'s order, which puts \
-     `null` below `1.00` where the bytes put it above.";
-/// One of `DIVERGENCES`' seven reasons.
 const CONTAINMENT: &str = "Containment and the editing operators, likewise not built. `@>` is named in this \
      unit's scope and lands with the extraction operators; the rest are a later unit. \
      Each is `0A000` naming itself.";
@@ -79,7 +76,6 @@ const CASTS: &str = "**Both refuse a `jsonb` *object* cast to a scalar; the code
      with this one.";
 /// Every statement this node answers differently, each pointing at one reason above.
 const ANSWERS: &[(&str, &str, &str)] = &[
-    ("SELECT id, b FROM js ORDER BY b", ORDER, "pg19_json.txt:69"),
     ("SELECT '{bad}'::json", MESSAGES, "pg19_json.txt:90"),
     ("SELECT ''::json", MESSAGES, "pg19_json.txt:91"),
     ("SELECT '{bad}'::jsonb", MESSAGES, "pg19_json.txt:92"),
@@ -311,11 +307,18 @@ fn jsonb_compares_as_a_document_and_json_refuses() {
     assert_eq!(error.sqlstate(), "42883");
     assert_eq!(error.to_string(), "operator does not exist: json = json");
 
-    // And the remainder, named rather than left to be discovered.
+    // **And a `jsonb` column orders by the document**, which is the same comparison reached from
+    // the other side: the declared type travels on the `SortKey` to the comparator, because a
+    // `Datum::Text` cannot say it is a document.
     node.run("CREATE TABLE j (id int8 PRIMARY KEY, b jsonb)")
         .unwrap();
-    let error = node.run("SELECT id FROM j ORDER BY b").unwrap_err();
-    assert_eq!(error.sqlstate(), "0A000");
+    node.run("INSERT INTO j VALUES (1, '2'), (2, 'true'), (3, '\"s\"'), (4, '[]')")
+        .unwrap();
+    assert_eq!(
+        node.rows("SELECT id FROM j ORDER BY b"),
+        vec![vec!["4"], vec!["3"], vec!["1"], vec!["2"]],
+        "[] < string < number < boolean"
+    );
 }
 
 /// A `jsonb` column round-trips through the row codec, which is what a format addition has to do.
