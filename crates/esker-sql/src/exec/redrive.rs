@@ -132,18 +132,47 @@ pub struct ReDriver {
     seen: BTreeMap<u64, Seen>,
     /// Which pass this is. One pass is one step interval.
     pass: u64,
+    /// **One session for the life of the re-driver**, which is what a background worker is.
+    ///
+    /// It used to register a *fresh* one per executor, and `crate::session::deregister` is called
+    /// from exactly one place — a connection's destructor — so nothing ever took them out again:
+    /// an **idle** cluster with no clients grew `pg_stat_activity` by one row per pass, for ever.
+    /// r1 measured 2–4 a minute and about 160 in forty minutes on a cluster with nothing but a
+    /// listening socket (`debts-v1.1.md` #48). Not the same defect as #47 — no client is involved
+    /// at all — and it is why that one's fix did not touch it.
+    ///
+    /// **PostgreSQL's own answer is the shape here.** Measured on 19beta1, 2026-09-10: an idle
+    /// server has eight rows, seven of them background — `autovacuum launcher`, `background
+    /// writer`, `checkpointer`, `io worker` twice, `logical replication launcher`, `walwriter` —
+    /// and each is **one row for the life of the process**, named for what it does, with a NULL
+    /// `client_addr` and a set `backend_start`. This is one row named `schema re-driver`.
+    identity: crate::session::Backend,
+}
+
+impl Drop for ReDriver {
+    /// Takes the session out of the table, for the same reason a connection's destructor does:
+    /// the run loop is not the only owner — tests build a re-driver, take a pass and drop it, and
+    /// a registry that kept those would grow for the life of the process.
+    fn drop(&mut self) {
+        crate::session::deregister(self.identity.pid);
+    }
 }
 
 impl ReDriver {
     /// A re-driver over the same backend and catalog cache the sessions use.
     #[must_use]
     pub fn new(backend: Arc<dyn Backend>, catalog: Arc<Catalog>, tenant: u64) -> Self {
+        let identity = crate::session::register();
+        if let Ok(mut activity) = identity.activity.lock() {
+            activity.client.backend_type = BACKEND_TYPE;
+        }
         ReDriver {
             backend,
             catalog,
             tenant,
             seen: BTreeMap::new(),
             pass: 0,
+            identity,
         }
     }
 
@@ -288,8 +317,11 @@ impl ReDriver {
             self.tenant,
             // A re-drive is a session like any other: it runs statements, so it is something
             // `pg_stat_activity` should be able to show and something a cancel could name. A real
-            // server lists its background workers there too.
-            crate::session::register(),
+            // server lists its background workers there too — **as one row each**, which is why
+            // this clones the re-driver's own identity rather than registering a new one. It
+            // registered here, once per executor and twice per pass, and nothing ever took those
+            // rows out (`debts-v1.1.md` #48).
+            self.identity.clone(),
         )
     }
 
@@ -343,6 +375,13 @@ impl ReDriver {
 const MAX_BATCHES_PER_PASS: usize = 64;
 
 /// How long a node with no interval waits before asking for one again.
+/// What `pg_stat_activity.backend_type` calls this node's one background session.
+///
+/// PostgreSQL names each of its own — `checkpointer`, `walwriter`, `autovacuum launcher` — rather
+/// than calling them all `client backend`, and an operator reads the column to tell a worker from
+/// a client. This node has one worker and this is its name.
+const BACKEND_TYPE: &str = "schema re-driver";
+
 const IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many passes a job must sit unchanged before this one may step it.

@@ -1993,7 +1993,12 @@ fn stat_activity_row(
         // The statement this session is running, which is what `WHERE query LIKE …` needs. NULL
         // while it runs nothing, as a real server sends for a session with no current query.
         activity.query.clone().map_or(Datum::Null, Datum::Text),
-        Datum::Text("client backend".to_owned()),
+        // **What kind of backend this is, and not always a client's.** Measured on 19beta1: an
+        // idle server shows seven background rows beside the one client, each named for what it
+        // does. This node has one background session — the schema re-driver — and it said
+        // `client backend` beside a NULL address, which is a row an operator would chase a client
+        // for (`debts-v1.1.md` #48).
+        Datum::Text(client.backend_type.to_owned()),
     ]
 }
 

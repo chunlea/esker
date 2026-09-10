@@ -548,6 +548,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 address: self.peer.map(|peer| peer.ip().to_string()),
                 port: self.peer.map(|peer| i32::from(peer.port())),
                 started: Some(wall_clock_micros()),
+                // Everything that arrives here arrived over a socket.
+                backend_type: crate::session::CLIENT_BACKEND,
             };
         }
         let database = self.database.clone();

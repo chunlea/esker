@@ -71,12 +71,16 @@ pub struct Activity {
     pub client: Client,
 }
 
+/// What `backend_type` says for a session nobody has named: every session that arrived over a
+/// socket.
+pub const CLIENT_BACKEND: &str = "client backend";
+
 /// The half of an [`Activity`] that is fixed when the connection opens.
 ///
 /// Separate because it is written once, at `open_session`, and never again — where the three
 /// fields above change with every statement. A session that never got that far has the default,
 /// which prints as the NULLs the view showed before any of this existed.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Client {
     /// The role the startup packet asked to connect as.
     pub user: String,
@@ -89,6 +93,16 @@ pub struct Client {
     pub address: Option<String>,
     /// The peer's port, beside the address and NULL in the same cases.
     pub port: Option<i32>,
+    /// What kind of backend this is, as `pg_stat_activity.backend_type` reports it.
+    ///
+    /// **`client backend` unless something says otherwise**, which is what every session that
+    /// arrived over a socket is. Measured on 19beta1, 2026-09-10: an idle server has eight rows
+    /// and seven of them are background — `autovacuum launcher`, `background writer`,
+    /// `checkpointer`, `io worker` twice, `logical replication launcher`, `walwriter` — each named
+    /// for what it does, each with a NULL `client_addr` and a set `backend_start`, and **each one
+    /// row for the life of the process**. An operator reading `client backend` beside a NULL
+    /// address would go looking for a client that was never there (`debts-v1.1.md` #48).
+    pub backend_type: &'static str,
     /// When the session opened, in microseconds since the PostgreSQL epoch.
     ///
     /// **The wall clock, and one of the two readings of it in this crate** — the other is the
@@ -103,6 +117,22 @@ pub struct Client {
     /// version reads it. `tests/session_identity.rs` measures how far it is from the node's own
     /// clock, because on a `MemoryBackend` the two are days apart and a reader has to know that.
     pub started: Option<i64>,
+}
+
+impl Default for Client {
+    /// **A session nobody has named is a client's**, which is what all but one of them are and is
+    /// why this is written out rather than derived: a derived `&'static str` is `""`, and an empty
+    /// `backend_type` is a column PostgreSQL never leaves empty.
+    fn default() -> Self {
+        Client {
+            user: String::new(),
+            application_name: String::new(),
+            address: None,
+            port: None,
+            backend_type: CLIENT_BACKEND,
+            started: None,
+        }
+    }
 }
 
 /// One row of `pg_prepared_statements`: a statement this session has named.
