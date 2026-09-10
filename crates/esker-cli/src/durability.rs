@@ -159,23 +159,65 @@ impl Ack {
 
 /// Runs the write load, appending one line per acknowledged commit.
 pub(crate) fn record(options: &DurabilityOptions) -> Result<String, String> {
-    let (transport, resolver) = crate::bench_route::routed(&options.pd)?;
-    let oracle = oracle(&options.pd)?;
-    let client = Arc::new(TxnClient::new(transport, resolver, oracle));
+    // **A client per writer, each with its own connection to the driver.**
+    //
+    // One shared oracle is one socket behind one mutex, and every transaction takes two timestamps
+    // — so four writers sharing it serialise on it. Measured on this harness: 236 acknowledged
+    // writes a second with a connection each, 36 with one between them. A load generator that
+    // bottlenecks on its own plumbing measures the plumbing.
+    //
+    // Worth saying where this does *not* apply: a SQL node has one `PdConn` for the whole process
+    // by design, and now takes its timestamps through it. Whether that is a serialisation point
+    // under many sessions is a real question and it is the node's, not this tool's — it wants its
+    // own measurement rather than a change made here on a hunch.
+    let mut clients = Vec::new();
+    for _ in 0..options.clients.max(1) {
+        let (transport, resolver) = crate::bench_route::routed(&options.pd)?;
+        clients.push(Arc::new(TxnClient::new(
+            transport,
+            resolver,
+            oracle(&options.pd)?,
+        )));
+    }
 
-    let file = std::fs::File::create(&options.file)
+    let mut file = std::fs::File::create(&options.file)
         .map_err(|error| format!("creating {}: {error}", options.file))?;
-    let out = Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(file)));
+    // **One writer, and the line number assigned where the line is written.**
+    //
+    // Run 118 found a hole at line 15 of 3,550, nowhere near a kill: four clients took line numbers
+    // from an atomic counter and then appended under a mutex, so the *order* they were numbered in
+    // and the order they were written in were two different orders. A lock stops the bytes
+    // interleaving; it does not make the numbering match. And a gap is not a cosmetic fault — the
+    // checker reads one as "records were lost, so this run does not count", which is what turned a
+    // whole real-topology run into no verdict at all.
+    //
+    // So the number is not taken until the line is about to be written, by the one thread that
+    // writes: numbering and order become the same event rather than two that agree by luck.
+    let (sender, records) = std::sync::mpsc::channel::<Ack>();
     let lines = Arc::new(AtomicU64::new(0));
+    let written = Arc::clone(&lines);
+    let scribe = std::thread::spawn(move || -> Result<(), String> {
+        let mut line = 0u64;
+        for mut ack in records {
+            line += 1;
+            ack.line = line;
+            file.write_all(ack.render().as_bytes())
+                .map_err(|error| format!("writing the record: {error}"))?;
+            // Per line, because a record left in a buffer when the load is killed is a write the
+            // cluster kept and the checker would call lost.
+            file.flush()
+                .map_err(|error| format!("flushing the record: {error}"))?;
+            written.store(line, Ordering::SeqCst);
+        }
+        Ok(())
+    });
     let refused = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
 
     let began = Instant::now();
     let mut writers = Vec::new();
-    for id in 0..options.clients {
-        let client = Arc::clone(&client);
-        let out = Arc::clone(&out);
-        let lines = Arc::clone(&lines);
+    for (id, client) in clients.into_iter().enumerate() {
+        let sender = sender.clone();
         let refused = Arc::clone(&refused);
         let stop = Arc::clone(&stop);
         let keyspace = options.keyspace.clone();
@@ -196,23 +238,15 @@ pub(crate) fn record(options: &DurabilityOptions) -> Result<String, String> {
                     // cluster never promised — neither is this invariant's business, and counting
                     // one would make the checker chase a write that was correctly refused.
                     Ok(Some(commit_ts)) => {
-                        let line = lines.fetch_add(1, Ordering::SeqCst) + 1;
-                        let ack = Ack {
-                            line,
+                        // **No line number here.** The scribe assigns it as it writes; see there.
+                        let _ = sender.send(Ack {
+                            line: 0,
                             key,
                             value,
                             commit_ts,
                             at_micros: u64::try_from(began.elapsed().as_micros())
                                 .unwrap_or(u64::MAX),
-                        };
-                        // **Flushed per line, under the lock.** A record left in a buffer when the
-                        // load is killed is a write the cluster kept and the checker will call
-                        // lost — a false red, and a false red on this invariant is worse than no
-                        // test at all.
-                        if let Ok(mut out) = out.lock() {
-                            let _ = out.write_all(ack.render().as_bytes());
-                            let _ = out.flush();
-                        }
+                        });
                     }
                     Ok(None) => {}
                     Err(_) => {
@@ -228,9 +262,12 @@ pub(crate) fn record(options: &DurabilityOptions) -> Result<String, String> {
     for writer in writers {
         let _ = writer.join();
     }
-    if let Ok(mut out) = out.lock() {
-        let _ = out.flush();
-    }
+    // Every writer is finished, so dropping this closes the channel and the scribe ends after the
+    // last record — rather than at a deadline, which would drop the tail.
+    drop(sender);
+    scribe
+        .join()
+        .map_err(|_| "the record writer panicked".to_owned())??;
     Ok(format!(
         "recorded {} acknowledged writes to {} in {:?}; {} attempts were refused",
         lines.load(Ordering::SeqCst),
@@ -302,11 +339,33 @@ pub(crate) fn verify(options: &DurabilityOptions) -> Result<String, String> {
     ))
 }
 
-/// Kills a store every `--every`, at random, and brings nothing back — the supervisor does that.
+/// Kills a store every `--every`, at random, **and only while the cluster is healthy**.
 ///
-/// **The pids are given, never discovered.** A lane that killed by name pattern once took four
-/// other lanes down with it; the only processes this may signal are ones its caller named on the
-/// command line, and the caller is whoever started them.
+/// # The guard run 118 found missing
+///
+/// The first version counted `--pids` **at parse time** and called that a quorum check. It is not:
+/// it asks how many stores were *named*, not how many are *alive*. Against four stores it fired at
+/// 7, 14, 28 and 42 s, took the cluster below its quorum of three on the second, and spent the
+/// remaining fourteen shots on corpses — while the recorder, correctly, could no longer commit
+/// anything. A whole real-topology run produced no verdict.
+///
+/// So the guard is dynamic and it asks the only authority that matters: **can the cluster still
+/// acknowledge a write?** A probe commit before every kill, and none is fired unless the last one
+/// succeeded. That needs nothing but `--pd`, which this already has.
+///
+/// **Liveness is not pid liveness**, and that is why the probe is a write. A store that is
+/// restarted comes back with a *different* pid, so `kill -0` on the pid this was given answers "no"
+/// for ever after the first kill and would stop the run for the wrong reason. What the invariant
+/// cares about is whether the cluster serves, and a commit is that question asked directly.
+///
+/// # What this does not do, and why
+///
+/// It does not restart what it kills. A chaos arm that started stores would have to know the whole
+/// launch configuration — data directory, ports, seed, store ids — which is `cluster start`'s
+/// knowledge, and two things that both believe they know what a store is will one day disagree.
+/// **The recipe supplies the supervisor**; this arm supplies the signal and refuses to fire when
+/// firing would take the quorum. If nothing brings stores back, the run stops early and says so,
+/// which is a true statement about the cluster rather than fourteen shots at nothing.
 pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
     if options.pids.len() < 3 {
         return Err(format!(
@@ -315,8 +374,9 @@ pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
             options.pids.len()
         ));
     }
-    // A seeded generator rather than the system's: a chaos run that cannot be replayed is a bug
-    // report nobody can act on (`esker-base`'s PCG32, which is this project's own).
+    let (transport, resolver) = crate::bench_route::routed(&options.pd)?;
+    let client = TxnClient::new(transport, resolver, oracle(&options.pd)?);
+
     let seed = u64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -327,6 +387,7 @@ pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
     let began = Instant::now();
     let mut log = vec![format!("seed {seed}")];
     let mut killed = 0u64;
+    let mut refused = 0u64;
     // **Its own deadline.** The arm ends whether or not anything answers: 134 orphaned busy loops
     // once drove this host to a load of 237 and only the lane that started them could stop them.
     while began.elapsed() < options.run_for {
@@ -338,13 +399,22 @@ pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
         if began.elapsed() >= options.run_for {
             break;
         }
-        let at = usize::try_from(rng.next_u32()).unwrap_or(0) % options.pids.len();
-        let pid = options.pids[at];
+        let at = began.elapsed().as_millis();
+        // **Healthy first.** A cluster that cannot commit has already lost a store nobody brought
+        // back, and another kill would only make the log longer.
+        if let Err(reason) = probe(&client, &options.keyspace, killed) {
+            refused += 1;
+            log.push(format!(
+                "{at:>8} ms  no kill: the cluster could not acknowledge a write ({reason}). \
+                 Nothing is restarting stores — the recipe needs a supervisor."
+            ));
+            continue;
+        }
+        let pid = options.pids[usize::try_from(rng.next_u32()).unwrap_or(0) % options.pids.len()];
         let outcome = kill9(pid);
         killed += u64::from(outcome.is_ok());
         log.push(format!(
-            "{:>8} ms  SIGKILL pid {pid}  {}",
-            began.elapsed().as_millis(),
+            "{at:>8} ms  SIGKILL pid {pid}  {}",
             match &outcome {
                 Ok(()) => "sent".to_owned(),
                 Err(reason) => format!("refused: {reason}"),
@@ -352,14 +422,25 @@ pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
         ));
     }
     Ok(format!(
-        "{killed} of {} attempts killed a store in {:?}\n{}",
-        log.len(),
+        "{killed} kills, {refused} withheld because the cluster was not serving, in {:?}\n{}",
         began.elapsed(),
         log.join("\n"),
     ))
 }
 
-/// Sends `SIGKILL` to one pid.
+/// Commits one key, to ask whether the cluster is still serving.
+///
+/// A write and not a read: a read can be answered by a replica that has not noticed the loss yet,
+/// and what the next kill must not do is take the quorum a *write* needs.
+fn probe(client: &TxnClient, keyspace: &str, round: u64) -> Result<(), String> {
+    let mut txn = client
+        .begin()
+        .map_err(|error| format!("no snapshot: {error}"))?;
+    txn.put(format!("{keyspace}/probe/{round:08}").as_bytes(), b"probe");
+    txn.commit().map_err(|error| format!("{error}")).map(|_| ())
+}
+
+/// Sends `SIGKILL` to one pid./// Sends `SIGKILL` to one pid.
 ///
 /// `kill(2)` through `libc` is not available — this workspace compiles no C — so this spends a
 /// process on `/bin/kill`, which is what a shell would do and costs nothing at this cadence.

@@ -214,3 +214,81 @@ fn the_checker_says_yes_to_what_was_written_and_no_to_what_was_not() {
         "no replayable failure list was written"
     );
 }
+
+/// **Four clients, ten thousand acknowledged writes, no gap in the record.**
+///
+/// The negative control for run 118's second finding. The recorder appended from four threads,
+/// numbering each line from an atomic counter and writing under a mutex — so the order lines were
+/// *numbered* in and the order they were *written* in were two different orders, and the file had a
+/// hole at line 15 of 3,550, nowhere near any kill. `verify` reads a hole as "records were lost, so
+/// this run does not count", which is how a whole real-topology run produced no verdict.
+///
+/// A gap is invisible to any assertion about *content*: every line present is correct, and the file
+/// looks fine unless something counts. So this counts — and it counts under the concurrency that
+/// produced the fault, because one client could never have shown it.
+#[test]
+#[ignore = "starts three store processes and writes ten thousand rows; run with --run-ignored all"]
+fn four_clients_leave_no_hole_in_the_record() {
+    /// Enough chances for the fault to show. The field gap was at **line 15 of 3,550**, so the
+    /// mechanism does not need volume to appear — it needs concurrent writers, which is what the
+    /// four clients are. `--for 80s` records upwards of ten thousand on an idle host; this floor is
+    /// what remains true when something else is using the machine, and the count is printed so a
+    /// thin run is visible rather than quietly weak.
+    ///
+    /// A higher bar made this test fail when nextest ran it beside its neighbour — a pass that
+    /// depends on what else is running is not a pass.
+    const FLOOR: usize = 2_000;
+
+    let cluster = start();
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("many.log");
+    let log_path = log.to_str().unwrap();
+
+    // Long enough for four clients to reach `WANTED` on this harness, which acknowledges a couple
+    // of hundred a second — measured, not guessed, and with room for a loaded host. The assertion
+    // is on the count actually recorded, so a slow run says so rather than passing on a thin
+    // sample.
+    let (ok, said) = esker(&[
+        "durability",
+        "record",
+        "--pd",
+        &cluster.pd,
+        "--out",
+        log_path,
+        "--clients",
+        "4",
+        "--for",
+        "80s",
+        "--keyspace",
+        "gapless",
+    ]);
+    assert!(ok, "the recorder failed: {said}");
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    let numbers: Vec<u64> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.split('\t')
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("a record has no line number: {line}"))
+        })
+        .collect();
+    println!(
+        "  recorded {} acknowledged writes from four clients",
+        numbers.len()
+    );
+    assert!(
+        numbers.len() >= FLOOR,
+        "only {} writes were acknowledged, which is too few for the absence of a gap to mean \
+         anything",
+        numbers.len()
+    );
+    let expected: Vec<u64> = (1..=numbers.len() as u64).collect();
+    assert_eq!(
+        numbers, expected,
+        "the record's line numbers are not 1..n, so records were lost — which `verify` reads as a \
+         broken recorder and refuses to give a verdict on"
+    );
+}

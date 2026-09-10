@@ -60,6 +60,10 @@ pub struct StandInPd {
     /// How long a lease this driver hands out. Per driver, because the two things a test can want
     /// from a lease are opposite: one watches it lapse, the others must not.
     lease_ms: u64,
+    /// **The next timestamp**, and the whole reason one driver serves several nodes: this counter
+    /// is what makes two nodes' transactions orderable against each other (`CLAUDE.md`
+    /// invariant 6).
+    next_ts: std::sync::atomic::AtomicU64,
 }
 
 impl Default for StandInPd {
@@ -67,6 +71,9 @@ impl Default for StandInPd {
         StandInPd {
             reports: Mutex::new(Vec::new()),
             lease_ms: LEASE_MS,
+            // Above zero, because a timestamp is never zero (`docs/txn-spec.md` §5.5) and a test
+            // that started at it would be exercising a value the protocol excludes.
+            next_ts: std::sync::atomic::AtomicU64::new(1),
         }
     }
 }
@@ -107,8 +114,17 @@ impl Service for StandInPd {
                         .push(wishes);
                     PdResp::ReportColumnar
                 }
-                // A SQL node has exactly two methods, and sending a third would mean this node
-                // had grown a vocabulary that belongs to a store.
+                // **The third method, added 2026-09-10.** A SQL node used to have exactly two,
+                // and a node that asked for a timestamp was asking for something it had no
+                // business asking — because it kept its own counter, which is the defect
+                // `tests/two_nodes_one_clock.rs` pins. It now asks the driver, so `Tso` belongs
+                // here; anything beyond these three is still a vocabulary that belongs to a store.
+                PdReq::Tso { count } => PdResp::Tso {
+                    start_ts: self
+                        .next_ts
+                        .fetch_add(u64::from(count.max(1)), std::sync::atomic::Ordering::SeqCst),
+                    count: count.max(1),
+                },
                 other => {
                     return Err(ProtoError::invalid(format!(
                         "a SQL node sent {}, which is not one of its two methods",
