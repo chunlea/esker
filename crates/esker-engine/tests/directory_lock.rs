@@ -8,8 +8,11 @@
 //! given different ports, nothing decides between them at all and both write WAL segments and
 //! manifests into one directory.
 //!
-//! The refusal is an error value and never a panic (invariant 9), and never a wait: a node that
-//! blocked on a held directory would be a node an operator reads as hung.
+//! The refusal is an error value and never a panic (invariant 9), and it is **bounded rather than
+//! immediate**: an open waits a few seconds for a directory somebody is still letting go of, since
+//! a claim held by a live writer is held for ever and one held by a shutdown is held for a moment.
+//! Waiting therefore separates the two without ever admitting a second live writer, and the tests
+//! below hold their databases open for the whole of the refusal they assert.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -112,6 +115,43 @@ fn the_in_memory_filesystem_hands_a_directory_to_anybody() {
     let _first = fs.lock_directory(std::path::Path::new("/db")).unwrap();
     fs.lock_directory(std::path::Path::new("/db"))
         .expect("an in-memory filesystem models a disk and not a machine");
+}
+
+/// **An open waits for a directory that is being let go of, rather than refusing it.**
+///
+/// This is the property the bound exists for, and it is the one that cannot be tested by racing:
+/// the release happens on a schedule this test sets. Half a second is longer than any shutdown
+/// takes and well inside the five the open will wait.
+///
+/// Without the wait this fails on its first attempt — which is what a gate saw on 2026-09-10,
+/// from a `stop(); drop; open` whose `drop` had not finished by the time the open asked.
+#[test]
+fn an_open_waits_for_a_directory_that_is_being_released() {
+    let dir = TempDir::new().unwrap();
+    let held = Db::open(dir.path(), options()).unwrap();
+
+    let releasing = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(held);
+    });
+
+    let started = std::time::Instant::now();
+    let second = Db::open(dir.path(), options())
+        .expect("an open must wait for a directory that is on its way to being free");
+    let waited = started.elapsed();
+    releasing.join().expect("the releasing thread");
+
+    assert!(
+        waited >= std::time::Duration::from_millis(400),
+        "the open returned in {waited:?}, so it did not wait for the release — it must have \
+         raced it, and this test would then pass for the wrong reason on a fast machine"
+    );
+    assert_eq!(
+        second
+            .get(cf::DEFAULT, b"k", &ReadOptions::default())
+            .unwrap(),
+        None
+    );
 }
 
 /// A different directory is a different claim — the obvious half, and the one that would make

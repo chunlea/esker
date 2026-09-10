@@ -218,6 +218,15 @@ pub trait WritableFile: Send {
 /// the open file description, so a `kill -9` releases it with every other descriptor the process
 /// had. That is what makes this safe in a system whose acceptance run is fifty `SIGKILL`s: a
 /// claim that outlived its holder would turn one crash into a node that can never start again.
+///
+/// **Within one process it is only released when the last holder lets go**, which is a different
+/// and sharper rule. A `kill -9` and the restart that follows it are two processes, so the kernel
+/// has already released the claim before the new one asks — `esker cluster start`'s supervisor
+/// spawns children and never opens a store itself, so respawning is unaffected. What *is* affected
+/// is any caller that closes a database and immediately reopens the same directory in the same
+/// process: it gets `InUse` unless everything holding the engine has actually let go first, and
+/// "I called `stop()`" is not the same claim — `esker-store`'s `Store::wait_for_tasks` exists
+/// because an aborted `tokio` task holds what it held until the runtime drops it.
 pub trait DirectoryLock: Send + Sync + fmt::Debug {}
 
 /// A file read by position, concurrently, without a shared cursor.
