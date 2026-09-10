@@ -1,0 +1,21 @@
+docs/adr/0106-what-a-statement-reads-below-the-sql.md
+  s_e5c0c6e78b5662::t_301b4c8803ceae 22,25-31,102,104-109,252,256-261,266-272,300-399
+docs/plans/debt-49-catalog-cache.md
+  s_e5c0c6e78b5662::t_34463abb40f1fb 3-6,16-17,171-199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5a00e22c396369aee31a407183d45dd0b674d32c",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
