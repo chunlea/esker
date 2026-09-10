@@ -5474,6 +5474,37 @@ fn sequence_reference(text: &str) -> String {
     text.to_owned()
 }
 
+/// **An element that is itself an array stacks; it does not nest.**
+///
+/// `ARRAY['{1,2}'::int[]]` is an `int[]` with another dimension. The constant fold built an
+/// `ArrayValue` whose `element` was `int[]` and whose values were arrays — a shape `ArrayValue`
+/// does not have, and everything downstream read `text[]`. The runtime constructor learned this in
+/// `exec::cursor`; this is the same rule reached through the other door, and
+/// `ArrayValue::stacked` is the one place it lives. The *literal* half of r1's 196-row wire census
+/// is exactly this door.
+///
+/// `None` when the elements are not arrays, which is the ordinary constructor below.
+fn stack_folded_arrays(
+    element: ColumnType,
+    values: &[Option<Datum>],
+) -> Result<Option<plan::Expr>> {
+    let Some(fallback) = esker_keys::array::ArrayValue::element_of(element) else {
+        return Ok(None);
+    };
+    let parts: Vec<Option<&esker_keys::array::ArrayValue>> = values
+        .iter()
+        .map(|value| match value {
+            Some(Datum::Array(array)) => Some(array),
+            _ => None,
+        })
+        .collect();
+    let stacked = esker_keys::array::ArrayValue::stacked(&parts, fallback)
+        .ok_or(SqlError::ArrayExpressionDimensions)?;
+    Ok(Some(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+        Datum::Array(stacked),
+    )))))
+}
+
 /// `ARRAY[…]` as a **value**, folded where every element is a constant.
 ///
 /// The constructor builds an array from expressions where a literal builds one from text, and the
@@ -5516,7 +5547,12 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             // (`debts-v1.1.md` #35) `ARRAY['t'::regclass]` started folding here and answering
             // `0A000 a relation name read as a regclass without a catalog`. One face fixed, the
             // next promoted; the runtime constructor below is where it belongs.
-            if cast_to == ColumnType::RegClass
+            // **And `regclass[]` for the same reason as `regclass`**: a name per element is a
+            // catalog lookup either way, and `Datum::from_text` has none. The element-level
+            // spelling `ARRAY['t'::regclass]` was already here; the array spelling
+            // `ARRAY['{t}'::regclass[]]` reaches the same fold with the array as its element type
+            // and answered `0A000` — one door of the pair had the guard.
+            if matches!(cast_to, ColumnType::RegClass | ColumnType::RegClassArray)
                 || (cast_to == ColumnType::RegType && value::named_type(text)?.is_none())
             {
                 return Ok(plan::Expr::Array {
@@ -5606,6 +5642,9 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             None => None,
             Some(text) => Some(Datum::from_text(element, &text)?),
         });
+    }
+    if let Some(stacked) = stack_folded_arrays(element, &values)? {
+        return Ok(stacked);
     }
     Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
         Datum::Array(esker_keys::array::ArrayValue::one_dimensional(

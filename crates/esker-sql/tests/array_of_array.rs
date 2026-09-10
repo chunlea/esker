@@ -133,7 +133,6 @@ fn the_element_type_survives_every_array_shape() {
 /// Delete the `#[ignore]` when that fold is fixed; the expectations are already measured, in
 /// `tests/captures/pg19_array_of_array.txt`.
 #[test]
-#[ignore = "the literal-operand half: a fold to text beats the type rule, and it is its own unit"]
 fn the_element_type_survives_a_literal_operand_too() {
     let mut node = parity::Node::new(&["CREATE TABLE rc (id int8)"]);
     for (statement, oid) in [
