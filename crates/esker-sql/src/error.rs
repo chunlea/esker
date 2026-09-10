@@ -913,6 +913,27 @@ pub enum SqlError {
     #[error("open path cannot be converted to polygon")]
     OpenPathIsNotAPolygon,
 
+    /// `'{"a":1}'::jsonb::numeric`: a `jsonb` whose **shape** is not the target's.
+    ///
+    /// **The shape is refused before the value is read**, which is the whole of this variant:
+    /// PostgreSQL checks what kind of JSON it has and only then hands the digits to a number's
+    /// input function, so an object is `22023 cannot cast jsonb object to type numeric` where this
+    /// node routed the whole document through the target's input function and answered
+    /// `22P02 invalid input syntax`. A refusal either way — but a client that branches on
+    /// `SQLSTATE` sees a different answer (`debts-v1.1.md` #44, group 5).
+    ///
+    /// **The kind is PostgreSQL's word for it and `number` is not one of them**: measured on
+    /// 19beta1, 2026-09-10, `'1'::jsonb::bool` is `cannot cast jsonb **numeric** to type boolean`.
+    /// The five that can appear are `object`, `array`, `string`, `numeric` and `boolean`; a JSON
+    /// `null` is not refused at all, it casts to SQL NULL.
+    #[error("cannot cast jsonb {kind} to type {to}")]
+    CannotCastJsonbShape {
+        /// PostgreSQL's word for the JSON kind: `object`, `array`, `string`, `numeric`, `boolean`.
+        kind: &'static str,
+        /// The target type, by its own name.
+        to: &'static str,
+    },
+
     /// `'<(0,0),0>'::circle::polygon`: the twelve vertices are the radius turned twelve ways, and
     /// a radius of zero names twelve copies of the centre. **`0A000`**, which is the surprise —
     /// a real server calls this a feature it does not have where the refusal beside it, one line
@@ -3332,6 +3353,9 @@ impl SqlError {
             // open path's text read fine and it is the shape the conversion cannot take. Measured
             // beside its neighbour, which is a `0A000`.
             | SqlError::OpenPathIsNotAPolygon
+            // **And a `jsonb` whose shape is not the target's**, for the same reason one line up:
+            // the document read fine and it is its kind that has no conversion. Measured.
+            | SqlError::CannotCastJsonbShape { .. }
             | SqlError::TypeLengthTooSmall(_)
             | SqlError::TypeLengthTooLarge(..)
             | SqlError::FloatPrecisionTooSmall

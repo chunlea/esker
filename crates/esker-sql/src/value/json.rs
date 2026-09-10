@@ -20,6 +20,7 @@
 use std::fmt::Write as _;
 
 use crate::error::{Result, SqlError};
+use crate::value::{ColumnType, Datum, PgDatum as _, PgType as _};
 
 /// One JSON value, parsed. The shape a canonical form is written from.
 ///
@@ -635,6 +636,84 @@ fn numeric_text(digits: &str) -> Option<String> {
         }
     }
     Some(text)
+}
+
+/// The targets a `jsonb` has a cast to, out of `pg_cast`.
+///
+/// Seven, and `text` is deliberately not one of them: `jsonb::text` is the document's own text and
+/// is `ToText`'s business, not a scalar extraction.
+pub(crate) fn casts_to_scalar(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Bool
+            | ColumnType::Int2
+            | ColumnType::Int4
+            | ColumnType::Int8
+            | ColumnType::Real
+            | ColumnType::Double
+            | ColumnType::Numeric
+    )
+}
+
+/// A `jsonb` cast to one of [`casts_to_scalar`]'s targets — **the kind is checked before the value
+/// is read**.
+///
+/// That order is the whole of it. PostgreSQL asks what kind of JSON it has and only then hands the
+/// digits to a number's input function, so `'{"a":1}'::jsonb::numeric` is
+/// `22023 cannot cast jsonb object to type numeric`. This node used to hand the *document* to the
+/// target's input function and answer `22P02 invalid input syntax` — a refusal either way, and a
+/// different one to a client that branches on `SQLSTATE` (`debts-v1.1.md` #44, group 5).
+///
+/// Measured on 19beta1, 2026-09-10, one statement per kind:
+///
+/// ```text
+/// '1'::jsonb::int4        1          '1.5'::jsonb::int4    2      — rounds, as numeric does
+/// 'true'::jsonb::bool     t          'true'::jsonb::int4   cannot cast jsonb boolean to type integer
+/// 'null'::jsonb::int4     NULL       '"x"'::jsonb::int4    cannot cast jsonb string to type integer
+/// '[1]'::jsonb::int4      cannot cast jsonb array to type integer
+/// '1'::jsonb::bool        cannot cast jsonb numeric to type boolean
+/// '99999999999'::jsonb::int2   smallint out of range      — the ordinary 22003, not this one
+/// ```
+///
+/// **Three of those a reader would get wrong.** A JSON `null` is not refused at all — it is SQL
+/// NULL. A number's kind word is **`numeric`**, not `number`. And a value that is the right kind
+/// and the wrong size is the number's own `22003`, because by then the shape check has passed and
+/// this function is out of the way.
+pub(crate) fn cast_to_scalar(text: &str, to: ColumnType) -> Result<Datum> {
+    match parse(text, Nulls::Refuse)? {
+        // The one kind with no refusal: a JSON null is an SQL NULL, whatever the target.
+        Json::Null => Ok(Datum::Null),
+        Json::Bool(flag) if to == ColumnType::Bool => Ok(Datum::Bool(flag)),
+        // A number reaches the target's own conversion, which is where its range error belongs.
+        Json::Number(digits) if to != ColumnType::Bool => {
+            let number = super::numeric::from_text(&digits)?;
+            match to {
+                ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 => {
+                    super::numeric_to_integer(number, to)
+                }
+                _ => Datum::from_text(to, &digits),
+            }
+        }
+        other => Err(SqlError::CannotCastJsonbShape {
+            kind: kind_name(&other),
+            to: to.name(),
+        }),
+    }
+}
+
+/// PostgreSQL's word for a JSON kind, as its refusals write it.
+///
+/// **`numeric` and not `number`**, which is the one a reader guesses wrong: measured,
+/// `'1'::jsonb::bool` is `cannot cast jsonb numeric to type boolean`.
+fn kind_name(value: &Json) -> &'static str {
+    match value {
+        Json::Null => "null",
+        Json::Bool(_) => "boolean",
+        Json::Number(_) => "numeric",
+        Json::Str(_) => "string",
+        Json::Array(_) => "array",
+        Json::Object(_) => "object",
+    }
 }
 
 #[cfg(test)]

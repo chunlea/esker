@@ -2458,6 +2458,21 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             {
                 crate::value::geometric_cast(&value, *to)?
             }
+            // **A `jsonb`'s *kind* is checked before its value is read**, which is the order the
+            // refusal comes out of: `'{"a":1}'::jsonb::numeric` is
+            // `22023 cannot cast jsonb object to type numeric` on a real server and was
+            // `22P02 invalid input syntax` here, because this arm handed the whole document to
+            // the target's input function (`debts-v1.1.md` #44, group 5).
+            //
+            // **Only the plan knows it is a `jsonb`**, for the reason the `"char"` arm below
+            // gives at length: a `jsonb` is a `Datum::Text` here, so the value cannot say which
+            // cast this is and the operand's declared type can. Same seam, second type.
+            Datum::Text(ref text)
+                if crate::value::json::casts_to_scalar(*to)
+                    && declared_type_of(operand) == Some(ColumnType::Jsonb) =>
+            {
+                crate::value::json::cast_to_scalar(text, *to)?
+            }
             // **A `"char"` to an `int4` is the byte, and only the *plan* knows it is a `"char"`.**
             // A `"char"` and a `text` are the same `Datum::Text` here, and `text -> int4` really is
             // the I/O conversion it looks like — `'42'::text::int4` is 42 — so the value alone

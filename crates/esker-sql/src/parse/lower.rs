@@ -6454,6 +6454,20 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 typmod: NO_TYPMOD,
             });
         }
+        // **A `jsonb`'s kind is checked before its value is read, here too.** The evaluator's
+        // `Expr::Cast` arm has this rule for a cast over a *column*; a cast over a **literal**
+        // never reaches it, and `'{"a":1}'::jsonb::numeric` written out in full is exactly the
+        // spelling a person tries first. One function, both readers
+        // (`crate::value::json::cast_to_scalar`, `debts-v1.1.md` #44).
+        if source_type(expr)? == Some(ColumnType::Jsonb)
+            && let Ok((to, NO_TYPMOD)) = lower_type(data_type)
+            && value::json::casts_to_scalar(to)
+            && let Some(text) = cast_literal_text(expr)?
+        {
+            return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                value::json::cast_to_scalar(&text, to)?,
+            ))));
+        }
         // **`money::numeric` is the cents as a decimal, not the printed money read back.** The
         // output function writes `$567.89` and `numeric`'s input function refuses it, so the
         // ordinary text path made a conversion a real server performs into a `22P02` about the

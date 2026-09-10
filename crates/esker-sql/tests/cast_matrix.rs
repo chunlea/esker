@@ -66,37 +66,17 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ),
         (
             "SELECT (c_bytea)::uuid FROM castprobe",
-            "**#43 group 5 -- both refuse, with different sentences.** A `jsonb` object cast to a number is `cannot cast jsonb object to type numeric` there and `22P02 invalid input syntax` here, because this node routes the cast through the target's input function rather than refusing the *shape* first; `text -> regclass` differs only in the SQLSTATE this node attaches to the same sentence. Refusals, so no value is wrong -- but a client that branches on SQLSTATE sees a different answer.",
+            "**#44 group 5 -- both refuse, with different sentences.** It opened as ten and is **three**. The seven that went were the `jsonb` family, and they were the group's own example: a `jsonb` object cast to a number was `22P02 invalid input syntax` here because the whole document went to the target's input function, where PostgreSQL asks the *kind* first and answers `22023 cannot cast jsonb object to type numeric`. Paid 2026-09-10 by `value::json::cast_to_scalar`, which both the evaluator's cast and the literal fold ask -- the literal spelling had a declared divergence of its own in `pg19_json.txt` and went with it. What is left is **two mechanisms and neither is an ordering**: `bytea -> uuid` differs in the sentence a length check writes (`invalid input length for type uuid`, with a DETAIL naming the bytes), and `text -> regclass` and `varchar -> regclass` differ only in the SQLSTATE this node attaches to the identical sentence. Refusals, so no value is wrong -- but a client that branches on SQLSTATE sees a different answer.",
             "pg19_cast_matrix.txt:50",
         ),
         (
-            "SELECT (c_jsonb)::bool FROM castprobe",
-            "**#43 group 5 -- both refuse, with different sentences.** A `jsonb` object cast to a number is `cannot cast jsonb object to type numeric` there and `22P02 invalid input syntax` here, because this node routes the cast through the target's input function rather than refusing the *shape* first; `text -> regclass` differs only in the SQLSTATE this node attaches to the same sentence. Refusals, so no value is wrong -- but a client that branches on SQLSTATE sees a different answer.",
-            "pg19_cast_matrix.txt:122",
-        ),
-        (
-            "SELECT (c_jsonb)::float4 FROM castprobe",
-            "**#43 group 5 -- both refuse, with different sentences.** A `jsonb` object cast to a number is `cannot cast jsonb object to type numeric` there and `22P02 invalid input syntax` here, because this node routes the cast through the target's input function rather than refusing the *shape* first; `text -> regclass` differs only in the SQLSTATE this node attaches to the same sentence. Refusals, so no value is wrong -- but a client that branches on SQLSTATE sees a different answer.",
-            "pg19_cast_matrix.txt:125",
-        ),
-        (
-            "SELECT (c_jsonb)::float8 FROM castprobe",
-            "**#43 group 5 -- both refuse, with different sentences.** A `jsonb` object cast to a number is `cannot cast jsonb object to type numeric` there and `22P02 invalid input syntax` here, because this node routes the cast through the target's input function rather than refusing the *shape* first; `text -> regclass` differs only in the SQLSTATE this node attaches to the same sentence. Refusals, so no value is wrong -- but a client that branches on SQLSTATE sees a different answer.",
-            "pg19_cast_matrix.txt:128",
-        ),
-        (
-            "SELECT (c_jsonb)::numeric FROM castprobe",
-            "**#43 group 5 -- both refuse, with different sentences.** A `jsonb` object cast to a number is `cannot cast jsonb object to type numeric` there and `22P02 invalid input syntax` here, because this node routes the cast through the target's input function rather than refusing the *shape* first; `text -> regclass` differs only in the SQLSTATE this node attaches to the same sentence. Refusals, so no value is wrong -- but a client that branches on SQLSTATE sees a different answer.",
-            "pg19_cast_matrix.txt:134",
-        ),
-        (
             "SELECT (c_text)::regclass FROM castprobe",
-            "**#43 group 5 -- both refuse, with different sentences.** A `jsonb` object cast to a number is `cannot cast jsonb object to type numeric` there and `22P02 invalid input syntax` here, because this node routes the cast through the target's input function rather than refusing the *shape* first; `text -> regclass` differs only in the SQLSTATE this node attaches to the same sentence. Refusals, so no value is wrong -- but a client that branches on SQLSTATE sees a different answer.",
+            "**#44 group 5 -- both refuse, with different sentences.** It opened as ten and is **three**. The seven that went were the `jsonb` family, and they were the group's own example: a `jsonb` object cast to a number was `22P02 invalid input syntax` here because the whole document went to the target's input function, where PostgreSQL asks the *kind* first and answers `22023 cannot cast jsonb object to type numeric`. Paid 2026-09-10 by `value::json::cast_to_scalar`, which both the evaluator's cast and the literal fold ask -- the literal spelling had a declared divergence of its own in `pg19_json.txt` and went with it. What is left is **two mechanisms and neither is an ordering**: `bytea -> uuid` differs in the sentence a length check writes (`invalid input length for type uuid`, with a DETAIL naming the bytes), and `text -> regclass` and `varchar -> regclass` differ only in the SQLSTATE this node attaches to the identical sentence. Refusals, so no value is wrong -- but a client that branches on SQLSTATE sees a different answer.",
             "pg19_cast_matrix.txt:209",
         ),
         (
             "SELECT (c_varchar)::regclass FROM castprobe",
-            "**#43 group 5 -- both refuse, with different sentences.** A `jsonb` object cast to a number is `cannot cast jsonb object to type numeric` there and `22P02 invalid input syntax` here, because this node routes the cast through the target's input function rather than refusing the *shape* first; `text -> regclass` differs only in the SQLSTATE this node attaches to the same sentence. Refusals, so no value is wrong -- but a client that branches on SQLSTATE sees a different answer.",
+            "**#44 group 5 -- both refuse, with different sentences.** It opened as ten and is **three**. The seven that went were the `jsonb` family, and they were the group's own example: a `jsonb` object cast to a number was `22P02 invalid input syntax` here because the whole document went to the target's input function, where PostgreSQL asks the *kind* first and answers `22023 cannot cast jsonb object to type numeric`. Paid 2026-09-10 by `value::json::cast_to_scalar`, which both the evaluator's cast and the literal fold ask -- the literal spelling had a declared divergence of its own in `pg19_json.txt` and went with it. What is left is **two mechanisms and neither is an ordering**: `bytea -> uuid` differs in the sentence a length check writes (`invalid input length for type uuid`, with a DETAIL naming the bytes), and `text -> regclass` and `varchar -> regclass` differ only in the SQLSTATE this node attaches to the identical sentence. Refusals, so no value is wrong -- but a client that branches on SQLSTATE sees a different answer.",
             "pg19_cast_matrix.txt:266",
         ),
         (
@@ -108,21 +88,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT (c_oid)::regclass FROM castprobe",
             "**#44 group 4 -- both answer and the values differ.** It opened as eight pairs and is **two**, and the two that went are the two that were named: `uuid -> bytea` left with #43's first mechanism (it was never a rendering -- it is the same text round trip seen from the other side), and `boolean` into a character type left on 2026-09-10, because `ToText` and `||` both had the rule that a boolean prints `t` and *casts* to `true` and the evaluator's `Expr::Cast` arm did not -- one fact, three readers, `crate::value::cast_text_under` is the one now. The `inet` prefix went the same day and by the same route: an address keeps the prefix its output function hides, `parse::lower` had had that rule for a literal since the address unit, and the evaluator's cast -- every cast over a *column* -- had not. **What is left is not a rendering at all**, which is the group's own lesson: `bpchar -> xml` is the blank padding of `character(4)`, a `bpchar` question wearing an `xml` name, and `oid -> regclass` prints a name where a real server prints the number for an oid no relation has, which is the catalog and ADR 0097's boundary. A group named from its symptom held four mechanisms and three of them left with rows that were about something else.",
             "pg19_cast_matrix.txt:164",
-        ),
-        (
-            "SELECT (c_jsonb)::int8 FROM castprobe",
-            "**#44's refusal-ordering family, three more.** A `jsonb` object cast to an integer is `22023 cannot cast jsonb object to type integer` there and `22P02 invalid input syntax` here, because this node routes the cast through the target's input function rather than refusing the **shape** first -- the same sentence #44 already records for `numeric`, now one integer width at a time.",
-            "pg19_cast_matrix.txt:478",
-        ),
-        (
-            "SELECT (c_jsonb)::int2 FROM castprobe",
-            "**#44's refusal-ordering family, three more.** A `jsonb` object cast to an integer is `22023 cannot cast jsonb object to type integer` there and `22P02 invalid input syntax` here, because this node routes the cast through the target's input function rather than refusing the **shape** first -- the same sentence #44 already records for `numeric`, now one integer width at a time.",
-            "pg19_cast_matrix.txt:481",
-        ),
-        (
-            "SELECT (c_jsonb)::int4 FROM castprobe",
-            "**#44's refusal-ordering family, three more.** A `jsonb` object cast to an integer is `22023 cannot cast jsonb object to type integer` there and `22P02 invalid input syntax` here, because this node routes the cast through the target's input function rather than refusing the **shape** first -- the same sentence #44 already records for `numeric`, now one integer width at a time.",
-            "pg19_cast_matrix.txt:484",
         ),
         (
             "SELECT (c_regclass)::int8 FROM castprobe",

@@ -119,19 +119,19 @@ SAVEPOINT sp_json_jsonb		-
 SELECT (c_json)::jsonb FROM castprobe		{"a": 1}
 ROLLBACK TO sp_json_jsonb		-
 SAVEPOINT sp_jsonb_bool		-
-SELECT (c_jsonb)::bool FROM castprobe	!cannot cast jsonb object to type boolean
+SELECT (c_jsonb)::bool FROM castprobe	!22023 cannot cast jsonb object to type boolean
 ROLLBACK TO sp_jsonb_bool		-
 SAVEPOINT sp_jsonb_float4		-
-SELECT (c_jsonb)::float4 FROM castprobe	!cannot cast jsonb object to type real
+SELECT (c_jsonb)::float4 FROM castprobe	!22023 cannot cast jsonb object to type real
 ROLLBACK TO sp_jsonb_float4		-
 SAVEPOINT sp_jsonb_float8		-
-SELECT (c_jsonb)::float8 FROM castprobe	!cannot cast jsonb object to type double precision
+SELECT (c_jsonb)::float8 FROM castprobe	!22023 cannot cast jsonb object to type double precision
 ROLLBACK TO sp_jsonb_float8		-
 SAVEPOINT sp_jsonb_json		-
 SELECT (c_jsonb)::json FROM castprobe		{"a": 1}
 ROLLBACK TO sp_jsonb_json		-
 SAVEPOINT sp_jsonb_numeric		-
-SELECT (c_jsonb)::numeric FROM castprobe	!cannot cast jsonb object to type numeric
+SELECT (c_jsonb)::numeric FROM castprobe	!22023 cannot cast jsonb object to type numeric
 ROLLBACK TO sp_jsonb_numeric		-
 SAVEPOINT sp_lseg_point		-
 SELECT (c_lseg)::point FROM castprobe		(0.5,0.5)

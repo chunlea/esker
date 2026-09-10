@@ -66,14 +66,6 @@ const FUNCTIONS: &str = "A `json` function this node does not have, named under 
      unit's scope; the corpus carries them so the unit that adds them starts from the \
      measurement.";
 /// One of `DIVERGENCES`' seven reasons.
-const CASTS: &str = "**Both refuse a `jsonb` *object* cast to a scalar; the code and the \
-     message differ.** PostgreSQL rejects it in the cast itself, `22023 cannot cast jsonb \
-     object to type integer`, where this node renders the object to its text and hands that \
-     to `integer`s input function, which refuses the rendered object as `22P02 invalid \
-     input syntax for type integer`. A refusal of the right shape with the wrong code, \
-     closing when the cast checks the `jsonb` *kind* before rendering. The scalar casts \
-     this reason also covered now agree: `::text` landed with the json unit and `::numeric` \
-     with this one.";
 /// Every statement this node answers differently, each pointing at one reason above.
 const ANSWERS: &[(&str, &str, &str)] = &[
     ("SELECT '{bad}'::json", MESSAGES, "pg19_json.txt:90"),
@@ -156,7 +148,6 @@ const ANSWERS: &[(&str, &str, &str)] = &[
         FUNCTIONS,
         "pg19_json.txt:129",
     ),
-    ("SELECT '{\"a\":1}'::jsonb::int", CASTS, "pg19_json.txt:134"),
 ];
 
 #[test]
