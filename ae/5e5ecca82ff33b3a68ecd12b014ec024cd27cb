@@ -1,0 +1,19 @@
+docs/adr/0101-a-batch-of-ticks-never-carries-a-whole-election.md
+  s_2bed4ac2b1c944::t_11705cb54e7288 87-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "ae5e5ecca82ff33b3a68ecd12b014ec024cd27cb",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
