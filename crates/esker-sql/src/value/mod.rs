@@ -837,6 +837,63 @@ pub fn geometric_kind(ty: ColumnType) -> Option<geometric::Kind> {
     })
 }
 
+/// Whether a cast between two of these types is one of the **fourteen geometric conversions**.
+///
+/// Says which performer answers, not whether the cast is allowed: permission is `pg_cast`'s and
+/// `catalog::pg_catalog::casts_to` holds the fourteen rows. A pair both of whose ends are shapes
+/// is computed by [`geometric_cast`]; everything else takes the ordinary road through the
+/// target's input function.
+///
+/// `point` counts and is not one of the six [`geometric::Kind`]s — it is its own `Datum`, two
+/// floats — and `line` counts here and has no conversion, which is the right answer: a real
+/// server has no `pg_cast` row for it in either direction, so `'{1,2,3}'::line::box` is `42846`
+/// there and the `42846` this reports is the same sentence.
+#[must_use]
+pub fn is_geometric(ty: ColumnType) -> bool {
+    ty == ColumnType::Point || geometric_kind(ty).is_some()
+}
+
+/// One of the fourteen conversions, over a value of the source shape.
+///
+/// **Two callers, one rule.** `exec::cursor`'s `Expr::Cast` arm performs it per row and
+/// `parse::lower`'s fold performs it over a literal, and before this existed they disagreed: the
+/// per-row path refused all fourteen with `42846` (no `pg_cast` row) while the fold quietly
+/// answered four of them through the text — two of those *wrongly*, since `poly_in` reads a
+/// `box`'s two corners as a two-point polygon and reads an **open** path as a closed one. A
+/// measured rule reaches only the caller it is written for, so both ask here.
+pub fn geometric_cast(value: &Datum, to: ColumnType) -> Result<Datum> {
+    let source = value.column_type().unwrap_or(to);
+    // The no-op every `casts_to` pair has: a type always casts to itself, and `box::box` reaches
+    // this arm the same way `int4::int4` reaches the ordinary one.
+    if source == to {
+        return Ok(value.clone());
+    }
+    let refuse = || SqlError::CannotCast {
+        from: source.name(),
+        to: to.name(),
+    };
+    match value {
+        // The one conversion a `point` is the **source** of.
+        Datum::Point { x, y } if to == ColumnType::Box => Ok(Datum::Geometry {
+            kind: Box::new(ColumnType::Box),
+            text: geometric::box_of_point(*x, *y),
+        }),
+        Datum::Geometry { kind, text } => {
+            let from = geometric_kind(**kind).ok_or_else(refuse)?;
+            if to == ColumnType::Point {
+                let (x, y) = geometric::to_point(from, text)?;
+                return Ok(Datum::Point { x, y });
+            }
+            let target = geometric_kind(to).ok_or_else(refuse)?;
+            Ok(Datum::Geometry {
+                kind: Box::new(to),
+                text: geometric::convert(from, target, text)?,
+            })
+        }
+        _ => Err(refuse()),
+    }
+}
+
 /// Whether the type has an equality **operator class** — what `DISTINCT` and `GROUP BY` need.
 ///
 /// Not the same question as "does `=` answer": an `lseg` has an `=` operator and no btree family

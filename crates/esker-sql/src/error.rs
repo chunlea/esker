@@ -905,6 +905,22 @@ pub enum SqlError {
     #[error("invalid line specification: must be two distinct points")]
     LineNeedsTwoPoints,
 
+    /// `'[(0,0),(1,1)]'::path::polygon`: a `polygon` is closed by definition, so an **open** path
+    /// has no polygon to become. **`22023`, an invalid *parameter*** — not the `22P02` a literal
+    /// that will not read gets, because the text read fine and it is the shape that will not
+    /// convert. Measured; before the conversion existed the ordinary text round trip converted an
+    /// open path *silently*, dropping the bracket that carries the whole distinction.
+    #[error("open path cannot be converted to polygon")]
+    OpenPathIsNotAPolygon,
+
+    /// `'<(0,0),0>'::circle::polygon`: the twelve vertices are the radius turned twelve ways, and
+    /// a radius of zero names twelve copies of the centre. **`0A000`**, which is the surprise —
+    /// a real server calls this a feature it does not have where the refusal beside it, one line
+    /// up, is a `22023` about a parameter. Measured, both, because a reader would guess the two
+    /// shared a class.
+    #[error("cannot convert circle with radius zero to polygon")]
+    CircleWithRadiusZeroIsNotAPolygon,
+
     /// `'FF'::bit(8)`: a character that is not a binary digit. **The message names the
     /// character**, not the type, which is its own sentence and not the
     /// `invalid input syntax for type …` every other type gives. Measured, `0x` included:
@@ -2975,7 +2991,10 @@ impl SqlError {
             // implemented yet.
             | SqlError::LockingNotAllowedWith { .. }
             | SqlError::LockingNullableSide(_)
-            | SqlError::CachedPlanMustNotChangeResultType => sqlstate::FEATURE_NOT_SUPPORTED,
+            | SqlError::CachedPlanMustNotChangeResultType
+            // A circle with no radius has no twelve vertices, and a real server spends `0A000` on
+            // it rather than the `22023` its neighbour in the same conversion gets.
+            | SqlError::CircleWithRadiusZeroIsNotAPolygon => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::InvalidRegex(_) => sqlstate::INVALID_REGULAR_EXPRESSION,
             SqlError::DuplicateSchema(_) => sqlstate::DUPLICATE_SCHEMA,
             SqlError::UndefinedSchema(_) => sqlstate::INVALID_SCHEMA_NAME,
@@ -3309,6 +3328,10 @@ impl SqlError {
             // **A label is a parameter, not an object**: PostgreSQL answers `22023` for a name
             // that is not one, where a missing *type* is `42704`.
             SqlError::NotAnEnumLabel(_)
+            // **A shape that will not convert is an invalid parameter, not invalid input**: the
+            // open path's text read fine and it is the shape the conversion cannot take. Measured
+            // beside its neighbour, which is a `0A000`.
+            | SqlError::OpenPathIsNotAPolygon
             | SqlError::TypeLengthTooSmall(_)
             | SqlError::TypeLengthTooLarge(..)
             | SqlError::FloatPrecisionTooSmall

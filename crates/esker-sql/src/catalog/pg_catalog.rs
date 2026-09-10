@@ -2147,7 +2147,7 @@ fn pg_depend_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
 ///
 /// `(castsource, casttarget, castcontext, castmethod)`. `castcontext` is `e` explicit, `a`
 /// assignment, `i` implicit; `castmethod` is `f` a function, `b` binary-coercible, `i` I/O.
-pub const CASTS: [(i64, i64, &str, &str); 123] = [
+pub const CASTS: [(i64, i64, &str, &str); 137] = [
     // **A bit string's eight rows, measured** rather than reasoned:
     //
     //     SELECT castsource::regtype, casttarget::regtype, castcontext, castmethod
@@ -2247,6 +2247,37 @@ pub const CASTS: [(i64, i64, &str, &str); 123] = [
     (142, 25, "a", "b"),
     (142, 1042, "a", "b"),
     (142, 1043, "a", "b"),
+    // **The fourteen geometric rows, measured as a family** rather than one pair at a time:
+    //
+    //     SELECT castsource::regtype, casttarget::regtype, castcontext, castmethod
+    //       FROM pg_cast WHERE castsource IN (600,601,602,603,604,718)
+    //                       OR casttarget IN (600,601,602,603,604,718);
+    //
+    // Fourteen rows and no more: `lseg -> box`, `path -> circle` and every other pair not here is
+    // `42846` on a real server too. Four are **assignment** casts and the rest explicit, which is
+    // its own fact — a `point` goes into a `box` column and a `box` into a `polygon` column
+    // without being asked to.
+    //
+    // `line` is a seventh shape with no `pg_cast` row at all, in either direction, and is not
+    // here for that reason rather than by omission.
+    //
+    // Without these rows `casts_to` refused all fourteen — `42846 cannot cast type box to circle`
+    // for a statement a real server answers — which is the first mechanism of `debts-v1.1.md`
+    // #43, and `crates/esker-sql/tests/captures/pg19_cast_matrix.txt` holds one probe per pair.
+    (600, 603, "a", "f"),
+    (601, 600, "e", "f"),
+    (602, 604, "a", "f"),
+    (603, 600, "e", "f"),
+    (603, 601, "e", "f"),
+    (603, 604, "a", "f"),
+    (603, 718, "e", "f"),
+    (604, 600, "e", "f"),
+    (604, 602, "a", "f"),
+    (604, 603, "e", "f"),
+    (604, 718, "e", "f"),
+    (718, 600, "e", "f"),
+    (718, 603, "e", "f"),
+    (718, 604, "e", "f"),
     (700, 20, "a", "f"),
     (700, 21, "a", "f"),
     (700, 23, "a", "f"),

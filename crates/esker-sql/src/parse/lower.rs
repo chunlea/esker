@@ -6323,6 +6323,29 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 Datum::from_text(ColumnType::Numeric, &value::money::to_numeric_text(cents))?,
             ))));
         }
+        // **A geometric conversion is computed too, and this is the second caller asking for it.**
+        // The evaluator's `Cast` arm performs the fourteen per row; a literal never reaches it, and
+        // the fold below reads the source's *text* with the target's input function — which for
+        // four of the fourteen is readable and wrong. `'((0,0),(1,1))'::box::polygon` folded to the
+        // two-point polygon `((1,1),(0,0))` where a real server gives the four corners, and an
+        // **open** `'[(0,0),(1,1)]'::path::polygon` folded silently where a real server refuses it
+        // `22023`. Wrong and green, both, and neither reachable from a column — which is why
+        // `tests/corpus/pg19_geometric.txt` takes all fourteen through a literal and
+        // `tests/cast_matrix.rs` takes them through a column.
+        //
+        // `line` is a shape with no conversions and reaches [`value::geometric_cast`] too, which
+        // answers the same `42846` a real server does — it has no `pg_cast` row either way.
+        if let Some(from) = source_type(expr)?
+            && let Ok((to, _)) = lower_type(data_type)
+            && from != to
+            && value::is_geometric(from)
+            && value::is_geometric(to)
+            && let Some(text) = cast_literal_text(expr)?
+        {
+            return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                value::geometric_cast(&Datum::from_text(from, &text)?, to)?,
+            ))));
+        }
         // **The permission is `pg_cast`'s, and the fold has to ask it too.** `casts_to` is the one
         // gate for a cast over an *expression* (`exec::query`), and a folded literal never reached
         // it: `'101'::bit(3)::int2` read the digits as decimal and answered `101` where a real

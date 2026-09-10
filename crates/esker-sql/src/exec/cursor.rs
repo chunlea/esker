@@ -2442,6 +2442,20 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             {
                 crate::value::assignment_cast(value, *to, crate::value::Rendering::default())?
             }
+            // **The fourteen geometric conversions are computed, not read back through the text.**
+            // A `box` to a `circle` is the circumscribed one and a `polygon` to a `point` the mean
+            // of its vertices; none of that is anywhere in the source's *output*, so the round
+            // trip below either refused — `circle_in` will not read `(1,1),(0,0)` — or, for the
+            // four pairs whose texts happen to be readable by the other's input function, answered
+            // the wrong shape: `'((0,0),(1,1))'::box::polygon` was the two-point polygon
+            // `((1,1),(0,0))` where a real server gives the four corners. Permission is
+            // `pg_cast`'s as everywhere else (`casts_to` carries the fourteen rows); this arm is
+            // only who performs it. `debts-v1.1.md` #43, first mechanism.
+            value @ (Datum::Geometry { .. } | Datum::Point { .. })
+                if crate::value::is_geometric(*to) =>
+            {
+                crate::value::geometric_cast(&value, *to)?
+            }
             value => {
                 // **The session's output function, not the boot one.** A cast between two types
                 // here is a text round trip, so the text it goes through has to be the text the
