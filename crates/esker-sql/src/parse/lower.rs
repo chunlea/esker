@@ -3925,16 +3925,23 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         // `tests/corpus/pg19_collation.txt` rather than left to be found.
         Expr::Collate { expr, collation } => {
             let lowered = lower_expr(expr)?;
-            // The name is checked and then dropped: both names this node has mean byte order, so
-            // there is nothing for the plan to carry.
-            collation_name(collation)?;
+            // **The name is checked and the clause is kept.** It used to be dropped, on the
+            // reasoning that both names this node has mean byte order so there was nothing for the
+            // plan to carry — true of the *bytes* and false of the text and of the rule: a stored
+            // expression prints the clause back (`upper((t COLLATE "C"))`), and two explicit
+            // clauses that disagree are `42P21`. A clause that is dropped can do neither
+            // ([ADR 0096](../../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md)).
+            let collation = collation_name(collation)?;
             if let plan::Expr::Literal(literal) = &lowered
                 && let Some(ty) = literal_type(literal)
                 && !catalog::pg_attribute::collatable(ty)
             {
                 return Err(SqlError::CollationNotSupported(ty.name()));
             }
-            Ok(lowered)
+            Ok(plan::Expr::Collate {
+                operand: Box::new(lowered),
+                collation,
+            })
         }
         Expr::Nested(inner) => lower_expr(inner),
         // `~`, `~*`, `!~`, `!~*` — POSIX matching, in `LIKE`'s shape and for `LIKE`'s reason: a

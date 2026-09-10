@@ -121,17 +121,55 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_collation_family.txt:164",
         ),
         (
-            "SELECT 'r', a.attname, replace(pg_get_expr(d.adbin, d.adrelid), '|', '!') FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'g1co'::regclass AND a.attnum > 3 ORDER BY a.attnum",
-            "**An explicit `COLLATE` is dropped from the stored expression.** `upper(t COLLATE \"C\")` prints `upper((t COLLATE \"C\"))` on a real server and `upper(t)` here: the parser reads the clause and the printed form loses it, so a reader cannot tell a column's own collation from an overridden one. The *value* agrees -- both collations this node has order by byte -- and the other two columns of this row agree to the character, which is what says the difference is the `COLLATE` and not the deparse. Part of #19.",
-            "pg19_collation_family.txt:167",
-        ),
-        (
             "SELECT 'r', (u COLLATE \"C\") < (t COLLATE \"POSIX\") FROM g1co",
             "**The other half of the same absence: two explicit collations that disagree.** PostgreSQL answers `42P21 collation mismatch between explicit collations` -- a different sqlstate from the indeterminate case, because this one is over-determined rather than under-determined -- and this node compares the two columns and answers. Both collations it has order by byte (ADR 0076), so the answer is the answer either would give; what is missing is the refusal. Its own line because it is a second sqlstate to implement.",
             "pg19_collation_family.txt:179",
         ),
     ],
 };
+
+/// **A `COLLATE` written on a stored expression is printed back**, which is what keeping the
+/// clause in the plan is for — [ADR 0096](../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md)'s
+/// first family.
+///
+/// Measured on 19beta1: `upper(t COLLATE "C")` is stored and printed as `upper((t COLLATE "C"))`,
+/// with a pair of its own, and this node printed `upper(t)` — the catalog disagreeing with the
+/// statement that wrote it. The corpus row it came off is `pg19_collation_family.txt`'s
+/// `pg_get_expr` read-back, and this is the same fact asserted where a reader looks for it.
+///
+/// **And the value is unchanged**, which is the half that says the clause is about ordering: both
+/// collations this node has are byte order (ADR 0076), so nothing a row holds moves.
+#[test]
+fn a_collate_clause_survives_into_the_stored_expression() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE cc (id int8 PRIMARY KEY, t text)",
+        "ALTER TABLE cc ADD COLUMN g text GENERATED ALWAYS AS (upper(t COLLATE \"C\")) STORED",
+        "INSERT INTO cc (id, t) VALUES (1, 'ab')",
+    ]);
+    assert_eq!(
+        node.rows(
+            "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON \
+             d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'cc'::regclass AND \
+             a.attname = 'g'"
+        ),
+        vec![vec!["upper((t COLLATE \"C\"))"]]
+    );
+    assert_eq!(node.rows("SELECT g FROM cc"), vec![vec!["AB"]]);
+    // **And a bare column reference keeps none**, so the pair above is the clause and not a
+    // parenthesis this node adds to everything.
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE cd (id int8 PRIMARY KEY, t text)",
+        "ALTER TABLE cd ADD COLUMN g text GENERATED ALWAYS AS (upper(t)) STORED",
+    ]);
+    assert_eq!(
+        node.rows(
+            "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON \
+             d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attrelid = 'cd'::regclass AND \
+             a.attname = 'g'"
+        ),
+        vec![vec!["upper(t)"]]
+    );
+}
 
 #[test]
 fn every_collation_answer_is_postgresql_19_s() {

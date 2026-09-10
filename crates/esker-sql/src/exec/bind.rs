@@ -1091,6 +1091,7 @@ pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) 
         | Expr::Negate(operand)
         | Expr::Cast { operand, .. }
         | Expr::ToText { operand, .. }
+        | Expr::Collate { operand, .. }
         | Expr::Scalar { operand, .. } => {
             walk_expr_mut(operand, visit);
         }
@@ -1380,6 +1381,7 @@ pub(super) fn descend<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
         | Expr::IsNull { operand, .. }
         | Expr::Cast { operand, .. }
         | Expr::ToText { operand, .. }
+        | Expr::Collate { operand, .. }
         | Expr::Negate(operand)
         | Expr::Scalar { operand, .. } => descend(operand, visit),
         Expr::InList { operand, list, .. } => {

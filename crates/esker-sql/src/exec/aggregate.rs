@@ -644,6 +644,10 @@ impl Aggregation {
                 func: *func,
                 operand: Box::new(self.rewrite(operand, scope)?),
             },
+            Expr::Collate { operand, collation } => Expr::Collate {
+                operand: Box::new(self.rewrite(operand, scope)?),
+                collation: collation.clone(),
+            },
             Expr::ToText {
                 operand,
                 strip_blanks,
@@ -938,6 +942,7 @@ fn walk<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
         | Expr::IsNull { operand, .. }
         | Expr::Negate(operand)
         | Expr::Scalar { operand, .. }
+        | Expr::Collate { operand, .. }
         | Expr::ToText { operand, .. } => walk(operand, visit),
         Expr::Binary { left, right, .. }
         | Expr::Arithmetic { left, right, .. }

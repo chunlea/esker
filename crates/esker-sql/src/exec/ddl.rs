@@ -6057,6 +6057,10 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
         | Expr::ToText { .. }
         | Expr::Scalar { .. }
         | Expr::Coalesce(_)
+        // **A `COLLATE` gains a pair of its own**: `upper(t COLLATE "C")` prints back as
+        // `upper((t COLLATE "C"))`, measured — which is why it is on this list and why the
+        // clause is kept in the plan at all (ADR 0096).
+        | Expr::Collate { .. }
         | Expr::Case { .. } => true,
         // **A catalog function whose name is an operator**, which today is `||` and which
         // [`deparse`] prints as one. Gated on the same condition `deparse`'s own arm uses, because
@@ -6161,6 +6165,13 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             |column| catalog::quote_identifier(&column.name),
         ),
         Expr::Literal(literal) => deparse_literal(literal, ty),
+        // **Its own pair, and the name quoted.** `upper(t COLLATE "C")` is stored and
+        // printed by a real server as `upper((t COLLATE "C"))`; this node dropped the
+        // clause at lowering and printed `upper(t)`, so the catalog disagreed with the
+        // statement that wrote it (ADR 0096, `tests/corpus/pg19_collation_family.txt`).
+        Expr::Collate { operand, collation } => {
+            format!("({} COLLATE \"{collation}\")", sub(operand))
+        }
         Expr::Array { elements, .. } => {
             format!(
                 "ARRAY[{}]",

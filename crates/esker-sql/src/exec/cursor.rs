@@ -2521,6 +2521,10 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 crate::value::truncate_to_typmod(Datum::from_text(*to, &text)?, *to, *typmod)?
             }
         },
+        // **The operand's value, unchanged.** Both collations this node has are byte order
+        // (ADR 0076), so the clause never moves a byte; what it does is make a collation
+        // *derivable*, which is a question asked of the plan and not of the row.
+        Expr::Collate { operand, .. } => evaluate_in(operand, row, env)?,
         Expr::ToText {
             operand,
             strip_blanks,
