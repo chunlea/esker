@@ -3173,6 +3173,35 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                     },
                 );
             }
+            // **An operator this crate spells as a function still has to exist for its operand.**
+            // `&&` and `@>` are lowered to catalog functions, so the binary-comparison check above
+            // never sees them, and by the time `exec::cursor` has them the type is a `Datum` and
+            // gone — which is why the refusals read `text && text` for a `json` operand and
+            // `@> over point` for a `point` one.
+            //
+            // The question is per operator **and** per type, because no two of these operators
+            // agree about which types have them: `polygon @> polygon` answers where
+            // `point @> point` does not, and `polygon && polygon` answers where `jsonb && jsonb`
+            // does not (`value::operator_exists`, measured cell by cell).
+            if matches!(
+                call.func,
+                CatalogFunc::RangeOverlaps
+                    | CatalogFunc::RangeContains
+                    | CatalogFunc::HstoreContains
+            ) && let Some(first) = args.first()
+                && let Ok(left) = expr_type(first, scope)
+                && !crate::value::operator_exists(call.func.name(), left)
+            {
+                let right = args
+                    .get(1)
+                    .and_then(|arg| expr_type(arg, scope).ok())
+                    .unwrap_or(left);
+                return Err(SqlError::UndefinedOperator {
+                    left: left.name().to_owned(),
+                    op: call.func.name(),
+                    right: right.name().to_owned(),
+                });
+            }
             // **`pg_typeof` is answered here, from the argument's *declared* type, always.**
             //
             // It used to read the datum with three exceptions carved out of it — an enum column,
@@ -4639,7 +4668,7 @@ fn undefined_operator(
     };
     SqlError::UndefinedOperator {
         left: left.to_owned(),
-        op: op.symbol(),
+        op: op.missing_symbol(),
         right: right.to_owned(),
     }
 }

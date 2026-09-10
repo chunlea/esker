@@ -2257,6 +2257,23 @@ impl BinaryOp {
         }
     }
 
+    /// The operator PostgreSQL names when *this* one has none for a type.
+    ///
+    /// `IS DISTINCT FROM` is built on `=`, and a real server refusing it says
+    /// `operator does not exist: json = json` rather than repeating the spelling the user wrote —
+    /// measured, and the same for `IS NOT DISTINCT FROM`. Everything else names itself.
+    ///
+    /// One function because two places ask: the literal reconciliation in `exec::query::retype`,
+    /// which refuses before a type is even settled, and the type check after it. They disagreed,
+    /// and the one that fires first is the one nobody had looked at.
+    #[must_use]
+    pub fn missing_symbol(self) -> &'static str {
+        match self {
+            BinaryOp::Distinct | BinaryOp::NotDistinct => BinaryOp::Eq.symbol(),
+            other => other.symbol(),
+        }
+    }
+
     /// Whether this is a comparison rather than a connective.
     #[must_use]
     pub fn is_comparison(self) -> bool {

@@ -19,7 +19,7 @@
 #[path = "parity_harness/mod.rs"]
 mod parity;
 
-use esker_sql::pgwire::message::Frontend;
+use esker_sql::pgwire::message::{Frontend, Target};
 use esker_sql::pgwire::session::Session;
 
 struct Client {
@@ -32,8 +32,8 @@ impl Client {
         Client {
             node: parity::Node::new(&[
                 "CREATE EXTENSION IF NOT EXISTS hstore",
-                "CREATE TABLE h (id bigint, data hstore)",
-                "INSERT INTO h VALUES (1, 'a=>1'), (2, 'b=>2')",
+                "CREATE TABLE h (id bigint, t text, data hstore)",
+                "INSERT INTO h VALUES (1, 'x', 'a=>1'), (2, 'y', 'b=>2')",
             ]),
             session: Session::new(),
         }
@@ -57,6 +57,15 @@ impl Client {
         if parsed.starts_with("ERROR") {
             return parsed;
         }
+        // A driver asks the statement's shape before binding. This is the message the first
+        // version of the test left out.
+        let described = self.send(&Frontend::Describe {
+            target: Target::Statement,
+            name: "s".to_owned(),
+        });
+        if described.starts_with("ERROR") {
+            return format!("AT-DESCRIBE {described}");
+        }
         let bound = self.send(&Frontend::Bind {
             portal: "p".to_owned(),
             statement: "s".to_owned(),
@@ -65,7 +74,7 @@ impl Client {
             result_formats: Vec::new(),
         });
         if bound.starts_with("ERROR") {
-            return bound;
+            return format!("AT-BIND {bound}");
         }
         self.send(&Frontend::Execute {
             portal: "p".to_owned(),
@@ -96,7 +105,7 @@ fn an_undeclared_parameter_takes_the_columns_type_over_the_wire() {
     let mut client = Client::new();
     let answer = client.ask("SELECT id FROM h WHERE data = $1", Vec::new(), "a=>1");
     assert!(
-        !answer.starts_with("ERROR"),
+        !answer.contains("ERROR"),
         "the column says `hstore`, so the parameter is one: {answer}"
     );
 }
@@ -107,7 +116,7 @@ fn a_zero_declared_type_takes_the_columns_type_over_the_wire() {
     let mut client = Client::new();
     let answer = client.ask("SELECT id FROM h WHERE data = $1", vec![0], "a=>1");
     assert!(
-        !answer.starts_with("ERROR"),
+        !answer.contains("ERROR"),
         "a zero OID is not a declaration of `text`: {answer}"
     );
 }
@@ -118,7 +127,10 @@ fn a_zero_declared_type_takes_the_columns_type_over_the_wire() {
 fn a_parameter_declared_text_still_refuses_over_the_wire() {
     let mut client = Client::new();
     let answer = client.ask("SELECT id FROM h WHERE data = $1", vec![25], "a=>1");
-    assert_eq!(answer, "ERROR operator does not exist: hstore = text");
+    assert!(
+        answer.ends_with("ERROR operator does not exist: hstore = text"),
+        "{answer}"
+    );
 }
 
 /// **The parameter on the left**, which is the asymmetry an inference written for one side has.
@@ -127,7 +139,108 @@ fn a_parameter_on_the_left_takes_the_columns_type_too() {
     let mut client = Client::new();
     let answer = client.ask("SELECT id FROM h WHERE $1 = data", vec![0], "a=>1");
     assert!(
-        !answer.starts_with("ERROR"),
+        !answer.contains("ERROR"),
         "inference must not depend on which side the column is: {answer}"
+    );
+}
+
+/// **Which column types survive `Describe`** — the isolation that says how wide this is.
+#[test]
+fn describe_infers_a_parameter_from_the_column_for_every_type() {
+    let mut client = Client::new();
+    for (column, value) in [("id", "1"), ("t", "x"), ("data", "a=>1")] {
+        let answer = client.ask(
+            &format!("SELECT id FROM h WHERE {column} = $1"),
+            vec![0],
+            value,
+        );
+        assert!(!answer.contains("ERROR"), "{column}: {answer}");
+    }
+}
+
+/// **The shape libpq actually sends**: `Parse` naming *no* types, `Bind`, then a `Describe` of the
+/// **portal**, then `Execute`.
+///
+/// r1's frame tap caught two things this file had wrong. The `Describe` is of the portal and not
+/// the statement — `PQsendQueryGuts` has no other shape, which `pgwire::session`'s own comment
+/// already said — and the defect is reachable from *both* `Parse` forms: one type OID of zero, and
+/// zero type OIDs at all. A pin that only covers `param_types=[0]` can go green while the empty
+/// form still refuses, so both are here.
+fn ask_portal_described(
+    client: &mut Client,
+    sql: &str,
+    param_types: Vec<u32>,
+    value: &str,
+) -> String {
+    let parsed = client.send(&Frontend::Parse {
+        statement: "s1".to_owned(),
+        sql: sql.to_owned(),
+        param_types,
+    });
+    if parsed.starts_with("ERROR") {
+        return format!("AT-PARSE {parsed}");
+    }
+    let bound = client.send(&Frontend::Bind {
+        portal: String::new(),
+        statement: "s1".to_owned(),
+        param_formats: Vec::new(),
+        params: vec![Some(value.as_bytes().to_vec())],
+        result_formats: Vec::new(),
+    });
+    if bound.starts_with("ERROR") {
+        return format!("AT-BIND {bound}");
+    }
+    let described = client.send(&Frontend::Describe {
+        target: Target::Portal,
+        name: String::new(),
+    });
+    if described.starts_with("ERROR") {
+        return format!("AT-DESCRIBE-PORTAL {described}");
+    }
+    client.send(&Frontend::Execute {
+        portal: String::new(),
+        max_rows: 0,
+    })
+}
+
+/// **Zero declared types, portal described** — the prepared path r1 captured.
+#[test]
+fn no_declared_types_with_the_portal_described() {
+    let mut client = Client::new();
+    let answer = ask_portal_described(
+        &mut client,
+        "SELECT id FROM h WHERE data = $1",
+        Vec::new(),
+        "a=>1",
+    );
+    assert!(!answer.contains("ERROR"), "{answer}");
+}
+
+/// **One zero OID, portal described** — the other form, which must not be the only one covered.
+#[test]
+fn a_zero_declared_type_with_the_portal_described() {
+    let mut client = Client::new();
+    let answer = ask_portal_described(
+        &mut client,
+        "SELECT id FROM h WHERE data = $1",
+        vec![0],
+        "a=>1",
+    );
+    assert!(!answer.contains("ERROR"), "{answer}");
+}
+
+/// **And `text` really declared still refuses**, through the portal shape too.
+#[test]
+fn a_declared_text_refuses_through_the_portal_shape() {
+    let mut client = Client::new();
+    let answer = ask_portal_described(
+        &mut client,
+        "SELECT id FROM h WHERE data = $1",
+        vec![25],
+        "a=>1",
+    );
+    assert!(
+        answer.ends_with("ERROR operator does not exist: hstore = text"),
+        "{answer}"
     );
 }

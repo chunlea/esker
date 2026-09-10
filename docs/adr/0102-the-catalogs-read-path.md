@@ -153,13 +153,37 @@ about a real workload's shape.
      and the only one that removes the coupling rather than the round trip.
 ### A unit that is not this ADR's, and comes before it
 
-**`Executor::catalog_view` is reached from thirteen places, and each one re-reads the two version
-counters.** Run 111 counted **4,790,406** views in one ActiveRecord pass. That is not this ADR's
-question — every one of its three shapes changes *where* the version is read from, and this changes
-*how many times* — and it should be a small unit of its own, for three reasons:
+**Measured, and the first claim about it was wrong.** This paragraph said "thirteen places, and
+each one re-reads the two version counters", which was inferred from counting call sites and never
+measured. Counting them per statement instead
+(`crates/esker-sql/tests/catalog_reads.rs`, with the instrument on):
+
+| statement | views | of which repeats |
+|---|---:|---:|
+| `CREATE TABLE` | 1 | 0 |
+| `INSERT`, one row | 2 | 1 |
+| `INSERT`, three rows | 2 | 2 |
+| `SELECT`, point | 2 | 2 |
+| `SELECT`, range | 2 | 2 |
+| `UPDATE`, point | 2 | 2 |
+| `DELETE`, point | 2 | 2 |
+| `ALTER TABLE ADD COLUMN` | 3 | 3 |
+| `SELECT`, self join | 4 | 3 |
+| `BEGIN` / `COMMIT` | 0 | 0 |
+| **the whole run** | **22** | **19** |
+
+**Two per ordinary statement, not thirteen** — the call sites do not all fire — and **19 of 22 are
+repeats**: 86% of the reads return the version the read before them returned. So the redundancy is
+real and it is a factor of two, not of thirteen. Against run 111's 4,790,406 views that is about
+2.4 million statements, which is the right order for that suite.
+
+That is not this ADR's question — every one of its three shapes changes *where* the version is read
+from, and this changes *how many times* — and it should be a small unit of its own, for three
+reasons:
 
 * **it is cheaper than any shape here**: caching the view per transaction inside the executor needs
-  no wire tag, no placement-driver change, no lease and no ADR;
+  no wire tag, no placement-driver change, no lease and no ADR — and it halves the reads rather
+  than removing them, which is worth knowing before it is built;
 * **it comes first, or this ADR measures the wrong thing.** A statement that reads the version
   thirteen times multiplies whatever a read costs by a number that belongs to the executor's
   structure and not to the catalog's read path. Measuring (a), (b) or (c) against that is measuring
@@ -170,9 +194,15 @@ question — every one of its three shapes changes *where* the version is read f
   one table by taking two views. What it can do is pay for the same answer thirteen times.
 
 The shape of the unit, in the order this lane has learned to do them: **count the reads per
-statement class first** (the instrument already does, and `repeats of the same version` is exactly
-the redundant part), **then merge them**, **then count again** — so the change is reported as a
-difference and not as an intention.
+statement class first** — done, above — **then merge them**, **then count again**, so the change is
+reported as a difference and not as an intention.
+
+**And the middle step now waits on a number this ADR does not have.** Halving a read is worth
+building when the read costs something; run 111's half-microsecond is a `MemoryBackend` table
+lookup and says nothing about a read that crosses a socket and Raft. Building the merge before that
+number exists would be the mistake
+[ADR 0100](0100-a-region-between-leaders-waits-on-the-callers-deadline.md) records: a change that
+looks like a fix, ships a smaller number, and leaves the question unanswered.
 
 3. **The tail is what decides against the median.** A mean of 200 µs with a `rest` bucket that is
    never empty is a different system from a flat 200 µs, and the second is the one nothing needs to
