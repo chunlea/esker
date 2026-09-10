@@ -24,9 +24,12 @@ const INTERVAL: &str = "**The two casts between `time` and `interval` are what i
      a `time` takes part in — `time - time`, `time * 2`, `time + interval`, `sum` and `avg`. The \
      type arrived, and those came off this list one at a time; `sum(time)` and `avg(time)` were \
      the last, when they began answering the `interval` a real server answers. \
-     `'12:34:56'::time::interval` and `'1 day 02:00:00'::interval::time` are the two rows that \
-     still disagree, and what they want is a conversion between the two types rather than the \
-     types themselves.";
+     `'12:34:56'::time::interval` is the one row that still disagrees, and what it wants is a \
+     conversion between the two types rather than the types themselves. It was two: `'1 day \
+     02:00:00'::interval::time` closed when `value::convert_without_text` was given that pair \
+     (`debts-v1.1.md` #43), and the asymmetry it leaves is worth naming: the same conversion over a \
+     **column** had been right all along, so this row is the *fold's* half of one cast and the \
+     matrix never saw it.";
 
 /// The other absent type.
 const TIMETZ: &str = "**`timetz` is a different type** — OID 1266, twelve bytes, a `time` plus a \
@@ -60,7 +63,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN \
          ('time','timetz') ORDER BY oid",
         "SELECT '12:34:56'::time::interval, '24:00:00'::time::interval",
-        "SELECT '1 day 02:00:00'::interval::time",
         "SELECT '12:34:56'::time::timetz",
         "SELECT '12:34:56'::timetz::time",
         "SELECT extract(hour FROM '12:34:56'::time), extract(epoch FROM '12:34:56'::time)",
@@ -95,11 +97,8 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             INTERVAL,
             "pg19_time.txt:87",
         ),
-        (
-            "SELECT '1 day 02:00:00'::interval::time",
-            INTERVAL,
-            "pg19_time.txt:88",
-        ),
+        // `'1 day 02:00:00'::interval::time` was here under the same reason and is **closed** —
+        // see `INTERVAL` above for the asymmetry it left behind.
         (
             "SELECT '12:34:56'::time::timetz",
             TIMETZ,

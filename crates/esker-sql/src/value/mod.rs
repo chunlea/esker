@@ -914,6 +914,38 @@ pub fn convert_without_text(value: &Datum, to: ColumnType) -> Option<Result<Datu
         (Datum::Int8(number), ColumnType::Bytea) => {
             Some(Ok(Datum::Bytea(number.to_be_bytes().to_vec())))
         }
+        // **An `interval` to a `time` keeps the clock and drops the calendar**, then wraps: the
+        // months and days go entirely — `'1 mon'::interval::time` and `'1 day'::interval::time`
+        // are both `00:00:00` — and what is left is taken modulo a day, so `'25:00:00'` is
+        // `01:00:00` and `'-1:00:00'` is `23:00:00`. Measured, six spellings including the
+        // negatives, which are the half a `%` would get wrong. Through the text this was
+        // `time`'s input function reading `1 day`, which is `22007 invalid input syntax` for a
+        // pair a real server converts and calls an *assignment* cast.
+        (Datum::Interval { micros, .. }, ColumnType::Time) => {
+            Some(Ok(Datum::Time(micros.rem_euclid(interval::MICROS_PER_DAY))))
+        }
+        // **`money` to `numeric` is the cents as a decimal, not the printed money read back.**
+        // `money`'s output function writes `$12.34` and `numeric`'s input function refuses the
+        // dollar sign, so the round trip made a conversion a real server performs into a `22P02`
+        // about punctuation. The other direction needs nothing and is not here: `567.89` and
+        // `12345` are both spellings `cash_in` reads, rounding half away from zero as `numeric`
+        // does — `567.895` is `$567.90` and `567.885` is `$567.89`, measured beside each other.
+        // `parse::lower` has had this one arm for a literal since `money` arrived; the evaluator
+        // had nothing, which is the split this table exists to close.
+        (Datum::Money(cents), ColumnType::Numeric) => Some(Datum::from_text(
+            ColumnType::Numeric,
+            &money::to_numeric_text(*cents),
+        )),
+        // **A `reg*` is an oid and an oid is a number** (`pg_cast` 24 -> 23 and 2206 -> 23, method
+        // `b`, a reinterpretation). Through the text this was `regproc`'s *name* handed to
+        // `int4in`: `22P02 invalid input syntax for type integer: "int4in"` for a statement a real
+        // server answers `42`. The evaluator had an arm of its own for this and the fold had
+        // nothing, which is the split this table exists to close.
+        (Datum::RegType { oid, .. } | Datum::RegProc { oid, .. }, _)
+            if integer(to) || to == ColumnType::Oid =>
+        {
+            Some(assignment_cast(Datum::Oid(*oid), to, Rendering::default()))
+        }
         // **A `uuid` is sixteen bytes and its `bytea` is those bytes**, not the thirty-six
         // characters it prints as. The first member of this family anyone measured
         // (`debts-v1.1.md` #44) and the one that named the shape.

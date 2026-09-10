@@ -44,6 +44,27 @@ ROLLBACK TO v8		-
 SAVEPOINT v9		-
 SELECT 'r', '\303'::"char"::int4	text,integer	r|-61
 ROLLBACK TO v9		-
+SAVEPOINT v10		-
+SELECT 'r', 65::int4::money, 65::int8::money, 12345::int4::money	text,money,money,money	r|$65.00|$65.00|$12,345.00
+ROLLBACK TO v10		-
+SAVEPOINT v11		-
+SELECT 'r', 567.895::numeric::money, 567.885::numeric::money, (-567.895)::numeric::money	text,money,money,money	r|$567.90|$567.89|-$567.90
+ROLLBACK TO v11		-
+SAVEPOINT v12		-
+SELECT 'r', '12.34'::money::numeric, '-0.01'::money::numeric, '$1,234.56'::money::numeric	text,numeric,numeric,numeric	r|12.34|-0.01|1234.56
+ROLLBACK TO v12		-
+SAVEPOINT v13		-
+SELECT 'r', '1 day'::interval::time, '3:04:05'::interval::time, '1 day 3:04:05'::interval::time	text,time without time zone,time without time zone,time without time zone	r|00:00:00|03:04:05|03:04:05
+ROLLBACK TO v13		-
+SAVEPOINT v14		-
+SELECT 'r', '25:00:00'::interval::time, '-1:00:00'::interval::time, '-25:00:00'::interval::time, '1 mon'::interval::time	text,time without time zone,time without time zone,time without time zone,time without time zone	r|01:00:00|23:00:00|23:00:00|00:00:00
+ROLLBACK TO v14		-
+SAVEPOINT v15		-
+SELECT 'r', 42::int4::regproc, 42::int8::regproc, 42::int2::regproc	text,regproc,regproc,regproc	r|int4in|int4in|int4in
+ROLLBACK TO v15		-
+SAVEPOINT v16		-
+SELECT 'r', 'int4in'::regproc::int4, 'int4in'::regproc::int8, 'integer'::regtype::int4, 'integer'::regtype::int8	text,integer,bigint,integer,bigint	r|42|42|23|23
+ROLLBACK TO v16		-
 SAVEPOINT r1		-
 SELECT 'r', 1e20::float8::int4	!22003 integer out of range
 ROLLBACK TO r1		-
@@ -65,4 +86,10 @@ ROLLBACK TO r6		-
 SAVEPOINT r7		-
 SELECT 'r', 2::int8::"char"	!42846 cannot cast type bigint to "char"
 ROLLBACK TO r7		-
+SAVEPOINT r8		-
+SELECT 'r', 2::int2::money	!42846 cannot cast type smallint to money
+ROLLBACK TO r8		-
+SAVEPOINT r9		-
+SELECT 'r', 'int4in'::regproc::int2	!42846 cannot cast type regproc to smallint
+ROLLBACK TO r9		-
 ROLLBACK		-

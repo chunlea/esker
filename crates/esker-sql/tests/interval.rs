@@ -35,13 +35,6 @@ const TYPMOD: &str = "**`interval`'s typmod is a field mask, not a number** — 
      the same literal and no typmod: `'1 2'::interval` is `22007` there too. Everything reading \
      that table follows, because the rows were never inserted.";
 
-/// The engine has no arithmetic operator at all.
-const ARITHMETIC: &str = "`plan::BinaryOp` is Eq/NotEq/Lt/LtEq/Gt/GtEq/And/Or, and every one of \
-     its uses assumes a comparison producing a boolean — so `+`, `-`, `*` and `/` over any pair \
-     are `0A000` naming the operator. This is the type those operators mostly *answer with*, \
-     which is why the whole family is here rather than in `tests/time.rs`: landing interval \
-     removes the reason arithmetic could not be modelled, and not the arithmetic.";
-
 /// Functions this node has for no type.
 const FUNCTIONS: &str = "A function this node does not implement for any type, named rather than \
      answered: `justify_days`/`justify_hours`/`justify_interval` are the three that do the \
@@ -158,11 +151,18 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // here and is closed: `debts-v1.1.md` #36 gave the cast and the row write their own
         // sides of one seam (`tests/typmod_seam.rs`). It had nothing to do with this type,
         // which is what every copy of it said — five entries across four files, one cause.
-        (
-            "SELECT '1 day'::interval::time",
-            ARITHMETIC,
-            "pg19_interval.txt:120",
-        ),
+        // **`'1 day'::interval::time` was the last entry here and it is closed**, which took the
+        // `ARITHMETIC` reason with it — no entry uses it any more, so the constant is gone too.
+        // What that reason said is worth keeping: `plan::BinaryOp` is Eq/NotEq/Lt/LtEq/Gt/GtEq/
+        // And/Or and every one of its uses assumes a comparison producing a boolean, so `+`, `-`,
+        // `*` and `/` over any pair were `0A000` naming the operator — and this is the type those
+        // operators mostly *answer with*, which is why the whole family sat here rather than in
+        // `tests/time.rs`. The arithmetic landed one entry at a time; this last one was never
+        // arithmetic at all. `interval -> time` keeps the clock part, drops the calendar and wraps
+        // modulo a day, and it went through the text — `time`'s input function reading `1 day` —
+        // until `value::convert_without_text` was given the pair (`debts-v1.1.md` #43). A missing
+        // *conversion* had been sitting in an arithmetic entry because an `interval` was on one
+        // side of it.
     ],
 };
 

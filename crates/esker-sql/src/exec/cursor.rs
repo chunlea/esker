@@ -2414,24 +2414,6 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 values.element = element;
                 Datum::Array(values)
             }
-            // **A `regtype` or a `regproc` to a number is the oid too**, for the same reason and
-            // with one difference: their oid is already four bytes. Without this arm
-            // `typinput::oid` rendered `boolin` and handed it to `oidin`, which is
-            // `22P02 invalid input syntax for type oid: "boolin"` for a statement a real server
-            // answers with 1242 — `pg_cast` calls the pair implicit and method `b`, a
-            // reinterpretation, and a reinterpretation is what this is (ADR 0098).
-            Datum::RegType { oid, .. } | Datum::RegProc { oid, .. }
-                if matches!(
-                    to,
-                    ColumnType::Oid | ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2
-                ) =>
-            {
-                crate::value::assignment_cast(
-                    Datum::Oid(oid),
-                    *to,
-                    crate::value::Rendering::default(),
-                )?
-            }
             // **The fourteen geometric conversions are computed, not read back through the text.**
             // A `box` to a `circle` is the circumscribed one and a `polygon` to a `point` the mean
             // of its vertices; none of that is anywhere in the source's *output*, so the round

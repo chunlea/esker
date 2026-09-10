@@ -27,21 +27,25 @@
 //! `bpchar`, which is a pair this file probes anyway, and the four real `"char"` targets are in
 //! the second half with their quotes. That is why 157 pairs are covered by 160 probes.
 //!
-//! **33 of the 157 still disagree**, and there is still no pair anywhere where this node answers
-//! and PostgreSQL refuses. It was 49 before the conversions that do not go through the text
-//! landed (`value::convert_without_text`), and 63 before the geometric fourteen. What is left:
+//! **24 of the 157 still disagree**, and there is still no pair anywhere where this node answers
+//! and PostgreSQL refuses. It was 33 before `money`, `regproc`, `regtype` and `interval -> time`,
+//! 49 before the conversions that do not go through the text (`value::convert_without_text`), and
+//! 63 before the geometric fourteen. What is left:
 //!
 //! ```text
-//! 13  a conversion this node does not have    money 2, interval -> time, nine pg_cast rows
-//!                                             `CASTS` lacks, and `"char" -> int4`   (#43)
+//!  1  a conversion this node does not have    `"char" -> int4`, and it is a missing *type*  (#43)
+//!  3  the two catalogs differ                 int2/int4/int8 -> regproc: the oid is right and
+//!                                             this node's `pg_proc` has fifteen functions
 //!  7  both answer, the values differ          inet, boolean, and the rest of #44's renderings
 //! 10  both refuse, the sentence differs       jsonb's shape, refused after the input function
-//!  3  ADR 0097's oid space                    regclass -> oid, int4, int8           (#45)
+//!  3  ADR 0097's oid space                    regclass -> oid, int4, int8                   (#45)
 //! ```
 //!
-//! `"char" -> int4` is the odd one and its reason says why: a `"char"` and a `text` are both a
-//! `Datum::Text`, so the *evaluator* cannot tell them apart, and the same cast over a **literal**
-//! is right because the fold knows the type that was written. `cast_fold.rs` is that half.
+//! **The first mechanism is one row from done, and that row is not a conversion.** A `"char"` and
+//! a `text` are both a `Datum::Text`, so the *evaluator* cannot tell which cast it is being asked
+//! for, where `text -> int4` really is the I/O conversion it looks like; the same cast over a
+//! **literal** is right because the fold knows the type that was written. `cast_fold.rs` is that
+//! half, and the fix is a type carrying itself rather than a conversion being written.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -54,21 +58,6 @@ const FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
-        (
-            "SELECT (c_money)::numeric FROM castprobe",
-            "**#43 group 2 -- `money` converts in neither direction.** `numeric -> money` and `money -> numeric` are both `pg_cast` entries a real server computes, and both are `42846` here. This is the pair that opened #43: the fold used to do it at parse time, so `567.89::numeric::money` worked and `(c_numeric)::money` never did, and nothing said so until #42 moved a literal out of the fold's reach.",
-            "pg19_cast_matrix.txt:140",
-        ),
-        (
-            "SELECT (c_numeric)::money FROM castprobe",
-            "**#43 group 2 -- `money` converts in neither direction.** `numeric -> money` and `money -> numeric` are both `pg_cast` entries a real server computes, and both are `42846` here. This is the pair that opened #43: the fold used to do it at parse time, so `567.89::numeric::money` worked and `(c_numeric)::money` never did, and nothing said so until #42 moved a literal out of the fold's reach.",
-            "pg19_cast_matrix.txt:158",
-        ),
-        (
-            "SELECT (c_interval)::time FROM castprobe",
-            "**#43 group 3 -- a conversion of its own.** `interval -> time` is `00:00:00` on a real server (the day part is dropped, the clock part kept) and `22007` here, which is the node reading the interval's *text* rather than converting it. This group had a second member, `regclass -> oid`, and it turned out not to be a conversion gap at all -- see the entry below.",
-            "pg19_cast_matrix.txt:116",
-        ),
         (
             "SELECT (c_regclass)::oid FROM castprobe",
             "**Not a conversion gap: the boundary of ADR 0097, ruled 2026-09-09 (`debts-v1.1.md` #45).** A relation id here is a `u64` and an `oid` is four bytes, so `'pg_class'::regclass::oid` on a live relation is `22003 value ... is out of range for type oid` where a real server answers a small number. Narrowing the id is the allocation change ADR 0097 weighed and declined, and answering a truncated oid would be a wrong value wearing a right type. Measured here before the ruling and kept as the row that shows what that boundary looks like from the cast's side; the aggregates reach the same edge through the implicit cast, which is how #45 was found.",
@@ -145,51 +134,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "pg19_cast_matrix.txt:164",
         ),
         (
-            "SELECT (c_int8)::regproc FROM castprobe2",
-            "**#43 first mechanism -- nine `pg_cast` rows this node's `CASTS` table does not have.** `65::regproc` is `int4eq` on a real server and `42846 cannot cast type integer to regproc` here; so are both integers to `money`, and `regproc` and `regtype` back to an integer. Same shape as the geometric fourteen, and the same cause: permission is `pg_cast`'s, `casts_to` is the one gate, and a pair with no row is refused before any value is read. Only reachable once the matrix grew integer columns -- `pg_cast`'s largest family had never been probed.",
-            "pg19_cast_matrix.txt:313",
-        ),
-        (
-            "SELECT (c_int8)::money FROM castprobe2",
-            "**#43 first mechanism -- nine `pg_cast` rows this node's `CASTS` table does not have.** `65::regproc` is `int4eq` on a real server and `42846 cannot cast type integer to regproc` here; so are both integers to `money`, and `regproc` and `regtype` back to an integer. Same shape as the geometric fourteen, and the same cause: permission is `pg_cast`'s, `casts_to` is the one gate, and a pair with no row is refused before any value is read. Only reachable once the matrix grew integer columns -- `pg_cast`'s largest family had never been probed.",
-            "pg19_cast_matrix.txt:325",
-        ),
-        (
-            "SELECT (c_int2)::regproc FROM castprobe2",
-            "**#43 first mechanism -- nine `pg_cast` rows this node's `CASTS` table does not have.** `65::regproc` is `int4eq` on a real server and `42846 cannot cast type integer to regproc` here; so are both integers to `money`, and `regproc` and `regtype` back to an integer. Same shape as the geometric fourteen, and the same cause: permission is `pg_cast`'s, `casts_to` is the one gate, and a pair with no row is refused before any value is read. Only reachable once the matrix grew integer columns -- `pg_cast`'s largest family had never been probed.",
-            "pg19_cast_matrix.txt:349",
-        ),
-        (
-            "SELECT (c_int4)::regproc FROM castprobe2",
-            "**#43 first mechanism -- nine `pg_cast` rows this node's `CASTS` table does not have.** `65::regproc` is `int4eq` on a real server and `42846 cannot cast type integer to regproc` here; so are both integers to `money`, and `regproc` and `regtype` back to an integer. Same shape as the geometric fourteen, and the same cause: permission is `pg_cast`'s, `casts_to` is the one gate, and a pair with no row is refused before any value is read. Only reachable once the matrix grew integer columns -- `pg_cast`'s largest family had never been probed.",
-            "pg19_cast_matrix.txt:385",
-        ),
-        (
-            "SELECT (c_int4)::money FROM castprobe2",
-            "**#43 first mechanism -- nine `pg_cast` rows this node's `CASTS` table does not have.** `65::regproc` is `int4eq` on a real server and `42846 cannot cast type integer to regproc` here; so are both integers to `money`, and `regproc` and `regtype` back to an integer. Same shape as the geometric fourteen, and the same cause: permission is `pg_cast`'s, `casts_to` is the one gate, and a pair with no row is refused before any value is read. Only reachable once the matrix grew integer columns -- `pg_cast`'s largest family had never been probed.",
-            "pg19_cast_matrix.txt:397",
-        ),
-        (
-            "SELECT (c_regproc)::int8 FROM castprobe",
-            "**#43 first mechanism -- nine `pg_cast` rows this node's `CASTS` table does not have.** `65::regproc` is `int4eq` on a real server and `42846 cannot cast type integer to regproc` here; so are both integers to `money`, and `regproc` and `regtype` back to an integer. Same shape as the geometric fourteen, and the same cause: permission is `pg_cast`'s, `casts_to` is the one gate, and a pair with no row is refused before any value is read. Only reachable once the matrix grew integer columns -- `pg_cast`'s largest family had never been probed.",
-            "pg19_cast_matrix.txt:412",
-        ),
-        (
-            "SELECT (c_regproc)::int4 FROM castprobe",
-            "**#43 first mechanism -- nine `pg_cast` rows this node's `CASTS` table does not have.** `65::regproc` is `int4eq` on a real server and `42846 cannot cast type integer to regproc` here; so are both integers to `money`, and `regproc` and `regtype` back to an integer. Same shape as the geometric fourteen, and the same cause: permission is `pg_cast`'s, `casts_to` is the one gate, and a pair with no row is refused before any value is read. Only reachable once the matrix grew integer columns -- `pg_cast`'s largest family had never been probed.",
-            "pg19_cast_matrix.txt:415",
-        ),
-        (
-            "SELECT (c_regtype)::int8 FROM castprobe",
-            "**#43 first mechanism -- nine `pg_cast` rows this node's `CASTS` table does not have.** `65::regproc` is `int4eq` on a real server and `42846 cannot cast type integer to regproc` here; so are both integers to `money`, and `regproc` and `regtype` back to an integer. Same shape as the geometric fourteen, and the same cause: permission is `pg_cast`'s, `casts_to` is the one gate, and a pair with no row is refused before any value is read. Only reachable once the matrix grew integer columns -- `pg_cast`'s largest family had never been probed.",
-            "pg19_cast_matrix.txt:472",
-        ),
-        (
-            "SELECT (c_regtype)::int4 FROM castprobe",
-            "**#43 first mechanism -- nine `pg_cast` rows this node's `CASTS` table does not have.** `65::regproc` is `int4eq` on a real server and `42846 cannot cast type integer to regproc` here; so are both integers to `money`, and `regproc` and `regtype` back to an integer. Same shape as the geometric fourteen, and the same cause: permission is `pg_cast`'s, `casts_to` is the one gate, and a pair with no row is refused before any value is read. Only reachable once the matrix grew integer columns -- `pg_cast`'s largest family had never been probed.",
-            "pg19_cast_matrix.txt:475",
-        ),
-        (
             "SELECT (c_char)::int4 FROM castprobe",
             "**#43 first mechanism -- twelve conversions the text round trip cannot perform.** `pg_cast` has the row, so `casts_to` permits the cast, and then `exec::cursor`'s `Expr::Cast` arm renders the source and hands the text to the target's input function. `float8 -> int4` is `2` on a real server, which *rounds*, and `22P02 invalid input syntax for type integer: \"1.5\"` here; `bool -> int4` is `1` there and `\"t\"` handed to `int4in` here; `bytea -> int4` is the four bytes read as a number, `16706`, and here it is the *hex text* handed to `int4in`. **`float8 -> int4` is the one an application meets**: casting a float column to an integer is an ordinary thing for a client to write, and it is the reason this group is worth more than its twelve rows.",
             "pg19_cast_matrix.txt:301",
@@ -218,6 +162,21 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT (c_regclass)::int4 FROM castprobe",
             "**Not a conversion gap: ADR 0097's boundary again (`debts-v1.1.md` #45).** A relation id here is a `u64`, so `'pg_class'::regclass::int4` is `22003 integer out of range` and `::int8` answers `9223372036854774786` where a real server says `1259`. The same edge `regclass -> oid` sits on, reached by the other two casts `regclass` has. Recorded rather than fixed, for the reason #45 gives.",
             "pg19_cast_matrix.txt:469",
+        ),
+        (
+            "SELECT (c_int8)::regproc FROM castprobe2",
+            "**The cast is right and the *name* is this node's catalog.** `65::regproc` is `int4eq` on a real server because oid 65 is `int4eq` in every PostgreSQL, and this node's `pg_proc` holds the fifteen functions `pg_catalog::BUILTIN_FUNCTIONS` lists — a measured list of what the suite asks for, not a copy of PostgreSQL's several thousand. So the conversion happens, the `regproc` carries oid 65, and it prints as `65` because there is no name for it here. **That is PostgreSQL's own rule for an oid it cannot name**, measured beside this: `999999::regproc` is `999999` there. Not a missing conversion and not a rendering bug — the two servers hold different catalogs, which is the same reason `char_type.rs` declares its `pg_class` counts. `debts-v1.1.md` #43.",
+            "pg19_cast_matrix.txt:313",
+        ),
+        (
+            "SELECT (c_int2)::regproc FROM castprobe2",
+            "**The cast is right and the *name* is this node's catalog.** `65::regproc` is `int4eq` on a real server because oid 65 is `int4eq` in every PostgreSQL, and this node's `pg_proc` holds the fifteen functions `pg_catalog::BUILTIN_FUNCTIONS` lists — a measured list of what the suite asks for, not a copy of PostgreSQL's several thousand. So the conversion happens, the `regproc` carries oid 65, and it prints as `65` because there is no name for it here. **That is PostgreSQL's own rule for an oid it cannot name**, measured beside this: `999999::regproc` is `999999` there. Not a missing conversion and not a rendering bug — the two servers hold different catalogs, which is the same reason `char_type.rs` declares its `pg_class` counts. `debts-v1.1.md` #43.",
+            "pg19_cast_matrix.txt:349",
+        ),
+        (
+            "SELECT (c_int4)::regproc FROM castprobe2",
+            "**The cast is right and the *name* is this node's catalog.** `65::regproc` is `int4eq` on a real server because oid 65 is `int4eq` in every PostgreSQL, and this node's `pg_proc` holds the fifteen functions `pg_catalog::BUILTIN_FUNCTIONS` lists — a measured list of what the suite asks for, not a copy of PostgreSQL's several thousand. So the conversion happens, the `regproc` carries oid 65, and it prints as `65` because there is no name for it here. **That is PostgreSQL's own rule for an oid it cannot name**, measured beside this: `999999::regproc` is `999999` there. Not a missing conversion and not a rendering bug — the two servers hold different catalogs, which is the same reason `char_type.rs` declares its `pg_class` counts. `debts-v1.1.md` #43.",
+            "pg19_cast_matrix.txt:385",
         ),
     ],
 };

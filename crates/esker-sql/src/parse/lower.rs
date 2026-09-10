@@ -6396,17 +6396,38 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `22P02` for a pair that does not exist at all. Two readers of one fact, and this is the
         // second asking the first.
         //
-        // Asked here for the two families whose rows are a measured census — the bit strings
-        // (see `pg_catalog::CASTS`) and `"char"`, whose four rows in and four out were measured
-        // the day `int2 -> "char"` was found folding where a real server says
-        // `42846 cannot cast type smallint to "char"`. The other families' folds are not this
-        // unit's to re-decide, which is why this is a list and not every pair.
+        // Asked here for the families whose `pg_cast` rows are a measured census: the bit
+        // strings, `"char"`, and now `money`, `regproc` and `regtype` (see `pg_catalog::CASTS`).
+        // Each was added by a probe rather than by reading — `int2 -> "char"`, `2::int2::money`
+        // and `'int4in'::regproc::int2` are each a pair this node **folded** and a real server
+        // refuses `42846`, and each was invisible until something compared the fold to the oracle.
+        //
+        // **The list wants to stop being a list.** Three families in a row have needed it, and
+        // `casts_to` is `pg_cast`'s own table: `exec::query` asks it for every cast over an
+        // *expression*, and the reason the fold does not ask it for every cast over a *constant*
+        // is caution, not a measurement. Dropping the guard entirely was tried here and
+        // `cast_fold` and `cast_matrix` were both green — but it changes what every folded cast in
+        // the language does, so it wants a whole-crate run of its own rather than a ride on a
+        // five-family unit. `debts-v1.1.md` #43 carries it.
         if let Some(from) = source_type(expr)?
             && let Ok((to, _)) = lower_type(data_type)
             && (matches!(
                 from,
-                ColumnType::Bit | ColumnType::VarBit | ColumnType::Char
-            ) || matches!(to, ColumnType::Bit | ColumnType::VarBit | ColumnType::Char))
+                ColumnType::Bit
+                    | ColumnType::VarBit
+                    | ColumnType::Char
+                    | ColumnType::Money
+                    | ColumnType::RegProc
+                    | ColumnType::RegType
+            ) || matches!(
+                to,
+                ColumnType::Bit
+                    | ColumnType::VarBit
+                    | ColumnType::Char
+                    | ColumnType::Money
+                    | ColumnType::RegProc
+                    | ColumnType::RegType
+            ))
             && !catalog::pg_catalog::casts_to(from, to)
         {
             return Err(SqlError::CannotCast {
