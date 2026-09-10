@@ -215,6 +215,95 @@ fn the_checker_says_yes_to_what_was_written_and_no_to_what_was_not() {
     );
 }
 
+/// **The driver is killed, comes back, and timestamps flow again.**
+///
+/// The exposure this closes is total while it is open: every timestamp in this system comes from
+/// the driver (`CLAUDE.md` invariant 6), so a cluster whose driver is gone cannot open a
+/// transaction — no statement runs at all, reads included. The supervisor used to leave it that
+/// way on purpose, with a comment about experiments; the argument was backwards, because "the
+/// cluster has lost the thing that hands out timestamps" is a reason to bring it back.
+///
+/// **The assertion is a write and not a pid.** A new pid in the state file says something was
+/// spawned; only a commit says the driver is answering `Tso` again, on the same database, above
+/// the mark the dead one had fsynced. So this records before and after, and requires both.
+#[test]
+#[ignore = "starts three store processes and a driver, and kills the driver; run with --run-ignored all"]
+fn a_killed_driver_is_restarted_and_timestamps_flow_again() {
+    let cluster = start();
+    let dir = cluster.dir.path().to_path_buf();
+
+    // Before, so that a failure after the kill is about the kill.
+    let (ok, said) = esker(&[
+        "durability",
+        "record",
+        "--pd",
+        &cluster.pd,
+        "--out",
+        "/dev/null",
+        "--for",
+        "1s",
+    ]);
+    assert!(
+        ok,
+        "the cluster did not serve before the driver was killed: {said}"
+    );
+
+    let victim = driver_pid(&dir).expect("the state file names the driver");
+    assert!(alive(victim), "the driver to kill is running");
+    assert!(
+        Command::new("kill")
+            .arg("-9")
+            .arg(victim.to_string())
+            .status()
+            .unwrap()
+            .success(),
+        "SIGKILL was sent to the driver"
+    );
+
+    // A new pid, and a live one. The supervisor ticks every 250 ms and backs off 500 ms, so this
+    // is a bound against hanging the suite rather than the assertion.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let restarted = loop {
+        match driver_pid(&dir) {
+            Some(pid) if pid != victim && alive(pid) => break pid,
+            _ => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "30 s after `kill -9 {victim}` the state file still names the dead driver — nothing \
+             brought it back, and while it is gone no node can start a transaction at all"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_ne!(restarted, victim);
+
+    // **The assertion.** A commit needs a `start_ts` and a `commit_ts`, and both come from the
+    // driver — so a recorder that acknowledges anything is a driver that is serving again.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (ok, said) = esker(&[
+            "durability",
+            "record",
+            "--pd",
+            &cluster.pd,
+            "--out",
+            "/dev/null",
+            "--for",
+            "1s",
+        ]);
+        if ok {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the driver is running as pid {restarted}, and 60 s later no write has been \
+             acknowledged — a restarted driver that cannot hand out a timestamp is not a \
+             recovery. The recorder said: {said}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// **Four clients, ten thousand acknowledged writes, no gap in the record.**
 ///
 /// The negative control for run 118's second finding. The recorder appended from four threads,
@@ -306,6 +395,20 @@ fn store_pids(dir: &Path) -> Vec<u32> {
             }
         })
         .collect()
+}
+
+/// The placement driver's pid, from the same file, or `None` before it has one.
+fn driver_pid(dir: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(dir.join("cluster.state")).unwrap_or_default();
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields[..] {
+                ["0", _, pid] => pid.parse::<u32>().ok(),
+                _ => None,
+            }
+        })
 }
 
 /// Whether a pid is still a live process.

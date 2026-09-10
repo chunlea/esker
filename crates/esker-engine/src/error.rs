@@ -88,8 +88,13 @@ pub enum Error {
     ///
     /// A directory holds one database and a database has one writer, and until this existed
     /// nothing said so: a second process opened the same tree and wrote its own WAL segments and
-    /// manifests into it. An error and never a panic (invariant 9), and never a wait — a node
-    /// that blocked here would be a node an operator reads as hung.
+    /// manifests into it. An error and never a panic (invariant 9).
+    ///
+    /// **It arrives late on purpose.** `Db::open` waits a few seconds for a directory somebody is
+    /// still letting go of before it answers this, because a claim held by a live writer is held
+    /// for ever and one held by a shutdown is held for a moment — so waiting separates them
+    /// without ever admitting a second live writer. The wait is bounded: a node that blocked here
+    /// for ever would be a node an operator reads as hung.
     #[error("{dir} is open in another process")]
     InUse {
         /// The directory somebody else holds.

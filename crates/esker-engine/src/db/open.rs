@@ -266,17 +266,47 @@ fn spawn_background(inner: &Arc<DbInner>, dir: &Path) -> Result<Background> {
 
 /// Creates or recovers the version set, and makes sure every column family the caller named
 /// exists.
+/// How long [`claim`] waits for a directory somebody else still holds.
+///
+/// **A held directory is held for ever, or for a moment.** A live writer keeps its claim for as
+/// long as it lives, so waiting cannot let two of them through — no amount of patience turns a
+/// running store into a stopped one. What waiting does let through is the *other* case, which is
+/// the common one and was not survivable: a caller that closed a database and reopened the same
+/// directory, where "closed" is not instantaneous. `Store::stop` aborts its tasks, and `abort` is
+/// a request — the runtime drops the future, and everything it holds, when it next gets to it.
+///
+/// That cost a gate on 2026-09-10: `esker-store::schema_fetch`'s
+/// `a_learner_without_the_catalog_fetches_the_schema_and_answers` does `stop(); drop; open` and
+/// met `InUse` at 0.026 s, in a run whose only other change was in another crate. **It did not
+/// reproduce**: a hundred rounds of open/stop/drop/open under a deliberately starved runtime, in
+/// two different store arrangements, stayed green with and without a fix aimed at the tasks. So
+/// this is not a fix for a mechanism that was cornered — it is the shape that does not need one
+/// cornered, because it cannot admit a second live writer however long it waits.
+///
+/// Five seconds because it is far longer than any shutdown takes and far shorter than an operator
+/// waits before reading the message; the refusal, when it comes, says the same thing it always did.
+const CLAIM_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Claims `dir` for this process, or says who has it.
 ///
-/// The refusal is [`Error::InUse`] and never a wait: two writers on one LSM tree is the failure
-/// this prevents, and a node that blocked here instead would be a node an operator reads as hung.
+/// Never a permanent block: [`CLAIM_WITHIN`] bounds it, and past that the answer is
+/// [`Error::InUse`] — a node that waited on a held directory for ever would be a node an operator
+/// reads as hung.
 fn claim(fs: &dyn FileSystem, dir: &Path) -> Result<Box<dyn DirectoryLock>> {
-    match fs.lock_directory(dir) {
-        Ok(lock) => Ok(lock),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(Error::InUse {
-            dir: dir.to_path_buf(),
-        }),
-        Err(error) => Err(Error::io(dir, error)),
+    let deadline = std::time::Instant::now() + CLAIM_WITHIN;
+    loop {
+        match fs.lock_directory(dir) {
+            Ok(lock) => return Ok(lock),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::InUse {
+                        dir: dir.to_path_buf(),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(Error::io(dir, error)),
+        }
     }
 }
 

@@ -2969,15 +2969,18 @@ impl Store {
     /// Stops replication: the heartbeats, every ticker, every peer's thread, and every store
     /// connection.
     pub fn stop(&self) {
-        if let Ok(mut tasks) = self.background.lock() {
-            for task in tasks.drain(..) {
-                task.abort();
-            }
+        // **Taken out, not just aborted.** A handle left in place would be aborted again by the
+        // next `stop`, and — more to the point — this function has to *wait* for these, so it
+        // needs to own them.
+        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        if let Ok(mut background) = self.background.lock() {
+            tasks.append(&mut background);
         }
-        if let Ok(tickers) = self.tickers.lock() {
-            for ticker in tickers.iter() {
-                ticker.abort();
-            }
+        if let Ok(mut tickers) = self.tickers.lock() {
+            tasks.append(&mut tickers);
+        }
+        for task in &tasks {
+            task.abort();
         }
         for state in self.regions.states() {
             if let Some(peer) = state.peer() {
@@ -2987,9 +2990,14 @@ impl Store {
         if let Some(transport) = &self.transport {
             transport.shutdown();
         }
-        // Last: a worker still holding a region would be applying into a database the caller is
-        // about to flush and drop.
+        // Before the wait: a worker still holding a region would be applying into a database the
+        // caller is about to flush and drop, and `DriverPool::shutdown` joins its threads.
         self.drivers.shutdown();
+        // Aborted and not waited for: `abort` is a request, and the runtime drops the future
+        // when it next gets to it. What that costs — a database still held for a moment after
+        // `stop()` returns — is answered where it lands, in `Db::open`, which waits for a claim
+        // rather than refusing the first time it meets one.
+        drop(tasks);
     }
 
     /// This store's id.
