@@ -1602,14 +1602,6 @@ fn placeholder(ty: ColumnType) -> Datum {
             varying: ty == ColumnType::VarBit,
             bits: String::new(),
         },
-        ColumnType::BitArray
-        | ColumnType::VarBitArray
-        | ColumnType::InetArray
-        | ColumnType::CidrArray
-        | ColumnType::MacAddrArray
-        | ColumnType::MoneyArray => {
-            Datum::Array(esker_keys::array::ArrayValue::empty(ColumnType::Money))
-        }
         // An empty array of the right element type: the shape a parameter takes before its value
         // arrives, and one that answers `column_type` correctly while it stands in.
         ColumnType::Int8Array
@@ -1645,7 +1637,20 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::OidArray
         | ColumnType::CitextArray
         | ColumnType::XmlArray
-        | ColumnType::LtreeArray => Datum::Array(esker_keys::array::ArrayValue::empty(
+        | ColumnType::LtreeArray
+        // **Five array types used to sit in an arm of their own with `money`'s element.** A
+        // stand-in's whole job is to answer `column_type()` with the parameter's type, and
+        // `ArrayValue::empty(Money)` answers `money[]` for all six — so `Describe` over
+        // `WHERE bit_col = $1` emitted `CAST(money[] AS bit[])` and the cast table refused it,
+        // correctly: nothing casts a money array to a bit array. **The stand-in was wrong, not
+        // the cast.** `element_of` covers all six, and the arm below has always been right for
+        // the forty-odd others (wire v3 family F8).
+        | ColumnType::BitArray
+        | ColumnType::VarBitArray
+        | ColumnType::InetArray
+        | ColumnType::CidrArray
+        | ColumnType::MacAddrArray
+        | ColumnType::MoneyArray => Datum::Array(esker_keys::array::ArrayValue::empty(
             esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text),
         )),
         ColumnType::Int8 => Datum::Int8(0),
