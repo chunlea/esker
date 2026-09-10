@@ -764,8 +764,14 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         | Datum::Point { .. }
         | Datum::Geometry { .. }
         | Datum::RegType { .. }
-        | Datum::RegProc { .. }
-        | Datum::RegClass { .. } => {}
+        | Datum::RegProc { .. } => {}
+        // **A `regclass` is a key, and the key is its number** (`debts-v1.1.md` #39). The choice
+        // the comment above describes is not a choice here: the row holds the oid and nothing else
+        // since #35, so the order that matches the comparison is the only order there is —
+        // measured, `ORDER BY r` over relations created `ra` then `rb`, with `ra` renamed to `rz`,
+        // is `rz` before `rb`. Encoded exactly as the `int8` below it, which is what `pg_cmp`
+        // compares two of them by.
+        Datum::RegClass { oid, .. } => codec::encode_i64(*oid, out),
         Datum::Int8(v)
         | Datum::TimestampTz(v)
         | Datum::Timestamp(v)
@@ -1220,7 +1226,6 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::RegTypeArray
             | ColumnType::RegProc
             | ColumnType::RegProcArray | ColumnType::RegClassArray
-            | ColumnType::RegClass
             // **A pseudo-type is not a key because it is not a column.** Nothing is ever stored as
             // a `void`, so there is no order for a key to encode.
             | ColumnType::Void
@@ -1277,7 +1282,6 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::RegTypeArray
         | ColumnType::RegProc
         | ColumnType::RegProcArray | ColumnType::RegClassArray
-        | ColumnType::RegClass
         | ColumnType::Void
         | ColumnType::Int2Vector
         | ColumnType::OidVector => {
@@ -1316,6 +1320,20 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::MacAddrArray
         | ColumnType::BitArray
         | ColumnType::VarBitArray => return decode_key_array(ty, bytes),
+        // **The number, and the name is the digits** — the same unresolved form a row decodes to,
+        // and for the same reason: a key holds the oid alone (`debts-v1.1.md` #39). What a caller
+        // does with it is what a caller does with a decoded row; an index lookup follows the
+        // primary key to the row, and the row's own decode is where the name goes back in.
+        ColumnType::RegClass => {
+            let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
+            (
+                Datum::RegClass {
+                    oid: value,
+                    name: value.to_string().into_boxed_str(),
+                },
+                rest,
+            )
+        }
         ColumnType::Int8 => {
             let (value, rest) = codec::decode_i64(bytes).map_err(decoded)?;
             (Datum::Int8(value), rest)

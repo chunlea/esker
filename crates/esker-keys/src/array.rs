@@ -138,6 +138,76 @@ impl ArrayValue {
         })
     }
 
+    /// Stack `parts` into one array with one more dimension — the value half of
+    /// [`array_over`](Self::array_over).
+    ///
+    /// `None` is a NULL operand and has **no** dimensions, which is why `ARRAY[NULL::int[]]` is
+    /// the empty array and `ARRAY['{1,2}'::int[], NULL::int[]]` is a mismatch rather than an array
+    /// with a NULL in it. Every part must carry the same dimensions; the result's are the number
+    /// of parts followed by theirs, and its elements are theirs end to end — which is all a
+    /// dimension is here, the values being flat already.
+    ///
+    /// Answers `None` when the dimensions disagree. **The caller says which sentence that is**:
+    /// PostgreSQL raises one from `ExecEvalArrayExpr` for a constructor and a different one from
+    /// `accumArrayResultArr` for `array_agg`, both `2202E`.
+    ///
+    /// `fallback` is the element type to use when every part is NULL and none can say.
+    #[must_use]
+    pub fn stacked(parts: &[Option<&ArrayValue>], fallback: ColumnType) -> Option<ArrayValue> {
+        let mut dims: Option<&[i32]> = None;
+        for part in parts {
+            let theirs: &[i32] = part.map_or(&[], |array| array.dims.as_slice());
+            match dims {
+                None => dims = Some(theirs),
+                Some(seen) if seen == theirs => {}
+                Some(_) => return None,
+            }
+        }
+        let element = parts
+            .iter()
+            .flatten()
+            .next()
+            .map_or(fallback, |array| array.element);
+        let inner = dims.unwrap_or(&[]);
+        // Nothing had a dimension — every part was NULL or itself empty — so neither has the
+        // answer. `ARRAY[NULL::int[]]` and `ARRAY['{}'::int[]]` are both `{}`, measured.
+        if inner.is_empty() {
+            return Some(ArrayValue::empty(element));
+        }
+        let mut all = Vec::with_capacity(inner.len() + 1);
+        all.push(i32::try_from(parts.len()).ok()?);
+        all.extend_from_slice(inner);
+        let mut values = Vec::new();
+        for part in parts.iter().flatten() {
+            values.extend(part.values.iter().cloned());
+        }
+        Some(ArrayValue {
+            element,
+            lower: 1,
+            dims: all,
+            values,
+        })
+    }
+
+    /// The type an `ARRAY[…]` constructor, an `array_agg`, an `ARRAY(subquery)` or a written
+    /// `T[]` has when its operand is of type `element`.
+    ///
+    /// **This is not `typarray`, and the difference is the whole of it.** PostgreSQL's arrays are
+    /// multidimensional rather than nested: there is no array *of* an array, so `_int4.typarray`
+    /// is 0 and [`array_of`](Self::array_of) rightly answers `None` for one. Building an array out
+    /// of arrays adds a dimension and keeps the type — `ARRAY['{1,2}'::int[]]` is an `int[]`, and
+    /// so is `int[][]` and `ARRAY(SELECT ARRAY(SELECT 1))`, all measured on 19beta1. So an operand
+    /// that is already an array answers *itself*.
+    ///
+    /// Every site that degraded this to `text[]` was one of r1's 196 wire-census rows.
+    #[must_use]
+    pub fn array_over(element: ColumnType) -> Option<ColumnType> {
+        if Self::element_of(element).is_some() {
+            return Some(element);
+        }
+        Self::array_of(element)
+    }
+
     /// The element type an array type is over, or `None` for a type that is not an array.
     #[must_use]
     pub fn element_of(array: ColumnType) -> Option<ColumnType> {

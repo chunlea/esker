@@ -1467,13 +1467,33 @@ impl Executor {
         self.in_a_transaction(statement, params)
     }
 
-    fn settings<'a>(&'a self, search_path: &'a [String]) -> cursor::Settings<'a> {
+    fn settings<'a>(
+        &'a self,
+        search_path: &'a [String],
+        names: Option<cursor::OidOfRelation<'a>>,
+    ) -> cursor::Settings<'a> {
         cursor::Settings {
             search_path,
             rendering: self.rendering(),
             prepared: &self.prepared,
             advisory: Some(&self.locks),
+            names,
         }
+    }
+
+    /// The name rule a row evaluator resolves a `regclass` with, built where its rules live.
+    ///
+    /// **One grammar, one parser** (`debts-v1.1.md` #41): `relation_oid` is the same function
+    /// `'x'::regclass` goes through before the plan, `stored_name_written` and all, so a name
+    /// resolved per row and a name resolved per statement cannot disagree. The snapshot behind it
+    /// is read at most once and shared by every call, which is what that function's own comment
+    /// asks for.
+    fn name_rule<'a>(
+        &'a self,
+        txn: &'a dyn Txn,
+        relations: &'a std::cell::RefCell<Option<crate::catalog::pg_relations::Relations>>,
+    ) -> impl Fn(&str) -> Result<i64> + 'a {
+        move |name| self.relation_oid(&mut relations.borrow_mut(), txn, name)
     }
 
     /// Whether `client_min_messages` lets a message of this severity out.
@@ -1781,8 +1801,14 @@ impl Executor {
             // qualified only when its schema is off the path, so the answer is a property of this
             // session and has to travel with the plan.
             let path = self.resolved_search_path(&*txn)?;
-            let mut cursor =
-                cursor::Cursor::open(&*txn, self.tenant, self.settings(&path), &planned.node)?;
+            let relations = std::cell::RefCell::new(None);
+            let names = self.name_rule(&*txn, &relations);
+            let mut cursor = cursor::Cursor::open(
+                &*txn,
+                self.tenant,
+                self.settings(&path, Some(&names)),
+                &planned.node,
+            )?;
             while let Some(row) = cursor.next()? {
                 raw.push(row);
             }
@@ -2264,10 +2290,12 @@ impl Executor {
                     }
                     subquery::resolve(&mut planned.node, txn, self.tenant)?;
                     let path = self.resolved_search_path(txn)?;
+                    let relations = std::cell::RefCell::new(None);
+                    let names = self.name_rule(txn, &relations);
                     let mut cursor = cursor::Cursor::open(
                         txn,
                         self.tenant,
-                        self.settings(&path),
+                        self.settings(&path, Some(&names)),
                         &planned.node,
                     )?;
                     while cursor.next()?.is_some() {}

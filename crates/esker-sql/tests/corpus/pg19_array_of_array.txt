@@ -1,0 +1,51 @@
+# **An array of an array** — measured on PostgreSQL 19beta1, 2026-09-09.
+# Capture: `tests/captures/pg19_array_of_array.txt`. No fixture; every operand is a literal.
+#
+# r1's wire census v2 named 196 rows of one defect: when the operand is already an array, this node
+# answered `text`/`text[]` where PostgreSQL keeps the element type. There is no array *of* an array
+# — `ARRAY[c]` over an `int[]` is an `int[]` with one more dimension, and `_int4.typarray` is 0, so
+# the constructor's rule is not the `typarray` rule.
+#
+# `array_dims` and the chained subscript `(…)[1][2]` are measured in the capture and deliberately
+# not replayed here: both are missing *features* of their own, not this mechanism, and a corpus
+# that carried them would fail for a reason this unit does not claim to fix.
+#
+SELECT ARRAY[c] AS v FROM (VALUES ('{1,2}'::int[])) s(c)	integer[]	{{1,2}}
+SELECT ARRAY[c] AS v FROM (VALUES ('{"[2020-01-01,2020-01-02)"}'::tsrange[])) s(c)	tsrange[]	{{"[\"2020-01-01 00:00:00\",\"2020-01-02 00:00:00\")"}}
+SELECT ARRAY[c] AS v FROM (VALUES ('{pg_class}'::regclass[])) s(c)	regclass[]	{{pg_class}}
+SELECT (ARRAY[c])[1] AS v FROM (VALUES ('{1,2}'::int[])) s(c)	integer	\N
+SELECT (ARRAY[c])[1] AS v FROM (VALUES ('{"[2020-01-01,2020-01-02)"}'::tsrange[])) s(c)	tsrange	\N
+SELECT (ARRAY[c])[1] AS v FROM (VALUES ('{pg_class}'::regclass[])) s(c)	regclass	\N
+SELECT unnest(ARRAY[c]) AS v FROM (VALUES ('{1,2}'::int[])) s(c)	integer	1 ; 2
+SELECT unnest(ARRAY[c]) AS v FROM (VALUES ('{"[2020-01-01,2020-01-02)"}'::tsrange[])) s(c)	tsrange	["2020-01-01 00:00:00","2020-01-02 00:00:00")
+SELECT unnest(ARRAY[c]) AS v FROM (VALUES ('{pg_class}'::regclass[])) s(c)	regclass	pg_class
+SELECT array_agg(c) AS v FROM (VALUES ('{1,2}'::int[]), ('{3,4}'::int[])) s(c)	integer[]	{{1,2},{3,4}}
+SELECT array_agg(c) AS v FROM (VALUES ('{"[2020-01-01,2020-01-02)"}'::tsrange[])) s(c)	tsrange[]	{{"[\"2020-01-01 00:00:00\",\"2020-01-02 00:00:00\")"}}
+SELECT array_agg(c) AS v FROM (VALUES ('{pg_class}'::regclass[])) s(c)	regclass[]	{{pg_class}}
+SELECT ARRAY[a,b] AS v FROM (VALUES ('{1,2}'::int[], '{3,4}'::int[])) s(a,b)	integer[]	{{1,2},{3,4}}
+SELECT ARRAY[a,b] AS v FROM (VALUES ('{1,2}'::int[], '{3,4,5}'::int[])) s(a,b)	!2202E multidimensional arrays must have array expressions with matching dimensions
+SELECT array_agg(c) AS v FROM (VALUES ('{1,2}'::int[]), ('{3,4,5}'::int[])) s(c)	!2202E cannot accumulate arrays of different dimensionality
+SELECT ARRAY[c] AS v FROM (VALUES (NULL::int[])) s(c)	integer[]	{}
+SELECT ARRAY[a,b] AS v FROM (VALUES ('{1,2}'::int[], NULL::int[])) s(a,b)	!2202E multidimensional arrays must have array expressions with matching dimensions
+SELECT ARRAY[c] AS v FROM (VALUES ('{}'::int[])) s(c)	integer[]	{}
+SELECT ARRAY[c] AS v FROM (VALUES ('{1,NULL}'::int[])) s(c)	integer[]	{{1,NULL}}
+SELECT array_agg(c) AS v FROM (VALUES ('{1,2}'::int[]), (NULL::int[])) s(c)	!22004 cannot accumulate null arrays
+SELECT array_agg(c) AS v FROM (VALUES ('{}'::int[]), ('{}'::int[])) s(c)	!2202E cannot accumulate empty arrays
+SELECT array_agg(c) AS v FROM (VALUES ('{}'::int[]), ('{1}'::int[])) s(c)	!2202E cannot accumulate empty arrays
+SELECT ARRAY[a,b] AS v FROM (VALUES ('{}'::int[], '{}'::int[])) s(a,b)	integer[]	{}
+SELECT ARRAY[a,b] AS v FROM (VALUES (NULL::int[], NULL::int[])) s(a,b)	integer[]	{}
+SELECT '{{1,2}}'::int[][] AS v	integer[]	{{1,2}}
+SELECT ARRAY(SELECT ARRAY(SELECT 1)) AS v	integer[]	{{1}}
+SELECT ARRAY(SELECT c FROM (VALUES ('{1,2}'::int[]),('{3,4}'::int[])) s(c)) AS v	integer[]	{{1,2},{3,4}}
+SELECT ARRAY(SELECT c FROM (VALUES ('{1,2}'::int[]),('{3,4,5}'::int[])) s(c)) AS v	!2202E cannot accumulate arrays of different dimensionality
+SELECT ARRAY(SELECT c FROM (VALUES (NULL::int[])) s(c)) AS v	!22004 cannot accumulate null arrays
+SELECT ARRAY(SELECT c FROM (VALUES ('{}'::int[])) s(c)) AS v	!2202E cannot accumulate empty arrays
+#
+#
+# **The literal half of these four shapes is not replayed here — it is the next unit.** r1's v3
+# smoke was right that the node degrades by operand provenance: with the operand written as a
+# literal the answer is a scalar `text` holding the array's own text, because the fold turns a
+# typed array literal into text before the constructor's rule can reach it — and for `regclass[]`
+# that fold is `0A000 a relation name read as a regclass without a catalog`. A different mechanism
+# in a different file, measured in the capture and pinned by an `#[ignore]`d test.
+

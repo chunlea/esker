@@ -241,7 +241,7 @@ impl SubqueryExpr {
             SubqueryKind::Array => self
                 .column
                 .as_ref()
-                .and_then(|(_, ty)| esker_keys::array::ArrayValue::array_of(*ty))
+                .and_then(|(_, ty)| esker_keys::array::ArrayValue::array_over(*ty))
                 .unwrap_or(ColumnType::TextArray),
             _ => ColumnType::Bool,
         }

@@ -137,18 +137,23 @@ fn a_regclass_is_a_primary_key() {
     );
 }
 
-/// **The one shape this unit still names rather than approximates.**
+/// **Nothing is a named gap here any more.**
 ///
-/// The `regclass[]` column left this test with `debts-v1.1.md` #38, which turned out to be the
-/// other half of *this* unit's design rather than a separate problem: the row codec already wrote
-/// the elements as numbers, and what was missing was the resolution walking into an array on the
-/// way out (`tests/stored_regclass_array.rs`).
+/// This unit left two, and both closed within the hour: the `regclass[]` column with #38 — which
+/// was this unit's own resolution not walking into an array — and the secondary index with #39,
+/// which was two list entries and an `i64` arm, the row key having taken the new form for free.
+/// What is left is `tests/stored_regclass_array.rs` and `tests/regclass_index.rs`.
 #[test]
-fn a_secondary_index_is_a_named_gap() {
-    let mut node = parity::Node::new(&["CREATE TABLE rc_k (id int8, r regclass)"]);
-    // A real server allows this, and a **primary key** over the same column already works here —
-    // the row key took the eight-byte form for free where the secondary index has its own
-    // encoding and its own list.
-    let error = node.run("CREATE INDEX rc_k_r ON rc_k (r)").unwrap_err();
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
+fn the_two_shapes_this_unit_named_are_closed() {
+    let mut node = parity::Node::new(&["CREATE TABLE rc_a (id int8)"]);
+    node.run("CREATE TABLE rc_j (id int8, rs regclass[])")
+        .unwrap();
+    node.run("CREATE TABLE rc_k (id int8, r regclass)").unwrap();
+    node.run("CREATE INDEX rc_k_r ON rc_k (r)").unwrap();
+    // The expression type was never in doubt and still answers 2210.
+    let outcome = node.run("SELECT ARRAY['rc_a'::regclass]").unwrap();
+    let esker_sql::pgwire::session::Outcome::Rows { fields, .. } = outcome else {
+        panic!("no rows");
+    };
+    assert_eq!(fields[0].type_oid, 2210);
 }

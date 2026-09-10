@@ -1461,6 +1461,36 @@ pub enum SqlError {
         detail: String,
     },
 
+    /// `22004` — `array_agg` given a NULL array.
+    ///
+    /// **The constructor accepts what this refuses**: `ARRAY[NULL::int[]]` is `{}` and
+    /// `array_agg` over a NULL row raises. Nothing about one predicts the other, and this is the
+    /// one of the aggregate's three refusals that is not `2202E`.
+    #[error("cannot accumulate null arrays")]
+    ArrayAccumulateNull,
+
+    /// `2202E` — `array_agg` given an empty array.
+    ///
+    /// Refused where the constructor answers `{}` for the same operand.
+    #[error("cannot accumulate empty arrays")]
+    ArrayAccumulateEmpty,
+
+    /// `2202E` — an `ARRAY[…]` whose operands are arrays of unequal dimensions.
+    ///
+    /// **A NULL array operand has no dimensions**, so `ARRAY['{1,2}'::int[], NULL::int[]]` raises
+    /// this rather than building an array with a NULL in it — while `ARRAY[NULL::int[]]` alone is
+    /// the empty array, because then nothing disagrees. Measured, both.
+    #[error("multidimensional arrays must have array expressions with matching dimensions")]
+    ArrayExpressionDimensions,
+
+    /// `2202E` — `array_agg` over arrays of different dimensionality.
+    ///
+    /// The same code and the same cause as [`ArrayExpressionDimensions`](Self::ArrayExpressionDimensions),
+    /// and **a different sentence**: PostgreSQL raises this one in `accumArrayResultArr` and that
+    /// one in `ExecEvalArrayExpr`. A node with one shared message is wrong about half of them.
+    #[error("cannot accumulate arrays of different dimensionality")]
+    ArrayAccumulateDimensions,
+
     /// A division or a modulo by zero: `22012`, for the integers **and** the floats.
     ///
     /// A float divided by zero raises here as it does on a real server; it does not yield
@@ -3138,6 +3168,10 @@ impl SqlError {
             | SqlError::FloatOverflow => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::DivisionByZero => sqlstate::DIVISION_BY_ZERO,
             SqlError::MalformedArrayLiteral { .. } => sqlstate::INVALID_TEXT_REPRESENTATION,
+            SqlError::ArrayExpressionDimensions
+            | SqlError::ArrayAccumulateDimensions
+            | SqlError::ArrayAccumulateEmpty => sqlstate::ARRAY_SUBSCRIPT_ERROR,
+            SqlError::ArrayAccumulateNull => sqlstate::NULL_VALUE_NOT_ALLOWED,
             SqlError::EmptyArrayType | SqlError::IndeterminateParameterType(_) => {
                 sqlstate::INDETERMINATE_DATATYPE
             }
