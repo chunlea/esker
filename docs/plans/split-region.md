@@ -316,6 +316,12 @@ across all six loaded rounds, with both arms shown to have raised the load above
 #40 closes as in-process-harness capacity**, and what stays is
 `a_batch_of_ticks_flattens_the_randomised_timeout` plus 0101's rule.
 
+**The control round is also a free experiment.** When the two 400 s timeouts happened this
+lane's build volume held 331 GB on a disk 86% full; it holds 1 GB now. The same test, on the same
+box, back near its 214 s is evidence that the disk was the drag; still past 400 s says it was not.
+Either way the number is worth reading before the loaded arms, because a control that is itself
+slow makes every comparison after it meaningless.
+
 **Budget: 25 minutes.** The control round took 19.45 s of test time at 663 regions, so nine rounds
 plus cluster setup, teardown and a 25-second load ramp each fits with slack. `env-sampler.sh` runs
 beside it at ten-second resolution, so every duration carries the box it was taken on — including

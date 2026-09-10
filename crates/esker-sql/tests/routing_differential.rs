@@ -1456,12 +1456,16 @@ async fn a_splitting_bulk_load_never_fails_for_want_of_attempts() {
 /// verdict.
 ///
 /// From `/proc`, which is the **Linux VM's** — so it moves when another lane's *container* runs
-/// and is **blind to the host**. That blindness is not hypothetical: the two runs above were
-/// finally attributed to another lane running `cargo test`, `clippy` and `cargo doc` **on the
-/// host** at 17:37, 17:49 and 17:51, none of which appears in this VM's load at all. So this line
-/// is half the picture by construction, and the other half — host compilers and which container
-/// holds which worktree — is the sampler in `esker-coord/h1/env-sampler.sh`. A number taken here
-/// with no sampler beside it can be slow for a reason this line cannot show.
+/// and is **blind to the host**, where a `cargo build` competes for the same physical cores. That
+/// is why the sampler in `esker-coord/h1/env-sampler.sh` counts host compilers beside this: a
+/// number taken here with no sampler next to it can be slow for a reason this line cannot show.
+///
+/// **And a line like this is worth more than the theories it replaces.** The two runs that
+/// prompted it were attributed to a gate, then to another lane, then to a compile inside the
+/// deadline — three times, each refused by evidence somebody had to go and find: the chain log,
+/// the transcript re-read *with the dates on*, and the runner's own first line
+/// (*Finished `test` profile … in 0.09s*). None of it needed a theory, and all of it would
+/// have been in this line.
 fn the_box_right_now(what: &str) -> String {
     let load = std::fs::read_to_string("/proc/loadavg")
         .ok()
