@@ -3816,7 +3816,16 @@ fn catalog_function(
                 (Datum::Text(printed), Some(oid))
                     if printed == crate::catalog::def_functions::UNKNOWN_TYPE =>
                 {
-                    match env.relations()?.user_type_name(oid) {
+                    // **And the `information_schema` domains after those**, which are a third
+                    // source and not a second: they have no record in the tenant's key space, so
+                    // `user_type_name` cannot see them, and `pg_attribute.atttypid` reports one
+                    // for every `information_schema` column (ADR 0103). Without this arm the
+                    // catalog printed `???` for the oids it had itself just handed out.
+                    let named = env.relations()?.user_type_name(oid).map_or_else(
+                        || crate::catalog::pg_catalog::information_schema_domain_name(oid),
+                        Some,
+                    );
+                    match named {
                         // **`schema.name`, not the stored bytes.** A type in a schema is stored
                         // `schema ++ NUL ++ name` (`catalog::SCHEMA_SEPARATOR`), and printing it
                         // raw put a NUL on the wire where PostgreSQL writes a dot — measured,

@@ -147,28 +147,39 @@ fn view_attribute(relation: &RelationRow, column: &super::ViewColumn, attnum: i1
 /// rows that question came back empty, which is a different answer from "four columns" and the
 /// one a client cannot tell from "no such relation".
 ///
-/// They are derived from [`super::pg_catalog::CatalogView::columns`] rather than written out, so
+/// They are derived from [`super::pg_catalog::CatalogView::table_def`] rather than written out, so
 /// a column added to a view cannot be missing from the catalog that describes it — the same rule
 /// `pg_class`'s own rows follow. Nothing here can carry a default, an identity or a generated
 /// expression, so the flags are constants: a catalog relation is computed, and there is nowhere
 /// for one to be stored.
+///
+/// **From the definition and not from the column list beside it**, and that is a fix rather than a
+/// tidy-up: this read `CatalogView::columns` — the `(name, type, typmod)` tuples — where every
+/// other reader of a catalog relation reads its `TableDef`, so when `information_schema`'s columns
+/// became domains (ADR 0103) the wire declared 13361 and **this view still said `name`**. One
+/// relation described two ways, which is the shape `pg_class`'s rows already avoid.
 fn catalog_rows() -> Vec<Vec<Datum>> {
     let mut rows = Vec::new();
     for view in super::pg_catalog::CatalogView::ALL {
-        let oid = i64::try_from(view.table_def().id).unwrap_or(i64::MAX);
-        for (attnum, (name, ty, typmod)) in (1..).zip(view.columns()) {
+        let def = view.table_def();
+        let oid = i64::try_from(def.id).unwrap_or(i64::MAX);
+        for (attnum, column) in (1..).zip(&def.columns) {
             rows.push(vec![
                 Datum::Int8(oid),
-                Datum::Text((*name).to_owned()),
-                Datum::Int8(i64::from(ty.oid())),
+                Datum::Text(column.name.clone()),
+                // **The type's own oid when the column has one**, which is the rule
+                // [`column_row`] applies to a user table — an `information_schema` column is a
+                // domain and `format_type` has to print `information_schema.sql_identifier`.
+                Datum::Int8(column.user_type.map_or_else(
+                    || i64::from(column.ty.oid()),
+                    |oid| i64::try_from(oid).unwrap_or(i64::MAX),
+                )),
                 Datum::Int2(attnum),
-                // **The length the view's column list declares**, which is `-1` for all but one
-                // family: `information_schema`'s `yes_or_no` columns are a domain over
-                // `character varying(3)`, and a real server reports the domain's own typmod for
-                // them. The comment here used to say every catalog column is declared at its
-                // type's own width, and that was true only while the list had nowhere to say
-                // otherwise.
-                Datum::Int4(*typmod),
+                // **-1 for every catalog column, measured** — including the six `yes_or_no` ones,
+                // whose `character varying(3)` is the *domain*'s width and reaches a client
+                // through `pg_type.typtypmod`. The list this once read carried the 7 instead, on
+                // the column, which is one fact in two places.
+                Datum::Int4(column.typmod),
                 Datum::Bool(false),
                 Datum::Bool(false),
                 // No catalog column was ever added by an `ALTER`, so none pads.
