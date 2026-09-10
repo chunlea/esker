@@ -72,6 +72,11 @@ pub(crate) enum ClusterOptions {
         /// who wants a death to stay a death — watching a cluster degrade, or a test that asserts
         /// a node stayed down.
         no_respawn: bool,
+        /// Log what each region's peer believes every N milliseconds, on every node.
+        ///
+        /// Off by default, and a diagnostic: nothing reads it. Passed straight through to
+        /// `esker server --region-census-ms` (`esker_store::census`).
+        region_census_ms: Option<u64>,
     },
     /// Stop a cluster `start` launched.
     Stop {
@@ -100,13 +105,17 @@ pub(crate) fn run(options: &ClusterOptions) -> Result<(), String> {
             write_buffer_size,
             pd,
             no_respawn,
+            region_census_ms,
         } => start(
             *nodes,
             data_dir,
             *base_port,
             *seed,
-            sst_store.as_deref(),
-            *write_buffer_size,
+            &Tuning {
+                sst_store: sst_store.as_deref(),
+                write_buffer_size: *write_buffer_size,
+                region_census_ms: *region_census_ms,
+            },
             Supervision {
                 pd: *pd,
                 respawn: !*no_respawn,
@@ -190,6 +199,8 @@ struct Layout<'a> {
     seed: u64,
     sst_store: Option<&'a str>,
     write_buffer_size: Option<usize>,
+    /// How often each region's peer logs what it believes. `None` is off.
+    region_census_ms: Option<u64>,
     /// The driver's address, once it is known to be listening.
     pd: Option<&'a str>,
     /// `id@address` for every node, which every node is told in full.
@@ -226,6 +237,9 @@ fn store_command(binary: &Path, layout: &Layout<'_>, id: u64) -> Result<Process,
     if let Some(size) = layout.write_buffer_size {
         process.arg("--write-buffer-size").arg(size.to_string());
     }
+    if let Some(every) = layout.region_census_ms {
+        process.arg("--region-census-ms").arg(every.to_string());
+    }
     if let Some(address) = layout.pd {
         process.arg("--pd").arg(address);
     }
@@ -259,13 +273,23 @@ fn spawn_stores(
     Ok(())
 }
 
+/// What `start` passes straight through to every store it spawns.
+///
+/// A struct rather than three more parameters: `start` was already at the seven clippy allows,
+/// and these three have one thing in common that the others do not — none of them is the
+/// supervisor's business, they are each forwarded verbatim to `esker server`.
+struct Tuning<'a> {
+    sst_store: Option<&'a str>,
+    write_buffer_size: Option<usize>,
+    region_census_ms: Option<u64>,
+}
+
 fn start(
     nodes: u64,
     data_dir: &Path,
     base_port: u16,
     seed: u64,
-    sst_store: Option<&str>,
-    write_buffer_size: Option<usize>,
+    tuning: &Tuning<'_>,
     supervision: Supervision,
 ) -> Result<(), String> {
     if nodes == 0 {
@@ -323,8 +347,9 @@ fn start(
         data_dir,
         base_port,
         seed,
-        sst_store,
-        write_buffer_size,
+        sst_store: tuning.sst_store,
+        write_buffer_size: tuning.write_buffer_size,
+        region_census_ms: tuning.region_census_ms,
         pd: pd.as_deref(),
         peers: &peers,
     };

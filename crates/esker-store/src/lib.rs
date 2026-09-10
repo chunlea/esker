@@ -42,6 +42,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod apply;
+pub mod census;
 pub mod columnar;
 pub mod driver;
 pub mod error;
