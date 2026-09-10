@@ -1,0 +1,23 @@
+crates/esker-client/tests/lock_heartbeat.rs
+  s_6f7019c05b578b::t_3e51e03e0feec4 35-47
+crates/esker-store/tests/balance.rs
+  s_6f7019c05b578b::t_49f7f1504d4471 30-32,424-448
+docs/plans/debts-v1.1.md
+  s_6f7019c05b578b::t_93a8ab85307ef7 119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "80ddc4a5928d6547d92a793661d04b56a3f27ce1",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
