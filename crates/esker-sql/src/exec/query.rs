@@ -3011,9 +3011,13 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             // they are the same type — and there is still no `polygon = polygon` on a real
             // server. Four types, and `polygon` is the one that reads like an oversight because
             // every other geometric shape has the operator.
+            // **The measured table decides, and `missing_symbol` names the operator being asked
+            // for.** `IS DISTINCT FROM` needs `=`, so it is refused where `=` is; `<>` asks for
+            // `<>`, and `point` has one where it has no `=` — which is the cell a single
+            // "these types have no comparisons" predicate got wrong in both directions.
             if op.is_comparison()
                 && let Ok(ty) = expr_type(&left, scope)
-                && !crate::value::has_equality_at_all(ty)
+                && !crate::value::operator_exists(op.missing_symbol(), ty)
             {
                 return Err(SqlError::UndefinedOperator {
                     left: ty.name().to_owned(),
@@ -3457,7 +3461,7 @@ fn resolve_in_list(
     // and asking it in only one of the two places is how `polygon IN (polygon)` answered while
     // `polygon = polygon` refused, in the same build.
     if let Ok(ty) = expr_type(&operand, scope)
-        && !crate::value::has_equality_at_all(ty)
+        && !crate::value::operator_exists(BinaryOp::Eq.symbol(), ty)
     {
         return Err(SqlError::UndefinedOperator {
             left: ty.name().to_owned(),
@@ -4002,12 +4006,22 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
     // `DISTINCT` needs; this one asks whether `=` answers at all. An `lseg` splits them —
     // `'…'::lseg = '…'::lseg` is `t` and `count(DISTINCT lseg)` raises — so the shapes are on
     // that list and not on this one.
+    // **`point` is not on this list, and that is the point of the list.** It was, back when a
+    // `point` had no comparison at all; it has exactly one — `point_ne`, and no `point_eq` — so
+    // "comparable to each other" and "which operators exist" are two questions, and only the
+    // second can answer for `<>` without answering the same way for `=`.
+    // `crate::value::operator_exists` is that second question and refuses `point =` where this
+    // now lets it through.
+    //
+    // `json`, `xml` and `json[]` stay because they have no operator at all, so the two questions
+    // agree about them and a second reader costs nothing. If one of them ever grows an operator,
+    // it leaves this list the way `point` did.
     if matches!(
         left,
-        ColumnType::Json | ColumnType::JsonArray | ColumnType::Point | ColumnType::Xml
+        ColumnType::Json | ColumnType::JsonArray | ColumnType::Xml
     ) || matches!(
         right,
-        ColumnType::Json | ColumnType::JsonArray | ColumnType::Point | ColumnType::Xml
+        ColumnType::Json | ColumnType::JsonArray | ColumnType::Xml
     ) {
         return false;
     }

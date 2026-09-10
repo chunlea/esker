@@ -1,0 +1,23 @@
+# **`point <>`, the inequality that exists without its equality** — PostgreSQL 19beta1, 2026-09-09.
+#
+# `point_ne` exists and `point_eq` does not, so `<>` answers and `=` is `42883` — the cell of
+# `pg19_no_equality_types.txt` that a derived rule gets wrong, seen from the side that answers.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **It is fuzzy.** `point_ne` is `|ax-bx| > 1e-6 || |ay-by| > 1e-6`: two points differing by
+#     `1e-6` are *not* different and by `1e-5` they are. Bitwise equality — which is what this
+#     crate's `Datum` already implements for a `point`, and says so in a comment — answers
+#     differently for every pair inside the epsilon.
+#   * **`NaN` is not different from `NaN`.** Every float comparison against a `NaN` is false, so
+#     `>` is false, so *not different*. Bitwise equality happens to agree here and for the opposite
+#     reason, which is worth knowing before someone "simplifies" one into the other.
+#
+SELECT ('(1,1)'::point <> '(1,1)'::point) AS v	boolean	f
+SELECT ('(1,1)'::point <> '(1.0000001,1)'::point) AS v	boolean	f
+SELECT ('(1,1)'::point <> '(1.000001,1)'::point) AS v	boolean	f
+SELECT ('(1,1)'::point <> '(1.00001,1)'::point) AS v	boolean	t
+SELECT ('(1,1)'::point <> '(1,1.00001)'::point) AS v	boolean	t
+SELECT ('(NaN,1)'::point <> '(NaN,1)'::point) AS v	boolean	f
+SELECT (a <> b) AS v FROM (VALUES ('(1,1)'::point, '(1.00001,1)'::point)) s(a,b)	boolean	t
+SELECT (a <> b) AS v FROM (VALUES ('(1,1)'::point, '(1,1)'::point)) s(a,b)	boolean	f

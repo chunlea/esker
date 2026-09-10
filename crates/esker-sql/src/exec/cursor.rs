@@ -2886,6 +2886,24 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     if matches!(left, Datum::Null) || matches!(right, Datum::Null) {
                         return Ok(Datum::Null);
                     }
+                    // **`point <>` is the one comparison a `point` has, and it is fuzzy.**
+                    // `point_ne` is `|ax-bx| > 1e-6 || |ay-by| > 1e-6`, so two points differing by
+                    // `1e-6` are not different and by `1e-5` they are; and every comparison
+                    // against a `NaN` is false, so a `NaN` is not different from itself. Neither
+                    // is what `Datum`'s own `PartialEq` for a `point` does — that is bitwise, and
+                    // its comment says why it is not a SQL equality. `point =` does not exist at
+                    // all and is refused at resolution, so this arm answers `<>` and nothing else.
+                    if let (
+                        Datum::Point { x: ax, y: ay },
+                        Datum::Point { x: bx, y: by },
+                        BinaryOp::NotEq,
+                    ) = (&left, &right, comparison)
+                    {
+                        const EPSILON: f64 = 1.0e-6;
+                        return Ok(Datum::Bool(
+                            (ax - bx).abs() > EPSILON || (ay - by).abs() > EPSILON,
+                        ));
+                    }
                     let ordering = left.pg_cmp(&right);
                     Datum::Bool(match comparison {
                         BinaryOp::Eq => ordering.is_eq(),
