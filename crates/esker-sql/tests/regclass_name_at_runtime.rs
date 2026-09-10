@@ -89,6 +89,18 @@ fn a_runtime_text_becomes_a_regclass() {
 }
 
 /// **`IN` resolves its list**, which is the exception the comparison half had to declare.
+///
+/// **`= ANY` and `IN` are one rule everywhere but here.** This crate folds `x = ANY(array)` and
+/// `x <> ALL(array)` into the same `InList` node as a written `IN`, so an index seek can use a
+/// list it can see — and the two differ in exactly one place: a bare literal in the list. `IN`
+/// coerces it through the *type's* input function and resolves the name; `= ANY` really is `=`, so
+/// `r = ANY('{ra}')` is `22P02`. Measured, both. That is why the node carries an `any` flag rather
+/// than the two being one thing or two variants.
+///
+/// **And it has to be decided before the common-type coercion.** That step gives every `unknown`
+/// in the list the list's type, which for a `regclass` operand means reading the name as an oid —
+/// the comparison's rule, arriving one step early. Putting this after it made `IN` a `22P02` no
+/// matter what the flag said.
 #[test]
 fn an_in_list_resolves_its_names() {
     let mut node = node();
