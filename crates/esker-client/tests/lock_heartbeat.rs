@@ -32,7 +32,19 @@ use esker_proto::{Epoch, Peer, ProtoError, Region, ServerHandle, TransportConfig
 use esker_store::{Store, StoreOptions, StoreService};
 
 /// Short enough that a test can outlive it, long enough that a scheduling hiccup is not a lease.
-const TTL_MS: u64 = 400;
+/// The lease these tests hold a lock across.
+///
+/// **Two seconds because the detector is a stopwatch.** The renewal cadence is `(ttl / 3).max(1)`,
+/// so a lock is lost when a renewal is late by more than `ttl - cadence` — at 400 ms that margin
+/// was **267 ms**, and the gate runs test binaries in parallel processes where a scheduling delay
+/// that long is ordinary. It reddened `a_lock_held_past_its_lease_is_still_its_holders` on an
+/// otherwise green gate at 4283 of 4285.
+///
+/// The production cadence is unchanged and this is not a weaker assertion: the lock must still
+/// survive three whole leases with a live holder. What moves is only how much lateness the
+/// measurement tolerates before it calls a slow thread a lost lock. The cost is about ten seconds
+/// of gate time, which is the price of a timing assertion that means what it says.
+const TTL_MS: u64 = 2_000;
 
 /// The row the whole test is about.
 const KEY: &[u8] = b"held";

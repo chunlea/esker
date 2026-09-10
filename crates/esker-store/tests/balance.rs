@@ -27,7 +27,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use esker_proto::{Operator, RawKvReq, Region, RegionStatus, RequestHeader, Server, Service};
+use esker_proto::{
+    Operator, ProtoError, RawKvReq, Region, RegionStatus, RequestHeader, Server, Service,
+};
 use esker_store::pd::{FakePd, PdClient};
 use esker_store::server::RaftOptions;
 use esker_store::split::SplitOptions;
@@ -419,18 +421,31 @@ async fn regions_reach_a_store_that_joins_and_none_is_left_without_a_leader() {
     // And the data is still all there, through whichever region owns each key.
     for n in 0..400 {
         let k = key(n);
-        let state = first
-            .store
-            .regions()
-            .find(&k)
-            .expect("every key is covered");
-        let header = RequestHeader::new(state.id(), state.region().epoch, 0);
-        let esker_proto::RawKvResp::Get { value: found } = first
-            .store
-            .handle(header, RawKvReq::get(k.clone()))
-            .unwrap()
-        else {
-            panic!("not a get");
+        // **The epoch is sampled and then used, and the cluster is still splitting between those
+        // two lines.** This read loop asked the map which region owns the key, built a header from
+        // the epoch it found, and unwrapped the answer — so a split landing in between came back
+        // as `EpochNotMatch` and failed the test on a gate that was otherwise green at 4283 of
+        // 4285: `region 28 [b"k000200", b"k000215")`, fifteen keys wide, still being cut.
+        //
+        // `put` above already knows this — *"through whichever region currently owns it, retrying
+        // while the routing moves"* — and this loop is the same problem read instead of written.
+        // Nothing is relaxed: every key must still read back the value it was written with, and a
+        // refusal that is not the routing moving still fails.
+        let found = loop {
+            let state = first
+                .store
+                .regions()
+                .find(&k)
+                .expect("every key is covered");
+            let header = RequestHeader::new(state.id(), state.region().epoch, 0);
+            match first.store.handle(header, RawKvReq::get(k.clone())) {
+                Ok(esker_proto::RawKvResp::Get { value }) => break value,
+                Ok(other) => panic!("not a get: {other:?}"),
+                Err(ProtoError::EpochNotMatch { .. } | ProtoError::KeyNotInRegion { .. }) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("{k:?} could not be read: {error}"),
+            }
         };
         assert_eq!(found, Some(Bytes::from(value.clone())), "{k:?} was lost");
     }
