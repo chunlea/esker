@@ -50,6 +50,18 @@ impl Client {
     /// `Parse` with one parameter whose type the client leaves to the server, then `Bind` the
     /// value as text and `Execute` — the three messages a driver sends for `where(col: value)`.
     fn ask(&mut self, sql: &str, param_types: Vec<u32>, value: &str) -> String {
+        let answer = self.ask_unsynced(sql, param_types, value);
+        // **Every ask ends with its `Sync`, and it has to.** After a failure a session discards
+        // every message up to the next `Sync` (`pgwire::session`'s `skipping_until_sync`, captured
+        // from a real server), so a second ask on the same client would be dropped in silence and
+        // come back as the empty string — which reads exactly like "no error". That is how the
+        // refusal test below spent a round pinning a fact about this node that was really a fact
+        // about this harness.
+        self.send(&Frontend::Sync);
+        answer
+    }
+
+    fn ask_unsynced(&mut self, sql: &str, param_types: Vec<u32>, value: &str) -> String {
         let parsed = self.send(&Frontend::Parse {
             statement: "s".to_owned(),
             sql: sql.to_owned(),
@@ -196,34 +208,76 @@ fn a_jsonb_parameter_is_inferred_on_both_parse_forms() {
 /// **The lower bound the fix above needs**: a type with no equality operator must still refuse,
 /// or the inference has bought its green by comparing everything as text.
 ///
-/// `json` does. **`xml` does not, and that is a pre-existing divergence this test found rather
-/// than caused** — measured on 19beta1, `SELECT 1 FROM t WHERE x = $1` over an `xml` column is
-/// `42883 operator does not exist: xml = unknown`, and this node answers no rows. It answered
-/// before the parameter fix too, checked by reverting it, so it belongs to the wire v3 comparison
-/// family (`esker-coord/b4-wire-v3-families.md`) and not here. Pinned as it is so the day that
-/// family lands, this line goes red and says where to look.
+/// Both `json` and `xml` refuse, on both `Parse` forms, and so does 19beta1 — measured today,
+/// `esker-coord/wire-v3-probes.txt`'s `where_eq` rows and r1's census on `ba932e4e` agree, which
+/// is what corrected the claim this test used to carry.
+///
+/// **What it used to say, and why it was wrong.** It asserted that `xml` was *answered* here where
+/// PostgreSQL refuses, and called that a pre-existing divergence for the wire v3 comparison family
+/// to close. That was never a measurement of this node: the `json` ask above it fails at
+/// `Describe`, the harness sent no `Sync`, and a session discards everything up to the next `Sync`
+/// after a failure — so the `xml` ask's four messages were dropped without a byte and the empty
+/// answer read as "no error". Both asks now end with their `Sync` and both refuse. A prediction of
+/// two new DIVERGE rows went out on the strength of the old assertion; the census measured MATCH
+/// and was right.
+///
+/// **The refusals are not word for word, and the difference is where the parameter is resolved.**
+/// This node infers `$1` from the column first and then looks for the operator, so it names both
+/// sides — `operator does not exist: xml = xml`. PostgreSQL leaves the parameter `unknown` and
+/// fails the same lookup — `operator does not exist: xml = unknown`. The census judges a refusal on
+/// direction and sqlstate, so the row is a MATCH; the sentence is written down here because it is
+/// the visible half a client reads.
 #[test]
 fn a_parameter_over_a_type_with_no_equality_still_refuses() {
     let mut client = Client::new();
-    let ask = |client: &mut Client, column: &str, value: &str| {
+    let ask = |client: &mut Client, column: &str, types: Vec<u32>, value: &str| {
         client.ask(
             &format!("SELECT id FROM h WHERE {column} = $1"),
-            vec![0],
+            types,
             value,
         )
     };
-    let json = ask(&mut client, "d", r#"{"a": 1}"#);
+    // **Both `Parse` forms**, because the two are different frames and a pin on one can go green
+    // while the other answers (r1's frame tap, `wire-v3-format.md`).
+    for types in [vec![0], Vec::new()] {
+        let json = ask(&mut client, "d", types.clone(), r#"{"a": 1}"#);
+        assert!(
+            json.contains("operator does not exist: json = json"),
+            "json has no equality on either server, param_types={types:?}: {json}"
+        );
+        let xml = ask(&mut client, "x", types.clone(), "<a/>");
+        assert!(
+            xml.contains("operator does not exist: xml = xml"),
+            "xml has no equality on either server either, param_types={types:?}: {xml}"
+        );
+    }
+}
+
+/// **The counterfactual for the harness bug above**, which is the only thing that can prove the
+/// `Sync` is load-bearing: without it the second ask on a failed session answers nothing at all,
+/// and an assertion that reads "no error" passes over a message stream the server never saw.
+#[test]
+fn an_ask_after_a_failure_is_discarded_until_sync() {
+    let mut client = Client::new();
+    let failed = client.ask_unsynced("SELECT id FROM h WHERE d = $1", vec![0], "{}");
     assert!(
-        json.contains("operator does not exist"),
-        "json has no equality on either server: {json}"
+        failed.contains("operator does not exist"),
+        "the first ask has to fail for this to measure anything: {failed}"
     );
-    // **Today's answer, and PostgreSQL's is a refusal.** Not asserted as correct — asserted so it
-    // cannot change silently.
-    let xml = ask(&mut client, "x", "<a/>");
+    let swallowed = client.ask_unsynced("SELECT id FROM h WHERE x = $1", vec![0], "<a/>");
+    assert_eq!(
+        swallowed, "",
+        "a session discards every message up to the next `Sync` after a failure, so this ask \
+         produced no bytes — and an assertion of the form `!answer.contains(\"ERROR\")` would call \
+         that a pass"
+    );
+    client
+        .session
+        .handle(&Frontend::Sync, &mut client.node.executor, &mut Vec::new());
+    let asked = client.ask("SELECT id FROM h WHERE x = $1", vec![0], "<a/>");
     assert!(
-        !xml.contains("operator does not exist"),
-        "if this now refuses, the wire v3 comparison family has landed and this pin is the record \
-         of what it fixed: {xml}"
+        asked.contains("operator does not exist: xml = xml"),
+        "and after the `Sync` the same ask reaches the executor and refuses: {asked}"
     );
 }
 
@@ -236,6 +290,17 @@ fn a_parameter_over_a_type_with_no_equality_still_refuses() {
 /// zero type OIDs at all. A pin that only covers `param_types=[0]` can go green while the empty
 /// form still refuses, so both are here.
 fn ask_portal_described(
+    client: &mut Client,
+    sql: &str,
+    param_types: Vec<u32>,
+    value: &str,
+) -> String {
+    let answer = portal_described_unsynced(client, sql, param_types, value);
+    client.send(&Frontend::Sync);
+    answer
+}
+
+fn portal_described_unsynced(
     client: &mut Client,
     sql: &str,
     param_types: Vec<u32>,
