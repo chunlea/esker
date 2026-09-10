@@ -462,12 +462,18 @@ struct Versions {
     row_locks: locks::RowLocks,
 }
 
-/// The wall clock, in Unix milliseconds — read **here and nowhere else in this crate**.
+/// The wall clock, in Unix milliseconds — one of **two** readings of it in this crate.
 ///
 /// `CLAUDE.md` invariant 6 is that no node uses its wall clock for ordering, and this does not
 /// break it: [`Versions`] is the timestamp oracle's stand-in, and reading the clock is what an
 /// oracle is for (`esker_pd::tso` does exactly this, and guards it with the same mark). Every
-/// *other* part of this crate takes its instant from a transaction's `start_ts`.
+/// value inside a *statement* takes its instant from a transaction's `start_ts`.
+///
+/// The other reading is `pgwire::server`'s `wall_clock_micros`, for `pg_stat_activity`'s
+/// `backend_start` — a connection has no transaction to derive an instant from, and that column
+/// orders nothing (`debts-v1.1.md` #47). **This line said "here and nowhere else" until that one
+/// landed**, which is the shape a doc comment fails in: nothing compiles it, so a second caller
+/// arrives and the sentence stays true-looking.
 fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

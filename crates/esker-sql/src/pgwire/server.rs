@@ -886,7 +886,9 @@ where
 
 /// The wall clock, in microseconds since the PostgreSQL epoch.
 ///
-/// **The only reading of the wall clock in this crate**, and it is for `backend_start` alone —
+/// **One of the two readings of the wall clock in this crate** — the other is
+/// `backend::unix_now_ms`, the timestamp oracle's stand-in — and this one is for `backend_start`
+/// alone:
 /// see [`crate::session::Client::started`] for why a connection cannot use the clock invariant 6
 /// names, and for the ruling that a display timestamp may use this one.
 fn wall_clock_micros() -> i64 {

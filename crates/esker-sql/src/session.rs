@@ -91,7 +91,9 @@ pub struct Client {
     pub port: Option<i32>,
     /// When the session opened, in microseconds since the PostgreSQL epoch.
     ///
-    /// **The wall clock, and it is the only reading of it in this crate.** Invariant 6 gives the
+    /// **The wall clock, and one of the two readings of it in this crate** — the other is the
+    /// timestamp oracle's stand-in, `backend::unix_now_ms`, which is what an oracle is for.
+    /// Invariant 6 gives the
     /// TSO's physical half as the only clock this node may read, and `now()`,
     /// `clock_timestamp()` and every other value in a *statement* obey it — they are derived from
     /// `txn.start_ts()`. A connection has no transaction: there is nothing to derive this from
