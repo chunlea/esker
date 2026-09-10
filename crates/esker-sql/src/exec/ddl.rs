@@ -549,7 +549,15 @@ pub(super) fn range_representation(subtype: ColumnType) -> Option<ColumnType> {
 ///
 /// Takes the type rather than the column so the `CREATE TABLE` path, which has no `TableDef` yet,
 /// can ask it too. The user-defined-type half stays with its caller, which has the table.
-fn refuse_unindexable_type(ty: ColumnType, method: &str) -> Result<()> {
+///
+/// **`Ok(true)` means approved outright and the caller must stop asking.** A `gin` or `gist` index
+/// over a `tsvector` is covered by that method's own operator class, and none of the *btree*
+/// questions its caller goes on to ask apply to it — including this node's own refusal of a
+/// `tsvector` btree key. Extracting this function turned that `return Ok(())` from "approved, and
+/// we are done" into "this check found nothing", and four tests went red on an index a real server
+/// builds: an early return means two different things and only one of them survives being moved
+/// into a callee. `Ok(false)` is the other one.
+fn refuse_unindexable_type(ty: ColumnType, method: &str) -> Result<bool> {
     // **A `tsvector` column is a `gin` or `gist` key.** `tsvector_ops` is the default operator
     // class for both — measured, `pg_opclass` where `opcdefault` — so `USING gin (tsv)` is exactly
     // what a real server accepts and what `schema_test.rb` builds. Neither method reads the index
@@ -563,7 +571,7 @@ fn refuse_unindexable_type(ty: ColumnType, method: &str) -> Result<()> {
             catalog::GIN_ACCESS_METHOD | catalog::GIST_ACCESS_METHOD
         )
     {
-        return Ok(());
+        return Ok(true);
     }
     if matches!(
         ty,
@@ -584,7 +592,7 @@ fn refuse_unindexable_type(ty: ColumnType, method: &str) -> Result<()> {
     ) {
         return Err(SqlError::NoDefaultOperatorClass(ty.name()));
     }
-    Ok(())
+    Ok(false)
 }
 
 /// **`json` and `point` cannot be indexed on a real server**, and they are the only two —
@@ -615,7 +623,10 @@ fn refuse_unindexable(table: &TableDef, column: &ColumnDef, method: &str) -> Res
     //
     // An *expression* of this type was already accepted, because `index_expression` has no gate of
     // its own; admitting the column is what makes the two paths agree.
-    refuse_unindexable_type(ty, method)?;
+    // Approved outright by the method's own operator class: nothing below is about it.
+    if refuse_unindexable_type(ty, method)? {
+        return Ok(());
+    }
     // **A composite is stored as `text` and must not be indexed as one.** `is_index_key` sees the
     // storage type and cannot tell it apart, so the question is asked here, where the column's
     // declared type is known. PostgreSQL orders a record **field by field**; this node's key would
