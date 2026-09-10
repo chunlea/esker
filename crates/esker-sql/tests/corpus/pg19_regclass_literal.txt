@@ -1,0 +1,31 @@
+# **A bare literal compared against a `regclass` is an oid** — against PostgreSQL 19beta1.
+#
+# `debts-v1.1.md` #41's comparison half: `=` over a `regclass` is `oideq`, so an unadorned literal
+# goes to `oidin` and a name is `22P02`. An *assignment* is the other way and resolves it.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`IN` is not `=`**: `r IN ('ra','rb')` answers where `r = 'ra'` is `22P02`, because the list
+#     is coerced through the type's input function rather than the operator's operand type.
+#   * A literal of **digits** is an oid and simply compares — `r = '0'` is no rows, not an error.
+#
+# Measured in `tests/captures/pg19_regclass_literal.txt`.
+CREATE TABLE ra (id int8)		-
+CREATE TABLE rb (id int8)		-
+CREATE TABLE rh (id int8, r regclass)		-
+INSERT INTO rh VALUES (1, 'ra'::regclass), (2, 'rb'::regclass)		-
+SELECT id FROM rh WHERE r = 'ra'	!22P02 invalid input syntax for type oid: "ra"
+SELECT id FROM rh WHERE 'ra' = r	!22P02 invalid input syntax for type oid: "ra"
+SELECT id FROM rh WHERE r = ANY('{ra}')	!22P02 invalid input syntax for type oid: "ra"
+SELECT id FROM rh WHERE r IN ('ra','rb') ORDER BY id	bigint	1 ; 2
+SELECT id FROM rh WHERE r = 'ra'::regclass	bigint	1
+SELECT id FROM rh WHERE r::text = 'ra'	bigint	1
+SELECT id FROM rh WHERE r <> 'ra'	!22P02 invalid input syntax for type oid: "ra"
+SELECT id FROM rh WHERE r = '0'	bigint	-
+DROP TABLE rh		-
+DROP TABLE ra		-
+DROP TABLE rb		-

@@ -175,7 +175,7 @@ impl Aggregation {
                 _ => undefined(),
             },
             AggregateFunc::ArrayAgg => {
-                Ok(esker_keys::array::ArrayValue::array_of(arg).unwrap_or(ColumnType::Text))
+                Ok(esker_keys::array::ArrayValue::array_over(arg).unwrap_or(ColumnType::Text))
             }
             // **`sum` widens, and the width it goes to is not uniform.** Measured: `int2` and
             // `int4` sum to `bigint`, `int8` sums to **numeric** — which is why an `int8` sum
@@ -608,6 +608,7 @@ impl Aggregation {
                 operand,
                 list,
                 negated,
+                any,
             } => Expr::InList {
                 operand: Box::new(self.rewrite(operand, scope)?),
                 list: list
@@ -615,6 +616,7 @@ impl Aggregation {
                     .map(|item| self.rewrite(item, scope))
                     .collect::<Result<Vec<_>>>()?,
                 negated: *negated,
+                any: *any,
             },
             Expr::IsNull { operand, negated } => Expr::IsNull {
                 operand: Box::new(self.rewrite(operand, scope)?),
@@ -1582,6 +1584,13 @@ impl Accumulator {
                 });
                 let values: Vec<Datum> = values.into_iter().map(|(_, value)| value).collect();
                 match element {
+                    // **Over arrays this stacks rather than nests**, exactly as an `ARRAY[…]`
+                    // constructor does — and refuses three things the constructor accepts, with
+                    // three sentences of its own. Measured; nothing about the constructor
+                    // predicts the aggregate here.
+                    Some(element) if array_element_of(*element).is_some() => {
+                        accumulate_arrays(&values, *element)?
+                    }
                     // **A real array value, not its text.** What the declared type says the column
                     // is, the datum now is — so `pg_typeof` reads `integer[]` off the value and a
                     // client is sent the array's own oid. An element type this node cannot name
@@ -1601,4 +1610,41 @@ impl Accumulator {
             }
         })
     }
+}
+
+/// The element an array type is over — the test for "this operand is itself an array".
+fn array_element_of(ty: ColumnType) -> Option<ColumnType> {
+    esker_keys::array::ArrayValue::element_of(ty)
+}
+
+/// `array_agg` **and `ARRAY(subquery)`** over array values: stack them into one array with
+/// another dimension.
+///
+/// Both reach PostgreSQL's `accumArrayResultArr`, which is why they share this and the `ARRAY[…]`
+/// constructor does not — measured: `ARRAY(SELECT NULL::int[])` raises *cannot accumulate null
+/// arrays* where `ARRAY[NULL::int[]]` answers `{}`. Two things that read like one constructor.
+///
+/// **Three refusals the constructor does not have**, all measured on 19beta1 and all raised from
+/// `accumArrayResultArr`: a NULL row is `22004 cannot accumulate null arrays`, an empty row is
+/// `2202E cannot accumulate empty arrays`, and rows of unequal dimensions are `2202E cannot
+/// accumulate arrays of different dimensionality`. `ARRAY[NULL::int[]]` and
+/// `ARRAY['{}'::int[]]` both answer `{}` for the same operands — the aggregate is the strict one.
+pub(super) fn accumulate_arrays(values: &[Datum], declared: ColumnType) -> Result<Datum> {
+    let mut parts = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            Datum::Null => return Err(SqlError::ArrayAccumulateNull),
+            Datum::Array(array) if array.dims.is_empty() => {
+                return Err(SqlError::ArrayAccumulateEmpty);
+            }
+            Datum::Array(array) => parts.push(Some(array)),
+            // Not an array: the declared type said it would be, so this is this crate's mistake
+            // and not a user's. The text form below is the honest answer for it.
+            _ => return Err(SqlError::Internal("array_agg gathered a non-array".into())),
+        }
+    }
+    let fallback = array_element_of(declared).unwrap_or(declared);
+    esker_keys::array::ArrayValue::stacked(&parts, fallback)
+        .map(Datum::Array)
+        .ok_or(SqlError::ArrayAccumulateDimensions)
 }

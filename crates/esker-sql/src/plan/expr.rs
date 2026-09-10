@@ -130,6 +130,15 @@ pub enum Expr {
         /// `NOT IN`, which is `NOT (x IN …)` and not "none of them are equal" — the difference is
         /// entirely in what NULL does.
         negated: bool,
+        /// Whether this came from `= ANY(…)` / `<> ALL(…)` rather than from a written `IN`.
+        ///
+        /// **The two are one rule everywhere but one place**, which is why the flag is here rather
+        /// than in two variants: a bare literal in the list. `x IN ('ra')` over a `regclass`
+        /// resolves the *name* — a list is coerced through the type's own input function — and
+        /// `x = ANY('{ra}')` is `22P02`, because that one really is `=` and `=` over a `regclass`
+        /// is `oideq`. Measured, both (`debts-v1.1.md` #41). The lowering folds `= ANY` into this
+        /// variant so an index seek can use it, and this is what it must not lose on the way.
+        any: bool,
     },
     /// `x <op> ANY(<array>)` and `x <op> ALL(<array>)` — a comparison, a quantifier, and an array
     /// that is a **value of the row** rather than a list the lowering could see

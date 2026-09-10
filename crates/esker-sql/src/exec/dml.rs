@@ -660,7 +660,7 @@ pub(super) fn insert(
                     column: column.name.clone(),
                 });
             }
-            row[*target] = value_for_column(expr, column, &table, &*txn, executor.rendering())?;
+            row[*target] = value_for_column(expr, column, &table, &*txn, &*executor)?;
         }
         // A sequence fills its column when the statement did not name it, or named it and wrote
         // `DEFAULT`. It runs **after** the values, so a `bigserial` the user did write keeps their
@@ -769,8 +769,30 @@ fn value_for_column(
     column: &crate::catalog::ColumnDef,
     table: &TableDef,
     txn: &dyn Txn,
-    rendering: crate::value::Rendering,
+    executor: &Executor,
 ) -> Result<Datum> {
+    let rendering = executor.rendering();
+    // **An assignment resolves a relation name; a comparison does not** (`debts-v1.1.md` #41).
+    // `INSERT INTO t VALUES ('ra')` goes through `regclassin` on a real server and stores the
+    // relation, where `WHERE r = 'ra'` is `22P02` because `=` is `oideq` — measured, and the two
+    // halves live in different functions for exactly that reason.
+    //
+    // **The name is thrown away here and that is the point**: a `regclass` row holds the number
+    // alone (#35), so what this has to get right is the oid, and the name comes back from the
+    // catalog when the value is printed.
+    if column.ty == ColumnType::RegClass
+        && let crate::plan::Expr::Literal(crate::plan::Literal::String(name)) = expr
+    {
+        // The snapshot is this call's, which is one catalog read per `regclass` column rather
+        // than per statement — a row has one of them or none, and the alternative was holding a
+        // borrow of the executor across the loop that fills the row, which the sequence and
+        // row-id calls after it need mutably.
+        let relations = std::cell::RefCell::new(None);
+        return Ok(crate::value::regclass_of_oid(executor
+            .name_rule(txn, &relations)(
+            name
+        )?));
+    }
     // **An enum column takes a label, not an `int2`.** The value is read as *text* whatever the
     // column's storage is and then turned into the label's ordinal, because `'sad'` in a column of
     // `mood` is a label the same way `'2020-01-01'` in a `date` column is a date — one rule, one
@@ -833,6 +855,17 @@ struct AssignedIn<'a> {
 /// [`value_for_column`], and keeping them side by side is what makes the enum rule visibly the
 /// same rule on both: a label stays a label here and becomes an ordinal in `into_column`.
 fn assigned_value(value: &crate::plan::Expr, at: &mut AssignedIn<'_>) -> Result<Datum> {
+    // **The `UPDATE` half of the assignment rule** (`debts-v1.1.md` #41), and the same sentence
+    // `value_for_column` carries for `INSERT`: an assignment goes through `regclassin` and
+    // resolves the name, where a comparison reads the literal as an oid. The name is discarded —
+    // a `regclass` row holds the number alone (#35) — so what this has to get right is the oid.
+    if at.column.ty == ColumnType::RegClass
+        && let crate::plan::Expr::Literal(crate::plan::Literal::String(name)) = value
+    {
+        let relations = std::cell::RefCell::new(None);
+        let oid = at.executor.name_rule(at.txn, &relations)(name)?;
+        return Ok(crate::value::regclass_of_oid(oid));
+    }
     match value {
         // `SET a = DEFAULT` is the column's own default, which for a sequence column is the next
         // value and for every other one is the constant the catalog holds. `sequence_for` answers
@@ -2080,7 +2113,14 @@ fn drain(
     // not loop, and its rows are the ones that were there when it started.
     super::subquery::resolve(&mut node, txn, executor.tenant)?;
     let path = executor.resolved_search_path(txn)?;
-    let mut cursor = cursor::Cursor::open(txn, executor.tenant, executor.settings(&path), &node)?;
+    let relations = std::cell::RefCell::new(None);
+    let names = executor.name_rule(txn, &relations);
+    let mut cursor = cursor::Cursor::open(
+        txn,
+        executor.tenant,
+        executor.settings(&path, Some(&names)),
+        &node,
+    )?;
     let mut rows = Vec::new();
     while let Some(row) = cursor.next()? {
         rows.push(row);

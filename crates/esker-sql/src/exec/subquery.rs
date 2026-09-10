@@ -1008,6 +1008,18 @@ pub(super) fn value_of(
         // element rather than an absence — which is what makes `{}`, `{NULL}` and NULL three
         // different answers. The element type is the plan's, not the values': an empty subquery
         // has no value to read one from and is still an array of something.
+        // **Over arrays this is the aggregate's rule, not the constructor's.** `ARRAY(SELECT …)`
+        // reaches `accumArrayResultArr` on a real server exactly as `array_agg` does, so it
+        // stacks and it refuses a NULL row, an empty row and ragged rows — where `ARRAY[…]`
+        // accepts the first two. Measured, all four.
+        SubqueryKind::Array
+            if element
+                .and_then(esker_keys::array::ArrayValue::element_of)
+                .is_some() =>
+        {
+            let rows = first_column(values);
+            super::aggregate::accumulate_arrays(&rows, element.unwrap_or(ColumnType::Text))?
+        }
         SubqueryKind::Array => Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
             element.unwrap_or(ColumnType::Text),
             1,
