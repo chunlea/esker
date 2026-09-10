@@ -2791,6 +2791,15 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 resolved.push(resolve(expr, scope)?);
             }
             let element = array_element_type(&resolved, *element, scope)?;
+            // **`void` has no array type**, and a subscript and an `unnest` both need an array
+            // built first, so three of the four array shapes are gated right here. Measured over
+            // the probe list's 100 spellings: `void` is the only one 19beta1 refuses
+            // (`tests/captures/pg19_array_of_void.txt`), so the test is the type and not
+            // `ArrayValue::array_of(ty).is_none()` — that would also refuse `lquery`,
+            // `int2vector` and `oidvector`, which a real server builds arrays of.
+            if element == Some(ColumnType::Void) {
+                return Err(SqlError::NoArrayType(ColumnType::Void.name()));
+            }
             Expr::Array {
                 elements: resolved,
                 element,
@@ -3348,6 +3357,35 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                     }
                 }
             }
+            // **And a pair PostgreSQL has no `||` for is `42883`.** The chain this replaced ended
+            // in a `text` fallback, so every pair concatenated: measured over the probe list's 100
+            // spellings asked three ways, 91 of the 300 shape-rows answered `text` where a real
+            // server has no operator at all (`tests/captures/pg19_concat_operator.txt`).
+            //
+            // **Before the match, not inside it**, because the arm that wraps an element beside an
+            // array would otherwise consume the call first: `'{"x"}'::"char"[] || 'a'::text` was
+            // wrapped into an array concatenation and answered `{x,a}` where 19beta1 has no
+            // operator for the pair. A gate placed after the rewrite is a gate on the rewrite.
+            //
+            // **Decided from the declared types and not from the datums**, because the evaluator's
+            // `text_concat` cannot: a `json`, an `xml` and a `void` are all `Datum::Text` here, so
+            // it asks `column_type()`, is told `text`, and concatenates. That is the borrowed
+            // representation reaching a second decision, and the plan is the only place that still
+            // knows what the operand is.
+            if call.func == CatalogFunc::HstoreConcat
+                && args.len() == 2
+                && let Ok(left) = expr_type(&args[0], scope)
+                && let Ok(right) = expr_type(&args[1], scope)
+                && left != ColumnType::Char
+                && right != ColumnType::Char
+                && concat_pair(left, right).is_none()
+            {
+                return Err(SqlError::UndefinedOperator {
+                    left: left.name().to_owned(),
+                    op: "||",
+                    right: right.name().to_owned(),
+                });
+            }
             match (call.func, args.first()) {
                 (CatalogFunc::PgTypeof, Some(arg)) if args.len() == 1 => {
                     let named = pg_typeof_of(arg, scope)?;
@@ -3385,8 +3423,16 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                     if args.len() == 2 && concat_element_side(&args, scope).is_some() =>
                 {
                     let at = concat_element_side(&args, scope).unwrap_or(0);
-                    let element = expr_type(&args[1 - at], scope)
+                    // **The element the pair *answers* with, not the one the array happens to
+                    // hold.** `'a'::text || '{x}'::varchar[]` is `text[]` on 19beta1 — the scalar
+                    // instantiates the polymorphic pair when it comes first — so wrapping the
+                    // scalar in the array's own element type declared `character varying[]` and
+                    // was measured wrong. [`concat_pair`] is the only thing that knows which.
+                    let element = expr_type(&args[0], scope)
                         .ok()
+                        .zip(expr_type(&args[1], scope).ok())
+                        .and_then(|(left, right)| concat_pair(left, right))
+                        .or_else(|| expr_type(&args[1 - at], scope).ok())
                         .and_then(esker_keys::array::ArrayValue::element_of);
                     let mut args = args;
                     let operand = args[at].clone();
@@ -5636,57 +5682,168 @@ fn same_comparison_family(left: ColumnType, right: ColumnType) -> bool {
     matches!((family(left), family(right)), (Some(a), Some(b)) if a == b)
 }
 
-fn concat_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> ColumnType {
-    // **And an `ltree` makes it an `ltree`**, by the same rule and for the same reason —
-    // `'a.b'::ltree || 'c'::text` is an `ltree` on a real server, so one operand being
-    // one is enough. Three spellings of one symbol now, and each answers its own type.
-    let of = |want: ColumnType| {
-        call.args
-            .iter()
-            .any(|arg| matches!(expr_type(arg, scope), Ok(ty) if ty == want))
-    };
-    // **A fifth spelling, and it is `all` where the others are `any`** — which is why it
-    // was missed. `jsonb || jsonb` merges documents; a jsonb column beside a **text** one
-    // is `text || text` on a real server, because no `jsonb || text` operator exists. So
-    // the quantifier is what the evaluator uses (`args.iter().all(is_jsonb_typed)`), and
-    // the two have to agree or the rows and the declared type part company.
-    //
-    // They had. `a || b` over two jsonb columns merged correctly and said `text`, the same
-    // wrong-declaration bug `->` had one arm below — found by auditing this arm after
-    // fixing that one, not by a failing test.
-    let all_jsonb = !call.args.is_empty()
-        && call
-            .args
-            .iter()
-            .all(|arg| matches!(expr_type(arg, scope), Ok(ColumnType::Jsonb)));
-    // **A fourth spelling.** A tsvector operand makes it a tsvector, and the rows were
-    // already right — it was only the *declared* type that said `text`, which a client
-    // binds against.
-    // **A sixth spelling: an array operand makes it array concatenation**, and the result is that
-    // array's type — `ARRAY[1,2] || 3` is `integer[]`, measured. Asked first because an array of
-    // `text` would otherwise fall through to the string arm and be declared `text`, which is the
-    // wrong-declaration bug this function has now been the site of four times.
-    if let Some(array) = call
-        .args
-        .iter()
-        .find_map(|arg| match expr_type(arg, scope) {
-            Ok(ty) if esker_keys::array::ArrayValue::element_of(ty).is_some() => Some(ty),
-            _ => None,
-        })
+/// **Which pairs `||` has an operator for, and the type it answers** — `pg_operator`'s entries for
+/// the symbol, measured rather than accumulated.
+///
+/// `None` means PostgreSQL has no `||` for this pair and raises `42883`. The chain of "any operand
+/// of type X" arms this replaced had a `text` fallback, so **everything** concatenated: measured
+/// over all 100 type spellings of the wire v3 probe list asked three ways
+/// (`tests/captures/pg19_concat_operator.txt`), 91 of the 300 shape-rows answered `text` where a
+/// real server has no operator at all.
+///
+/// **`||` is not one operator**, which is why one probe shape could not find this. `pg_operator`
+/// carries `text || text`, `anynonarray || text`, `text || anynonarray`, `anyarray || anyarray`,
+/// `anyarray || anyelement`, `anyelement || anyarray`, and one each for `bytea`, `bit`,
+/// `tsvector`, `tsquery`, `jsonb`, `hstore` and `ltree`.
+///
+/// Two widenings that an arm written by hand gets wrong, both measured: **`bit || bit` is
+/// `bit varying`**, and **`citext || citext` is `text`**.
+///
+/// `"char"` is not here: an operand of it makes the call *ambiguous* rather than missing —
+/// `42725`, decided in `resolve` before this is asked, because a real server has a candidate at
+/// every string width and category `Z` prefers none of them.
+fn concat_pair(left: ColumnType, right: ColumnType) -> Option<ColumnType> {
+    /// The types that reach `text || text` through an implicit cast, which is why
+    /// `citext || citext` answers `text` and not `citext`.
+    fn stringy(ty: ColumnType) -> bool {
+        matches!(
+            ty,
+            ColumnType::Text
+                | ColumnType::Varchar
+                | ColumnType::Bpchar
+                | ColumnType::Citext
+                | ColumnType::Name
+        )
+    }
+    use esker_keys::array::ArrayValue;
+    let element_of = ArrayValue::element_of;
+    match (element_of(left), element_of(right)) {
+        // **`anyarray || anyarray` is `unify` on the elements**, which is what `unify` already
+        // does — measured on seven pairs the probe list cannot ask, because its rows carry one
+        // type: `text[] || varchar[]` is `text[]` and `varchar[] || text[]` is
+        // `character varying[]`, `integer[] || bigint[]` is `bigint[]`, `citext[] || text[]` and
+        // `text[] || citext[]` are both `text[]`, `name[] || text[]` is `name[]`. The asymmetry in
+        // the first two is the same one `unify` documents for `name` beside `text`: where both
+        // directions are implicit, the operand that came first keeps the answer.
+        (Some(le), Some(re)) if stringy(le) && stringy(re) => {
+            // **`citext` reaches `text` and nothing reaches back**, which is why it is the one
+            // element that displaces the operand that came first: `citext[] || text[]` and
+            // `text[] || citext[]` are both `text[]`, while `citext[] || citext[]` stays
+            // `citext[]`. `unify` cannot see this — the cast that makes it true is created by
+            // `CREATE EXTENSION citext` and is not in `pg_catalog::CASTS`, which is a dump of a
+            // stock server.
+            let element = if le == re {
+                le
+            } else if le == ColumnType::Citext || re == ColumnType::Citext {
+                ColumnType::Text
+            } else {
+                le
+            };
+            ArrayValue::array_of(element)
+        }
+        (Some(_), Some(_)) => unify(left, right).ok(),
+        // `anyarray || anyelement`, and **the side decides which array type comes out**: measured,
+        // `varchar[] || text` is `character varying[]` while `text || varchar[]` is `text[]`,
+        // because the first operand instantiates the polymorphic pair. A `citext[]` gives `text[]`
+        // on both sides, because `citext -> text` is implicit and the other direction is not.
+        (Some(element), None) if stringy(right) => {
+            if matches!(
+                element,
+                ColumnType::Varchar | ColumnType::Bpchar | ColumnType::Name
+            ) {
+                Some(left)
+            } else {
+                stringy(element).then_some(ColumnType::TextArray)
+            }
+        }
+        (Some(element), None) => (element == right).then_some(left),
+        (None, Some(element)) if stringy(left) => stringy(element).then_some(ColumnType::TextArray),
+        (None, Some(element)) => (element == left).then_some(right),
+        (None, None) => concat_scalars(left, right, stringy),
+    }
+    .or_else(|| {
+        // An array of an element the pair agrees on, for the `ARRAY[…] || element` rewrite that
+        // wrapped one side already.
+        (element_of(left).is_some() && left == right)
+            .then(|| ArrayValue::array_of(element_of(left)?))
+            .flatten()
+    })
+}
+
+/// The scalar half of [`concat_pair`], split out so neither is a wall of arms.
+fn concat_scalars(
+    left: ColumnType,
+    right: ColumnType,
+    stringy: fn(ColumnType) -> bool,
+) -> Option<ColumnType> {
+    // **An `ltree` beside a string is an `ltree`**, which is a real `ltree || text` operator and
+    // not the `anynonarray || text` one — so it is asked before the string rule that would make it
+    // `text`.
+    if (left == ColumnType::Ltree && stringy(right))
+        || (stringy(left) && right == ColumnType::Ltree)
     {
-        return array;
+        return Some(ColumnType::Ltree);
     }
-    if all_jsonb {
-        ColumnType::Jsonb
-    } else if of(ColumnType::Hstore) {
-        ColumnType::Hstore
-    } else if of(ColumnType::Ltree) {
-        ColumnType::Ltree
-    } else if of(ColumnType::TsVector) {
-        ColumnType::TsVector
-    } else {
-        ColumnType::Text
+    if stringy(left) && stringy(right) {
+        return Some(ColumnType::Text);
     }
+    // **The two vectors keep the answer they have**, which is neither server's. PostgreSQL's
+    // `int2vector` and `oidvector` really are arrays — `int2vector || int2vector` is `smallint[]`
+    // there, measured — and here they borrow `text`'s representation, so answering the array type
+    // would mean *parsing* the value and not only declaring a type. That is family **F6**. Left
+    // answering `text` on purpose: turning a wrong type into a refusal would break the queries
+    // that concatenate one today, and neither answer is right until F6 lands.
+    //
+    // **Only beside itself.** `int2vector || text` is `42883` on 19beta1 — a vector is in the
+    // array category there and `text` is not its element — and this node answered `1 2a`. Written
+    // as one rule for both operands first, which kept that row answering; measured, and narrowed.
+    if left == right && matches!(left, ColumnType::Int2Vector | ColumnType::OidVector) {
+        return Some(ColumnType::Text);
+    }
+    if left == right {
+        return match left {
+            // **The widening**: two `bit`s make a `bit varying`, measured.
+            ColumnType::Bit | ColumnType::VarBit => Some(ColumnType::VarBit),
+            ColumnType::Bytea
+            | ColumnType::TsVector
+            | ColumnType::TsQuery
+            | ColumnType::Jsonb
+            | ColumnType::Hstore
+            | ColumnType::Ltree => Some(left),
+            _ => None,
+        };
+    }
+    // **The two vectors are not `anynonarray`.** They are in PostgreSQL's *array* category, so
+    // `int2vector || text` is `42883` there — `text` is not an `int2` — where every other
+    // non-array scalar beside a string is `text`. Here they are `Datum::Text`, so the rule below
+    // would have answered `1 2a`; measured, and excluded.
+    if matches!(left, ColumnType::Int2Vector | ColumnType::OidVector)
+        || matches!(right, ColumnType::Int2Vector | ColumnType::OidVector)
+    {
+        return None;
+    }
+    // `anynonarray || text` and `text || anynonarray`, the pair that makes `id || '-'` work.
+    (stringy(left) || stringy(right)).then_some(ColumnType::Text)
+}
+
+fn concat_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> ColumnType {
+    // **Folded pairwise, left to right, because that is how `||` associates.** `a || b || c` is
+    // `(a || b) || c` on a real server and the middle type is what the third operand meets.
+    //
+    // A pair [`concat_pair`] has no operator for cannot be reached: `resolve` refuses it with
+    // `42883` before anything asks for a type. `text` is the total answer for that unreachable
+    // case and for the `unknown` literals, which is what they resolve to.
+    let mut folded: Option<ColumnType> = None;
+    for arg in &call.args {
+        let Ok(ty) = expr_type(arg, scope) else {
+            return ColumnType::Text;
+        };
+        folded = Some(match folded {
+            None => ty,
+            Some(left) => concat_pair(left, ty).unwrap_or(ColumnType::Text),
+        });
+    }
+    folded.unwrap_or(ColumnType::Text)
 }
 
 /// Which fetch a `->` is, from the **declared type of its operand**.

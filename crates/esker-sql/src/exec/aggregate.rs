@@ -174,6 +174,12 @@ impl Aggregation {
                 ColumnType::Bytea => Ok(ColumnType::Bytea),
                 _ => undefined(),
             },
+            // **The fourth array shape, and the one the constructor's gate does not cover.**
+            // `array_agg(x)` builds an array without an `ARRAY[…]`, so `array_agg(void)` answered
+            // where 19beta1 raises `42704 could not find array type for data type void`.
+            AggregateFunc::ArrayAgg if arg == ColumnType::Void => {
+                Err(SqlError::NoArrayType(ColumnType::Void.name()))
+            }
             AggregateFunc::ArrayAgg => {
                 Ok(esker_keys::array::ArrayValue::array_over(arg).unwrap_or(ColumnType::Text))
             }

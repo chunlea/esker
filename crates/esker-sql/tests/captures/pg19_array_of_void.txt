@@ -1,0 +1,146 @@
+# **Which types an array shape accepts** — four shapes, the whole probe list.
+#
+# PostgreSQL 19beta1, 2026-09-10, `127.0.0.1:55432`, one `BEGIN … ROLLBACK` with a
+# `SAVEPOINT`/`ROLLBACK TO` per probe and `statement_timeout` set. Wire v3 family **F5**.
+#
+# Each of the 100 distinct type spellings the wire v3 probe list carries, asked four ways with the
+# value bound rather than spliced:
+#
+#     pg_typeof(ARRAY[x])                                     ctor
+#     pg_typeof(array_agg(x))                                 agg
+#     pg_typeof((ARRAY[x])[1])                                sub
+#     pg_typeof((SELECT u FROM unnest(ARRAY[x]) u LIMIT 1))    unnest
+#
+# ## The finding: `void` is the only refusal, and all four raise the same one
+#
+#     42704 could not find array type for data type void
+#
+# No `DETAIL`, no `HINT`. Everything else answers — `json`, `xml`, `point`, `lseg`, `box` and the
+# nine array types `GREATEST` refuses for want of a comparison function all build arrays, because
+# an array constructor asks nothing of its element but its type. That is the whole difference
+# between this family and F1a.
+#
+# **So the node's predicate is the type `void`, and must not be "this node has no array for it".**
+# `ArrayValue::array_of` answers `None` for `lquery`, `int2vector` and `oidvector` too, and 19beta1
+# builds `lquery[]`, `int2vector[]` and `oidvector[]`. Refusing those would turn a wrong *type*
+# into a refused *statement* — the worse direction (ADR 0031) — so they stay answering `text[]`
+# and are pinned in `tests/array_of_void.rs` against **F6**, which owns them.
+#
+# ## Two things the sweep found that are NOT this family
+#
+# **`array_agg` over an array is the array, not an array of it**: `array_agg(int2vector)` is
+# `int2vector` and `array_agg(bigint[])` is `bigint[]`, because `array_agg(anyarray)` accumulates
+# into one more dimension of the same type. `ARRAY[bigint[]]` is `bigint[]` for the same reason —
+# PostgreSQL has no nested array types, only more dimensions.
+#
+# **`unnest` in the FROM clause loses the element type on this node**, and it is a separate
+# mechanism: measured, `SELECT unnest(ARRAY['2020-01-01'::date])` describes as `date` (correct)
+# while `SELECT u FROM unnest(ARRAY['2020-01-01'::date]) u` describes as **`text`** — 50 of the
+# 100 spellings, and `regclass` is worse: `XX000 internal error: regclass() reached the row
+# evaluator unresolved`. Family **F10** in `esker-coord/b4-wire-v3-families.md`; nothing here
+# touches it.
+#
+# ## The raw answers, one line per distinct spelling
+#
+#     <type> <TAB> ctor=<answer> <TAB> agg=<answer> <TAB> sub=<answer> <TAB> unnest=<answer>
+#
+"char"	ctor="char"[]	agg="char"[]	sub="char"	unnest="char"
+"char"[]	ctor="char"[]	agg="char"[]	sub="char"	unnest="char"
+bigint	ctor=bigint[]	agg=bigint[]	sub=bigint	unnest=bigint
+bigint[]	ctor=bigint[]	agg=bigint[]	sub=bigint	unnest=bigint
+bit	ctor=bit[]	agg=bit[]	sub=bit	unnest=bit
+bit[]	ctor=bit[]	agg=bit[]	sub=bit	unnest=bit
+boolean	ctor=boolean[]	agg=boolean[]	sub=boolean	unnest=boolean
+boolean[]	ctor=boolean[]	agg=boolean[]	sub=boolean	unnest=boolean
+box	ctor=box[]	agg=box[]	sub=box	unnest=box
+box[]	ctor=box[]	agg=box[]	sub=box	unnest=box
+bytea	ctor=bytea[]	agg=bytea[]	sub=bytea	unnest=bytea
+bytea[]	ctor=bytea[]	agg=bytea[]	sub=bytea	unnest=bytea
+character	ctor=character[]	agg=character[]	sub=character	unnest=character
+character varying	ctor=character varying[]	agg=character varying[]	sub=character varying	unnest=character varying
+character varying[]	ctor=character varying[]	agg=character varying[]	sub=character varying	unnest=character varying
+character[]	ctor=character[]	agg=character[]	sub=character	unnest=character
+cidr	ctor=cidr[]	agg=cidr[]	sub=cidr	unnest=cidr
+cidr[]	ctor=cidr[]	agg=cidr[]	sub=cidr	unnest=cidr
+circle	ctor=circle[]	agg=circle[]	sub=circle	unnest=circle
+circle[]	ctor=circle[]	agg=circle[]	sub=circle	unnest=circle
+citext	ctor=citext[]	agg=citext[]	sub=citext	unnest=citext
+citext[]	ctor=citext[]	agg=citext[]	sub=citext	unnest=citext
+date	ctor=date[]	agg=date[]	sub=date	unnest=date
+date[]	ctor=date[]	agg=date[]	sub=date	unnest=date
+daterange	ctor=daterange[]	agg=daterange[]	sub=daterange	unnest=daterange
+daterange[]	ctor=daterange[]	agg=daterange[]	sub=daterange	unnest=daterange
+double precision	ctor=double precision[]	agg=double precision[]	sub=double precision	unnest=double precision
+double precision[]	ctor=double precision[]	agg=double precision[]	sub=double precision	unnest=double precision
+hstore	ctor=hstore[]	agg=hstore[]	sub=hstore	unnest=hstore
+hstore[]	ctor=hstore[]	agg=hstore[]	sub=hstore	unnest=hstore
+inet	ctor=inet[]	agg=inet[]	sub=inet	unnest=inet
+inet[]	ctor=inet[]	agg=inet[]	sub=inet	unnest=inet
+int2vector	ctor=int2vector[]	agg=int2vector	sub=int2vector	unnest=int2vector
+int4range	ctor=int4range[]	agg=int4range[]	sub=int4range	unnest=int4range
+int4range[]	ctor=int4range[]	agg=int4range[]	sub=int4range	unnest=int4range
+int8range	ctor=int8range[]	agg=int8range[]	sub=int8range	unnest=int8range
+int8range[]	ctor=int8range[]	agg=int8range[]	sub=int8range	unnest=int8range
+integer	ctor=integer[]	agg=integer[]	sub=integer	unnest=integer
+integer[]	ctor=integer[]	agg=integer[]	sub=integer	unnest=integer
+interval	ctor=interval[]	agg=interval[]	sub=interval	unnest=interval
+interval[]	ctor=interval[]	agg=interval[]	sub=interval	unnest=interval
+json	ctor=json[]	agg=json[]	sub=json	unnest=json
+json[]	ctor=json[]	agg=json[]	sub=json	unnest=json
+jsonb	ctor=jsonb[]	agg=jsonb[]	sub=jsonb	unnest=jsonb
+jsonb[]	ctor=jsonb[]	agg=jsonb[]	sub=jsonb	unnest=jsonb
+line	ctor=line[]	agg=line[]	sub=line	unnest=line
+line[]	ctor=line[]	agg=line[]	sub=line	unnest=line
+lquery	ctor=lquery[]	agg=lquery[]	sub=lquery	unnest=lquery
+lseg	ctor=lseg[]	agg=lseg[]	sub=lseg	unnest=lseg
+lseg[]	ctor=lseg[]	agg=lseg[]	sub=lseg	unnest=lseg
+ltree	ctor=ltree[]	agg=ltree[]	sub=ltree	unnest=ltree
+ltree[]	ctor=ltree[]	agg=ltree[]	sub=ltree	unnest=ltree
+macaddr	ctor=macaddr[]	agg=macaddr[]	sub=macaddr	unnest=macaddr
+macaddr[]	ctor=macaddr[]	agg=macaddr[]	sub=macaddr	unnest=macaddr
+money	ctor=money[]	agg=money[]	sub=money	unnest=money
+money[]	ctor=money[]	agg=money[]	sub=money	unnest=money
+name	ctor=name[]	agg=name[]	sub=name	unnest=name
+name[]	ctor=name[]	agg=name[]	sub=name	unnest=name
+numeric	ctor=numeric[]	agg=numeric[]	sub=numeric	unnest=numeric
+numeric[]	ctor=numeric[]	agg=numeric[]	sub=numeric	unnest=numeric
+numrange	ctor=numrange[]	agg=numrange[]	sub=numrange	unnest=numrange
+numrange[]	ctor=numrange[]	agg=numrange[]	sub=numrange	unnest=numrange
+oid	ctor=oid[]	agg=oid[]	sub=oid	unnest=oid
+oid[]	ctor=oid[]	agg=oid[]	sub=oid	unnest=oid
+oidvector	ctor=oidvector[]	agg=oidvector	sub=oidvector	unnest=oidvector
+path	ctor=path[]	agg=path[]	sub=path	unnest=path
+path[]	ctor=path[]	agg=path[]	sub=path	unnest=path
+point	ctor=point[]	agg=point[]	sub=point	unnest=point
+point[]	ctor=point[]	agg=point[]	sub=point	unnest=point
+polygon	ctor=polygon[]	agg=polygon[]	sub=polygon	unnest=polygon
+polygon[]	ctor=polygon[]	agg=polygon[]	sub=polygon	unnest=polygon
+real	ctor=real[]	agg=real[]	sub=real	unnest=real
+real[]	ctor=real[]	agg=real[]	sub=real	unnest=real
+regclass	ctor=regclass[]	agg=regclass[]	sub=regclass	unnest=regclass
+regclass[]	ctor=regclass[]	agg=regclass[]	sub=regclass	unnest=regclass
+regproc	ctor=regproc[]	agg=regproc[]	sub=regproc	unnest=regproc
+regproc[]	ctor=regproc[]	agg=regproc[]	sub=regproc	unnest=regproc
+regtype	ctor=regtype[]	agg=regtype[]	sub=regtype	unnest=regtype
+regtype[]	ctor=regtype[]	agg=regtype[]	sub=regtype	unnest=regtype
+smallint	ctor=smallint[]	agg=smallint[]	sub=smallint	unnest=smallint
+smallint[]	ctor=smallint[]	agg=smallint[]	sub=smallint	unnest=smallint
+text	ctor=text[]	agg=text[]	sub=text	unnest=text
+text[]	ctor=text[]	agg=text[]	sub=text	unnest=text
+time	ctor=time without time zone[]	agg=time without time zone[]	sub=time without time zone	unnest=time without time zone
+timestamp	ctor=timestamp without time zone[]	agg=timestamp without time zone[]	sub=timestamp without time zone	unnest=timestamp without time zone
+timestamp with time zone	ctor=timestamp with time zone[]	agg=timestamp with time zone[]	sub=timestamp with time zone	unnest=timestamp with time zone
+timestamp with time zone[]	ctor=timestamp with time zone[]	agg=timestamp with time zone[]	sub=timestamp with time zone	unnest=timestamp with time zone
+tsquery	ctor=tsquery[]	agg=tsquery[]	sub=tsquery	unnest=tsquery
+tsquery[]	ctor=tsquery[]	agg=tsquery[]	sub=tsquery	unnest=tsquery
+tsrange	ctor=tsrange[]	agg=tsrange[]	sub=tsrange	unnest=tsrange
+tsrange[]	ctor=tsrange[]	agg=tsrange[]	sub=tsrange	unnest=tsrange
+tstzrange	ctor=tstzrange[]	agg=tstzrange[]	sub=tstzrange	unnest=tstzrange
+tstzrange[]	ctor=tstzrange[]	agg=tstzrange[]	sub=tstzrange	unnest=tstzrange
+tsvector	ctor=tsvector[]	agg=tsvector[]	sub=tsvector	unnest=tsvector
+tsvector[]	ctor=tsvector[]	agg=tsvector[]	sub=tsvector	unnest=tsvector
+uuid	ctor=uuid[]	agg=uuid[]	sub=uuid	unnest=uuid
+uuid[]	ctor=uuid[]	agg=uuid[]	sub=uuid	unnest=uuid
+void	ctor=!42704 could not find array type for data type void	agg=!42704 could not find array type for data type void	sub=!42704 could not find array type for data type void	unnest=!42704 could not find array type for data type void
+xml	ctor=xml[]	agg=xml[]	sub=xml	unnest=xml
+xml[]	ctor=xml[]	agg=xml[]	sub=xml	unnest=xml
