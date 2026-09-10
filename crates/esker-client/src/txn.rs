@@ -62,7 +62,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, Waiting};
 use crate::region_cache::RegionResolver;
 use crate::retry::backoff_ms;
 use crate::router::{ClientOptions, Router, clamp_end, fan_out, repair_route};
@@ -864,7 +864,7 @@ impl Transaction {
             ))));
         };
         if status.is_fatal() {
-            self.check(status.clone(), Some(key))?;
+            self.check(status.clone(), Some(key), Waiting::Acquire)?;
         }
         Ok(status.lock().cloned())
     }
@@ -1061,7 +1061,7 @@ impl Transaction {
         let request = TxnKvReq::LatestCommit {
             key: Bytes::copy_from_slice(key),
         };
-        match self.call_resolving(&request)? {
+        match self.call_resolving(&request, Waiting::Read)? {
             TxnKvResp::LatestCommit { newest } => Ok(newest),
             other => Err(unexpected(Method::TxnLatestCommit, &other)),
         }
@@ -1089,7 +1089,7 @@ impl Transaction {
             key: Bytes::copy_from_slice(key),
             ts: self.read_ts(),
         };
-        match self.call_resolving(&request)? {
+        match self.call_resolving(&request, Waiting::Read)? {
             TxnKvResp::Get { value } => Ok(value),
             other => Err(unexpected(Method::TxnGet, &other)),
         }
@@ -1222,7 +1222,7 @@ impl Transaction {
             ts: self.read_ts(),
             reverse: false,
         };
-        match self.call_resolving(&request)? {
+        match self.call_resolving(&request, Waiting::Read)? {
             TxnKvResp::Scan { pairs } => Ok(pairs),
             other => Err(unexpected(Method::TxnScan, &other)),
         }
@@ -1426,7 +1426,7 @@ impl Transaction {
             // key tells the two apart (`docs/txn-spec.md` §6.1).
             if let Some(at) = statuses.iter().position(TxnStatus::is_fatal) {
                 let lost = keys.get(at);
-                return self.check(statuses[at].clone(), lost);
+                return self.check(statuses[at].clone(), lost, Waiting::Acquire);
             }
             let locks: Vec<LockInfo> = statuses
                 .iter()
@@ -1440,6 +1440,7 @@ impl Transaction {
                 return Err(Error::LockNotCleared {
                     start_ts: locks[0].start_ts,
                     key: locks[0].key.clone(),
+                    waiting: Waiting::Acquire,
                 });
             }
             // The same rule on the prewrite path: the last look waits the lease out, so a
@@ -1511,7 +1512,7 @@ impl Transaction {
         match self.call(&request)? {
             // No key: a `Commit` answers for the batch, not per key, so naming one would be a
             // guess dressed as a fact.
-            TxnKvResp::Commit { status } => self.check(status, None),
+            TxnKvResp::Commit { status } => self.check(status, None, Waiting::Acquire),
             other => Err(unexpected(Method::TxnCommit, &other)),
         }
     }
@@ -1522,7 +1523,7 @@ impl Transaction {
             keys: keys.to_vec(),
         };
         match self.call(&request)? {
-            TxnKvResp::Rollback { status } => self.check(status, None),
+            TxnKvResp::Rollback { status } => self.check(status, None, Waiting::Acquire),
             other => Err(unexpected(Method::TxnRollback, &other)),
         }
     }
@@ -1594,7 +1595,7 @@ impl Transaction {
             // `check`, whose `Locked` arm reports `LockNotCleared` on sight — a `40001` for a
             // holder that may be about to roll back, which is a phantom that never existed.
             for round in 0..=self.max_lock_resolutions {
-                let status = match self.call_resolving(&request)? {
+                let status = match self.call_resolving(&request, Waiting::ReadSet)? {
                     TxnKvResp::Prewrite { keys } => keys.into_iter().next(),
                     other => return Err(unexpected(Method::TxnPrewrite, &other)),
                 };
@@ -1603,13 +1604,14 @@ impl Transaction {
                     // The range's lower bound is the key the conflict is reported against: it
                     // is what the request routed by, and it is the only key of the range this
                     // client can name.
-                    self.check(status, Some(start))?;
+                    self.check(status, Some(start), Waiting::ReadSet)?;
                     break;
                 };
                 if round == self.max_lock_resolutions {
                     return Err(Error::LockNotCleared {
                         start_ts: lock.start_ts,
                         key: lock.key.clone(),
+                        waiting: Waiting::ReadSet,
                     });
                 }
                 // **`may_wound: false`, and that is the decision this loop exists to make.** A
@@ -1722,7 +1724,7 @@ impl Transaction {
     /// `key` is the one the status is about, where the method answered per key. `None` where it
     /// did not — and it stays `None` rather than becoming the batch's first key, because a
     /// caller that reads it as "this key lost" would be reading a guess.
-    fn check(&self, status: TxnStatus, key: Option<&Bytes>) -> Result<()> {
+    fn check(&self, status: TxnStatus, key: Option<&Bytes>, waiting: Waiting) -> Result<()> {
         match status {
             TxnStatus::Ok => Ok(()),
             TxnStatus::Conflict { commit_ts } => Err(Error::TxnConflict {
@@ -1748,6 +1750,7 @@ impl Transaction {
             TxnStatus::Locked(lock) => Err(Error::LockNotCleared {
                 start_ts: lock.start_ts,
                 key: lock.key.clone(),
+                waiting,
             }),
         }
     }
@@ -1772,7 +1775,7 @@ impl Transaction {
     /// primary what happened and finish the job either way — and the loop is bounded, because
     /// a lock whose owner keeps heartbeating never clears and a client that waited for ever
     /// would be indistinguishable from one that hung.
-    fn call_resolving(&self, request: &TxnKvReq) -> Result<TxnKvResp> {
+    fn call_resolving(&self, request: &TxnKvReq, waiting: Waiting) -> Result<TxnKvResp> {
         for attempt in 0..=self.max_lock_resolutions {
             let error = match self.call(request) {
                 Ok(response) => return Ok(response),
@@ -1786,6 +1789,7 @@ impl Transaction {
                 return Err(Error::LockNotCleared {
                     start_ts: lock.start_ts,
                     key: lock.key.clone(),
+                    waiting,
                 });
             }
             // **The last look waits out the lease rather than one more backoff step.**

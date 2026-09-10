@@ -1059,7 +1059,16 @@ fn a_lock_inside_its_lease_is_waited_for_rather_than_settled() {
     match txn.get(b"k").unwrap_err() {
         // The key comes back with the transaction that held it: a caller told only "a lock did
         // not clear" cannot say *what* it waited on, and one blocked key looks like any other.
-        Error::LockNotCleared { start_ts, key } => {
+        Error::LockNotCleared {
+            start_ts,
+            key,
+            waiting,
+        } => {
+            assert_eq!(
+                waiting,
+                esker_client::Waiting::Read,
+                "a `get` holds nothing and acquires nothing"
+            );
             assert_eq!((start_ts, key.as_ref()), (LIVE_TS, b"k".as_slice()));
         }
         other => panic!("expected LockNotCleared, got {other:?}"),
@@ -1442,7 +1451,16 @@ fn a_lock_that_never_clears_is_bounded() {
     let txn = client.begin().unwrap();
 
     match txn.get(b"k").unwrap_err() {
-        Error::LockNotCleared { start_ts, key } => {
+        Error::LockNotCleared {
+            start_ts,
+            key,
+            waiting,
+        } => {
+            assert_eq!(
+                waiting,
+                esker_client::Waiting::Read,
+                "a `get` holds nothing and acquires nothing"
+            );
             assert_eq!((start_ts, key.as_ref()), (DEAD_TS, b"k".as_slice()));
         }
         other => panic!("expected LockNotCleared, got {other:?}"),
