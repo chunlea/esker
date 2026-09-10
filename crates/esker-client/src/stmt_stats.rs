@@ -22,17 +22,46 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use crate::wire::Method;
 
-/// Whether the instrument is on, read once from the environment.
+/// Whether the instrument is on: read once from the environment, or turned on by [`force_on`].
+///
+/// One relaxed load once it is settled, which is the whole of what "off" costs.
 #[must_use]
 pub fn enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("ESKER_STMT_STATS").is_some())
+    match ON.load(Ordering::Relaxed) {
+        UNKNOWN => {
+            let on = if std::env::var_os("ESKER_STMT_STATS").is_some() {
+                YES
+            } else {
+                NO
+            };
+            ON.store(on, Ordering::Relaxed);
+            on == YES
+        }
+        settled => settled == YES,
+    }
 }
+
+/// Turns the instrument on for the rest of this process.
+///
+/// **For a test that has to read its own counters.** A run turns this on with `ESKER_STMT_STATS`;
+/// a test cannot, because setting an environment variable is `unsafe` in this edition and racy in
+/// fact — another thread may be reading one as it is written. This is the same switch without the
+/// race, and it only ever moves one way.
+pub fn force_on() {
+    ON.store(YES, Ordering::Relaxed);
+}
+
+const UNKNOWN: u8 = 0;
+const NO: u8 = 1;
+const YES: u8 = 2;
+
+/// [`UNKNOWN`] until the first [`enabled`] settles it, or [`force_on`] does.
+static ON: AtomicU8 = AtomicU8::new(UNKNOWN);
 
 thread_local! {
     /// Wire calls this thread has made since the last reset — **one per attempt**.
@@ -76,6 +105,23 @@ thread_local! {
     static READ_HEADS: RefCell<BTreeMap<[u8; HEAD], u64>> = const { RefCell::new(BTreeMap::new()) };
     /// The same for range scans, kept apart because they are the number `DROP` is priced by.
     static SCAN_HEADS: RefCell<BTreeMap<[u8; HEAD], u64>> = const { RefCell::new(BTreeMap::new()) };
+
+    // -- what this statement met when a store was not there ------------------------------
+    //
+    // **A statement that met a dead store and recovered looks exactly like one that did not.**
+    // A failed attempt is a round trip, so `ROUND_TRIPS` counts both and tells them apart from
+    // neither. run 124 asks a question the difference is the whole of: with a store killed every
+    // sixty seconds under a real workload, was any store ever unreachable, and was every such
+    // moment recovered from? A green run without these two numbers cannot separate "nothing was
+    // ever unreachable" from "everything unreachable was silently recovered", and those are
+    // different claims about the redial `102aef93` added.
+
+    /// Calls that never left this client because the connection to that store was closed, by
+    /// store. `NotSent` and nothing else: an error the store answered is not this.
+    static NOT_SENT: RefCell<BTreeMap<u64, u64>> = const { RefCell::new(BTreeMap::new()) };
+    /// Connections rebuilt to a store that had gone away, by store — the recovery itself, and
+    /// the only place a run can see that one happened at all.
+    static REDIALS: RefCell<BTreeMap<u64, u64>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 /// How many leading bytes of a key are kept to tell record kinds apart. Opaque to this crate.
@@ -102,6 +148,10 @@ pub struct Cost {
     pub read_heads: BTreeMap<[u8; HEAD], u64>,
     /// Key heads the range scans addressed.
     pub scan_heads: BTreeMap<[u8; HEAD], u64>,
+    /// Calls that never left the client because that store's connection was closed, by store.
+    pub not_sent: BTreeMap<u64, u64>,
+    /// Connections rebuilt to a store that had gone away, by store.
+    pub redials: BTreeMap<u64, u64>,
 }
 
 /// How many mutations a body carries, which is zero for everything but a `Prewrite`.
@@ -163,6 +213,25 @@ pub fn record_call(region_id: u64, body: &crate::wire::Body) {
     }
 }
 
+/// Records a call that never left this client, because `store_id`'s connection was closed.
+///
+/// **Not every `NotSent`** — only the one this crate can attribute to a store that went away.
+/// A request with nowhere to go at all is a different fact and is not counted here.
+pub fn record_not_sent(store_id: u64) {
+    if !enabled() {
+        return;
+    }
+    NOT_SENT.with_borrow_mut(|counts| *counts.entry(store_id).or_default() += 1);
+}
+
+/// Records a connection rebuilt to `store_id`.
+pub fn record_redial(store_id: u64) {
+    if !enabled() {
+        return;
+    }
+    REDIALS.with_borrow_mut(|counts| *counts.entry(store_id).or_default() += 1);
+}
+
 /// Adds one to `map`'s count for the head of `key`, padded when the key is shorter than [`HEAD`].
 fn bump(map: &'static std::thread::LocalKey<RefCell<BTreeMap<[u8; HEAD], u64>>>, key: &[u8]) {
     let mut head = [0u8; HEAD];
@@ -184,6 +253,8 @@ pub fn taken() -> Cost {
         waited: Duration::from_micros(WAITED.with(Cell::get)),
         read_heads: READ_HEADS.with_borrow(Clone::clone),
         scan_heads: SCAN_HEADS.with_borrow(Clone::clone),
+        not_sent: NOT_SENT.with_borrow(Clone::clone),
+        redials: REDIALS.with_borrow(Clone::clone),
     }
 }
 
@@ -198,6 +269,8 @@ pub fn reset() {
     WAITED.with(|n| n.set(0));
     READ_HEADS.with_borrow_mut(BTreeMap::clear);
     SCAN_HEADS.with_borrow_mut(BTreeMap::clear);
+    NOT_SENT.with_borrow_mut(BTreeMap::clear);
+    REDIALS.with_borrow_mut(BTreeMap::clear);
 }
 
 #[cfg(test)]
