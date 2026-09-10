@@ -1,0 +1,19 @@
+docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md
+  s_2bed4ac2b1c944::t_cc141fc2e7b7e5 427-474,572-573
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "74d1028f58ae28d7b20696ccd29c34f36097045d",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
