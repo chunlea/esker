@@ -312,3 +312,132 @@ fn two_inserts_of_one_new_key_leave_one_winner() {
 
     cluster.shutdown();
 }
+
+/// **A range check meets a lock, waits for it, and is refused when it commits** — and never
+/// wounds it ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
+/// §1).
+///
+/// The store answers `Locked` for a lock inside a checked range, because a transaction that has
+/// prewritten into the range but not committed is a phantom in flight. What the client owes it is
+/// a wait, not a wound: a range check **acquires nothing**, so it cannot be half of a cycle, and
+/// killing the holder to make "this range did not move" true would abort a transaction that did
+/// nothing wrong. The holder here is *younger* than the checker, which is exactly the case the
+/// wound rule would kill.
+///
+/// The assertion is in two halves and both are needed: the checker is refused, **and the holder's
+/// lock is still there afterwards**. Only the second one can tell a wait from a wound.
+#[test]
+fn a_range_check_waits_for_a_lock_it_may_not_wound() {
+    let cluster = cluster(0xa0_0104);
+    let client = client(&cluster, 104);
+    let router = cluster.router(104).expect("a router");
+
+    // The checker's snapshot is taken first, so the holder below is younger than it.
+    let mut checker = client.begin().unwrap();
+    let holder_ts = cluster.oracle().tso_one();
+    assert!(
+        holder_ts > checker.start_ts(),
+        "the holder must be the younger of the two for the wound rule to have an opinion"
+    );
+
+    let held = router
+        .call(&Body::Txn(TxnKvReq::Prewrite {
+            start_ts: holder_ts,
+            primary: Bytes::from_static(b"a7"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::Put {
+                key: Bytes::from_static(b"a7"),
+                value: Bytes::from_static(b"in flight"),
+                read_ts: None,
+            }],
+        }))
+        .unwrap()
+        .into_txn_kv()
+        .unwrap();
+    assert_eq!(held, TxnKvResp::prewrite_ok(1));
+
+    // `a7`, not something past `m`: the topology's boundary is `b"m"`, and a range check is
+    // answered by the region its **lower bound** falls in and no further (ADR 0067 §3). A holder
+    // on the far side of the boundary is a limitation this test must not accidentally measure.
+    checker.put(b"a5", b"mine");
+    checker.checking(
+        [],
+        vec![(Bytes::from_static(b"a"), Bytes::from_static(b"z"))],
+    );
+    let refused = checker
+        .commit()
+        .expect_err("a lock inside the read range is a phantom this transaction cannot rule out");
+    assert!(
+        matches!(refused, Error::LockNotCleared { start_ts, .. } if start_ts == holder_ts),
+        "{refused}"
+    );
+
+    // **The half that proves it waited rather than wounded.** A wound would have left a rollback
+    // marker on the holder's primary and taken its lock away.
+    let still = router
+        .call(&Body::Txn(TxnKvReq::Prewrite {
+            start_ts: cluster.oracle().tso_one(),
+            primary: Bytes::from_static(b"a"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::CheckRange {
+                start: Bytes::from_static(b"a"),
+                end: Bytes::from_static(b"z"),
+            }],
+        }))
+        .unwrap()
+        .into_txn_kv()
+        .unwrap();
+    let TxnKvResp::Prewrite { keys } = still else {
+        panic!("a prewrite answers a prewrite")
+    };
+    assert!(
+        matches!(&keys[..], [TxnStatus::Locked(lock)] if lock.start_ts == holder_ts),
+        "the holder is untouched: {keys:?}"
+    );
+
+    cluster.shutdown();
+}
+
+/// **And when the lock turns out to be nobody's, the check is asked again and passes.**
+///
+/// The counterfactual of the test above, and the reason the store answers `Locked` rather than
+/// `Conflict`: a lock is a question, not a verdict. This holder's lease runs out, so the checker
+/// settles it — leaving a rollback marker, which ADR 0078 already says is not a phantom — asks the
+/// range again, and commits. A client that read `Locked` as "you lost" would refuse this
+/// transaction for a row that never existed.
+#[test]
+fn a_range_check_that_outlives_the_lock_commits() {
+    let cluster = cluster(0xa0_0105);
+    let client = client(&cluster, 105);
+    let router = cluster.router(105).expect("a router");
+
+    // A lease short enough that the resolution loop outlives it, on this side of the `b"m"`
+    // boundary so that the range check actually reaches it.
+    let abandoned = router
+        .call(&Body::Txn(TxnKvReq::Prewrite {
+            start_ts: cluster.oracle().tso_one(),
+            primary: Bytes::from_static(b"a7"),
+            ttl_ms: 1,
+            mutations: vec![TxnMutation::Put {
+                key: Bytes::from_static(b"a7"),
+                value: Bytes::from_static(b"abandoned"),
+                read_ts: None,
+            }],
+        }))
+        .unwrap()
+        .into_txn_kv()
+        .unwrap();
+    assert_eq!(abandoned, TxnKvResp::prewrite_ok(1));
+
+    let mut checker = client.begin().unwrap();
+    checker.put(b"a5", b"mine");
+    checker.checking(
+        [],
+        vec![(Bytes::from_static(b"a"), Bytes::from_static(b"z"))],
+    );
+    checker
+        .commit()
+        .expect("the lock was settled and left a marker, which is not a phantom");
+
+    cluster.shutdown();
+}

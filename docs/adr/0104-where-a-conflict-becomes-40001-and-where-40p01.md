@@ -261,13 +261,24 @@ same reason ① does. It is listed separately only because it fails separately.
 
 Four units. Each says which layer it is in and what it needs before it can be built.
 
-### §1 — a range check must see a lock, not only a commit  *(store/txn — h1)*
+### §1 — a range check must see a lock, not only a commit  *(store/txn — h1)*  — **built**
 
-`TxnSnapshot` gains `newest_lock_in_range(start, end)`, the same walk `newest_write_in_range`
-already does, over `cf::LOCK` — the iterator and the key split both exist in the same file
-(`esker-store/src/txnkv.rs:359`, `key::split_lock`). The `CheckRange` arm of `prewrite` asks it
-after the write scan and, when a lock of **another** transaction is inside the range, answers
-`TxnStatus::Locked(lock)` instead of `Ok`.
+`TxnSnapshot` gains `foreign_lock_in_range(start, end, mine)`, the same walk
+`newest_write_in_range` already does, over `cf::LOCK` — the iterator and the key split both exist
+in the same file (`esker-store/src/txnkv.rs`, `key::split_lock`). The `CheckRange` arm of
+`prewrite` asks it **after** the write scan and, when a lock of another transaction is inside the
+range, answers `TxnStatus::Locked(lock)` instead of `Ok`.
+
+The order is the point: a commit inside the range is a verdict — this transaction has lost whatever
+anyone is holding — and a lock is a *question*, because its owner may still roll back, in which
+case nothing was ever there and refusing over it would be a `40001` for a phantom that never
+existed. `Locked` and not `Conflict` for exactly that reason.
+
+**`mine` is excluded, and the build is what proved it must be.** `Transaction::commit` prewrites
+this transaction's own keys at step 3 and sends the range checks at step 4, so by the time the
+check runs, the row this transaction inserted into the range it scanned is locked *inside that
+range*. A scan without the exclusion refuses every transaction that writes where it read — which is
+all of them. `our_own_lock_inside_a_checked_range_is_not_a_phantom` is that guard.
 
 No wire change: `Prewrite` already answers one status per mutation and `TxnStatus::Locked` is
 already one of them ([ADR 0016](0016-txnkv-on-the-wire.md) decision 1).
@@ -276,16 +287,29 @@ already one of them ([ADR 0016](0016-txnkv-on-the-wire.md) decision 1).
 for an *acquirer* — a transaction that holds locks and wants one more, which is half of a cycle. A
 range check acquires nothing: it asserts that a range it read has not moved. Killing the holder to
 make that assertion true would abort a transaction that did nothing wrong, and would answer `40P01`
-to a session whose test expects `40001`. So `Transaction::prewrite` resolves a lock met by a
-`CheckRange` position with `may_wound = false` — wait for the holder to settle, then re-check, which
-is what a reader already does (`esker-client/src/txn.rs:1695` and the note there: *"a reader holds
-no locks: it can wait and cannot be waited for"*). The positional alignment between mutations and
-statuses that `prewrite` already relies on is what tells it which lock came from a range.
+to a session whose test expects `40001`. So the range check resolves with `may_wound = false` —
+wait for the holder to settle, then ask again, which is what a reader already does
+(`esker-client/src/txn.rs` and the note there: *"a reader holds no locks: it can wait and cannot be
+waited for"*).
 
-The outcome for ① and ②: the second session waits for the first, re-checks, now sees its commit in
+**Where that loop goes is not where this ADR first said.** A range check never travels in
+`prewrite`'s batch: `prewrite_range_checks` sends **one `Prewrite` per range, carrying a single
+`CheckRange`**, so no positional trick is needed to tell a range's lock from a key's. The gap was
+one line further on — the answer fell through to `check`, whose `Locked` arm reports
+`LockNotCleared` on sight with the comment *"reaching here means the caller skipped the
+resolution"*. It had, because until now the store could not answer `Locked` to a range. So the loop
+is `prewrite_range_checks`'s own, bounded by `MAX_LOCK_RESOLUTIONS` like every other.
+
+The outcome for ① and ②: the second session waits for the first, asks again, now sees its commit in
 `cf::WRITE`, and is refused `TxnStatus::Conflict` → `40001`. If both sessions wait for each other,
 both spend their budget and both are refused `40001` — which still satisfies `assert_raises`, and is
 a conservative answer rather than a wrong one.
+
+**What it still cannot see is a lock past a region boundary.** A range check is answered by the
+region its lower bound falls in and no further, which is the bound ADR 0067 §3 already declares for
+commits; the lock scan inherits it exactly. `a_range_check_waits_for_a_lock_it_may_not_wound`
+places its holder on the near side of the boundary deliberately, because a test that straddled it
+would be measuring the limitation instead of the fix.
 
 **This does not make the node serializable.** It closes the concurrent-prewrite window and nothing
 more; the window ADR 0062 declares — an insert that lands after the check — stays open, and

@@ -1125,3 +1125,121 @@ async fn a_marker_inside_a_checked_range_is_not_a_phantom() {
         "nothing committed in the range: the only record above the snapshot is a rollback marker"
     );
 }
+
+/// **A lock inside a validated range refuses the check**
+/// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §1).
+///
+/// The range check reads the `write` CF, and a transaction that has prewritten into the range but
+/// not yet committed is in the `lock` CF. Two transactions that both scan a range and both insert
+/// into it write *different* keys, so nothing collides at prewrite — and with only the write scan
+/// neither sees the other and both commit, which is the write skew run 112a caught
+/// (`transaction_test.rb`'s `raises SerializationFailure when a serialization failure occurs`
+/// expected `40001` and nothing was raised).
+///
+/// `Locked` and not `Conflict`, because the holder may still roll back: what the client owes the
+/// range is the same thing it owes a locked key — settle the holder, then ask again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lock_inside_a_checked_range_refuses_the_check() {
+    let running = start().await;
+    let transport = TcpTransport::connect(running.handle.local_addr())
+        .await
+        .unwrap();
+
+    // The other transaction prewrites into the range and stops there: a lock, no commit.
+    let locked = call(
+        &transport,
+        TxnKvReq::Prewrite {
+            start_ts: 50,
+            primary: key(b"m"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::Put {
+                key: key(b"m"),
+                value: Bytes::from_static(b"in flight"),
+                read_ts: None,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(locked, TxnKvResp::prewrite_ok(1));
+
+    let checked = call(
+        &transport,
+        TxnKvReq::Prewrite {
+            start_ts: 40,
+            primary: key(b"a"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::CheckRange {
+                start: key(b"a"),
+                end: key(b"z"),
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        checked,
+        TxnKvResp::Prewrite {
+            keys: vec![TxnStatus::Locked(LockInfo {
+                key: key(b"m"),
+                primary: key(b"m"),
+                start_ts: 50,
+                ttl_ms: 3_000,
+            })]
+        },
+        "the lock is named by the key it sits on, which is not either bound of the range"
+    );
+}
+
+/// **This transaction's own lock inside its own read range is not a phantom.**
+///
+/// The guard on the test above, and not a hypothetical: the client prewrites its keys **before**
+/// it sends its range checks (`Transaction::commit` step 3), so a transaction that inserts into a
+/// range it scanned always has a lock of its own sitting in that range by the time the check runs.
+/// A scan that did not exclude it would refuse every such transaction — which is every transaction
+/// that writes where it read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn our_own_lock_inside_a_checked_range_is_not_a_phantom() {
+    let running = start().await;
+    let transport = TcpTransport::connect(running.handle.local_addr())
+        .await
+        .unwrap();
+
+    // Our own insert into the range we read, prewritten first, exactly as `commit` orders it.
+    let ours = call(
+        &transport,
+        TxnKvReq::Prewrite {
+            start_ts: 40,
+            primary: key(b"m"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::Put {
+                key: key(b"m"),
+                value: Bytes::from_static(b"ours"),
+                read_ts: None,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ours, TxnKvResp::prewrite_ok(1));
+
+    let checked = call(
+        &transport,
+        TxnKvReq::Prewrite {
+            start_ts: 40,
+            primary: key(b"m"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::CheckRange {
+                start: key(b"a"),
+                end: key(b"z"),
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        checked,
+        TxnKvResp::prewrite_ok(1),
+        "the only lock in the range is this transaction's own"
+    );
+}
