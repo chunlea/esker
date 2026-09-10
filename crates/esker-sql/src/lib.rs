@@ -59,6 +59,7 @@ pub mod row;
 pub mod sequence;
 pub mod session;
 pub mod sqlstate;
+pub mod stmt_stats;
 pub mod time_machine;
 pub mod value;
 

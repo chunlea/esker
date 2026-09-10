@@ -255,6 +255,12 @@ impl Router {
                     let header =
                         RequestHeader::new(route.region.id, route.region.epoch, target.peer_id);
                     let wire = body.clone().into_request(header);
+                    // **The one place that knows both numbers `debts-v1.1.md` #49 asks for**: the
+                    // region this attempt is addressed to, and the fact that it is a wire call at
+                    // all. Counted per *attempt* — a request refused for a stale epoch and sent
+                    // again cost the cluster two round trips, and a count that hid the second
+                    // would be measuring this API rather than the wire.
+                    crate::stmt_stats::record_call(route.region.id);
                     match self.transport.call(target.store_id, &wire, deadline) {
                         Ok(response) if response.method() == method => return Ok(response),
                         Ok(response) => {

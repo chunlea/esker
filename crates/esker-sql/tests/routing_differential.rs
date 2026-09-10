@@ -2409,3 +2409,58 @@ async fn a_bulk_load_into_a_splitting_table_is_not_told_it_does_not_know() {
         }
     );
 }
+
+/// **What one catalog-introspection statement costs below the SQL** — `debts-v1.1.md` #49's first
+/// number, and the reason its instrument was built.
+///
+/// Run 113 timed three of these on the real topology at **0.5–0.8 s each** — `pg_index ⋈
+/// pg_attribute` 790 ms, `obj_description` 546 ms, `pg_inherits` 793 ms — and
+/// [ADR 0102](../../../../docs/adr/0102-the-catalogs-read-path.md)'s instrument, which was **on for
+/// the same run**, accounts for 2.2 ms of a 506 ms statement. So the half-second is not a slower
+/// version of a known cost, and the three numbers that could name it did not exist.
+///
+/// This is the statement `ActiveRecord` sends to find a table's primary key, taken verbatim from
+/// `tests/corpus/activerecord_8_1_statements.txt` rather than invented, run against a `Gate` — real
+/// stores, a real placement driver, a `StoreBackend` over a router with a lease.
+///
+/// **Prints and asserts nothing about the numbers.** A measurement that fails a build is a gate,
+/// and this is not one: what it asserts is that the instrument was on and that the statement
+/// answered, because a zero from a switched-off counter reads exactly like a zero from a statement
+/// that made no reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a debts-v1.1.md #49 measurement: a cluster, and it wants ESKER_STMT_STATS=1"]
+async fn what_an_introspection_statement_costs_below_the_sql() {
+    let gate = Gate::start_splitting(u64::MAX).await;
+    println!("{}", the_box_right_now("introspection measurement"));
+    assert!(
+        esker_sql::stmt_stats::enabled(),
+        "ESKER_STMT_STATS is not set: every counter would stay at zero and this run would say \
+         nothing — which reads exactly like a statement that made no reads"
+    );
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        settle(
+            &mut session,
+            "CREATE TABLE widgets (id int8 PRIMARY KEY, n int8)",
+        );
+        // `ActiveRecord`'s primary-key reflection, verbatim.
+        let introspection = "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON \
+                             a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) WHERE \
+                             i.indrelid = 'widgets'::regclass AND i.indisprimary \
+                             ORDER BY array_position(i.indkey, a.attnum)";
+        let before = esker_sql::stmt_stats::counts();
+        let began = Instant::now();
+        let answered = session.run(introspection).is_ok();
+        let took = began.elapsed();
+        let after = esker_sql::stmt_stats::counts();
+        assert!(answered, "the introspection statement did not answer");
+        println!("\n  {introspection}\n");
+        println!("  took          {:>8.1} ms", took.as_secs_f64() * 1000.0);
+        println!("  point reads   {:>8}", after.1 - before.1);
+        println!("  range scans   {:>8}", after.2 - before.2);
+        println!("  round trips   {:>8}", after.3 - before.3);
+        println!("  regions       {:>8}", after.4 - before.4);
+        println!("\n  {}\n", esker_sql::stmt_stats::summary());
+    });
+    gate.stop().await;
+}
