@@ -6,8 +6,8 @@
 //! `CASE` through a `CHECK`, a `mod` through an index, a reserved word through two of five
 //! printers. Each was found by the Rails suite, one per run.
 //!
-//! This file is the cross product instead — 86 expression shapes and 10 constants against the
-//! eight readers each admits, 221 probes — so that the next parenthesis rule is learned here.
+//! This file is the cross product instead — 94 expression shapes and 10 constants against the
+//! eight readers each admits, 229 probes — so that the next parenthesis rule is learned here.
 //!
 //! ```text
 //! shapes   binary chains (AND/OR mixed and nested) · operator-spelled functions both ways ·
@@ -37,7 +37,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    // **Thirty-four statements in four groups, by mechanism.** The census opened with
+    // **Thirty-one statements in four groups, by mechanism.** The census opened with
     // sixty-five in eight; groups B, H, A, E and F are closed and deleted as blocks, and group I is what closing A
     // left behind — which is the point of grouping them: a group that shrinks by one was two
     // mechanisms wearing one name.
@@ -87,141 +87,126 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "**Group C -- an array slice is `0A000` here and a working index key there.** `arr[1:2]` is refused by name (`an array slice is not supported`), so the four readers that would print it are never reached: measured, PostgreSQL takes `CREATE INDEX ON cen ((arr[1:2]))` and prints it back `USING btree ((arr[1:2]))`, stores `arr[1:2]` in `indexprs`, and refuses only the *generated column* over `(arr[1:2])::text` -- for the immutability reason, not the slice. A feature gap and not a printing one, which is what is left of a group that was four mechanisms wearing one word: the pair on a constructor and a subscript, the immutability refusal, the viewdef rows that were never C's, and this.",
             "pg19_deparse_census.txt:391",
         ),
-        // ---- D-default: 4 statements ----
+        // ---- D-fold: 1 statement ----
         (
             "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'",
-            "**Group D -- a fold at plan time destroys a node PostgreSQL keeps and prints.** `lower_cast` folds a literal under a cast into a `Literal::Typed` datum, and `ToText` over a constant folds too, so `((1)::bigint)::text` is one `Datum::Text` by the time anything can print it: the `bigint` is not recoverable, and the `DEFAULT` falls back to the text the user wrote -- rendered by `sqlparser`'s `Display`, which is where the upper-cased `::TEXT` in this node's answer comes from. **Measured with a one-off build that bypassed `reads_back`**: three of these four are unchanged by it, so they never reach the fixpoint guard -- `reprinted_by_pg_get_expr` refuses a `Typed(Text)` top node, which is what the fold leaves. The fourth does change, to `('{1,2}'::integer[])::text`, so the array constant prints as a literal where a real server prints the constructor it kept. **Not a printing rule and not one commit**: ADR 0086 is this fold, `debts-v1.1.md` #30 already carved out the *lossy* case (rounding keeps its `Cast` node because it is not invertible), and closing this means the lossless case keeps its node too -- every literal cast in every statement, through typing, evaluation and the wire. Left declared with its measurement rather than half-closed, and it belongs beside #30 rather than in a deparse group.",
-            "pg19_deparse_census.txt:641",
-        ),
-        (
-            "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'",
-            "**Group D -- a `DEFAULT` keeps the text it was written with, type name and all.** `(1)::bigint` comes back `(1)::BIGINT`, the parser's own rendering upper-cased, and `-1` comes back `(-1)` where a real server prints `('-1'::integer)`. The deparser has the rule (`numeric_constant`, `debts-v1.1.md` #24 closed it) and the `DEFAULT` path does not reach it for these shapes: `reprinted_by_pg_get_expr` is an allow-list and a cast over a constant is not on it.",
-            "pg19_deparse_census.txt:645",
-        ),
-        (
-            "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'",
-            "**Group D -- a `DEFAULT` keeps the text it was written with, type name and all.** `(1)::bigint` comes back `(1)::BIGINT`, the parser's own rendering upper-cased, and `-1` comes back `(-1)` where a real server prints `('-1'::integer)`. The deparser has the rule (`numeric_constant`, `debts-v1.1.md` #24 closed it) and the `DEFAULT` path does not reach it for these shapes: `reprinted_by_pg_get_expr` is an allow-list and a cast over a constant is not on it.",
-            "pg19_deparse_census.txt:649",
-        ),
-        (
-            "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='cend'::regclass AND a.attname='t'",
-            "**Group D -- a `DEFAULT` keeps the text it was written with, type name and all.** `(1)::bigint` comes back `(1)::BIGINT`, the parser's own rendering upper-cased, and `-1` comes back `(-1)` where a real server prints `('-1'::integer)`. The deparser has the rule (`numeric_constant`, `debts-v1.1.md` #24 closed it) and the `DEFAULT` path does not reach it for these shapes: `reprinted_by_pg_get_expr` is an allow-list and a cast over a constant is not on it.",
-            "pg19_deparse_census.txt:653",
+            "**Group D -- a constant array literal is folded to its own text, and the element type goes with it.** `lower_array_constructor` folds `ARRAY[1, 2]` into a `Literal::Typed(Datum::Array)`, so `(ARRAY[1, 2])::text` prints `('{1,2}'::integer[])::text` where a real server prints the constructor it kept. **The rest of this group is closed**: `lower_cast` no longer discards a cast node whose target is not the literal's own type (`debts-v1.1.md` #42), which closed `(42)::text`, `(-1)::text`, `((1)::bigint)::text` and `((-1)::bigint)::text`. Those were four entries sharing one matcher -- the SQL is the same `pg_get_expr` read for every `DEFAULT` probe on this column -- so they are one entry now, and it is the array occurrence that still disagrees. What is left is a **different fold at a different site**, the same mechanism the wire census found as 196 array rows, and it is b4's: `tests/array_of_array.rs` pins it with `#[ignore]`d expectations.",
+            "pg19_deparse_census.txt:661",
         ),
         // ---- G-viewdef: 23 statements ----
         (
             "SELECT pg_get_viewdef('v_case_simple'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:218",
         ),
         (
             "SELECT pg_get_viewdef('v_arr_ctor'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:357",
         ),
         (
             "SELECT pg_get_viewdef('v_arr_sub'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:373",
         ),
         (
             "SELECT pg_get_viewdef('v_arr_cat'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:409",
         ),
         (
             "SELECT pg_get_viewdef('v_str_nest'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:425",
         ),
         (
             "SELECT pg_get_viewdef('v_str_cat'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:441",
         ),
         (
             "SELECT pg_get_viewdef('v_fn_mod'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:122",
         ),
         (
             "SELECT pg_get_viewdef('v_op_mod'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:138",
         ),
         (
             "SELECT pg_get_viewdef('v_fn_abs'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:154",
         ),
         (
             "SELECT pg_get_viewdef('v_op_plus'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:170",
         ),
         (
             "SELECT pg_get_viewdef('v_op_nest'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:186",
         ),
         (
             "SELECT pg_get_viewdef('v_case_search'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:202",
         ),
         (
             "SELECT pg_get_viewdef('v_case_fn'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:234",
         ),
         (
             "SELECT pg_get_viewdef('v_case_nest'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:250",
         ),
         (
             "SELECT pg_get_viewdef('v_case_null'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:266",
         ),
         (
             "SELECT pg_get_viewdef('v_cast_chain'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:294",
         ),
         (
             "SELECT pg_get_viewdef('v_cast_text'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:310",
         ),
         (
             "SELECT pg_get_viewdef('v_neg_cast'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:326",
         ),
         (
             "SELECT pg_get_viewdef('v_neg_bare'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:342",
         ),
         (
             "SELECT pg_get_viewdef('v_str_len'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:457",
         ),
         (
             "SELECT pg_get_viewdef('v_coalesce'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:605",
         ),
         (
             "SELECT pg_get_viewdef('v_greatest'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:621",
         ),
         (
             "SELECT pg_get_viewdef('v_nullif'::regclass)",
-            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 34 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
+            "**Group G -- `pg_get_viewdef` returns the stored text where a real server reconstructs the query.** The standing divergence recorded on `plan::CatalogFunc::PgGetViewdef` and in `tests/view_debts.rs`: re-cased, re-qualified, re-indented, every expression parenthesised and a semicolon on the end is `ruleutils.c` rather than a function. Twenty-three of the census's 31 are this one divergence seen once per shape, which is what a cross product does to a standing difference -- they are listed rather than folded so that the *shapes* stay countable.",
             "pg19_deparse_census.txt:637",
         ),
     ],
