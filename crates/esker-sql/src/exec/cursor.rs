@@ -3237,10 +3237,21 @@ fn catalog_function(
     }
     Ok(match call.func {
         // **Reached only for the types that *have* `~=` on a real server**, since resolution has
-        // already refused the rest with PostgreSQL's own sentence. `point` and `polygon` answer it
-        // there and this node does not implement it, so the refusal is the one it always was — a
-        // gap a client can read, and a row of `pg19_no_equality_types.txt` in the (b) direction.
-        CatalogFunc::SameAs => return Err(SqlError::unsupported("the operator ~=")),
+        // already refused the rest with PostgreSQL's own sentence. A geometric value carries its
+        // own `ColumnType`, so the shape decides the rule: a polygon is the same as its own
+        // rotation and its own reversal, and everything else is its vertices in order.
+        CatalogFunc::SameAs => match (args.first(), args.get(1)) {
+            (
+                Some(Datum::Geometry { kind, text: left }),
+                Some(Datum::Geometry { text: right, .. }),
+            ) => crate::value::geometric::same_as(**kind, left, right)
+                .map_or(Datum::Null, Datum::Bool),
+            (Some(Datum::Point { x: ax, y: ay }), Some(Datum::Point { x: bx, y: by })) => {
+                Datum::Bool(crate::value::geometric::same_point((*ax, *ay), (*bx, *by)))
+            }
+            (Some(Datum::Null), _) | (_, Some(Datum::Null)) => Datum::Null,
+            _ => return Err(SqlError::unsupported("the operator ~=")),
+        },
         // **Polygon containment and overlap**, over the canonical text the type stores — the
         // predicates and the epsilon they share live in `crate::value::geometric`. A value this
         // pass cannot read as a ring is NULL rather than a wrong answer.

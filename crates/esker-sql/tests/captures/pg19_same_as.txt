@@ -1,0 +1,36 @@
+# **`~=`, "same as"** — PostgreSQL 19beta1, 2026-09-10.
+#
+# The last operator of the (b) direction that this node refuses outright. It runs the *opposite*
+# way from its neighbours — `point` and `polygon` have it and the document types do not — which is
+# why `pg19_no_equality_types.txt` needed a table keyed by operator and type.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **A polygon is the same as its own rotation *and* its own reversal.** Starting the vertex
+#     list anywhere and walking it either way is the same polygon; an arbitrary shuffle of the same
+#     points is not. PostgreSQL does **not** normalise the text — the two print differently and
+#     compare same — so this cannot be answered by comparing canonical forms, which is exactly what
+#     a node storing canonical text would reach for first.
+#   * **It is fuzzy, epsilon `1e-6`**, like every geometric comparison in this family, and per
+#     vertex: `2` and `2.0000001` are the same vertex, `2.00001` is not.
+#   * **`NaN ~= NaN` is true**, for the same reason `NaN <> NaN` is false — every float comparison
+#     against a `NaN` is false, so "not the same" is false and "same" is its negation here.
+#
+# ## The measurements
+#
+SELECT ('(1,1)'::point ~= '(1,1)'::point) AS v	boolean	t
+SELECT ('(1,1)'::point ~= '(1.0000001,1)'::point) AS v	boolean	t
+SELECT ('(1,1)'::point ~= '(1.00001,1)'::point) AS v	boolean	f
+SELECT ('(NaN,1)'::point ~= '(NaN,1)'::point) AS v	boolean	t
+SELECT ('((0,0),(2,0),(2,2))'::polygon ~= '((0,0),(2,0),(2,2))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(2,0),(2,2))'::polygon ~= '((2,0),(2,2),(0,0))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(2,0),(2,2))'::polygon ~= '((2,2),(2,0),(0,0))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(2,0),(2,2),(0,2))'::polygon ~= '((0,2),(2,2),(2,0),(0,0))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(2,0),(2,2),(0,2))'::polygon ~= '((2,0),(2,2),(0,2),(0,0))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(2,0),(2,2),(0,2))'::polygon ~= '((0,0),(2,2),(2,0),(0,2))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(2,0),(2,2))'::polygon ~= '((0,0),(3,0),(3,3))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(2,0),(2,2))'::polygon ~= '((0,0),(2,0),(2,2),(0,2))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(2,0),(2,2))'::polygon ~= '((0,0),(2.0000001,0),(2,2))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(2,0),(2,2))'::polygon ~= '((0,0),(2.00001,0),(2,2))'::polygon) AS v	boolean	f
+SELECT (a ~= b) AS v FROM (VALUES ('(1,1)'::point, '(1,1)'::point)) s(a,b)	boolean	t
+SELECT (a ~= b) AS v FROM (VALUES ('((0,0),(2,0),(2,2))'::polygon, '((2,0),(2,2),(0,0))'::polygon)) s(a,b)	boolean	t

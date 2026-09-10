@@ -3231,7 +3231,12 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 // The polygon half of the same seam: `@>`, `<@` and `&&` all reach here as one
                 // of the three shared catalog functions, and a polygon is canonical text by
                 // evaluation just as a `jsonb` is.
-                if let Some(operand) = written_left
+                // **Only the three containment spellings**: `SameAs` reaches this block too, and
+                // without this guard `~=` was rewritten into `polygon_contains`, which answers `t`
+                // for the same points in any order — a shuffled square compared *same* where
+                // PostgreSQL says it is a different polygon.
+                if matches!(symbol, "@>" | "<@" | "&&")
+                    && let Some(operand) = written_left
                     && let Ok(ColumnType::Polygon) = expr_type(operand, scope)
                 {
                     let (left, right) = if flipped {
