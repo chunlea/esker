@@ -1650,12 +1650,38 @@ mod tests {
 
     #[test]
     fn an_unknown_method_is_an_error_not_a_skipped_frame() {
-        // **`0x020B` is the first code this service has not issued**, and keeping the first
-        // *unused* one here is what makes this a test about an older peer meeting a newer method
-        // rather than a test about four numbers that were free the day it was written. Every
-        // method added to a service takes one of these boundaries away, so the next one replaces
-        // it — `0x020A` was in this list until `TxnKv::ReclaimRange` claimed it.
-        for tag in [0x0000u16, 0x0109, 0x0200, 0x020B, 0xFFFF] {
+        // **The boundaries are computed, not listed.** This test is about an older peer meeting a
+        // newer method, so the interesting tag is the first code each service has *not* issued —
+        // and every method added takes one of those away. Written out, the list goes stale the
+        // next time anyone adds a method, and it did twice: `0x020A` was in it until
+        // `TxnKv::ReclaimRange` claimed it, and `0x020B` until `TxnKv::ReleaseLock` did. A list
+        // that has to be edited by whoever extends the enum is a list that reddens the gate
+        // instead of testing anything, so this asks the enum.
+        //
+        // Two boundaries per service and both are unissued by construction: **index zero**, which
+        // no service starts at, and **one past its highest** — skipped where that would carry into
+        // the next service's number space, because there it would not be this service's boundary
+        // at all.
+        let mut unknown = vec![0x0000u16, 0xFFFF];
+        let mut highest: std::collections::BTreeMap<u8, u8> = std::collections::BTreeMap::new();
+        for method in Method::ALL {
+            let tag = method as u16;
+            let entry = highest.entry((tag >> 8) as u8).or_default();
+            *entry = (*entry).max((tag & 0xFF) as u8);
+        }
+        for (service, top) in &highest {
+            unknown.push(u16::from(*service) << 8);
+            if let Some(next) = top.checked_add(1) {
+                unknown.push(u16::from(*service) << 8 | u16::from(next));
+            }
+        }
+        unknown.sort_unstable();
+        unknown.dedup();
+        assert!(
+            unknown.len() > 2,
+            "the enum named no services, so this test checked nothing"
+        );
+        for tag in unknown {
             assert_eq!(Method::from_u16(tag), None, "{tag:#06x}");
             assert!(Request::decode(&tag.to_le_bytes()).is_err(), "{tag:#06x}");
             assert!(Response::decode(&tag.to_le_bytes()).is_err(), "{tag:#06x}");
