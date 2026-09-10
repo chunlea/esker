@@ -22,7 +22,7 @@ use esker_txn::snapshot::{MemoryStore, TxnSnapshot};
 use esker_txn::{
     CommitDecision, LOCK_TTL_MS, Mutations, Op, Prewrite, PrewriteDecision, PrimaryCommitted,
     PrimaryState, ReadOutcome, Resolution, TxnError, check_prewrite, commit_primary,
-    commit_secondary, primary_state, read, resolve, rollback,
+    commit_secondary, primary_state, read, release, resolve, rollback,
 };
 
 /// The largest logical counter that fits beside a physical millisecond.
@@ -454,6 +454,100 @@ fn rolling_back_twice_writes_nothing_the_second_time() {
     let mut store = MemoryStore::new();
     store.apply(&rollback(&store, b"k", 10).unwrap());
     assert_eq!(rollback(&store, b"k", 10).unwrap(), Mutations::new());
+}
+
+// -- release -----------------------------------------------------------------------------
+
+/// **A release takes the lock and the value and writes nothing down**
+/// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+///
+/// The whole difference from `rollback`, in one assertion: no marker. A rollback makes the
+/// transaction dead on the key for ever, and a savepoint's victim goes on to write the row it
+/// locked.
+#[test]
+fn release_removes_our_lock_and_value_and_leaves_no_marker() {
+    let mut store = MemoryStore::new();
+    let long = Bytes::from(vec![1u8; 300]);
+    let request = Prewrite::new(key(b"k"), key(b"k"), 10, Op::Put(long));
+    match check_prewrite(&store, &request).unwrap() {
+        PrewriteDecision::Lock(mutations) => store.apply(&mutations),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(store.len(Cf::Default), 1);
+
+    let (mutations, released) = release(&store, b"k", 10).unwrap();
+    assert!(released, "the lock was ours");
+    store.apply(&mutations);
+    assert!(store.is_empty(Cf::Lock), "the lock is gone");
+    assert!(store.is_empty(Cf::Default), "the value went with it");
+    assert!(
+        store.is_empty(Cf::Write),
+        "and nothing was written down: a release is not a rollback"
+    );
+}
+
+/// **The consequence that makes it a release and not a rollback**: the same transaction may lock
+/// the key again. After a rollback it could never touch it again, which is what a savepoint's
+/// victim does the moment its `rescue` is over.
+#[test]
+fn a_released_key_can_be_taken_again_by_the_same_transaction() {
+    let mut store = MemoryStore::new();
+    lock_key(&mut store, &prewrite(b"k", b"k", 10, put(b"first")));
+
+    let (mutations, _) = release(&store, b"k", 10).unwrap();
+    store.apply(&mutations);
+
+    match check_prewrite(&store, &prewrite(b"k", b"k", 10, put(b"again"))).unwrap() {
+        PrewriteDecision::Lock(mutations) => store.apply(&mutations),
+        other => panic!("a released key is free, not rolled back: {other:?}"),
+    }
+    assert_eq!(
+        store.get_lock(b"k").unwrap().map(|lock| lock.start_ts),
+        Some(10)
+    );
+}
+
+/// Somebody else's lock is not ours to give away — the same rule `rollback` keeps, and here it is
+/// the only rule, because there is no marker to leave behind either.
+#[test]
+fn release_leaves_another_transaction_s_lock_alone() {
+    let mut store = MemoryStore::new();
+    lock_key(&mut store, &prewrite(b"k", b"k", 30, put(b"theirs")));
+
+    let (mutations, released) = release(&store, b"k", 10).unwrap();
+    assert!(!released, "not ours, so not counted");
+    assert_eq!(mutations, Mutations::new(), "and nothing is staged");
+    store.apply(&mutations);
+    assert_eq!(
+        store.get_lock(b"k").unwrap().map(|lock| lock.start_ts),
+        Some(30)
+    );
+}
+
+/// Idempotent: releasing a key we do not hold writes nothing and says so. What makes it safe on a
+/// retry, and safe from a destructor.
+#[test]
+fn releasing_a_key_we_do_not_hold_writes_nothing() {
+    let store = MemoryStore::new();
+    let (mutations, released) = release(&store, b"k", 10).unwrap();
+    assert!(!released);
+    assert_eq!(mutations, Mutations::new());
+}
+
+/// A committed key has no lock left to take, and a release must not pretend otherwise: the write
+/// record is every reader's now.
+#[test]
+fn releasing_a_committed_key_takes_nothing() {
+    let mut store = MemoryStore::new();
+    commit_one(&mut store, b"k", b"v", 10, 20);
+    let (mutations, released) = release(&store, b"k", 10).unwrap();
+    assert!(!released);
+    assert_eq!(mutations, Mutations::new());
+    assert_eq!(
+        read(&store, b"k", 30).unwrap(),
+        ReadOutcome::Value(Bytes::from_static(b"v")),
+        "the commit is untouched"
+    );
 }
 
 #[test]

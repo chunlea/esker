@@ -162,6 +162,9 @@ pub enum Method {
     /// drop's commit timestamp, which is why that timestamp is on the request rather than left to
     /// the caller's timing.
     TxnReclaimRange = 0x020A,
+    /// `TxnKv::ReleaseLock` — give one transaction's own locks back without ending it
+    /// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+    TxnReleaseLock = 0x020B,
 
     /// `Fragment::Evaluate` — run a plan fragment against a node's columnar copy of a region
     /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md), [`crate::fragment`]).
@@ -208,7 +211,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -243,6 +246,7 @@ impl Method {
         Self::TxnGcSafepoint,
         Self::TxnLatestCommit,
         Self::TxnReclaimRange,
+        Self::TxnReleaseLock,
         Self::AdminSplit,
         Self::AdminTransferLeader,
         Self::AdminRegions,
@@ -296,6 +300,7 @@ impl Method {
             0x0208 => Some(Self::TxnGcSafepoint),
             0x0209 => Some(Self::TxnLatestCommit),
             0x020A => Some(Self::TxnReclaimRange),
+            0x020B => Some(Self::TxnReleaseLock),
             0x0501 => Some(Self::AdminSplit),
             0x0502 => Some(Self::AdminTransferLeader),
             0x0503 => Some(Self::AdminRegions),
@@ -362,6 +367,7 @@ impl Method {
             Self::TxnGcSafepoint => "TxnKv::GcSafepoint",
             Self::TxnLatestCommit => "TxnKv::LatestCommit",
             Self::TxnReclaimRange => "TxnKv::ReclaimRange",
+            Self::TxnReleaseLock => "TxnKv::ReleaseLock",
         }
     }
 
@@ -393,6 +399,8 @@ impl Method {
                 // It deletes data. That it deletes it by range rather than key by key does not
                 // make it a read.
                 | Self::TxnReclaimRange
+                // It deletes a lock record, which every replica has to agree about.
+                | Self::TxnReleaseLock
         )
     }
 
@@ -1609,7 +1617,8 @@ mod tests {
                 | Method::TxnHeartbeat
                 | Method::TxnGcSafepoint
                 | Method::TxnLatestCommit
-                | Method::TxnReclaimRange => SERVICE_TXN_KV,
+                | Method::TxnReclaimRange
+                | Method::TxnReleaseLock => SERVICE_TXN_KV,
                 Method::FragmentEvaluate => crate::messages::SERVICE_FRAGMENT,
                 Method::SchemaFetch => crate::messages::SERVICE_SCHEMA,
                 _ => SERVICE_RAW_KV,

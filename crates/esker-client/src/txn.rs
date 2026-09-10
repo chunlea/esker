@@ -720,6 +720,91 @@ impl Transaction {
         }
     }
 
+    /// **Gives back locks this transaction placed, and stays running**
+    /// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+    ///
+    /// `ROLLBACK TO SAVEPOINT`, and the deadlock victim inside one. A real server releases a
+    /// subtransaction's row locks when it aborts; before this, the SQL layer released its
+    /// node-local half and nothing reached the store, so the lock a `SELECT … FOR UPDATE` left
+    /// there outlived the savepoint that took it and blocked every other session until the whole
+    /// transaction ended.
+    ///
+    /// Only keys this transaction actually holds a *store* lock on are sent: a buffered write has
+    /// no lock yet, and a key we never locked has nothing to give back.
+    ///
+    /// # The primary
+    ///
+    /// The primary is what every resolver consults, so releasing it while another of this
+    /// transaction's locks still names it would leave those locks pointing at a record that is not
+    /// there — a transaction that reads as `Missing` and can be rolled back by anyone.
+    ///
+    /// **But it cannot simply be refused**, and that is the case this method exists for: the
+    /// primary is *the smallest key already buffered, or the key being locked when nothing is*
+    /// ([`Transaction::pin_primary`]), and a savepoint whose first act is `SELECT … FOR UPDATE`
+    /// over a transaction that has written nothing — which is precisely Rails' shape — pins that
+    /// very row. Refusing it would leave the savepoint's own lock behind, which is the bug.
+    ///
+    /// So the rule is exact rather than cautious: the primary goes when **nothing else names it**,
+    /// and the transaction is unpinned so that the next eager lock or the commit picks a new one by
+    /// the ordinary rule. The renewal stops with it — a heartbeat for a lock that is not there
+    /// keeps nothing alive.
+    ///
+    /// # Errors
+    ///
+    /// Any transport or region failure the router could not retry away. A key whose lock turned out
+    /// to be somebody else's is **not** an error: the caller wanted it free of *this* transaction's
+    /// lock and it is.
+    pub fn release(&mut self, keys: &[Bytes]) -> Result<()> {
+        // Everything but the primary first, so that releasing the primary in the same call sees a
+        // transaction that no longer holds anything else.
+        let pinned = self.pinned.clone();
+        let mut others: Vec<Bytes> = keys
+            .iter()
+            .filter(|key| self.locked.contains(*key) && Some(*key) != pinned.as_ref())
+            .cloned()
+            .collect();
+        others.sort();
+        others.dedup();
+        if !others.is_empty() {
+            self.release_keys(&others)?;
+            for key in &others {
+                self.locked.remove(key);
+            }
+        }
+
+        // The primary, if it was asked for and nothing of ours is left to name it.
+        let Some(primary) = pinned else {
+            return Ok(());
+        };
+        if !keys.contains(&primary) || !self.locked.contains(&primary) {
+            return Ok(());
+        }
+        if self.locked.iter().any(|held| *held != primary) {
+            // Another eager lock still points at it. One row of one transaction stays held to the
+            // end of the block, which is the declared remainder — not every row of every savepoint.
+            return Ok(());
+        }
+        self.release_keys(std::slice::from_ref(&primary))?;
+        self.locked.remove(&primary);
+        self.pinned = None;
+        self.renewals.forget(self.start_ts);
+        Ok(())
+    }
+
+    /// One `ReleaseLock` per region the keys fall in.
+    fn release_keys(&self, keys: &[Bytes]) -> Result<()> {
+        self.grouped(keys, |group| {
+            let request = TxnKvReq::ReleaseLock {
+                start_ts: self.start_ts,
+                keys: group.to_vec(),
+            };
+            match self.call(&request)? {
+                TxnKvResp::ReleaseLock { .. } => Ok(()),
+                other => Err(unexpected(Method::TxnReleaseLock, &other)),
+            }
+        })
+    }
+
     /// Fixes the primary and puts its lock on the store, which every later lock of this
     /// transaction points at.
     ///

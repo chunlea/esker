@@ -316,7 +316,7 @@ more; the window ADR 0062 declares — an insert that lands after the check — 
 `Isolation::Serializable` stays the declared divergence it is
 (`crates/esker-sql/src/parameter.rs:594`).
 
-### §2 — a savepoint must be able to give back an eager lock  *(store/txn — h1; needs the human)*
+### §2 — a savepoint must be able to give back an eager lock  *(store/txn — h1)* — **built**, approved 2026-09-10
 
 The one thing this needs does not exist: **a way to remove this transaction's own lock record from a
 key without ending the transaction.**
@@ -341,12 +341,26 @@ with `esker_client::Transaction::release(&mut self, keys)` removing them from `s
 halves. `Savepoints::give_locks_back_to` (`exec/savepoint.rs:191`) already knows exactly which keys
 belong to the savepoint and already calls `Txn::unlock` for each, so nothing above changes.
 
-**This is a wire change and it is not mine to make.** `CLAUDE.md` — *"Ask before doing … change an
-on-disk or wire format that already has a golden test"* — and ADR 0067 §2's rule that a
-cluster-scope lock change is *"asked for as one rather than smuggled in"*. It adds a method tag to
-`TxnKvReq`; it adds **no** `TxnWrite` variant and **no** record kind, so no on-disk golden moves,
-and it is not replicated as a new command shape — the deletion of a lock record is a mutation the
-`Mutations` type already produces. That is the smallest form I can find; the question is the human's.
+**This is a wire change and it was not mine to make.** `CLAUDE.md` — *"Ask before doing … change
+an on-disk or wire format that already has a golden test"* — and ADR 0067 §2's rule that a
+cluster-scope lock change is *"asked for as one rather than smuggled in"*. Asked, and approved on
+2026-09-10.
+
+**What it costs is one method tag and one log verb, and the second of those this ADR got wrong.**
+The draft said it "is not replicated as a new command shape — the deletion of a lock record is a
+mutation the `Mutations` type already produces". The mutation is, and that is not the question: a
+lock deletion is state every replica has to agree about, so it must travel through the log like
+every other write. A follower that never learned of the deletion goes on refusing readers for a
+lock its leader gave back — and goes on refusing after it becomes leader. So `TxnCommand` gains
+verb **6**, `ReleaseLock`, alongside the wire's `0x020B`.
+
+Both are **additions**: every byte an earlier verb or tag produced still decodes to the same thing,
+no `TxnWrite` variant is added, no record kind is added, and the on-disk goldens
+(`esker-txn/tests/golden/txn.txt` and the rest) do not move. What does move is the *wire* golden,
+`esker-proto/tests/golden/messages.hex`, by two added lines — the file's own exhaustiveness test
+(`the_goldens_cover_every_method_and_every_error_code`) is what demands them, and it caught the
+omission before anything else did. The rolling-upgrade rule is the one every replicated addition
+here carries: a peer that does not know verb 6 refuses to decode it.
 
 **Only our own lock.** A key whose lock belongs to another `start_ts` is untouched — the same rule
 `rollback` states (`crates/esker-txn/src/percolator.rs:610`).
@@ -386,11 +400,10 @@ same question ADR 0088 asked of the eager lock itself and answered with `tests/l
 (b) is the better end state and (a) is what closes ③. They compose: (a) first, (b) if the remainder
 is ever measured to matter.
 
-*If the human refuses the new method*, the fallback must be written down rather than discovered:
-`SELECT … FOR UPDATE` inside a savepoint keeps its cluster lock to the end of the top transaction,
-③ stays red, and the sentence goes in `DESIGN.md` §8 and the divergence table — *"a subtransaction's
-row locks are released node-locally on `ROLLBACK TO SAVEPOINT`; the cluster-scope half is held to
-the end of the transaction"*.
+(a) is what was built. The remainder it leaves is exact and small: **one row of one transaction** —
+the primary of a transaction that still holds another eager lock — stays held to the end of the
+block, and `a_primary_is_kept_while_another_lock_still_names_it` is that case pinned as a test
+rather than left to be discovered. (b) stays available if the remainder is ever measured to matter.
 
 ### §3 — a store-side wait must draw an edge  *(SQL layer — either lane; I would take it)*
 

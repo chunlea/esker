@@ -624,6 +624,9 @@ pub fn stage(
                 TxnCommand::Rollback { start_ts, keys } => {
                     crate::txnkv::rollback(db, batch, *start_ts, keys)?
                 }
+                TxnCommand::ReleaseLock { start_ts, keys } => {
+                    crate::txnkv::release_lock(db, batch, *start_ts, keys)?
+                }
                 TxnCommand::ResolveLock {
                     start_ts,
                     commit_ts,

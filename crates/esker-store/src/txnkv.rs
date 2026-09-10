@@ -617,6 +617,45 @@ pub fn rollback(
     })
 }
 
+/// Gives **this** transaction's own locks on `keys` back, leaving it running
+/// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+///
+/// `ROLLBACK TO SAVEPOINT`, and the deadlock victim inside one: a real server releases a
+/// subtransaction's row locks when it aborts and keeps the transaction alive. Until this existed
+/// the node released the node-local half and nothing reached the store, so a `SELECT … FOR UPDATE`
+/// taken inside a savepoint held its row until the whole transaction ended — and the survivor of
+/// a deadlock met that lock at its own commit and was told `40001`.
+///
+/// **Not [`rollback`]**, which leaves a marker and so kills the transaction on those keys for
+/// ever; a savepoint's victim very often writes the row it locked once its `rescue` is done.
+/// Nothing is written down here: the lock record goes and the key is as it was.
+///
+/// The count is how many locks were actually this transaction's. A key held by somebody else, or
+/// no longer held at all, is left alone and not counted — the caller wanted the keys free of *its*
+/// lock and they are, which is the same reading [`resolve_lock`]'s count gets.
+pub fn release_lock(
+    db: &Db,
+    batch: &mut WriteBatch,
+    start_ts: u64,
+    keys: &[Bytes],
+) -> Result<TxnKvResp, ProtoError> {
+    let snapshot = EngineSnapshot::new(db);
+    let mut staged = Mutations::new();
+    let mut released = 0u64;
+
+    for user_key in keys {
+        let (mutations, gave_back) =
+            esker_txn::release(&snapshot, user_key, start_ts).map_err(txn_to_proto)?;
+        if gave_back {
+            staged.extend(mutations);
+            released += 1;
+        }
+    }
+
+    stage(db, batch, &staged)?;
+    Ok(TxnKvResp::ReleaseLock { released })
+}
+
 /// Applies a verdict about someone else's transaction to the keys of it that live here
 /// (`docs/txn-spec.md` §5.5).
 ///

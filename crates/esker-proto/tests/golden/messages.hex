@@ -126,6 +126,7 @@ request txn-resolve-rollback 0602010203042a00010161
 request txn-heartbeat 0702010203042a0170b817
 request txn-gc-safepoint 080201020304808080808040
 request txn-reclaim-range 0a0201020304016400808080808040
+request txn-release-lock 0b02010203042a010161
 request admin-split 010503016d
 request admin-transfer-leader 02050307
 request admin-regions 0305
@@ -145,6 +146,7 @@ response txn-commit-lock-lost 040205
 response txn-rollback 050201
 response txn-rollback-committed 05020432
 response txn-resolve-lock 060203
+response txn-release-lock 0b0201
 response txn-heartbeat 0702b817
 response txn-gc-safepoint 0802808080808040
 response txn-reclaim-range 0a02016600808080808040

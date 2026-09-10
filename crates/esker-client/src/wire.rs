@@ -131,6 +131,7 @@ pub fn txn_payload_size(request: &TxnKvReq) -> usize {
         }
         TxnKvReq::Commit { keys: k, .. }
         | TxnKvReq::Rollback { keys: k, .. }
+        | TxnKvReq::ReleaseLock { keys: k, .. }
         | TxnKvReq::ResolveLock { keys: k, .. } => keys(k) + 2 * PER_FIELD,
         TxnKvReq::Heartbeat { primary, .. } => primary.len() + 3 * PER_FIELD,
         TxnKvReq::GcSafepoint { .. } => PER_FIELD,
