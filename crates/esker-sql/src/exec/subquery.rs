@@ -1017,7 +1017,7 @@ pub(super) fn value_of(
                 .and_then(esker_keys::array::ArrayValue::element_of)
                 .is_some() =>
         {
-            let rows: Vec<Datum> = first_column(values).to_vec();
+            let rows = first_column(values);
             super::aggregate::accumulate_arrays(&rows, element.unwrap_or(ColumnType::Text))?
         }
         SubqueryKind::Array => Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
