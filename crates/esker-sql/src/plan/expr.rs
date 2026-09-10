@@ -1892,7 +1892,6 @@ impl CatalogFunc {
             | CatalogFunc::PgEncodingToChar
             | CatalogFunc::ObjDescription
             | CatalogFunc::PgGetPartkeydef
-            | CatalogFunc::OidVector
             | CatalogFunc::JsonFetchText
             // `concat` answers `text` for the ordinary reason: it builds a string.
             | CatalogFunc::Concat
@@ -1985,6 +1984,13 @@ impl CatalogFunc {
             CatalogFunc::HstoreAkeys | CatalogFunc::HstoreAvals | CatalogFunc::StringToArray => {
                 ColumnType::TextArray
             }
+            // **`x::oidvector` is an `oidvector`, whatever built it.** It sat in the group above
+            // answering `text`, which the *literal* path hid: that one folds to a value under an
+            // `Expr::Cast { to: OidVector }` and never asks this. Every other operand — a `text`
+            // column, `::text::oidvector`, an `ARRAY[…]` — reaches this, so `pg_typeof` said
+            // `text` where 19beta1 says `oidvector`, and a client decoding by oid was told the
+            // wrong thing (ADR 0086 is the same sentence from the value's side).
+            CatalogFunc::OidVector => ColumnType::OidVector,
             CatalogFunc::HstoreConcat | CatalogFunc::HstoreBuild => ColumnType::Hstore,
             // `->` keeps the document type and `->>` is text — measured,
             // `pg_typeof(payload->'b')` is `jsonb` and `pg_typeof(payload->>'b')` is `text`.

@@ -18,21 +18,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
-        // **What the literal ladder did not reach.** An unadorned `1` is declared `integer` here
-        // since the `int4` rung — `SELECT 1` describes as `integer` and `SELECT i4 || 2` names
-        // `integer || bigint` — but this refusal is raised by the *evaluator*, from the datums it
-        // was handed, and the rung narrowed declared types rather than values: a literal's datum
-        // is still an `i64`. So the operator that does not exist is named `bigint || bigint` where
-        // a real server names `integer || integer`. The sqlstate, the sentence, the `DETAIL` and
-        // the `HINT` are identical, and what the statement is *for* — that `||` is not integer
-        // concatenation — is answered the same way on both. Closing it means narrowing the datum,
-        // which is a change to what a bare integer *is* rather than to what it is called.
-        (
-            "SELECT 1 || 2",
-            "the refusal is raised from the datums, and a literal's datum is still an i64, so the \
-             message names bigint where the declared type is already integer",
-            "pg19_concat.txt:22",
-        ),
+        // **`SELECT 1 || 2` stood here and is gone**, closed by the `||` operator table (wire v3
+        // families F3a and F3b). It said the refusal named `bigint || bigint` where a real server
+        // names `integer || integer`, because it was raised by the *evaluator* from the datums and
+        // a literal's datum is still an `i64` — the `int4` rung narrowed declared types, not
+        // values. **The table moved the refusal to resolution**, where the declared type has been
+        // `integer` all along, and the whole sentence now matches. Closing it needed no change to
+        // what a bare integer *is*: it needed the decision made where the type was still known.
         // **`||` over arrays is built now**, and the entry that stood here for it is gone: three
         // shapes and the two NULL rules, measured in `tests/captures/pg19_array_families.txt`.
         // What was named a family of its own turned out to be the whole operator — `text[] ||

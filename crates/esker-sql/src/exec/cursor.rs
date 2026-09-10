@@ -4018,8 +4018,23 @@ fn catalog_function(
                 }
                 Datum::Text(out)
             }
+            // **A string is read as a vector, wherever it came from.** The lowering says this in
+            // its own comment and only does it for a **bare quoted literal**, so
+            // `'25 1043'::text::oidvector`, a `text` column and a concatenation all arrived here
+            // as a `Datum::Text` and fell into the arm below — which raises a sentence about an
+            // array's elements for a value that is not an array. Measured on 19beta1: an explicit
+            // cast out of a string type is accepted for **every one** of the wire v3 probe list's
+            // 100 spellings, through the target's input function, `pg_cast` row or not
+            // (`tests/captures/pg19_cast_at_use.txt`). `int2vector` was already right, because it
+            // reaches `lower_type` and the ordinary literal path.
+            //
+            // Read by the same `from_text` the literal path uses, so a string that is not a vector
+            // is the **input function's** `22P02` and not a refused cast.
+            Some(Datum::Text(text) | Datum::Citext(text)) => {
+                Datum::from_text(ColumnType::OidVector, text)?
+            }
             Some(Datum::Null) | None => Datum::Null,
-            // `x::oidvector` where `x` is not an array at all.
+            // `x::oidvector` where `x` is neither an array nor a string.
             Some(other) => {
                 return Err(SqlError::CannotCast {
                     from: other.column_type().map_or("unknown", |ty| ty.name()),
