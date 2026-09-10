@@ -6396,38 +6396,23 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `22P02` for a pair that does not exist at all. Two readers of one fact, and this is the
         // second asking the first.
         //
-        // Asked here for the families whose `pg_cast` rows are a measured census: the bit
-        // strings, `"char"`, and now `money`, `regproc` and `regtype` (see `pg_catalog::CASTS`).
-        // Each was added by a probe rather than by reading — `int2 -> "char"`, `2::int2::money`
-        // and `'int4in'::regproc::int2` are each a pair this node **folded** and a real server
-        // refuses `42846`, and each was invisible until something compared the fold to the oracle.
+        // **Asked for every pair, and it used to be a list.** It began with the bit strings,
+        // gained `"char"` the day `int2 -> "char"` was found folding where a real server says
+        // `42846`, and gained `money`, `regproc` and `regtype` the day after — three families in a
+        // row, each found by a probe rather than by reading, each a pair this node **folded** and
+        // a real server refuses (`int2 -> "char"`, `2::int2::money`, `'int4in'::regproc::int2`).
+        // A list that grows every time somebody measures is the wrong shape.
         //
-        // **The list wants to stop being a list.** Three families in a row have needed it, and
-        // `casts_to` is `pg_cast`'s own table: `exec::query` asks it for every cast over an
-        // *expression*, and the reason the fold does not ask it for every cast over a *constant*
-        // is caution, not a measurement. Dropping the guard entirely was tried here and
-        // `cast_fold` and `cast_matrix` were both green — but it changes what every folded cast in
-        // the language does, so it wants a whole-crate run of its own rather than a ride on a
-        // five-family unit. `debts-v1.1.md` #43 carries it.
+        // `casts_to` is `pg_cast`'s own table, and `exec::query` asks it for every cast over an
+        // *expression*; there is no reason a cast over a **constant** should be licensed by a
+        // different rule, and every time the two rules differed the constant was the wrong one.
+        // Two readers of one fact, reading it the same way (`debts-v1.1.md` #43).
+        //
+        // **`refused_cast` runs first and keeps its own sentences** — the `date`/number pairs, the
+        // `money` asymmetry, a `numeric` NaN — so this widens what is refused and changes nothing
+        // that was already refused. What it adds is the pairs nobody had written a rule for.
         if let Some(from) = source_type(expr)?
             && let Ok((to, _)) = lower_type(data_type)
-            && (matches!(
-                from,
-                ColumnType::Bit
-                    | ColumnType::VarBit
-                    | ColumnType::Char
-                    | ColumnType::Money
-                    | ColumnType::RegProc
-                    | ColumnType::RegType
-            ) || matches!(
-                to,
-                ColumnType::Bit
-                    | ColumnType::VarBit
-                    | ColumnType::Char
-                    | ColumnType::Money
-                    | ColumnType::RegProc
-                    | ColumnType::RegType
-            ))
             && !catalog::pg_catalog::casts_to(from, to)
         {
             return Err(SqlError::CannotCast {
