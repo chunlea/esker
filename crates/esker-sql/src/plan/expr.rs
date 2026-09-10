@@ -1082,6 +1082,12 @@ pub enum CatalogFunc {
     /// `Datum::Text` with nothing to say which it is. `<@` is this with the operands the other way
     /// round — measured, not assumed.
     JsonbContains,
+    /// `polygon_contains(a, b)`: whether the polygon `a` contains the polygon `b`, as `@>` means
+    /// between two of them. `<@` is this with the operands the other way round.
+    PolygonContains,
+    /// `polygon_overlaps(a, b)`: `&&` between two polygons, which **includes touching** — two
+    /// squares sharing only an edge or only a vertex overlap. Measured.
+    PolygonOverlaps,
     /// `a ~= b`: whether two geometric values are the same.
     ///
     /// **Carried rather than refused at lowering, so that it can be refused with a type.** A
@@ -1635,6 +1641,8 @@ impl CatalogFunc {
             CatalogFunc::SameAs => "~=",
             CatalogFunc::JsonbCompare => "jsonb_compare",
             CatalogFunc::JsonbContains => "jsonb_contains",
+            CatalogFunc::PolygonContains => "polygon_contains",
+            CatalogFunc::PolygonOverlaps => "polygon_overlaps",
             // One symbol, two containments — see `exec::cursor`, where the operand decides.
             CatalogFunc::RangeContains | CatalogFunc::HstoreContains => "@>",
             CatalogFunc::HstoreConcat | CatalogFunc::JsonbConcat => "||",
@@ -1736,6 +1744,8 @@ impl CatalogFunc {
             | CatalogFunc::SameAs
             | CatalogFunc::JsonbCompare
             | CatalogFunc::JsonbContains
+            | CatalogFunc::PolygonContains
+            | CatalogFunc::PolygonOverlaps
             | CatalogFunc::HstoreContains
             | CatalogFunc::HstoreConcat
             | CatalogFunc::JsonbConcat
@@ -1945,7 +1955,9 @@ impl CatalogFunc {
             | CatalogFunc::TsMatch
             | CatalogFunc::PgCancelBackend
             | CatalogFunc::PgTerminateBackend
-            | CatalogFunc::JsonbContains => ColumnType::Bool,
+            | CatalogFunc::JsonbContains
+            | CatalogFunc::PolygonContains
+            | CatalogFunc::PolygonOverlaps => ColumnType::Bool,
             CatalogFunc::TextToLtree => ColumnType::Ltree,
             // Measured: `akeys` is `text[]`, and `||` and `hstore(…)` are hstores. `->`'s `text`
             // and `?`/`@>`'s `boolean` are folded into the lists above and below.

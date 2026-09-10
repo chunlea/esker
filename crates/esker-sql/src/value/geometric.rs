@@ -451,6 +451,132 @@ fn centroid(vertices: &[(f64, f64)]) -> (f64, f64) {
 /// One reader for all six because that is what PostgreSQL's own are: `'2,3,5.5,7'::box` and
 /// `'(2,3),(5.5,7)'::box` are the same box, so the punctuation carries no information beyond the
 /// outermost pair — which each arm above has already read.
+/// **How close two coordinates have to be to count as one.**
+///
+/// PostgreSQL's geometric operators are fuzzy and this is the constant: a point `1e-6` outside an
+/// edge is contained and one `1e-5` outside is not, and `point_ne` draws the same line
+/// (`tests/captures/pg19_point_ne.txt`, `pg19_polygon_contains.txt`). A predicate written against
+/// the reals is wrong on every pair inside the band, which is not a rounding detail — it is what
+/// the operator means.
+pub(crate) const EPSILON: f64 = 1.0e-6;
+
+/// A polygon's vertices, in order.
+fn ring(text: &str) -> Option<Vec<(f64, f64)>> {
+    let flat = numbers(text)?;
+    (flat.len() >= 2 && flat.len() % 2 == 0).then(|| {
+        flat.chunks_exact(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect()
+    })
+}
+
+/// How far `point` is from the segment `a`–`b`.
+fn distance_to_segment(point: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let length = dx.mul_add(dx, dy * dy);
+    // A degenerate segment is a point, and the distance to it is the distance to that point.
+    let t = if length <= 0.0 {
+        0.0
+    } else {
+        (((point.0 - a.0) * dx + (point.1 - a.1) * dy) / length).clamp(0.0, 1.0)
+    };
+    let (nx, ny) = (dx.mul_add(t, a.0), dy.mul_add(t, a.1));
+    (point.0 - nx).hypot(point.1 - ny)
+}
+
+/// Whether `point` is inside `ring`, **with the boundary counted as inside** and fuzzily so.
+fn point_in_ring(ring: &[(f64, f64)], point: (f64, f64)) -> bool {
+    // The boundary first, because the crossing count below is exactly what is undefined on it.
+    for pair in 0..ring.len() {
+        let (a, b) = (ring[pair], ring[(pair + 1) % ring.len()]);
+        if distance_to_segment(point, a, b) <= EPSILON {
+            return true;
+        }
+    }
+    // Ray casting: an odd number of crossings to the right means inside.
+    let mut inside = false;
+    for pair in 0..ring.len() {
+        let (a, b) = (ring[pair], ring[(pair + 1) % ring.len()]);
+        if (a.1 > point.1) != (b.1 > point.1) {
+            let at = (b.0 - a.0) * (point.1 - a.1) / (b.1 - a.1) + a.0;
+            if point.0 < at {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// Which side of the line `a`–`b` the point `c` is on, as a sign.
+fn side(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
+    (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+}
+
+/// Whether the segments `a`–`b` and `c`–`d` cross **properly** — sharing an endpoint or touching
+/// along a boundary is not a crossing, which is what lets an inner polygon share an edge with its
+/// container.
+fn segments_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+    // **Touching within the epsilon is not crossing**, and it has to be measured as a distance
+    // rather than read off `side`, which is twice a triangle's area and so grows with the
+    // segments. Without this, a polygon lying `1e-7` outside an edge has a side that strictly
+    // crosses it and the containment came back `f` where PostgreSQL says `t` — one cell of
+    // `pg19_polygon_contains.txt`, and the reason that cell is in it.
+    if distance_to_segment(c, a, b) <= EPSILON
+        || distance_to_segment(d, a, b) <= EPSILON
+        || distance_to_segment(a, c, d) <= EPSILON
+        || distance_to_segment(b, c, d) <= EPSILON
+    {
+        return false;
+    }
+    let (s1, s2) = (side(a, b, c), side(a, b, d));
+    let (s3, s4) = (side(c, d, a), side(c, d, b));
+    (s1 * s2 < 0.0) && (s3 * s4 < 0.0)
+}
+
+/// Whether the polygon `outer` contains the polygon `inner`, as `@>` means.
+///
+/// **Two questions, and the second is the one a plausible implementation leaves out**: every vertex
+/// of `inner` must be inside `outer`, *and* no edge of `inner` may cross an edge of `outer`. In a
+/// concave `outer` an edge can leave and re-enter between two contained vertices, and PostgreSQL
+/// answers `f` for exactly that — measured before this was written, which is why it is here.
+pub(crate) fn polygon_contains(outer: &str, inner: &str) -> Option<bool> {
+    let (outer, inner) = (ring(outer)?, ring(inner)?);
+    if !inner.iter().all(|point| point_in_ring(&outer, *point)) {
+        return Some(false);
+    }
+    for i in 0..inner.len() {
+        let (a, b) = (inner[i], inner[(i + 1) % inner.len()]);
+        for j in 0..outer.len() {
+            let (c, d) = (outer[j], outer[(j + 1) % outer.len()]);
+            if segments_cross(a, b, c, d) {
+                return Some(false);
+            }
+        }
+    }
+    Some(true)
+}
+
+/// Whether two polygons overlap, as `&&` means — **touching counts**, measured: two squares
+/// sharing only an edge overlap, and so do two sharing only a vertex.
+pub(crate) fn polygons_overlap(left: &str, right: &str) -> Option<bool> {
+    let (left, right) = (ring(left)?, ring(right)?);
+    if left.iter().any(|point| point_in_ring(&right, *point))
+        || right.iter().any(|point| point_in_ring(&left, *point))
+    {
+        return Some(true);
+    }
+    for i in 0..left.len() {
+        let (a, b) = (left[i], left[(i + 1) % left.len()]);
+        for j in 0..right.len() {
+            let (c, d) = (right[j], right[(j + 1) % right.len()]);
+            if segments_cross(a, b, c, d) {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
 fn numbers(text: &str) -> Option<Vec<f64>> {
     let mut out = Vec::new();
     for part in text.split([',', '(', ')', '[', ']', '<', '>']) {
@@ -581,6 +707,66 @@ mod tests {
         assert_eq!(
             flat.to_string(),
             "invalid line specification: A and B cannot both be zero"
+        );
+    }
+}
+
+#[cfg(test)]
+mod contains_tests {
+    /// **Every measured cell of the capture**, read rather than restated.
+    ///
+    /// The capture is the specification — `value::geometric` had no predicates at all before this,
+    /// so there was nothing to derive them from but PostgreSQL's answers.
+    #[test]
+    fn every_measured_polygon_cell_agrees() {
+        let capture = include_str!("../../tests/captures/pg19_polygon_contains.txt");
+        let mut checked = 0;
+        for line in capture.lines().filter(|line| !line.starts_with('#')) {
+            let mut fields = line.split('\t');
+            let (Some(statement), Some(_), Some(expected)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let Some(inner) = statement
+                .strip_prefix("SELECT ('")
+                .and_then(|rest| rest.strip_suffix(") AS v"))
+            else {
+                continue;
+            };
+            let Some((left, rest)) = inner.split_once("'::polygon ") else {
+                continue;
+            };
+            let Some((op, right)) = rest.split_once(" '") else {
+                continue;
+            };
+            let ours = if let Some(right) = right.strip_suffix("'::polygon") {
+                match op {
+                    "@>" => super::polygon_contains(left, right),
+                    // `<@` is `@>` with the operands the other way round, measured.
+                    "<@" => super::polygon_contains(right, left),
+                    "&&" => super::polygons_overlap(left, right),
+                    _ => continue,
+                }
+            } else if let Some(right) = right.strip_suffix("'::point") {
+                // A point is a one-vertex ring, so the same predicate answers for it.
+                match op {
+                    "@>" => super::polygon_contains(left, right),
+                    _ => continue,
+                }
+            } else {
+                continue;
+            };
+            assert_eq!(
+                ours,
+                Some(expected == "t"),
+                "{left} {op} {right} -- PostgreSQL says {expected}"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 35,
+            "only {checked} cells read; the capture did not load"
         );
     }
 }
