@@ -48,7 +48,7 @@ pub use mutation::{Cf, Mutation, Mutations};
 pub use percolator::{
     CommitDecision, Op, Prewrite, PrewriteDecision, PrimaryCommit, PrimaryCommitted, PrimaryState,
     ReadOutcome, Resolution, check_prewrite, commit_primary, commit_secondary, primary_state, read,
-    resolve, rollback,
+    release, resolve, rollback,
 };
 pub use snapshot::{TxnSnapshot, Version};
 

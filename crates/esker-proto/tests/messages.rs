@@ -619,6 +619,19 @@ fn golden_txn_finish_requests() -> Vec<(&'static str, Request)> {
             ),
         ),
         (
+            // `Rollback`'s two fields and a different verb: this hands the keys back to a
+            // transaction that is still running, where a rollback ends it on them for ever
+            // (ADR 0104 §2).
+            "txn-release-lock",
+            Request::txn_kv(
+                h,
+                TxnKvReq::ReleaseLock {
+                    start_ts: TXN_TS,
+                    keys: vec![Bytes::from_static(b"a")],
+                },
+            ),
+        ),
+        (
             "txn-heartbeat",
             Request::txn_kv(
                 h,
@@ -772,6 +785,10 @@ fn golden_txn_housekeeping_responses() -> Vec<(&'static str, Response)> {
         (
             "txn-resolve-lock",
             Response::TxnKv(TxnKvResp::ResolveLock { resolved: 3 }),
+        ),
+        (
+            "txn-release-lock",
+            Response::TxnKv(TxnKvResp::ReleaseLock { released: 1 }),
         ),
         (
             "txn-heartbeat",

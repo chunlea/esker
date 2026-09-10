@@ -620,6 +620,59 @@ pub fn rollback(snapshot: &impl TxnSnapshot, user_key: &[u8], start_ts: u64) -> 
     Ok(mutations)
 }
 
+// -- release -----------------------------------------------------------------------------
+
+/// Gives one key back **without ending the transaction that holds it**
+/// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+///
+/// `ROLLBACK TO SAVEPOINT`, and the deadlock victim inside one. PostgreSQL releases a
+/// subtransaction's row locks when it aborts and keeps the transaction alive; a
+/// `SELECT … FOR UPDATE` in this system leaves a lock **in the store**, and until this existed
+/// nothing could take it back short of ending the whole transaction.
+///
+/// # Why this is not [`rollback`]
+///
+/// A rollback writes a marker at `commit_ts == start_ts`, which makes the transaction dead **on
+/// that key for ever**: a later `Prewrite` of it answers [`PrewriteDecision::RolledBack`]. That is
+/// exactly right for a transaction that is over and exactly wrong here — a savepoint's victim very
+/// often writes the row it locked once the `rescue` is done, and a marker would trade a lock that
+/// blocks others for a transaction that cannot finish. So: the lock record goes, the value it
+/// staged goes with it, and **nothing is written down**. The key returns to the state it was in
+/// before this transaction touched it.
+///
+/// # What it will not do
+///
+/// * **Somebody else's lock is not ours to remove** — the same rule [`rollback`] keeps. A key
+///   whose lock belongs to another `start_ts` is left alone and counted as not released.
+/// * **A committed key is not un-committed.** If the transaction already committed this key, the
+///   lock is gone and there is nothing here to take; answering "released" would be a lie about a
+///   record that is now every reader's.
+///
+/// Idempotent: a key this transaction does not hold answers `false` and writes nothing, which is
+/// what makes it safe on a retry and safe from a destructor.
+pub fn release(
+    snapshot: &impl TxnSnapshot,
+    user_key: &[u8],
+    start_ts: u64,
+) -> Result<(Mutations, bool)> {
+    let mut mutations = Mutations::new();
+    let Some(lock) = snapshot.get_lock(user_key)? else {
+        return Ok((mutations, false));
+    };
+    if lock.start_ts != start_ts {
+        return Ok((mutations, false));
+    }
+    mutations.delete_lock(user_key);
+    // The staged value goes with the lock it belonged to. A short value lives *inside* the lock
+    // record and needs no second delete; a long one is a `default` CF entry filed under this
+    // transaction's own `start_ts`, and leaving it would be a value no write record can ever
+    // name — garbage the safepoint would have to collect.
+    if lock.short_value.is_none() && lock.kind == Kind::Put {
+        mutations.delete_value(user_key, start_ts);
+    }
+    Ok((mutations, true))
+}
+
 // -- resolution --------------------------------------------------------------------------
 
 /// Reads what the `write` and `lock` column families say about the transaction that owns

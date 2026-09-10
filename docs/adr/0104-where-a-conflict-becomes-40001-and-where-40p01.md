@@ -316,7 +316,7 @@ more; the window ADR 0062 declares — an insert that lands after the check — 
 `Isolation::Serializable` stays the declared divergence it is
 (`crates/esker-sql/src/parameter.rs:594`).
 
-### §2 — a savepoint must be able to give back an eager lock  *(store/txn — h1; needs the human)*
+### §2 — a savepoint must be able to give back an eager lock  *(store/txn — h1)* — **built**, approved 2026-09-10
 
 The one thing this needs does not exist: **a way to remove this transaction's own lock record from a
 key without ending the transaction.**
@@ -341,12 +341,26 @@ with `esker_client::Transaction::release(&mut self, keys)` removing them from `s
 halves. `Savepoints::give_locks_back_to` (`exec/savepoint.rs:191`) already knows exactly which keys
 belong to the savepoint and already calls `Txn::unlock` for each, so nothing above changes.
 
-**This is a wire change and it is not mine to make.** `CLAUDE.md` — *"Ask before doing … change an
-on-disk or wire format that already has a golden test"* — and ADR 0067 §2's rule that a
-cluster-scope lock change is *"asked for as one rather than smuggled in"*. It adds a method tag to
-`TxnKvReq`; it adds **no** `TxnWrite` variant and **no** record kind, so no on-disk golden moves,
-and it is not replicated as a new command shape — the deletion of a lock record is a mutation the
-`Mutations` type already produces. That is the smallest form I can find; the question is the human's.
+**This is a wire change and it was not mine to make.** `CLAUDE.md` — *"Ask before doing … change
+an on-disk or wire format that already has a golden test"* — and ADR 0067 §2's rule that a
+cluster-scope lock change is *"asked for as one rather than smuggled in"*. Asked, and approved on
+2026-09-10.
+
+**What it costs is one method tag and one log verb, and the second of those this ADR got wrong.**
+The draft said it "is not replicated as a new command shape — the deletion of a lock record is a
+mutation the `Mutations` type already produces". The mutation is, and that is not the question: a
+lock deletion is state every replica has to agree about, so it must travel through the log like
+every other write. A follower that never learned of the deletion goes on refusing readers for a
+lock its leader gave back — and goes on refusing after it becomes leader. So `TxnCommand` gains
+verb **6**, `ReleaseLock`, alongside the wire's `0x020B`.
+
+Both are **additions**: every byte an earlier verb or tag produced still decodes to the same thing,
+no `TxnWrite` variant is added, no record kind is added, and the on-disk goldens
+(`esker-txn/tests/golden/txn.txt` and the rest) do not move. What does move is the *wire* golden,
+`esker-proto/tests/golden/messages.hex`, by two added lines — the file's own exhaustiveness test
+(`the_goldens_cover_every_method_and_every_error_code`) is what demands them, and it caught the
+omission before anything else did. The rolling-upgrade rule is the one every replicated addition
+here carries: a peer that does not know verb 6 refuses to decode it.
 
 **Only our own lock.** A key whose lock belongs to another `start_ts` is untouched — the same rule
 `rollback` states (`crates/esker-txn/src/percolator.rs:610`).
@@ -386,11 +400,10 @@ same question ADR 0088 asked of the eager lock itself and answered with `tests/l
 (b) is the better end state and (a) is what closes ③. They compose: (a) first, (b) if the remainder
 is ever measured to matter.
 
-*If the human refuses the new method*, the fallback must be written down rather than discovered:
-`SELECT … FOR UPDATE` inside a savepoint keeps its cluster lock to the end of the top transaction,
-③ stays red, and the sentence goes in `DESIGN.md` §8 and the divergence table — *"a subtransaction's
-row locks are released node-locally on `ROLLBACK TO SAVEPOINT`; the cluster-scope half is held to
-the end of the transaction"*.
+(a) is what was built. The remainder it leaves is exact and small: **one row of one transaction** —
+the primary of a transaction that still holds another eager lock — stays held to the end of the
+block, and `a_primary_is_kept_while_another_lock_still_names_it` is that case pinned as a test
+rather than left to be discovered. (b) stays available if the remainder is ever measured to matter.
 
 ### §3 — a store-side wait must draw an edge  *(SQL layer — either lane; I would take it)*
 
@@ -411,30 +424,54 @@ session.
 the SQL layer's graph is not consulted at all. §3 is for the *statement* path, and it is what stands
 between `transactions_test.rb` and a wait that nothing ends — see below.
 
-### §4 — the commit path's budget reports the wrong condition  *(store/txn — h1)*
+### §4 — **refuted, 2026-09-10, by its own examination** — *(no code)*
 
-`Transaction::prewrite` gives up after `MAX_LOCK_RESOLUTIONS = 8` rounds and reports
-`LockNotCleared` → `40001`. Against a *dead* holder that is right and the budget is what stops an
-infinite loop. Against a **live, heartbeating** holder it is a spurious failure: PostgreSQL would go
-on waiting, and the transaction being refused has lost no race — it has met a lock that is still
-somebody's.
+The draft said: `Transaction::prewrite` gives up after `MAX_LOCK_RESOLUTIONS = 8` rounds and
+reports `LockNotCleared` → `40001`; against a live, heartbeating holder that is a spurious
+failure, so it should say `55P03` instead, and it should check its own fate first and say `40P01`
+if it was wounded. Both halves are wrong, and writing them down is what showed it.
 
-Two changes, neither of them a new bound:
+**(a) `55P03` is wrong because the caller is usually not an acquirer.** `LockNotCleared` has three
+producers, and only one of them is a transaction that wanted a lock:
 
-* **Ask why the budget ran out.** A refusal after eight rounds against a holder that was *alive on
-  every one of them* is not a serialization failure; it is this transaction failing to acquire. The
-  honest code for it is `55P03` (`SqlError::LockNotAvailable` / `LockTimeout`, both already mapped),
-  and the honest sentence names the holder. `40001` tells a client to retry an identical
-  transaction, which will meet the same live lock and fail the same way.
-* **Check our own fate before reporting.** A transaction that has been wounded is holding a primary
-  with somebody else's rollback marker on it, and `primary_fate` (`esker-client/src/txn.rs:1841`)
-  already asks that question atomically. Asking it *before* returning `LockNotCleared` turns a
-  wound the victim has not noticed yet into the `40P01` it is, at the step where PostgreSQL raises
-  it, rather than one statement later.
+| producer | who is asking | `esker-client/src/txn.rs` |
+|---|---|---|
+| `call_resolving`'s budget | a **reader** — `get`, `scan_page`, `latest_commit` | 1785 |
+| `prewrite_range_checks`'s budget | a **read set** asserting a range did not move (§1) | 1609 |
+| `prewrite`'s budget | an **acquirer**, the only one | 1439 |
 
-§4 is not required by any of the three tests once §2 lands. It is here because ③ is the second time
-this project has read a `LockNotCleared` as evidence of something it is not, and because the first
-of the two changes is what makes a *long* transaction survive a *slow* one.
+(A fourth site, `check`'s `Locked` arm at 1747, is documented as unreachable — *"reaching here
+means the caller skipped the resolution, which is a bug in this crate"* — and §1 is what made it
+reachable for a range, which is why §1 gave that path a loop of its own.)
+
+A reader that gave up did not fail to obtain a lock; it holds nothing and wanted nothing. Telling
+it `55P03 could not obtain lock on row` — which Rails maps to `LockWaitTimeout` — would be a worse
+lie than the one it replaces, and the class is not rare: `catalog/record.rs` documents an ordinary
+`SELECT` meeting a DDL's lock on the catalog's version counter and becoming *"a serialization
+failure in a transaction that serializes with nothing"*.
+
+**And it is wrong for the acquirer too.** The draft's argument was that *"`40001` tells a client to
+retry an identical transaction, which will meet the same live lock and fail the same way"*. That
+assumes the holder is immortal. It is not: it holds a three-second lease and is, in the case this
+is about, committing. A retry usually succeeds, which is exactly what `40001` promises and what
+`55P03` would tell the client not to bother with.
+
+**(b) cannot be built on this wire, and that is a fact rather than a preference.**
+`esker_txn::rollback` is idempotent by design — *"Already marked. Idempotent: the answer is the
+same and there is nothing to write"* — so the store answers `TxnStatus::Ok` whether the marker was
+already there or has just been written. A client therefore **cannot tell "somebody wounded me"
+from "I have just killed myself by asking"**, and `primary_fate` is that same destructive question.
+Making the answer distinguish the two would change an existing method's meaning for every caller of
+`Rollback`, which is a much larger change than the one §4 was proposing to justify it.
+
+**What survives is the symptom, and it is a measurement, not an argument.** A healthy transaction
+*is* refused when a slow but live holder outlasts a fixed eight-round budget, and PostgreSQL, whose
+`lock_timeout` defaults to `0`, would have waited. The question is not which SQLSTATE to rename —
+it is whether the budget is too small, and that is answerable: count `LockNotCleared` by producer
+under the Rails suite on the real topology, and separate the refusals whose holder was **alive on
+every round** from those that met a dead one. If the first group is non-empty under ordinary load,
+the budget is the defect and the fix is in the budget. Nothing in this section should be built
+before that number exists.
 
 ### §5 — savepoint interaction, stated once
 
@@ -532,8 +569,8 @@ choose between them.
   gate-reverse-dependents care that a new proto variant always needs.
 * **§3 makes a `40P01` reachable where the node used to hang.** A test that passed by waiting will
   now be told, which is the direction we want and is still a behaviour change.
-* **§4 moves one condition from `40001` to `55P03`.** A client retrying on `40001` alone stops
-  retrying that case, which is correct — the retry could not have worked — and is visible.
+* **§4 changes nothing**, and the SQLSTATE it proposed to move would have been wrong in both
+  directions — see its refutation above. The symptom it named survives as a measurement to make.
 * **Nothing here changes a SQLSTATE mapping, a message, or an on-disk record.** The three tests need
   the store to decide differently, not the SQL layer to say it differently.
 

@@ -1243,3 +1243,137 @@ async fn our_own_lock_inside_a_checked_range_is_not_a_phantom() {
         "the only lock in the range is this transaction's own"
     );
 }
+
+/// **A release takes this transaction's lock and leaves nothing behind**
+/// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2),
+/// through the log and the apply loop like every other write.
+///
+/// The three assertions are the three ways it differs from a `Rollback`: the lock is gone, **no
+/// write record was left**, and the same transaction can take the key again. A savepoint's
+/// deadlock victim does exactly that — it gives its rows back at the `40P01` and writes one of
+/// them the moment its `rescue` is over — and a marker would have made that impossible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_gives_the_key_back_without_a_marker() {
+    let running = start().await;
+    let transport = TcpTransport::connect(running.handle.local_addr())
+        .await
+        .unwrap();
+
+    let locked = call(
+        &transport,
+        TxnKvReq::Prewrite {
+            start_ts: 40,
+            primary: key(b"m"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::Put {
+                key: key(b"m"),
+                value: Bytes::from_static(b"inside the savepoint"),
+                read_ts: None,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(locked, TxnKvResp::prewrite_ok(1));
+
+    let released = call(
+        &transport,
+        TxnKvReq::ReleaseLock {
+            start_ts: 40,
+            keys: vec![key(b"m")],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(released, TxnKvResp::ReleaseLock { released: 1 });
+
+    // Nothing was written down. A rollback would have left a marker at `commit_ts == start_ts`.
+    let newest = call(&transport, TxnKvReq::LatestCommit { key: key(b"m") })
+        .await
+        .unwrap();
+    assert_eq!(
+        newest,
+        TxnKvResp::LatestCommit { newest: None },
+        "a release is not a rollback: it records nothing"
+    );
+
+    // And the key is free — to this transaction as much as to anybody.
+    let again = call(
+        &transport,
+        TxnKvReq::Prewrite {
+            start_ts: 40,
+            primary: key(b"m"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::Put {
+                key: key(b"m"),
+                value: Bytes::from_static(b"after the rescue"),
+                read_ts: None,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        again,
+        TxnKvResp::prewrite_ok(1),
+        "the transaction that released it may take it again"
+    );
+}
+
+/// A release names its owner: somebody else's lock is not ours to give away, and the count says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_leaves_another_transactions_lock_alone() {
+    let running = start().await;
+    let transport = TcpTransport::connect(running.handle.local_addr())
+        .await
+        .unwrap();
+
+    let theirs = call(
+        &transport,
+        TxnKvReq::Prewrite {
+            start_ts: 50,
+            primary: key(b"m"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::Put {
+                key: key(b"m"),
+                value: Bytes::from_static(b"theirs"),
+                read_ts: None,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(theirs, TxnKvResp::prewrite_ok(1));
+
+    let released = call(
+        &transport,
+        TxnKvReq::ReleaseLock {
+            start_ts: 40,
+            keys: vec![key(b"m")],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        released,
+        TxnKvResp::ReleaseLock { released: 0 },
+        "not ours, so not counted and not taken"
+    );
+
+    // Still held, by its owner.
+    let met = call(
+        &transport,
+        TxnKvReq::Get {
+            key: key(b"m"),
+            ts: 60,
+        },
+    )
+    .await;
+    match met.expect_err("the owner still holds it") {
+        ProtoError::Locked { lock_info } => {
+            let lock = LockInfo::decode(&lock_info).expect("a lock the client can read");
+            assert_eq!(lock.start_ts, 50, "still its owner's");
+        }
+        other => panic!("expected a Locked refusal, got {other:?}"),
+    }
+}

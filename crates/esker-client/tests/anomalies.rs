@@ -441,3 +441,102 @@ fn a_range_check_that_outlives_the_lock_commits() {
 
     cluster.shutdown();
 }
+
+/// Whether `key` is free of any lock, asked by the only thing a `FOR UPDATE` lock excludes.
+///
+/// **Not a `Get`.** A lock taken by `Transaction::lock` carries `Kind::Lock`, and
+/// `percolator::read` steps past those on purpose: a locking read must not block a plain reader,
+/// which is what a real server does too. What such a lock excludes is another *acquirer*, so that
+/// is what asks.
+///
+/// The probe is younger than any holder, so it waits rather than wounding, and it gives back
+/// whatever it took — with the very call under test, which is the cheapest way to keep the probe
+/// from becoming a second holder.
+fn is_free(client: &TxnClient, key: &'static [u8]) -> bool {
+    let mut probe = client.begin().expect("a probe transaction");
+    let taken = matches!(
+        probe.lock(key).expect("the probe reaches the store"),
+        esker_client::Acquired::Taken
+    );
+    if taken {
+        probe
+            .release(&[Bytes::from_static(key)])
+            .expect("the probe gives back what it took");
+    }
+    taken
+}
+
+/// **A savepoint gives its eager lock back, and the transaction goes on**
+/// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+///
+/// The case that made ADR 0104 §2 necessary and the case the obvious guard would have missed:
+/// the released key is the transaction's own **primary**. `pin_primary` takes *the smallest key
+/// already buffered, or the key being locked when nothing is*, so a savepoint whose first act is
+/// `SELECT … FOR UPDATE` over a transaction that has written nothing pins that very row — which is
+/// Rails' shape exactly. A rule of "never release the primary" would leave the savepoint's own
+/// lock behind, which is the bug this closes.
+///
+/// Released with nothing else naming it, the transaction is unpinned and carries on: it locks
+/// another row, which pins a new primary by the ordinary rule, and commits.
+#[test]
+fn a_transaction_releases_its_own_primary_when_nothing_else_names_it() {
+    let cluster = cluster(0xa0_0106);
+    let client = client(&cluster, 106);
+
+    let mut txn = client.begin().unwrap();
+    txn.lock(b"a7").unwrap();
+    assert!(!is_free(&client, b"a7"), "the lock is on the store");
+
+    txn.release(&[Bytes::from_static(b"a7")]).unwrap();
+    assert!(
+        is_free(&client, b"a7"),
+        "the savepoint gave it back, and it was the primary"
+    );
+
+    // Still a live transaction: a new lock pins a new primary, and the commit lands.
+    txn.lock(b"a8").unwrap();
+    txn.put(b"a8", b"after the rescue");
+    txn.commit().expect("the transaction was never ended");
+
+    let reader = client.begin().unwrap();
+    assert_eq!(
+        reader.get(b"a8").unwrap(),
+        Some(Bytes::from_static(b"after the rescue"))
+    );
+
+    cluster.shutdown();
+}
+
+/// **And keeps it while another of its locks still names it.**
+///
+/// Every lock record of one transaction names the same primary, and a resolver reads that primary
+/// to decide the fate of all of them. Releasing it under a live secondary would leave that
+/// secondary pointing at a record that is not there — a transaction that reads as `Missing`, which
+/// anyone may roll back. So one row of one transaction stays held to the end of the block, which is
+/// the declared remainder: not every row of every savepoint.
+#[test]
+fn a_primary_is_kept_while_another_lock_still_names_it() {
+    let cluster = cluster(0xa0_0107);
+    let client = client(&cluster, 107);
+
+    let mut txn = client.begin().unwrap();
+    txn.lock(b"a7").unwrap();
+    txn.lock(b"a8").unwrap();
+
+    txn.release(&[Bytes::from_static(b"a7")]).unwrap();
+    assert!(
+        !is_free(&client, b"a7"),
+        "a8's lock still names a7 as its primary, so a7 stays"
+    );
+
+    // With the secondary gone the primary is releasable, in the same call or a later one.
+    txn.release(&[Bytes::from_static(b"a8"), Bytes::from_static(b"a7")])
+        .unwrap();
+    assert!(is_free(&client, b"a8"), "the secondary went");
+    assert!(
+        is_free(&client, b"a7"),
+        "and then nothing named the primary"
+    );
+
+    cluster.shutdown();
+}

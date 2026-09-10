@@ -498,6 +498,23 @@ impl Txn for StoreTxn {
             // `give_back` and not `release`: the transaction carries on. See `RowLocks`.
             locks.give_back(self.id, &[key.to_vec()]);
         }
+        // **And the half a second node can see**
+        // ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
+        // §2). A `SELECT … FOR UPDATE` leaves a Percolator lock on the store (ADR 0088), and
+        // until this call existed nothing gave it back short of ending the transaction: a
+        // savepoint's rollback freed the row for the sessions of *this* node and left every other
+        // node — and this node's own commit path — meeting a lock whose owner was alive and
+        // heartbeating. `transaction_nested_test.rb`'s recoverable deadlock is that, exactly.
+        //
+        // **A failure here is not the caller's**, and is deliberately not reported: `unlock` has
+        // no way to say so, and what a failed release costs is what this whole method used to
+        // cost — the lock lives to the end of the transaction, which commit and rollback both
+        // still clear. Degrading to the old behaviour is right; taking a `ROLLBACK TO SAVEPOINT`
+        // down over it is not.
+        let key = Bytes::copy_from_slice(key);
+        if let Some(txn) = self.open_mut() {
+            let _ = txn.release(std::slice::from_ref(&key));
+        }
     }
 
     fn read_set(&self) -> crate::backend::ReadSet {
