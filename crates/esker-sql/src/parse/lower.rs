@@ -1908,6 +1908,14 @@ pub(super) fn column_default(
     // A literal, with the sign or the cast a user wrote around it: what PostgreSQL's coercion
     // folds, and nothing more. `1 + 1` is *not* folded by a real server either — it prints back as
     // `(1 + 1)`, measured — so the fold here stops exactly where the server's does.
+    // **Which shapes this intercepts, and which fall through to [`lower_cast`]** — worth naming,
+    // because the boundary is not where it looks and reading it wrong sends you to the wrong
+    // function. Three are caught here: a bare literal, a signed one (which returns early and
+    // leaves the *text* to the deparser), and a literal under **one** cast. Everything else goes
+    // to lowering — including `(-1)::text`, whose inner is a `UnaryOp` rather than a `Value`, and
+    // `((1)::bigint)::text`, whose inner is another cast. That is why three of the deparse
+    // census's four `DEFAULT` rows were `lower_cast`'s to fix (`debts-v1.1.md` #42) and the
+    // fourth, `(42)::text`, already agreed: it is the one shape of the four that lands here.
     let (literal, cast) = match expr {
         Expr::Value(value) => (Some(&value.value), None),
         Expr::UnaryOp {
