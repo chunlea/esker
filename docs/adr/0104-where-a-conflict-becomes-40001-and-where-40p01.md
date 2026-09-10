@@ -400,6 +400,23 @@ same question ADR 0088 asked of the eager lock itself and answered with `tests/l
 (b) is the better end state and (a) is what closes ③. They compose: (a) first, (b) if the remainder
 is ever measured to matter.
 
+#### What it closed, with the counterfactual
+
+`store_locking.rs`'s `a_deadlock_inside_a_savepoint_is_recoverable_against_real_stores` runs ③'s
+sequence against three real stores — the file named for it, `nested_savepoint_deadlock.rs`, runs on
+`MemoryBackend`, which has no Percolator locks at all and so has never touched the half that fails.
+
+| tree | result |
+|---|---|
+| `4e5c5e51` — §1, **no** §2 (the tree run 114 measured) | **red**: `deadlock detected` escapes the *post-rescue* update |
+| `b04d2065` — §1 + §2 | green: one `40P01`, both sessions recover, both rows at 10 |
+
+So the sequence is closed, and the counterfactual says by which change. **It is not run 114's
+remaining failure**, and the two directions together are what say so: run 114 reports `40001 a lock
+… could not be cleared` on a tree that has §2, and this test's pre-§2 failure is a *second* `40P01`
+— a different condition at a different step. Something else in that file's environment produces the
+uncleared lock, which is what §4's diagnostic exists to name.
+
 (a) is what was built. The remainder it leaves is exact and small: **one row of one transaction** —
 the primary of a transaction that still holds another eager lock — stays held to the end of the
 block, and `a_primary_is_kept_while_another_lock_still_names_it` is that case pinned as a test

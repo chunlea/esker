@@ -368,8 +368,15 @@ fn a_range_check_waits_for_a_lock_it_may_not_wound() {
         .commit()
         .expect_err("a lock inside the read range is a phantom this transaction cannot rule out");
     assert!(
-        matches!(refused, Error::LockNotCleared { start_ts, .. } if start_ts == holder_ts),
-        "{refused}"
+        matches!(
+            refused,
+            Error::LockNotCleared {
+                start_ts,
+                waiting: esker_client::Waiting::ReadSet,
+                ..
+            } if start_ts == holder_ts
+        ),
+        "a range check names itself, so a pass can tell it from a read: {refused}"
     );
 
     // **The half that proves it waited rather than wounded.** A wound would have left a rollback
@@ -536,6 +543,58 @@ fn a_primary_is_kept_while_another_lock_still_names_it() {
     assert!(
         is_free(&client, b"a7"),
         "and then nothing named the primary"
+    );
+
+    cluster.shutdown();
+}
+
+/// **And an acquiring write names itself too** — the third of the three, and the only one that
+/// wanted the lock ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
+/// §4).
+///
+/// The holder is *older*, so the wound rule says wait rather than kill, and it never commits — so
+/// the acquirer spends its budget and is refused. What is asserted is the label: run 114 reported
+/// `a lock … could not be cleared` and no pass could say whether a reader, a read set or a writer
+/// had raised it, which is a whole measurement spent on a sentence.
+#[test]
+fn an_acquiring_write_that_gives_up_says_so() {
+    let cluster = cluster(0xa0_0108);
+    let client = client(&cluster, 108);
+    let router = cluster.router(108).expect("a router");
+
+    // Older than the writer below, so it is waited for rather than wounded, and never settled.
+    let holder_ts = cluster.oracle().tso_one();
+    let held = router
+        .call(&Body::Txn(TxnKvReq::Prewrite {
+            start_ts: holder_ts,
+            primary: Bytes::from_static(b"a7"),
+            ttl_ms: 3_000,
+            mutations: vec![TxnMutation::Put {
+                key: Bytes::from_static(b"a7"),
+                value: Bytes::from_static(b"in flight"),
+                read_ts: None,
+            }],
+        }))
+        .unwrap()
+        .into_txn_kv()
+        .unwrap();
+    assert_eq!(held, TxnKvResp::prewrite_ok(1));
+
+    let mut writer = client.begin().unwrap();
+    writer.put(b"a7", b"mine");
+    let refused = writer
+        .commit()
+        .expect_err("the row is held by a transaction that never finishes");
+    assert!(
+        matches!(
+            refused,
+            Error::LockNotCleared {
+                start_ts,
+                waiting: esker_client::Waiting::Acquire,
+                ..
+            } if start_ts == holder_ts
+        ),
+        "{refused}"
     );
 
     cluster.shutdown();
