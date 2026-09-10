@@ -1453,6 +1453,34 @@ async fn a_splitting_bulk_load_never_fails_for_want_of_attempts() {
 /// capacity and not the system's. If it does not move at all, the harness is not what is holding
 /// the election up, and the next arm — the same load on four real store processes — is what
 /// separates the rest.
+///
+/// # **This sweep has never fired, and until that is understood its zero is not evidence**
+///
+/// Two rounds on 2026-09-09: **0 sightings** here at 332 and 300 regions, while
+/// [`how_long_a_writer_waits_for_a_region_between_leaders`] — running in the next process, minutes
+/// later — stalled **3 of 3** both times, at 321 and 235 regions. Everything that should matter is
+/// the same, and it was checked rather than assumed:
+///
+/// | | this sweep | its sibling |
+/// |---|---|---|
+/// | harness | `Gate::start_with(8 KiB, 5 ms, 4)` | `Gate::start_splitting(8 KiB)` = the same call |
+/// | tick and driver threads | **reach the stores**: `open_store` sets `raft.tick` and `raft.driver_workers` from them | the same |
+/// | the load | 4,000 rows, 250 a batch, 256-byte filler, one table | identical |
+/// | the writer | `session.run`, the SQL path | identical |
+/// | what counts as a sighting | a refusal whose text says `not the leader` | identical |
+/// | the retry | the same statement every 20 ms until it lands | identical |
+/// | give-up | 20 s | 30 s |
+/// | the loop's exit | after 4 sightings | after 25 *cleared* waits, so never |
+/// | position in the run | **first in its process, on an idle box** | third overall, after two clusters have been built and torn down |
+///
+/// The last row is the only difference big enough to matter, and it cuts against the obvious
+/// reading: **inside this sweep the second cluster runs on the warmer box and fires even less**.
+/// So "later fires more" is not it either, and the honest state is that two tests which differ in
+/// nothing that should matter answer differently, twice.
+///
+/// **The experiment that decides it** is to run the sibling first and this sweep second — one
+/// flip, and whichever way the answer moves names the variable. Until then neither number is
+/// evidence about the tick or the thread count, which is what this sweep was built to measure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "debts #34, arm (b): two clusters, minutes, and it wants a quiet box"]
 async fn how_the_leaderless_window_moves_with_the_drivers() {

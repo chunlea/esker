@@ -149,6 +149,106 @@ fn a_batch_of_ticks_flattens_the_randomised_timeout() {
     );
 }
 
+/// **A leader that is alive is deposed by followers whose ticks were delivered ahead of its
+/// heartbeat.**
+///
+/// The second mechanism `docs/plans/debts-v1.1.md` #40 needs, and the one
+/// [ADR 0101](../../../../docs/adr/0101-a-batch-of-ticks-never-carries-a-whole-election.md) does
+/// **not** cover: 0101 makes a batch too narrow to contain a whole election timeout, and says
+/// nothing about the *order* of a batch's contents. A driver's queue carries ticks and messages
+/// alike, so a follower can advance its `election_elapsed` past its own draw on ticks that were
+/// queued **in front of** the heartbeat that would have reset it.
+///
+/// That produces exactly what the field snapshots show and a livelock does not: a leader **is**
+/// elected — one store answered `Follower … leader Some(10)` — and does not survive, with the term
+/// climbing fifty to ninety per two hundred and fifty rows.
+///
+/// The lease is no defence here and the reason is worth stating: §6.2's veto refuses a vote while
+/// `election_elapsed < randomized_election_timeout`, so a follower starved *alike* has already
+/// spent its own window and grants what it would otherwise have refused. Starvation does not pick
+/// one peer.
+///
+/// **The pair**: the same ticks and the same heartbeats, delivered one at a time, leave the leader
+/// in office.
+#[test]
+fn a_batch_that_puts_ticks_before_a_heartbeat_deposes_a_live_leader() {
+    // The control: interleaved, which is what a driver that keeps up delivers.
+    let mut interleaved = Harness::new(&[1, 2, 3], 11);
+    interleaved.tick_and_settle(40);
+    let settled = interleaved.leaders();
+    assert_eq!(
+        settled.len(),
+        1,
+        "the control must have one leader: {settled:?}"
+    );
+    let (leader, term) = settled[0];
+    interleaved.tick_and_settle(40);
+    assert_eq!(
+        interleaved.leaders(),
+        vec![(leader, term)],
+        "a leader whose heartbeats are delivered as they are sent keeps its office and its term"
+    );
+
+    // The same group, and the same number of ticks — but nothing is delivered until the batch is
+    // over, so every follower's own ticks are ahead of the leader's heartbeat in the queue.
+    let mut batched = Harness::new(&[1, 2, 3], 11);
+    batched.tick_and_settle(40);
+    let before = batched.leaders();
+    assert_eq!(
+        before.len(),
+        1,
+        "the batched arm starts from one leader too"
+    );
+    let (elected, first_term) = before[0];
+
+    // **Two widths, because the answer is different on each side of ADR 0101's cap** — and that
+    // is the finding rather than a parameter of the test.
+    let capped = crate::ELECTION_TIMEOUT_MIN_TICKS - 1;
+    for _ in 0..4 {
+        for _ in 0..capped {
+            batched.tick_all();
+        }
+        batched.settle();
+    }
+    let under_the_cap = batched.leaders();
+    println!(
+        "  batches of {capped} (the cap): was ({elected}, {first_term}), now {under_the_cap:?}"
+    );
+    assert_eq!(
+        under_the_cap,
+        vec![(elected, first_term)],
+        "at the capped width the leader must survive: every follower's `election_elapsed` is reset \
+         by the heartbeat each drive delivers, so {capped} ticks cannot reach a draw of \
+         {}..={}",
+        crate::ELECTION_TIMEOUT_MIN_TICKS,
+        crate::ELECTION_TIMEOUT_MAX_TICKS
+    );
+
+    // And the width the driver used to deliver, which is what the cap exists to prevent.
+    let uncapped = crate::ELECTION_TIMEOUT_MAX_TICKS + 1;
+    let mut wide = Harness::new(&[1, 2, 3], 11);
+    wide.tick_and_settle(40);
+    let (was, was_term) = wide.leaders()[0];
+    for _ in 0..4 {
+        for _ in 0..uncapped {
+            wide.tick_all();
+        }
+        wide.settle();
+    }
+    let after_wide = wide.leaders();
+    let term_now = wide.node(was).term();
+    println!(
+        "  batches of {uncapped} (pre-0101): was ({was}, {was_term}), now {after_wide:?}, node \
+         {was} at term {term_now}"
+    );
+    assert_ne!(
+        after_wide,
+        vec![(was, was_term)],
+        "a batch wider than the election timeout must be able to depose a live leader, or the cap \
+         in `esker_store::driver` is guarding nothing"
+    );
+}
+
 /// A single voter is its own majority and needs no round trip.
 #[test]
 fn a_lone_voter_elects_itself() {
