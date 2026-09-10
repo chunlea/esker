@@ -1,0 +1,31 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_2bed4ac2b1c944::t_1bbc7b1cbf2648 2966-2968
+crates/esker-sql/src/exec/mod.rs
+  s_2bed4ac2b1c944::t_33c3f3388b314b 4338-4358
+crates/esker-sql/tests/captures/pg19_domain_type.txt
+  s_2bed4ac2b1c944::t_b02fd6a57d89a7 112-132
+crates/esker-sql/tests/domain.rs
+  s_2bed4ac2b1c944::t_ecc729ee4d6472 162-163,165,167-195,197,201-222,225-245
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_2bed4ac2b1c944::t_dad01b32f2efeb 804-806
+docs/adr/0103-a-domain-is-a-type-a-client-can-be-sent.md
+  s_2bed4ac2b1c944::t_9c61434b87b005 195-222
+docs/plans/debts-v1.1.md
+  s_2bed4ac2b1c944::t_c0c11621dc2446 121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "88c91053ec9699c02eaf72c762c4995594d475ad",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
