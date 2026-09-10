@@ -1,0 +1,68 @@
+crates/esker-cli/src/args.rs
+  h_44076b318daf9c 197-198,233-236,515-518,1783-1790
+crates/esker-cli/src/bench.rs
+  h_44076b318daf9c 240-247,312,341-362,836
+crates/esker-cli/src/bench_remote.rs
+  h_44076b318daf9c 41-42,44-51,55,60-64
+crates/esker-cli/src/bench_route.rs
+  h_44076b318daf9c 1-104
+crates/esker-cli/src/bench_txn.rs
+  h_44076b318daf9c 45-46,48-64,70,75-76
+crates/esker-cli/src/main.rs
+  h_44076b318daf9c 15
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 51-54,2475-2478,2481
+crates/esker-sql/src/catalog/stats.rs
+  h_44076b318daf9c 1-153
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 156-160,543,545-548,550-560,574,595-629,972-975
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 796-805,865-893,908-917
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 2179-2193
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 2991-3011,3376-3388
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 4190-4197,4199-4206,6808-6823
+crates/esker-sql/src/value/mod.rs
+  h_44076b318daf9c 936-958
+crates/esker-sql/tests/bind_infers_from_the_column.rs
+  h_44076b318daf9c 1-173
+crates/esker-sql/tests/bind_infers_over_the_wire.rs
+  h_44076b318daf9c 1-133
+crates/esker-sql/tests/captures/pg19_no_equality_types.txt
+  h_44076b318daf9c 1-188
+crates/esker-sql/tests/captures/pg19_regclass_array_names.txt
+  h_44076b318daf9c 1-44
+crates/esker-sql/tests/corpus/pg19_no_equality_types.txt
+  h_44076b318daf9c 1-158
+crates/esker-sql/tests/corpus/pg19_regclass_array_names.txt
+  h_44076b318daf9c 1-32
+crates/esker-sql/tests/gin_default_opclass.rs
+  h_44076b318daf9c 198-226
+crates/esker-sql/tests/json.rs
+  h_44076b318daf9c 342-348,352,360-365
+crates/esker-sql/tests/no_equality_types.rs
+  h_44076b318daf9c 1-104
+crates/esker-sql/tests/regclass_array_names.rs
+  h_44076b318daf9c 1-78
+docs/adr/0097-an-oid-is-four-bytes-and-a-derived-one-is-not.md
+  h_44076b318daf9c 117-125
+docs/adr/0102-the-catalogs-read-path.md
+  h_44076b318daf9c 3-8,100,102,104-158
+docs/bench/v1.1.md
+  h_44076b318daf9c 1-77
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "71a76a326e6af928f3a8d6a1732da29559a000cf",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
