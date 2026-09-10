@@ -1,0 +1,39 @@
+crates/esker-client/src/txn.rs
+  s_e5c0c6e78b5662::t_f1227e355b78c8 1098-1155
+crates/esker-sql/src/backend/mod.rs
+  s_e5c0c6e78b5662::t_fdbee9df7bfb19 246-264,843-850
+crates/esker-sql/src/backend/store.rs
+  s_e5c0c6e78b5662::t_a05d30b9c71c35 272-278
+crates/esker-sql/src/catalog/mod.rs
+  s_e5c0c6e78b5662::t_7a508bbe1e7f34 2489-2493,2495,4550-4552,4559-4563
+crates/esker-sql/src/exec/savepoint.rs
+  s_e5c0c6e78b5662::t_86519ad988a740 271-274
+crates/esker-sql/tests/redrive.rs
+  s_e5c0c6e78b5662::t_057d8c00d498f0 360-365
+docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md
+  s_e5c0c6e78b5662::t_93f56a0212770f 479-480
+docs/plans/debts-v1.1.md
+  s_e5c0c6e78b5662::t_8bf493d6c9525b 24,116-117
+crates/esker-sql/tests/catalog_contention.rs
+  s_e5c0c6e78b5662::t_194958a75e666d 1-216
+crates/esker-sql/tests/cluster/mod.rs
+  s_e5c0c6e78b5662::t_f4579715e5c785 246-269
+docs/adr/0105-a-catalog-read-never-waits.md
+  s_e5c0c6e78b5662::t_54fa6cc345b835 1-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f8eacc8dc3a05f1a77ccdda4289061120b3f4a7e",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
