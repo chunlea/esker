@@ -1,0 +1,32 @@
+# **A `regclass` column on a temporary table** — measured on PostgreSQL 19beta1, 2026-09-09.
+# Capture: `tests/captures/pg19_regclass_array_names.txt`.
+#
+# r1's v3 smoke found `CREATE TEMP TABLE (c regclass)` refused here and accepted there. Only the
+# *column* provenance reaches this gap — #39 built its `regclass` index on a permanent table, so
+# the fixture is what missed it rather than the coverage.
+#
+#
+# **The permanent twin of the `regclass[]` rows above.** The temp-ness is not what this is about:
+# a name-bearing array literal assigned to a `regclass[]` column behaves identically on a
+# permanent table, measured. Kept so the corpus says which half the defect belongs to.
+#
+CREATE TABLE ra (id int8)		-
+CREATE TEMP TABLE tk (id int8, r regclass)		-
+INSERT INTO tk VALUES (1, 'ra'), (2, NULL)		-
+SELECT id, r FROM tk ORDER BY id	bigint,regclass	1|ra ; 2|\N
+SELECT relpersistence FROM pg_class WHERE relname = 'tk'	"char"	t
+SELECT id, r FROM tk WHERE r = 'ra'::regclass	bigint,regclass	1|ra
+CREATE INDEX tk_r ON tk (r)		-
+SELECT id, r FROM tk WHERE r = 'ra'::regclass	bigint,regclass	1|ra
+ALTER TABLE ra RENAME TO rz		-
+SELECT id, r FROM tk ORDER BY id	bigint,regclass	1|rz ; 2|\N
+SELECT r::text FROM tk WHERE id = 1	text	rz
+INSERT INTO tk VALUES (3, 'nosuchrel')	!42P01 relation "nosuchrel" does not exist
+CREATE TEMP TABLE tka (id int8, r regclass[])		-
+INSERT INTO tka VALUES (1, '{rz}')		-
+SELECT id, r FROM tka	bigint,regclass[]	1|{rz}
+CREATE TABLE pka (id int8, r regclass[])		-
+INSERT INTO pka VALUES (1, '{rz}')		-
+SELECT id, r FROM pka	bigint,regclass[]	1|{rz}
+INSERT INTO pka VALUES (2, ARRAY['rz'::regclass])		-
+SELECT id, r FROM pka ORDER BY id	bigint,regclass[]	1|{rz} ; 2|{rz}
