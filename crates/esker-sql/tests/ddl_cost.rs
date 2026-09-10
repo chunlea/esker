@@ -114,6 +114,27 @@ fn which_kinds_a_ddl_statement_reads() {
         "\n  -- DROP TABLE (2 indexes, 1 sequence, 1 fk, 5 columns) --\n  {}",
         where_the_reads_went(&mut s, "DROP TABLE wide")
     );
+
+    // **Is `'q'` a loop over sequences, or one scan per table load?** `table_sequences` scans the
+    // prefix whether or not the table has any — "a table with no sequences costs one empty read" —
+    // so a plain table separates the two: a loop would drop to zero, a per-load scan would not.
+    // The `'t'` count beside it is the table record itself, and the two moving together is what
+    // says the table is being loaded more than once.
+    s.run("CREATE TABLE plain (id bigint primary key, n bigint)")
+        .unwrap();
+    println!(
+        "\n  -- DROP TABLE (nothing attached) --\n  {}",
+        where_the_reads_went(&mut s, "DROP TABLE plain")
+    );
+
+    // A statement that reads a table without changing it, for the floor.
+    s.run("CREATE TABLE reader (id bigint primary key)")
+        .unwrap();
+    s.run("INSERT INTO reader (id) VALUES (1)").unwrap();
+    println!(
+        "\n  -- SELECT, for the floor --\n  {}",
+        where_the_reads_went(&mut s, "SELECT id FROM reader WHERE id = 1")
+    );
     println!();
 }
 
