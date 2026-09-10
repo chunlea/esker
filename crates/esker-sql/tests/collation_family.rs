@@ -120,11 +120,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "**No collation derivation, so this node builds what a real server declines.** PostgreSQL refuses a *stored* expression whose collation it cannot derive from a column -- `42P22`, naming the operation: `upper()/lower() function`, `string comparison` or `LIKE`. The corpus header carries the whole family and its two halves: which operations need a collation at all (`replace` does and `substr` does not, measured), and the fact that only a **column** settles it -- an explicit `COLLATE` on a literal does not, in any placement, while the same expression in a *query* or a `DEFAULT` is answered. This node has no collation inference: `COLLATE` is recorded per column and never derived through an expression, so each of these builds and stores the value a real server would have computed if it had built it. C3 in the accepting direction, and `docs/plans/debts-v1.1.md` #19 is the row.",
             "pg19_collation_family.txt:164",
         ),
-        (
-            "SELECT 'r', (u COLLATE \"C\") < (t COLLATE \"POSIX\") FROM g1co",
-            "**The other half of the same absence: two explicit collations that disagree.** PostgreSQL answers `42P21 collation mismatch between explicit collations` -- a different sqlstate from the indeterminate case, because this one is over-determined rather than under-determined -- and this node compares the two columns and answers. Both collations it has order by byte (ADR 0076), so the answer is the answer either would give; what is missing is the refusal. Its own line because it is a second sqlstate to implement.",
-            "pg19_collation_family.txt:179",
-        ),
     ],
 };
 
@@ -169,6 +164,65 @@ fn a_collate_clause_survives_into_the_stored_expression() {
         ),
         vec![vec!["upper(t)"]]
     );
+}
+
+/// **Two explicit `COLLATE` clauses that disagree are `42P21`** — [ADR 0096](../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md)'s
+/// second family, and the one rule of the three that needs no scope at all.
+///
+/// It is decidable from the expression's own shape, so it runs at lowering and covers a query, an
+/// `ORDER BY` and a generated column from one place — which is what a real server does. Every row
+/// below was measured on 19beta1 on 2026-09-10, and **the rule is wider than a comparison**:
+/// `||`, `COALESCE` and `CASE` raise it too, and it propagates up through a function.
+///
+/// **No `HINT`**, which is the pair of facts that tells it from `42P22`: there the user named
+/// nothing and the hint asks for a clause; here they named two and there is nothing to suggest.
+#[test]
+fn two_explicit_collations_that_disagree_are_a_mismatch() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE g (t text, u text COLLATE \"C\", v text COLLATE \"POSIX\")",
+        "INSERT INTO g VALUES ('a','b','c')",
+    ]);
+    let mismatch = "!42P21 collation mismatch between explicit collations \"C\" and \"POSIX\"";
+    for statement in [
+        // Two columns, each with a clause of its own.
+        "SELECT (u COLLATE \"C\") < (t COLLATE \"POSIX\") FROM g",
+        // **Concatenation**, which needs no collation at all and still merges the two.
+        "SELECT ('a' COLLATE \"C\") || ('b' COLLATE \"POSIX\") FROM g",
+        // **Up through a function**: the clause inside `upper` is what the comparison meets.
+        "SELECT upper('a' COLLATE \"C\") < ('b' COLLATE \"POSIX\") FROM g",
+        "SELECT COALESCE('a' COLLATE \"C\", 'b' COLLATE \"POSIX\") FROM g",
+        "SELECT CASE WHEN true THEN 'a' COLLATE \"C\" ELSE 'b' COLLATE \"POSIX\" END FROM g",
+        // Not only the target list.
+        "SELECT t FROM g ORDER BY (u COLLATE \"C\") < (v COLLATE \"POSIX\")",
+    ] {
+        assert_eq!(node.answer(statement).to_string(), mismatch, "{statement}");
+    }
+}
+
+/// **And the three shapes that are *not* a mismatch**, each measured, because a rule with no lower
+/// bound refuses more than it was asked to.
+///
+/// * the **same** clause on both sides is fine;
+/// * **explicit against implicit** is fine — the explicit one wins, which is the whole of what
+///   `Derivation` is for;
+/// * a **nested** clause is fine, and the **outer** one wins:
+///   `(('a' COLLATE "C") COLLATE "POSIX") < 'b'` is answered on 19beta1, so a rule that collected
+///   every clause in the tree and compared them would refuse a statement a real server answers.
+#[test]
+fn a_clause_that_wins_is_not_a_mismatch() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE g (t text, u text COLLATE \"C\", v text COLLATE \"POSIX\")",
+        "INSERT INTO g VALUES ('a','b','c')",
+    ]);
+    for statement in [
+        "SELECT ('a' COLLATE \"C\") < ('b' COLLATE \"C\") FROM g",
+        "SELECT ('a' COLLATE \"C\") < v FROM g",
+        "SELECT ((\'a\' COLLATE \"C\") COLLATE \"POSIX\") < 'b' FROM g",
+    ] {
+        assert_eq!(node.rows(statement), vec![vec!["t"]], "{statement}");
+    }
+    // And the value is still the operand's: a clause is an ordering, never a rendering.
+    assert_eq!(node.rows("SELECT t COLLATE \"C\" FROM g"), vec![vec!["a"]]);
 }
 
 #[test]

@@ -18,6 +18,7 @@
 //! comes back. A silently dropped clause is the defect class this module exists to make
 //! impossible.
 
+pub(crate) mod collation;
 pub mod cte;
 mod ddl;
 mod dml;
