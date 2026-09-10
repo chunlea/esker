@@ -2988,6 +2988,24 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             {
                 return Err(SqlError::NoEqualityOperator(element.name()));
             }
+            // **A `jsonb` comparison becomes `jsonb_compare(a, b) <op> 0`.** All six operators are
+            // then one implementation and the ordinary `int4` comparison does the rest. It is
+            // rewritten here and not at lowering because the parser sees a *cast* and this sees a
+            // *type*, so a `jsonb` column compares like a `jsonb` literal — the provenance split
+            // that has cost this lane four units.
+            if op.is_comparison()
+                && let Ok(ty) = expr_type(&left, scope)
+                && ty == ColumnType::Jsonb
+            {
+                return Ok(Expr::Binary {
+                    op: *op,
+                    left: Box::new(Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                        func: CatalogFunc::JsonbCompare,
+                        args: vec![left, right],
+                    }))),
+                    right: Box::new(Expr::Literal(Literal::Typed(Box::new(Datum::Int4(0))))),
+                });
+            }
             // **And a scalar whose `=` does not exist at all**, which is a different list from
             // the one above and from `same_family`: `same_family(polygon, polygon)` is true —
             // they are the same type — and there is still no `polygon = polygon` on a real

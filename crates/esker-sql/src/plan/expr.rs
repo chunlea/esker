@@ -1066,6 +1066,15 @@ pub enum CatalogFunc {
     HstoreFetch,
     /// `h ? k`: whether the hstore holds the key, **including one whose value is NULL**.
     HstoreHasKey,
+    /// `jsonb_compare(a, b)`: where `a` sorts against `b`, as `-1`, `0` or `1`.
+    ///
+    /// **Not an operator a user can write** — it is what a `jsonb` comparison becomes, so that all
+    /// six of them are one implementation and the ordinary `int4` comparison does the rest:
+    /// `a < b` is `jsonb_compare(a, b) < 0`. `jsonb` shares `text`'s representation, so by
+    /// evaluation there is nothing to say these two are documents; carrying the intent in the call
+    /// is what ADR 0042 left open, and it needs no `Datum` of its own because
+    /// `crate::value::json` already canonicalises on the way in.
+    JsonbCompare,
     /// `a ~= b`: whether two geometric values are the same.
     ///
     /// **Carried rather than refused at lowering, so that it can be refused with a type.** A
@@ -1617,6 +1626,7 @@ impl CatalogFunc {
             CatalogFunc::HstoreFetch | CatalogFunc::JsonFetch | CatalogFunc::JsonbFetch => "->",
             CatalogFunc::HstoreHasKey => "?",
             CatalogFunc::SameAs => "~=",
+            CatalogFunc::JsonbCompare => "jsonb_compare",
             // One symbol, two containments — see `exec::cursor`, where the operand decides.
             CatalogFunc::RangeContains | CatalogFunc::HstoreContains => "@>",
             CatalogFunc::HstoreConcat | CatalogFunc::JsonbConcat => "||",
@@ -1716,6 +1726,7 @@ impl CatalogFunc {
             | CatalogFunc::HstoreFetch
             | CatalogFunc::HstoreHasKey
             | CatalogFunc::SameAs
+            | CatalogFunc::JsonbCompare
             | CatalogFunc::HstoreContains
             | CatalogFunc::HstoreConcat
             | CatalogFunc::JsonbConcat
@@ -1906,7 +1917,8 @@ impl CatalogFunc {
             // `strpos` is a position, and `0` for "not found" rather than NULL.
             | CatalogFunc::StrPos
             // `integer` on a real server, and the column `pg_stat_activity.pid` is declared as.
-            | CatalogFunc::PgBackendPid => ColumnType::Int4,
+            | CatalogFunc::PgBackendPid
+            | CatalogFunc::JsonbCompare => ColumnType::Int4,
             // The two range predicates answer a boolean, which is what lets `&&` stand in a
             // `WHERE` without a comparison around it.
             CatalogFunc::PathIsOpen

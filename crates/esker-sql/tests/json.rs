@@ -36,8 +36,10 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 /// keeps its `Expr::Cast` node when the value cannot speak for itself, and that node is what
 /// `expr_type` reads.
 ///
-/// `Datum` still has no `jsonb` variant, and the `COMPARISON` divergence below is still that fact
-/// — this half of it never needed one.
+/// `Datum` still has no `jsonb` variant and does not need one: `crate::value::json` parses the
+/// canonical text into a `Json` with kinds, so a comparison is a comparison over *that*, and the
+/// six operators became `jsonb_compare(a, b) <op> 0`. What is still open is ordering a `jsonb`
+/// **column**, where a sort compares `Datum`s and the type is gone before the comparator runs.
 /// **Empty.** The one entry moved here from `answers` by parity rule 4 and then ran out of
 /// reasons: `typlen` was a `smallint` against a `text`, `typcategory` became a `"char"`
 /// (ADR 0095), `oid` an `oid` (ADR 0097) and `typinput` a `regproc` (ADR 0098). The row never
@@ -55,16 +57,6 @@ const CONTAINMENT: &str = "Containment and the editing operators, likewise not b
 const MESSAGES: &str = "The refusal is the right one and its **text** differs: PostgreSQL adds a `DETAIL` \
      naming the position or the token, which this node does not carry for these two \
      SQLSTATEs. The SQLSTATE and the sentence agree; the detail line does not.";
-/// One of `DIVERGENCES`' seven reasons.
-const COMPARISON: &str = "**Comparison over `json` or `jsonb` is refused rather than answered from the \
-     bytes**, which is what ADR 0042 turns on: `'1.0'::jsonb = '1.00'::jsonb` is `t` on a \
-     real server and byte equality says `f`, and `jsonb` sorts by *kind* before value. \
-     `Datum` has no json variant — these types share `text`'s representation, which is \
-     safe for `varchar` and `bpchar` because their comparison *is* text comparison and is \
-     not safe here. Giving `jsonb` a `Datum` of its own is what closes this, and it is \
-     the `real` unit's lesson one layer up: a type may share another's representation \
-     only if it shares its comparison. `json` has no comparison operators at all on a \
-     real server, so refusing there is closer still than refusing `jsonb`.";
 /// One of `DIVERGENCES`' seven reasons.
 const OPERATORS: &str = "**`#>` and `#>>` are what is left of this reason.** `->` and `->>` were \
      here too and are built now, and the nine lines that declared them agreed the moment they \
@@ -101,37 +93,6 @@ const ANSWERS: &[(&str, &str, &str)] = &[
         "SELECT ('\"\\u0000\"'::json)::jsonb",
         MESSAGES,
         "pg19_json.txt:97",
-    ),
-    (
-        "SELECT '{\"a\":1}'::jsonb = '{\"a\": 1}'::jsonb",
-        COMPARISON,
-        "pg19_json.txt:100",
-    ),
-    (
-        "SELECT '1.0'::jsonb = '1.00'::jsonb",
-        COMPARISON,
-        "pg19_json.txt:101",
-    ),
-    (
-        "SELECT '{\"a\":1}'::jsonb = '{\"a\":1.0}'::jsonb",
-        COMPARISON,
-        "pg19_json.txt:102",
-    ),
-    (
-        "SELECT '{\"a\":1}'::jsonb <> '{\"a\":2}'::jsonb",
-        COMPARISON,
-        "pg19_json.txt:103",
-    ),
-    (
-        "SELECT '{\"a\":1}'::jsonb < '{\"b\":1}'::jsonb",
-        COMPARISON,
-        "pg19_json.txt:104",
-    ),
-    (
-        "SELECT 'true'::jsonb > '1'::jsonb, '\"s\"'::jsonb > '1'::jsonb, '[]'::jsonb \
-             > '{}'::jsonb",
-        COMPARISON,
-        "pg19_json.txt:105",
     ),
     (
         "SELECT '{\"a\":{\"b\":2}}'::json #> '{a,b}', '{\"a\":{\"b\":2}}'::json #>> \
@@ -205,11 +166,6 @@ const ANSWERS: &[(&str, &str, &str)] = &[
         "pg19_json.txt:129",
     ),
     ("SELECT '{\"a\":1}'::jsonb::int", CASTS, "pg19_json.txt:134"),
-    (
-        "SELECT NULL::jsonb IS NULL, '{\"a\":1}'::jsonb = NULL",
-        COMPARISON,
-        "pg19_json.txt:137",
-    ),
 ];
 
 #[test]
@@ -327,31 +283,32 @@ fn a_nul_escape_splits_the_two_types() {
     }
 }
 
-/// Comparison is **refused**, not answered from the bytes, and that is the point of ADR 0042.
+/// **`jsonb` answers its comparisons and `json` refuses them**, which is ADR 0042 read correctly:
+/// a type may share another's representation only if it shares its comparison, and `jsonb`'s is
+/// the *document's* — kind first, numbers numerically — which the canonical text does not
+/// reproduce. So the comparison is the document's too, over the `Json` the value layer already
+/// parses, and byte order never decides anything.
 ///
-/// `'1.0'::jsonb = '1.00'::jsonb` is `t` on a real server while the two print differently, so byte
-/// equality is not `jsonb` equality; `jsonb` also sorts by kind before value. `Datum` has no json
-/// variant — these types share `text`'s representation, which is safe for `varchar` and `bpchar`
-/// because their comparison *is* text comparison, and is not safe here. Refusing is contract C2;
-/// answering `f` would be a wrong answer.
+/// `json` has no comparison operator on a real server at all, so its refusal is not a gap but the
+/// answer: `42883 operator does not exist: json = json`.
 ///
-/// **The two are refused with different codes, and the difference is whose gap it is.** `jsonb`
-/// has a complete btree on a real server and *answers*, so refusing it is this node's own
-/// unimplemented and says `0A000`. `json` has no comparison operator at all, so the honest
-/// refusal is the one a real server gives — `42883 operator does not exist: json = json`, and it
-/// is not a gap but the answer. One shared sentence was wrong about `json` for eighteen rows of
-/// `tests/captures/pg19_no_equality_types.txt`.
+/// Ordering a `jsonb` **column** is still refused, and that is the honest remainder: a sort
+/// compares `Datum`s and a `jsonb` one is a `Datum::Text`, so the type is gone by the time the
+/// comparator runs. `tests/captures/pg19_jsonb_order.txt` measures what it must answer.
 #[test]
-fn comparing_json_is_refused_rather_than_answered_wrongly() {
+fn jsonb_compares_as_a_document_and_json_refuses() {
     let mut node = parity::Node::new(&[]);
-    // This node's own gap: PostgreSQL answers these.
-    for sql in [
-        "SELECT '1.0'::jsonb = '1.00'::jsonb",
-        "SELECT '{\"a\":1}'::jsonb < '{\"b\":1}'::jsonb",
+    // Measured cells: numbers compare as `numeric`, and the rank puts a number under a boolean.
+    for (sql, expected) in [
+        ("SELECT '1.0'::jsonb = '1.00'::jsonb", "t"),
+        ("SELECT '{\"a\":1}'::jsonb < '{\"b\":1}'::jsonb", "t"),
+        ("SELECT 'true'::jsonb > '1'::jsonb", "t"),
+        // The empty array, which does not follow the rank — the cell a derived rule gets wrong.
+        ("SELECT '[]'::jsonb < 'null'::jsonb", "t"),
     ] {
-        let error = node.run(sql).unwrap_err();
-        assert_eq!(error.sqlstate(), "0A000", "{sql}");
+        assert_eq!(node.rows(sql), vec![vec![expected.to_owned()]], "{sql}");
     }
+
     // PostgreSQL's own refusal, with PostgreSQL's own sentence.
     let error = node
         .run("SELECT '{\"a\":1}'::json = '{\"a\":1}'::json")
@@ -359,7 +316,7 @@ fn comparing_json_is_refused_rather_than_answered_wrongly() {
     assert_eq!(error.sqlstate(), "42883");
     assert_eq!(error.to_string(), "operator does not exist: json = json");
 
-    // And over a column, where the type is on the plan rather than in the syntax.
+    // And the remainder, named rather than left to be discovered.
     node.run("CREATE TABLE j (id int8 PRIMARY KEY, b jsonb)")
         .unwrap();
     let error = node.run("SELECT id FROM j ORDER BY b").unwrap_err();
