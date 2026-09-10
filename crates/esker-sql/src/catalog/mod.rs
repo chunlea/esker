@@ -2510,8 +2510,13 @@ impl Catalog {
         //
         // The sum rather than a pair because callers compare versions for *inequality* only —
         // "has anything changed" — and either counter moving changes it.
+        // **Never `get`** ([ADR 0105](../../../../docs/adr/0105-a-catalog-read-never-waits.md)).
+        // Every DDL writes this key and every statement reads it, so `get` put an ordinary
+        // `SELECT` on an unrelated table behind a DDL's commit — the client's whole resolution
+        // budget, measured at 4.28 s, and then `40001`. A real server does neither: an uncommitted
+        // DDL is invisible, and a plain `SELECT` under READ COMMITTED never raises `40001`.
         let counter = |key: &[u8]| -> Result<u64> {
-            Ok(match txn.get(key)? {
+            Ok(match txn.get_without_waiting(key)? {
                 Some(bytes) => record::decode_counter(&bytes)?,
                 // No DDL has ever run. Version 0 is the empty catalog.
                 None => 0,
@@ -4566,14 +4571,20 @@ pub fn allocate_id(txn: &mut dyn Txn, tenant: u64) -> Result<u64> {
 /// existing databases are disposable by the user's decision, and there is no upgrade path
 /// ([ADR 0080](../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)).
 fn refuse_an_older_layout(txn: &dyn Txn, version: u64) -> Result<()> {
-    let held = match txn.get(&record::layout_key())? {
+    // The same rule as the counters beside it: this is read by every statement and written by
+    // every DDL, so waiting here is waiting for somebody's uncommitted work (ADR 0105).
+    let held = match txn.get_without_waiting(&record::layout_key())? {
         Some(bytes) => record::decode_layout(&bytes)?,
         // **Absent, and nothing ever written** — not the two counters this build reads, the
         // tenant's and the cluster's, and not the one counter every store wrote before the key
         // became per tenant. That last one is what a pre-marker database holds, and a reader that
         // looked only at the new keys saw version 0 on it and opened a layout-1 store as if it were
         // new: the misread this marker exists to prevent.
-        None if version == 0 && txn.get(&record::legacy_version_key())?.is_none() => {
+        None if version == 0
+            && txn
+                .get_without_waiting(&record::legacy_version_key())?
+                .is_none() =>
+        {
             return Ok(());
         }
         // An unmarked catalog **is** layout 1, which is what makes the sentence below true rather

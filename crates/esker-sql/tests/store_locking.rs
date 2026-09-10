@@ -530,3 +530,203 @@ fn concurrent_increments_do_not_lose_one_against_real_stores() {
         WRITERS * EACH
     );
 }
+
+// One side of the crossed pair. `own` is the row it locks, `other` the row it writes — which
+// is also the row it writes again after the rescue, exactly as the Rails test does.
+fn side(
+    session: &mut cluster::Session,
+    own: i64,
+    other: i64,
+    mine: &std::sync::mpsc::Sender<&'static str>,
+    theirs: &std::sync::mpsc::Receiver<&'static str>,
+) -> Result<bool, String> {
+    session.run("BEGIN").map_err(|e| e.to_string())?;
+    // `make_parent_transaction_dirty`: opens the real transaction without touching `samples`.
+    session
+        .run("SELECT * FROM bits LIMIT 1")
+        .map_err(|e| e.to_string())?;
+    session.run("SAVEPOINT sp").map_err(|e| e.to_string())?;
+    session
+        .run(&format!(
+            "SELECT * FROM samples WHERE id = {own} FOR UPDATE"
+        ))
+        .map_err(|e| e.to_string())?;
+
+    mine.send("locked").unwrap();
+    theirs.recv_timeout(Duration::from_secs(30)).unwrap();
+
+    let crossed = session.run(&format!("UPDATE samples SET value = 4 WHERE id = {other}"));
+    let deadlocked = match crossed {
+        Ok(_) => {
+            session
+                .run("RELEASE SAVEPOINT sp")
+                .map_err(|e| e.to_string())?;
+            false
+        }
+        Err(error) => {
+            // Only a deadlock is recoverable here. Anything else — a `40001` in particular —
+            // is the failure this test exists to catch, and it is reported as itself rather
+            // than swallowed into "the other one won".
+            if error.sqlstate() != "40P01" {
+                return Err(format!("{}: {error}", error.sqlstate()));
+            }
+            session
+                .run("ROLLBACK TO SAVEPOINT sp")
+                .map_err(|e| e.to_string())?;
+            true
+        }
+    };
+
+    session
+        .run(&format!("UPDATE samples SET value = 10 WHERE id = {other}"))
+        .map_err(|e| e.to_string())?;
+    session.run("COMMIT").map_err(|e| e.to_string())?;
+    Ok(deadlocked)
+}
+
+/// **`transaction_nested_test.rb`'s recoverable deadlock, against real stores.**
+///
+/// The same sequence `nested_savepoint_deadlock.rs` runs — and that file runs it on
+/// `MemoryBackend`, which has no Percolator locks at all, so it has never touched the half that
+/// fails. Run 112a and run 114 both fail this on the real topology, and the whole difference is
+/// the lock a `SELECT … FOR UPDATE` leaves *in the store* (ADR 0088).
+///
+/// ```text
+/// A: BEGIN; SELECT bits; SAVEPOINT sp; SELECT … id=1 FOR UPDATE
+/// B: BEGIN; SELECT bits; SAVEPOINT sp; SELECT … id=2 FOR UPDATE
+///                       ── both ready ──
+/// A: UPDATE … id=2                     B: UPDATE … id=1
+///        one is told 40P01, rolls back to its savepoint, and both go on
+/// each: UPDATE <the row it tried> = 10; COMMIT
+/// ```
+///
+/// Exactly one `40P01`, and both rows end at 10 — which is what PostgreSQL 19 does, measured.
+#[test]
+fn a_deadlock_inside_a_savepoint_is_recoverable_against_real_stores() {
+    let cluster = Cluster::start();
+    let mut setup = cluster.session();
+    setup
+        .run("CREATE TABLE samples (id bigint primary key, value bigint)")
+        .unwrap();
+    setup
+        .run("CREATE TABLE bits (id bigint primary key, value bigint)")
+        .unwrap();
+    setup
+        .run("INSERT INTO samples (id, value) VALUES (1, 1), (2, 2)")
+        .unwrap();
+
+    let (a_ready, hears_a) = channel();
+    let (b_ready, hears_b) = channel();
+
+    let mut b = cluster.session();
+    let right = std::thread::spawn(move || side(&mut b, 2, 1, &b_ready, &hears_a));
+
+    let mut a = cluster.session();
+    let left = side(&mut a, 1, 2, &a_ready, &hears_b);
+    let right = right.join().unwrap();
+
+    let left = left.expect("the left session must finish, deadlocked or not");
+    let right = right.expect("the right session must finish, deadlocked or not");
+    assert_eq!(
+        usize::from(left) + usize::from(right),
+        1,
+        "exactly one of the two is the victim"
+    );
+
+    let mut reader = cluster.session();
+    assert_eq!(
+        reader.rows("SELECT value FROM samples ORDER BY id"),
+        [[Some("10".to_owned())], [Some("10".to_owned())]],
+        "both sessions recovered and committed"
+    );
+}
+
+/// **A wait the node's deadlock graph cannot see is a wait nothing ends**
+/// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §3).
+///
+/// A row lock in this node is two things: `RowLocks`, which carries the wait-for graph, and — for
+/// `SELECT … FOR UPDATE` — a Percolator lock in the store (ADR 0088). `StoreBackend::lock` takes
+/// the node-local one *first*, so when it then blocks on the store the session is recorded as
+/// **holding** the key and no edge is drawn. Two sessions of one node can therefore hold each
+/// other with nothing to find the cycle:
+///
+/// ```text
+/// A holds node-local k1, waits on a store lock on k2   -- no edge recorded
+/// B holds the store lock on k2, waits on node-local k1 -- edge B → A recorded
+/// the walk from B reaches A, finds A waiting for nobody, and reports no cycle
+/// ```
+///
+/// The only way to reach that state on one node is a store lock **without** its node-local half,
+/// and a savepoint used to make exactly one: `ROLLBACK TO SAVEPOINT` gave back the node-local lock
+/// and left the Percolator lock behind. So this is the arrangement, and what it asserts is that
+/// **neither session hangs** — the failure it guards against has no error to report, only silence.
+///
+/// Every other source of a Percolator lock on this node takes the node-local one first —
+/// `write_row` locks an `INSERT`'s new row as well as an `UPDATE`'s existing one, and
+/// `pin_primary` can only pin a key already in the write buffer, which is a key that went through
+/// `write_row`. The two spaces are in step, and this is what says so.
+#[test]
+fn a_savepoints_released_lock_leaves_no_wait_the_graph_cannot_see() {
+    let cluster = Cluster::start();
+    let mut setup = cluster.session();
+    setup
+        .run("CREATE TABLE sp (id bigint primary key, n bigint)")
+        .unwrap();
+    setup
+        .run("INSERT INTO sp (id, n) VALUES (1, 1), (2, 2)")
+        .unwrap();
+
+    let (b_says, hears_b) = channel();
+    let (a_says, hears_a) = channel();
+    let (b_done, hears_b_done) = channel();
+
+    let mut b = cluster.session();
+    let right = std::thread::spawn(move || {
+        b.run("BEGIN").unwrap();
+        b.run("SAVEPOINT sp").unwrap();
+        // The eager lock, and then the savepoint that gives it back. Before ADR 0104 §2 only the
+        // node-local half came back and the store's stayed until the block ended.
+        b.run("SELECT * FROM sp WHERE id = 2 FOR UPDATE").unwrap();
+        b.run("ROLLBACK TO SAVEPOINT sp").unwrap();
+        b_says.send("released").unwrap();
+
+        hears_a.recv_timeout(Duration::from_secs(30)).unwrap();
+        // Crosses into the row A is holding. With the graph complete this either waits for A and
+        // then writes, or is told `40P01`; with A's wait invisible it waits for ever.
+        let crossed = b.run("UPDATE sp SET n = 20 WHERE id = 1");
+        let ended = crossed.and_then(|_| b.run("COMMIT").map(|_| ()));
+        b_done.send(()).unwrap();
+        ended
+    });
+
+    hears_b.recv_timeout(Duration::from_secs(30)).unwrap();
+    let mut a = cluster.session();
+    a.run("BEGIN").unwrap();
+    a.run("UPDATE sp SET n = 10 WHERE id = 1").unwrap();
+    a_says.send("A holds row 1").unwrap();
+
+    // **The wait that used to be invisible.** Row 2's node-local lock is free — B gave it back —
+    // so this reaches the store, and what it finds there decides whether anything moves again.
+    let took = a.run("SELECT * FROM sp WHERE id = 2 FOR UPDATE");
+    assert!(
+        took.is_ok(),
+        "row 2 was given back with its savepoint, so nothing should be in the way: {took:?}"
+    );
+    a.run("COMMIT").unwrap();
+
+    // B is the one that hangs when the graph is blind, so B's finishing is the assertion.
+    hears_b_done
+        .recv_timeout(Duration::from_secs(30))
+        .expect("B never finished: its wait for A is one nothing in the node can see");
+    right
+        .join()
+        .unwrap()
+        .expect("B waits for A's commit and then writes");
+
+    let mut reader = cluster.session();
+    assert_eq!(
+        reader.rows("SELECT n FROM sp ORDER BY id"),
+        [[Some("20".to_owned())], [Some("2".to_owned())]],
+        "A wrote row 1 and committed, then B overwrote it"
+    );
+}

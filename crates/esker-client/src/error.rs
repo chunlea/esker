@@ -12,6 +12,34 @@ use bytes::Bytes;
 
 use crate::wire::{Method, ProtoError, RequestOutcome};
 
+/// **What a transaction was doing when a lock refused to clear**, so that a `40001` says which.
+///
+/// [`Error::LockNotCleared`] has three callers and they are not the same condition. Naming the
+/// caller in the error is what lets an operator — or a Rails pass — tell a reader blocked behind
+/// somebody's write from a row two writers want, without reading this crate's source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waiting {
+    /// A read: `get`, `scan`, `latest_commit`. It holds no lock and wanted none, so what it met
+    /// is somebody else's uncommitted write standing in front of a value it needed.
+    Read,
+    /// A `SERIALIZABLE` read set, asserting that a range it read has not moved
+    /// (ADR 0104 §1). It acquires nothing either, and it may not wound.
+    ReadSet,
+    /// A transaction **acquiring** a key it means to write — the only one of the three that
+    /// wanted the lock.
+    Acquire,
+}
+
+impl std::fmt::Display for Waiting {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(match self {
+            Self::Read => "a read",
+            Self::ReadSet => "a read-set range check",
+            Self::Acquire => "an acquiring write",
+        })
+    }
+}
+
 /// A failed client call.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -122,10 +150,20 @@ pub enum Error {
 
     /// A lock stood in the way for the whole of a call's budget: its owner kept heartbeating,
     /// or the resolution kept losing a race. Nothing was written.
-    #[error("a lock held by the transaction at {start_ts} did not clear in time")]
+    #[error("a lock held by the transaction at {start_ts} did not clear in time for {waiting}")]
     LockNotCleared {
         /// The transaction holding it.
         start_ts: u64,
+        /// **What this transaction was doing when it gave up**
+        /// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §4).
+        ///
+        /// Three different calls reach this error and a client cannot tell them apart from the
+        /// message: a read that holds nothing, a read set asserting a range did not move, and a
+        /// transaction acquiring a key it means to write. They want different answers from an
+        /// operator — the first is a reader blocked behind somebody's write, the last is
+        /// contention on a row — and run 114 spent a whole pass unable to say which one had
+        /// raised the `40001` it reported.
+        waiting: Waiting,
         /// **Which key was locked.** Carried for the same reason [`Error::TxnConflict`] carries
         /// its own: the caller above may need to tell one blocked key from another, and it
         /// cannot if the error names only the transaction.

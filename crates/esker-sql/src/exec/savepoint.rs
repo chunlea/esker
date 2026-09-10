@@ -268,6 +268,10 @@ impl<'a> Recording<'a> {
 impl Txn for Recording<'_> {
     /// Forwarded, like everything else here: the recording is a lens on one transaction and not a
     /// transaction of its own, so the session it belongs to is the inner one's.
+    fn get_without_waiting(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get_without_waiting(key)
+    }
+
     fn owned_by_session(&mut self, pid: u32) {
         self.inner.owned_by_session(pid);
     }

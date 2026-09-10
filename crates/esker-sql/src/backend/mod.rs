@@ -243,6 +243,25 @@ pub trait Txn: fmt::Debug + Send {
     /// that never chose anything (`tests/pg_locks.rs`), which is why it is required now.
     fn locks(&self) -> LockView;
 
+    /// **The catalog's read, which never waits for a lock**
+    /// ([ADR 0105](../../../docs/adr/0105-a-catalog-read-never-waits.md)).
+    ///
+    /// Every statement that resolves a relation reads the catalog's version counter, and every DDL
+    /// writes it — so an ordinary `SELECT` on an unrelated table met a DDL's commit there, spent
+    /// the client's whole resolution budget and was refused `40001`. PostgreSQL does neither half:
+    /// a plain `SELECT` under READ COMMITTED never raises `40001`, and an uncommitted DDL is
+    /// invisible to other sessions.
+    ///
+    /// So this answers **the newest committed value at or below the oldest lock in the way**,
+    /// which is the same thing: the catalog as it was before the transaction that is still
+    /// writing it.
+    ///
+    /// **Required rather than defaulted**, and that is not a style choice: a `Txn` method with a
+    /// default is a silent opt-out for every wrapper, and `savepoint::Recording` has now swallowed
+    /// three of them. A backend that cannot read past a lock must say so by writing `get`'s
+    /// behaviour out, where a reader of that backend can see it.
+    fn get_without_waiting(&self, key: &[u8]) -> Result<Option<Bytes>>;
+
     /// Records what this transaction reads, so that its commit can be validated
     /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md)).
     ///
@@ -821,6 +840,14 @@ impl Drop for MemoryTxn {
 
 impl Txn for MemoryTxn {
     /// See [`Txn::owned_by_session`]: set once, right after the transaction is opened.
+    fn get_without_waiting(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        // **The same as `get`, and saying so is the point.** Nothing here has a lease and nothing
+        // is ever in the way — a `MemoryTxn` holds its writes in this process until it commits —
+        // so there is no lock to read past. Written out rather than defaulted, so that a backend
+        // which *does* have locks cannot inherit this answer by forgetting (ADR 0105).
+        self.get(key)
+    }
+
     fn owned_by_session(&mut self, pid: u32) {
         self.session = pid;
     }

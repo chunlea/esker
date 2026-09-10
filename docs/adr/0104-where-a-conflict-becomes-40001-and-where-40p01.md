@@ -17,6 +17,9 @@ which is the layer an in-process backend does not have:
 | ② `transaction_nested_test.rb` · `unserializable transaction raises SerializationFailure inside nested SavepointTransaction` | passed | **nothing was raised** | `40001` |
 | ③ `transaction_nested_test.rb` · `deadlock inside nested SavepointTransaction is recoverable` | passed | **`40001` — `a lock from the transaction at 6688 could not be cleared`** | `40P01`, then commit |
 
+**All three are closed on the real topology.** ① and ② by §1 at run 114, ③ by §2 at run 115 —
+6 assertions to 8, and `could not be cleared` reported zero times.
+
 And `transactions_test.rb`, 105 runs green on the fake, hit the 1800 s per-file watchdog on the
 real topology while the node went on answering new sessions.
 
@@ -400,29 +403,91 @@ same question ADR 0088 asked of the eager lock itself and answered with `tests/l
 (b) is the better end state and (a) is what closes ③. They compose: (a) first, (b) if the remainder
 is ever measured to matter.
 
+#### What it closed, with the counterfactual
+
+`store_locking.rs`'s `a_deadlock_inside_a_savepoint_is_recoverable_against_real_stores` runs ③'s
+sequence against three real stores — the file named for it, `nested_savepoint_deadlock.rs`, runs on
+`MemoryBackend`, which has no Percolator locks at all and so has never touched the half that fails.
+
+| tree | result |
+|---|---|
+| `4e5c5e51` — §1, **no** §2 (the tree run 114 measured) | **red**: `deadlock detected` escapes the *post-rescue* update |
+| `b04d2065` — §1 + §2 | green: one `40P01`, both sessions recover, both rows at 10 |
+
+So the sequence is closed, and the counterfactual says by which change.
+
+**The acceptance is run 115, not this test.** On the real topology against `eadf39ba` (§1 + §2),
+`test_deadlock_inside_nested_SavepointTransaction_is_recoverable` passes, and the number to read is
+the assertion count rather than the pass: **6 → 8**. It did not merely stop erroring — it ran to its
+end and made the two assertions it had never reached. `could not be cleared` and `40001` appear zero
+times in the run (`esker-rails-harness/results/run-115.md`).
+
+That also settles a thing this test could not: at run 114 its pre-§2 failure here was a *second*
+`40P01`, not the `40001` the real topology was reporting, so the two failed differently and this
+test was never a reproduction of run 114's. Run 115 makes the question moot — both are gone — but
+the rule stands: an in-process test that fails differently from the field is not the field's
+reproduction, whatever colour it shows.
+
 (a) is what was built. The remainder it leaves is exact and small: **one row of one transaction** —
 the primary of a transaction that still holds another eager lock — stays held to the end of the
 block, and `a_primary_is_kept_while_another_lock_still_names_it` is that case pinned as a test
 rather than left to be discovered. (b) stays available if the remainder is ever measured to matter.
 
-### §3 — a store-side wait must draw an edge  *(SQL layer — either lane; I would take it)*
+### §3 — **closed by §2, measured** — *(no code; the invariant is now a test)*
 
-`StoreBackend::lock` returning `Lock::Held { by, .. }` from the Percolator half must record the
-wait in the node-local graph before returning, and clear it on every exit — which
-`wait_for_row`'s single tidy-up point already does (`exec/mod.rs:321`).
+The draft said: `StoreBackend::lock` takes the node-local lock *first*, so when it then blocks on
+the store the session is recorded as **holding** the key and no edge is drawn — and two sessions of
+one node can therefore hold each other with nothing to find the cycle.
 
-`by` is the holder's `start_ts`, and `RowLocks` already carries a `start_ts` beside every holder's
-id, so a holder **on this node** is resolvable to an id and the existing edge and the existing walk
-apply unchanged. A holder on *another* node has no id here; that edge cannot be drawn and must not
-be faked, so the answer stays wound-wait, which terminates.
+```text
+A holds node-local k1, waits on a store lock on k2   -- no edge recorded
+B holds the store lock on k2, waits on node-local k1 -- edge B → A recorded
+the walk from B reaches A, finds A waiting for nobody, and reports no cycle
+```
 
-That is the whole of it: one lookup, the edge, and the same `deadlocks` call the node-local path
-already makes. It turns the invisible same-node hold-and-wait above into a `40P01` for exactly one
-session.
+**That was real, and §2 closed it.** Reaching the state needs a Percolator lock *without* its
+node-local half, and on one node there was exactly one way to make one: `ROLLBACK TO SAVEPOINT`
+gave back the node-local lock and left the store's behind. §2 makes the two go together, so the
+drift that the missing edge depended on no longer happens.
 
-**It does not fix ③.** ③'s fatal wait happens inside `COMMIT`, in the client's prewrite loop, where
-the SQL layer's graph is not consulted at all. §3 is for the *statement* path, and it is what stands
-between `transactions_test.rb` and a wait that nothing ends — see below.
+Measured rather than argued, and the failure mode is why it had to be:
+
+| tree | `a_savepoints_released_lock_leaves_no_wait_the_graph_cannot_see` |
+|---|---|
+| `4e5c5e51` — §1, **no** §2 | **hung**; killed by the runner at 366 s having reported nothing |
+| `0cf1f85a` — §1 + §2 | passes, 0.08–0.35 s over five runs |
+
+There is no error in the red column. A wait the graph cannot see produces **silence**, which is why
+this section could not be closed by reading and why the test asserts that both sessions *finish*
+rather than asserting a code.
+
+#### Why no edge is needed after all
+
+Every other producer of a Percolator lock on this node takes the node-local one first, and the list
+is short enough to be checked rather than assumed:
+
+| producer | node-local first? |
+|---|---|
+| `StoreBackend::lock` — the only place the SQL layer takes one (`backend/store.rs`) | yes, before the store is asked |
+| `pin_primary` — the client's own early prewrite | it can only pin a key already in the write buffer, and every such key went through `write_row` |
+| `write_row` — **`INSERT` as well as `UPDATE`** | yes; a new row's key is locked like an existing one |
+| catalog writes — DDL, sequences | **no**, and `crate::backend::Reach` appears nowhere in `catalog/` |
+
+The catalog is the one asymmetry left and it is harmless for cycles: a DDL takes no row locks, so it
+can never be the waiting half of one. What it can do is make an ordinary reader wait — which is the
+`for a read` the §4 diagnostic now prints, and the wart `catalog/record.rs` already documents.
+**That became debt #50 the day the diagnostic named it**, and
+[ADR 0105](0105-a-catalog-read-never-waits.md) closes it: a catalog read never waits.
+
+The cross-node case is not this shape either. Both sides of a cross-node pair block in
+`wound_or_wait`, where the older transaction never waits, so it terminates by construction
+(ADR 0088). The hang above needed one side in `wound_or_wait` and the other in the node-local poll
+loop, and only drift between the two spaces could arrange that.
+
+**So the deliverable is the invariant, not the edge.** Nothing enforced "every Percolator lock a
+session holds is one it also holds node-locally" — §2 made it true and nothing kept it true. The
+test above is what keeps it: a future `Reach::Cluster` path that skips `RowLocks::take`, or a second
+`unlock` that forgets one half, turns it red in a second instead of hanging a node for six minutes.
 
 ### §4 — **refuted, 2026-09-10, by its own examination** — *(no code)*
 
@@ -498,8 +563,8 @@ block's and are kept — which `Savepoints::locks` already gets right by recordi
 
 **Nothing on this list is a SQL-layer mapping change.** That is the finding I did not expect: the
 codes, the sentences and the Rails classes they land in are all already right, and all three
-failures are the store and client deciding the wrong *condition*. The only SQL-layer unit in this
-ADR is §3, which no listed test needs and which the hung file may.
+failures are the store and client deciding the wrong *condition*. §3 was the one SQL-layer unit and
+it turned out to need no code either — §2 closed it.
 
 Two consequence tests, red before either change:
 
@@ -522,8 +587,9 @@ writing one row**:
 * `test_transaction_isolation__read_committed` (`transactions_test.rb:1725`) — 3 threads doing
   `find/save/find/save/find` on `developers` id 1, plus a fourth doing ten read-only transactions.
 
-Both are `Reach::Node` writes only — no `FOR UPDATE` — so §3's invisible wait needs a `FOR UPDATE`
-that these tests do not have, and neither should be able to reach the hold-and-wait shape. What they
+Both are `Reach::Node` writes only — no `FOR UPDATE` — so the invisible wait §3 examined needs a
+`FOR UPDATE` that these tests do not have, and neither should be able to reach the hold-and-wait
+shape. What they
 *can* reach is the restart loop: `changed_since_statement` → `restart_statement` →
 `StatementMustRestart`, capped at `MAX_STATEMENT_RESTARTS = 32` (`exec/mod.rs:572`), with each
 attempt's wait unbounded because neither `lock_timeout` nor `statement_timeout` is set. Thirty-two
@@ -567,8 +633,8 @@ choose between them.
 * **§2 adds a method to the TxnKv wire.** Every store must understand it before a client sends it;
   a mixed-version cluster answers `UnexpectedResponse` to a release. It needs the ordinary
   gate-reverse-dependents care that a new proto variant always needs.
-* **§3 makes a `40P01` reachable where the node used to hang.** A test that passed by waiting will
-  now be told, which is the direction we want and is still a behaviour change.
+* **§3 changes nothing either**, because §2 already had. What it leaves is a test that turns the
+  drift between the two lock spaces from a six-minute silence into a red second.
 * **§4 changes nothing**, and the SQLSTATE it proposed to move would have been wrong in both
   directions — see its refutation above. The symptom it named survives as a measurement to make.
 * **Nothing here changes a SQLSTATE mapping, a message, or an on-disk record.** The three tests need

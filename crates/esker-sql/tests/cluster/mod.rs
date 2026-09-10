@@ -243,6 +243,30 @@ impl Cluster {
             Arc::clone(&self.oracle),
         ))
     }
+
+    /// A router of its own, for a test that has to speak the wire directly.
+    ///
+    /// The one thing a `TxnClient` cannot do is leave a transaction **prewritten and
+    /// uncommitted** — its `commit` does both halves — and that is exactly the state a DDL is in
+    /// while it commits, which is the window ADR 0105 is about. Driving it by hand is the only way
+    /// to hold it still.
+    pub fn router(&self) -> Router {
+        let stores = TcpStores::connect_all(&self.addresses, TransportConfig::new())
+            .expect("a raw router connects to all three");
+        let resolver: Arc<dyn RegionResolver> = Arc::new(RegionTable::from_routes([
+            route(1, b"", b"m"),
+            route(2, b"m", b"t"),
+            route(3, b"t", b""),
+        ]));
+        Router::with_options(
+            Arc::new(stores),
+            resolver,
+            ClientOptions {
+                jitter_seed: Some(13),
+                ..ClientOptions::default()
+            },
+        )
+    }
 }
 
 /// One connection's worth of executor.

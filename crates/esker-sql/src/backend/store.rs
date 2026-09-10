@@ -269,6 +269,13 @@ impl StoreTxn {
 
 impl Txn for StoreTxn {
     /// See [`Txn::owned_by_session`]: set once, right after the transaction is opened.
+    fn get_without_waiting(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        // The only backend where the distinction is real: a lock here is a Percolator lock in a
+        // store, and reading past it is a second `Get` at a lower timestamp (ADR 0105).
+        self.record_key(key);
+        self.open()?.get_without_waiting(key).map_err(translate)
+    }
+
     fn owned_by_session(&mut self, pid: u32) {
         self.session = pid;
     }
@@ -606,8 +613,21 @@ fn translate(error: ClientError) -> SqlError {
         // nothing more is what made a cross-database DDL hotspot need a census rather than a log
         // line: an operator could not tell a wait on the catalog's version counter from a wait on
         // any row. `TxnConflict` above has always carried its key; this now does too.
-        ClientError::LockNotCleared { start_ts, key } => SqlError::SerializationFailure {
-            message: format!("a lock from the transaction at {start_ts} could not be cleared"),
+        // **And what this transaction was doing when it gave up**
+        // ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
+        // §4). Three different calls raise this — a read, a `SERIALIZABLE` read set, and a
+        // transaction acquiring a key it means to write — and they are not the same condition:
+        // the first is a reader stuck behind somebody's uncommitted write, the last is two
+        // writers on one row. Run 114 reported this message and no pass could say which of the
+        // three had produced it, which is a whole measurement spent on a sentence.
+        ClientError::LockNotCleared {
+            start_ts,
+            key,
+            waiting,
+        } => SqlError::SerializationFailure {
+            message: format!(
+                "a lock from the transaction at {start_ts} could not be cleared for {waiting}"
+            ),
             key: Some(key.to_vec()),
         },
         // **The victim of a wound, told the way PostgreSQL tells one**

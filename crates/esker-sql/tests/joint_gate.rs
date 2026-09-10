@@ -212,7 +212,8 @@ enum Cell {
 /// `physical_ms(1009)` is 0, `physical_ms(now)` is 0, and a lock left behind by a write whose
 /// answer was lost can never expire. Anything that then touches those rows spins against it for
 /// as long as it is willing to wait — seen exactly so, as `a lock from the transaction at 1009
-/// could not be cleared`, for thirty seconds.
+/// could not be cleared`, for thirty seconds. (ADR 0104 §4 gave that sentence a suffix naming
+/// which of the three waits gave up, so what a run prints today ends `… for a read`.)
 ///
 /// The other tests in this crate never orphan a lock, which is why they can count and this cannot.
 /// Nothing here reads a clock to *order* anything (`CLAUDE.md` invariant 6): this stands in for

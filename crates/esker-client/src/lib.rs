@@ -43,7 +43,7 @@ pub mod transport;
 pub mod txn;
 pub mod wire;
 
-pub use error::{Error, Result};
+pub use error::{Error, Result, Waiting};
 pub use fragment::{FRAGMENT_TIMEOUT, FragmentAnswer, FragmentClient, Shard};
 pub use raw::{ClientOptions, RawClient};
 pub use region_cache::{RegionCache, RegionResolver, RegionTable, Route, StaticRegion};
