@@ -2877,6 +2877,7 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 read_as_text(operand, scope)
             };
             if let Ok(from) = expr_type(&operand, scope)
+                && !is_already_of_type(&operand, *to)
                 && !pg_catalog::casts_to(from, *to)
             {
                 return Err(SqlError::CannotCast {
@@ -4236,14 +4237,31 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
         // what a real server answers. With the node kept, the pair matched no arm here, nothing
         // typed the other side, and the comparison quietly answered `f`. One arm, and it restores
         // the sentence the fold used to carry.
-        (Expr::Cast { to, typmod, .. }, Expr::Literal(literal)) => (
-            left.clone(),
-            Expr::Literal(blank_pad(retype(*to, literal, op, false)?, *to, *typmod)),
-        ),
-        (Expr::Literal(literal), Expr::Cast { to, typmod, .. }) => (
-            Expr::Literal(blank_pad(retype(*to, literal, op, true)?, *to, *typmod)),
-            right.clone(),
-        ),
+        //
+        // **And refuses it exactly as a column does**, which is the half of that sentence this arm
+        // was missing. Retyping is what an `unknown` needs; a literal that already *has* a type
+        // needs the family check the two-column and two-literal arms below both make, and got
+        // neither — the pair matched here first. So `'x'::text = '<a/>'::xml` answered `f` where a
+        // real server says `42883 operator does not exist: text = xml`, and with it twenty-five
+        // more pairs in `tests/captures/pg19_comparison_matrix.txt`: every type whose value cannot
+        // carry its own name — `xml`, `jsonb`, `name`, `"char"`, `bit`, `int2vector`, `oidvector`,
+        // `lquery`, `void` — keeps a `Cast` node out of the fold and so arrives on this side of
+        // the pattern, against a `tsrange` or a `text` that folded to a literal on the other
+        // (`debts-v1.1.md` #43's second mechanism).
+        (Expr::Cast { to, typmod, .. }, Expr::Literal(literal)) => {
+            refuse_across_families(*to, literal, op, false)?;
+            (
+                left.clone(),
+                Expr::Literal(blank_pad(retype(*to, literal, op, false)?, *to, *typmod)),
+            )
+        }
+        (Expr::Literal(literal), Expr::Cast { to, typmod, .. }) => {
+            refuse_across_families(*to, literal, op, true)?;
+            (
+                Expr::Literal(blank_pad(retype(*to, literal, op, true)?, *to, *typmod)),
+                right.clone(),
+            )
+        }
         // **A constructor gives the other side its array type**, which is the mirror of the
         // subscript rule below and the same failure if it is missing: `ARRAY[t] = '{x}'` compared
         // a `Datum::Array` against a `Datum::Text` and answered **`f` for every row**, including
@@ -4775,6 +4793,50 @@ fn integer_span(ty: ColumnType) -> Option<(i64, i64)> {
         ColumnType::Int8 => Some((i64::MIN, i64::MAX)),
         _ => None,
     }
+}
+
+/// Refuses a cast against a literal that **already carries a type**, where no operator relates
+/// the two.
+///
+/// The check the `Ordinal` arms get from [`Literal::comparable_with`] and the two-literal arm
+/// makes for itself; a cast beside a literal reached neither. `None` is an `unknown` — a quoted
+/// string or a bare NULL — which is exactly the case the cast is there to give a type to, so it
+/// passes through to [`retype`] untouched.
+/// Whether a constant operand **already is** a value of `ty`, in the one case where its own
+/// `column_type` cannot say so.
+///
+/// A [`Datum::Range`] carries its *subtype*, and an `int4range` and an `int8range` are both ranges
+/// of an `int8` in this crate — so `column_type` answers the first as a **representative**, which
+/// is what it documents itself as doing. `expr_type` reads that representative, and the cast the
+/// fold keeps over a range constant then looked like one between two different types:
+/// `'[1,3)'::int8range` refused *itself* with `42846 cannot cast type int4range to int8range`, a
+/// pair `pg_cast` rightly has no row for, for a statement whose operand is already exactly the
+/// type named. Found by the comparison matrix, which is where the row is measured.
+///
+/// [`Datum::fits`] is the same question asked from the column's side, where the answer is single
+/// valued — and it is asked *only* for a range, because a range is the only datum whose type is a
+/// set. The node stays either way: it is what makes `int4range = int8range` the `42883` a real
+/// server gives, which folding the constant would answer instead.
+fn is_already_of_type(expr: &Expr, ty: ColumnType) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(Literal::Typed(value))
+            if matches!(**value, Datum::Range { .. }) && value.fits(ty)
+    )
+}
+
+fn refuse_across_families(
+    ty: ColumnType,
+    literal: &Literal,
+    op: BinaryOp,
+    literal_on_the_left: bool,
+) -> Result<()> {
+    if let Some(carried) = literal_type(literal)
+        && !same_family(carried, ty)
+    {
+        return Err(undefined_operator(ty, literal, op, literal_on_the_left));
+    }
+    Ok(())
 }
 
 fn undefined_operator(

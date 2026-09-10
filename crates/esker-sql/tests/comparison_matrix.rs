@@ -23,6 +23,13 @@
 //! they all compare with each other — no single tag expresses that overlap, so the pair is asked
 //! before the tags now, the way `json`'s is.
 //!
+//! **The literal form closed the rest**, and it is the same 2,809 statements: a cast beside a
+//! literal met neither the column path's family check nor the two-literal one, because
+//! `reconcile` matched it first and *retyped* instead. That is the arm whose own comment says a
+//! cast types the other side exactly as a column does — with the second half of the sentence
+//! missing, which is `debts-v1.1.md` #43's second mechanism in its purest form and the fourth
+//! time in this crate that a rule reached only the caller it was written for.
+//!
 //! Measured in `tests/captures/pg19_comparison_matrix.txt`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -30,7 +37,7 @@
 #[path = "parity_harness/mod.rs"]
 mod parity;
 
-/// **Every measured pair, in the literal form** — red, and handed over measured.
+/// **Every measured pair, in the literal form.**
 ///
 /// This is the path where `reconcile` retypes a literal, and it does not consult `same_family` at
 /// all: it asks `Literal::comparable_with` → `Datum::fits` → `one_representation`. Three gates,
@@ -40,16 +47,31 @@ mod parity;
 /// a text-shaped target and not the reverse. The first attempt added the reverse, moved nothing,
 /// and was reverted.
 ///
-/// **27 rows remain and they are one family**: a `tsrange` literal compared against a text-shaped
-/// literal — `name`, `"char"`, `character`, `character varying`, `xml`, `jsonb`, `bit`, `oidvector`,
-/// `lquery`, `void` — where this node answers and a real server refuses. Neither gate fires on
-/// them: `Literal::String(_)` is comparable with everything, deliberately, because an untyped
-/// literal is supposed to take the other side's type; and the pairwise `same_family` checks want
-/// `literal_type` on both sides, which a string literal does not have. So the operand escapes both,
-/// which is #43's mechanism in its purest form — the fix is that a *cast* literal should not still
-/// be an untyped string by the time it reaches here.
+/// It went 59 → 37 → 27 → 0, and the last twenty-seven were **two** findings rather than the one
+/// family the previous round named:
+///
+/// ```text
+/// 26  PG refuses, node ANSWERS   a cast beside a typed literal was retyped, never family-checked
+///  1  PG answers, node REFUSES   '[1,3)'::int8range refused itself, 42846 int4range -> int8range
+/// ```
+///
+/// **The first is a pattern that matched too early.** Every type whose *value* cannot carry its
+/// own name — `xml`, `jsonb`, `name`, `"char"`, `bit`, `int2vector`, `oidvector`, `lquery`, `void`
+/// — keeps a `Cast` node out of the fold, so it reaches `reconcile` as a cast rather than as a
+/// literal; the arm that matches a cast against a literal retypes it, which is right for an
+/// `unknown` and is how `'x'::text = '<a/>'::xml` answered `f` where a real server says
+/// `42883 operator does not exist: text = xml`. The previous round read the same rows as "an
+/// untyped string escapes both gates" — a diagnosis from reading the two gates rather than from
+/// asking which arm the pair actually took.
+///
+/// **The second was hidden behind the first**, and the node's own sentence is what named it: a
+/// `Datum::Range` carries its subtype, an `int4range` and an `int8range` are both ranges of an
+/// `int8` here, and `column_type` therefore answers a *representative*. The cast the fold keeps
+/// over the constant then looked like one between two different types and refused a statement
+/// whose operand is already exactly the type named. Folding the constant instead would answer
+/// `int4range = int8range`, which a real server refuses — so the node stays and
+/// `exec::query::is_already_of_type` asks `fits`, which is the same question with a single answer.
 #[test]
-#[ignore = "27 rows left, one family: a tsrange literal escapes both gates as an untyped string"]
 fn every_comparison_pair_agrees_with_postgresql_19() {
     let mut node = parity::Node::new(&[]);
     let capture = include_str!("captures/pg19_comparison_matrix.txt");
@@ -58,8 +80,11 @@ fn every_comparison_pair_agrees_with_postgresql_19() {
         let Some((statement, expected)) = line.split_once('\t') else {
             continue;
         };
-        let answered = node.run(statement).is_ok();
-        if answered == expected.starts_with('!') {
+        // **The node's own sentence, where it has one.** A row where PostgreSQL answers and this
+        // node refuses is only half reported by the word "refuses": the message names which gate
+        // fired, and reading it is what told `int8range` apart from the twenty-six pairs beside it.
+        let answered = node.run(statement).map_err(|error| error.to_string());
+        if answered.is_ok() == expected.starts_with('!') {
             wrong.push(format!(
                 "{statement}\n  PostgreSQL {} · node {}",
                 if expected.starts_with('!') {
@@ -67,7 +92,10 @@ fn every_comparison_pair_agrees_with_postgresql_19() {
                 } else {
                     "answers"
                 },
-                if answered { "answers" } else { "refuses" }
+                match &answered {
+                    Ok(_) => "answers".to_owned(),
+                    Err(error) => format!("refuses: {error}"),
+                }
             ));
         }
         checked += 1;
