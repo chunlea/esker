@@ -260,7 +260,11 @@ impl Router {
                     // all. Counted per *attempt* — a request refused for a stale epoch and sent
                     // again cost the cluster two round trips, and a count that hid the second
                     // would be measuring this API rather than the wire.
-                    crate::stmt_stats::record_call(route.region.id);
+                    crate::stmt_stats::record_call(
+                        route.region.id,
+                        method,
+                        crate::stmt_stats::mutations_in(body),
+                    );
                     match self.transport.call(target.store_id, &wire, deadline) {
                         Ok(response) if response.method() == method => return Ok(response),
                         Ok(response) => {

@@ -262,6 +262,7 @@ impl TxnClient {
     /// stamped with, what its `default` values are filed under, and what a resolver looks its
     /// fate up by. It comes from the oracle and from nowhere else (`CLAUDE.md` invariant 6).
     pub fn begin(&self) -> Result<Transaction> {
+        crate::stmt_stats::record_tso();
         Ok(self.open(self.oracle.timestamp()?, false))
     }
 
@@ -284,6 +285,7 @@ impl TxnClient {
     /// The floor costs one round trip, and it is spent here rather than per read: see
     /// [`TxnClient::safepoint`] for what that number is and what it is not.
     pub fn begin_at(&self, start_ts: u64) -> Result<Transaction> {
+        crate::stmt_stats::record_tso();
         let now = self.oracle.timestamp()?;
         if start_ts > now {
             return Err(Error::SnapshotInTheFuture {
@@ -320,6 +322,7 @@ impl TxnClient {
     /// bottom of the timestamp space, which [`TxnClient::begin_at`] then refuses as too old —
     /// a refusal naming the window, rather than an overflow.
     pub fn ts_ago(&self, how_long: Duration) -> Result<u64> {
+        crate::stmt_stats::record_tso();
         let now = self.oracle.timestamp()?;
         let ago_ms = u64::try_from(how_long.as_millis()).unwrap_or(u64::MAX);
         Ok(ts_at_ms(physical_ms(now).saturating_sub(ago_ms)))
@@ -367,6 +370,7 @@ impl TxnClient {
     /// byte-opaque (`CLAUDE.md` invariant 7), so where the name → timestamp map lives is the
     /// decision of the layer above, which for SQL is the catalog (ADR 0021 decision 4).
     pub fn export_snapshot(&self, name: &[u8]) -> Result<u64> {
+        crate::stmt_stats::record_tso();
         let at = self.oracle.timestamp()?;
         let mut txn = self.begin()?;
         txn.put(name, &encode_snapshot(at));
@@ -1357,6 +1361,7 @@ impl Transaction {
         }
 
         // 4. and 5. The commit point.
+        crate::stmt_stats::record_tso();
         let commit_ts = self.oracle.timestamp()?;
         if let Err(error) = self.commit_keys(commit_ts, std::slice::from_ref(&primary)) {
             // **A transaction that did not commit takes its locks with it**
@@ -1921,6 +1926,7 @@ impl Transaction {
                     backoff_ms(attempt).min(lease_ms)
                 }
                 .max(1);
+                crate::stmt_stats::record_wait(Duration::from_millis(wait));
                 self.router.clock().sleep(Duration::from_millis(wait));
                 return Ok(());
             }
@@ -1965,6 +1971,7 @@ impl Transaction {
         // From the oracle, not from a clock (`CLAUDE.md` invariant 6). A fresh timestamp
         // rather than this transaction's own `start_ts`: both are conservative, but a reader
         // that began long ago would judge every lock alive for ever and never make progress.
+        crate::stmt_stats::record_tso();
         let now = self.oracle.timestamp()?;
         if !is_expired(lock.start_ts, lock.ttl_ms, now) {
             return Ok(Classified::alive(lock, now));
