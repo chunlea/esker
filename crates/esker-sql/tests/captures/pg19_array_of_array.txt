@@ -1,0 +1,68 @@
+# **An array of an array** — PostgreSQL 19beta1, 2026-09-09.
+# `ON_ERROR_ROLLBACK on`, one `BEGIN … ROLLBACK`, no fixture: every operand is a literal.
+#
+# r1's wire census v2 named 196 rows of one defect: **when the operand is already an array, this
+# node degrades the answer to `text`/`text[]` where PostgreSQL keeps the element type** — 49 array
+# types across `ARRAY[c]`, `(ARRAY[c])[1]`, `unnest(ARRAY[c])` and `array_agg(c)`.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **There is no array of an array.** `ARRAY[c]` over an `int[]` is an `int[]` with one more
+#     dimension, not a nested type — `pg_type._int4.typarray` is 0, so a `typarray` lookup answers
+#     *nothing* here and the constructor's rule is a different rule. `int[][]` and
+#     `ARRAY(SELECT ARRAY(SELECT 1))` are both `integer[]` for the same reason.
+#   * **One subscript on a two-dimensional array is NULL**, of the element type. `(ARRAY[c])[1]` is
+#     NULL and `(ARRAY[c])[1][2]` is the value: a subscript list shorter than the dimensions does
+#     not slice, it under-specifies.
+#   * **`unnest` flattens all the way.** Two rows out of a one-row 2-D array, of the element type.
+#   * **The constructor and `array_agg` disagree about NULL and empty, in opposite directions.**
+#     `ARRAY[NULL::int[]]` is `{}` and `ARRAY['{}'::int[],'{}'::int[]]` is `{}` — a NULL or empty
+#     operand contributes no dimensions and no elements. `array_agg` **refuses both**: *cannot
+#     accumulate null arrays* and *cannot accumulate empty arrays*. Nothing about the constructor
+#     predicts the aggregate here.
+#   * **Three sentences across two SQLSTATEs**, so one shared code is wrong about one of them:
+#     null arrays is `22004`, empty arrays and different dimensionality are `2202E`. And the
+#     constructor's own mismatch is a *fourth* sentence, from `ExecEvalArrayExpr` rather than
+#     `accumArrayResultArr`.
+#   * **`ARRAY(subquery)` is the aggregate's rule, not the constructor's.** It reaches
+#     `accumArrayResultArr` like `array_agg`, so `ARRAY(SELECT NULL::int[])` raises where
+#     `ARRAY[NULL::int[]]` answers `{}`. Two spellings that read like one constructor, and they
+#     disagree about NULL, about empty and about nothing else.
+#   * **A NULL beside a non-empty array is a dimension mismatch**, not a NULL element:
+#     `ARRAY['{1,2}'::int[], NULL::int[]]` raises where `ARRAY[NULL::int[]]` answers `{}`.
+#
+# ## The measurements
+#
+SELECT ARRAY[c] AS v FROM (VALUES ('{1,2}'::int[])) s(c)	integer[]	{{1,2}}
+SELECT ARRAY[c] AS v FROM (VALUES ('{"[2020-01-01,2020-01-02)"}'::tsrange[])) s(c)	tsrange[]	{{"[\"2020-01-01 00:00:00\",\"2020-01-02 00:00:00\")"}}
+SELECT ARRAY[c] AS v FROM (VALUES ('{pg_class}'::regclass[])) s(c)	regclass[]	{{pg_class}}
+SELECT (ARRAY[c])[1] AS v FROM (VALUES ('{1,2}'::int[])) s(c)	integer	\N
+SELECT (ARRAY[c])[1] AS v FROM (VALUES ('{"[2020-01-01,2020-01-02)"}'::tsrange[])) s(c)	tsrange	\N
+SELECT (ARRAY[c])[1] AS v FROM (VALUES ('{pg_class}'::regclass[])) s(c)	regclass	\N
+SELECT (ARRAY[c])[1][2] AS v FROM (VALUES ('{1,2}'::int[])) s(c)	integer	2
+SELECT unnest(ARRAY[c]) AS v FROM (VALUES ('{1,2}'::int[])) s(c)	integer	1 ; 2
+SELECT unnest(ARRAY[c]) AS v FROM (VALUES ('{"[2020-01-01,2020-01-02)"}'::tsrange[])) s(c)	tsrange	["2020-01-01 00:00:00","2020-01-02 00:00:00")
+SELECT unnest(ARRAY[c]) AS v FROM (VALUES ('{pg_class}'::regclass[])) s(c)	regclass	pg_class
+SELECT array_agg(c) AS v FROM (VALUES ('{1,2}'::int[]), ('{3,4}'::int[])) s(c)	integer[]	{{1,2},{3,4}}
+SELECT array_agg(c) AS v FROM (VALUES ('{"[2020-01-01,2020-01-02)"}'::tsrange[])) s(c)	tsrange[]	{{"[\"2020-01-01 00:00:00\",\"2020-01-02 00:00:00\")"}}
+SELECT array_agg(c) AS v FROM (VALUES ('{pg_class}'::regclass[])) s(c)	regclass[]	{{pg_class}}
+SELECT array_dims(ARRAY[a,b]) AS v FROM (VALUES ('{1,2}'::int[], '{3,4}'::int[])) s(a,b)	text	[1:2][1:2]
+SELECT ARRAY[a,b] AS v FROM (VALUES ('{1,2}'::int[], '{3,4}'::int[])) s(a,b)	integer[]	{{1,2},{3,4}}
+SELECT ARRAY[a,b] AS v FROM (VALUES ('{1,2}'::int[], '{3,4,5}'::int[])) s(a,b)	!2202E multidimensional arrays must have array expressions with matching dimensions
+SELECT array_agg(c) AS v FROM (VALUES ('{1,2}'::int[]), ('{3,4,5}'::int[])) s(c)	!2202E cannot accumulate arrays of different dimensionality
+SELECT ARRAY[c] AS v FROM (VALUES (NULL::int[])) s(c)	integer[]	{}
+SELECT ARRAY[a,b] AS v FROM (VALUES ('{1,2}'::int[], NULL::int[])) s(a,b)	!2202E multidimensional arrays must have array expressions with matching dimensions
+SELECT ARRAY[c] AS v FROM (VALUES ('{}'::int[])) s(c)	integer[]	{}
+SELECT array_dims(ARRAY[c]) AS v FROM (VALUES ('{}'::int[])) s(c)	text	\N
+SELECT ARRAY[c] AS v FROM (VALUES ('{1,NULL}'::int[])) s(c)	integer[]	{{1,NULL}}
+SELECT array_agg(c) AS v FROM (VALUES ('{1,2}'::int[]), (NULL::int[])) s(c)	!22004 cannot accumulate null arrays
+SELECT array_agg(c) AS v FROM (VALUES ('{}'::int[]), ('{}'::int[])) s(c)	!2202E cannot accumulate empty arrays
+SELECT array_agg(c) AS v FROM (VALUES ('{}'::int[]), ('{1}'::int[])) s(c)	!2202E cannot accumulate empty arrays
+SELECT ARRAY[a,b] AS v FROM (VALUES ('{}'::int[], '{}'::int[])) s(a,b)	integer[]	{}
+SELECT ARRAY[a,b] AS v FROM (VALUES (NULL::int[], NULL::int[])) s(a,b)	integer[]	{}
+SELECT '{{1,2}}'::int[][] AS v	integer[]	{{1,2}}
+SELECT ARRAY(SELECT ARRAY(SELECT 1)) AS v	integer[]	{{1}}
+SELECT ARRAY(SELECT c FROM (VALUES ('{1,2}'::int[]),('{3,4}'::int[])) s(c)) AS v	integer[]	{{1,2},{3,4}}
+SELECT ARRAY(SELECT c FROM (VALUES ('{1,2}'::int[]),('{3,4,5}'::int[])) s(c)) AS v	!2202E cannot accumulate arrays of different dimensionality
+SELECT ARRAY(SELECT c FROM (VALUES (NULL::int[])) s(c)) AS v	!22004 cannot accumulate null arrays
+SELECT ARRAY(SELECT c FROM (VALUES ('{}'::int[])) s(c)) AS v	!2202E cannot accumulate empty arrays

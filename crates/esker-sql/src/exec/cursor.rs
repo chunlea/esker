@@ -2094,18 +2094,40 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         // elements all happen to be NULL must not produce a differently-typed array from the one
         // before it.
         Expr::Array { elements, element } => {
-            let mut values = Vec::with_capacity(elements.len());
+            let mut operands = Vec::with_capacity(elements.len());
             for expr in elements {
-                values.push(match evaluate_in(expr, row, env)? {
-                    Datum::Null => None,
-                    value => Some(value),
-                });
+                operands.push(evaluate_in(expr, row, env)?);
             }
-            Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
-                element.unwrap_or(ColumnType::Text),
-                1,
-                values,
-            ))
+            // **An array of arrays is one array with another dimension**, which is what a real
+            // server does and what `ArrayValue` already models — flat elements and `dims`. The
+            // operands' own dimensions have to agree, a NULL array has none, and an operand that
+            // is not an array at all never reaches here: mixing them is a type failure at
+            // resolution (*ARRAY types integer[] and integer cannot be matched*).
+            // **The declared type decides, not the values.** `ARRAY[NULL::int[]]` has no array
+            // operand to look at and is still `{}` rather than `{NULL}`: what says so is the
+            // element type being an array type, which resolution settled before a row was read.
+            let stacking = element
+                .and_then(esker_keys::array::ArrayValue::element_of)
+                .is_some()
+                || operands
+                    .iter()
+                    .any(|value| matches!(value, Datum::Array(_)));
+            if stacking {
+                stack_arrays(&operands, *element)?
+            } else {
+                let values = operands
+                    .into_iter()
+                    .map(|value| match value {
+                        Datum::Null => None,
+                        value => Some(value),
+                    })
+                    .collect();
+                Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+                    element.unwrap_or(ColumnType::Text),
+                    1,
+                    values,
+                ))
+            }
         }
         // The type was settled when the expression was resolved. Where it was not — a `DEFAULT`
         // evaluated by the DDL path, which never resolves against a row — the operands' own types
@@ -2881,6 +2903,30 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             }
         }
     })
+}
+
+/// Stack array operands into one array with another dimension, for an `ARRAY[…]` constructor.
+///
+/// The mechanism is `ArrayValue::stacked`; what belongs here is the **sentence**. PostgreSQL has
+/// two for one cause and raises them from two functions, so this one is the constructor's and
+/// `array_agg`'s is its own — a shared message would be wrong about half of the family.
+fn stack_arrays(operands: &[Datum], element: Option<ColumnType>) -> Result<Datum> {
+    let parts: Vec<Option<&esker_keys::array::ArrayValue>> = operands
+        .iter()
+        .map(|value| match value {
+            Datum::Array(array) => Some(array),
+            _ => None,
+        })
+        .collect();
+    // The declared type is the *array*'s, so the fallback element is what it is an array of —
+    // needed only when every operand is NULL and no value can say.
+    let fallback = element
+        .and_then(esker_keys::array::ArrayValue::element_of)
+        .or(element)
+        .unwrap_or(ColumnType::Text);
+    esker_keys::array::ArrayValue::stacked(&parts, fallback)
+        .map(Datum::Array)
+        .ok_or(SqlError::ArrayExpressionDimensions)
 }
 
 /// `x IN (a, b, …)` — three-valued, and the rule is **not** "a NULL means false":

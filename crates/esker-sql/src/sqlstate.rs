@@ -57,6 +57,21 @@ pub const INVALID_REGULAR_EXPRESSION: &str = "2201B";
 
 // --- Class 22 — Data Exception ---
 
+/// `22004` — a NULL where the operation has no answer for one.
+///
+/// Reached here by `array_agg` over arrays: *cannot accumulate null arrays*. Note it is **not**
+/// `2202E` like that aggregate's other two refusals — one code for all three would be wrong about
+/// this one.
+pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
+
+/// `2202E` — an array subscript or dimension PostgreSQL will not accept.
+///
+/// Two different sentences share it and both are measured: an `ARRAY[…]` whose operands are arrays
+/// of unequal dimensions says *multidimensional arrays must have array expressions with matching
+/// dimensions*, and `array_agg` over the same says *cannot accumulate arrays of different
+/// dimensionality*. Same code, different functions — `ExecEvalArrayExpr` and `accumArrayResultArr`.
+pub const ARRAY_SUBSCRIPT_ERROR: &str = "2202E";
+
 /// A literal could not be read as its target type — `'abc'::int8`.
 pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 /// `2200N invalid_xml_content` — `'<a>'::xml`. **Its own class**, not the `22P02` every other

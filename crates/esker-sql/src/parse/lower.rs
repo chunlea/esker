@@ -5944,7 +5944,7 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
     if let DataType::Array(inner) = data_type
         && let Some(element) = array_element(inner)
         && let Ok((element, NO_TYPMOD)) = lower_type(element)
-        && let Some(array) = esker_keys::array::ArrayValue::array_of(element)
+        && let Some(array) = esker_keys::array::ArrayValue::array_over(element)
     {
         // **`ARRAY[]::int[]` is the empty array and `ARRAY[]` is an error**, and the difference
         // is exactly this cast: the constructor has no element to take a type from, and the cast
@@ -8783,7 +8783,7 @@ pub(super) fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
                 return Err(SqlError::unsupported(format!("the type {data_type}")));
             };
             let (element, typmod) = lower_type(element)?;
-            let Some(array) = esker_keys::array::ArrayValue::array_of(element) else {
+            let Some(array) = esker_keys::array::ArrayValue::array_over(element) else {
                 return Err(SqlError::unsupported(format!("the type {data_type}")));
             };
             Ok((array, typmod))

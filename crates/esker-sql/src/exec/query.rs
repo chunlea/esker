@@ -4083,7 +4083,7 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
             Expr::Literal(literal @ Literal::String(_)),
         ) => {
             let array =
-                esker_keys::array::ArrayValue::array_of(*ty).unwrap_or(ColumnType::TextArray);
+                esker_keys::array::ArrayValue::array_over(*ty).unwrap_or(ColumnType::TextArray);
             (
                 left.clone(),
                 Expr::Literal(retype(array, literal, op, false)?),
@@ -4096,7 +4096,7 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
             },
         ) => {
             let array =
-                esker_keys::array::ArrayValue::array_of(*ty).unwrap_or(ColumnType::TextArray);
+                esker_keys::array::ArrayValue::array_over(*ty).unwrap_or(ColumnType::TextArray);
             (
                 Expr::Literal(retype(array, literal, op, true)?),
                 right.clone(),
@@ -5556,7 +5556,7 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // answering `text[]` there is a right value under a wrong declared type, which is what
         // `->` was doing one arm below.
         Expr::Array { elements, element } => array_element_type(elements, *element, scope)?
-            .and_then(esker_keys::array::ArrayValue::array_of)
+            .and_then(esker_keys::array::ArrayValue::array_over)
             .unwrap_or(ColumnType::TextArray),
         Expr::Arithmetic {
             op, left, right, ..
