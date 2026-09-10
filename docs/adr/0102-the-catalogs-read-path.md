@@ -48,22 +48,67 @@ a correctness rule rather than a preference:
 
 ## The three shapes
 
-### (a) A cached version with an invalidation the store pushes
+### (a) A cached version — and the lease it needs is already built
 
-The node keeps the version it last read and uses it without asking, until the store tells it the
-version moved.
+The node keeps the version it last read and answers later transactions from it, instead of reading
+the counters again.
 
-* **Consistency**: an invalidation that is *late* serves a stale definition, which rule 3 exists to
-  forbid — so the push has to be ordered against the DDL's commit, not merely sent after it. The
-  honest version of this is a lease: the node may use the cached version for as long as the store
-  has promised not to acknowledge a DDL without telling it, and the fallback when the lease lapses
-  is the read we do today.
-* **The once-per-transaction contract** survives untouched: it becomes once-per-transaction *from
-  the cache*, and the version is still a single value the whole transaction is answered at.
-* **What it needs**: a subscription in the wire protocol — a new tag, since nothing today lets a
-  store push to a SQL node — and a lease with a clock, which is the part that needs an ADR of its
-  own rather than a paragraph in this one.
-* **What it saves**: the two point reads per transaction, in the common case where no DDL has run.
+**The draft said this needs a push and a new wire tag. It does not.**
+[ADR 0028](0028-the-schema-lease.md) already ships the guarantee: `Pd::SchemaLease` (0x0307)
+answers `lease_ms` — *how long a node may serve writes from a cached schema* — and PD's schema-change
+step clock is timed against it, so a step cannot outrun a live lease. That is exactly the promise a
+version cache needs, and `Backend::schema_lease_remaining` already returns it, already fails closed
+on `None`, and is already refreshed once per lease period rather than per statement.
+
+**So the proposal, concretely:**
+
+* **What is cached**: for one tenant, the version `view_at` computes — the sum of that tenant's
+  `catalog_version` and the cluster tenant's — together with the instant it was read. One entry per
+  tenant, on the node, beside the definition cache that is already keyed by that version.
+* **When it may be used**: while `schema_lease_remaining()` is `Some(d)` **and** the entry is
+  younger than the lease that was live when it was read. Both halves, because a lease that lapsed
+  and came back is not the same lease: a DDL may have stepped in between, which is the whole reason
+  the clock is a timer.
+* **Where it is dropped**, and this is the list that has to be exhaustive:
+  1. `schema_lease_remaining()` returns `None`, or a shorter remaining time than the entry's age —
+     the fail-closed path ADR 0028 already has;
+  2. this node commits catalog DDL — the same points `Executor::catalog_written` is set, which the
+     pin below already hooks;
+  3. the entry's own age passes `lease_ms`, whether or not a refresh has happened since;
+  4. `LeaseRefresher` observes a lease it did not renew — a gap, not a renewal.
+* **What it does not cover**: another node's DDL *within* the lease window. It does not have to —
+  that is what the lease's timer buys, and it is the same bound writes already run under.
+
+### How it relates to `view_pinned`, which is already in the tree
+
+They are not the same mechanism and the difference is the safety argument:
+
+| | `view_pinned` (built) | the version cache (this option) |
+|---|---|---|
+| scope | inside **one transaction** | across transactions, on the node |
+| why it is safe | the transaction's snapshot is fixed, so the version cannot move | PD promised not to step a schema change faster than the lease |
+| what it removes | the second and later reads of one statement — measured 22 → 12 | the **first** read of each transaction, which is what is left |
+| what invalidates it | the transaction ending, or writing the catalog | the four points above |
+
+The pin is the cheap half and it is done. The cache is the half that crosses a snapshot boundary,
+which is why it needs a promise from outside the node rather than an argument about one.
+
+### The test that has to exist before it lands
+
+**"After an invalidation, no statement reads the old version"** — asserted on the *consequence*
+rather than on the counter, which is this register's own rule (`a-catalog-write-must-bump-the-version`):
+
+1. two sessions on one node: session A runs `ALTER TABLE t ADD COLUMN c`, commits; session B — a
+   different session, so a different transaction and a different pin — then runs
+   `INSERT INTO t (…, c) VALUES (…)` and **must** see the column. This is the local invalidation,
+   point 2 above;
+2. the lease's own path, which is the one a unit test cannot fake: a node whose
+   `schema_lease_remaining` is driven to `None` must re-read rather than answer from the entry, and
+   the assertion is again a consequence — a statement that would be wrong under the old version;
+3. and the one that decides whether the bound is real: **two SQL nodes**, DDL on the first, a
+   statement on the second before its lease would have expired. Under the proposal that statement
+   may still see the old definition, and the test's job is to pin *how long* that window is and
+   that it never exceeds `lease_ms`. `cluster_harness` starts one SQL node today; this needs two.
 
 ### (b) A lease read, or a follower read, of the version
 
