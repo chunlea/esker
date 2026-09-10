@@ -32,18 +32,24 @@ mod parity;
 
 /// **Every measured pair, in the literal form** — red, and handed over measured.
 ///
-/// 37 of the 2,809 disagree and they are the *other* half of #43's second mechanism: this is the
-/// path where `reconcile` retypes a literal, and it does not consult `same_family` at all — it asks
-/// `Literal::comparable_with`, which asks `Datum::fits`, which asks `one_representation`. Three
-/// gates, none of them the one the column path uses, which is why the same build answers
-/// `'x'::citext = 'x'::text` over columns and refuses it over literals.
+/// This is the path where `reconcile` retypes a literal, and it does not consult `same_family` at
+/// all: it asks `Literal::comparable_with` → `Datum::fits` → `one_representation`. Three gates,
+/// none of them the column path's, which is why the same build answered
+/// `'x'::citext = 'x'::text` over columns and refused it over literals until `one_representation`
+/// gained the pair — **in the direction the gate actually asks**, which is `citext` *held* against
+/// a text-shaped target and not the reverse. The first attempt added the reverse, moved nothing,
+/// and was reverted.
 ///
-/// The remainder: ten `citext` pairs against the text family, and roughly two dozen where a
-/// text-shaped literal is compared against a `tsrange` and this node answers. Adding `Citext` to
-/// `one_representation` was tried and moved none of them, so the gate is earlier still and is not
-/// found yet — recorded rather than guessed at.
+/// **27 rows remain and they are one family**: a `tsrange` literal compared against a text-shaped
+/// literal — `name`, `"char"`, `character`, `character varying`, `xml`, `jsonb`, `bit`, `oidvector`,
+/// `lquery`, `void` — where this node answers and a real server refuses. Neither gate fires on
+/// them: `Literal::String(_)` is comparable with everything, deliberately, because an untyped
+/// literal is supposed to take the other side's type; and the pairwise `same_family` checks want
+/// `literal_type` on both sides, which a string literal does not have. So the operand escapes both,
+/// which is #43's mechanism in its purest form — the fix is that a *cast* literal should not still
+/// be an untyped string by the time it reaches here.
 #[test]
-#[ignore = "the literal path is the other half of #43: measured at 37 rows, gate not yet located"]
+#[ignore = "27 rows left, one family: a tsrange literal escapes both gates as an untyped string"]
 fn every_comparison_pair_agrees_with_postgresql_19() {
     let mut node = parity::Node::new(&[]);
     let capture = include_str!("captures/pg19_comparison_matrix.txt");

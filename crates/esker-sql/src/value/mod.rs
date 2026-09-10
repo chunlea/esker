@@ -1085,6 +1085,9 @@ fn has_equality_at_all(ty: ColumnType) -> bool {
             // `lquery` is a pattern, not a value: a real server has no `lquery = lquery`, which
             // the comparison matrix found this node answering.
             | ColumnType::LQuery
+            // A `void` has one value and no equality — `''::void = ''::void` is `42883`, measured.
+            // It reads like a type that trivially compares with itself, and does not.
+            | ColumnType::Void
     )
 }
 

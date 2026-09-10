@@ -1232,6 +1232,19 @@ fn one_representation(held: ColumnType, wanted: ColumnType) -> bool {
             ColumnType::Oid
         )
         | (ColumnType::Oid, ColumnType::RegType)
+        // **A `citext` is `text`'s representation, in both directions.** This match is directional
+        // — `(RegType, Oid)` and `(Oid, RegType)` are both written out below for that reason — and
+        // a `citext` datum carries `Citext` as its own type, so the pair that matters here is
+        // `citext` *held* against a text-shaped column, not the reverse. Measured: the comparison
+        // matrix has ten `citext` pairs the literal path refused and a real server answers.
+        | (
+            ColumnType::Citext,
+            ColumnType::Text
+                | ColumnType::Varchar
+                | ColumnType::Name
+                | ColumnType::Char
+                | ColumnType::Bpchar
+        )
         // A `regclass` beside an `oid`, for the same reason and with the same measurement:
         // `SELECT count(*) > 0 FROM pg_attribute WHERE attrelid = 'pg_class'::regclass` is `t`.
         //
