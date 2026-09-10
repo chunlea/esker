@@ -2194,7 +2194,7 @@ fn pg_depend_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
 ///
 /// `(castsource, casttarget, castcontext, castmethod)`. `castcontext` is `e` explicit, `a`
 /// assignment, `i` implicit; `castmethod` is `f` a function, `b` binary-coercible, `i` I/O.
-pub const CASTS: [(i64, i64, &str, &str); 148] = [
+pub const CASTS: [(i64, i64, &str, &str); 157] = [
     // **A bit string's eight rows, measured** rather than reasoned:
     //
     //     SELECT castsource::regtype, casttarget::regtype, castcontext, castmethod
@@ -2421,6 +2421,28 @@ pub const CASTS: [(i64, i64, &str, &str); 148] = [
     (3802, 700, "e", "f"),
     (3802, 701, "e", "f"),
     (3802, 1700, "e", "f"),
+    // **Added 2026-09-10, measured on 19beta1**, and every one of them is a pair this node has
+    // both ends of — which is what the rule above says belongs here. They were missing for two
+    // different reasons and cost the same thing: `COALESCE`/`CASE`/`UNION` refused a pair a real
+    // server unifies, because the second pass asks `pg_cast` whether the other branch can reach
+    // the type chosen (wire v3 family F9, `tests/captures/pg19_branch_common_type.txt`).
+    //
+    // **The three `-> regtype` rows** are the ones the integers already had for `regclass` and
+    // `regproc`; `regtype` was left out of a set that is otherwise complete.
+    (20, 2206, "i", "f"),
+    (23, 2206, "i", "b"),
+    (21, 2206, "i", "f"),
+    // **The six `citext` rows exist only after `CREATE EXTENSION citext`**, so a capture taken
+    // against a stock server could not see them. `citext -> text` and `citext -> varchar` are
+    // *implicit* and the three back are *assignment*, which is exactly why `COALESCE(citext,
+    // text)` is `text` on 19beta1 and `COALESCE(text, citext)` is `text` too: the preference is
+    // one-directional and it decides both orders.
+    (16402, 25, "i", "b"),
+    (16402, 1043, "i", "b"),
+    (16402, 1042, "a", "b"),
+    (25, 16402, "a", "b"),
+    (1043, 16402, "a", "b"),
+    (1042, 16402, "a", "b"),
 ];
 
 /// The built-in functions this node has, as PostgreSQL numbers them.

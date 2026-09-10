@@ -664,7 +664,10 @@ pub(super) fn append(
             return Err(SqlError::SetOperationArity);
         }
         for (at, column) in arm.columns.iter().enumerate() {
-            columns[at].ty = unify(columns[at].ty, column.ty)?;
+            // **The same `select_common_type` a `COALESCE` and a `CASE` ask** — this path had
+            // both of its passes and the right two sentences first, and `common_of` is that rule
+            // written once so the other two stopped having their own.
+            columns[at].ty = common_of(&[columns[at].ty, column.ty], Unifying::SetOperation)?;
             // A typmod survives only where both arms agree on it, the way a `CASE`'s does: a
             // `varchar(3)` beside a `varchar(5)` is a `varchar` with no length on a real server.
             if columns[at].typmod != column.typmod {
@@ -872,6 +875,131 @@ fn coerce_arm(node: Node, arm: &[ColumnType], columns: &[OutputColumn]) -> Node 
 /// Whether every arm can then *reach* the chosen type is [`reaches_implicitly`]'s question, asked
 /// in [`append`] once the type is known: `money` beside `numeric` and `json` beside `jsonb` agree
 /// on a category and have no implicit cast, which is `42846` there and not `42804`.
+/// Which construct is unifying, for the two sentences PostgreSQL gives when it cannot.
+///
+/// The words differ per construct and the **codes** do not: a pair in two categories is `42804`
+/// and a pair in one category with no implicit cast is `42846`, for a `UNION`, a `COALESCE` and a
+/// `CASE` alike. Measured for all three.
+#[derive(Clone, Copy)]
+pub(super) enum Unifying {
+    /// `UNION`, `INTERSECT`, `EXCEPT`.
+    SetOperation,
+    /// `COALESCE`, whose arguments are walked left to right.
+    Coalesce,
+    /// A `CASE`'s results, whose list starts at the `ELSE`.
+    Case,
+}
+
+impl Unifying {
+    /// `42804`, for a pair whose `typcategory` letters differ.
+    fn mismatch(self, left: ColumnType, right: ColumnType) -> SqlError {
+        match self {
+            Unifying::SetOperation => SqlError::SetOperationTypes {
+                left: left.name(),
+                right: right.name(),
+            },
+            Unifying::Coalesce => SqlError::DatatypeMismatch(format!(
+                "COALESCE types {} and {} cannot be matched",
+                left.name(),
+                right.name()
+            )),
+            Unifying::Case => SqlError::DatatypeMismatch(format!(
+                "CASE types {} and {} cannot be matched",
+                left.name(),
+                right.name()
+            )),
+        }
+    }
+
+    /// `42846`, for a branch that cannot reach the type the construct settled on.
+    ///
+    /// **`CASE/WHEN` where the other two say their own name**, measured:
+    /// `CASE/WHEN could not convert type character to citext`.
+    fn cannot_convert(self, from: ColumnType, to: ColumnType) -> SqlError {
+        match self {
+            Unifying::SetOperation => SqlError::SetOperationCannotConvert {
+                from: from.name(),
+                to: to.name(),
+            },
+            Unifying::Coalesce => SqlError::CannotConvertBranch {
+                kind: "COALESCE",
+                from: from.name(),
+                to: to.name(),
+            },
+            Unifying::Case => SqlError::CannotConvertBranch {
+                kind: "CASE/WHEN",
+                from: from.name(),
+                to: to.name(),
+            },
+        }
+    }
+}
+
+/// Whether `from` reaches `to` by an **implicit** cast and nothing looser — `pg_cast`'s `i` rows,
+/// element-wise for a pair of arrays.
+///
+/// [`reaches_implicitly`] is the same question with a number-beside-a-number fallback, and that
+/// fallback is exactly wrong for choosing between two candidates: `int8 -> int4` is an
+/// *assignment* on a real server, so a rule that reads it as implicit lets `int8` be displaced by
+/// `int4` and `COALESCE(bigint, integer)` comes out `integer`. Measured: it is `bigint`.
+fn coerces_implicitly(from: ColumnType, to: ColumnType) -> bool {
+    use esker_keys::array::ArrayValue;
+    if from == to {
+        return true;
+    }
+    if let (Some(f), Some(t)) = (ArrayValue::element_of(from), ArrayValue::element_of(to)) {
+        return coerces_implicitly(f, t);
+    }
+    implicit_cast(from, to)
+}
+
+/// **PostgreSQL's `select_common_type`, both of its passes**, for every construct that unifies a
+/// list of types into one.
+///
+/// 1. The running candidate is the first type. A later type in a **different `typcategory`** is
+///    `42804`. Otherwise the candidate is displaced only when it is *not* its category's preferred
+///    type, it casts implicitly to the other, and the other does not cast back.
+/// 2. Then **every** input must reach the candidate by an implicit cast, or it is `42846` — a
+///    different sentence and a different code from the first pass, and the one a pair in one
+///    category with no cast between them gets.
+///
+/// **An array's category is `A`, not its element's**, which is the half `unify` gets wrong by
+/// recursing into elements before the category test: `"char"[]` beside `bigint[]` is
+/// `42846 could not convert type bigint[] to "char"[]` on 19beta1 and was `42804` here, and
+/// `"char"[]` beside `text[]` is answered `text[]` there and was refused here. Measured over every
+/// same-category pair of the wire v3 probe list's 100 spellings, 5,556 shape-rows
+/// (`tests/captures/pg19_branch_common_type.txt`).
+///
+/// **Written once for three callers.** The set-operation path had both passes and the right two
+/// sentences; `COALESCE` and `CASE` had neither, which is a measured rule reaching only the caller
+/// it was written for.
+pub(super) fn common_of(types: &[ColumnType], kind: Unifying) -> Result<ColumnType> {
+    let Some(&first) = types.first() else {
+        return Ok(ColumnType::Text);
+    };
+    let mut chosen = first;
+    for &next in &types[1..] {
+        if next == chosen {
+            continue;
+        }
+        if pg_catalog::typcategory(chosen) != pg_catalog::typcategory(next) {
+            return Err(kind.mismatch(chosen, next));
+        }
+        if !is_preferred(chosen)
+            && coerces_implicitly(chosen, next)
+            && !coerces_implicitly(next, chosen)
+        {
+            chosen = next;
+        }
+    }
+    for &ty in types {
+        if !reaches_implicitly(ty, chosen) {
+            return Err(kind.cannot_convert(ty, chosen));
+        }
+    }
+    Ok(chosen)
+}
+
 pub(super) fn unify(left: ColumnType, right: ColumnType) -> Result<ColumnType> {
     use esker_keys::array::ArrayValue;
     if left == right {
@@ -3372,19 +3500,40 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             // it asks `column_type()`, is told `text`, and concatenates. That is the borrowed
             // representation reaching a second decision, and the plan is the only place that still
             // knows what the operand is.
-            if call.func == CatalogFunc::HstoreConcat
-                && args.len() == 2
-                && let Ok(left) = expr_type(&args[0], scope)
-                && let Ok(right) = expr_type(&args[1], scope)
-                && left != ColumnType::Char
-                && right != ColumnType::Char
-                && concat_pair(left, right).is_none()
-            {
-                return Err(SqlError::UndefinedOperator {
-                    left: left.name().to_owned(),
-                    op: "||",
-                    right: right.name().to_owned(),
-                });
+            if call.func == CatalogFunc::HstoreConcat && args.len() == 2 {
+                let left = concat_operand_type(&args[0], scope)?;
+                let right = concat_operand_type(&args[1], scope)?;
+                if left != Some(ColumnType::Char)
+                    && right != Some(ColumnType::Char)
+                    && concat_answer(left, right).is_none()
+                {
+                    return Err(SqlError::UndefinedOperator {
+                        left: left.map_or("unknown", ColumnType::name).to_owned(),
+                        op: "||",
+                        right: right.map_or("unknown", ColumnType::name).to_owned(),
+                    });
+                }
+                // **An operand the pair settled on `text` for is coerced here**, which is what a
+                // real server's parser does and what the evaluator cannot: `'a=>1'::hstore ||
+                // 'x'::text` is string concatenation on 19beta1 (`"a"=>"1"x`) while
+                // `'a=>1'::hstore || 'b=>2'` is an hstore merge, and the two reach the evaluator
+                // as the same pair of `Datum`s — an `unknown` has no mark on it once it is a
+                // value. Only the operands with a `||` of their own are wrapped: the rest already
+                // render as themselves.
+                if concat_answer(left, right) == Some(ColumnType::Text) {
+                    for (at, ty) in [(0, left), (1, right)] {
+                        if let Some(ty) = ty
+                            && !concat_stringy(ty)
+                            && concat_pair(ty, ty).is_some()
+                        {
+                            args[at] = Expr::Cast {
+                                operand: Box::new(args[at].clone()),
+                                to: ColumnType::Text,
+                                typmod: crate::value::NO_TYPMOD,
+                            };
+                        }
+                    }
+                }
             }
             match (call.func, args.first()) {
                 (CatalogFunc::PgTypeof, Some(arg)) if args.len() == 1 => {
@@ -3671,56 +3820,27 @@ fn resolve_case(
     // type decides it; a later one whose type is in a different family is `42804`, and an
     // `unknown` one is **converted** rather than refused — `ELSE 'x'` against a `bigint`
     // is `22P02 invalid input syntax for type bigint`, which is what `give_type` raises.
-    let results = otherwise
+    let types: Vec<ColumnType> = otherwise
         .iter()
         .map(AsRef::as_ref)
-        .chain(resolved.iter().map(|branch| &branch.then));
-    let mut common = None;
-    for result in results {
-        let Some(ty) = branch_type(result, scope) else {
-            continue;
-        };
-        match common {
-            None => common = Some(ty),
-            // **The wider of the two, not the first one seen.** This kept whatever the head of the
-            // list carried and only checked that the rest were in its family, so
-            // `CASE WHEN true THEN 1.10 ELSE 2 END` settled on `integer` — the `ELSE` is walked
-            // first — and then refused to assign `1.10` to it. `carried_type` had always answered
-            // `numeric` for the same expression, so the declared type and the value path were
-            // two different rules; folded through `unify` they are one.
-            //
-            // **And `unify` is the question, not `same_family`.** The two ask different things and
-            // `"char"` is what separates them: `'r'::"char" = 'r'::text` is `t` — so an operator
-            // exists and the family test says yes — while
-            // `CASE WHEN true THEN 'r'::"char" ELSE 'x'::text END` is
-            // `42804 CASE types text and "char" cannot be matched`, because their `typcategory`
-            // letters differ and PostgreSQL's `select_common_type` has nothing to pick. Measured,
-            // both halves.
-            // **And a type unifies with itself before either test is asked.** `same_family` is a
-            // *comparison* predicate and is deliberately false for `json` beside `json` — the
-            // type has no equality operator, which its own doc comment records — so asking it
-            // here refused `CASE WHEN true THEN j ELSE j END` on a type 19beta1 settles without
-            // comparing anything. Measured over all 100 spellings of the wire v3 probe list: on a
-            // real server every one of them unifies with itself, and this node refused three
-            // (`json`, `json[]`, `xml`). `unify`'s own first line is `left == right`, so the
-            // family test in front of it was the whole of it.
-            Some(chosen) if chosen == ty => {}
-            Some(chosen) if same_family(chosen, ty) && unify(chosen, ty).is_ok() => {
-                common = Some(unify(chosen, ty).unwrap_or(chosen));
-            }
-            Some(chosen) => {
-                // The **resolved** type first and the offending one second, which is the
-                // order the list is walked in and therefore the order PostgreSQL names
-                // them: `THEN id ELSE name` is `CASE types text and bigint`, because the
-                // `ELSE` is the head of the list and `text` is what it settled on first.
-                return Err(SqlError::DatatypeMismatch(format!(
-                    "CASE types {} and {} cannot be matched",
-                    chosen.name(),
-                    ty.name()
-                )));
-            }
-        }
-    }
+        .chain(resolved.iter().map(|branch| &branch.then))
+        .filter_map(|expr| branch_type(expr, scope))
+        .collect();
+    // **`select_common_type` over the results, the `ELSE` first**, which is [`common_of`] and is
+    // the same function a `COALESCE` and a set operation ask.
+    //
+    // Two things this fold used to get wrong and one it got right. It kept whatever the head of
+    // the list carried and only checked that the rest were in its **family** — a *comparison*
+    // predicate, which separates every array type from every other, so `CASE … "char"[] …
+    // text[]` was `42804` where 19beta1 answers `text[]`. And it had no second pass, so a pair in
+    // one category with no cast between them got the `42804` that belongs to two categories.
+    // What it got right is the order: the `ELSE` is the head of the list, which is why
+    // `THEN id ELSE name` is `CASE types text and bigint`.
+    let common = if types.is_empty() {
+        None
+    } else {
+        Some(common_of(&types, Unifying::Case)?)
+    };
     if let Some(ty) = common {
         if let Some(expr) = &mut otherwise {
             give_branch_type(expr, ty)?;
@@ -3750,35 +3870,24 @@ fn resolve_coalesce(args: &[Expr], scope: &Scope<'_>) -> Result<Expr> {
     for arg in args {
         resolved.push(resolve(arg, scope)?);
     }
-    let mut common = None;
-    for arg in &resolved {
-        let Some(ty) = branch_type(arg, scope) else {
-            continue;
-        };
-        match common {
-            None => common = Some(ty),
-            // **The wider of the two, not the first.** `COALESCE(1, 2.5)` is `numeric` on a real
-            // server — the integer is promoted — so the common type is taken from the same
-            // promotion table arithmetic uses (ADR 0046) rather than from whichever argument came
-            // first. A pair with no promotion between them keeps the family test's answer.
-            // The same first question a `CASE`'s branches ask, for the same reason: a type
-            // unifies with itself whatever `same_family` says about comparing it.
-            Some(chosen) if chosen == ty => {}
-            Some(chosen) if same_family(chosen, ty) => {
-                common = Some(
-                    crate::value::arith::result_type(crate::plan::ArithOp::Add, chosen, ty)
-                        .unwrap_or(chosen),
-                );
-            }
-            Some(chosen) => {
-                return Err(SqlError::DatatypeMismatch(format!(
-                    "COALESCE types {} and {} cannot be matched",
-                    chosen.name(),
-                    ty.name()
-                )));
-            }
-        }
-    }
+    // **`select_common_type` over the whole list, left to right**, which is [`common_of`] and is
+    // the same function a set operation and a `CASE` ask. This folded pairwise through
+    // `arith::result_type(Add, …)` instead and kept the left operand when that had no answer, so
+    // `COALESCE(citext, text)` was `citext` where 19beta1 says `text`, `COALESCE("char", text)`
+    // answered where it refuses, and a pair in one category with no cast between them got the
+    // `42804` that belongs to two categories rather than the `42846` that belongs to this.
+    //
+    // The `unknown`s are skipped and coerced afterwards, which is what `branch_type` answering
+    // `None` means.
+    let types: Vec<ColumnType> = resolved
+        .iter()
+        .filter_map(|arg| branch_type(arg, scope))
+        .collect();
+    let common = if types.is_empty() {
+        None
+    } else {
+        Some(common_of(&types, Unifying::Coalesce)?)
+    };
     if let Some(ty) = common {
         for arg in &mut resolved {
             give_branch_type(arg, ty)?;
@@ -4570,33 +4679,25 @@ fn carried_type(expr: &Expr) -> Option<ColumnType> {
     }
 }
 
-/// The type a `CASE` or a `COALESCE` settles on: the first branch that carries one, else `text`.
-///
-/// **`text` is the answer and not `None`**, which is the whole point of asking: an all-`unknown`
-/// constructor is a `text` value on a real server, so a comparison against a number is `42883`
-/// rather than a silent no-match.
-/// The type a set of `CASE` or `COALESCE` branches settles on, folded with the promotion
-/// arithmetic uses. A pair with no common type keeps what it had: this answers a type rather than
-/// a `Result`, and the refusal for a genuinely mismatched `CASE` belongs where the branches are
-/// checked against each other.
-fn common_branch_type(types: impl Iterator<Item = ColumnType>) -> ColumnType {
-    let mut common: Option<ColumnType> = None;
-    for ty in types {
-        common = Some(match common {
-            None => ty,
-            Some(so_far) => unify(so_far, ty).unwrap_or(so_far),
-        });
-    }
-    common.unwrap_or(ColumnType::Text)
-}
-
 fn branch_common_type<'a>(branches: impl Iterator<Item = &'a Expr>) -> ColumnType {
-    common_branch_type(branches.filter_map(|branch| {
-        carried_type(branch).or_else(|| match branch {
-            Expr::Literal(literal) => literal_type(literal),
-            _ => None,
+    // **The same `select_common_type` `resolve_case` and `resolve_coalesce` ask**, because this is
+    // the answer a client is *told* and those two are what actually happens — and they were two
+    // different rules. Measured: `pg_typeof(COALESCE('{"x"}'::"char"[], '{"x"}'::text[]))` read
+    // this one and said `"char"[]` while the resolution settled on `text[]`, which is 19beta1's
+    // answer. A declared type that disagrees with the plan is the `->` bug's shape.
+    //
+    // Infallible here on purpose: a refusal is `resolve`'s to raise, and this is asked of
+    // expressions that have not been resolved yet (`output_columns` on a raw projection). `text`
+    // is the fallback `select_common_type` itself uses when nothing carries a type.
+    let types: Vec<ColumnType> = branches
+        .filter_map(|branch| {
+            carried_type(branch).or_else(|| match branch {
+                Expr::Literal(literal) => literal_type(literal),
+                _ => None,
+            })
         })
-    }))
+        .collect();
+    common_of(&types, Unifying::Coalesce).unwrap_or(ColumnType::Text)
 }
 
 fn retype_subscript(expr: &Expr, ty: ColumnType) -> Expr {
@@ -5682,6 +5783,56 @@ fn same_comparison_family(left: ColumnType, right: ColumnType) -> bool {
     matches!((family(left), family(right)), (Some(a), Some(b)) if a == b)
 }
 
+/// The types that reach `text || text` through an implicit cast, which is why
+/// `citext || citext` answers `text` and not `citext`.
+fn concat_stringy(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Text
+            | ColumnType::Varchar
+            | ColumnType::Bpchar
+            | ColumnType::Citext
+            | ColumnType::Name
+    )
+}
+
+/// One operand's type for `||`, where **`None` means `unknown`** — an unquoted string literal or a
+/// bare `NULL`, neither of which has a type until an operator gives it one.
+///
+/// `expr_type` answers `text` for both, which is right almost everywhere and wrong here: `unknown`
+/// is what makes `'a=>1'::hstore || 'b=>2'` an **hstore** on a real server while
+/// `'a=>1'::hstore || 'x'::text` is `text`. The two differ only in whether the second operand has
+/// a type, and nothing below the plan can tell.
+fn concat_operand_type(expr: &Expr, scope: &Scope<'_>) -> Result<Option<ColumnType>> {
+    if matches!(expr, Expr::Literal(Literal::String(_) | Literal::Null)) {
+        return Ok(None);
+    }
+    expr_type(expr, scope).map(Some)
+}
+
+/// The type `a || b` answers, `unknown` operands included, or `None` for a pair with no operator.
+///
+/// **An `unknown` takes the other operand's type when that type has a `||` with itself**, and the
+/// pair is `text` otherwise. Measured, and it is not "the unknown takes the other side's type":
+///
+/// ```text
+/// 'a=>1'::hstore || 'b=>2'   hstore      '1'::bit  || '0'    bit varying
+/// 'a'::tsquery   || 'b'      tsquery     'a.b'::ltree || 'c' ltree
+/// 1              || 'x'      text        '2020-01-01'::date || 'x'  text
+/// ```
+///
+/// `hstore` has an `hstore || hstore`, so the unknown becomes one; `integer` has no
+/// `integer || integer`, so the pair resolves through `anynonarray || text` instead.
+fn concat_answer(left: Option<ColumnType>, right: Option<ColumnType>) -> Option<ColumnType> {
+    match (left, right) {
+        (Some(left), Some(right)) => concat_pair(left, right),
+        (Some(known), None) | (None, Some(known)) => {
+            concat_pair(known, known).or(Some(ColumnType::Text))
+        }
+        (None, None) => Some(ColumnType::Text),
+    }
+}
+
 /// **Which pairs `||` has an operator for, and the type it answers** — `pg_operator`'s entries for
 /// the symbol, measured rather than accumulated.
 ///
@@ -5703,20 +5854,9 @@ fn same_comparison_family(left: ColumnType, right: ColumnType) -> bool {
 /// `42725`, decided in `resolve` before this is asked, because a real server has a candidate at
 /// every string width and category `Z` prefers none of them.
 fn concat_pair(left: ColumnType, right: ColumnType) -> Option<ColumnType> {
-    /// The types that reach `text || text` through an implicit cast, which is why
-    /// `citext || citext` answers `text` and not `citext`.
-    fn stringy(ty: ColumnType) -> bool {
-        matches!(
-            ty,
-            ColumnType::Text
-                | ColumnType::Varchar
-                | ColumnType::Bpchar
-                | ColumnType::Citext
-                | ColumnType::Name
-        )
-    }
     use esker_keys::array::ArrayValue;
     let element_of = ArrayValue::element_of;
+    let stringy = concat_stringy;
     match (element_of(left), element_of(right)) {
         // **`anyarray || anyarray` is `unify` on the elements**, which is what `unify` already
         // does — measured on seven pairs the probe list cannot ask, because its rows carry one
@@ -5800,10 +5940,18 @@ fn concat_scalars(
     if left == right && matches!(left, ColumnType::Int2Vector | ColumnType::OidVector) {
         return Some(ColumnType::Text);
     }
+    // **The widening, and it does not need the two spellings to match**: `bit(3) || bit(2)`,
+    // `varbit || varbit` and `varbit || bit(2)` are all `bit varying` on 19beta1
+    // (`tests/corpus/pg19_varbit.txt`). Written first as `left == right` only, which left
+    // `varbit || bit(2)` refused — a declared divergence that stayed declared because the pair
+    // was never asked with two spellings.
+    if matches!(left, ColumnType::Bit | ColumnType::VarBit)
+        && matches!(right, ColumnType::Bit | ColumnType::VarBit)
+    {
+        return Some(ColumnType::VarBit);
+    }
     if left == right {
         return match left {
-            // **The widening**: two `bit`s make a `bit varying`, measured.
-            ColumnType::Bit | ColumnType::VarBit => Some(ColumnType::VarBit),
             ColumnType::Bytea
             | ColumnType::TsVector
             | ColumnType::TsQuery
@@ -5833,17 +5981,17 @@ fn concat_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> Column
     // A pair [`concat_pair`] has no operator for cannot be reached: `resolve` refuses it with
     // `42883` before anything asks for a type. `text` is the total answer for that unreachable
     // case and for the `unknown` literals, which is what they resolve to.
-    let mut folded: Option<ColumnType> = None;
+    let mut folded: Option<Option<ColumnType>> = None;
     for arg in &call.args {
-        let Ok(ty) = expr_type(arg, scope) else {
+        let Ok(ty) = concat_operand_type(arg, scope) else {
             return ColumnType::Text;
         };
         folded = Some(match folded {
             None => ty,
-            Some(left) => concat_pair(left, ty).unwrap_or(ColumnType::Text),
+            Some(left) => concat_answer(left, ty),
         });
     }
-    folded.unwrap_or(ColumnType::Text)
+    folded.flatten().unwrap_or(ColumnType::Text)
 }
 
 /// Which fetch a `->` is, from the **declared type of its operand**.
@@ -6084,6 +6232,23 @@ fn catalog_func_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> 
     }
 }
 
+/// The type a `COALESCE`'s arguments or a `CASE`'s results settle on, asked of the one
+/// [`common_of`] the resolution asks.
+///
+/// `branch_type` rather than `expr_type` is the whole of the filter: an `unknown` and a bare NULL
+/// carry no type and take one from the branch that has one, so they are skipped here and coerced
+/// afterwards.
+fn branch_result_type<'a>(
+    results: impl Iterator<Item = &'a Expr>,
+    kind: Unifying,
+    scope: &Scope<'_>,
+) -> Result<ColumnType> {
+    let types: Vec<ColumnType> = results
+        .filter_map(|expr| branch_type(expr, scope))
+        .collect();
+    common_of(&types, kind)
+}
+
 pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
     Ok(match expr {
         // The type the cast named. Settled at lowering, where the permission was checked too.
@@ -6245,9 +6410,13 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // an `int8` the two rules agreed on every statement in every corpus here. The `int4` rung
         // is what made the difference observable, and the two cannot land apart: unifying alone
         // makes `COALESCE(NULL::integer, 0)` a `bigint`, and the rung alone makes the `ELSE` win.
-        Expr::Coalesce(args) => {
-            common_branch_type(args.iter().filter_map(|arg| branch_type(arg, scope)))
-        }
+        //
+        // **And it is `common_of`, the one `resolve_coalesce` uses**, not a fold of its own. There
+        // were three readers of this question — this one, `branch_common_type` above it, and the
+        // resolution — and they were three rules: `pg_typeof(COALESCE("char"[], text[]))` read one
+        // of them and said `"char"[]` where the resolution settled on `text[]`, which is 19beta1's
+        // answer.
+        Expr::Coalesce(args) => branch_result_type(args.iter(), Unifying::Coalesce, scope)?,
         // **A `CASE`'s type is its branches' and never its operand's**, so the simple
         // form answers exactly as the searched one does: `CASE a WHEN 1 THEN 'x' END`
         // is `text` however `a` is typed.
@@ -6255,13 +6424,14 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
             operand: _,
             branches,
             otherwise,
-        } => common_branch_type(
+        } => branch_result_type(
             otherwise
                 .iter()
                 .map(AsRef::as_ref)
-                .chain(branches.iter().map(|branch| &branch.then))
-                .filter_map(|result| branch_type(result, scope)),
-        ),
+                .chain(branches.iter().map(|branch| &branch.then)),
+            Unifying::Case,
+            scope,
+        )?,
         Expr::Parameter(number) => return Err(SqlError::UndefinedParameter(*number)),
         // **An aggregate is typed from its argument**, by the same table the aggregation itself
         // uses — because this is asked *before* the aggregation exists.

@@ -1,0 +1,57 @@
+# **What a bound parameter answers beside a typed column** — wire v3 family **F8**.
+#
+# PostgreSQL 19beta1, 2026-09-10, `127.0.0.1:55432`, one `BEGIN … ROLLBACK` with a
+# `SAVEPOINT`/`ROLLBACK TO` per probe. The census's shape: a temp table with one typed column, the
+# value inserted, then `SELECT c AS v FROM t WHERE c = $1` with the value **bound**, and the
+# answer's oid read off the `RowDescription` with `PG::Result#ftype`.
+#
+# ## The array half
+#
+#     bit[]        bit[]          1561      cidr[]       cidr[]         651
+#     inet[]       inet[]         1041      macaddr[]    macaddr[]      1040
+#     varbit[]     bit varying[]  1563      money[]      money[]        791
+#
+# Every one answers its own type and one row. This node refused five of them at **`Describe`**:
+#
+#     AT-DESCRIBE  !42846 cannot cast type money[] to bit[]
+#
+# `money[]` is not a typo in the message. `exec/bind.rs`'s `placeholder()` had six array types in
+# one arm answering `ArrayValue::empty(ColumnType::Money)`, so the stand-in's `column_type()` was
+# `money[]` for all six and the wrapper that carries a parameter's type emitted
+# `CAST(money[] AS bit[])`.
+#
+# **`varbit[]` is measured here for the first time**: it is in that arm and had no row in the probe
+# list, so a census could see the defect on five of six and call the sixth clean. Two rows added.
+#
+# ## The `reg*` half, and it is not about parameters
+#
+#     CREATE TEMP TABLE q (c regtype); INSERT INTO q VALUES ('int4');   -- both spellings insert
+#
+#     WHERE c = 'int4'::regtype        1 row
+#     WHERE c = 23                     1 row
+#     WHERE c = $1   ($1 = '23')       1 row
+#     WHERE c = 'int4'                 !22P02 invalid input syntax for type oid: "int4"
+#     WHERE c = $1   ($1 = 'int4')     !22P02 invalid input syntax for type oid: "int4"
+#
+# Same for `regproc` (`int4in`) and `regclass` (`pg_class`). **The INSERT accepts the name and the
+# comparison does not**, and the literal behaves exactly like the parameter — so this was never a
+# parameter defect, which is what the census's shape made it look like.
+#
+# **`pg_operator` has no `=` for `regtype`.** Asked directly:
+#
+#     SELECT oprname, oprleft::regtype, oprright::regtype, oprcode
+#     FROM pg_operator WHERE oprname = '=' AND (oprleft = 'regtype'::regtype::oid OR …)
+#     -> no rows
+#
+# The comparison is `oid`'s, so an `unknown` beside a `reg*` column is coerced to **`oid`** and
+# read by `oidin` — digits, not a name. That is the whole mechanism, and it is why the message
+# names `type oid` for a column of `regtype`.
+#
+# This node reads the unknown as a **name** and answers the row, which is the direction ADR 0031
+# ranks worse. Pinned at today's answer in `tests/param_stand_in.rs`, not closed here.
+#
+# ## And the array types' own rows, for the record
+#
+#     bit[]        {1}                        cidr[]     {127.0.0.0/24}
+#     inet[]       {127.0.0.1}                macaddr[]  {08:00:2b:01:02:03}
+#     varbit[]     {101}                      money[]    {$1.00}

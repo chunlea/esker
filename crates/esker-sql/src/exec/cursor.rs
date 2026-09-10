@@ -1552,6 +1552,123 @@ fn text_concat(left: Option<&Datum>, right: Option<&Datum>) -> Result<Datum> {
     Ok(Datum::Text(left + &right))
 }
 
+/// **Three same-type `||` operators PostgreSQL has and this crate did not**, each measured
+/// with its value (`tests/captures/pg19_concat_values.txt`):
+///
+/// ```text
+/// '101'::bit(3) || '01'::bit(2)   bit varying  10101   -- and the width WIDENS
+/// '\x0102'::bytea || '\x03'       bytea        \x010203
+/// 'a'::tsquery || 'b'::tsquery    tsquery      'a' | 'b'   -- an OR, not a join
+/// ```
+///
+/// Asked before the `ltree` and `hstore` blocks because a `Datum::Text` beside one of these is
+/// the `unknown` literal — `'1'::bit || '0'` is a `bit varying` on a real server — which is the
+/// same rule those two already follow, one type over. The pairs `resolve` settled on `text`
+/// never reach here: it wraps the operand in a cast, because an `unknown` has no mark on it
+/// once it is a value.
+fn same_type_concat(args: &[Datum]) -> Result<Option<Datum>> {
+    let wrong_type = |value: Option<&Datum>| {
+        SqlError::unsupported(format!(
+            "|| over {}",
+            value
+                .and_then(Datum::column_type)
+                .map_or("unknown", PgType::name)
+        ))
+    };
+
+    if args.iter().any(|value| matches!(value, Datum::Bit { .. })) {
+        let bits = |value: Option<&Datum>| match value {
+            Some(Datum::Bit { bits, .. }) => Ok(Some(bits.clone())),
+            Some(Datum::Text(text)) => crate::value::bit::from_text(text).map(Some),
+            Some(Datum::Null) | None => Ok(None),
+            other => Err(wrong_type(other)),
+        };
+        return Ok(Some(match (bits(args.first())?, bits(args.get(1))?) {
+            // **`varying`, whatever went in.** `bit(3) || bit(2)` is a `bit varying` of five
+            // and not a `bit(5)`: the width is the sum and the type has stopped promising one.
+            (Some(left), Some(right)) => Datum::Bit {
+                varying: true,
+                bits: left + &right,
+            },
+            _ => Datum::Null,
+        }));
+    }
+    if args.iter().any(|value| matches!(value, Datum::Bytea(_))) {
+        let bytes = |value: Option<&Datum>| match value {
+            Some(Datum::Bytea(bytes)) => Ok(Some(bytes.clone())),
+            Some(Datum::Text(text)) => match Datum::from_text(ColumnType::Bytea, text)? {
+                Datum::Bytea(bytes) => Ok(Some(bytes)),
+                _ => Ok(None),
+            },
+            Some(Datum::Null) | None => Ok(None),
+            other => Err(wrong_type(other)),
+        };
+        return Ok(Some(match (bytes(args.first())?, bytes(args.get(1))?) {
+            (Some(mut left), Some(right)) => {
+                left.extend_from_slice(&right);
+                Datum::Bytea(left)
+            }
+            _ => Datum::Null,
+        }));
+    }
+    if args.iter().any(|value| matches!(value, Datum::TsQuery(_))) {
+        let query = |value: Option<&Datum>| match value {
+            Some(Datum::TsQuery(text) | Datum::Text(text)) => {
+                crate::value::tsquery::from_text(text).map(Some)
+            }
+            Some(Datum::Null) | None => Ok(None),
+            other => Err(wrong_type(other)),
+        };
+        return Ok(Some(match (query(args.first())?, query(args.get(1))?) {
+            // **An OR of the two, not a concatenation of their text.** `'a & b' || 'c'` is
+            // `'a' & 'b' | 'c'` — the printed form re-parenthesises by precedence, which is
+            // why the answer is built as a tree and rendered rather than spliced.
+            (Some(left), Some(right)) => Datum::TsQuery(crate::value::tsquery::to_text(
+                &crate::value::tsquery::Node::Or(Box::new(left), Box::new(right)),
+            )),
+            _ => Datum::Null,
+        }));
+    }
+    Ok(None)
+}
+
+/// **An `ltree` on either side takes `@>`, `<@` and `||` away from `hstore`.** They are spelled the
+/// same for both and the operand is the only place that can decide — the rule the `||` regression
+/// taught, one type later. A bare `Datum::Text` beside an ltree is the `unknown` literal, which is
+/// what `'a.b'::ltree || 'c'` is.
+///
+/// Split out of [`hstore_function`] when the three same-type operators above joined it: one
+/// function per family the symbol means, rather than one function that is all of them.
+fn ltree_operator(
+    func: crate::plan::CatalogFunc,
+    args: &[Datum],
+    wrong_type: impl Fn(Option<&Datum>) -> SqlError,
+) -> Result<Option<Datum>> {
+    use crate::plan::CatalogFunc;
+    use crate::value::ltree;
+    if !args.iter().any(|value| matches!(value, Datum::Ltree(_))) {
+        return Ok(None);
+    }
+    let path = |value: Option<&Datum>| match value {
+        Some(Datum::Ltree(text)) => Ok(Some(text.clone())),
+        Some(Datum::Text(text)) => ltree::from_text(text).map(Some),
+        Some(Datum::Null) | None => Ok(None),
+        other => Err(wrong_type(other)),
+    };
+    Ok(Some(
+        match (func, path(args.first())?, path(args.get(1))?) {
+            (CatalogFunc::HstoreContains, Some(outer), Some(inner)) => {
+                Datum::Bool(ltree::contains(&outer, &inner))
+            }
+            (CatalogFunc::HstoreConcat, Some(left), Some(right)) => {
+                Datum::Ltree(ltree::concat(&left, &right))
+            }
+            (CatalogFunc::HstoreContains | CatalogFunc::HstoreConcat, _, _) => Datum::Null,
+            _ => return Err(wrong_type(args.first())),
+        },
+    ))
+}
+
 fn hstore_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Datum> {
     use crate::plan::CatalogFunc;
     use crate::value::hstore;
@@ -1570,27 +1687,13 @@ fn hstore_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Result<Dat
                 .map_or("unknown", PgType::name)
         ))
     };
-    // **An `ltree` on either side takes this operator away from `hstore`.** `@>`, `<@` and `||`
-    // are spelled the same for both, and the operand is the only place that can decide — the rule
-    // the `||` regression taught, one type later. A bare `Datum::Text` beside an ltree is the
-    // `unknown` literal, which is what `'a.b'::ltree || 'c'::text` is.
-    if args.iter().any(|value| matches!(value, Datum::Ltree(_))) {
-        let path = |value: Option<&Datum>| match value {
-            Some(Datum::Ltree(text)) => Ok(Some(text.clone())),
-            Some(Datum::Text(text)) => ltree::from_text(text).map(Some),
-            Some(Datum::Null) | None => Ok(None),
-            other => Err(wrong_type(other)),
-        };
-        return Ok(match (func, path(args.first())?, path(args.get(1))?) {
-            (CatalogFunc::HstoreContains, Some(outer), Some(inner)) => {
-                Datum::Bool(ltree::contains(&outer, &inner))
-            }
-            (CatalogFunc::HstoreConcat, Some(left), Some(right)) => {
-                Datum::Ltree(ltree::concat(&left, &right))
-            }
-            (CatalogFunc::HstoreContains | CatalogFunc::HstoreConcat, _, _) => Datum::Null,
-            _ => return Err(wrong_type(args.first())),
-        });
+    if func == CatalogFunc::HstoreConcat
+        && let Some(answer) = same_type_concat(args)?
+    {
+        return Ok(answer);
+    }
+    if let Some(answer) = ltree_operator(func, args, wrong_type)? {
+        return Ok(answer);
     }
     // **At least one operand has to be a real hstore.** A `Datum::Text` is accepted only as the
     // `unknown` literal beside one — `h @> 'a=>b'` is how the suite writes containment — and never
@@ -4186,11 +4289,21 @@ fn catalog_function(
         {
             array_concat(args.first(), args.get(1))
         }
+        // **The operand list here is the list of types with a `||` of their own**, and it grew by
+        // three: `bit`, `bytea` and `tsquery` each have one on a real server and reached
+        // `text_concat` instead, which refused them because neither side is text. Adding an arm to
+        // `hstore_function` was not enough — this guard runs first, so a pair it does not name
+        // never gets there.
         CatalogFunc::HstoreConcat
             if !args.iter().any(|value| {
                 matches!(
                     value,
-                    Datum::Hstore(_) | Datum::Ltree(_) | Datum::TsVector(_)
+                    Datum::Hstore(_)
+                        | Datum::Ltree(_)
+                        | Datum::TsVector(_)
+                        | Datum::Bit { .. }
+                        | Datum::Bytea(_)
+                        | Datum::TsQuery(_)
                 )
             }) =>
         {

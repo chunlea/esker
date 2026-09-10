@@ -1,0 +1,216 @@
+# **`select_common_type` — what a `UNION`, a `COALESCE` and a `CASE` settle a list of types on.**
+#
+# PostgreSQL 19beta1, 2026-09-10, `127.0.0.1:55432`, one `BEGIN … ROLLBACK` with a
+# `SAVEPOINT`/`ROLLBACK TO` per probe and `statement_timeout` set. Wire v3 family **F9**.
+#
+# ## The sweep
+#
+# The wire v3 probe list's 100 distinct type spellings, grouped by `pg_type.typcategory`, and
+# **every ordered pair inside a category** — 2,778 pairs — asked twice:
+#
+#     SELECT pg_typeof(COALESCE(a, b))                   FROM (SELECT $1::L AS a, $2::R AS b) t
+#     SELECT pg_typeof(CASE WHEN true THEN a ELSE b END) FROM (SELECT $1::L AS a, $2::R AS b) t
+#
+# 5,556 shape-rows. Cross-category pairs are not asked: they are `42804` on both servers by
+# construction, and the categories are what this capture records instead.
+#
+#     A 49   arrays, and int2vector and oidvector are in it — typelem smallint and oid
+#     N 11   bigint double precision integer money numeric oid real regclass regproc regtype smallint
+#     U 11   bytea hstore json jsonb lquery ltree macaddr tsquery tsvector uuid xml
+#     G  7   box circle line lseg path point polygon
+#     R  6   the six ranges          S  5   character varchar citext name text
+#     D  4   date time timestamp timestamptz
+#     I  2   cidr inet               B/P/T/V/Z 1 each   boolean void interval bit "char"
+#
+#     typispreferred: boolean, double precision, inet, interval, oid, text, timestamptz
+#
+# ## The algorithm, read off the answers
+#
+# 1. The candidate is the first type. A later type in a **different category** is
+#    `42804 <construct> types X and Y cannot be matched`. Otherwise the candidate is displaced only
+#    when it is **not** its category's preferred type, it casts **implicitly** to the other, and the
+#    other does **not** cast back.
+# 2. Then **every** input must reach the candidate by an implicit cast, or it is
+#    `42846 <construct> could not convert type X to Y` — a different code and a different sentence.
+#
+# **The word differs per construct and the codes do not**: `UNION`, `COALESCE`, and — only in the
+# second sentence — `CASE/WHEN`, where the first says plain `CASE`. PostgreSQL's own inconsistency.
+#
+# **An array's category is `A`, not its element's.** `"char"[]` beside `bigint[]` is
+# `42846 could not convert type bigint[] to "char"[]`, not `42804`: the categories match and it is
+# the *cast* that is missing.
+#
+# ## The string family, whole, because it is where the two passes are visible
+#
+#                        COALESCE(L, R)        CASE … THEN L ELSE R
+#     character   + text        character            text
+#     text        + character   text                 character
+#     varchar     + text        character varying    text
+#     text        + varchar     text                 character varying
+#     citext      + text        text                 text
+#     text        + citext      text                 text
+#     citext      + varchar     character varying    character varying
+#     citext      + character   !42846               !42846
+#     citext      + name        !42846               !42846
+#     name        + text        name                 text
+#
+# **`varchar` beside `text` keeps whichever came first** — both directions are implicit, so neither
+# displaces — while **`citext` is displaced by `text` in both orders**, because `citext -> text` is
+# implicit and `text -> citext` is only an assignment. One rule, and the pair that separates the
+# two halves of it. (A `CASE`'s list starts at its `ELSE`, which is why every row's two columns are
+# the same rule read from the two ends.)
+#
+# ## What this node answered
+#
+#     before   5,198 of the 5,556 shape-rows disagreed
+#     after      100
+#
+# The 5,098 that closed were one rule written four times: the set-operation path had both passes,
+# `resolve_coalesce` folded through the *arithmetic* promotion table, `resolve_case` folded through
+# `unify` behind a **comparison** predicate, and `expr_type` had two more folds for the type a
+# client is *told* — `pg_typeof(COALESCE("char"[], text[]))` read one of those and said `"char"[]`
+# where the resolution settled on `text[]`.
+#
+# ## The 100 that remain, and none of them is this rule
+#
+#     56  a pair involving int2vector or oidvector. PostgreSQL's vectors are arrays
+#         (typcategory A, typelem smallint/oid) and this node models them as scalars — family F6.
+#     40  a pair whose element cast this node's `pg_cast` table does not carry. Nine rows were
+#         added from this measurement (three `-> regtype`, six `citext`); the rest are reg* pairs
+#         whose ends this node has and whose rows a stock-server capture did not include.
+#      4  `regclass[]` beside a string array, where **19beta1 itself** answers
+#         `42P01 relation "pg_class" does not exist` for the probe's own value. A fixture artifact,
+#         not a divergence: the value is resolved per row and the sweep's subquery gives it no
+#         relation to find.
+#
+# ## Reproducing
+#
+# `esker-coord/` holds no scripts; the sweep is fifteen lines of `pg` over the type list in
+# `esker-coord/wire-v3-probes.txt`, grouping by `typcategory` and asking the two statements above.
+# The counts here are what to reproduce, not the script.
+#
+# ## The number category, whole — where the forty remaining rows live
+#
+#     <left> <TAB> <right> <TAB> co=<COALESCE> <TAB> ca=<CASE>
+#
+bigint	bigint	co=bigint	ca=bigint
+bigint	double precision	co=double precision	ca=double precision
+bigint	integer	co=bigint	ca=bigint
+bigint	money	co=!42846	ca=!42846
+bigint	numeric	co=numeric	ca=numeric
+bigint	oid	co=oid	ca=oid
+bigint	real	co=real	ca=real
+bigint	regclass	co=regclass	ca=regclass
+bigint	regproc	co=regproc	ca=regproc
+bigint	regtype	co=regtype	ca=regtype
+bigint	smallint	co=bigint	ca=bigint
+double precision	bigint	co=double precision	ca=double precision
+double precision	double precision	co=double precision	ca=double precision
+double precision	integer	co=double precision	ca=double precision
+double precision	money	co=!42846	ca=!42846
+double precision	numeric	co=double precision	ca=double precision
+double precision	oid	co=!42846	ca=!42846
+double precision	real	co=double precision	ca=double precision
+double precision	regclass	co=!42846	ca=!42846
+double precision	regproc	co=!42846	ca=!42846
+double precision	regtype	co=!42846	ca=!42846
+double precision	smallint	co=double precision	ca=double precision
+integer	bigint	co=bigint	ca=bigint
+integer	double precision	co=double precision	ca=double precision
+integer	integer	co=integer	ca=integer
+integer	money	co=!42846	ca=!42846
+integer	numeric	co=numeric	ca=numeric
+integer	oid	co=oid	ca=oid
+integer	real	co=real	ca=real
+integer	regclass	co=regclass	ca=regclass
+integer	regproc	co=regproc	ca=regproc
+integer	regtype	co=regtype	ca=regtype
+integer	smallint	co=integer	ca=integer
+money	bigint	co=!42846	ca=!42846
+money	double precision	co=!42846	ca=!42846
+money	integer	co=!42846	ca=!42846
+money	money	co=money	ca=money
+money	numeric	co=!42846	ca=!42846
+money	oid	co=!42846	ca=!42846
+money	real	co=!42846	ca=!42846
+money	regclass	co=!42846	ca=!42846
+money	regproc	co=!42846	ca=!42846
+money	regtype	co=!42846	ca=!42846
+money	smallint	co=!42846	ca=!42846
+numeric	bigint	co=numeric	ca=numeric
+numeric	double precision	co=double precision	ca=double precision
+numeric	integer	co=numeric	ca=numeric
+numeric	money	co=!42846	ca=!42846
+numeric	numeric	co=numeric	ca=numeric
+numeric	oid	co=!42846	ca=!42846
+numeric	real	co=real	ca=real
+numeric	regclass	co=!42846	ca=!42846
+numeric	regproc	co=!42846	ca=!42846
+numeric	regtype	co=!42846	ca=!42846
+numeric	smallint	co=numeric	ca=numeric
+oid	bigint	co=oid	ca=oid
+oid	double precision	co=!42846	ca=!42846
+oid	integer	co=oid	ca=oid
+oid	money	co=!42846	ca=!42846
+oid	numeric	co=!42846	ca=!42846
+oid	oid	co=oid	ca=oid
+oid	real	co=!42846	ca=!42846
+oid	regclass	co=oid	ca=regclass
+oid	regproc	co=oid	ca=regproc
+oid	regtype	co=oid	ca=regtype
+oid	smallint	co=oid	ca=oid
+real	bigint	co=real	ca=real
+real	double precision	co=double precision	ca=double precision
+real	integer	co=real	ca=real
+real	money	co=!42846	ca=!42846
+real	numeric	co=real	ca=real
+real	oid	co=!42846	ca=!42846
+real	real	co=real	ca=real
+real	regclass	co=!42846	ca=!42846
+real	regproc	co=!42846	ca=!42846
+real	regtype	co=!42846	ca=!42846
+real	smallint	co=real	ca=real
+regclass	bigint	co=regclass	ca=regclass
+regclass	double precision	co=!42846	ca=!42846
+regclass	integer	co=regclass	ca=regclass
+regclass	money	co=!42846	ca=!42846
+regclass	numeric	co=!42846	ca=!42846
+regclass	oid	co=regclass	ca=oid
+regclass	real	co=!42846	ca=!42846
+regclass	regclass	co=regclass	ca=regclass
+regclass	regproc	co=!42846	ca=!42846
+regclass	regtype	co=!42846	ca=!42846
+regclass	smallint	co=regclass	ca=regclass
+regproc	bigint	co=regproc	ca=regproc
+regproc	double precision	co=!42846	ca=!42846
+regproc	integer	co=regproc	ca=regproc
+regproc	money	co=!42846	ca=!42846
+regproc	numeric	co=!42846	ca=!42846
+regproc	oid	co=regproc	ca=oid
+regproc	real	co=!42846	ca=!42846
+regproc	regclass	co=!42846	ca=!42846
+regproc	regproc	co=regproc	ca=regproc
+regproc	regtype	co=!42846	ca=!42846
+regproc	smallint	co=regproc	ca=regproc
+regtype	bigint	co=regtype	ca=regtype
+regtype	double precision	co=!42846	ca=!42846
+regtype	integer	co=regtype	ca=regtype
+regtype	money	co=!42846	ca=!42846
+regtype	numeric	co=!42846	ca=!42846
+regtype	oid	co=regtype	ca=oid
+regtype	real	co=!42846	ca=!42846
+regtype	regclass	co=!42846	ca=!42846
+regtype	regproc	co=!42846	ca=!42846
+regtype	regtype	co=regtype	ca=regtype
+regtype	smallint	co=regtype	ca=regtype
+smallint	bigint	co=bigint	ca=bigint
+smallint	double precision	co=double precision	ca=double precision
+smallint	integer	co=integer	ca=integer
+smallint	money	co=!42846	ca=!42846
+smallint	numeric	co=numeric	ca=numeric
+smallint	oid	co=oid	ca=oid
+smallint	real	co=real	ca=real
+smallint	regclass	co=regclass	ca=regclass
+smallint	regproc	co=regproc	ca=regproc
+smallint	regtype	co=regtype	ca=regtype
+smallint	smallint	co=smallint	ca=smallint
