@@ -1,0 +1,19 @@
+crates/esker-sql/tests/bind_infers_over_the_wire.rs
+  s_6f7019c05b578b::t_cac62efcb11873 53-64,211-229,233,236,240-262,264-265,267-277,279-280,297-307
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e7a6610922dfa92aab65e2c3f78bcc6239d08134",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
