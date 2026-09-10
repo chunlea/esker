@@ -1,0 +1,37 @@
+crates/esker-sql/tests/cast_fold.rs
+  s_e5c0c6e78b5662::t_889f53464bcf29 1-59
+crates/esker-sql/src/exec/cursor.rs
+  s_e5c0c6e78b5662::t_bc5412a83333cf 2450-2460
+crates/esker-sql/src/parse/lower.rs
+  s_e5c0c6e78b5662::t_4840981fdabb5e 6309-6311,6313-6315,6320-6326,6329-6353,6399-6403,6406-6409,6470-6495
+crates/esker-sql/src/value/mod.rs
+  s_e5c0c6e78b5662::t_d22c6579005a40 840-932
+crates/esker-sql/tests/captures/pg19_cast_matrix.txt
+  s_e5c0c6e78b5662::t_fb5ce6f713c774 248
+crates/esker-sql/tests/cast_matrix.rs
+  s_e5c0c6e78b5662::t_89ce49ecd23e28 30-44
+crates/esker-sql/tests/char_type.rs
+  s_e5c0c6e78b5662::t_67b9698aaa4930 32-40
+crates/esker-sql/tests/corpus/pg19_cast_fold.txt
+  s_e5c0c6e78b5662::t_16617c46cf345b 1-68
+crates/esker-sql/tests/corpus/pg19_cast_matrix.txt
+  s_e5c0c6e78b5662::t_b0f38c4546e1f4 248
+docs/plans/debts-v1.1.md
+  s_e5c0c6e78b5662::t_99c948b0775766 117-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e59a80dff7e180ff701fedd9d405852f3c8733cf",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
