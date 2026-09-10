@@ -157,3 +157,90 @@ fn describe_infers_a_parameter_from_the_column_for_every_type() {
         assert!(!answer.contains("ERROR"), "{column}: {answer}");
     }
 }
+
+/// **The shape libpq actually sends**: `Parse` naming *no* types, `Bind`, then a `Describe` of the
+/// **portal**, then `Execute`.
+///
+/// r1's frame tap caught two things this file had wrong. The `Describe` is of the portal and not
+/// the statement — `PQsendQueryGuts` has no other shape, which `pgwire::session`'s own comment
+/// already said — and the defect is reachable from *both* `Parse` forms: one type OID of zero, and
+/// zero type OIDs at all. A pin that only covers `param_types=[0]` can go green while the empty
+/// form still refuses, so both are here.
+fn ask_portal_described(
+    client: &mut Client,
+    sql: &str,
+    param_types: Vec<u32>,
+    value: &str,
+) -> String {
+    let parsed = client.send(&Frontend::Parse {
+        statement: "s1".to_owned(),
+        sql: sql.to_owned(),
+        param_types,
+    });
+    if parsed.starts_with("ERROR") {
+        return format!("AT-PARSE {parsed}");
+    }
+    let bound = client.send(&Frontend::Bind {
+        portal: String::new(),
+        statement: "s1".to_owned(),
+        param_formats: Vec::new(),
+        params: vec![Some(value.as_bytes().to_vec())],
+        result_formats: Vec::new(),
+    });
+    if bound.starts_with("ERROR") {
+        return format!("AT-BIND {bound}");
+    }
+    let described = client.send(&Frontend::Describe {
+        target: Target::Portal,
+        name: String::new(),
+    });
+    if described.starts_with("ERROR") {
+        return format!("AT-DESCRIBE-PORTAL {described}");
+    }
+    client.send(&Frontend::Execute {
+        portal: String::new(),
+        max_rows: 0,
+    })
+}
+
+/// **Zero declared types, portal described** — the prepared path r1 captured.
+#[test]
+fn no_declared_types_with_the_portal_described() {
+    let mut client = Client::new();
+    let answer = ask_portal_described(
+        &mut client,
+        "SELECT id FROM h WHERE data = $1",
+        Vec::new(),
+        "a=>1",
+    );
+    assert!(!answer.contains("ERROR"), "{answer}");
+}
+
+/// **One zero OID, portal described** — the other form, which must not be the only one covered.
+#[test]
+fn a_zero_declared_type_with_the_portal_described() {
+    let mut client = Client::new();
+    let answer = ask_portal_described(
+        &mut client,
+        "SELECT id FROM h WHERE data = $1",
+        vec![0],
+        "a=>1",
+    );
+    assert!(!answer.contains("ERROR"), "{answer}");
+}
+
+/// **And `text` really declared still refuses**, through the portal shape too.
+#[test]
+fn a_declared_text_refuses_through_the_portal_shape() {
+    let mut client = Client::new();
+    let answer = ask_portal_described(
+        &mut client,
+        "SELECT id FROM h WHERE data = $1",
+        vec![25],
+        "a=>1",
+    );
+    assert!(
+        answer.ends_with("ERROR operator does not exist: hstore = text"),
+        "{answer}"
+    );
+}

@@ -899,6 +899,50 @@ pub fn has_equality_at_all(ty: ColumnType) -> bool {
     )
 }
 
+/// Whether PostgreSQL defines `op` between two values of `ty`, for the types that have no
+/// complete set of them.
+///
+/// **Every operator has its own set and no two of them agree**, which is why this is keyed by both
+/// rather than a list per operator — measured on 19beta1, one statement per cell, in
+/// `crates/esker-sql/tests/captures/pg19_no_equality_types.txt`:
+///
+/// ```text
+///        json    jsonb   xml     point   polygon
+///  =     no      yes     no      no      no
+///  <>    no      yes     no      YES     no
+///  ~=    no      no      no      yes     yes
+///  @> <@ no      yes     no      no      yes
+///  &&    no      no      no      no      yes
+/// ```
+///
+/// Two rows of that table are worth reading twice. `point` has `<>` and no `=` — `point_ne` exists
+/// and `point_eq` does not — so a rule deriving one from the other is wrong on exactly that cell.
+/// And `~=` runs the *other* way from every neighbour: the geometric shapes have it and the
+/// document types do not, so a single "these four types are the broken ones" list would refuse
+/// `point ~= point`, which a real server answers.
+///
+/// Anything not named here has the operator: this answers only for the types whose surface is
+/// incomplete, and `true` is the right default for every ordinary one.
+#[must_use]
+#[expect(
+    clippy::match_same_arms,
+    reason = "one arm per operator, and the point is that no two of their type sets agree — \
+              merging the three `false` arms would read as one rule where the measurement says \
+              there are three"
+)]
+pub fn operator_exists(op: &str, ty: ColumnType) -> bool {
+    use ColumnType as T;
+    match (op, ty) {
+        ("~=", T::Json | T::Jsonb | T::Xml) => false,
+        ("@>" | "<@", T::Json | T::Xml | T::Point) => false,
+        ("&&", T::Json | T::Jsonb | T::Xml | T::Point) => false,
+        // The inequality that exists without its equality, and the one cell a derived rule misses.
+        ("<>", T::Point) => true,
+        ("=" | "<>" | "<" | ">" | "<=" | ">=", _) => has_equality_at_all(ty),
+        _ => true,
+    }
+}
+
 /// A type as `format_type` writes it, with its typmod: what an error message and `\gdesc` say.
 #[must_use]
 pub fn format_type(ty: ColumnType, typmod: i32) -> String {
