@@ -3851,7 +3851,11 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::RegType | ColumnType::RegProc | ColumnType::RegClass => family(ColumnType::Oid),
             // **Text's family, because text is what they are here.** They compare as the
             // strings they print as, which is what `attnum = ANY(indkey)` already relies on.
-            ColumnType::Int2Vector | ColumnType::OidVector => family(ColumnType::Text),
+            // **They share `text`'s representation and compare with nothing but themselves.**
+            // Being in `text`'s family answered nine pairs a real server refuses — the borrowed
+            // representation reaching a second decision, as it does everywhere in this crate.
+            ColumnType::Int2Vector => 96,
+            ColumnType::OidVector => 97,
             ColumnType::RegTypeArray => 200,
             ColumnType::RegProcArray => 201,
             ColumnType::RegClassArray => 202,
@@ -3878,7 +3882,15 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // An `oid` is a number and compares with the integers: `26::oid = 26` is `t`.
             | ColumnType::Oid
             | ColumnType::Numeric => 0,
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Name | ColumnType::Char | ColumnType::Bpchar => 1,
+            // **`citext` is in here**, measured: `'a'::citext = 'a'::text` answers, and so does it
+            // against `name`, `varchar`, `bpchar` and `"char"`. It had a family of its own and
+            // refused all ten pairs.
+            ColumnType::Text
+            | ColumnType::Varchar
+            | ColumnType::Name
+            | ColumnType::Char
+            | ColumnType::Bpchar
+            | ColumnType::Citext => 1,
             ColumnType::Bool => 2,
             ColumnType::Bytea => 3,
             // A `date` is in the datetime family, not one of its own: `'2020-01-01'::date =
@@ -3895,7 +3907,6 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::TsVector => 83,
             ColumnType::TsQuery => 84,
             // Its own family: a citext compares only with a citext and with an `unknown`.
-            ColumnType::Citext => 28,
             // A family each: a range compares only with a range of the same subtype.
             ColumnType::TsRange => 29,
             ColumnType::TstzRange => 30,
@@ -3992,13 +4003,14 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // `time = timestamp` and `time = date` are both `42883 operator does not exist` on
             // 19beta1 — measured, because putting it in family 4 by analogy would answer where a
             // real server raises, which is ADR 0031's worst class.
-            ColumnType::Time => 6,
+            // **A `time` and an `interval` are one family**, through the implicit cast a real
+            // server has between them: `'1 min'::interval = '00:01:00'::time` answers. Measured.
+            ColumnType::Time | ColumnType::Interval => 6,
             // Its own family too: `uuid = text` and `uuid = integer` are both `42883` on a real
             // server, and its only comparisons are with another uuid.
             ColumnType::Uuid => 7,
             // Its own family: `interval = integer` is `42883` on a real server, and an interval
             // compares with another interval and with nothing else here.
-            ColumnType::Interval => 8,
             // Unreachable: returned above, and kept as an arm rather than a `_` so that the next
             // type added here is a compile error rather than a silent family 9.
             ColumnType::Json => 9,
@@ -4046,6 +4058,25 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
         ColumnType::Json | ColumnType::JsonArray | ColumnType::Xml
     ) {
         return false;
+    }
+    // **An `oid` compares with the integers and with the other oid-ish types, and with nothing
+    // else** — `26::oid = 26` answers and `1::numeric = 1::oid` is `42883`, both measured. A flat
+    // family tag cannot say that: the integers, the floats and `numeric` are one family because
+    // they all compare with each other, and `oid` overlaps only part of it. So this pair is asked
+    // before the tags, the way `json`'s is above.
+    let oid_ish = |ty| {
+        matches!(
+            ty,
+            ColumnType::Oid | ColumnType::RegType | ColumnType::RegProc | ColumnType::RegClass
+        )
+    };
+    let integer = |ty| matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8);
+    if oid_ish(left) != oid_ish(right) {
+        return if oid_ish(left) {
+            integer(right)
+        } else {
+            integer(left)
+        };
     }
     family(left) == family(right)
 }

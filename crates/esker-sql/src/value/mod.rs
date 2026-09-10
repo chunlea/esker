@@ -1078,7 +1078,13 @@ pub fn has_equality_operator(ty: ColumnType) -> bool {
 fn has_equality_at_all(ty: ColumnType) -> bool {
     !matches!(
         ty,
-        ColumnType::Json | ColumnType::Xml | ColumnType::Point | ColumnType::Polygon
+        ColumnType::Json
+            | ColumnType::Xml
+            | ColumnType::Point
+            | ColumnType::Polygon
+            // `lquery` is a pattern, not a value: a real server has no `lquery = lquery`, which
+            // the comparison matrix found this node answering.
+            | ColumnType::LQuery
     )
 }
 
