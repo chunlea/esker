@@ -67,13 +67,15 @@ fn every_printed_expression_is_postgresql_19_s() {
 }
 
 /// What this node answers differently on the shape corpus, and why.
+///
+/// **Nothing, since 2026-09-10.** It carried one row — `GENERATED ALWAYS AS (upper('a')) STORED`,
+/// which this node built and a real server refuses with `42P22` — and ADR 0096's third family
+/// closed it (`debts-v1.1.md` #19). The entry came off under parity rule 2 the day it landed,
+/// which is the rule doing its job across a corpus that is not the collation one: this file is
+/// about **parentheses**, and the statement it declared was about collation.
 const SHAPE_DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[(
-        "ALTER TABLE g1dp2 ADD COLUMN f_literal text GENERATED ALWAYS AS (upper('a')) STORED",
-        "**No collation derivation, so a text call over nothing but literals is accepted          where a real server refuses it.** PostgreSQL answers `42P22 could not determine which          collation to use for upper() function`: a generated column's expression must have a          determinable collation, a literal argument carries none, and the column's own is not          consulted. Measured, and it is the reason this corpus tests a literal argument as a          *default* (`g1dp3`) rather than as a generated column. This node has no collation          inference at all — `COLLATE` is recorded per column and never derived through an          expression — so it builds the column and stores `upper('a'::text)`, which is what the          same expression prints as a default here and there. C3, in the direction that accepts          more than the oracle; the value it computes is the value a real server would compute if          it built it.",
-        "pg19_deparse_parens.txt:141",
-    )],
+    answers: &[],
 };
 
 /// **The deparser's specification**, one row per shape, taken from the oracle.

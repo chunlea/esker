@@ -5432,17 +5432,47 @@ fn index_key_column(table: &TableDef, expr: &str) -> Option<usize> {
 /// translated; every other one [`refuse_unless_immutable`] raises already names its own cause
 /// (`0A000 the function md5`, `42P02 there is no parameter $1`).
 fn generated_column_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)> {
-    deparsed_expression(table, expr).map_err(|error| match error {
+    deparsed_expression_into(table, expr, Stored::GeneratedColumn).map_err(|error| match error {
         SqlError::NotImmutableInIndex => SqlError::NotImmutableInGeneratedColumn,
         other => other,
     })
 }
 
+/// Which stored context an expression is being written into.
+///
+/// **It decides exactly one thing**, and that one thing is measured: whether a collation-using
+/// operation with nothing to derive an ordering from is `42P22`. A generated column asks; an index
+/// key, an index predicate, a `CHECK` and a `DEFAULT` all accept `upper('a')` on 19beta1
+/// ([ADR 0096](../../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md),
+/// `tests/captures/pg19_collation_operations.txt`). Everything else about the two paths — the
+/// immutability rule, the deparse, the read-back guard — is the same, which is why this is a flag
+/// on one function rather than two functions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stored {
+    /// An index key, an index predicate, a `CHECK` or a `DEFAULT`.
+    Elsewhere,
+    /// `GENERATED ALWAYS AS (…) STORED`.
+    GeneratedColumn,
+}
+
 fn deparsed_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)> {
+    deparsed_expression_into(table, expr, Stored::Elsewhere)
+}
+
+fn deparsed_expression_into(
+    table: &TableDef,
+    expr: &str,
+    into: Stored,
+) -> Result<(String, ColumnType)> {
     let parsed = crate::parse::parse_stored_expr(expr)?;
     let scope = crate::exec::query::Scope::single(table);
     let resolved = crate::exec::query::resolve(&parsed, &scope)?;
     refuse_unless_immutable(&resolved, &scope)?;
+    if into == Stored::GeneratedColumn {
+        plan::collation::refuse_underivable(&resolved, &|node| {
+            crate::exec::query::expr_type(node, &scope).ok()
+        })?;
+    }
     let ty = crate::exec::query::expr_type(&resolved, &scope)?;
     let printed = deparse(&resolved, table, ty);
     if reads_back(table, &printed, ty) {

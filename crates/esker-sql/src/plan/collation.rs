@@ -42,6 +42,16 @@ pub(crate) struct Derived<'a> {
     pub(crate) collation: Option<&'a str>,
     /// How firmly.
     pub(crate) strength: Derivation,
+    /// **Whether a column reference is under here at all**, which is a different question from
+    /// [`Self::strength`] and the one a generated column asks.
+    ///
+    /// Measured, and it is the pair that separates them: `upper(t COLLATE "C")` is accepted and
+    /// `upper('a' COLLATE "C")` is `42P22`. Both are `Derivation::Explicit` — a clause **names** a
+    /// collation — and only the first has a column under it. So an explicit clause names an
+    /// ordering and does **not** make one derivable; only a column does, and any column will,
+    /// even an `integer` one through a cast (`upper(n::text)` is accepted where `upper(1::text)`
+    /// is not).
+    pub(crate) from_column: bool,
 }
 
 impl Derived<'_> {
@@ -49,12 +59,14 @@ impl Derived<'_> {
     const NONE: Self = Derived {
         collation: None,
         strength: Derivation::None,
+        from_column: false,
     };
 
     /// A column said it, and the caller did not say which.
     const IMPLICIT: Self = Derived {
         collation: None,
         strength: Derivation::Implicit,
+        from_column: true,
     };
 }
 
@@ -72,6 +84,111 @@ pub(crate) fn refuse_explicit_mismatch(expr: &Expr) -> Result<()> {
     derive(expr).map(|_| ())
 }
 
+/// **A collation-using operation whose collation cannot be derived**, refused — `42P22`.
+///
+/// ADR 0096's second rule, and the context is the whole of it: only a **generated column** asks.
+/// A `DEFAULT`, an index expression, an index predicate and a `CHECK` all accept `upper('a')` on
+/// 19beta1, measured, and the corpus header that said otherwise is corrected beside its own rows.
+///
+/// The walk is outermost-first and stops at the first refusal, which is what a real server does:
+/// one error names one operation.
+pub(crate) fn refuse_underivable(
+    expr: &Expr,
+    type_of: &dyn Fn(&Expr) -> Option<crate::value::ColumnType>,
+) -> Result<()> {
+    // **`from_column`, not `strength`.** An explicit clause names a collation and does not make
+    // one derivable: `upper('a' COLLATE "C")` is `42P22` on 19beta1 and `upper(t COLLATE "C")`
+    // builds, measured one placement at a time. A check on the strength would have accepted the
+    // first, which is the direction this whole row exists to close.
+    if let Some(operation) = collation_using(expr, type_of)
+        && !derive(expr)?.from_column
+    {
+        return Err(SqlError::IndeterminateCollation(operation));
+    }
+    for child in children(expr) {
+        refuse_underivable(child, type_of)?;
+    }
+    Ok(())
+}
+
+/// **What PostgreSQL calls this operation**, when it is one that uses a collation.
+///
+/// Six names, measured over 43 shapes at once
+/// (`tests/captures/pg19_collation_operations.txt`) rather than read off the three the
+/// placement-by-placement corpus happened to reach. `initcap` is a name of its own and this node
+/// does not have the function; `LIKE` and `ILIKE` are two names for one node; a regular-expression
+/// match is `regular expression` and not `LIKE`.
+///
+/// **The type decides, not the operator.** `(1 = 2)` is accepted and `('a' = 'b')` is not, so a
+/// comparison asks only over a *collatable* type — the same predicate a `COLLATE` clause on a
+/// column is checked against.
+///
+/// **And `string comparison` is much wider than `<`.** A function that *compares* needs a
+/// collation and one that only *cuts* does not: `replace`, `split_part`, `strpos`,
+/// `string_to_array`, `greatest`, `least`, `nullif` and `array_position` do; `substr`,
+/// `substring`, `btrim`, `ltrim`, `rtrim`, `reverse`, `ascii`, `length`, `md5` and `||` do not.
+/// `COALESCE` picks rather than compares and does not; a `CASE` asks through the comparison in its
+/// `WHEN`, which this walk reaches as a node of its own.
+fn collation_using(
+    expr: &Expr,
+    type_of: &dyn Fn(&Expr) -> Option<crate::value::ColumnType>,
+) -> Option<&'static str> {
+    use crate::plan::{BinaryOp, CatalogFunc, ScalarFunc};
+
+    let collatable =
+        |operand: &Expr| type_of(operand).is_some_and(crate::catalog::pg_attribute::collatable);
+    match expr {
+        Expr::Scalar {
+            func: ScalarFunc::Lower,
+            ..
+        } => Some("lower() function"),
+        Expr::Scalar {
+            func: ScalarFunc::Upper,
+            ..
+        } => Some("upper() function"),
+        Expr::Like {
+            case_insensitive, ..
+        } => Some(if *case_insensitive { "ILIKE" } else { "LIKE" }),
+        Expr::RegexMatch { .. } => Some("regular expression"),
+        Expr::Binary { op, left, .. }
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            ) && collatable(left) =>
+        {
+            Some(STRING_COMPARISON)
+        }
+        // `IN` is an equality per element, and answers the same name — measured.
+        Expr::InList { operand, .. } if collatable(operand) => Some(STRING_COMPARISON),
+        // **The functions that compare.** Each was measured; none is derivable from its name,
+        // which is why they are a list and `substr` beside `replace` is the pair that says so.
+        Expr::CatalogFunc(call)
+            if matches!(
+                call.func,
+                CatalogFunc::Replace
+                    | CatalogFunc::SplitPart
+                    | CatalogFunc::StrPos
+                    | CatalogFunc::StringToArray
+                    | CatalogFunc::Greatest
+                    | CatalogFunc::Least
+                    | CatalogFunc::NullIf
+                    | CatalogFunc::ArrayPosition
+            ) && call.args.first().is_some_and(collatable) =>
+        {
+            Some(STRING_COMPARISON)
+        }
+        _ => None,
+    }
+}
+
+/// The one name fourteen measured shapes answer to.
+const STRING_COMPARISON: &str = "string comparison";
+
 /// The collation an expression carries, and how firmly — raising `42P21` on the way.
 ///
 /// **An outer `COLLATE` overrides what is inside it**, measured:
@@ -79,10 +196,14 @@ pub(crate) fn refuse_explicit_mismatch(expr: &Expr) -> Result<()> {
 /// clause and still walks the operand, because a mismatch *inside* the operand is still a mismatch.
 fn derive(expr: &Expr) -> Result<Derived<'_>> {
     if let Expr::Collate { operand, collation } = expr {
-        derive(operand)?;
+        // **The clause wins the *name* and the operand keeps the *column*.** They are two
+        // answers, not one: `upper(t COLLATE "C")` builds and `upper('a' COLLATE "C")` is
+        // `42P22`, both being `Explicit`.
+        let inner = derive(operand)?;
         return Ok(Derived {
             collation: Some(collation),
             strength: Derivation::Explicit,
+            from_column: inner.from_column,
         });
     }
     let mut merged = leaf_derivation(expr);
@@ -120,11 +241,14 @@ fn merge<'a>(left: Derived<'a>, right: Derived<'a>) -> Result<Derived<'a>> {
             _ => {}
         }
     }
-    Ok(if right.strength > left.strength {
+    let mut merged = if right.strength > left.strength {
         right
     } else {
         left
-    })
+    };
+    // **A column under either operand is a column under the node**, whichever side won the name.
+    merged.from_column = left.from_column || right.from_column;
+    Ok(merged)
 }
 
 /// Every **immediate** child of one expression, in the order the statement writes them.
