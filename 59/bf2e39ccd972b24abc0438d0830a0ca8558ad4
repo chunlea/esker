@@ -1,0 +1,73 @@
+crates/esker-keys/src/array.rs
+  s_2bed4ac2b1c944::t_4c0abf82e4581a 141-210
+crates/esker-keys/src/row.rs
+  s_2bed4ac2b1c944::t_3d0515c3dfdbdf 767-774,1323-1336
+crates/esker-sql/src/error.rs
+  s_2bed4ac2b1c944::t_c58016ef1fcc3a 1464-1493,3171-3174
+crates/esker-sql/src/exec/aggregate.rs
+  s_2bed4ac2b1c944::t_5cb5ce2704dc30 178,611,619,1587-1593,1614-1650
+crates/esker-sql/src/exec/cursor.rs
+  s_2bed4ac2b1c944::t_06475b94ff4e64 37-42,77-89,100,2097,2099-2129,2366-2380,2732,2908-2931,3750-3766
+crates/esker-sql/src/exec/ddl.rs
+  s_2bed4ac2b1c944::t_f7a286f67b7e13 6272
+crates/esker-sql/src/exec/dml.rs
+  s_2bed4ac2b1c944::t_7fefb5fff052df 663,772,774-795,858-868,2116-2123
+crates/esker-sql/src/exec/mod.rs
+  s_2bed4ac2b1c944::t_6bcaae90fc1d90 1470-1474,1480,1484-1498,1804-1811,2293-2294,2298
+crates/esker-sql/src/exec/query.rs
+  s_2bed4ac2b1c944::t_d022f09bfb8176 3002-3003,3275,3309-3335,3359,4086,4099,4534-4553,5559
+crates/esker-sql/src/exec/subquery.rs
+  s_2bed4ac2b1c944::t_17f6b923a7e90e 1011-1022
+crates/esker-sql/src/parse/lower.rs
+  s_2bed4ac2b1c944::t_73bf1fa5ef5bda 4420,4710-4711,5947,8786
+crates/esker-sql/src/plan/expr.rs
+  s_2bed4ac2b1c944::t_8d78c439eae949 133-141
+crates/esker-sql/src/plan/query.rs
+  s_2bed4ac2b1c944::t_7cb000ebd491db 1379
+crates/esker-sql/src/plan/subquery.rs
+  s_2bed4ac2b1c944::t_b120745dce0ead 244
+crates/esker-sql/src/sqlstate.rs
+  s_2bed4ac2b1c944::t_0a86d0844fcd93 60-74
+crates/esker-sql/tests/array_of_array.rs
+  s_2bed4ac2b1c944::t_2b1e955aa8c120 1-175
+crates/esker-sql/tests/array_subquery.rs
+  s_2bed4ac2b1c944::t_0feb1bc2a7d468 41,44-50
+crates/esker-sql/tests/captures/pg19_array_of_array.txt
+  s_2bed4ac2b1c944::t_cc8fb9909b914d 1-86
+crates/esker-sql/tests/captures/pg19_regclass_index.txt
+  s_2bed4ac2b1c944::t_8ceab91ff25a25 1-30
+crates/esker-sql/tests/captures/pg19_regclass_literal.txt
+  s_2bed4ac2b1c944::t_754fb5391e99ce 1-35
+crates/esker-sql/tests/captures/pg19_regclass_name_at_runtime.txt
+  s_2bed4ac2b1c944::t_694d9ce5724b33 1-35
+crates/esker-sql/tests/corpus/pg19_array_of_array.txt
+  s_2bed4ac2b1c944::t_60cfff6c6179e4 1-51
+crates/esker-sql/tests/corpus/pg19_regclass_literal.txt
+  s_2bed4ac2b1c944::t_7a108289b3c05f 1-31
+crates/esker-sql/tests/regclass_index.rs
+  s_2bed4ac2b1c944::t_b265b53ca15d04 1-87
+crates/esker-sql/tests/regclass_literal.rs
+  s_2bed4ac2b1c944::t_d3255d32c26529 1-90
+crates/esker-sql/tests/regclass_name_at_runtime.rs
+  s_2bed4ac2b1c944::t_ad11f1f9b4652b 1-114
+crates/esker-sql/tests/stored_regclass.rs
+  s_2bed4ac2b1c944::t_40e0c5c5af317e 140,142-145,147-158
+docs/plans/debts-v1.1.md
+  s_2bed4ac2b1c944::t_8cf923efb7c86b 24,123-125,153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "59bf2e39ccd972b24abc0438d0830a0ca8558ad4",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
