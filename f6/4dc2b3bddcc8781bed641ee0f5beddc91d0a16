@@ -1,0 +1,29 @@
+crates/esker-sql/tests/deparse_census.rs
+  s_2bed4ac2b1c944::t_cd4a7e048af823 56,61,66
+docs/DESIGN.md
+  s_2bed4ac2b1c944::t_00fb6a25a42e6f 380-385,425-432,1187-1196
+docs/acceptance/v1.1.md
+  s_2bed4ac2b1c944::t_653acb6d9816e6 6,13-15,17-18,49,143,364-472,501
+docs/adr/0103-a-domain-is-a-type-a-client-can-be-sent.md
+  s_2bed4ac2b1c944::t_b01803d09fd916 1-192
+docs/plans/debts-v1.1.md
+  s_2bed4ac2b1c944::t_6e927b2aeabb4e 24,113,118,127
+docs/plans/split-region.md
+  s_2bed4ac2b1c944::t_9cfae61bd17a1b 292-302
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "f64dc2b3bddcc8781bed641ee0f5beddc91d0a16",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
