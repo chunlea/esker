@@ -53,6 +53,70 @@ fn priced(session: &mut cluster::Session, sql: &str) -> String {
     )
 }
 
+/// One statement's reads and scans, grouped by the catalog kind each addressed.
+fn where_the_reads_went(session: &mut cluster::Session, sql: &str) -> String {
+    esker_client::stmt_stats::reset();
+    session.run(sql).unwrap();
+    let cost = esker_client::stmt_stats::taken();
+    let show =
+        |what: &str,
+         heads: &std::collections::BTreeMap<[u8; esker_client::stmt_stats::HEAD], u64>| {
+            let named = esker_sql::stmt_stats::name_heads(heads);
+            let total: u64 = named.iter().map(|(_, n)| n).sum();
+            let each: Vec<String> = named
+                .iter()
+                .map(|(name, n)| format!("{name} x{n}"))
+                .collect();
+            format!("{what} {total} = {}", each.join(", "))
+        };
+    format!(
+        "{}\n      {}\n      {}",
+        sql.chars().take(60).collect::<String>(),
+        show("reads", &cost.read_heads),
+        show("scans", &cost.scan_heads),
+    )
+}
+
+/// **Which catalog kinds a DDL statement reads and scans** — the instrument
+/// `esker-coord/h1-ddl-cost.md` § 2 asked for, to say whether `DROP`'s nine fixed scans are nine
+/// kinds, a few kinds scanned repeatedly, or not catalog scans at all.
+#[test]
+#[ignore = "a measurement, not an assertion — see the module doc for how to run it"]
+fn which_kinds_a_ddl_statement_reads() {
+    assert!(
+        esker_sql::stmt_stats::enabled(),
+        "set ESKER_STMT_STATS=1, or every number here is zero"
+    );
+    let cluster = Cluster::start();
+    let mut s = cluster.session();
+    s.run("CREATE TABLE parent (id bigint primary key)")
+        .unwrap();
+    s.run(
+        "CREATE TABLE wide (id bigserial primary key, a bigint, b text, c bigint, \
+         p bigint references parent (id))",
+    )
+    .unwrap();
+    s.run("CREATE INDEX wide_a ON wide (a)").unwrap();
+    s.run("CREATE INDEX wide_c ON wide (c)").unwrap();
+
+    println!(
+        "\n  -- CREATE TABLE --\n  {}",
+        where_the_reads_went(
+            &mut s,
+            "CREATE TABLE fresh (id bigint primary key, n bigint)"
+        )
+    );
+    println!(
+        "\n  -- ALTER TABLE … DISABLE TRIGGER ALL --\n  {}",
+        where_the_reads_went(&mut s, "ALTER TABLE wide DISABLE TRIGGER ALL")
+    );
+    println!(
+        "\n  -- DROP TABLE (2 indexes, 1 sequence, 1 fk, 5 columns) --\n  {}",
+        where_the_reads_went(&mut s, "DROP TABLE wide")
+    );
+    println!();
+}
+
 /// Prints the round-trip decomposition of each DDL shape run 117 found expensive.
 #[test]
 #[ignore = "a measurement, not an assertion — see the module doc for how to run it"]

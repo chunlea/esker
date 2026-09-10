@@ -237,6 +237,52 @@ pub fn summary() -> String {
     )
 }
 
+/// **Names the key heads `esker-client` recorded**, which it deliberately cannot do itself.
+///
+/// The client keeps a fixed window of bytes per read and knows nothing about what they mean
+/// (`CLAUDE.md` invariant 7). Here is where they become a catalog kind: the reserved layout puts
+/// `'m'` in front of every metadata key, `esker-sql`'s own records follow it with `"sql"` and one
+/// byte naming the kind (`catalog/record.rs`'s header), and everything else is named by its
+/// namespace alone.
+///
+/// A `Vec` of `(name, count)` rather than a map of bytes, because the only caller is a measurement
+/// that prints it and a byte array in a report is a puzzle rather than an answer.
+#[must_use]
+pub fn name_heads(
+    heads: &std::collections::BTreeMap<[u8; esker_client::stmt_stats::HEAD], u64>,
+) -> Vec<(String, u64)> {
+    // **Merged by name, because the head is wider than a kind.** The client keeps eight opaque
+    // bytes; a kind is five, and the rest is the start of a tenant — so one kind read for two
+    // tenants arrives as two entries. Merging here rather than narrowing the window keeps the
+    // client's record free of any assumption about where a kind ends.
+    let mut merged: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for (head, count) in heads {
+        *merged.entry(name_of_head(head)).or_default() += count;
+    }
+    merged.into_iter().collect()
+}
+
+/// One head, named. Split out so the mapping is testable without building a map.
+fn name_of_head(head: &[u8]) -> String {
+    match head.first().copied() {
+        Some(esker_keys::prefix::META) => {
+            // `'m' ++ "sql" ++ kind` for this crate's records; another component's metadata keys
+            // are named by their namespace and left alone.
+            if head.len() > 4 && &head[1..4] == b"sql" {
+                let kind = head[4];
+                format!("catalog '{}'", char::from(kind))
+            } else {
+                "metadata (not the catalog's)".to_owned()
+            }
+        }
+        Some(esker_keys::prefix::SQL) => "row or index data".to_owned(),
+        Some(esker_keys::prefix::TXN) => "txn record".to_owned(),
+        Some(esker_keys::prefix::RAW) => "raw".to_owned(),
+        Some(other) => format!("namespace {other:#04x}"),
+        None => "empty key".to_owned(),
+    }
+}
+
 /// The write side of [`counts`], for a test that prices one statement at a time:
 /// `(tso, prewrites, commits, keys, waited micros)`.
 #[must_use]
