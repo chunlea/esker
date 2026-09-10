@@ -1,0 +1,47 @@
+crates/esker-cli/src/cluster.rs
+  s_2bed4ac2b1c944::t_3cd870a9752e8e 277
+crates/esker-cli/src/raw.rs
+  s_2bed4ac2b1c944::t_3b09588d82c55d 227
+crates/esker-cli/tests/dep_budget.rs
+  s_2bed4ac2b1c944::t_93153dfb4506ed 309-312
+crates/esker-client/tests/bank.rs
+  s_2bed4ac2b1c944::t_76924b35e409f5 234
+crates/esker-client/tests/load.rs
+  s_2bed4ac2b1c944::t_de4f022efeb190 209
+crates/esker-engine/src/db/table_cache.rs
+  s_2bed4ac2b1c944::t_09c3bb50409f2f 203-206
+crates/esker-engine/src/memtable/skiplist.rs
+  s_2bed4ac2b1c944::t_359e4fe7d53563 573
+crates/esker-engine/src/sst/reader.rs
+  s_2bed4ac2b1c944::t_138c656189177c 155-156
+crates/esker-pd/tests/balance.rs
+  s_2bed4ac2b1c944::t_0da8d7a62d6532 321
+crates/esker-pd/tests/records.rs
+  s_2bed4ac2b1c944::t_29d54053ede109 172
+crates/esker-proto/tests/frame.rs
+  s_2bed4ac2b1c944::t_b9b09aee971b1f 29
+crates/esker-sim/src/raft/cluster/membership.rs
+  s_2bed4ac2b1c944::t_18b24d03354eeb 110
+crates/esker-sql/src/value/money.rs
+  s_2bed4ac2b1c944::t_a4dacf015c7443 52
+crates/esker-store/src/split.rs
+  s_2bed4ac2b1c944::t_c9b10fffd3279c 134
+crates/esker-store/tests/cluster.rs
+  s_2bed4ac2b1c944::t_657e6a1e283649 125-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "77d6c2a5861d4df21fa18e2ce3b2241781c11d20",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
