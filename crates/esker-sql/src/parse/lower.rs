@@ -1908,6 +1908,14 @@ pub(super) fn column_default(
     // A literal, with the sign or the cast a user wrote around it: what PostgreSQL's coercion
     // folds, and nothing more. `1 + 1` is *not* folded by a real server either — it prints back as
     // `(1 + 1)`, measured — so the fold here stops exactly where the server's does.
+    // **Which shapes this intercepts, and which fall through to [`lower_cast`]** — worth naming,
+    // because the boundary is not where it looks and reading it wrong sends you to the wrong
+    // function. Three are caught here: a bare literal, a signed one (which returns early and
+    // leaves the *text* to the deparser), and a literal under **one** cast. Everything else goes
+    // to lowering — including `(-1)::text`, whose inner is a `UnaryOp` rather than a `Value`, and
+    // `((1)::bigint)::text`, whose inner is another cast. That is why three of the deparse
+    // census's four `DEFAULT` rows were `lower_cast`'s to fix (`debts-v1.1.md` #42) and the
+    // fourth, `(42)::text`, already agreed: it is the one shape of the four that lands here.
     let (literal, cast) = match expr {
         Expr::Value(value) => (Some(&value.value), None),
         Expr::UnaryOp {
@@ -4179,9 +4187,23 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             op: UnaryOperator::Not,
             expr,
         } => Ok(plan::Expr::Not(Box::new(lower_expr(expr)?))),
-        // A comparison over `json` or `jsonb` is refused; [`refuse_json_comparison`] says why.
+        // A comparison over `json` or `jsonb` is refused — and **the two are refused differently**,
+        // for the reason the `||` arm above parts them: `json` has no comparison operator on a
+        // real server, so the honest answer is the one a real server gives, while `jsonb` has a
+        // complete btree and *answers*, so refusing it is this node's own gap and says so.
+        //
+        // One sentence would have to be wrong about one of them. `0A000 the operator = over json
+        // or jsonb` was wrong about `json`, which is a `42883 operator does not exist: json =
+        // json` on 19beta1 — eighteen rows of the no-equality census.
         Expr::BinaryOp { left, op, right } if is_comparison(op) && either_is_json(left, right) => {
-            Err(refuse_json_comparison(op))
+            match (json_cast_name(left), json_cast_name(right)) {
+                (Some("json"), _) | (_, Some("json")) => Err(SqlError::UndefinedOperator {
+                    left: json_cast_name(left).unwrap_or("json").to_owned(),
+                    op: comparison_symbol(op),
+                    right: json_cast_name(right).unwrap_or("json").to_owned(),
+                }),
+                _ => Err(refuse_json_comparison(op)),
+            }
         }
         // `date + time` and `time + date`, the one arithmetic in this type that answers a type
         // this node has. Folded here, over **constants only**, which is the same boundary
@@ -6420,6 +6442,69 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                         typmod,
                     });
                 }
+                // **A fold that discards a node PostgreSQL prints is lossy too**, which is the
+                // whole of `debts-v1.1.md` #42. The arm above keeps the node when the conversion
+                // loses *digits*; this keeps it when the literal's **own type** is not the
+                // target's — which is exactly when a real server keeps it. Measured on 19beta1
+                // through `pg_get_expr` over a `DEFAULT`:
+                //
+                // ```text
+                // (1)::bigint      (1)::bigint                (1)::numeric   (1)::numeric
+                // (1.5)::float8    (1.5)::double precision    (1)::smallint  (1)::smallint
+                // (-1)::bigint     ('-1'::integer)::bigint    (-1)::text     ('-1'::integer)::text
+                // (-1.5)::numeric  '-1.5'::numeric            <- the one that folds: same type
+                // ```
+                //
+                // The last row is the rule stated from the other side, and it is why this is a
+                // type comparison rather than a list: a real server folds a cast away exactly
+                // when the constant already *is* the target type, and keeps it otherwise.
+                //
+                // **The operand is the literal as written, not the folded value**, for the reason
+                // the digits arm gives one clause up: folding it and then wrapping the result
+                // would keep a node over a constant nobody wrote. An unknown literal has no type
+                // of its own, so `'x'::jsonb` and `'2020-01-01'::date` are untouched by this and
+                // still fold — which is what a real server does with them too.
+                //
+                // [`source_type`] already reads through a *nested* cast, and that is what makes
+                // `((1)::bigint)::text` two nodes rather than one `Datum::Text`: the outer cast
+                // sees `bigint` where it used to see the text the inner one had folded to.
+                //
+                // **The array half of this is not here and is not closed.** A *typed array
+                // literal* — `'{1,2}'::int[]`, and an `ARRAY[…]` of constants — is folded to its
+                // own text one layer down, in [`lower_array_constructor`], so the element type is
+                // lost before this arm ever sees it: `SELECT ARRAY['{1,2}'::int[]]` answers
+                // `text` where a real server answers `integer[]`, and `'{pg_class}'::regclass[]`
+                // is `0A000`. Same shape as the rule above, different site, and it is b4's —
+                // pinned by the `#[ignore]`d expectations in `tests/array_of_array.rs`, which is
+                // the file to read before touching the fold below.
+                // **Only where the target is `text`**, and the boundary is measured rather than
+                // cautious. `ToText` is the target type's *output* function, which every type has,
+                // so deferring the conversion to evaluation costs nothing. A cast to anything else
+                // has to be performed by the evaluator's own `Cast` arm, and that arm knows fewer
+                // conversions than this fold does — keeping the node for those turned three green
+                // tests red at once, each naming a different half of the same gap:
+                //
+                // ```text
+                // 567.89::numeric::money   42846 cannot cast type numeric to money
+                // 1::money UNION 2::numeric   the refusal changed sentence
+                // 1::oid = 1::int8         42883 operator does not exist: oid = bigint
+                // ```
+                //
+                // The last one is not an evaluator gap at all: a comparison retypes a *literal*
+                // against the other side, and a `Cast` node is not a literal, so `1::int8` stopped
+                // being something `reconcile` could meet an `oid` with. **The fold is load-bearing
+                // for more than printing**, and the non-`text` half of #42 waits on that being
+                // true in the evaluator and the resolver first. The census carries the measurement.
+                if let Some(from) = source_type(expr)?
+                    && from != ty
+                    && ty == ColumnType::Text
+                {
+                    return Ok(plan::Expr::ToText {
+                        operand: Box::new(lower_expr(expr)?),
+                        strip_blanks: false,
+                        enum_labels: None,
+                    });
+                }
                 if value.column_type() == Some(ty) && typmod == NO_TYPMOD {
                     return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(value))));
                 }
@@ -6697,6 +6782,22 @@ fn arithmetic_op(op: &BinaryOperator) -> Option<plan::ArithOp> {
 }
 
 /// Whether an operator compares, as against combines.
+/// A comparison operator's symbol, as `'static` text an error message can hold.
+///
+/// `BinaryOperator`'s `Display` says the same thing and gives a `String`; [`SqlError`]'s operator
+/// field is `&'static str`, so the six that [`is_comparison`] admits are written out. Anything
+/// else cannot reach here and answers `=`, which is the operator every implied comparison is.
+fn comparison_symbol(op: &BinaryOperator) -> &'static str {
+    match op {
+        BinaryOperator::NotEq => "<>",
+        BinaryOperator::Lt => "<",
+        BinaryOperator::LtEq => "<=",
+        BinaryOperator::Gt => ">",
+        BinaryOperator::GtEq => ">=",
+        _ => "=",
+    }
+}
+
 fn is_comparison(op: &BinaryOperator) -> bool {
     matches!(
         op,

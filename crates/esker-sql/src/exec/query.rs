@@ -2988,6 +2988,27 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             {
                 return Err(SqlError::NoEqualityOperator(element.name()));
             }
+            // **And a scalar whose `=` does not exist at all**, which is a different list from
+            // the one above and from `same_family`: `same_family(polygon, polygon)` is true —
+            // they are the same type — and there is still no `polygon = polygon` on a real
+            // server. Four types, and `polygon` is the one that reads like an oversight because
+            // every other geometric shape has the operator.
+            if op.is_comparison()
+                && let Ok(ty) = expr_type(&left, scope)
+                && !crate::value::has_equality_at_all(ty)
+            {
+                return Err(SqlError::UndefinedOperator {
+                    left: ty.name().to_owned(),
+                    // **`IS DISTINCT FROM` names `=`**, because `=` is the operator it is missing:
+                    // a real server says `operator does not exist: json = json` for it and not the
+                    // spelling the user wrote. `IS NOT DISTINCT FROM` the same. Measured.
+                    op: match op {
+                        BinaryOp::Distinct | BinaryOp::NotDistinct => BinaryOp::Eq.symbol(),
+                        other => other.symbol(),
+                    },
+                    right: expr_type(&right, scope).unwrap_or(ty).name().to_owned(),
+                });
+            }
             Expr::Binary {
                 op: *op,
                 left: Box::new(left),
@@ -3351,6 +3372,19 @@ fn resolve_in_list(
         let (left, right) = reconcile(BinaryOp::Eq, operand, item)?;
         operand = left;
         resolved.push(right);
+    }
+    // **`IN` is `=`, so a type with no `=` cannot be on either side of one.** The written
+    // comparison asks this in `resolve`; a list is the same question with the operator implied,
+    // and asking it in only one of the two places is how `polygon IN (polygon)` answered while
+    // `polygon = polygon` refused, in the same build.
+    if let Ok(ty) = expr_type(&operand, scope)
+        && !crate::value::has_equality_at_all(ty)
+    {
+        return Err(SqlError::UndefinedOperator {
+            left: ty.name().to_owned(),
+            op: BinaryOp::Eq.symbol(),
+            right: ty.name().to_owned(),
+        });
     }
     Ok(Expr::InList {
         operand: Box::new(operand),

@@ -1,0 +1,158 @@
+# **The comparison family over four types that have no equality** — measured on PostgreSQL
+# 19beta1, 2026-09-09. Capture: `tests/captures/pg19_no_equality_types.txt`.
+#
+# `json`, `xml`, `point` and `polygon` have neither equality nor ordering, and this node answered
+# `=` over all four — the direction ADR 0031 ranks as the worse one. Twenty shapes by five types;
+# `jsonb` is the contrast, because it has nearly everything the other four lack, and the point of
+# carrying it is that a fix must not refuse *its* family too.
+#
+SELECT ('{"a":1}'::json = '{"a":1}'::json) AS v	!42883 operator does not exist: json = json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('{"a":1}'::json <> '{"a":1}'::json) AS v	!42883 operator does not exist: json <> json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('{"a":1}'::json < '{"a":1}'::json) AS v	!42883 operator does not exist: json < json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('{"a":1}'::json > '{"a":1}'::json) AS v	!42883 operator does not exist: json > json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('{"a":1}'::json <= '{"a":1}'::json) AS v	!42883 operator does not exist: json <= json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('{"a":1}'::json >= '{"a":1}'::json) AS v	!42883 operator does not exist: json >= json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('{"a":1}'::json ~= '{"a":1}'::json) AS v	!42883 operator does not exist: json ~= json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('{"a":1}'::json @> '{"a":1}'::json) AS v	!42883 operator does not exist: json @> json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('{"a":1}'::json <@ '{"a":1}'::json) AS v	!42883 operator does not exist: json <@ json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('{"a":1}'::json && '{"a":1}'::json) AS v	!42883 operator does not exist: json && json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 1 AS v WHERE '{"a":1}'::json IN ('{"a":1}'::json)	!42883 operator does not exist: json = json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('{"a":1}'::json IS DISTINCT FROM '{"a":1}'::json) AS v	!42883 operator does not exist: json = json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT c FROM (VALUES ('{"a":1}'::json)) s(c) ORDER BY c	!42883 could not identify an ordering operator for type json HINT: Use an explicit ordering operator or modify the query.
+SELECT c FROM (VALUES ('{"a":1}'::json)) s(c) GROUP BY c	!42883 could not identify an equality operator for type json
+SELECT DISTINCT c FROM (VALUES ('{"a":1}'::json)) s(c)	!42883 could not identify an equality operator for type json
+SELECT c FROM (VALUES ('{"a":1}'::json)) s(c) UNION SELECT c FROM (VALUES ('{"a":1}'::json)) s(c)	!42883 could not identify an equality operator for type json
+CREATE TEMP TABLE pk_json (c json PRIMARY KEY)	!42704 data type json has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+CREATE TEMP TABLE uq_json (c json UNIQUE)	!42704 data type json has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+CREATE TEMP TABLE ix_json (c json)		-
+CREATE INDEX ix_json_c ON ix_json (c)	!42704 data type json has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+SELECT ('<a/>'::xml = '<a/>'::xml) AS v	!42883 operator does not exist: xml = xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('<a/>'::xml <> '<a/>'::xml) AS v	!42883 operator does not exist: xml <> xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('<a/>'::xml < '<a/>'::xml) AS v	!42883 operator does not exist: xml < xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('<a/>'::xml > '<a/>'::xml) AS v	!42883 operator does not exist: xml > xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('<a/>'::xml <= '<a/>'::xml) AS v	!42883 operator does not exist: xml <= xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('<a/>'::xml >= '<a/>'::xml) AS v	!42883 operator does not exist: xml >= xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('<a/>'::xml ~= '<a/>'::xml) AS v	!42883 operator does not exist: xml ~= xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('<a/>'::xml @> '<a/>'::xml) AS v	!42883 operator does not exist: xml @> xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('<a/>'::xml <@ '<a/>'::xml) AS v	!42883 operator does not exist: xml <@ xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('<a/>'::xml && '<a/>'::xml) AS v	!42883 operator does not exist: xml && xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 1 AS v WHERE '<a/>'::xml IN ('<a/>'::xml)	!42883 operator does not exist: xml = xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('<a/>'::xml IS DISTINCT FROM '<a/>'::xml) AS v	!42883 operator does not exist: xml = xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT c FROM (VALUES ('<a/>'::xml)) s(c) ORDER BY c	!42883 could not identify an ordering operator for type xml HINT: Use an explicit ordering operator or modify the query.
+SELECT c FROM (VALUES ('<a/>'::xml)) s(c) GROUP BY c	!42883 could not identify an equality operator for type xml
+SELECT DISTINCT c FROM (VALUES ('<a/>'::xml)) s(c)	!42883 could not identify an equality operator for type xml
+SELECT c FROM (VALUES ('<a/>'::xml)) s(c) UNION SELECT c FROM (VALUES ('<a/>'::xml)) s(c)	!42883 could not identify an equality operator for type xml
+CREATE TEMP TABLE pk_xml (c xml PRIMARY KEY)	!42704 data type xml has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+CREATE TEMP TABLE uq_xml (c xml UNIQUE)	!42704 data type xml has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+CREATE TEMP TABLE ix_xml (c xml)		-
+CREATE INDEX ix_xml_c ON ix_xml (c)	!42704 data type xml has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+SELECT ('(0,0)'::point = '(0,0)'::point) AS v	!42883 operator does not exist: point = point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('(0,0)'::point <> '(0,0)'::point) AS v	boolean	f
+SELECT ('(0,0)'::point < '(0,0)'::point) AS v	!42883 operator does not exist: point < point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('(0,0)'::point > '(0,0)'::point) AS v	!42883 operator does not exist: point > point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('(0,0)'::point <= '(0,0)'::point) AS v	!42883 operator does not exist: point <= point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('(0,0)'::point >= '(0,0)'::point) AS v	!42883 operator does not exist: point >= point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('(0,0)'::point ~= '(0,0)'::point) AS v	boolean	t
+SELECT ('(0,0)'::point @> '(0,0)'::point) AS v	!42883 operator does not exist: point @> point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('(0,0)'::point <@ '(0,0)'::point) AS v	!42883 operator does not exist: point <@ point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('(0,0)'::point && '(0,0)'::point) AS v	!42883 operator does not exist: point && point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 1 AS v WHERE '(0,0)'::point IN ('(0,0)'::point)	!42883 operator does not exist: point = point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('(0,0)'::point IS DISTINCT FROM '(0,0)'::point) AS v	!42883 operator does not exist: point = point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT c FROM (VALUES ('(0,0)'::point)) s(c) ORDER BY c	!42883 could not identify an ordering operator for type point HINT: Use an explicit ordering operator or modify the query.
+SELECT c FROM (VALUES ('(0,0)'::point)) s(c) GROUP BY c	!42883 could not identify an equality operator for type point
+SELECT DISTINCT c FROM (VALUES ('(0,0)'::point)) s(c)	!42883 could not identify an equality operator for type point
+SELECT c FROM (VALUES ('(0,0)'::point)) s(c) UNION SELECT c FROM (VALUES ('(0,0)'::point)) s(c)	!42883 could not identify an equality operator for type point
+CREATE TEMP TABLE pk_point (c point PRIMARY KEY)	!42704 data type point has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+CREATE TEMP TABLE uq_point (c point UNIQUE)	!42704 data type point has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+CREATE TEMP TABLE ix_point (c point)		-
+CREATE INDEX ix_point_c ON ix_point (c)	!42704 data type point has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+SELECT ('((0,0),(1,1),(2,0))'::polygon = '((0,0),(1,1),(2,0))'::polygon) AS v	!42883 operator does not exist: polygon = polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('((0,0),(1,1),(2,0))'::polygon <> '((0,0),(1,1),(2,0))'::polygon) AS v	!42883 operator does not exist: polygon <> polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('((0,0),(1,1),(2,0))'::polygon < '((0,0),(1,1),(2,0))'::polygon) AS v	!42883 operator does not exist: polygon < polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('((0,0),(1,1),(2,0))'::polygon > '((0,0),(1,1),(2,0))'::polygon) AS v	!42883 operator does not exist: polygon > polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('((0,0),(1,1),(2,0))'::polygon <= '((0,0),(1,1),(2,0))'::polygon) AS v	!42883 operator does not exist: polygon <= polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('((0,0),(1,1),(2,0))'::polygon >= '((0,0),(1,1),(2,0))'::polygon) AS v	!42883 operator does not exist: polygon >= polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('((0,0),(1,1),(2,0))'::polygon ~= '((0,0),(1,1),(2,0))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(1,1),(2,0))'::polygon @> '((0,0),(1,1),(2,0))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(1,1),(2,0))'::polygon <@ '((0,0),(1,1),(2,0))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(1,1),(2,0))'::polygon && '((0,0),(1,1),(2,0))'::polygon) AS v	boolean	t
+SELECT 1 AS v WHERE '((0,0),(1,1),(2,0))'::polygon IN ('((0,0),(1,1),(2,0))'::polygon)	!42883 operator does not exist: polygon = polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('((0,0),(1,1),(2,0))'::polygon IS DISTINCT FROM '((0,0),(1,1),(2,0))'::polygon) AS v	!42883 operator does not exist: polygon = polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT c FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c) ORDER BY c	!42883 could not identify an ordering operator for type polygon HINT: Use an explicit ordering operator or modify the query.
+SELECT c FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c) GROUP BY c	!42883 could not identify an equality operator for type polygon
+SELECT DISTINCT c FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c)	!42883 could not identify an equality operator for type polygon
+SELECT c FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c) UNION SELECT c FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c)	!42883 could not identify an equality operator for type polygon
+CREATE TEMP TABLE pk_polygon (c polygon PRIMARY KEY)	!42704 data type polygon has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+CREATE TEMP TABLE uq_polygon (c polygon UNIQUE)	!42704 data type polygon has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+CREATE TEMP TABLE ix_polygon (c polygon)		-
+CREATE INDEX ix_polygon_c ON ix_polygon (c)	!42704 data type polygon has no default operator class for access method "btree" HINT: You must specify an operator class for the index or define a default operator class for the data type.
+SELECT ('{"a":1}'::jsonb = '{"a":1}'::jsonb) AS v	boolean	t
+SELECT ('{"a":1}'::jsonb <> '{"a":1}'::jsonb) AS v	boolean	f
+SELECT ('{"a":1}'::jsonb < '{"a":1}'::jsonb) AS v	boolean	f
+SELECT ('{"a":1}'::jsonb > '{"a":1}'::jsonb) AS v	boolean	f
+SELECT ('{"a":1}'::jsonb <= '{"a":1}'::jsonb) AS v	boolean	t
+SELECT ('{"a":1}'::jsonb >= '{"a":1}'::jsonb) AS v	boolean	t
+SELECT ('{"a":1}'::jsonb ~= '{"a":1}'::jsonb) AS v	!42883 operator does not exist: jsonb ~= jsonb DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT ('{"a":1}'::jsonb @> '{"a":1}'::jsonb) AS v	boolean	t
+SELECT ('{"a":1}'::jsonb <@ '{"a":1}'::jsonb) AS v	boolean	t
+SELECT ('{"a":1}'::jsonb && '{"a":1}'::jsonb) AS v	!42883 operator does not exist: jsonb && jsonb DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 1 AS v WHERE '{"a":1}'::jsonb IN ('{"a":1}'::jsonb)	integer	1
+SELECT ('{"a":1}'::jsonb IS DISTINCT FROM '{"a":1}'::jsonb) AS v	boolean	f
+SELECT c FROM (VALUES ('{"a":1}'::jsonb)) s(c) ORDER BY c	jsonb	{"a": 1}
+SELECT c FROM (VALUES ('{"a":1}'::jsonb)) s(c) GROUP BY c	jsonb	{"a": 1}
+SELECT DISTINCT c FROM (VALUES ('{"a":1}'::jsonb)) s(c)	jsonb	{"a": 1}
+SELECT c FROM (VALUES ('{"a":1}'::jsonb)) s(c) UNION SELECT c FROM (VALUES ('{"a":1}'::jsonb)) s(c)	jsonb	{"a": 1}
+CREATE TEMP TABLE pk_jsonb (c jsonb PRIMARY KEY)		-
+CREATE TEMP TABLE uq_jsonb (c jsonb UNIQUE)		-
+CREATE TEMP TABLE ix_jsonb (c jsonb)		-
+CREATE INDEX ix_jsonb_c ON ix_jsonb (c)		-
+SELECT (c = c) AS v FROM (VALUES ('{"a":1}'::json)) s(c)	!42883 operator does not exist: json = json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c <> c) AS v FROM (VALUES ('{"a":1}'::json)) s(c)	!42883 operator does not exist: json <> json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c < c) AS v FROM (VALUES ('{"a":1}'::json)) s(c)	!42883 operator does not exist: json < json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c > c) AS v FROM (VALUES ('{"a":1}'::json)) s(c)	!42883 operator does not exist: json > json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c ~= c) AS v FROM (VALUES ('{"a":1}'::json)) s(c)	!42883 operator does not exist: json ~= json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c @> c) AS v FROM (VALUES ('{"a":1}'::json)) s(c)	!42883 operator does not exist: json @> json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c <@ c) AS v FROM (VALUES ('{"a":1}'::json)) s(c)	!42883 operator does not exist: json <@ json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c && c) AS v FROM (VALUES ('{"a":1}'::json)) s(c)	!42883 operator does not exist: json && json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 1 AS v FROM (VALUES ('{"a":1}'::json)) s(c) WHERE c IN (c)	!42883 operator does not exist: json = json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c IS DISTINCT FROM c) AS v FROM (VALUES ('{"a":1}'::json)) s(c)	!42883 operator does not exist: json = json DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c = c) AS v FROM (VALUES ('<a/>'::xml)) s(c)	!42883 operator does not exist: xml = xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c <> c) AS v FROM (VALUES ('<a/>'::xml)) s(c)	!42883 operator does not exist: xml <> xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c < c) AS v FROM (VALUES ('<a/>'::xml)) s(c)	!42883 operator does not exist: xml < xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c > c) AS v FROM (VALUES ('<a/>'::xml)) s(c)	!42883 operator does not exist: xml > xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c ~= c) AS v FROM (VALUES ('<a/>'::xml)) s(c)	!42883 operator does not exist: xml ~= xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c @> c) AS v FROM (VALUES ('<a/>'::xml)) s(c)	!42883 operator does not exist: xml @> xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c <@ c) AS v FROM (VALUES ('<a/>'::xml)) s(c)	!42883 operator does not exist: xml <@ xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c && c) AS v FROM (VALUES ('<a/>'::xml)) s(c)	!42883 operator does not exist: xml && xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 1 AS v FROM (VALUES ('<a/>'::xml)) s(c) WHERE c IN (c)	!42883 operator does not exist: xml = xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c IS DISTINCT FROM c) AS v FROM (VALUES ('<a/>'::xml)) s(c)	!42883 operator does not exist: xml = xml DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c = c) AS v FROM (VALUES ('(0,0)'::point)) s(c)	!42883 operator does not exist: point = point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c <> c) AS v FROM (VALUES ('(0,0)'::point)) s(c)	boolean	f
+SELECT (c < c) AS v FROM (VALUES ('(0,0)'::point)) s(c)	!42883 operator does not exist: point < point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c > c) AS v FROM (VALUES ('(0,0)'::point)) s(c)	!42883 operator does not exist: point > point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c ~= c) AS v FROM (VALUES ('(0,0)'::point)) s(c)	boolean	t
+SELECT (c @> c) AS v FROM (VALUES ('(0,0)'::point)) s(c)	!42883 operator does not exist: point @> point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c <@ c) AS v FROM (VALUES ('(0,0)'::point)) s(c)	!42883 operator does not exist: point <@ point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c && c) AS v FROM (VALUES ('(0,0)'::point)) s(c)	!42883 operator does not exist: point && point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 1 AS v FROM (VALUES ('(0,0)'::point)) s(c) WHERE c IN (c)	!42883 operator does not exist: point = point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c IS DISTINCT FROM c) AS v FROM (VALUES ('(0,0)'::point)) s(c)	!42883 operator does not exist: point = point DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c = c) AS v FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c)	!42883 operator does not exist: polygon = polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c <> c) AS v FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c)	!42883 operator does not exist: polygon <> polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c < c) AS v FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c)	!42883 operator does not exist: polygon < polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c > c) AS v FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c)	!42883 operator does not exist: polygon > polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c ~= c) AS v FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c)	boolean	t
+SELECT (c @> c) AS v FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c)	boolean	t
+SELECT (c <@ c) AS v FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c)	boolean	t
+SELECT (c && c) AS v FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c)	boolean	t
+SELECT 1 AS v FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c) WHERE c IN (c)	!42883 operator does not exist: polygon = polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c IS DISTINCT FROM c) AS v FROM (VALUES ('((0,0),(1,1),(2,0))'::polygon)) s(c)	!42883 operator does not exist: polygon = polygon DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c = c) AS v FROM (VALUES ('{"a":1}'::jsonb)) s(c)	boolean	t
+SELECT (c <> c) AS v FROM (VALUES ('{"a":1}'::jsonb)) s(c)	boolean	f
+SELECT (c < c) AS v FROM (VALUES ('{"a":1}'::jsonb)) s(c)	boolean	f
+SELECT (c > c) AS v FROM (VALUES ('{"a":1}'::jsonb)) s(c)	boolean	f
+SELECT (c ~= c) AS v FROM (VALUES ('{"a":1}'::jsonb)) s(c)	!42883 operator does not exist: jsonb ~= jsonb DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT (c @> c) AS v FROM (VALUES ('{"a":1}'::jsonb)) s(c)	boolean	t
+SELECT (c <@ c) AS v FROM (VALUES ('{"a":1}'::jsonb)) s(c)	boolean	t
+SELECT (c && c) AS v FROM (VALUES ('{"a":1}'::jsonb)) s(c)	!42883 operator does not exist: jsonb && jsonb DETAIL: No operator of that name accepts the given argument types. HINT: You might need to add explicit type casts.
+SELECT 1 AS v FROM (VALUES ('{"a":1}'::jsonb)) s(c) WHERE c IN (c)	integer	1
+SELECT (c IS DISTINCT FROM c) AS v FROM (VALUES ('{"a":1}'::jsonb)) s(c)	boolean	f

@@ -114,6 +114,15 @@ Which is the Decision above.
   makes the rows follow it; what a future unit would have to build is a record per derived
   constraint so an oid can be *allocated* rather than computed, and then re-take every golden that
   pins one. Ruled 2026-09-09: keep `u64` relation ids.
+* **A real relation's `regclass` cannot be cast to `oid`, and so `min`/`max` over one cannot
+  answer.** This is the decision's own boundary rather than a defect: relation ids are `u64` and an
+  `oid` is four bytes, so `'pg_class'::regclass::oid` on a live relation is
+  `value 9223372036854774786 is out of range for type oid`. The aggregates reach it because their
+  argument decays through the implicit cast to `oid` (the `Min|Max: RegProc|RegType|RegClass => Oid`
+  arm). Ruled 2026-09-09 not to fix: narrowing the id would be the allocation change the first
+  consequence above describes, and answering a truncated oid would be a wrong value under a right
+  type. Measured by r1's wire census, run 111 — `results/run-111/wire-baseline-54-before.txt` and
+  the baseline that replaced it. Recorded as `debts-v1.1.md` #45.
 * **31 declared divergences deleted across 13 files**, all named by the ratchet.
 * **`26::oid` used to be `0A000`.** `cast_operand` accepted a single-quoted string and nothing
   else, so `'26'::oid` answered and the spelling a person writes did not. It now asks

@@ -103,16 +103,6 @@ const ANSWERS: &[(&str, &str, &str)] = &[
         "pg19_json.txt:97",
     ),
     (
-        "SELECT '{\"a\":1}'::json = '{\"a\":1}'::json",
-        COMPARISON,
-        "pg19_concat.txt:42",
-    ),
-    (
-        "SELECT '{\"a\":1}'::json = '{\"a\":1}'::jsonb",
-        COMPARISON,
-        "pg19_json.txt:99",
-    ),
-    (
         "SELECT '{\"a\":1}'::jsonb = '{\"a\": 1}'::jsonb",
         COMPARISON,
         "pg19_json.txt:100",
@@ -349,17 +339,30 @@ fn a_nul_escape_splits_the_two_types() {
 /// variant — these types share `text`'s representation, which is safe for `varchar` and `bpchar`
 /// because their comparison *is* text comparison, and is not safe here. Refusing is contract C2;
 /// answering `f` would be a wrong answer.
+///
+/// **The two are refused with different codes, and the difference is whose gap it is.** `jsonb`
+/// has a complete btree on a real server and *answers*, so refusing it is this node's own
+/// unimplemented and says `0A000`. `json` has no comparison operator at all, so the honest
+/// refusal is the one a real server gives — `42883 operator does not exist: json = json`, and it
+/// is not a gap but the answer. One shared sentence was wrong about `json` for eighteen rows of
+/// `tests/captures/pg19_no_equality_types.txt`.
 #[test]
 fn comparing_json_is_refused_rather_than_answered_wrongly() {
     let mut node = parity::Node::new(&[]);
+    // This node's own gap: PostgreSQL answers these.
     for sql in [
         "SELECT '1.0'::jsonb = '1.00'::jsonb",
         "SELECT '{\"a\":1}'::jsonb < '{\"b\":1}'::jsonb",
-        "SELECT '{\"a\":1}'::json = '{\"a\":1}'::json",
     ] {
         let error = node.run(sql).unwrap_err();
         assert_eq!(error.sqlstate(), "0A000", "{sql}");
     }
+    // PostgreSQL's own refusal, with PostgreSQL's own sentence.
+    let error = node
+        .run("SELECT '{\"a\":1}'::json = '{\"a\":1}'::json")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), "42883");
+    assert_eq!(error.to_string(), "operator does not exist: json = json");
 
     // And over a column, where the type is on the plan rather than in the syntax.
     node.run("CREATE TABLE j (id int8 PRIMARY KEY, b jsonb)")
