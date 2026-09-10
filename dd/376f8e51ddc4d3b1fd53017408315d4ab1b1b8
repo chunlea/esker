@@ -1,0 +1,19 @@
+docs/adr/0102-the-catalogs-read-path.md
+  s_2bed4ac2b1c944::t_88ff22513982d8 3-8,100,102,104-158
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "dd376f8e51ddc4d3b1fd53017408315d4ab1b1b8",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
