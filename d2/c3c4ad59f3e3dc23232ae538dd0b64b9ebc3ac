@@ -1,0 +1,19 @@
+docs/adr/0106-what-a-statement-reads-below-the-sql.md
+  s_6f7019c05b578b::t_cc857c5ff88d0e 256-283
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d2c3c4ad59f3e3dc23232ae538dd0b64b9ebc3ac",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
