@@ -1,0 +1,71 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_6f7019c05b578b::t_70fef55ba97373 2459-2479,2502,4593-4605,4621-4623,4625-4637
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_6f7019c05b578b::t_d164a9ddf0cbdc 2150,2210-2245,2286-2316
+crates/esker-sql/src/catalog/stats.rs
+  s_6f7019c05b578b::t_9d25aba9c645e9 20,31-41,43-53,69,74-78,117-127,132,139,179
+crates/esker-sql/src/error.rs
+  s_6f7019c05b578b::t_9262ff6ae2ab4d 908-923,2994-2997,3331-3334
+crates/esker-sql/src/exec/cursor.rs
+  s_6f7019c05b578b::t_e4693ba8f18225 2094-2113,2447-2457,2459,2461-2473,2475,2478-2488
+crates/esker-sql/src/exec/mod.rs
+  s_6f7019c05b578b::t_9fa125983dca17 205-210,827,1027,1074,1095,1128,3872-3885,3890-3908,4502,4594,4627
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_b38c61e575ab83 6361-6363,6365,6370-6376,6379-6403,6419-6441,6449-6463,6526-6551
+crates/esker-sql/src/value/char_type.rs
+  s_6f7019c05b578b::t_eca69f43684d74 63-74
+crates/esker-sql/src/value/geometric.rs
+  s_6f7019c05b578b::t_8bb9a5f869ca1c 193-448
+crates/esker-sql/src/value/interval.rs
+  s_6f7019c05b578b::t_aae90ea214e82d 36
+crates/esker-sql/src/value/mod.rs
+  s_6f7019c05b578b::t_8d9090dbec11a3 840-1021
+crates/esker-sql/tests/captures/pg19_cast_matrix.txt
+  s_6f7019c05b578b::t_f48ceefad77f45 1-486
+crates/esker-sql/tests/cast_fold.rs
+  s_6f7019c05b578b::t_64adc90226f58d 1-59
+crates/esker-sql/tests/cast_matrix.rs
+  s_6f7019c05b578b::t_d6af6aa947ef0c 1-191
+crates/esker-sql/tests/catalog_reads.rs
+  s_6f7019c05b578b::t_ffcd874c5cc197 1-86
+crates/esker-sql/tests/char_type.rs
+  s_6f7019c05b578b::t_c1adc37443e972 32-40
+crates/esker-sql/tests/corpus/pg19_cast_fold.txt
+  s_6f7019c05b578b::t_f40c6d40470260 1-95
+crates/esker-sql/tests/corpus/pg19_cast_matrix.txt
+  s_6f7019c05b578b::t_afd7935b2d6774 1-486
+crates/esker-sql/tests/corpus/pg19_geometric.txt
+  s_6f7019c05b578b::t_3828b2d5132792 23-30,68,70-71,73-74,76-77,79-80,82-83,85-86,88,115-124
+crates/esker-sql/tests/geometric.rs
+  s_6f7019c05b578b::t_4a76cf76b63cfb 38,44-59
+crates/esker-sql/tests/interval.rs
+  s_6f7019c05b578b::t_f2ddf4c75d297a 154-165
+crates/esker-sql/tests/routing_differential.rs
+  s_6f7019c05b578b::t_3ec92664868b03 1606-1681
+crates/esker-sql/tests/time.rs
+  s_6f7019c05b578b::t_b4820089723af2 27-32,100-101
+docs/adr/0102-the-catalogs-read-path.md
+  s_6f7019c05b578b::t_05e500b2517d14 51-111,163-181,218-293
+docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md
+  s_6f7019c05b578b::t_11ed3d66a127e3 1-526
+docs/bench/v1.1.md
+  s_6f7019c05b578b::t_e2b7c16844ee30 7-8,12-30
+docs/plans/debts-v1.1.md
+  s_6f7019c05b578b::t_2e24df1d7c5a7a 24,118-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c5e949cb5891cf7db6fa82d02ca3af3b4bdb4f73",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
