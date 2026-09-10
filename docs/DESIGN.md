@@ -377,7 +377,12 @@ log replication with batching and flow control (`max_inflight_msgs`), **pre-vote
 leader **ReadIndex**, log compaction and **snapshots** (InstallSnapshot streamed by the store), single-server
 **membership change** (add/remove one voter or learner at a time; joint consensus is an ADR for later),
 **learners**, leadership transfer. The message set folds heartbeats into `AppendEntries` and
-acknowledges a snapshot with `AppendEntriesResponse` — [ADR 0007](adr/0007-raft-message-set.md). A vote
+acknowledges a snapshot with `AppendEntriesResponse` — [ADR 0007](adr/0007-raft-message-set.md).
+**The randomisation above only separates peers if the driver never hands a peer a whole timeout at
+once**: a batch that carries `election_tick` ticks in one call steps every peer past its deadline
+in the same instant, and the redraw that ends a split vote never happens
+([ADR 0101](adr/0101-a-batch-of-ticks-never-carries-a-whole-election.md), where it showed as a
+pre-vote livelock with the term climbing to 617). A vote
 is granted only to a candidate **this** configuration calls a voter, which is not the same question
 as whether the candidate thinks it is one — a node promoted in a configuration the voter has not
 applied yet is still a learner here, and granting it would elect a leader the group does not have
@@ -417,7 +422,14 @@ Regions cover the whole key space contiguously; the first region is `["", "")`.
   nothing depends on — two regions share no state, no batch and no apply index. One worker per store is
   the shape this rules out, because then one region's `fsync` blocks every other region's consensus; one
   thread per region is the shape 4a shipped, and it does not reach fifty. A driver error retires that one
-  region and the worker keeps serving the rest.
+  region and the worker keeps serving the rest. **A worker drains a batch until it has carried
+  `TICKS_PER_BATCH` ticks — one below `esker_raft::ELECTION_TIMEOUT_MIN_TICKS` — and then drives,
+  and only ticks count against it** because a batch of appends or reads is what batching is for
+  ([ADR 0101](adr/0101-a-batch-of-ticks-never-carries-a-whole-election.md)).
+- **A region has one core per store, and registering claims a place rather than taking one.** The
+  register succeeds where the map would refuse, so an orphan is created by the refusal rather than
+  by the register; the reservation is what closes that gap
+  ([ADR 0099](adr/0099-one-core-per-region-per-store.md)).
 - **Split:** triggered by a periodic size check on the **leader** (region > 96 MiB *default*), or by an
   operator through the Admin service (§9). The leader picks a boundary from the region's own
   data ([ADR 0012](adr/0012-split-key-selection.md) — the engine exposes no per-range key sample, so it is
@@ -1172,7 +1184,16 @@ therefore read by every statement on every node, and a moment when it has no lea
 whole node is refusing. Three shapes to choose between when this is decided: a **cached** version
 with an invalidation the store pushes, a **lease read** that a follower may answer, or a **split
 exemption** that keeps the catalog in a region nothing else can make busy. Measured evidence for
-why it matters is `docs/plans/debts-v1.1.md` #34.
+why it matters is `docs/plans/debts-v1.1.md` #34, and the three shapes are written out with what
+each costs in [ADR 0102](adr/0102-the-catalogs-read-path.md) — **a draft for a milestone
+conversation, not a decision**, so this question stays open and now has its options on paper.
+
+*Answered by being refuted:* whether a client should wait longer for a region that is **between
+leaders** — a count of retries rather than the caller's deadline. It should not, and nothing in the
+client changes: at these region counts a region that loses its leader gets one back inside the
+deadline the caller already gave, so the pre-registered criterion answered itself
+([ADR 0100](adr/0100-a-region-between-leaders-waits-on-the-callers-deadline.md)). Recorded because
+a measurement that refutes its own proposal is the cheapest kind and the easiest to lose.
 
 *Landed since this list was written:* the `"char"` one-byte type (ADR 0095), `oid` as its own type
 rather than `bigint` (ADR 0097) and `regproc` (ADR 0098) — b4's three families, all three in the
