@@ -269,6 +269,13 @@ impl StoreTxn {
 
 impl Txn for StoreTxn {
     /// See [`Txn::owned_by_session`]: set once, right after the transaction is opened.
+    fn get_without_waiting(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        // The only backend where the distinction is real: a lock here is a Percolator lock in a
+        // store, and reading past it is a second `Get` at a lower timestamp (ADR 0105).
+        self.record_key(key);
+        self.open()?.get_without_waiting(key).map_err(translate)
+    }
+
     fn owned_by_session(&mut self, pid: u32) {
         self.session = pid;
     }

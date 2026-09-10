@@ -476,6 +476,8 @@ is short enough to be checked rather than assumed:
 The catalog is the one asymmetry left and it is harmless for cycles: a DDL takes no row locks, so it
 can never be the waiting half of one. What it can do is make an ordinary reader wait — which is the
 `for a read` the §4 diagnostic now prints, and the wart `catalog/record.rs` already documents.
+**That became debt #50 the day the diagnostic named it**, and
+[ADR 0105](0105-a-catalog-read-never-waits.md) closes it: a catalog read never waits.
 
 The cross-node case is not this shape either. Both sides of a cross-node pair block in
 `wound_or_wait`, where the older transaction never waits, so it terminates by construction

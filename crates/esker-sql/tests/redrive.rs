@@ -357,6 +357,12 @@ impl Txn for GatedTxn {
         self.inner.owned_by_session(pid);
     }
 
+    /// Forwarded, and it is **required** so that this wrapper cannot forget it — which is the
+    /// lesson the comment below was written about (ADR 0105).
+    fn get_without_waiting(&self, key: &[u8]) -> esker_sql::Result<Option<Bytes>> {
+        self.inner.get_without_waiting(key)
+    }
+
     // **Every defaulted method is forwarded, including the ones this test never calls.**
     //
     // A wrapper only has to forget one to opt its whole test out of a mechanism, and the compiler

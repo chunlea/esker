@@ -1095,6 +1095,64 @@ impl Transaction {
         }
     }
 
+    /// **The same read, except that it never waits for a lock**
+    /// ([ADR 0105](../../docs/adr/0105-a-catalog-read-never-waits.md)).
+    ///
+    /// A lock in the way is not resolved and not waited out: this re-reads at
+    /// `lock.start_ts - 1`, which is the newest committed state **strictly before** the
+    /// transaction holding it. The answer is therefore the value as of a moment just before
+    /// somebody else's uncommitted work — which for the catalog is the whole point, because an
+    /// uncommitted DDL is not supposed to be visible to anybody.
+    ///
+    /// # Why this is not a weaker `get`
+    ///
+    /// It answers a *different question*. `get` asks "what does my snapshot say", waits for
+    /// whoever is in the way, and is right for a row. This asks "what was committed before the
+    /// transaction in my way", which is only the right question where an in-flight writer must be
+    /// invisible rather than waited for. `esker-sql`'s catalog is the one caller, and the key
+    /// semantics that make it the right caller live there (`CLAUDE.md` invariant 7) — this crate
+    /// only offers the read.
+    ///
+    /// Terminates by construction: every retry lowers the timestamp strictly, and a timestamp of
+    /// zero has nothing below it.
+    ///
+    /// # Errors
+    ///
+    /// Any transport or region failure the router could not retry away. **Not** a lock: a lock is
+    /// the one thing this cannot fail on.
+    pub fn get_without_waiting(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        if let Some(write) = self.buffer.get(key) {
+            return Ok(match write {
+                Write::Put(value) => Some(value.clone()),
+                Write::Delete => None,
+            });
+        }
+        let key = Bytes::copy_from_slice(key);
+        let mut at = self.read_ts();
+        loop {
+            let error = match self.call(&TxnKvReq::Get {
+                key: key.clone(),
+                ts: at,
+            }) {
+                Ok(TxnKvResp::Get { value }) => return Ok(value),
+                Ok(other) => return Err(unexpected(Method::TxnGet, &other)),
+                Err(error) => error,
+            };
+            let Some(lock) = lock_in(&error) else {
+                return Err(error);
+            };
+            // **Just below the holder**, not one lease or one backoff below: the state this read
+            // wants is the one that was committed when that transaction began, and every version
+            // between the two belongs to transactions that started later than it.
+            let Some(below) = lock?.start_ts.checked_sub(1) else {
+                // A lock at timestamp zero cannot exist — no transaction starts there — but a
+                // store that answered one must not become an unbounded loop here.
+                return Ok(None);
+            };
+            at = below;
+        }
+    }
+
     /// Reads `[start, end)` at this transaction's snapshot, its own buffered writes merged in.
     ///
     /// The merge is the read-your-writes rule applied to a range: a buffered `Put` in the
