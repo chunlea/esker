@@ -228,13 +228,16 @@ impl Aggregation {
                 | ColumnType::Int8Range
                 | ColumnType::FloatRange
                 | ColumnType::VarcharRange
-                | ColumnType::TsRangeArray
-                | ColumnType::TstzRangeArray
-                | ColumnType::Int4RangeArray
-                | ColumnType::DateRangeArray
-                | ColumnType::NumRangeArray
-                | ColumnType::Int8RangeArray
-                | ColumnType::PointArray
+                // **The arrays are NOT here, and their absence is the correction.** The
+                // sentence above measured `min(tsrange)` and the seven array entries that used to
+                // sit here were never measured beside it: PostgreSQL orders an array of anything
+                // (`array_lt`), so `min(tsrange[])` answers **its own type** where `min(tsrange)`
+                // is `42883` — measured for all seven plus `point[]`,
+                // `tests/captures/pg19_min_max_greatest.txt`. A rule taken for a scalar had been
+                // extended to its array, and the comment above made the scalar's measurement look
+                // like it covered both. Family F2 of the wire v3 census, 44 rows.
+                //
+                // They fall through to `_ => Ok(arg)` below, which is the right answer for them.
                 | ColumnType::Bool
                 | ColumnType::Json
                 | ColumnType::Jsonb
@@ -293,7 +296,18 @@ impl Aggregation {
                 // `42883 function min(macaddr) does not exist`. Not derivable from its two
                 // neighbours either — a `cidr` decays and an `inet` keeps itself, three rules for
                 // three types (`tests/captures/pg19_cidr_aggregate.txt`).
-                | ColumnType::MacAddr => undefined(),
+                | ColumnType::MacAddr
+                // **Three PostgreSQL has no aggregate for, and they were missing.** Family F1b,
+                // 18 rows, and it is the same list wrong in the other direction — which is why the
+                // two are one unit: a change that fixed one would leave this looking measured.
+                //
+                // `hstore` and `lquery` **do** have a comparison function — `GREATEST(hstore)` is
+                // answered on a real server — so what is missing is the *aggregate*, not an
+                // ordering. That distinction is what `GREATEST`/`LEAST` turns on and why it does
+                // not share this list (F1a).
+                | ColumnType::Hstore
+                | ColumnType::LQuery
+                | ColumnType::Void => undefined(),
                 // Measured: `min(varchar)` and `max(varchar)` come back as **`text`** on a real
                 // server, and `min(character(n))` comes back as **`bpchar`**. The string family
                 // does not decay uniformly — `bpchar` has a `min` of its own where `varchar`
