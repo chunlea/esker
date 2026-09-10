@@ -66,3 +66,21 @@ SELECT ARRAY(SELECT c FROM (VALUES ('{1,2}'::int[]),('{3,4}'::int[])) s(c)) AS v
 SELECT ARRAY(SELECT c FROM (VALUES ('{1,2}'::int[]),('{3,4,5}'::int[])) s(c)) AS v	!2202E cannot accumulate arrays of different dimensionality
 SELECT ARRAY(SELECT c FROM (VALUES (NULL::int[])) s(c)) AS v	!22004 cannot accumulate null arrays
 SELECT ARRAY(SELECT c FROM (VALUES ('{}'::int[])) s(c)) AS v	!2202E cannot accumulate empty arrays
+#
+# **The same four shapes with a *literal* operand.** r1's v3 smoke found the node degrades by
+# operand provenance, not uniformly: a literal `ARRAY['{…}'::tsrange[]]` fell to a scalar `text`
+# where the runtime forms fell to `text[]`. The twelve rows above take their operand from
+# `(VALUES …) s(c)`; these twelve are the literal half, so the unit pins both.
+#
+SELECT ARRAY['{1,2}'::int[]] AS v	integer[]	{{1,2}}
+SELECT (ARRAY['{1,2}'::int[]])[1] AS v	integer	\N
+SELECT unnest(ARRAY['{1,2}'::int[]]) AS v	integer	1 ; 2
+SELECT array_agg('{1,2}'::int[]) AS v	integer[]	{{1,2}}
+SELECT ARRAY['{"[2020-01-01,2020-01-02)"}'::tsrange[]] AS v	tsrange[]	{{"[\"2020-01-01 00:00:00\",\"2020-01-02 00:00:00\")"}}
+SELECT (ARRAY['{"[2020-01-01,2020-01-02)"}'::tsrange[]])[1] AS v	tsrange	\N
+SELECT unnest(ARRAY['{"[2020-01-01,2020-01-02)"}'::tsrange[]]) AS v	tsrange	["2020-01-01 00:00:00","2020-01-02 00:00:00")
+SELECT array_agg('{"[2020-01-01,2020-01-02)"}'::tsrange[]) AS v	tsrange[]	{{"[\"2020-01-01 00:00:00\",\"2020-01-02 00:00:00\")"}}
+SELECT ARRAY['{pg_class}'::regclass[]] AS v	regclass[]	{{pg_class}}
+SELECT (ARRAY['{pg_class}'::regclass[]])[1] AS v	regclass	\N
+SELECT unnest(ARRAY['{pg_class}'::regclass[]]) AS v	regclass	pg_class
+SELECT array_agg('{pg_class}'::regclass[]) AS v	regclass[]	{{pg_class}}

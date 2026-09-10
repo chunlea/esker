@@ -40,3 +40,12 @@ SELECT ARRAY(SELECT c FROM (VALUES ('{1,2}'::int[]),('{3,4}'::int[])) s(c)) AS v
 SELECT ARRAY(SELECT c FROM (VALUES ('{1,2}'::int[]),('{3,4,5}'::int[])) s(c)) AS v	!2202E cannot accumulate arrays of different dimensionality
 SELECT ARRAY(SELECT c FROM (VALUES (NULL::int[])) s(c)) AS v	!22004 cannot accumulate null arrays
 SELECT ARRAY(SELECT c FROM (VALUES ('{}'::int[])) s(c)) AS v	!2202E cannot accumulate empty arrays
+#
+#
+# **The literal half of these four shapes is not replayed here — it is the next unit.** r1's v3
+# smoke was right that the node degrades by operand provenance: with the operand written as a
+# literal the answer is a scalar `text` holding the array's own text, because the fold turns a
+# typed array literal into text before the constructor's rule can reach it — and for `regclass[]`
+# that fold is `0A000 a relation name read as a regclass without a catalog`. A different mechanism
+# in a different file, measured in the capture and pinned by an `#[ignore]`d test.
+
