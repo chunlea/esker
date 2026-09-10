@@ -49,6 +49,14 @@ pub const ANSWER_WITHIN: Duration = Duration::from_millis(500);
 /// Every `Option` here means **the driver did not answer**, not "there is nothing to say".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionCensus {
+    /// The store this line came from.
+    ///
+    /// **Peer ids are not store ids**, and run 122 is where that cost a reading: its census named
+    /// peers 2, 9 and 10 on a four-store cluster, and nothing on the line said which store held
+    /// which — so "three kills and none of them interrupted a peer's stream" could not be told
+    /// from "the kills hit stores whose peers are not in this list". A peer id is allocated by the
+    /// placement driver when a peer joins a region; a store id is the store's own.
+    pub store_id: u64,
     /// The region.
     pub region_id: u64,
     /// Its epoch, from the region record this store keeps.
@@ -103,6 +111,7 @@ impl RegionCensus {
         let elections = self.elections.unwrap_or_default();
         tracing::info!(
             target: "esker_store::census",
+            store = self.store_id,
             region = self.region_id,
             epoch_conf = self.epoch.conf_ver,
             epoch_version = self.epoch.version,

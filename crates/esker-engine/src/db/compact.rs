@@ -183,6 +183,7 @@ impl Db {
     /// this returned, which is why the sentence above is here rather than implied
     /// (`tests/db.rs::the_background_pool_compacts_by_itself`, 2026-09-05).
     pub fn compact_range(&self, cf: &str, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
+        self.inner.writable("compact")?;
         let handle = self.inner.cf_by_name(cf)?;
         // An inverted range is a caller's mistake, and silently compacting the files that
         // happen to span the gap would hide it.

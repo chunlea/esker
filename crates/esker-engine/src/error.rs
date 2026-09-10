@@ -95,10 +95,15 @@ pub enum Error {
     /// for ever and one held by a shutdown is held for a moment — so waiting separates them
     /// without ever admitting a second live writer. The wait is bounded: a node that blocked here
     /// for ever would be a node an operator reads as hung.
-    #[error("{dir} is open in another process")]
+    #[error("{dir} is open in another process ({holder})")]
     InUse {
         /// The directory somebody else holds.
         dir: PathBuf,
+        /// Who holds it, as the holder wrote into the lock file, or why that is not known.
+        ///
+        /// A note and never an authority — the lock is the authority. It exists because a gate
+        /// archived `InUse { dir }` and nothing more, and the next question had no answer.
+        holder: String,
     },
 }
 

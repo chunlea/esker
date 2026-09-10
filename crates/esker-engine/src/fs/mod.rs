@@ -321,11 +321,15 @@ impl FileSystem for LocalFileSystem {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        // Not truncated and never written: the file is a handle to hold a lock on, and an empty
-        // one says the same thing on a second open as it did on the first. `try_lock` and not
-        // `lock`, because a second node blocking for ever on a directory reads as a hang.
+        // Not truncated on the way in: whoever holds it is still holding it, and emptying their
+        // record before finding out whether we can have the lock would erase the one thing that
+        // says who to look for. `try_lock` and not `lock`, because a second node blocking for
+        // ever on a directory reads as a hang.
         match file.try_lock() {
-            Ok(()) => Ok(Box::new(LocalDirectoryLock { _file: file })),
+            Ok(()) => {
+                write_holder(&file);
+                Ok(Box::new(LocalDirectoryLock { _file: file }))
+            }
             Err(fs::TryLockError::WouldBlock) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 format!("{} is held by another process", path.display()),
@@ -335,12 +339,48 @@ impl FileSystem for LocalFileSystem {
     }
 }
 
-/// The name of the file [`LocalFileSystem::lock_directory`] locks.
+/// The name of the file [`LocalFileSystem::lock_directory`] locks, and the note in it.
 ///
 /// Uppercase like `CURRENT`, and — like every name the engine does not recognise —
 /// [`crate::filename::classify`] answers `None` for it, which is what keeps the obsolete-file
 /// sweep from deleting the lock out from under its holder.
+///
+/// Its **contents** are one line naming the holder — `pid=… exe=… since_unix=…` — written after
+/// the lock is taken and read by whoever is refused. A note and never an authority: the lock
+/// decides, and this only answers the question a refusal used to leave open.
 pub const LOCK_FILE: &str = "LOCK";
+
+/// Records who holds the claim, in the file the claim is held on.
+///
+/// **The lock is the authority and this is only a note**, which is what makes it safe: nothing
+/// reads this to decide anything, so a stale or truncated line costs a reader nothing but the
+/// diagnosis. It is written after the lock is taken, so no two processes can be writing it, and a
+/// failure to write it is ignored — a claim that failed because its note could not be written
+/// would be a worse trade than an unexplained refusal.
+///
+/// It exists because a gate archived `InUse { dir: "/tmp/.tmpe1uNGX" }` and nothing more, and the
+/// next question — *who had it* — had no answer anywhere.
+fn write_holder(file: &File) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let pid = std::process::id();
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "?".to_owned());
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let line = format!("pid={pid} exe={exe} since_unix={since}\n");
+    let mut file = file;
+    let _ = file.set_len(0);
+    let _ = file.seek(SeekFrom::Start(0));
+    let _ = file.write_all(line.as_bytes());
+    let _ = file.flush();
+}
 
 /// A claim on a local directory: an open file whose kernel lock is released when it closes.
 #[derive(Debug)]

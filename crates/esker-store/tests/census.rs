@@ -142,6 +142,7 @@ async fn a_running_store_takes_a_census_every_period_and_says_what_it_believes()
     // the run it exists for.
     let last = lines.last().expect("a census line");
     for field in [
+        "store=1",
         "region=1",
         "handle_peer=1",
         "answered_by=1",
