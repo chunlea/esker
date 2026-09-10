@@ -1,0 +1,168 @@
+# **Which types `min`/`max` aggregate, and which `GREATEST`/`LEAST` compare** — and they are two
+# different domains.
+#
+# PostgreSQL 19beta1, 2026-09-10, one `BEGIN … ROLLBACK`, every probe inside its own
+# `SAVEPOINT`/`ROLLBACK TO`, each asked as `pg_typeof(min(x))` over `SELECT <value> AS x`.
+# `debts-v1.1.md` #19's neighbours in the wire v3 census: families F1a, F1b and F2 of
+# `esker-coord/b4-wire-v3-families.md`.
+#
+# **Provenance**: `ltree` was already installed on this oracle and `hstore` was created inside the
+# rolled-back transaction; after the `ROLLBACK` the extension list is `ltree, pg_trgm, pgcrypto,
+# plpgsql, uuid-ossp` — one of the two, and it is the pre-existing one. Nothing was left behind.
+#
+# ## The finding: `min`/`max` and `GREATEST`/`LEAST` do not have the same type domain
+#
+#   min(point[])        point[]          GREATEST(point[])   42883 no comparison function
+#   min(hstore)         42883 no min     GREATEST(hstore)    hstore
+#
+# **`min`/`max` refuse iff PostgreSQL has no aggregate for the type**, which is a list in
+# `pg_proc`; **`GREATEST`/`LEAST` refuse iff the type has no comparison function**, which is a
+# property of its `btree` opclass — and an array has one exactly when its **element** does. So a
+# node with one predicate for both is wrong in both directions at once, and a fix that shared a
+# list between them would close one family and open another.
+#
+# **And `min(regclass)` is an `oid`**, not a `regclass`: the aggregate PostgreSQL picks is
+# `min(oid)` and the argument is coerced to reach it. `GREATEST(regclass)` keeps `regclass`.
+#
+# **Both refusals are `42883`, and they come from different places** — measured with
+# `\set VERBOSITY verbose`, which prints the source location:
+#
+#   min(json)          42883 function min(json) does not exist
+#                            LOCATION: ParseFuncOrColumn, parse_func.c:643      <- the PARSER
+#   GREATEST(json,json) 42883 could not identify a comparison function for type json
+#                            LOCATION: ExecInitExprRec, execExpr.c:2274         <- the EXECUTOR
+#
+# One is a function lookup that fails because no such aggregate exists; the other is an opclass
+# lookup that fails when the expression is initialised. Same sqlstate, different sentence,
+# different mechanism — which is the structural confirmation of the finding above.
+#
+# ## The raw answers
+#
+#   min(hstore)                !42883 function min(hstore) does not exist
+#   max(hstore)                !42883 function max(hstore) does not exist
+#   GREATEST(hstore)           hstore
+#   LEAST(hstore)              hstore
+#   min(lquery)                !42883 function min(lquery) does not exist
+#   max(lquery)                !42883 function max(lquery) does not exist
+#   GREATEST(lquery)           !42883 could not identify a comparison function for type lquery
+#   LEAST(lquery)              !42883 could not identify a comparison function for type lquery
+#   min(void)                  !42883 function min(void) does not exist
+#   max(void)                  !42883 function max(void) does not exist
+#   GREATEST(void)             !42883 could not identify a comparison function for type void
+#   LEAST(void)                !42883 could not identify a comparison function for type void
+#   min(regclass)              oid
+#   max(regclass)              oid
+#   GREATEST(regclass)         regclass
+#   LEAST(regclass)            regclass
+#   min(tsrange[])             tsrange[]
+#   max(tsrange[])             tsrange[]
+#   GREATEST(tsrange[])        tsrange[]
+#   LEAST(tsrange[])           tsrange[]
+#   min(tstzrange[])           tstzrange[]
+#   max(tstzrange[])           tstzrange[]
+#   GREATEST(tstzrange[])      tstzrange[]
+#   LEAST(tstzrange[])         tstzrange[]
+#   min(int4range[])           int4range[]
+#   max(int4range[])           int4range[]
+#   GREATEST(int4range[])      int4range[]
+#   LEAST(int4range[])         int4range[]
+#   min(daterange[])           daterange[]
+#   max(daterange[])           daterange[]
+#   GREATEST(daterange[])      daterange[]
+#   LEAST(daterange[])         daterange[]
+#   min(numrange[])            numrange[]
+#   max(numrange[])            numrange[]
+#   GREATEST(numrange[])       numrange[]
+#   LEAST(numrange[])          numrange[]
+#   min(int8range[])           int8range[]
+#   max(int8range[])           int8range[]
+#   GREATEST(int8range[])      int8range[]
+#   LEAST(int8range[])         int8range[]
+#   min(point[])               point[]
+#   max(point[])               point[]
+#   GREATEST(point[])          !42883 could not identify a comparison function for type point[]
+#   LEAST(point[])             !42883 could not identify a comparison function for type point[]
+#   min(point)                 !42883 function min(point) does not exist
+#   max(point)                 !42883 function max(point) does not exist
+#   GREATEST(point)            !42883 could not identify a comparison function for type point
+#   LEAST(point)               !42883 could not identify a comparison function for type point
+#   min(lseg)                  !42883 function min(lseg) does not exist
+#   max(lseg)                  !42883 function max(lseg) does not exist
+#   GREATEST(lseg)             !42883 could not identify a comparison function for type lseg
+#   LEAST(lseg)                !42883 could not identify a comparison function for type lseg
+#   min(box)                   !42883 function min(box) does not exist
+#   max(box)                   !42883 function max(box) does not exist
+#   GREATEST(box)              !42883 could not identify a comparison function for type box
+#   LEAST(box)                 !42883 could not identify a comparison function for type box
+#   min(path)                  !42883 function min(path) does not exist
+#   max(path)                  !42883 function max(path) does not exist
+#   GREATEST(path)             !42883 could not identify a comparison function for type path
+#   LEAST(path)                !42883 could not identify a comparison function for type path
+#   min(polygon)               !42883 function min(polygon) does not exist
+#   max(polygon)               !42883 function max(polygon) does not exist
+#   GREATEST(polygon)          !42883 could not identify a comparison function for type polygon
+#   LEAST(polygon)             !42883 could not identify a comparison function for type polygon
+#   min(circle)                !42883 function min(circle) does not exist
+#   max(circle)                !42883 function max(circle) does not exist
+#   GREATEST(circle)           !42883 could not identify a comparison function for type circle
+#   LEAST(circle)              !42883 could not identify a comparison function for type circle
+#   min(line)                  !42883 function min(line) does not exist
+#   max(line)                  !42883 function max(line) does not exist
+#   GREATEST(line)             !42883 could not identify a comparison function for type line
+#   LEAST(line)                !42883 could not identify a comparison function for type line
+#   min(json)                  !42883 function min(json) does not exist
+#   max(json)                  !42883 function max(json) does not exist
+#   GREATEST(json)             !42883 could not identify a comparison function for type json
+#   LEAST(json)                !42883 could not identify a comparison function for type json
+#   min(xml)                   !42883 function min(xml) does not exist
+#   max(xml)                   !42883 function max(xml) does not exist
+#   GREATEST(xml)              !42883 could not identify a comparison function for type xml
+#   LEAST(xml)                 !42883 could not identify a comparison function for type xml
+#   min(lseg[])                lseg[]
+#   max(lseg[])                lseg[]
+#   GREATEST(lseg[])           !42883 could not identify a comparison function for type lseg[]
+#   LEAST(lseg[])              !42883 could not identify a comparison function for type lseg[]
+#   min(box[])                 box[]
+#   max(box[])                 box[]
+#   GREATEST(box[])            !42883 could not identify a comparison function for type box[]
+#   LEAST(box[])               !42883 could not identify a comparison function for type box[]
+#   min(path[])                path[]
+#   max(path[])                path[]
+#   GREATEST(path[])           !42883 could not identify a comparison function for type path[]
+#   LEAST(path[])              !42883 could not identify a comparison function for type path[]
+#   min(polygon[])             polygon[]
+#   max(polygon[])             polygon[]
+#   GREATEST(polygon[])        !42883 could not identify a comparison function for type polygon[]
+#   LEAST(polygon[])           !42883 could not identify a comparison function for type polygon[]
+#   min(circle[])              circle[]
+#   max(circle[])              circle[]
+#   GREATEST(circle[])         !42883 could not identify a comparison function for type circle[]
+#   LEAST(circle[])            !42883 could not identify a comparison function for type circle[]
+#   min(line[])                line[]
+#   max(line[])                line[]
+#   GREATEST(line[])           !42883 could not identify a comparison function for type line[]
+#   LEAST(line[])              !42883 could not identify a comparison function for type line[]
+#   min(json[])                json[]
+#   max(json[])                json[]
+#   GREATEST(json[])           !42883 could not identify a comparison function for type json[]
+#   LEAST(json[])              !42883 could not identify a comparison function for type json[]
+#   min(xml[])                 xml[]
+#   max(xml[])                 xml[]
+#   GREATEST(xml[])            !42883 could not identify a comparison function for type xml[]
+#   LEAST(xml[])               !42883 could not identify a comparison function for type xml[]
+#   min(jsonb)                 !42883 function min(jsonb) does not exist
+#   max(jsonb)                 !42883 function max(jsonb) does not exist
+#   GREATEST(jsonb)            jsonb
+#   LEAST(jsonb)               jsonb
+#   min(uuid)                  !42883 function min(uuid) does not exist
+#   max(uuid)                  !42883 function max(uuid) does not exist
+#   GREATEST(uuid)             uuid
+#   LEAST(uuid)                uuid
+#   min(tsrange)               !42883 function min(tsrange) does not exist
+#   max(tsrange)               !42883 function max(tsrange) does not exist
+#   GREATEST(tsrange)          tsrange
+#   LEAST(tsrange)             tsrange
+#   min(bool)                  !42883 function min(boolean) does not exist
+#   max(bool)                  !42883 function max(boolean) does not exist
+#   GREATEST(bool)             boolean
+#   LEAST(bool)                boolean
