@@ -289,6 +289,17 @@ Raft batch for a region a store does not serve yet is dropped rather than refuse
 left the median exactly where it was, at 63 ms; `Store::campaign_the_child` asks again for a handful
 of ticks and stops at the first leader.
 
+**A third ADR followed, and it came from the measurement rather than from the split.** Chasing the
+tail above found regions that were leaderless for far longer than an election, with three voters all
+`PreCandidate` at once and the term climbing — and the cause was in the driver, not in the split: a
+batch that carried a whole election timeout stepped every peer past its deadline in the same
+instant, so the per-peer randomisation that ends a split vote never got a chance to separate them.
+A worker now drives before a batch can carry `ELECTION_TIMEOUT_MIN_TICKS`
+([ADR 0101](../adr/0101-a-batch-of-ticks-never-carries-a-whole-election.md)). The related question —
+whether a *client* should wait longer for a region between leaders — was proposed and **refuted by
+its own measurement**: it gets a leader back inside the deadline the caller already gave, so nothing
+in the client changes ([ADR 0100](../adr/0100-a-region-between-leaders-waits-on-the-callers-deadline.md)).
+
 **And the campaign runs only after the region map has taken the child**
 ([ADR 0099](../adr/0099-one-core-per-region-per-store.md)). `RegionMap::apply_split` refuses three
 things — a parent this store does not host, a child it already hosts, a parent whose start key moved
