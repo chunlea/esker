@@ -59,11 +59,27 @@ impl Client {
         database: &str,
         options: &str,
     ) -> Result<Self, String> {
+        Client::connect_named(address, database, options, "").await
+    }
+
+    /// The same, carrying an `application_name` — the parameter `pg_stat_activity` reports and
+    /// nothing else reads (`tests/session_identity.rs`).
+    ///
+    /// # Errors
+    ///
+    /// An `ErrorResponse` that arrived before `ReadyForQuery`.
+    pub async fn connect_named(
+        address: std::net::SocketAddr,
+        database: &str,
+        options: &str,
+        application_name: &str,
+    ) -> Result<Self, String> {
         let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
         let mut body = 0x0003_0000u32.to_be_bytes().to_vec();
         for (name, value) in [("user", "esker"), ("database", database)]
             .into_iter()
             .chain((!options.is_empty()).then_some(("options", options)))
+            .chain((!application_name.is_empty()).then_some(("application_name", application_name)))
         {
             body.extend_from_slice(name.as_bytes());
             body.push(0);

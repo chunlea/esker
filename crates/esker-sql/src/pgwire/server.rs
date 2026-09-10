@@ -113,7 +113,7 @@ pub async fn serve(config: Config, executors: Arc<dyn Executors>) -> std::io::Re
             // Nagle would add a round trip's worth of latency to every small reply, and almost
             // every reply in this protocol is small.
             let _ = stream.set_nodelay(true);
-            if let Err(error) = accept(stream, config, Arc::clone(&executors)).await {
+            if let Err(error) = accept(stream, peer, config, Arc::clone(&executors)).await {
                 tracing::debug!(%peer, %error, "connection ended");
             }
         });
@@ -162,6 +162,16 @@ pub struct Connection<S> {
     ///
     /// `None` for a connection built directly, which is what the in-memory tests do.
     pending: Option<Vec<u8>>,
+    /// The `application_name` the startup packet carried, or empty when it carried none.
+    ///
+    /// Kept beside `user` and `database` for the same reason they are: `pg_stat_activity` reports
+    /// it, and the parameters are gone by the time a session exists (`debts-v1.1.md` #47).
+    application_name: String,
+    /// Who is on the other end, when there is a socket to ask.
+    ///
+    /// `None` for a connection built directly — every in-process test — which is exactly when
+    /// PostgreSQL answers NULL for `client_addr` too.
+    peer: Option<std::net::SocketAddr>,
     /// Bytes read off the socket **while a statement was running**, waiting to be framed.
     ///
     /// [`Connection::watch_for_the_client_leaving`] has to read to learn that the peer is gone —
@@ -213,7 +223,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             backend: None,
             pending,
             spare: Vec::new(),
+            application_name: String::new(),
+            peer: None,
         }
+    }
+
+    /// Records the peer's address, for `pg_stat_activity` to report.
+    ///
+    /// Set by the accept path, which is where the socket's address is known: [`Connection`] is
+    /// generic over its stream and a `TlsStream` has no `peer_addr` of its own.
+    #[must_use]
+    pub fn from_peer(mut self, peer: std::net::SocketAddr) -> Self {
+        self.peer = Some(peer);
+        self
     }
 
     /// Runs the connection to completion: startup, then messages until the client leaves.
@@ -408,6 +430,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             if let Some((_, options)) = parameters.iter().find(|(name, _)| name == "options") {
                 self.options.clone_from(options);
             }
+            // **Kept for the view and not applied to anything**, which is what it is on a real
+            // server too: `application_name` is a `GUC` a client sets to label itself, and every
+            // reader of it is a report. `psql` sends `psql`; a client that sends none shows as
+            // the empty string, measured (`debts-v1.1.md` #47).
+            if let Some((_, name)) = parameters
+                .iter()
+                .find(|(name, _)| name == "application_name")
+            {
+                self.application_name.clone_from(name);
+            }
         }
         self.out.clear();
         match negotiation(startup) {
@@ -505,6 +537,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             .backend
             .clone()
             .unwrap_or_else(crate::session::register);
+        // **Who this session is, written once and never again.** The startup packet is gone by
+        // the time a statement runs, and `pg_stat_activity` reported NULL for every one of these
+        // — which is how r1 came to have three thousand sessions it could count and not chase
+        // (`debts-v1.1.md` #47).
+        if let Ok(mut activity) = identity.activity.lock() {
+            activity.client = crate::session::Client {
+                user: self.user.clone(),
+                application_name: self.application_name.clone(),
+                address: self.peer.map(|peer| peer.ip().to_string()),
+                port: self.peer.map(|peer| i32::from(peer.port())),
+                started: Some(wall_clock_micros()),
+            };
+        }
         let database = self.database.clone();
         let made = tokio::task::spawn_blocking(move || executors.for_session(&database, identity))
             .await
@@ -822,15 +867,33 @@ where
 ///
 /// The one place both listeners meet, so `SSLRequest` is answered identically whether the node was
 /// started by [`serve`] or by a test through [`serve_on`].
-async fn accept<S>(stream: S, config: Config, executors: Arc<dyn Executors>) -> std::io::Result<()>
+async fn accept<S>(
+    stream: S,
+    peer: std::net::SocketAddr,
+    config: Config,
+    executors: Arc<dyn Executors>,
+) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let tls = config.tls.clone();
     let (stream, pending) = negotiate(stream, &tls).await?;
     Connection::resuming(stream, config, pending)
+        .from_peer(peer)
         .run(executors)
         .await
+}
+
+/// The wall clock, in microseconds since the PostgreSQL epoch.
+///
+/// **The only reading of the wall clock in this crate**, and it is for `backend_start` alone —
+/// see [`crate::session::Client::started`] for why a connection cannot use the clock invariant 6
+/// names, and for the ruling that a display timestamp may use this one.
+fn wall_clock_micros() -> i64 {
+    let since_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| i64::try_from(since.as_micros()).unwrap_or(0));
+    since_unix - crate::value::timestamp::PG_EPOCH_UNIX_SECONDS * 1_000_000
 }
 
 /// Reads a startup packet: a four-byte length that counts itself, then the rest.
@@ -973,7 +1036,7 @@ pub async fn serve_on(
         let executors = Arc::clone(&executors);
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
-            if let Err(error) = accept(stream, config, Arc::clone(&executors)).await {
+            if let Err(error) = accept(stream, peer, config, Arc::clone(&executors)).await {
                 tracing::debug!(%peer, %error, "connection ended");
             }
         });

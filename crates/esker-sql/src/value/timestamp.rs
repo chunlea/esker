@@ -118,7 +118,7 @@ pub(super) fn to_text_in(micros: i64, zone: Option<&super::zone::Zone>) -> Strin
 }
 
 /// 2000-01-01T00:00:00Z as a Unix time: what converts this crate's epoch to the zone table's.
-pub(super) const PG_EPOCH_UNIX_SECONDS: i64 = UNIX_TO_PG_EPOCH_DAYS * SECONDS_PER_DAY;
+pub(crate) const PG_EPOCH_UNIX_SECONDS: i64 = UNIX_TO_PG_EPOCH_DAYS * SECONDS_PER_DAY;
 
 /// What, if anything, follows the time.
 #[derive(Clone, Copy)]

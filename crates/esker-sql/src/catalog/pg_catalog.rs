@@ -844,7 +844,9 @@ impl CatalogView {
                 ("usesysid", ColumnType::Oid, NO_LENGTH),
                 ("usename", ColumnType::Name, NO_LENGTH),
                 ("application_name", ColumnType::Text, NO_LENGTH),
-                ("client_addr", ColumnType::Text, NO_LENGTH),
+                // **`inet`, measured** — `pg_typeof(client_addr)` is `inet` on 19beta1, and this
+                // column said `text` while it only ever held NULL, so nothing could tell.
+                ("client_addr", ColumnType::Inet, NO_LENGTH),
                 ("client_hostname", ColumnType::Text, NO_LENGTH),
                 ("client_port", ColumnType::Int4, NO_LENGTH),
                 ("backend_start", ColumnType::TimestampTz, NO_LENGTH),
@@ -1925,19 +1927,45 @@ fn stat_activity_row(
     pid: u32,
     activity: &crate::session::Activity,
 ) -> Vec<Datum> {
+    let client = &activity.client;
     vec![
         Datum::Int8(i64::try_from(tenant).unwrap_or(i64::MAX)),
         datname.map_or(Datum::Null, Datum::Text),
         Datum::Int4(i32::try_from(pid).unwrap_or(i32::MAX)),
         // Not a parallel worker: there are none, so no backend here has a leader.
         Datum::Null,
+        // `usesysid` stays NULL: this node has no `pg_authid` oid to give a role.
         Datum::Null,
+        // **Who, from where, and since when** — all five were NULL or empty for every session
+        // this node ever had, which is how r1 came to have three thousand of them it could count
+        // and not chase (`debts-v1.1.md` #47). Measured on 19beta1, 2026-09-10: `usename` is the
+        // role that connected, `application_name` is `psql` for psql and the empty string for a
+        // client that sets none, `client_addr` is an **`inet`** and `client_port` an `integer`.
+        //
+        // A session with no socket under it — every in-process `Pair` and `Cluster` — answers
+        // NULL for the address and the port, which is what a real server answers for a connection
+        // over a Unix socket, and the nearest true thing this node can say.
+        Datum::Text(client.user.clone()),
+        Datum::Text(client.application_name.clone()),
+        client.address.as_deref().map_or(Datum::Null, |address| {
+            crate::value::inet::from_text(address, false).map_or(Datum::Null, |address| {
+                Datum::Inet {
+                    family: address.family,
+                    bits: address.bits,
+                    cidr: false,
+                    addr: address.addr,
+                }
+            })
+        }),
+        // `client_hostname` is NULL unless a server was told to look one up, and this one never
+        // is: PostgreSQL leaves it NULL without `log_hostname`, which is the default there too.
         Datum::Null,
-        Datum::Text(String::new()),
-        Datum::Null,
-        Datum::Null,
-        Datum::Null,
-        Datum::Null,
+        client.port.map_or(Datum::Null, Datum::Int4),
+        client.started.map_or(Datum::Null, Datum::TimestampTz),
+        // `xact_start`, `query_start` and `state_change` stay NULL, and not for the reason
+        // `backend_start` nearly did: those three are properties of a *statement*, which does
+        // have a transaction to read invariant 6's clock from, so they are a unit of their own
+        // and not a wall-clock question at all.
         Datum::Null,
         Datum::Null,
         Datum::Null,

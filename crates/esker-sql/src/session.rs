@@ -58,6 +58,49 @@ pub struct Activity {
     /// Whether the session is inside an open block, which is what makes `idle` into
     /// `idle in transaction` — a distinction PostgreSQL draws and this node did not.
     pub in_transaction: bool,
+    /// **Who is connected, and from where** — `usename`, `application_name`, `client_addr` and
+    /// `client_port`, which were NULL and empty in the view for every session this node has ever
+    /// had.
+    ///
+    /// r1 found this while it could not attribute a session leak: about three thousand sessions
+    /// were visible and nothing in the row said whose they were or when they had arrived, so the
+    /// leak could be counted and not chased (`debts-v1.1.md` #47). Measured on 19beta1,
+    /// 2026-09-10: `usename` is a `name`, `application_name` a `text` — `psql` for psql —
+    /// `client_addr` an **`inet`** and `client_port` an `integer`; `client_hostname` is NULL
+    /// unless the server was told to look one up, which this node is never told.
+    pub client: Client,
+}
+
+/// The half of an [`Activity`] that is fixed when the connection opens.
+///
+/// Separate because it is written once, at `open_session`, and never again — where the three
+/// fields above change with every statement. A session that never got that far has the default,
+/// which prints as the NULLs the view showed before any of this existed.
+#[derive(Debug, Default, Clone)]
+pub struct Client {
+    /// The role the startup packet asked to connect as.
+    pub user: String,
+    /// The `application_name` parameter, or empty when the client sent none — which is what
+    /// PostgreSQL shows for a client that does not set it.
+    pub application_name: String,
+    /// The peer's address, as its own text. `None` for a connection with no socket under it,
+    /// which is every in-process session (`Pair`, `Cluster`) and is exactly when PostgreSQL
+    /// answers NULL too.
+    pub address: Option<String>,
+    /// The peer's port, beside the address and NULL in the same cases.
+    pub port: Option<i32>,
+    /// When the session opened, in microseconds since the PostgreSQL epoch.
+    ///
+    /// **The wall clock, and it is the only reading of it in this crate.** Invariant 6 gives the
+    /// TSO's physical half as the only clock this node may read, and `now()`,
+    /// `clock_timestamp()` and every other value in a *statement* obey it — they are derived from
+    /// `txn.start_ts()`. A connection has no transaction: there is nothing to derive this from
+    /// short of asking the placement driver for a timestamp per connection, which is a round trip
+    /// to fill in a display column. Ruled by the user on 2026-09-10: the constitution forbids the
+    /// wall clock for **ordering**, and this orders nothing — no comparison, no key, no MVCC
+    /// version reads it. `tests/session_identity.rs` measures how far it is from the node's own
+    /// clock, because on a `MemoryBackend` the two are days apart and a reader has to know that.
+    pub started: Option<i64>,
 }
 
 /// One row of `pg_prepared_statements`: a statement this session has named.
