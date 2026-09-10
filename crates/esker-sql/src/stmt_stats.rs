@@ -259,8 +259,13 @@ fn start_reporting() {
 
 /// Empties this thread's trace, so a caller can tell "read nothing" from "was never asked".
 ///
-/// A statement that does not reach [`begin`] — transaction control goes a different way — would
-/// otherwise leave the previous statement's list in place and a census would read it as its own.
+/// A statement that does not reach the per-statement guard — transaction control goes a different
+/// way — would otherwise leave the previous statement's list in place and a census would read it
+/// as its own.
+///
+/// **Not a link to `begin`**, which is `pub(crate)`: a `pub` item's doc that links a private one is
+/// `cargo doc`'s `-D warnings` on the workspace, and it is invisible to `cargo clippy --all-targets`
+/// — which is how this reached a gate (`intra-doc links resolve where they are written`).
 pub fn clear_trace() {
     TRACE.with(|reads| {
         if let Ok(mut reads) = reads.try_borrow_mut() {
