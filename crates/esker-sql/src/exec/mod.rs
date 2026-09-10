@@ -4338,6 +4338,27 @@ fn void_value() -> crate::plan::Expr {
 
 fn field_of(column: &query::OutputColumn) -> FieldDescription {
     match (&column.user_type, column.pseudo) {
+        // **A domain sends its BASE type and the domain's typmod**, which is the one user-defined
+        // kind that does not send its own oid — PostgreSQL's `printtup.c` says so in as many
+        // words: *"If column is a domain, send the base type and typmod instead"*.
+        //
+        // Measured on 19beta1 through the `RowDescription` bytes, not through a view of the plan:
+        // `information_schema.tables.table_name` is **19** (`name`), `columns.is_nullable` is
+        // **1043 with typmod 7** — the base type carrying the *domain's* width — and a user
+        // `CREATE DOMAIN d AS integer` column is **23**.
+        //
+        // **This ADR 0103 got wrong and shipped**, from `pg_prepared_statements.result_types`,
+        // which answers `information_schema.sql_identifier` for the same query. That is the plan's
+        // type and `pg_typeof` agrees with it; the wire does not. Two answers, and only the bytes
+        // are the wire (`tests/domain.rs`, `docs/adr/0103-…`).
+        //
+        // **The `pg_type` domain rows stay** — `ActiveRecord` loads its type map with
+        // `typtype IN ('r','e','d')` and a real server has those rows too. What it must never meet
+        // is an oid on the wire it has no decoder for, and sending the base is what makes both
+        // true at once.
+        (Some(def), _) if let crate::catalog::TypeKind::Domain { base, typmod, .. } = &def.kind => {
+            FieldDescription::of(column.name.clone(), *base, *typmod)
+        }
         // The type's own oid, and the **rendered** value's width: an enum is an ordinal in the row
         // and a variable-length label on the wire.
         (Some(def), _) => FieldDescription::of_user_type(

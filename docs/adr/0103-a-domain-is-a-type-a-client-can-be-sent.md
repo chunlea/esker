@@ -192,6 +192,34 @@ this project has been bitten three times by *right bytes, wrong declared type* (
 the milestone a **choice about when**, with no test currently forcing it, which is what a milestone
 the user sets should look like.
 
+## Corrected: shape A sends the BASE type on the wire, 2026-09-10
+
+**The third family shipped a regression and this is where it is recorded, not quietly fixed.**
+
+**`pg_prepared_statements.result_types` is not the wire either.** It is the **plan's** type, and
+`\gdesc` is the **client's** rendering, and the `RowDescription` bytes are neither: for
+`SELECT table_name FROM information_schema.tables`, `result_types` says
+`information_schema.sql_identifier`, `\gdesc` says `name`, and the wire says **19 (`name`)** —
+`\gdesc` being right here for its own reason. PostgreSQL's `printtup.c` replaces a domain on the
+way out, in as many words: *"If column is a domain, send the base type and typmod instead"*.
+Measured through `PG::Result#ftype`, which reads those bytes: `table_name` **19** fmod -1,
+`is_nullable` **1043 fmod 7** (the base type carrying the *domain's* width), `ordinal_position`
+**23**, and a user `CREATE DOMAIN d AS integer` column **23** on both protocol paths.
+
+So `37745bc7` made `information_schema.tables.table_name` leave this node as **13361** where
+PostgreSQL sends **19**, and r1's wire baseline caught it in run 116/117. The fix is one arm in
+`exec::mod`'s `field_of`: a `TypeKind::Domain` sends `FieldDescription::of(base, domain's typmod)`
+where every other user-defined kind sends its own oid.
+
+**What does not change**: the `pg_type` domain rows of family two, which a real server has too, and
+`pg_typeof`, which answers the **plan's** type — `information_schema.sql_identifier` — on both
+servers. Those two were right and stay.
+
+**The lesson this ADR is now the record of**: *a type has at least three answers — the plan's, the
+client's rendering, and the bytes — and only the bytes are the wire.* This document reasoned from
+the first and called it the third. `tests/domain.rs::a_domain_column_declares_its_base_type_on_the_wire`
+is the pin, measured through `PG::Result#ftype`.
+
 ## Decided: shape A, 2026-09-10
 
 **Status: accepted.** The user's ruling was to build it, and this section is what was built and

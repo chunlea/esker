@@ -801,7 +801,9 @@ fn type_name(oid: u32, typmod: i32) -> String {
     // **A domain is printed as its base, which is what the capture holds.** `psql` resolves
     // `typbasetype` for display: `\gdesc` of `information_schema.columns.is_nullable` says
     // `character varying(3)` where the `RowDescription` carries 13369 — measured on 19beta1
-    // through `pg_prepared_statements.result_types`, which reads the wire and says
+    // through `pg_prepared_statements.result_types`, which is the **plan's** type and not the
+    // wire's — a distinction ADR 0103 got wrong once, and the corpora hold the client's rendering
+    // either way, which is all this function needs — and says
     // `information_schema.yes_or_no`. The corpora were captured through the client, so this side
     // has to render the same way or two servers that agree exactly would be reported as
     // disagreeing (ADR 0103, `debts-v1.1.md` #37).
