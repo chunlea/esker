@@ -496,6 +496,85 @@ fn a_flush_moves_data_to_l0_and_reads_still_find_it() {
     );
 }
 
+/// How long the sweep is parked. Long enough that a `flush()` which does not wait for it returns
+/// well inside the hold, and short enough that the test costs half a second.
+const SWEEP_HOLD: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Parks the obsolete-file sweep, so that the window between "the memtable is retired" and "the
+/// old files are gone" can be observed instead of raced for.
+#[derive(Debug, Default)]
+struct HoldTheSweep {
+    armed: std::sync::atomic::AtomicBool,
+    entered: std::sync::atomic::AtomicBool,
+}
+
+impl esker_engine::testing::PauseHook for HoldTheSweep {
+    fn pause(&self, point: esker_engine::testing::PausePoint) {
+        use std::sync::atomic::Ordering;
+        if point == esker_engine::testing::PausePoint::SweptDirectoryBeforePending
+            && self.armed.load(Ordering::Acquire)
+            && !self.entered.swap(true, Ordering::AcqRel)
+        {
+            std::thread::sleep(SWEEP_HOLD);
+        }
+    }
+}
+
+/// **`flush()` returns when the flush is finished, sweep included.**
+///
+/// The contract behind `flushed_data_survives_a_reopen_and_the_old_log_is_reclaimed`, which
+/// asserts the old WAL segment is gone the instant `flush()` returns. That test went red once on
+/// 2026-09-10 under load 12 and green on the re-run, with nothing on either side touching this
+/// crate — the signature of a race it has always had rather than a regression.
+///
+/// The window is in `flush_one`: `immutable.remove(0)` — which is what `wait_for_flush`'s predicate
+/// watches — happens **three steps before** `purge_and_evict`, and the two steps in between include
+/// `advance_log_number`'s durable manifest edit. Load does not create the race; it stretches an
+/// fsync inside a window that was always open.
+///
+/// So this holds the window open on purpose rather than sampling it. With the sweep parked, a
+/// `flush()` that returns early returns *inside* the hold — and the two assertions say so in the
+/// two ways that cannot both be satisfied by accident: the segment is gone, **and** the call took
+/// at least as long as the hold, which is the ordering rather than the timing.
+#[test]
+fn flush_returns_only_after_the_obsolete_files_are_swept() {
+    let hook = Arc::new(HoldTheSweep::default());
+    let (memfs, fs) = memfs();
+    let db = open(
+        &fs,
+        Options {
+            create_if_missing: true,
+            pause_hook: Some(Arc::clone(&hook) as Arc<dyn esker_engine::testing::PauseHook>),
+            ..Options::default()
+        },
+        &[cf::DEFAULT],
+    )
+    .unwrap();
+
+    let old_log = db.wal_number().unwrap();
+    for i in 0..50u32 {
+        db.put(cf::DEFAULT, format!("k{i:03}").as_bytes(), b"v")
+            .unwrap();
+    }
+
+    hook.armed.store(true, std::sync::atomic::Ordering::Release);
+    let began = std::time::Instant::now();
+    db.flush(cf::DEFAULT).unwrap();
+    let took = began.elapsed();
+
+    assert!(
+        !memfs
+            .exists(&filename::wal(std::path::Path::new(DIR), old_log))
+            .unwrap(),
+        "`flush` returned while the obsolete-file sweep was still parked, so the segment it \
+         reclaims was still there — the window is `immutable.remove(0)` to `purge_and_evict`"
+    );
+    assert!(
+        took >= SWEEP_HOLD,
+        "`flush` returned in {took:?} without waiting for a sweep parked for {SWEEP_HOLD:?}"
+    );
+}
+
 #[test]
 fn flushed_data_survives_a_reopen_and_the_old_log_is_reclaimed() {
     let (memfs, fs) = memfs();

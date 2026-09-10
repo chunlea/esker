@@ -249,6 +249,18 @@ pub(crate) struct MemState {
     /// Oldest first, each with the log segment it was filled from. The newest is at the back,
     /// so a read walks it backwards.
     pub(crate) immutable: Vec<(Arc<MemTable>, u64)>,
+    /// **How many flushes of this family have finished, sweep included.**
+    ///
+    /// `immutable` empties three steps before the obsolete-file sweep runs, so a caller waiting
+    /// on `immutable.is_empty()` was told its flush was done while the segment that flush
+    /// reclaims was still on disk — the race
+    /// `flushed_data_survives_a_reopen_and_the_old_log_is_reclaimed` lost once under load on
+    /// 2026-09-10. This is bumped after the sweep and under this same lock, so a waiter that
+    /// samples it before signalling has one predicate for "the whole job is over".
+    ///
+    /// Per family rather than one counter for the database: another family's flush finishing
+    /// inside ours would otherwise satisfy the wait.
+    pub(crate) swept: u64,
 }
 
 impl ColumnFamily {
@@ -267,6 +279,7 @@ impl ColumnFamily {
                 active: Arc::new(MemTable::new(Arc::clone(comparator))),
                 active_log: log_number,
                 immutable: Vec::new(),
+                swept: 0,
             }),
         }
     }
