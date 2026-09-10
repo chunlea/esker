@@ -1,0 +1,27 @@
+crates/esker-cli/src/args.rs
+  s_2bed4ac2b1c944::t_4d4af60ff21dfa 73-87,205-208,483,890-985
+crates/esker-cli/src/durability.rs
+  s_2bed4ac2b1c944::t_b2ea25cb723af3 1-377
+crates/esker-cli/src/main.rs
+  s_2bed4ac2b1c944::t_e0a554fb8c54aa 19,67-88,127
+crates/esker-cli/tests/durability_rehearsal.rs
+  s_2bed4ac2b1c944::t_898a89c344ff0d 1-216
+docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md
+  s_2bed4ac2b1c944::t_84229fb931d184 577-608
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6e5b590182cd2aa265e336c57d3231b6b8be8411",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
