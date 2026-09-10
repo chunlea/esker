@@ -576,6 +576,7 @@ impl Gate {
     /// [`Gate::start_splitting`], with the two numbers that decide how much Raft one process is
     /// driving: the tick every group counts in, and how many threads the pool spreads them over.
     async fn start_with(split_size: u64, tick: Duration, workers: usize) -> Self {
+        println!("{}", the_box_right_now("starting a cluster"));
         let pd_listener = reserve();
         let pd_address = pd_listener.local_addr().unwrap();
         let listeners: Vec<std::net::TcpListener> = (0..STORES).map(|_| reserve()).collect();
@@ -983,6 +984,7 @@ impl Gate {
     }
 
     async fn stop(mut self) {
+        println!("{}", the_box_right_now("stopping a cluster"));
         for node in self.nodes.drain(..) {
             node.store.stop();
             let _ = node.handle.shutdown().await;
@@ -1438,6 +1440,61 @@ async fn a_splitting_bulk_load_never_fails_for_want_of_attempts() {
          time left:\n  {}",
         counted.join("\n  ")
     );
+}
+
+/// **What the box was doing, printed rather than asserted.**
+///
+/// A duration measured here is worth what the machine was doing while it was taken, and this lane
+/// has already read one wrong: two runs of one test took 214 s and then over 400 s, and the
+/// obvious culprit — a gate — turned out not to have been running at all. The chain log said so;
+/// a twelve-second sample extrapolated backwards said otherwise, and it was the sample that was
+/// wrong. So every cluster this file starts prints the environment at both ends, and a reader
+/// comparing two numbers can see whether they were taken in the same world.
+///
+/// **Printed and never asserted.** A test that fails because another lane was busy is a worse
+/// test than one that is slow, and the number this is here to explain is the *duration*, not the
+/// verdict.
+///
+/// From `/proc`, which is the **Linux VM's** — so it moves when another lane's *container* runs
+/// and is **blind to the host**, where a `cargo build` competes for the same physical cores. That
+/// is why the sampler in `esker-coord/h1/env-sampler.sh` counts host compilers beside this: a
+/// number taken here with no sampler next to it can be slow for a reason this line cannot show.
+///
+/// **And a line like this is worth more than the theories it replaces.** The two runs that
+/// prompted it were attributed to a gate, then to another lane, then to a compile inside the
+/// deadline — three times, each refused by evidence somebody had to go and find: the chain log,
+/// the transcript re-read *with the dates on*, and the runner's own first line
+/// (*Finished `test` profile … in 0.09s*). None of it needed a theory, and all of it would
+/// have been in this line.
+fn the_box_right_now(what: &str) -> String {
+    let load = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| {
+            text.split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .into()
+        })
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let free = std::fs::read_to_string("/proc/meminfo").ok().map_or_else(
+        || "unavailable".to_owned(),
+        |text| {
+            let field = |name: &str| {
+                text.lines()
+                    .find(|line| line.starts_with(name))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|kb| kb.parse::<u64>().ok())
+                    .map_or_else(|| "?".to_owned(), |kb| format!("{} MB", kb / 1024))
+            };
+            format!(
+                "free {}, available {}",
+                field("MemFree:"),
+                field("MemAvailable:")
+            )
+        },
+    );
+    format!("  [box] {what}: load {load}, {free}")
 }
 
 /// **Does the leaderless window move with what the process is driving?** — `docs/plans/debts-v1.1.md`
