@@ -56,7 +56,7 @@ SAVEPOINT sp_bpchar_xml		-
 SELECT (c_bpchar)::xml FROM castprobe		ab  
 ROLLBACK TO sp_bpchar_xml		-
 SAVEPOINT sp_bytea_uuid		-
-SELECT (c_bytea)::uuid FROM castprobe		!invalid input length for type uuid\nDETAIL:  Expected 16 bytes, got 2.
+SELECT (c_bytea)::uuid FROM castprobe	!22P03 invalid input length for type uuid DETAIL: Expected 16 bytes, got 2.
 ROLLBACK TO sp_bytea_uuid		-
 SAVEPOINT sp_char_bpchar		-
 SELECT (c_char)::bpchar FROM castprobe		a

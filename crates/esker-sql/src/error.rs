@@ -913,6 +913,23 @@ pub enum SqlError {
     #[error("open path cannot be converted to polygon")]
     OpenPathIsNotAPolygon,
 
+    /// `'\x4142'::bytea::uuid`: a `bytea` that is not sixteen bytes.
+    ///
+    /// **A length, not a syntax**, and PostgreSQL has a class of its own for it: `22P03`, invalid
+    /// binary representation — where a `uuid` read from *text* that will not parse is the ordinary
+    /// `22P02`. This node routed the cast through the text and blamed the syntax of `\x4142`,
+    /// which is a sentence about the wrong thing: the bytes are perfectly good bytes and there are
+    /// two of them.
+    ///
+    /// Measured on 19beta1, 2026-09-10, with `VERBOSITY verbose`:
+    /// `22P03: invalid input length for type uuid` with `DETAIL:  Expected 16 bytes, got 2.`
+    /// (`debts-v1.1.md` #44, group 5).
+    #[error("invalid input length for type uuid")]
+    UuidLength {
+        /// How many bytes arrived, which the `DETAIL` names.
+        got: usize,
+    },
+
     /// `'{"a":1}'::jsonb::numeric`: a `jsonb` whose **shape** is not the target's.
     ///
     /// **The shape is refused before the value is read**, which is the whole of this variant:
@@ -3208,6 +3225,10 @@ impl SqlError {
             | SqlError::FloatOverflow => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::DivisionByZero => sqlstate::DIVISION_BY_ZERO,
             SqlError::MalformedArrayLiteral { .. } => sqlstate::INVALID_TEXT_REPRESENTATION,
+            // **The bytes are not the text**, which is why this is not the `22P02` beside it: a
+            // `bytea` handed to a `uuid` is sixteen bytes or it is nothing, and its length is the
+            // complaint. Measured.
+            SqlError::UuidLength { .. } => sqlstate::INVALID_BINARY_REPRESENTATION,
             SqlError::ArrayExpressionDimensions
             | SqlError::ArrayAccumulateDimensions
             | SqlError::ArrayAccumulateEmpty => sqlstate::ARRAY_SUBSCRIPT_ERROR,
@@ -3460,6 +3481,9 @@ impl SqlError {
             SqlError::InvalidCidrValue(_) => {
                 Some("Value has bits set to right of mask.".to_owned())
             }
+            // Measured: `Expected 16 bytes, got 2.` — the count is the bytes that arrived, and the
+            // sixteen is the type's own width rather than a number this sentence carries.
+            SqlError::UuidLength { got } => Some(format!("Expected 16 bytes, got {got}.")),
             // Empty for the `timezone` spellings, which carry no DETAIL on a real server.
             SqlError::DateTruncUnitNotSupported { detail, .. } if !detail.is_empty() => {
                 Some(detail.clone())

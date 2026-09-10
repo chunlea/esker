@@ -74,6 +74,12 @@ pub const ARRAY_SUBSCRIPT_ERROR: &str = "2202E";
 
 /// A literal could not be read as its target type — `'abc'::int8`.
 pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
+/// A value whose **bytes** are not a valid representation, where the text would be `22P02`.
+///
+/// `'\x4142'::bytea::uuid` is the one this node has: the bytes are good bytes and there are two of
+/// them, so the length is what is wrong and PostgreSQL says so in a class of its own. Measured on
+/// 19beta1 with `VERBOSITY verbose` (`debts-v1.1.md` #44).
+pub const INVALID_BINARY_REPRESENTATION: &str = "22P03";
 /// `2200N invalid_xml_content` — `'<a>'::xml`. **Its own class**, not the `22P02` every other
 /// input function raises, because the SQL/XML standard gives XML its own set of data exceptions.
 pub const INVALID_XML_CONTENT: &str = "2200N";
