@@ -2778,7 +2778,9 @@ fn user_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
             // Not an array, so no element type — the array row below is the one with one.
             Datum::Int8(0),
             Datum::Text(",".to_owned()),
-            Datum::Text(format!("{bare}_in")),
+            // **The kind's input function, not the type's name.** This was `format!("{bare}_in")`
+            // and named a function that exists on no server (`debts-v1.1.md` #37).
+            Datum::Text(def.kind.typinput().to_owned()),
             Datum::Text(def.kind.typtype().to_owned()),
             // **`typbasetype` is the domain's base type and zero for everything else** — measured,
             // `typbasetype::regtype` over `custom_money` prints `numeric`. It is the column a
