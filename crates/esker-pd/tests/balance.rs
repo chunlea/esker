@@ -318,7 +318,7 @@ impl Harness {
         // A round is a region-heartbeat interval (`docs/DESIGN.md` §14), so a region's balance
         // cooldown expires after a few of them rather than never.
         self.clock.advance(self.tick_ms);
-        if self.rounds % self.store_report_every == 0 {
+        if self.rounds.is_multiple_of(self.store_report_every) {
             for store_id in &self.model.stores {
                 self.pd
                     .store_heartbeat(&StoreBeat {

@@ -135,6 +135,10 @@ impl Drop for Db {
 pub(crate) struct DbInner {
     pub(crate) fs: Arc<dyn FileSystem>,
     pub(crate) dir: PathBuf,
+    /// This process's claim on [`dir`](Self::dir), held for as long as the database is open and
+    /// released when it closes — or when the process dies, which is the case that matters.
+    #[expect(dead_code, reason = "held for its lifetime, never read")]
+    pub(crate) directory: Box<dyn crate::fs::DirectoryLock>,
     pub(crate) options: Options,
     pub(crate) comparator: Arc<InternalKeyComparator>,
     pub(crate) versions: Mutex<VersionSet>,

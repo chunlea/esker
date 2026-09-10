@@ -107,7 +107,7 @@ impl Cluster {
             .collect();
         let inside: Vec<RaftId> = config.voters.clone();
 
-        let add = pick % 2 == 0 || inside.len() <= 3;
+        let add = pick.is_multiple_of(2) || inside.len() <= 3;
         if add && !outside.is_empty() {
             let at = usize::try_from(pick % outside.len() as u64).unwrap_or(0);
             return Some(esker_raft::ConfChange::new(

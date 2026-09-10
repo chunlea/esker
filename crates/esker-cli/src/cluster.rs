@@ -274,7 +274,7 @@ fn start(
     // An even group has no advantage over the odd one below it — four nodes tolerate one
     // failure, exactly as three do — and it makes a split-brain-looking two-two partition
     // possible. Worth saying rather than silently allowing.
-    if nodes % 2 == 0 {
+    if nodes.is_multiple_of(2) {
         eprintln!(
             "esker cluster: {nodes} is an even number of nodes; it tolerates no more failures \
              than {} and can split evenly",

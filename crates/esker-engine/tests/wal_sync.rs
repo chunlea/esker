@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use esker_engine::memfs::MemFileSystem;
 use esker_engine::{
-    Db, FileSystem, Options, RandomAccessFile, SyncCall, WalSyncMode, WritableFile, WriteOptions,
-    cf,
+    Db, DirectoryLock, FileSystem, Options, RandomAccessFile, SyncCall, WalSyncMode, WritableFile,
+    WriteOptions, cf,
 };
 
 /// A filesystem that counts `sync_data` per path and otherwise gets out of the way.
@@ -114,6 +114,10 @@ impl FileSystem for CountingFs {
     }
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.inner.hard_link(from, to)
+    }
+
+    fn lock_directory(&self, dir: &Path) -> io::Result<Box<dyn DirectoryLock>> {
+        self.inner.lock_directory(dir)
     }
 }
 

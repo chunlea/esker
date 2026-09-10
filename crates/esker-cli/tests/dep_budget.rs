@@ -306,10 +306,10 @@ impl Graph {
                     continue;
                 }
                 queue.push(dependency.clone());
-                if !self.members.contains(dependency) {
-                    if let Some(name) = self.names.get(dependency) {
-                        external.insert(name.clone());
-                    }
+                if !self.members.contains(dependency)
+                    && let Some(name) = self.names.get(dependency)
+                {
+                    external.insert(name.clone());
                 }
             }
         }

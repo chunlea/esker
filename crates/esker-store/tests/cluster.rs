@@ -122,12 +122,11 @@ async fn settled_leader(nodes: &[Node]) -> usize {
             let at = nodes
                 .iter()
                 .position(|node| node.store.peer().unwrap().peer_id() == leader);
-            if let Some(at) = at {
-                if unanimous
-                    && nodes[at].store.peer().unwrap().status().await.unwrap().role == Role::Leader
-                {
-                    return at;
-                }
+            if let Some(at) = at
+                && unanimous
+                && nodes[at].store.peer().unwrap().status().await.unwrap().role == Role::Leader
+            {
+                return at;
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

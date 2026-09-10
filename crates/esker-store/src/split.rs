@@ -131,7 +131,7 @@ pub fn choose_split_key(
     let mut seen: u64 = 0;
 
     while let Some(user) = keys.next_key()? {
-        if seen % stride == 0 {
+        if seen.is_multiple_of(stride) {
             samples.push(Bytes::from(user));
             if samples.len() == max_sampled {
                 // Keep every second sample and look at half as many from here on, so the sample

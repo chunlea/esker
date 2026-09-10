@@ -140,46 +140,49 @@ impl Drop for Supervisor {
     }
 }
 
-/// What `esker pd inspect` says about the driver's own directory.
-fn inspect(pd_dir: &Path) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_esker-cli"))
-        .arg("pd")
-        .arg("inspect")
-        .arg("--data-dir")
-        .arg(pd_dir)
-        .output()
-        .expect("`pd inspect` runs");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+/// What the cluster has said so far, as the supervisor and its children wrote it.
+fn said(log: &Path) -> String {
+    std::fs::read_to_string(log).unwrap_or_default()
 }
 
-/// How many stores `pd inspect` says have registered, or zero before it has said.
+/// How many stores have told the driver they exist, from the line each one prints when it has.
 ///
-/// The count is the progress signal the wait below is measured against, and it is read from the
-/// line `crates/esker-cli/src/pd.rs` prints as `stores ({n})`. A format change here loses the
-/// signal rather than corrupting it: the success condition is the whole `stores (4)` string, so
-/// a parser that stopped matching would leave the wait to its ceiling and never pass wrongly.
+/// **This used to be `esker pd inspect` on the running driver's data directory**, which is the
+/// count as PD holds it — a better place to read it from, and one that is no longer readable
+/// while the driver is up. `pd inspect` opens the directory with `Db::open_with`, and an engine
+/// open is not read-only: it replays the log, writes a fresh WAL segment and appends a manifest
+/// edit. So a poll every 200 ms for a minute was writing into the database a live driver was
+/// writing to, which is the two-writers case that `esker-engine`'s directory claim now refuses —
+/// see `esker-cli/tests/data_dir_lock.rs`. The tool's own module doc has always said it is for a
+/// *stopped* driver (`esker-pd/src/inspect.rs`); nothing enforced it.
+///
+/// What is left is the same fact one hop later: `esker server` prints this line **after** the
+/// driver has answered its registration, so a store that has printed it is a store PD recorded.
+/// The gap between the two readings is a driver that answered and then lost the record, which
+/// invariant 1 does not allow.
 fn registered_stores(seen: &str) -> u64 {
     seen.lines()
-        .find_map(|line| line.strip_prefix("stores ("))
-        .and_then(|rest| rest.strip_suffix(')'))
-        .and_then(|count| count.parse().ok())
-        .unwrap_or(0)
+        .filter(|line| line.contains("registered with the placement driver"))
+        .count() as u64
 }
 
-/// The parser reads the line the tool actually writes, spelled here the way `pd.rs` spells it.
+/// The parser reads the line the store actually writes, spelled here the way `server.rs` spells it.
 #[test]
-fn the_store_count_is_read_from_the_line_pd_inspect_prints() {
-    let inspected = "id reserved    1000\n\nstores (3)\n     1  127.0.0.1:1  last beat 0 ms\n";
-    assert_eq!(registered_stores(inspected), 3);
-    assert_eq!(registered_stores("cluster        (not bootstrapped)"), 0);
-    assert_eq!(registered_stores("stores (0)"), 0);
+fn the_store_count_is_read_from_the_line_a_store_prints_when_it_registers() {
+    let seen = "esker server: store 2 listening on 127.0.0.1:27701, data in /tmp/node-2\n\
+                esker server: registered with the placement driver at 127.0.0.1:27704\n\
+                esker server: registered with the placement driver at 127.0.0.1:27704\n";
+    assert_eq!(registered_stores(seen), 2);
+    assert_eq!(registered_stores("esker cluster: 4 nodes started"), 0);
+    assert_eq!(registered_stores(""), 0);
 }
 
 /// Every store the command started registers with the driver it started for them.
 ///
-/// The assertion is `stores (4)` and not "four processes are alive", because a store that is alive
-/// and has not registered is the same failure to anyone using the cluster — and because PD's view
-/// is what every later operator is decided from.
+/// The assertion is four registrations and not "four processes are alive", because a store that is
+/// alive and has not registered is the same failure to anyone using the cluster. It was PD's own
+/// count until PD's directory became unreadable from outside while it runs; see
+/// [`registered_stores`] for what changed and why the store's line is the same fact.
 ///
 /// **This is an outcome test and not a race-forcing one**, and it is worth being plain about that:
 /// on a warm binary the driver binds in a few milliseconds and the stores would very likely have
@@ -195,6 +198,11 @@ fn a_four_node_cluster_with_a_driver_registers_four_stores() {
     let base_port = free_port_run();
     warm_the_binary();
 
+    // One file, opened once and shared by both streams: two `create`s would truncate each other.
+    let log = data_dir.path().join("cluster.log");
+    let out = std::fs::File::create(&log).expect("the cluster log");
+    let errors = out.try_clone().expect("the cluster log");
+
     let mut supervisor = Supervisor(
         Command::new(env!("CARGO_BIN_EXE_esker-cli"))
             .arg("cluster")
@@ -206,8 +214,10 @@ fn a_four_node_cluster_with_a_driver_registers_four_stores() {
             .arg("--base-port")
             .arg(base_port.to_string())
             .arg("--pd")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Kept, not discarded: the stores' own registration lines are what this test waits
+            // on, and a cluster that does not come up says why here and nowhere else.
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(errors))
             .spawn()
             .expect("the cluster command starts"),
     );
@@ -216,7 +226,6 @@ fn a_four_node_cluster_with_a_driver_registers_four_stores() {
     // minute a *placement* decision takes: nothing here waits on a region heartbeat. And what it
     // waits on is a count that only goes up, so that is what it is measured against rather than a
     // stopwatch — see [`PER_STORE`].
-    let pd_dir = data_dir.path().join("pd");
     let started = Instant::now();
     let mut progressed = started;
     let mut registered = 0;
@@ -236,12 +245,12 @@ fn a_four_node_cluster_with_a_driver_registers_four_stores() {
                  cluster. what the driver had seen by then:\n{seen}"
             );
         }
-        seen = inspect(&pd_dir);
-        if seen.contains(&format!("stores ({NODES})")) {
+        seen = said(&log);
+        let count = registered_stores(&seen);
+        if count >= NODES {
             return;
         }
         let now = Instant::now();
-        let count = registered_stores(&seen);
         if count > registered {
             registered = count;
             progressed = now;

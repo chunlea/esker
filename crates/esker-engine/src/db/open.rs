@@ -26,7 +26,7 @@ use crate::batch::WriteBatch;
 use crate::dbformat::{InternalKeyComparator, SeqNo};
 use crate::error::{Error, IoResultExt, Result};
 use crate::filename::{self, FileKind};
-use crate::fs::{FileSystem, LocalFileSystem, SstTier};
+use crate::fs::{DirectoryLock, FileSystem, LocalFileSystem, SstTier};
 use crate::options::Options;
 use crate::version::{VersionEdit, VersionSet};
 use crate::wal::{LogReader, LogWriter, ReadOutcome};
@@ -63,7 +63,7 @@ impl Db {
         let dir = path.as_ref().to_path_buf();
         let dir_for_error = dir.clone();
         let comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&options.comparator)));
-        let mut versions = open_versions(&fs, &dir, &comparator, &options, cfs)?;
+        let (mut versions, directory) = open_versions(&fs, &dir, &comparator, &options, cfs)?;
 
         // Build a column family for every family the manifest knows about, not only the ones
         // the caller named. The log number is filled in below, once replay has said which
@@ -125,6 +125,7 @@ impl Db {
         let inner = Arc::new(DbInner {
             fs,
             dir,
+            directory,
             options,
             comparator,
             versions: Mutex::new(versions),
@@ -265,13 +266,44 @@ fn spawn_background(inner: &Arc<DbInner>, dir: &Path) -> Result<Background> {
 
 /// Creates or recovers the version set, and makes sure every column family the caller named
 /// exists.
+/// Claims `dir` for this process, or says who has it.
+///
+/// The refusal is [`Error::InUse`] and never a wait: two writers on one LSM tree is the failure
+/// this prevents, and a node that blocked here instead would be a node an operator reads as hung.
+fn claim(fs: &dyn FileSystem, dir: &Path) -> Result<Box<dyn DirectoryLock>> {
+    match fs.lock_directory(dir) {
+        Ok(lock) => Ok(lock),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(Error::InUse {
+            dir: dir.to_path_buf(),
+        }),
+        Err(error) => Err(Error::io(dir, error)),
+    }
+}
+
+/// The version set, and this process's claim on the directory it came from.
+///
+/// **The claim is taken before the first byte is read or written**, which is why it is here rather
+/// than in the caller: this function is where the directory either exists, comes to exist, or is
+/// refused, and the claim has to be on the near side of all three.
+///
+/// It takes two attempts and not one. A directory that is not there yet cannot be claimed, and
+/// creating one in order to claim it would make an open that is about to refuse leave a directory
+/// behind to prove it was here — `create_if_missing` is off by default, so that refusal is the
+/// common case for a mistyped path. A database that is created instead is claimed the moment it
+/// exists, and two processes creating one at the same instant are separated by `CURRENT`, which
+/// [`VersionSet::create`] creates exclusively.
 fn open_versions(
     fs: &Arc<dyn FileSystem>,
     dir: &Path,
     comparator: &Arc<InternalKeyComparator>,
     options: &Options,
     cfs: &[&str],
-) -> Result<VersionSet> {
+) -> Result<(VersionSet, Box<dyn DirectoryLock>)> {
+    let claimed = if fs.exists(dir).at(dir)? {
+        Some(claim(fs.as_ref(), dir)?)
+    } else {
+        None
+    };
     let current = filename::current(dir);
     let exists = fs.exists(&current).at(&current)?;
     if exists && options.error_if_exists {
@@ -303,12 +335,18 @@ fn open_versions(
         )));
     };
 
+    // Before `create_cf` below, which writes a manifest edit.
+    let directory = match claimed {
+        Some(lock) => lock,
+        None => claim(fs.as_ref(), dir)?,
+    };
+
     for name in cfs {
         if versions.cf_id(name).is_none() {
             versions.create_cf(name)?;
         }
     }
-    Ok(versions)
+    Ok((versions, directory))
 }
 
 /// What replaying the log found.

@@ -16,7 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::fs::{FileSystem, RandomAccessFile, WritableFile};
+use crate::fs::{DirectoryLock, FileSystem, RandomAccessFile, WritableFile};
 
 /// One file's bytes, shared by every handle and hard link to it.
 type Shared = Arc<Mutex<FileData>>;
@@ -207,7 +207,30 @@ impl FileSystem for MemFileSystem {
         inner.files.insert(to.to_path_buf(), shared);
         Ok(())
     }
+
+    /// Hands a claim to anybody, on purpose.
+    ///
+    /// **An in-memory filesystem models a disk, not a machine.** The thing a directory claim
+    /// prevents is two *processes* writing one tree, and there are no processes here — while the
+    /// tests that share one of these are modelling exactly the arrangement a claim would forbid:
+    /// `esker-engine/tests/wal_sync_crash.rs` `mem::forget`s a `Db` to model a machine that ran
+    /// no destructor, and then opens the same directory again, which is what a reboot does. A
+    /// claim held by a `Db` nobody will ever drop would make a power loss unmodellable and
+    /// protect nothing that a deployment has.
+    ///
+    /// Stated here rather than left to a trait default, which is the difference between a
+    /// decision and an opt-out: [`crate::fs::LocalFileSystem`] is where the rule lives, because
+    /// that is where the processes are.
+    fn lock_directory(&self, _dir: &Path) -> io::Result<Box<dyn DirectoryLock>> {
+        Ok(Box::new(MemDirectoryLock))
+    }
 }
+
+/// A claim on a directory of a [`MemFileSystem`]: nothing, held.
+#[derive(Debug)]
+struct MemDirectoryLock;
+
+impl DirectoryLock for MemDirectoryLock {}
 
 /// An appendable in-memory file.
 #[derive(Debug)]

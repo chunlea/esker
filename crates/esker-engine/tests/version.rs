@@ -131,7 +131,7 @@ use std::sync::{Arc, Mutex};
 use esker_engine::dbformat::{BytewiseComparator, Comparator, InternalKeyComparator};
 use esker_engine::error::Error;
 use esker_engine::filename;
-use esker_engine::fs::{FileSystem, RandomAccessFile, WritableFile};
+use esker_engine::fs::{DirectoryLock, FileSystem, RandomAccessFile, WritableFile};
 use esker_engine::memfs::MemFileSystem;
 use esker_engine::version::{Version, VersionSet};
 
@@ -223,6 +223,10 @@ impl FileSystem for CrashFs {
     }
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.inner.hard_link(from, to)
+    }
+
+    fn lock_directory(&self, dir: &Path) -> io::Result<Box<dyn DirectoryLock>> {
+        self.inner.lock_directory(dir)
     }
 }
 

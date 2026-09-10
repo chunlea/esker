@@ -83,6 +83,18 @@ pub enum Error {
     /// storage engine starts returning keys that are not there.
     #[error("database must be reopened: {0}")]
     Poisoned(String),
+
+    /// The data directory already has a writer.
+    ///
+    /// A directory holds one database and a database has one writer, and until this existed
+    /// nothing said so: a second process opened the same tree and wrote its own WAL segments and
+    /// manifests into it. An error and never a panic (invariant 9), and never a wait — a node
+    /// that blocked here would be a node an operator reads as hung.
+    #[error("{dir} is open in another process")]
+    InUse {
+        /// The directory somebody else holds.
+        dir: PathBuf,
+    },
 }
 
 impl Error {

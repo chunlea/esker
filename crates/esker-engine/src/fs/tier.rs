@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex};
 use esker_s3::{Error as S3Error, ObjectStore};
 
 use super::claim::{self, Identity};
-use super::{FileSystem, RandomAccessFile, SstTier, WritableFile};
+use super::{DirectoryLock, FileSystem, RandomAccessFile, SstTier, WritableFile};
 use crate::filename::{self, FileKind};
 
 /// The suffix a whole-file fetch writes under before renaming into place.
@@ -717,6 +717,12 @@ impl FileSystem for TieredFileSystem {
 
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.local.hard_link(from, to)
+    }
+
+    /// The local directory's claim. A tier holds the SSTs, not the directory, and two nodes
+    /// sharing one bucket prefix is [`crate::fs::claim`]'s question rather than this one.
+    fn lock_directory(&self, dir: &Path) -> io::Result<Box<dyn DirectoryLock>> {
+        self.local.lock_directory(dir)
     }
 
     fn tier(&self) -> Option<&dyn SstTier> {

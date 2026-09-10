@@ -79,7 +79,7 @@ pub use dbformat::{
     BytewiseComparator, Comparator, EntryKind, InternalKeyComparator, MAX_SEQNO, SeqNo,
 };
 pub use error::{Error, Result};
-pub use fs::{FileSystem, LocalFileSystem, RandomAccessFile, WritableFile};
+pub use fs::{DirectoryLock, FileSystem, LocalFileSystem, RandomAccessFile, WritableFile};
 pub use iterator::Cursor;
 pub use memtable::MemTable;
 pub use options::{
