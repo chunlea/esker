@@ -793,6 +793,16 @@ fn value_for_column(
             name
         )?));
     }
+    // The array beside it, by the same rule and the same parser.
+    if column.ty == ColumnType::RegClassArray
+        && let crate::plan::Expr::Literal(crate::plan::Literal::String(text)) = expr
+    {
+        let relations = std::cell::RefCell::new(None);
+        let rule = executor.name_rule(txn, &relations);
+        if let Some(value) = regclass_array_from_names(text, &rule)? {
+            return Ok(value);
+        }
+    }
     // **An enum column takes a label, not an `int2`.** The value is read as *text* whatever the
     // column's storage is and then turned into the label's ordinal, because `'sad'` in a column of
     // `mood` is a label the same way `'2020-01-01'` in a `date` column is a date — one rule, one
@@ -852,6 +862,35 @@ struct AssignedIn<'a> {
 /// One `SET` assignment's value, before it meets the column.
 ///
 /// Split out of [`update`] because it is the same three cases the `INSERT` path has in
+/// **A name-bearing array literal assigned to a `regclass[]` column**, resolved element by element.
+///
+/// `'{ra,rb}'` into a `regclass[]` is `regclassin` once per element on a real server, and this is
+/// the array half of the assignment rule `value_for_column` and `assigned_value` carry for the
+/// scalar (`debts-v1.1.md` #41). It was missing: the scalar rule reached the column it was written
+/// for and not the array beside it, which is the shape this repository keeps paying for.
+///
+/// The literal is read as a `text[]` first, so the array grammar has **one** parser — the elements,
+/// the quoting, the NULLs and the braces are `array_in`'s, and only the per-element resolution is
+/// this function's. A NULL element stays NULL; a name that answers to nothing is the rule's own
+/// `42P01`.
+fn regclass_array_from_names(
+    text: &str,
+    rule: &dyn Fn(&str) -> Result<i64>,
+) -> Result<Option<Datum>> {
+    let parsed = Datum::from_text(ColumnType::TextArray, text)?;
+    let Datum::Array(mut values) = parsed else {
+        return Ok(None);
+    };
+    for element in values.values.iter_mut().flatten() {
+        let Some(name) = PgDatum::to_text(&*element) else {
+            return Ok(None);
+        };
+        *element = crate::value::regclass_of_oid(rule(&name)?);
+    }
+    values.element = ColumnType::RegClass;
+    Ok(Some(Datum::Array(values)))
+}
+
 /// [`value_for_column`], and keeping them side by side is what makes the enum rule visibly the
 /// same rule on both: a label stays a label here and becomes an ordinal in `into_column`.
 fn assigned_value(value: &crate::plan::Expr, at: &mut AssignedIn<'_>) -> Result<Datum> {
@@ -865,6 +904,16 @@ fn assigned_value(value: &crate::plan::Expr, at: &mut AssignedIn<'_>) -> Result<
         let relations = std::cell::RefCell::new(None);
         let oid = at.executor.name_rule(at.txn, &relations)(name)?;
         return Ok(crate::value::regclass_of_oid(oid));
+    }
+    // The array beside it, by the same rule and the same parser.
+    if at.column.ty == ColumnType::RegClassArray
+        && let crate::plan::Expr::Literal(crate::plan::Literal::String(text)) = value
+    {
+        let relations = std::cell::RefCell::new(None);
+        let rule = at.executor.name_rule(at.txn, &relations);
+        if let Some(resolved) = regclass_array_from_names(text, &rule)? {
+            return Ok(resolved);
+        }
     }
     match value {
         // `SET a = DEFAULT` is the column's own default, which for a sequence column is the next

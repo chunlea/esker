@@ -1,0 +1,44 @@
+# **A `regclass` column on a temporary table** — PostgreSQL 19beta1, 2026-09-09.
+# `ON_ERROR_ROLLBACK on`, one `BEGIN … ROLLBACK`.
+#
+# r1's v3 smoke: `CREATE TEMP TABLE (c regclass)` is refused on this node with
+# `0A000 a relation name read as a regclass without a catalog`, and a real server accepts it. Only
+# the *column* provenance reaches this gap, which is why #39 — a `regclass` secondary index, made
+# on a permanent table — did not find it: **the fixture was the thing that was wrong**, not the
+# coverage.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * A temporary table's `regclass` column is a `regclass` in every way a permanent one is: the
+#     name resolves on the way in, the number is what is stored, a rename shows through it, and an
+#     index over it answers. All measured below, on a temp table.
+#   * `relpersistence` is `t`, so nothing about the column changes what the relation is.
+#   * A name that answers to nothing is `42P01` at the *insert*, not at the create.
+#   * **The temporary table is not what this is about.** `CREATE TEMP TABLE (c regclass)` was
+#     reported as refused and it is not: it works, and so does an index over the column. What
+#     actually fails is a name-bearing *array* literal assigned to a `regclass[]` column, and the
+#     permanent twin at the end fails identically — the persistence was a coincidence of the
+#     probe.
+#
+# ## The measurements
+#
+CREATE TABLE ra (id int8)		-
+CREATE TEMP TABLE tk (id int8, r regclass)		-
+INSERT INTO tk VALUES (1, 'ra'), (2, NULL)		-
+SELECT id, r FROM tk ORDER BY id	bigint,regclass	1|ra ; 2|\N
+SELECT relpersistence FROM pg_class WHERE relname = 'tk'	"char"	t
+SELECT id, r FROM tk WHERE r = 'ra'::regclass	bigint,regclass	1|ra
+CREATE INDEX tk_r ON tk (r)		-
+SELECT id, r FROM tk WHERE r = 'ra'::regclass	bigint,regclass	1|ra
+ALTER TABLE ra RENAME TO rz		-
+SELECT id, r FROM tk ORDER BY id	bigint,regclass	1|rz ; 2|\N
+SELECT r::text FROM tk WHERE id = 1	text	rz
+INSERT INTO tk VALUES (3, 'nosuchrel')	!42P01 relation "nosuchrel" does not exist
+CREATE TEMP TABLE tka (id int8, r regclass[])		-
+INSERT INTO tka VALUES (1, '{rz}')		-
+SELECT id, r FROM tka	bigint,regclass[]	1|{rz}
+CREATE TABLE pka (id int8, r regclass[])		-
+INSERT INTO pka VALUES (1, '{rz}')		-
+SELECT id, r FROM pka	bigint,regclass[]	1|{rz}
+INSERT INTO pka VALUES (2, ARRAY['rz'::regclass])		-
+SELECT id, r FROM pka ORDER BY id	bigint,regclass[]	1|{rz} ; 2|{rz}

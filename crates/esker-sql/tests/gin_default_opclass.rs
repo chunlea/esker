@@ -195,3 +195,32 @@ fn gist_over_a_tsvector_answers_as_gin_does() {
     .unwrap();
     assert_eq!(node.rows("SELECT name FROM things"), [["a".to_owned()]]);
 }
+
+/// **A constraint asks half the question an index asks** — measured, and left red on purpose.
+///
+/// `CREATE INDEX ON t (v)` over a `tsvector` is `0A000 an index on a column of type tsvector`:
+/// this node cannot order one by `tsvector_ops` (ADR 0066), so it refuses rather than build a key
+/// whose order a real server would not reproduce. `refuse_unindexable` asks two questions to get
+/// there — the operator class, and `esker_keys::row::is_index_key` — and the constraint path now
+/// asks only the first, so `CREATE TABLE (v tsvector UNIQUE)` is accepted and could not be
+/// written.
+///
+/// PostgreSQL accepts all three (`gin`, `gist`, `btree`, and the constraints), so refusing is this
+/// node's own gap either way; what is wrong is *when* it arrives. Closing it needs the declared
+/// type's name at a point that has only [`catalog::ColumnDef::user_type`], an id, and no table to
+/// resolve it against — the name matters here, because a `floatrange` column must be refused as a
+/// `floatrange` and not as the type holding it.
+///
+/// Delete the `#[ignore]` when the constraint path can name a user type.
+#[test]
+#[ignore = "the constraint path asks the opclass question and not the key question; naming a user type there is its own unit"]
+fn a_constraint_asks_the_whole_question_an_index_asks() {
+    let mut node = parity::Node::new(&[]);
+    let refused = node
+        .run("CREATE TABLE tu (v tsvector UNIQUE)")
+        .expect_err("a key this node cannot build must be refused where it is declared");
+    assert_eq!(
+        refused.to_string(),
+        "an index on a column of type tsvector is not supported"
+    );
+}

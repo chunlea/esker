@@ -4187,9 +4187,23 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             op: UnaryOperator::Not,
             expr,
         } => Ok(plan::Expr::Not(Box::new(lower_expr(expr)?))),
-        // A comparison over `json` or `jsonb` is refused; [`refuse_json_comparison`] says why.
+        // A comparison over `json` or `jsonb` is refused — and **the two are refused differently**,
+        // for the reason the `||` arm above parts them: `json` has no comparison operator on a
+        // real server, so the honest answer is the one a real server gives, while `jsonb` has a
+        // complete btree and *answers*, so refusing it is this node's own gap and says so.
+        //
+        // One sentence would have to be wrong about one of them. `0A000 the operator = over json
+        // or jsonb` was wrong about `json`, which is a `42883 operator does not exist: json =
+        // json` on 19beta1 — eighteen rows of the no-equality census.
         Expr::BinaryOp { left, op, right } if is_comparison(op) && either_is_json(left, right) => {
-            Err(refuse_json_comparison(op))
+            match (json_cast_name(left), json_cast_name(right)) {
+                (Some("json"), _) | (_, Some("json")) => Err(SqlError::UndefinedOperator {
+                    left: json_cast_name(left).unwrap_or("json").to_owned(),
+                    op: comparison_symbol(op),
+                    right: json_cast_name(right).unwrap_or("json").to_owned(),
+                }),
+                _ => Err(refuse_json_comparison(op)),
+            }
         }
         // `date + time` and `time + date`, the one arithmetic in this type that answers a type
         // this node has. Folded here, over **constants only**, which is the same boundary
@@ -6791,6 +6805,22 @@ fn arithmetic_op(op: &BinaryOperator) -> Option<plan::ArithOp> {
 }
 
 /// Whether an operator compares, as against combines.
+/// A comparison operator's symbol, as `'static` text an error message can hold.
+///
+/// `BinaryOperator`'s `Display` says the same thing and gives a `String`; [`SqlError`]'s operator
+/// field is `&'static str`, so the six that [`is_comparison`] admits are written out. Anything
+/// else cannot reach here and answers `=`, which is the operator every implied comparison is.
+fn comparison_symbol(op: &BinaryOperator) -> &'static str {
+    match op {
+        BinaryOperator::NotEq => "<>",
+        BinaryOperator::Lt => "<",
+        BinaryOperator::LtEq => "<=",
+        BinaryOperator::Gt => ">",
+        BinaryOperator::GtEq => ">=",
+        _ => "=",
+    }
+}
+
 fn is_comparison(op: &BinaryOperator) -> bool {
     matches!(
         op,

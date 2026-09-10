@@ -933,6 +933,29 @@ pub fn has_equality_operator(ty: ColumnType) -> bool {
     )
 }
 
+/// Whether `=` exists for the type **at all** — a third question, and neither of the two above.
+///
+/// [`has_equality_operator`] asks whether there is an equality *operator class*, which `DISTINCT`
+/// and `GROUP BY` need. `esker_sql::exec::query::same_family` asks whether two types are
+/// comparable *to each other*. This asks whether the operator exists, and the answer separates
+/// `polygon` from every other geometric shape: `lseg`, `box`, `path`, `circle` and `line` each
+/// have an `=` and no opclass, and `polygon` has neither. Measured on 19beta1, one statement per
+/// shape — `'…'::polygon = '…'::polygon` is `42883 operator does not exist: polygon = polygon`
+/// while the other five answer `t`.
+///
+/// **Scalars only.** An array's `=` is `array_eq`, which looks the *element's* equality up in the
+/// type cache and so follows [`has_equality_operator`] rather than this — `'{…}'::lseg[] =
+/// '{…}'::lseg[]` refuses even though `lseg` itself compares. That is why this is a third list and
+/// not a widening of either: the doc above records that sharing the first two was tried and the
+/// geometric corpus refused it in one run, and this would have been the second such attempt.
+#[must_use]
+pub fn has_equality_at_all(ty: ColumnType) -> bool {
+    !matches!(
+        ty,
+        ColumnType::Json | ColumnType::Xml | ColumnType::Point | ColumnType::Polygon
+    )
+}
+
 /// A type as `format_type` writes it, with its typmod: what an error message and `\gdesc` say.
 #[must_use]
 pub fn format_type(ty: ColumnType, typmod: i32) -> String {

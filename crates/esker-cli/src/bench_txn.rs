@@ -42,20 +42,38 @@ use crate::raw::{BOOTSTRAP_REGION, NO_LEADER_OPINION, resolve};
 
 /// Runs one transactional workload against the store at `addr`.
 pub(crate) fn run(options: &Run, addr: &str) -> Result<Report, String> {
-    let client = Arc::new(connect(addr)?);
+    run_with(options, &Arc::new(connect(addr)?))
+}
 
+/// The same transactional workload, routed through a placement driver
+/// ([`crate::bench_route`]).
+pub(crate) fn run_routed(options: &Run, pd: &str) -> Result<Report, String> {
+    let (stores, regions) = crate::bench_route::routed(pd)?;
+    // The same oracle rule as `connect`: started from the wall clock in PD's layout, because a
+    // store that has been benchmarked before holds commit timestamps a run starting at one would
+    // lose every write conflict against.
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(0));
+    let oracle = Arc::new(CountingOracle::starting_at(
+        epoch_ms << esker_client::TSO_LOGICAL_BITS,
+    ));
+    run_with(options, &Arc::new(TxnClient::new(stores, regions, oracle)))
+}
+
+fn run_with(options: &Run, client: &Arc<TxnClient>) -> Result<Report, String> {
     if options.workload.needs_a_populated_database() {
         // Untimed, and through transactions rather than `RawKv`: a `txnget` has to read rows
         // that have `write` records and, for long values, `default` entries — which is what
         // MVCC reads cost. Filling with `RawKv` would leave nothing for the read path to do
         // and make the ratio flattering.
-        populate(&client, options)?;
+        populate(client, options)?;
     }
 
     let started = Instant::now();
     let latencies = match options.workload {
-        Workload::TxnPut => parallel(&client, options, put_random)?,
-        Workload::TxnGet => parallel(&client, options, get_random)?,
+        Workload::TxnPut => parallel(client, options, put_random)?,
+        Workload::TxnGet => parallel(client, options, get_random)?,
         other => return Err(format!("{} is not a transactional workload", other.name())),
     };
     let elapsed = started.elapsed();

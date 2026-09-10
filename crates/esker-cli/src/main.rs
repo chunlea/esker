@@ -12,6 +12,7 @@ mod bench;
 mod bench_mpp;
 mod bench_pd;
 mod bench_remote;
+mod bench_route;
 mod bench_txn;
 mod bytes;
 mod cluster;

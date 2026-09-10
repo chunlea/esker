@@ -1,7 +1,11 @@
 # ADR 0102 — The catalog's read path (draft, no decision)
 
-Status: **proposed — a draft for a milestone conversation, not a decision** · Number 0102 reserved
-by the coordinator; 0101 is the highest on `main`. **No code changes with this file.**
+Status: **proposed, with a measurement plan and its criteria fixed in advance** (2026-09-09) ·
+Number 0102 reserved by the coordinator. The instrument is built (`751e2299`); **nothing else is
+decided here**, and the criteria below are written before the numbers exist so that reading them
+cannot choose the answer — the same discipline that refuted
+[ADR 0100](0100-a-region-between-leaders-waits-on-the-callers-deadline.md) and closed
+`docs/plans/debts-v1.1.md` #40.
 
 ## Context — one region is on the path of every statement, and that is the key space, not a bug
 
@@ -93,17 +97,65 @@ region holds the catalog and nothing else.
   elections deciding whether the catalog can be read. On the evidence in #34 that coupling is the
   expensive half.
 
-## What to measure before deciding
+## The measurement plan — written before the numbers, like the last one
 
-* **The round trip's real cost**: two point reads per transaction to one region — measured against
-  a statement that does no other work, which is where it is the whole of the latency.
-* **How often it is the leaderless one**: #34's instrument already counts sightings per region; the
-  interesting number is what share of a node's refusals come from the catalog's region rather than
-  from the region the statement is actually about.
-* **For (a) only**: how often a DDL invalidation would arrive, which is what decides whether a
-  lease is nearly free or a constant interruption.
+### ① What is measured, and why each number decides something
 
-## Not decided here
+| number | why it decides | where it comes from |
+|---|---|---|
+| **catalog views per statement**, by statement class — point read, range, write, DDL | if a write already pays for a dozen round trips, one more is noise; if a point read pays for two and does one, it is half the statement | the instrument below, against a workload whose statement mix is known |
+| **the share of those reads that reach the store** rather than the cache | (a) is worth building only if the cache is missing often; a cache that already answers is a lease with no lease | the same instrument's `of the store` count |
+| **what a catalog read costs**, mean and tail | this is the *whole* of what (a) and (b) can remove | the same instrument's histogram |
+| **the catalog region's share of a node's traffic**, against another region | (c) is about **coupling**: it is worth doing when one region carries a load nothing else can shed | **not this instrument** — see the limitation below |
+
+**The limitation, stated rather than discovered later.** The instrument counts and times the read;
+it does not say **which region** answered it. The catalog's keys sort below all data, so it is the
+left-most region by construction on every cluster this project has run — but *proving* that per
+read needs the client's routing to report what it chose, which is a larger change than an
+instrument. The fourth row above therefore needs a second instrument, and until it exists (c) is
+argued from the key space rather than measured.
+
+### ② Where the instrument lives
+
+`crates/esker-sql/src/catalog/stats.rs`, counting at `Catalog::view_at` — **the one place every
+statement passes through**, and nowhere else. Off unless `ESKER_CATALOG_STATS` is set: an
+environment variable and not a cargo feature, because the run that should produce these numbers is
+the ActiveRecord suite against the *released* node binary and a feature would mean a special build
+nobody has. Off costs a cached atomic load. On, one line every ten seconds under
+`esker::catalog::stats`:
+
+```text
+catalog views N, of the store N, mean N us, worst N us, buckets <100us N <1ms N <10ms N rest N
+```
+
+### ③ What to run it against
+
+**The ActiveRecord suite, on the run that was going to happen anyway.** It is a real statement mix
+rather than one this lane would have invented, it is thousands of statements rather than a
+microbenchmark's one shape, and it costs no machine time that was not already being spent — r1
+starts the node with the variable set and copies the line into the run report. A synthetic
+`esker-cli bench` arm is worth having **only as a control**, to say what the number looks like when
+the statement mix is deliberately uniform; it decides nothing on its own, because the question is
+about a real workload's shape.
+
+### ④ The criteria, fixed now
+
+1. **Catalog reads are under 2% of a statement's latency at the median, and the store-side share is
+   under 10%** → **nothing is built**: the row is recorded as *measured and not worth moving*, and
+   ADR 0102 closes as answered. A cache that is already hit 90% of the time is the cheap version of
+   (a) that exists today.
+2. **Either number is above its bar** → the option is chosen by which number is above it:
+   * the **store-side share** is what (a) removes → a cached version with a pushed invalidation,
+     and its lease gets its own ADR because that is where its correctness lives;
+   * the **cost of the read itself**, with the share already low, is what (b) removes → a follower
+     read, which needs no new tag and does need the client to be able to address a replica;
+   * neither, and the pain is that one region carries everything → **(c)**, which is the cheapest
+     and the only one that removes the coupling rather than the round trip.
+3. **The tail is what decides against the median.** A mean of 200 µs with a `rest` bucket that is
+   never empty is a different system from a flat 200 µs, and the second is the one nothing needs to
+   be done about.
+
+## Not decided here — and the number that would change that is now collectable
 
 This file exists so the choice is made against the same facts by whoever makes it, and so that the
 consequence recorded in #34 has somewhere to point. **It decides nothing**, and each of the three

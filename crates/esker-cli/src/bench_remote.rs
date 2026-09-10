@@ -38,21 +38,30 @@ const SCAN_PAGE: u32 = 1_000;
 
 /// Runs one workload against the store at `addr`.
 pub(crate) fn run(options: &Run, addr: &str) -> Result<Report, String> {
-    let client = Arc::new(connect(addr)?);
+    run_with(options, &Arc::new(connect(addr)?))
+}
 
+/// The same workload, routed through a placement driver rather than pinned to one store
+/// ([`crate::bench_route`]).
+pub(crate) fn run_routed(options: &Run, pd: &str) -> Result<Report, String> {
+    let (stores, regions) = crate::bench_route::routed(pd)?;
+    run_with(options, &Arc::new(RawClient::new(stores, regions)))
+}
+
+fn run_with(options: &Run, client: &Arc<RawClient>) -> Result<Report, String> {
     if options.workload.needs_a_populated_database() {
         // Untimed, exactly as the local driver does it: a read workload has to have something
         // to read, and filling it is not what is being measured.
-        populate(&client, options)?;
+        populate(client, options)?;
     }
 
     let started = Instant::now();
     let latencies = match options.workload {
-        Workload::ReadSeq => scan_everything(&client, options)?,
-        Workload::ReadRandom => parallel(&client, options, read_random)?,
-        Workload::ReadMissing => parallel(&client, options, read_missing)?,
-        Workload::FillSeq => parallel(&client, options, write_sequential)?,
-        Workload::FillRandom | Workload::Overwrite => parallel(&client, options, write_random)?,
+        Workload::ReadSeq => scan_everything(client, options)?,
+        Workload::ReadRandom => parallel(client, options, read_random)?,
+        Workload::ReadMissing => parallel(client, options, read_missing)?,
+        Workload::FillSeq => parallel(client, options, write_sequential)?,
+        Workload::FillRandom | Workload::Overwrite => parallel(client, options, write_random)?,
         // Unreachable by construction: `bench::run` refuses a placement-driver workload with
         // `--remote` before it gets here, because this speaks `RawKv` to a store.
         other => return Err(format!("{} does not run over RawKv", other.name())),
