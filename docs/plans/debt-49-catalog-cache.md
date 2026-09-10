@@ -187,10 +187,21 @@ are catalog"* is indeed a true fact about a cheap statement, **and the plan is s
 1. **The first test is the one that matters most, not the ratio test.** `pk_and_sequence_for` in
    `transactions_test` is the target: 483 x 2.4 s. Test 1's five-relation ratio is the mechanism;
    the acceptance number is r1's, and it is **1,466 s → 496 s** at 35 → 3 round trips.
-2. **The `other` bucket is the second thing to look at and is nobody's row yet.** 592 statements,
-   median 8.2 ms, **p95 1,078 ms** — 184 of its 189 seconds are in a tail nobody has opened. That
-   is larger than `app SELECT` and `DDL DROP TABLE` put together and it is not this plan's; it
-   wants one `sort` before it wants a design.
+2. **The `other` tail was opened, and half of it is this plan's after all.** One pass over
+   `run-117-transactions-tap.txt`: the 184 s is `DISABLE`/`ENABLE TRIGGER ALL` (200 statements,
+   seven `ALTER TABLE`s each at ~106 ms — ordinary DDL, and **no option in ADR 0106 touches it**),
+   and beside it sits **`AR tables()` at 208 x 437 ms = 91 s**, which *is* the `Relations::read`
+   path this plan routes. So the plan's target is four shapes, not one:
+
+   ```text
+   pk_and_sequence_for   1,129 s     AR tables()   91 s
+   AR columns()             16 s     AR primary key 9 s      = 1,245 s of 1,596 s = 78%
+   ```
+3. **Every one of them is O(catalog), measured.** Mean ms by decile of arrival through the file:
+   `pk_and_sequence_for` 1432→3377 (**2.36x**), `tables()` 248→635 (**2.56x**). The 2.36x within
+   the file is the 2.3x r1 measured *between* files — one mechanism, and it is the tenant-wide
+   scans this plan removes. **The acceptance test should therefore be a slope, not a p50**: run the
+   target statement against a catalog of n and of 5n and assert the ratio stops tracking n.
 
 **And the risk this plan carries because of run 117**: the report's own catalog-stats section reads
 *"the catalog READ is 2.3% of this file"*, which taken alone would say none of this is worth doing.

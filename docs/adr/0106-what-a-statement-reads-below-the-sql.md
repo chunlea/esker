@@ -365,14 +365,60 @@ That is the ADR's contribution to run 117 rather than the other way round, and i
 numbers stand together: **the version read is 2.3%; the reads nobody was counting are most of the
 72.4%.**
 
-### And the census predicts the 2.3x that r1 calls its own error
+### The census predicted the 2.3x, and run 117's own tap confirms it
 
-The same statement costs 1,051 ms in `schema_test` and 2,382 ms in `transactions_test`. The census
-says why it *could*: five of its reads are **tenant-wide scans**, so its cost is O(relations), and
-the two files reach it with different-sized catalogs. **That is a prediction and not a finding** —
-what would test it is one number per file, the relation count at the moment the statement runs,
-against the ratio 2.3. If they track, the O(catalog) reading is right and option B's estimate is
-conservative; if they do not, something else varies between the files and this ADR has not found it.
+The same statement costs 1,051 ms in `schema_test` and 2,382 ms in `transactions_test`, which r1
+records as its own sampling error. The census says why it happens at all: five of the statement's
+reads are **tenant-wide scans**, so its cost is O(relations), and the two files reach it with
+different-sized catalogs.
+
+**That was written as a prediction and the tap answers it without a new run.**
+`run-117-transactions-tap.txt` times every statement in arrival order, and the catalog grows through
+the file as it creates tables. Mean milliseconds by decile of arrival:
+
+```text
+pk_and_sequence_for   1432 1652 1867 2089 2289 2507 2722 2933 3152 3377     2.36x
+AR tables()            248  262  308  355  401  445  494  540  586  635     2.56x
+ALTER … TRIGGER ALL    789  844  888  934  972 1017 1065 1105 1150 1191     1.51x
+```
+
+**Monotone, all three, and `pk_and_sequence_for`'s 2.36x within the file is the 2.3x r1 measured
+between two files.** The between-file gap and the within-file growth are one mechanism: **the cost
+is proportional to the size of the catalog at the moment the statement runs.** Its first decile,
+1,432 ms, sits just above `schema_test`'s 1,051 ms, which is what a smaller catalog looks like.
+
+**So `pk_and_sequence_for` has no p50 that means anything without a catalog size beside it**, and
+neither does any other shape in that table. A price quoted for one of these is a price *at a
+catalog size*, and this is the second time this project has priced one from the wrong file.
+
+### What is in the `other` tail — the fourth question, answered from the tap
+
+The tail this ADR flagged as *"nobody has asked what is in it"* is four shapes, and none of them is
+mysterious. Taking every statement at or over 200 ms that is **not** `pk_and_sequence_for`:
+
+```text
+   n     total    mean   shape
+ 100    99.6 s   996 ms  ALTER TABLE "…" DISABLE TRIGGER ALL;  x7 per statement
+ 100    84.7 s   847 ms  ALTER TABLE "…" ENABLE TRIGGER ALL;   x7 per statement
+ 208    90.8 s   437 ms  SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace …   (AR tables())
+  13    16.4 s  1265 ms  SELECT a.attname, format_type(…) …                          (AR columns())
+   9     9.2 s  1026 ms  SELECT a.attname FROM pg_index i JOIN pg_attribute a …      (AR primary key)
+```
+
+**`DISABLE`/`ENABLE TRIGGER ALL` is 184 s** — and 184 s is exactly the tail this ADR computed from
+r1's `other` bucket (189 s subtotal against 592 x 8.2 ms of medians). It is Rails'
+`disable_referential_integrity`, seven `ALTER TABLE`s concatenated into one statement, **~106 ms per
+`ALTER`** — the same order as this file's `DDL CREATE TABLE` at 86 ms. So it is not one statement
+doing O(tables) work; it is seven ordinary DDL statements in a trench coat, and **none of the three
+options here touches it.**
+
+**`AR tables()` is 90.8 s and is catalog introspection** — the third-largest shape in the file after
+`pk_and_sequence_for` and the trigger pair, growing 2.56x across the run. It is the same
+`Relations::read` path, so **option B reaches it and the ADR's arithmetic did not count it.**
+
+Together: `pk_and_sequence_for` 1,129 s + `tables()` 91 s + `columns()` 16 s + primary key 9 s =
+**1,245 s of 1,596 s = 78%** in four introspection shapes, all of them going through the loader that
+bypasses the cache.
 
 ### What changes in the ranking, and what does not
 
