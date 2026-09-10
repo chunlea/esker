@@ -111,3 +111,84 @@ fn every_comparison_pair_agrees_with_postgresql_19() {
         wrong.join("\n")
     );
 }
+
+/// **The third pairing: a column against a typed literal** — measured, and handed over measured.
+///
+/// The other two forms are the one above (two literals) and the column form the module note
+/// describes; a **mixed** pair takes neither's arms. `reconcile` matches `(Ordinal, Literal)`
+/// before any family check and calls `retype`, whose first gate is `Literal::comparable_with` —
+/// which ends in `Datum::fits`, the **assignment** rule. That is exactly the shape the cast arms
+/// had until `debts-v1.1.md` #43's second mechanism closed, so it is the place to look next and
+/// the reason this capture exists at all.
+///
+/// 52 columns against 53 literals — `void` is the one spelling that cannot be a column — and
+/// PostgreSQL answers 153 of the 2,756. **86 of them disagree**, and they are three mechanisms:
+///
+/// ```text
+/// 44  PG refuses, node ANSWERS   41 of them a `tsrange` literal against every column there is
+///  1                             '[1,3)'::int4range against an int8range column
+///  2                             int2vector and oidvector against a text literal
+/// 31  PG answers, node refuses   42883, `comparable_with` ending in `Datum::fits`
+/// 11  PG answers, node refuses   42804, `retype` narrowing where it should compare
+/// ```
+///
+/// **The 41 are one line.** `Datum::fits` answers a range by `row::range_subtype(ty) == subtype`,
+/// and `range_subtype` returns `Timestamp` for every type that is not a range — so a `tsrange`
+/// value fits *every* non-range column, and `c = '…'::tsrange` answers for a `boolean`, a `box`,
+/// an `xml`. The `int4range` row is the same function's other face: an `int4range` and an
+/// `int8range` are both ranges of an `int8` here, so each fits the other's column.
+///
+/// **The 31 and the 11 are the two gates in order.** `comparable_with`'s last arm is
+/// `value.fits(ty)` — the **assignment** rule, which its own doc comment says is the wrong
+/// question for a comparison — so `bigint_col = 1.5::float8`, `date_col = '…'::timestamp`,
+/// `citext_col = 'x'::text`, `inet_col = '…'::cidr` and `regtype_col = 1::int8` are each `42883`
+/// where a real server answers. Fix that and the 11 appear behind it: `retype` goes on to
+/// `literal.assign(ty)`, and assigning an `oid` into a `regproc` is
+/// `42804 column "?column?" is of type regproc but expression is of type oid`.
+///
+/// It is the same pair of readers `debts-v1.1.md` #43's second mechanism was, one arm over: the
+/// cast arms were fixed by asking `same_family`, which is the measured table, and these arms
+/// still ask `fits`.
+#[test]
+#[ignore = "86 of 2,756: comparable_with ends in the assignment rule, and a range fits every column"]
+fn every_column_against_a_typed_literal_agrees_with_postgresql_19() {
+    let capture = include_str!("captures/pg19_comparison_matrix_column.txt");
+    let fixture: Vec<&str> = capture
+        .lines()
+        .filter_map(|line| line.strip_prefix("# SETUP: "))
+        .collect();
+    assert_eq!(fixture.len(), 2, "the capture must carry its own fixture");
+    let mut node = parity::Node::new(&fixture);
+    let (mut checked, mut wrong) = (0, Vec::new());
+    for line in capture.lines().filter(|line| !line.starts_with('#')) {
+        let Some((statement, expected)) = line.split_once('\t') else {
+            continue;
+        };
+        let answered = node.run(statement).map_err(|error| error.to_string());
+        if answered.is_ok() == expected.starts_with('!') {
+            wrong.push(format!(
+                "{statement}\n  PostgreSQL {} · node {}",
+                if expected.starts_with('!') {
+                    "refuses"
+                } else {
+                    "answers"
+                },
+                match &answered {
+                    Ok(_) => "answers".to_owned(),
+                    Err(error) => format!("refuses: {error}"),
+                }
+            ));
+        }
+        checked += 1;
+    }
+    assert!(
+        checked > 2_700,
+        "only {checked} pairs read; the capture did not load"
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} of {checked} disagree:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
