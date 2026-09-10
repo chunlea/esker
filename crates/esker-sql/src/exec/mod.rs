@@ -1492,18 +1492,28 @@ impl Executor {
         self.in_a_transaction(statement, params)
     }
 
+    /// What the session decides about the rows a cursor produces — **including which catalog
+    /// snapshot its `pg_catalog` views are read through**.
+    ///
+    /// The view is taken here rather than per view node, which is the whole of why a statement
+    /// naming five catalog relations reads the tenant's catalog once
+    /// (`docs/plans/debt-49-catalog-cache.md`). It is [`Executor::catalog_view`]'s pin, so a
+    /// transaction that has written the catalog carries a detached snapshot and reads its own
+    /// uncommitted DDL exactly as it did before.
     fn settings<'a>(
         &'a self,
+        txn: &'a dyn Txn,
         search_path: &'a [String],
         names: Option<cursor::OidOfRelation<'a>>,
-    ) -> cursor::Settings<'a> {
-        cursor::Settings {
+    ) -> Result<cursor::Settings<'a>> {
+        Ok(cursor::Settings {
             search_path,
             rendering: self.rendering(),
             prepared: &self.prepared,
             advisory: Some(&self.locks),
             names,
-        }
+            catalog: self.catalog_view(txn)?.snapshot(),
+        })
     }
 
     /// The name rule a row evaluator resolves a `regclass` with, built where its rules live.
@@ -1831,7 +1841,7 @@ impl Executor {
             let mut cursor = cursor::Cursor::open(
                 &*txn,
                 self.tenant,
-                self.settings(&path, Some(&names)),
+                self.settings(&*txn, &path, Some(&names))?,
                 &planned.node,
             )?;
             while let Some(row) = cursor.next()? {
@@ -2334,7 +2344,7 @@ impl Executor {
                     let mut cursor = cursor::Cursor::open(
                         txn,
                         self.tenant,
-                        self.settings(&path, Some(&names)),
+                        self.settings(txn, &path, Some(&names))?,
                         &planned.node,
                     )?;
                     while cursor.next()?.is_some() {}

@@ -87,6 +87,15 @@ pub(super) struct Settings<'a> {
     /// `None` is an evaluator with no session behind it, and it is why a `Datum::Text` cast to
     /// `regclass` there is a refusal rather than a wrong relation.
     pub(super) names: Option<OidOfRelation<'a>>,
+    /// **The catalog cache and the version this statement pinned** — what a `pg_catalog` view's
+    /// rows are read through, so that five views of one statement read the tenant's catalog once
+    /// between them rather than once each (`docs/plans/debt-49-catalog-cache.md`).
+    ///
+    /// A [`crate::catalog::Snapshot`] and not a `View` because a `Settings` travels *beside* the
+    /// transaction rather than holding one; the view is rebuilt over whichever transaction is at
+    /// hand. [`crate::catalog::Snapshot::detached`] — an evaluator with no session — reads the
+    /// store directly, which is what every reader did before there was a cache.
+    pub(super) catalog: crate::catalog::Snapshot<'a>,
 }
 
 impl Settings<'_> {
@@ -98,6 +107,7 @@ impl Settings<'_> {
             prepared: &[],
             advisory: None,
             names: None,
+            catalog: crate::catalog::Snapshot::detached(),
         }
     }
 }
@@ -370,8 +380,7 @@ fn inner_side(
 ) -> Result<Vec<Vec<Datum>>> {
     if let Some(view) = inner_view {
         return view.rows_of(
-            txn,
-            tenant,
+            &settings.catalog.view(txn, tenant),
             settings.rendering,
             settings.prepared,
             settings.advisory,
@@ -435,8 +444,7 @@ impl<'a> Cursor<'a> {
             // is none. If a catalog view ever is not small, this is the line that changes.
             Node::CatalogView { view, .. } => Kind::Rows(
                 view.rows_of(
-                    txn,
-                    tenant,
+                    &settings.catalog.view(txn, tenant),
                     settings.rendering,
                     settings.prepared,
                     settings.advisory,

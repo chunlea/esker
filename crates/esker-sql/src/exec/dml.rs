@@ -2167,7 +2167,7 @@ fn drain(
     let mut cursor = cursor::Cursor::open(
         txn,
         executor.tenant,
-        executor.settings(&path, Some(&names)),
+        executor.settings(txn, &path, Some(&names))?,
         &node,
     )?;
     let mut rows = Vec::new();

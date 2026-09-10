@@ -41,14 +41,14 @@
 use super::NO_LENGTH;
 use std::borrow::Cow;
 
-use crate::backend::Txn;
 use crate::catalog::pg_relations::{RelKind, RelationRow, Relations};
 use crate::catalog::{IndexKey, KeyPart, SchemaState, TableDef};
 use crate::error::Result;
 use crate::value::{ColumnType, Datum};
 
 /// Every `pg_index` row this tenant has: one per index, and one per primary key.
-pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
+pub fn rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
+    let (txn, tenant) = (view.txn(), view.tenant());
     let relations = Relations::read(txn, tenant)?;
     let mut rows = Vec::new();
     for relation in relations.rows() {

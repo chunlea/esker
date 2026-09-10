@@ -2564,8 +2564,42 @@ impl Catalog {
     }
 }
 
+/// The cache and the version a statement resolves against, **without the transaction**.
+///
+/// A [`View`] is the thing every catalog reader wants, and it cannot be carried in
+/// `exec::cursor::Settings` because a `Settings` travels beside a `&dyn Txn` rather than holding
+/// one — two transaction references that must agree is a way to be wrong that this does not have.
+/// So what travels is the half that is a property of the *session*: which cache to use and which
+/// version it was pinned at. The transaction is always the one at hand when the view is rebuilt.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Snapshot<'a> {
+    catalog: Option<&'a Catalog>,
+    version: u64,
+}
+
+impl<'a> Snapshot<'a> {
+    /// No cache at all: what an evaluator with no session behind it resolves against — a column
+    /// `DEFAULT` or an index key. Its reads go to the store, which is what they did before there
+    /// was a cache.
+    #[must_use]
+    pub fn detached() -> Self {
+        Snapshot::default()
+    }
+
+    /// The view this snapshot names, over the transaction at hand.
+    #[must_use]
+    pub fn view(&self, txn: &'a dyn Txn, tenant: u64) -> View<'a> {
+        View {
+            catalog: self.catalog,
+            txn,
+            tenant,
+            version: self.version,
+        }
+    }
+}
+
 /// One transaction's consistent view of the catalog.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct View<'a> {
     /// The cache to answer from and fill, or `None` for a transaction that has written the
     /// catalog and whose reads are therefore its own uncommitted DDL.
@@ -2575,11 +2609,36 @@ pub struct View<'a> {
     version: u64,
 }
 
-impl View<'_> {
+impl<'a> View<'a> {
     /// The catalog version this view is pinned to.
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// The transaction this view reads through.
+    ///
+    /// **For a caller that has a view and needs the transaction beside it** — a `pg_catalog` row
+    /// builder reads records the catalog does not model, and passing both would be passing the
+    /// same two things twice.
+    #[must_use]
+    pub fn txn(&self) -> &'a dyn Txn {
+        self.txn
+    }
+
+    /// The tenant this view is of.
+    #[must_use]
+    pub fn tenant(&self) -> u64 {
+        self.tenant
+    }
+
+    /// The half of this view that can travel without a transaction: see [`Snapshot`].
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot<'a> {
+        Snapshot {
+            catalog: self.catalog,
+            version: self.version,
+        }
     }
 
     /// What a name is, or `None` when nothing of that name exists.
