@@ -155,3 +155,39 @@ fn every_typinput_resolves_to_a_function() {
         "these types name an input function `value::reg_proc` does not know: {digits:?}"
     );
 }
+
+/// **The same rule, asked of a node that has one of each user type** — which is the half that was
+/// missing, and the reason `domain_in`, `enum_in` and `record_in` were absent from
+/// `value::reg_proc` for as long as `TypeKind::typinput` had been answering them.
+///
+/// `pg_type` on a fresh node holds only built-in rows, so the test above could not reach a name
+/// only a *user* type produces. It went red on the day the five `information_schema` domains
+/// became built-in rows and `domain_in` finally appeared in a row it reads — the rule having been
+/// broken all along with nothing able to see it (`debts-v1.1.md` #37, ADR 0103).
+///
+/// A fixture per kind, so a fifth `TypeKind` is a red test here rather than a client reading
+/// digits where a real server prints a name.
+#[test]
+fn every_user_types_typinput_resolves_too() {
+    let mut node = parity::Node::new(&[
+        "CREATE DOMAIN rp_dom AS integer",
+        "CREATE TYPE rp_mood AS ENUM ('sad', 'ok')",
+        "CREATE TYPE rp_rng AS RANGE (subtype = float8)",
+        "CREATE TYPE rp_rec AS (a integer, b text)",
+    ]);
+    // The four kinds are there to be asked about, which is what makes the emptiness below mean
+    // something: `typtype` is `d`, `e`, `r` and `c`.
+    assert_eq!(
+        node.rows(
+            "SELECT typtype FROM pg_type WHERE typname IN \
+             ('rp_dom', 'rp_mood', 'rp_rng', 'rp_rec') ORDER BY typname"
+        ),
+        vec![vec!["d"], vec!["e"], vec!["c"], vec!["r"]]
+    );
+    let digits =
+        node.rows("SELECT typname, typinput FROM pg_type WHERE typinput::oid = 0 ORDER BY typname");
+    assert!(
+        digits.is_empty(),
+        "these types name an input function `value::reg_proc` does not know: {digits:?}"
+    );
+}

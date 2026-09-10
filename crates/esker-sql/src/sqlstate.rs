@@ -128,6 +128,21 @@ pub const INVALID_PARAMETER_VALUE: &str = "22023";
 
 /// `indeterminate_datatype` — `ARRAY[]` with nothing to say what it is an array of.
 pub const INDETERMINATE_DATATYPE: &str = "42P18";
+
+/// `42P21` — two **explicit** `COLLATE` clauses that disagree meet in one expression.
+///
+/// A different class from [`INDETERMINATE_COLLATION`], and the difference is which mistake was
+/// made: here the user named two orderings and PostgreSQL will not pick one; there nobody named
+/// any and it cannot derive one. Measured on 19beta1 — `('a' COLLATE "C") || ('b' COLLATE
+/// "POSIX")` is this, with no `HINT`
+/// ([ADR 0096](../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md)).
+pub const COLLATION_MISMATCH: &str = "42P21";
+
+/// `42P22` — a collation-using operation whose collation cannot be derived.
+///
+/// `upper('a')` in a generated column, and two disagreeing *implicit* collations at a comparison.
+/// It carries `HINT: Use the COLLATE clause to set the collation explicitly.`
+pub const INDETERMINATE_COLLATION: &str = "42P22";
 /// A `SET` of a parameter that exists and is fixed — a different answer from one that does not
 /// exist, which is [`UNDEFINED_OBJECT`].
 pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";

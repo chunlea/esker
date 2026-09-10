@@ -285,6 +285,21 @@ fn activerecord_s_four_type_map_queries_answer() {
             vec!["3910", "tstzrange", "r"],
             vec!["3912", "daterange", "r"],
             vec!["3926", "int8range", "r"],
+            // **And the five `information_schema` domains**, which this node had as their base
+            // types until `debts-v1.1.md` #37's second family. This query is the reason they
+            // exist: `ActiveRecord` runs it on **every connection** — 712 occurrences across 164
+            // captured files — and an oid this node sends that does not come back from here has no
+            // decoder, so a correct value would arrive as a string. The rows come first and the
+            // wire follows them (ADR 0103).
+            //
+            // The oids are PostgreSQL 19beta1's own, measured: they sit inside its built-in range,
+            // which runs to 13744, and this node hands out user ids from 16384 upwards — so
+            // nothing it allocates can collide with one.
+            vec!["13356", "cardinal_number", "d"],
+            vec!["13359", "character_data", "d"],
+            vec!["13361", "sql_identifier", "d"],
+            vec!["13367", "time_stamp", "d"],
+            vec!["13369", "yes_or_no", "d"],
         ]
     );
 
@@ -849,6 +864,62 @@ fn activerecord_s_four_type_map_queries_answer() {
                 "b".to_owned(),
                 "0".to_owned(),
             ],
+            // **And one array per `information_schema` domain**, whose `typelem` points back at the
+            // domain — which is how `ActiveRecord` reaches them, because the query above asks for
+            // `typtype IN ('r','e','d')` and an array is `b`. The array oid is the domain's
+            // **minus one**, because `initdb` allocates the array type first; this node's own
+            // convention for a user type is `oid + 1`, so the pairs are measured rather than
+            // derived (`debts-v1.1.md` #37, `tests/captures/pg19_domain_type.txt`).
+            vec![
+                "13355".to_owned(),
+                "_cardinal_number".to_owned(),
+                "13356".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "13358".to_owned(),
+                "_character_data".to_owned(),
+                "13359".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "13360".to_owned(),
+                "_sql_identifier".to_owned(),
+                "13361".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "13366".to_owned(),
+                "_time_stamp".to_owned(),
+                "13367".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
+            vec![
+                "13368".to_owned(),
+                "_yes_or_no".to_owned(),
+                "13369".to_owned(),
+                ",".to_owned(),
+                "array_in".to_owned(),
+                "\\N".to_owned(),
+                "b".to_owned(),
+                "0".to_owned(),
+            ],
         ]
     );
 }
@@ -935,10 +1006,20 @@ fn a_star_expands_to_every_column_of_the_view() {
             "\\N"
         ]]
     );
+    // **One row per `ColumnType`, and ten more that are not `ColumnType`s at all.** The five
+    // `information_schema` domains — `cardinal_number`, `character_data`, `sql_identifier`,
+    // `time_stamp`, `yes_or_no` — and one array type each. They are real domains on a real server
+    // and this node had them as their base types; they are `pg_type` rows rather than enum
+    // variants because a domain is not a storage type (`debts-v1.1.md` #37, ADR 0103).
+    //
+    // The arithmetic is written out rather than hidden behind a constant so that a *third* source
+    // of rows shows up here as a number that does not add up, which is what this assertion has
+    // always been for.
     assert_eq!(
         node.rows("SELECT * FROM pg_type").len(),
-        esker_sql::value::ColumnType::ALL.len(),
-        "one row per type this server has, and the catalog cannot fall behind the enum"
+        esker_sql::value::ColumnType::ALL.len() + 5 + 5,
+        "one row per type this server has, plus the five information_schema domains and their \
+         array types, and the catalog cannot fall behind either"
     );
 
     // **`pg_range` was empty until this node had range types**, and this assertion said so. It

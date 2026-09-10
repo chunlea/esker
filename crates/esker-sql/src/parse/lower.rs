@@ -3869,12 +3869,30 @@ impl Drop for DepthGuard {
     }
 }
 
+/// One expression, lowered — and **its explicit `COLLATE` clauses checked against each other**.
+///
+/// The check is here because it is the one collation rule that needs no scope: two clauses that
+/// disagree are decidable from the expression's own shape, so a query, a `DEFAULT`, a generated
+/// column and an index key all get it from one place, which is what a real server does
+/// ([ADR 0096](../../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md)).
+///
+/// **Once per whole expression, not once per node.** The recursion is
+/// [`lower_expr_inner`], which calls itself; every caller outside it lowers a *complete*
+/// expression and pays one linear walk. A statement with no `COLLATE` anywhere pays that walk and
+/// finds nothing, which is the shape of the other total walks in this crate.
+fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
+    let lowered = lower_expr_inner(expr)?;
+    plan::collation::refuse_explicit_mismatch(&lowered)?;
+    Ok(lowered)
+}
+
+/// The recursion, which is the whole of the old `lower_expr` — see its wrapper above.
 #[allow(
     clippy::too_many_lines,
     reason = "one arm per `sqlparser` expression node, in the parser's own order; splitting it \
               would put half the tree's shapes in a function named after nothing"
 )]
-fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
+fn lower_expr_inner(expr: &Expr) -> Result<plan::Expr> {
     // **Invariant 9, at the one place that was missing it.** The parser has been guarded since
     // phase 6a, and its guard counts *brackets* — which is why it never saw this: `a OR b OR c`
     // has one bracket and builds an N-deep tree, so run 46's node parsed a boolean chain happily
@@ -3898,20 +3916,20 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             {
                 Ok(plan::Expr::Arithmetic {
                     op: plan::ArithOp::Power,
-                    left: Box::new(lower_expr(&Expr::UnaryOp {
+                    left: Box::new(lower_expr_inner(&Expr::UnaryOp {
                         op: UnaryOperator::Minus,
                         expr: left.clone(),
                     })?),
-                    right: Box::new(lower_expr(right)?),
+                    right: Box::new(lower_expr_inner(right)?),
                     ty: None,
                 })
             }
-            other => Ok(plan::Expr::Negate(Box::new(lower_expr(other)?))),
+            other => Ok(plan::Expr::Negate(Box::new(lower_expr_inner(other)?))),
         },
         Expr::UnaryOp {
             op: UnaryOperator::Plus,
             expr,
-        } => lower_expr(expr),
+        } => lower_expr_inner(expr),
         // `title COLLATE "C" DESC`, which `unsafe_raw_sql_test.rb` sends and which this node can
         // answer *exactly*: `C` is byte order and a memcomparable key is already in byte order, so
         // the clause asks for the ordering the rows would have had. The name is still checked —
@@ -3924,19 +3942,26 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         // *column* is accepted here where PostgreSQL raises. Declared in
         // `tests/corpus/pg19_collation.txt` rather than left to be found.
         Expr::Collate { expr, collation } => {
-            let lowered = lower_expr(expr)?;
-            // The name is checked and then dropped: both names this node has mean byte order, so
-            // there is nothing for the plan to carry.
-            collation_name(collation)?;
+            let lowered = lower_expr_inner(expr)?;
+            // **The name is checked and the clause is kept.** It used to be dropped, on the
+            // reasoning that both names this node has mean byte order so there was nothing for the
+            // plan to carry — true of the *bytes* and false of the text and of the rule: a stored
+            // expression prints the clause back (`upper((t COLLATE "C"))`), and two explicit
+            // clauses that disagree are `42P21`. A clause that is dropped can do neither
+            // ([ADR 0096](../../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md)).
+            let collation = collation_name(collation)?;
             if let plan::Expr::Literal(literal) = &lowered
                 && let Some(ty) = literal_type(literal)
                 && !catalog::pg_attribute::collatable(ty)
             {
                 return Err(SqlError::CollationNotSupported(ty.name()));
             }
-            Ok(lowered)
+            Ok(plan::Expr::Collate {
+                operand: Box::new(lowered),
+                collation,
+            })
         }
-        Expr::Nested(inner) => lower_expr(inner),
+        Expr::Nested(inner) => lower_expr_inner(inner),
         // `~`, `~*`, `!~`, `!~*` — POSIX matching, in `LIKE`'s shape and for `LIKE`'s reason: a
         // subject and a *pattern*, with modifiers a binary op has nowhere to put.
         Expr::BinaryOp {
@@ -3948,8 +3973,8 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 | BinaryOperator::PGRegexNotIMatch),
             right,
         } => Ok(plan::Expr::RegexMatch {
-            operand: Box::new(lower_expr(left)?),
-            pattern: Box::new(lower_expr(right)?),
+            operand: Box::new(lower_expr_inner(left)?),
+            pattern: Box::new(lower_expr_inner(right)?),
             negated: matches!(
                 op,
                 BinaryOperator::PGRegexNotMatch | BinaryOperator::PGRegexNotIMatch
@@ -3977,8 +4002,8 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         } => {
             refuse_if(*any, "LIKE ANY, which is Snowflake's")?;
             Ok(plan::Expr::Like {
-                operand: Box::new(lower_expr(expr)?),
-                pattern: Box::new(lower_expr(pattern)?),
+                operand: Box::new(lower_expr_inner(expr)?),
+                pattern: Box::new(lower_expr_inner(pattern)?),
                 negated: *negated,
                 case_insensitive: matches!(expr_ref, Expr::ILike { .. }),
                 // **`ESCAPE` replaces the backslash rather than adding to it**: with one written a
@@ -4030,7 +4055,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 return Err(SqlError::SyntaxAtOrNear("[".to_owned()));
             }
             let (operand, subscript) = match access_chain.as_slice() {
-                [AccessExpr::Subscript(subscript)] => (lower_expr(root)?, subscript),
+                [AccessExpr::Subscript(subscript)] => (lower_expr_inner(root)?, subscript),
                 [
                     AccessExpr::Dot(Expr::Identifier(column)),
                     AccessExpr::Subscript(subscript),
@@ -4050,7 +4075,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             };
             Ok(plan::Expr::Subscript {
                 operand: Box::new(operand),
-                index: Box::new(lower_expr(index)?),
+                index: Box::new(lower_expr_inner(index)?),
                 // `text` until a comparison gives it one, which is where an element's type comes
                 // from (`plan::Expr::Subscript::element`).
                 element: ColumnType::Text,
@@ -4110,11 +4135,11 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             ))),
         },
         Expr::IsNull(operand) => Ok(plan::Expr::IsNull {
-            operand: Box::new(lower_expr(operand)?),
+            operand: Box::new(lower_expr_inner(operand)?),
             negated: false,
         }),
         Expr::IsNotNull(operand) => Ok(plan::Expr::IsNull {
-            operand: Box::new(lower_expr(operand)?),
+            operand: Box::new(lower_expr_inner(operand)?),
             negated: true,
         }),
         // **Not a `NOT` around an `=`.** The two are one operator each, because the negation of
@@ -4158,8 +4183,8 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             // the `OR` form and the `NOT`-wrapped form give the same three NULLs and the same
             // trues and falses elsewhere. The doc that used to sit here said the wrap was what
             // carried the NULL through — true of it, and true of the `OR` form as well.
-            let value = lower_expr(expr)?;
-            let (low, high) = (lower_expr(low)?, lower_expr(high)?);
+            let value = lower_expr_inner(expr)?;
+            let (low, high) = (lower_expr_inner(low)?, lower_expr_inner(high)?);
             let (op, first, second) = if *negated {
                 (plan::BinaryOp::Or, plan::BinaryOp::Lt, plan::BinaryOp::Gt)
             } else {
@@ -4186,7 +4211,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
-        } => Ok(plan::Expr::Not(Box::new(lower_expr(expr)?))),
+        } => Ok(plan::Expr::Not(Box::new(lower_expr_inner(expr)?))),
         // **A comparison over `json` is refused and one over `jsonb` is not**, for the reason the
         // `||` arm above parts them: `json` has no comparison operator on a real server, so the
         // honest answer is the one a real server gives, while `jsonb` has a complete btree and
@@ -4230,8 +4255,8 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
         Expr::BinaryOp { op, left, right } if arithmetic_op(op).is_some() => {
             Ok(plan::Expr::Arithmetic {
                 op: arithmetic_op(op).unwrap_or(plan::ArithOp::Add),
-                left: Box::new(lower_expr(left)?),
-                right: Box::new(lower_expr(right)?),
+                left: Box::new(lower_expr_inner(left)?),
+                right: Box::new(lower_expr_inner(right)?),
                 ty: None,
             })
         }
@@ -4286,8 +4311,8 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 | BinaryOperator::PGNotLikeMatch
                 | BinaryOperator::PGNotILikeMatch) => {
                     return Ok(plan::Expr::Like {
-                        operand: Box::new(lower_expr(left)?),
-                        pattern: Box::new(lower_expr(right)?),
+                        operand: Box::new(lower_expr_inner(left)?),
+                        pattern: Box::new(lower_expr_inner(right)?),
                         negated: matches!(
                             op,
                             BinaryOperator::PGNotLikeMatch | BinaryOperator::PGNotILikeMatch
@@ -4312,7 +4337,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                     };
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func,
-                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                        args: vec![lower_expr_inner(left)?, lower_expr_inner(right)?],
                     })));
                 }
                 // **`->>` needs no dispatch**: it is not an hstore operator, so every one of them
@@ -4320,13 +4345,13 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 BinaryOperator::LongArrow => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::JsonFetchText,
-                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                        args: vec![lower_expr_inner(left)?, lower_expr_inner(right)?],
                     })));
                 }
                 BinaryOperator::Question => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::HstoreHasKey,
-                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                        args: vec![lower_expr_inner(left)?, lower_expr_inner(right)?],
                     })));
                 }
                 // **`@>` is spelled the same for an hstore and a range**, so it lowers to one
@@ -4340,13 +4365,13 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 BinaryOperator::TildeEq => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::SameAs,
-                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                        args: vec![lower_expr_inner(left)?, lower_expr_inner(right)?],
                     })));
                 }
                 BinaryOperator::AtArrow => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::HstoreContains,
-                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                        args: vec![lower_expr_inner(left)?, lower_expr_inner(right)?],
                     })));
                 }
                 // `b <@ a` is `a @> b` with the arguments the other way round, so there is one
@@ -4354,7 +4379,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 BinaryOperator::ArrowAt => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::RangeContains,
-                        args: vec![lower_expr(right)?, lower_expr(left)?],
+                        args: vec![lower_expr_inner(right)?, lower_expr_inner(left)?],
                     })));
                 }
                 // **`@@` in both argument orders is one call**, and the evaluator decides which
@@ -4362,7 +4387,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 BinaryOperator::AtAt => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::TsMatch,
-                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                        args: vec![lower_expr_inner(left)?, lower_expr_inner(right)?],
                     })));
                 }
                 BinaryOperator::StringConcat => {
@@ -4417,13 +4442,13 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                     };
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func,
-                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                        args: vec![lower_expr_inner(left)?, lower_expr_inner(right)?],
                     })));
                 }
                 BinaryOperator::PGOverlap => {
                     return Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
                         func: plan::CatalogFunc::RangeOverlaps,
-                        args: vec![lower_expr(left)?, lower_expr(right)?],
+                        args: vec![lower_expr_inner(left)?, lower_expr_inner(right)?],
                     })));
                 }
                 other => {
@@ -4449,7 +4474,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             list,
             negated,
         } => Ok(plan::Expr::InList {
-            operand: Box::new(lower_expr(expr)?),
+            operand: Box::new(lower_expr_inner(expr)?),
             list: list.iter().map(lower_expr).collect::<Result<Vec<_>>>()?,
             negated: *negated,
             any: false,
@@ -4519,14 +4544,14 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                 Some(TrimWhereField::Trailing) => plan::CatalogFunc::Rtrim,
                 Some(TrimWhereField::Both) | None => plan::CatalogFunc::Btrim,
             };
-            let mut args = vec![lower_expr(expr)?];
+            let mut args = vec![lower_expr_inner(expr)?];
             // Two spellings of the same second argument: `TRIM(BOTH 'x' FROM y)` puts it in
             // `trim_what`, and PostgreSQL's `trim(y, 'x')` in `trim_characters`.
             if let Some(what) = trim_what {
-                args.push(lower_expr(what)?);
+                args.push(lower_expr_inner(what)?);
             } else if let Some(chars) = trim_characters {
                 for one in chars {
-                    args.push(lower_expr(one)?);
+                    args.push(lower_expr_inner(one)?);
                 }
             }
             Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
@@ -4572,7 +4597,7 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                     .iter()
                     .map(lower_expr)
                     .collect::<Result<Vec<_>>>()?,
-                other => vec![lower_expr(other)?],
+                other => vec![lower_expr_inner(other)?],
             };
             Ok(plan::Expr::Subquery(Box::new(
                 plan::SubqueryExpr::compared_row(
@@ -4641,8 +4666,8 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
                     .iter()
                     .map(|branch| {
                         Ok(plan::CaseBranch {
-                            when: lower_expr(&branch.condition)?,
-                            then: lower_expr(&branch.result)?,
+                            when: lower_expr_inner(&branch.condition)?,
+                            then: lower_expr_inner(&branch.result)?,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -4664,15 +4689,15 @@ fn lower_expr(expr: &Expr) -> Result<plan::Expr> {
             shorthand,
             ..
         } => {
-            let mut args = vec![lower_expr(expr)?];
+            let mut args = vec![lower_expr_inner(expr)?];
             let Some(from) = substring_from else {
                 // `SUBSTRING(x FOR n)` with no `FROM` is `SUBSTRING(x FROM 1 FOR n)` on a real
                 // server; nothing sends it, so it is named rather than assumed.
                 return Err(SqlError::unsupported("SUBSTRING with no FROM"));
             };
-            args.push(lower_expr(from)?);
+            args.push(lower_expr_inner(from)?);
             if let Some(count) = substring_for {
-                args.push(lower_expr(count)?);
+                args.push(lower_expr_inner(count)?);
             }
             // The spelling decides the output column's name and nothing else — measured.
             Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {

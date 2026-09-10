@@ -3395,6 +3395,14 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         // Only the **operand** is resolved here. Everything inside the sub-select was resolved
         // against the sub-select's own scope when `crate::exec::subquery::plan_subqueries` planned
         // it, and resolving it again here would type it against a row it will never see.
+        // **The operand is resolved and the clause kept.** This function's tail is
+        // `other => other.clone()`, so a node with a child that is *not* listed here keeps an
+        // unresolved `Expr::Column` inside it and reaches the row evaluator as an internal error
+        // — which is what a new one-child variant costs, and the compiler cannot say so.
+        Expr::Collate { operand, collation } => Expr::Collate {
+            operand: Box::new(resolve(operand, scope)?),
+            collation: collation.clone(),
+        },
         Expr::Subquery(sub) => {
             let mut resolved = sub.clone();
             resolved.operands = sub
@@ -4446,6 +4454,8 @@ fn carried_type(expr: &Expr) -> Option<ColumnType> {
         Expr::ToText { .. } => Some(ColumnType::Text),
         // The type the cast named, which is the whole point of carrying it.
         Expr::Cast { to, .. } => Some(*to),
+        // A `COLLATE` carries whatever it was written on: it changes an ordering, never a type.
+        Expr::Collate { operand, .. } => carried_type(operand),
         // **An `unknown` stops being one the moment it passes through a constructor.** Measured,
         // one constructor at a time: `pg_typeof((SELECT '1'))`, `pg_typeof(CASE WHEN true THEN
         // '1' ELSE '2' END)` and `pg_typeof(COALESCE('1','2'))` are each **`text`** on a real
@@ -5010,6 +5020,9 @@ fn figure_column_name(expr: &Expr) -> String {
         // them: `coalesce`, `case`.
         Expr::Coalesce(_) => "coalesce".to_owned(),
         Expr::Case { .. } => "case".to_owned(),
+        // **A `COLLATE` is transparent to naming**: `SELECT t COLLATE "C"` is a column called
+        // `t` on a real server, measured, exactly as `SELECT (t)` is.
+        Expr::Collate { operand, .. } => figure_column_name(operand),
         // A cast that reaches run time: the operand's name, or the type it casts to.
         Expr::ToText { operand, .. } => match figure_column_name(operand) {
             unnamed if unnamed == "?column?" => "text".to_owned(),
@@ -5761,7 +5774,20 @@ fn pg_typeof_of(expr: &Expr, scope: &Scope<'_>) -> Result<Datum> {
     {
         return Ok(Datum::RegType {
             oid: u32::try_from(def.oid).unwrap_or(0),
-            name: def.name.clone().into(),
+            // **The stored name as a sentence spells it**, which is a NUL apart from what it
+            // holds: a type in a schema is `schema ++ NUL ++ name` on disk, and `pg_typeof` was
+            // handing that byte to a client — `s\0dom_probe` where a real server says
+            // `s.dom_probe`. `format_type` had it right one screen away, which is how it was
+            // found — and it is `information_schema.sql_identifier` that needs it, since every
+            // column of those views is a domain now (ADR 0103).
+            //
+            // **Qualified for anything outside `public`**, which is `qualify`'s rule read back
+            // and not quite PostgreSQL's: a real server qualifies a type that is not in the
+            // *session's* search path, so a schema a client has put on its path prints bare there
+            // and qualified here. `exec::cursor`'s `type_qualified_for` asks the session and is
+            // the right answer; this function has no `Settings` to ask, and the narrower
+            // divergence is not the one that was putting a NUL on the wire.
+            name: crate::catalog::display_name(&def.name).into(),
         });
     }
     Ok(crate::value::regtype_of_oid(expr_type(expr, scope)?.oid()))
@@ -5891,10 +5917,14 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // The arm answers now, so this asks it like any other operand — and measured on 19beta1,
         // `abs(min(int4))` is `integer`, `abs(sum(int4))` is `bigint`, `abs(avg(int4))` is
         // `numeric` and `abs(count(*))` is `bigint`, which is exactly its argument's type.
+        // **And a `COLLATE`, which has the type it was written on**: it changes an ordering
+        // and never a representation, so it is transparent here exactly as `abs` is over its
+        // argument (ADR 0096).
         Expr::Scalar {
             func: crate::plan::ScalarFunc::Abs,
             operand,
-        } => expr_type(operand, scope)?,
+        }
+        | Expr::Collate { operand, .. } => expr_type(operand, scope)?,
         // **The three counting functions answer `integer`, whatever they count.** Measured on
         // 19beta1: `pg_typeof(length('abc'))`, `char_length` and `octet_length` are all `integer`,
         // and this node declared `text` for every one of them — the *values* were always right, so

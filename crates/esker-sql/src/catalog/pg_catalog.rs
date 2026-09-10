@@ -1303,7 +1303,14 @@ impl CatalogView {
                                 generated_virtual: false,
                                 comment: None,
                                 dropped: false,
-                                user_type: None,
+                                // **Every `information_schema` column is a domain**, and this is
+                                // where a client is told so: `field_of` sends the type a column's
+                                // `user_type` names, so `table_name` leaves here as 13361 and not
+                                // as `name`. A `pg_catalog` column answers `None` and keeps the
+                                // type it declared (ADR 0103, shape A).
+                                user_type: (view.schema() == super::INFORMATION_SCHEMA)
+                                    .then(|| information_schema_domain_of(name))
+                                    .flatten(),
                             })
                             .collect(),
                         primary_key: Vec::new(),
@@ -1323,7 +1330,14 @@ impl CatalogView {
                         partition_bound: None,
                         comment: None,
                         primary_key_comment: None,
-                        enums: std::collections::BTreeMap::new(),
+                        // The other half of the pair: a column holds a type's **oid** and the
+                        // definition lives on the table, so both have to be here or the lookup
+                        // finds nothing and the field falls back to the base type.
+                        enums: if view.schema() == super::INFORMATION_SCHEMA {
+                            information_schema_domain_types().clone()
+                        } else {
+                            std::collections::BTreeMap::new()
+                        },
                     })
                 })
                 .collect()
@@ -2751,12 +2765,304 @@ fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
             ]
         })
         .collect();
+    rows.extend(information_schema_domain_rows());
     rows.extend(user_type_rows(txn, tenant)?);
     rows.sort_by_key(|row| match row.first() {
         Some(Datum::Int8(oid)) => *oid,
         _ => 0,
     });
     Ok(rows)
+}
+
+/// One of the five `information_schema` domains, which are real domains on a real server and were
+/// base types here.
+///
+/// A struct rather than a tuple because seven fields is past what a reader can hold in order, and
+/// three of them are numbers that look alike.
+struct InformationSchemaDomain {
+    /// PostgreSQL 19beta1's own oid for it.
+    oid: i64,
+    /// And for its array type, which is the domain's **minus one**.
+    array_oid: i64,
+    /// Bare, as `pg_type.typname` carries it; the schema is `typnamespace`.
+    name: &'static str,
+    /// What the values physically are, and what `typlen` and `typcategory` are read from.
+    base: ColumnType,
+    /// **The domain's own width** — `pg_type.typtypmod`, measured: `yes_or_no` is
+    /// `character varying(3)` and `time_stamp` is `timestamptz(2)`, the other three `-1`. It is on
+    /// the *type* and not on the column: every one of the 122 `information_schema` columns has
+    /// `atttypmod = -1`, measured, which is why the column list beside this one declares no width.
+    typmod: i32,
+    /// `pg_type.typdefault`, for the one that has one.
+    default: Option<&'static str>,
+    /// **The columns of this node's own `information_schema` views declared as it.**
+    ///
+    /// The column *name alone* decides which domain — measured across all seven views, 122
+    /// columns, and **no name maps to two domains** — so the list is written per domain rather
+    /// than per view, and a column that appears in three views is named once. Only the names this
+    /// node's views declare are here; PostgreSQL's full `information_schema` has more of each.
+    columns: &'static [&'static str],
+}
+
+/// The five, and **the oids are PostgreSQL 19beta1's own.**
+///
+/// Measured 2026-09-10 (`tests/captures/pg19_domain_type.txt`). Using the measured numbers rather
+/// than allocating from this node's own sequence costs nothing and is safe by construction: they
+/// sit inside PostgreSQL's built-in range — `pg_type`'s built-ins run 16 to 13744 — and this node
+/// hands out user ids from [`super::FIRST_USER_ID`] (16384) upwards, so nothing it allocates can
+/// collide with one.
+///
+/// **The array oid is the domain's minus one**, for all five, because `initdb` allocates the array
+/// type first. This node's own convention for a user type is `oid + 1`, which is why the pairs are
+/// written out rather than derived: a rule read off one of these would be wrong about the others'
+/// direction.
+///
+/// **`typlen` and `typcategory` are the base's**, which is the rule `TypeKind::Domain` already
+/// applies to a user domain: measured, `sql_identifier` is 64 (`name`'s width) and `S`,
+/// `cardinal_number` is 4 and `N`, `time_stamp` is 8 and `D`, and the two over `varchar` are -1
+/// and `S`.
+///
+/// **`time_stamp` has no columns**, which is a fact rather than an omission: the views that carry
+/// one — `triggers`, `routines`, the `role_*` family — are not views this node has.
+///
+/// **They come before the wire, never after.** `ActiveRecord` loads its type map with
+/// `WHERE t.typtype IN ('r', 'e', 'd')` on every connection — 712 occurrences across 164 captured
+/// files — and an oid this node sends that does not come back from that query has no decoder, so a
+/// correct value arrives as a string. These rows are what makes sending one safe
+/// ([ADR 0103](../../../../docs/adr/0103-a-domain-is-a-type-a-client-can-be-sent.md),
+/// `debts-v1.1.md` #37).
+const INFORMATION_SCHEMA_DOMAINS: [InformationSchemaDomain; 5] = [
+    InformationSchemaDomain {
+        oid: 13_356,
+        array_oid: 13_355,
+        name: "cardinal_number",
+        base: ColumnType::Int4,
+        typmod: crate::value::NO_TYPMOD,
+        default: None,
+        columns: &[
+            "character_maximum_length",
+            "datetime_precision",
+            "numeric_precision",
+            "numeric_scale",
+            "ordinal_position",
+            "position_in_unique_constraint",
+        ],
+    },
+    InformationSchemaDomain {
+        oid: 13_359,
+        array_oid: 13_358,
+        name: "character_data",
+        base: ColumnType::Varchar,
+        typmod: crate::value::NO_TYPMOD,
+        default: None,
+        columns: &[
+            "column_default",
+            "constraint_type",
+            "data_type",
+            "delete_rule",
+            "generation_expression",
+            "identity_generation",
+            "is_generated",
+            "match_option",
+            "table_type",
+            "update_rule",
+            "view_definition",
+        ],
+    },
+    InformationSchemaDomain {
+        oid: 13_361,
+        array_oid: 13_360,
+        name: "sql_identifier",
+        base: ColumnType::Name,
+        typmod: crate::value::NO_TYPMOD,
+        default: None,
+        columns: &[
+            "collation_catalog",
+            "collation_name",
+            "collation_schema",
+            "column_name",
+            "constraint_name",
+            "constraint_schema",
+            "domain_name",
+            "domain_schema",
+            "table_name",
+            "table_schema",
+            "udt_name",
+            "udt_schema",
+            "unique_constraint_name",
+            "unique_constraint_schema",
+        ],
+    },
+    InformationSchemaDomain {
+        oid: 13_367,
+        array_oid: 13_366,
+        name: "time_stamp",
+        base: ColumnType::TimestampTz,
+        typmod: 2,
+        default: Some("CURRENT_TIMESTAMP(2)"),
+        columns: &[],
+    },
+    InformationSchemaDomain {
+        oid: 13_369,
+        array_oid: 13_368,
+        name: "yes_or_no",
+        base: ColumnType::Varchar,
+        typmod: super::information_schema::YES_OR_NO,
+        default: None,
+        columns: &[
+            "initially_deferred",
+            "is_deferrable",
+            "is_identity",
+            "is_insertable_into",
+            "is_nullable",
+            "is_updatable",
+        ],
+    },
+];
+
+/// The five as [`super::TypeDef`]s, by oid — what a column of one points at.
+///
+/// **Built once and shared**, because they are constants wearing a runtime type: a `TypeDef` is
+/// what `TableDef::enums` holds and what `exec::assign::user_type_of` looks a column's
+/// `user_type` up in, so a domain that reaches the wire has to be one of these.
+///
+/// The name is the **stored** form — `information_schema` and the domain, separated by
+/// [`super::SCHEMA_SEPARATOR`] — because that is what every other type in a schema carries, and
+/// what makes `pg_typeof` print `information_schema.sql_identifier` the way a real server does.
+fn information_schema_domain_types() -> &'static std::collections::BTreeMap<u64, super::TypeDef> {
+    static TYPES: OnceLock<std::collections::BTreeMap<u64, super::TypeDef>> = OnceLock::new();
+    TYPES.get_or_init(|| {
+        INFORMATION_SCHEMA_DOMAINS
+            .iter()
+            .map(|domain| {
+                let oid = u64::try_from(domain.oid).unwrap_or(0);
+                (
+                    oid,
+                    super::TypeDef {
+                        name: super::qualify(super::INFORMATION_SCHEMA, domain.name),
+                        oid,
+                        kind: super::TypeKind::Domain {
+                            base: domain.base,
+                            typmod: domain.typmod,
+                            // None of the five is `NOT NULL` and only one has a default, both
+                            // measured; a `CHECK` a real server has on `yes_or_no` is not
+                            // reachable here, because nothing writes to a catalog view.
+                            not_null: false,
+                            default: domain.default.map(str::to_owned),
+                            check: None,
+                        },
+                    },
+                )
+            })
+            .collect()
+    })
+}
+
+/// The base type and width **a client resolves one of the five to for display**, by oid.
+///
+/// Public because `psql` does exactly this and the parity corpora record its answer: `\gdesc` of
+/// `information_schema.columns.is_nullable` prints `character varying(3)`, not
+/// `information_schema.yes_or_no`, while the `RowDescription` behind it carries 13369 — measured
+/// on 19beta1 through `pg_prepared_statements.result_types`, which reads the wire and says
+/// `{information_schema.sql_identifier, information_schema.yes_or_no,
+/// information_schema.cardinal_number}`. Two renderings of one oid, and a corpus holds the
+/// client's, so `tests/parity_harness` needs the same table to compare against it.
+///
+/// **The width is the type's** — `pg_type.typtypmod` — because the column's is -1.
+#[must_use]
+pub fn information_schema_domain_base(oid: u32) -> Option<(ColumnType, i32)> {
+    INFORMATION_SCHEMA_DOMAINS
+        .iter()
+        .find(|domain| u32::try_from(domain.oid).is_ok_and(|theirs| theirs == oid))
+        .map(|domain| (domain.base, domain.typmod))
+}
+
+/// The **stored** name of one of the five, by oid — `None` for any other oid.
+///
+/// `format_type` needs it: the five have no record in the tenant's key space, so
+/// `Relations::user_type_name` cannot find one and the answer was `???` for the very oids this
+/// node had just put in `pg_attribute.atttypid`.
+pub(crate) fn information_schema_domain_name(oid: u64) -> Option<&'static str> {
+    information_schema_domain_types()
+        .get(&oid)
+        .map(|def| def.name.as_str())
+}
+
+/// The domain an `information_schema` column is declared as, **by its name alone**.
+///
+/// That the name is enough is measured and not assumed (see [`InformationSchemaDomain::columns`]),
+/// and `every_information_schema_column_is_a_domain` is the ratchet: every column of every view
+/// this node has must answer here, so a view added without its domains fails rather than quietly
+/// declaring a base type to a client.
+fn information_schema_domain_of(column: &str) -> Option<u64> {
+    INFORMATION_SCHEMA_DOMAINS
+        .iter()
+        .find(|domain| domain.columns.contains(&column))
+        .and_then(|domain| u64::try_from(domain.oid).ok())
+}
+
+/// The oid this node's `pg_namespace` gives `information_schema`.
+///
+/// **Its own number and not PostgreSQL's 13342**, for the reason the built-in rows' `typnamespace`
+/// comment already gives: the schema model is what differs, not this column. What matters to a
+/// client is that the join lands in a schema called `information_schema`, and it does.
+const INFORMATION_SCHEMA_NAMESPACE_OID: i64 = 13;
+
+/// A `pg_type` row per `information_schema` domain, and one per array of one.
+fn information_schema_domain_rows() -> Vec<Vec<Datum>> {
+    let mut rows = Vec::with_capacity(INFORMATION_SCHEMA_DOMAINS.len() * 2);
+    for domain in &INFORMATION_SCHEMA_DOMAINS {
+        let InformationSchemaDomain {
+            oid,
+            array_oid,
+            name,
+            base,
+            default,
+            ..
+        } = *domain;
+        rows.push(vec![
+            Datum::Int8(oid),
+            Datum::Text(name.to_owned()),
+            // A domain over a scalar has no element type, however its base prints.
+            Datum::Int8(0),
+            Datum::Text(",".to_owned()),
+            Datum::Text("domain_in".to_owned()),
+            Datum::Text("d".to_owned()),
+            Datum::Int8(i64::from(base.oid())),
+            Datum::Int8(super::pg_attribute::typcollation(base)),
+            Datum::Int8(INFORMATION_SCHEMA_NAMESPACE_OID),
+            Datum::Int2(base.type_len()),
+            Datum::Text(typcategory(base).to_owned()),
+            Datum::Int8(array_oid),
+            // Only a composite owns a `pg_class` row.
+            Datum::Int8(0),
+            // None of the five is `NOT NULL`, measured.
+            Datum::Bool(false),
+            default.map_or(Datum::Null, |text| Datum::Text(text.to_owned())),
+        ]);
+        rows.push(vec![
+            Datum::Int8(array_oid),
+            Datum::Text(format!("_{name}")),
+            // **The array's element is the domain**, which is how a client reaches it: the
+            // type-map query asks for `typtype IN ('r','e','d')` and an array is `b`, so
+            // `ActiveRecord` never sees this row directly and finds it through the domain's.
+            Datum::Int8(oid),
+            Datum::Text(",".to_owned()),
+            Datum::Text("array_in".to_owned()),
+            // An array **of** a domain is a base type; the `d` belongs to what it is an array of.
+            Datum::Text("b".to_owned()),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(INFORMATION_SCHEMA_NAMESPACE_OID),
+            Datum::Int2(-1),
+            Datum::Text("A".to_owned()),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Bool(false),
+            Datum::Null,
+        ]);
+    }
+    rows
 }
 
 /// One row per user-defined type, and **one more for the array type `CREATE TYPE` made with it**.

@@ -2246,6 +2246,28 @@ pub enum SqlError {
     #[error("collations are not supported by type {0}")]
     CollationNotSupported(&'static str),
 
+    /// Two **explicit** `COLLATE` clauses that disagree, meeting in one expression: `42P21`.
+    ///
+    /// PostgreSQL's own sentence, and **no `HINT`** — measured on 19beta1, which is the pair of
+    /// facts that tells this apart from `42P22`: there the user named nothing and the server could
+    /// not derive an ordering, and the hint asks for a clause; here the user named two and the
+    /// server will not pick between them, so there is nothing to suggest.
+    ///
+    /// **The names are in the order the expression writes them**, measured:
+    /// `((t COLLATE "POSIX") < (u COLLATE "C"))` says `"POSIX" and "C"`.
+    ///
+    /// It is not only comparison: `||`, `COALESCE` and `CASE` raise it too, and it propagates up
+    /// through a function — `upper('a' COLLATE "C") < ('b' COLLATE "POSIX")` is this. Anywhere two
+    /// explicit clauses **merge**
+    /// ([ADR 0096](../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md)).
+    #[error("collation mismatch between explicit collations \"{left}\" and \"{right}\"")]
+    CollationMismatch {
+        /// The one the expression writes first.
+        left: String,
+        /// And the one that disagreed with it.
+        right: String,
+    },
+
     /// `CREATE INDEX … USING gin(name)` where the type has no default class **for that method**.
     /// The same sentence [`SqlError::NoDefaultOperatorClass`] gives, with the method named too —
     /// measured, and the two are one message with the access method substituted.
@@ -3166,6 +3188,7 @@ impl SqlError {
             // `COLLATE "C"` on an `integer`: the collation exists, the type has no ordering for it
             // to override. `42804`, measured — and `42704` is what the *name* being unknown gets.
             | SqlError::CollationNotSupported(_) => sqlstate::DATATYPE_MISMATCH,
+            SqlError::CollationMismatch { .. } => sqlstate::COLLATION_MISMATCH,
 
             SqlError::DuplicateTrigger { .. }
             // A label a `CREATE`/`ALTER TYPE` would add twice is a duplicate object like any other.
