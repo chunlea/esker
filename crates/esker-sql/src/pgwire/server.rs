@@ -162,6 +162,14 @@ pub struct Connection<S> {
     ///
     /// `None` for a connection built directly, which is what the in-memory tests do.
     pending: Option<Vec<u8>>,
+    /// Bytes read off the socket **while a statement was running**, waiting to be framed.
+    ///
+    /// [`Connection::watch_for_the_client_leaving`] has to read to learn that the peer is gone —
+    /// a socket has no other way to say so — and a client is entitled to pipeline while its
+    /// statement runs, so whatever it sent has to be given back. Every read goes through
+    /// [`Connection::read_exact_or_eof`], which drains this first, so the message stream is the
+    /// same one the client wrote whether or not anybody was watching.
+    spare: Vec<u8>,
     /// This session's pid, key and cancellation flag, from the moment startup completes.
     ///
     /// `None` before then and for a connection that never got that far — a `CancelRequest` is
@@ -204,6 +212,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             out: Vec::with_capacity(8 * 1024),
             backend: None,
             pending,
+            spare: Vec::new(),
         }
     }
 
@@ -312,17 +321,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             // because a node serves many connections at once: blocking a *worker* thread per
             // statement would starve the runtime of the threads it needs to read the next
             // message, where the blocking pool exists to be blocked.
-            work.out.clear();
-            // The bundle moves in and comes back out, so the buffer really is reused across
-            // messages rather than reallocated per statement.
-            work = tokio::task::spawn_blocking(move || {
-                let mut work = work;
-                work.session
-                    .handle(&message, work.executor.as_mut(), &mut work.out);
-                work
-            })
-            .await
-            .map_err(std::io::Error::other)?;
+            work = self.handle_while_watching(work, message).await?;
             // **A session may terminate itself**, and then its own answer must not be sent:
             // `SELECT pg_terminate_backend(pg_backend_pid())` on PostgreSQL replies `FATAL` and
             // closes — the `t` the function computed never reaches the client. The check before
@@ -613,7 +612,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             ));
         }
         let mut body = vec![0u8; length - 4];
-        self.stream.read_exact(&mut body).await?;
+        if !self.read_exact_or_eof(&mut body).await? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the connection ended in the middle of a message",
+            ));
+        }
         Ok(Some((header[0], body)))
     }
 
@@ -621,8 +625,152 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
     ///
     /// A client that hangs up between messages is ordinary, not an error; one that hangs up
     /// *inside* a message is a real failure and `read_exact` reports it.
+    ///
+    /// **[`Connection::spare`] comes first**, and every read goes through here for that reason:
+    /// bytes the watcher took off the socket while a statement ran are part of the same stream and
+    /// have to be framed in the order the client wrote them.
     async fn read_exact_or_eof(&mut self, buffer: &mut [u8]) -> std::io::Result<bool> {
-        read_exact_or_eof(&mut self.stream, buffer).await
+        let taken = self.spare.len().min(buffer.len());
+        buffer[..taken].copy_from_slice(&self.spare[..taken]);
+        self.spare.drain(..taken);
+        if taken == buffer.len() {
+            return Ok(true);
+        }
+        match read_exact_or_eof(&mut self.stream, &mut buffer[taken..]).await? {
+            true => Ok(true),
+            // Nothing was in hand, so this is the ordinary hang-up between messages.
+            false if taken == 0 => Ok(false),
+            // Bytes were in hand and the rest never came: the same half-message failure
+            // `read_exact_or_eof` reports, one layer up.
+            false => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the connection ended in the middle of a message",
+            )),
+        }
+    }
+
+    /// Runs one message's work on the blocking pool, **watching the socket while it runs**.
+    ///
+    /// The bundle moves in and comes back out, so the reply buffer really is reused across
+    /// messages rather than reallocated per statement, and `spawn_blocking` rather than
+    /// `block_in_place` because a node serves many connections at once: blocking a *worker* thread
+    /// per statement would starve the runtime of the threads it needs to read the next message,
+    /// where the blocking pool exists to be blocked.
+    ///
+    /// The watching half is `debts-v1.1.md` #47 and is described on
+    /// [`Connection::watch_for_the_client_leaving`]. Nothing here closes anything: the watcher
+    /// sets the cancellation flag, the statement ends with `57014`, and the read at the top of the
+    /// loop finds the end of the stream and ends the session the ordinary way.
+    async fn handle_while_watching(
+        &mut self,
+        work: Work,
+        message: crate::pgwire::message::Frontend,
+    ) -> std::io::Result<Work> {
+        let leaving = self
+            .backend
+            .as_ref()
+            .map(|backend| Arc::clone(&backend.cancel));
+        let mut running = tokio::task::spawn_blocking(move || {
+            let mut work = work;
+            // **This message's reply, and nothing before it.** The buffer is reused across
+            // messages and arrives holding the *startup* reply on the first trip round, because
+            // `run` takes it from the connection after startup has built its answers in it — so
+            // leaving this out sends the startup reply again in front of the first statement's,
+            // and a client that reads to `ReadyForQuery` stops at the one it has already seen:
+            // `Answer { tags: "Z", rows: [] }` for `SELECT 1`. It was a line in the loop before
+            // this function was extracted, and it belongs to the message rather than to the loop.
+            work.out.clear();
+            work.session
+                .handle(&message, work.executor.as_mut(), &mut work.out);
+            work
+        });
+        // The borrows of `self` end with this block, so the join below is free to take `running`
+        // on the path where the watcher won the race.
+        let finished = {
+            let watching = Self::watch_for_the_client_leaving(
+                &mut self.stream,
+                &mut self.spare,
+                leaving.as_ref(),
+            );
+            tokio::pin!(watching);
+            tokio::select! {
+                done = &mut running => done,
+                // The watcher never finishes — it has nothing to hand back and the statement is
+                // the only thing that ends the race, so it says so in its type.
+                never = &mut watching => match never {},
+            }
+        };
+        finished.map_err(std::io::Error::other)
+    }
+
+    /// Watches the socket **while a statement runs**, and cancels the statement when the client
+    /// has gone.
+    ///
+    /// Returns when there is nothing more to watch for: the peer closed, the socket failed, or so
+    /// much was pipelined that holding it is worse than not watching.
+    ///
+    /// **A socket only says the peer is gone by returning zero from a read**, which is why this
+    /// exists at all: between statements the connection loop is already blocked in a read and
+    /// notices at once — a client killed while idle is reaped in about eight seconds, measured —
+    /// but *during* a statement nobody is reading, so the `FIN` sits in the kernel and the session
+    /// and its `CLOSE_WAIT` socket live until the statement ends on its own. `SELECT pg_sleep(60)`
+    /// killed immediately still held both for the full sixty seconds; a statement that never ends
+    /// held them for ever, which is how run 112 accumulated about three thousand sessions that
+    /// `pg_stat_activity` never gave back (`debts-v1.1.md` #47, r1's
+    /// `results/run-112b/session-leak.md`).
+    ///
+    /// **It sets the cancellation flag rather than closing anything.** That flag is the one
+    /// `pg_cancel_backend` and the protocol's `CancelRequest` already set, and `exec::cancel`
+    /// already checks it between units of work — the scan walk, the row wait and `pg_sleep` — so
+    /// the wait this row was found on is interruptible without a second mechanism. The statement
+    /// ends with `57014`, the loop goes round, and the read that follows finds the end of the
+    /// stream and closes the session properly, unwinding whatever it held.
+    async fn watch_for_the_client_leaving(
+        stream: &mut S,
+        spare: &mut Vec<u8>,
+        cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    ) -> std::convert::Infallible {
+        let mut buffer = [0u8; 4096];
+        loop {
+            // **A cap, because a watcher is not a queue.** A client may pipeline behind its own
+            // statement and this has to keep those bytes; a client that floods must not be able to
+            // make the server hold them. Past the cap the watch simply stops: the connection is
+            // then exactly as it was before this function existed, which is a leak and never a
+            // corruption.
+            if spare.len() > MAX_MESSAGE_LEN {
+                break;
+            }
+            match stream.read(&mut buffer).await {
+                // Zero is the peer's `FIN`; an error is an `RST` or worse. Both mean nobody is
+                // waiting for this statement's answer.
+                //
+                // **It goes on insisting rather than setting the flag once**, and that is a race
+                // this cannot otherwise win: `exec::cancel::with_session` **clears** the flag at
+                // the start of every statement — deliberately, so a `CancelRequest` that arrives
+                // while a session is idle cannot kill the *next* statement — and it does that on
+                // the blocking thread, after this task has already started watching. A client
+                // that was gone before its statement got going would have its one store wiped by
+                // that clear, and the statement would run to completion: harmless for a `SELECT`,
+                // and not harmless at all for the case this row was found on, where the statement
+                // is blocked on a lock held by another dead session and would never end.
+                //
+                // So it stores in a loop, and the loop lives exactly as long as the statement:
+                // `handle_while_watching` drops this future the moment the work completes. Fifty
+                // milliseconds is far below any wait worth cancelling and far above the window the
+                // clear can hide in.
+                Ok(0) | Err(_) => loop {
+                    if let Some(cancel) = cancel {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                },
+                Ok(read) => spare.extend_from_slice(&buffer[..read]),
+            }
+        }
+        // Nothing left to watch for, and nothing to report: the statement is what this races, and
+        // it is the only thing that ends the race. Returning would make the caller join a future
+        // it has not been told anything by.
+        std::future::pending().await
     }
 
     /// Sends one error and flushes. Used on the paths where the connection is about to end, which

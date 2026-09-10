@@ -86,12 +86,21 @@ impl Client {
     }
 
     pub async fn query(&mut self, sql: &str) -> Answer {
+        self.send_query(sql).await;
+        self.read_until_ready().await
+    }
+
+    /// Sends a `Query` and **does not wait for the reply**.
+    ///
+    /// The only way to have a statement genuinely running while the test does something else to
+    /// the socket — which is what a client dying mid-statement is
+    /// (`tests/client_leaves_mid_statement.rs`).
+    pub async fn send_query(&mut self, sql: &str) {
         let mut packet = vec![b'Q'];
         packet.extend_from_slice(&u32::try_from(sql.len() + 5).unwrap().to_be_bytes());
         packet.extend_from_slice(sql.as_bytes());
         packet.push(0);
         self.0.write_all(&packet).await.unwrap();
-        self.read_until_ready().await
     }
 
     /// One statement through the **extended** protocol, the way `PG::Connection#exec_params` sends
