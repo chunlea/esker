@@ -164,15 +164,7 @@ fn announce(nodes: u64, base_port: u16, launched: &[Node], pd: Option<&str>) {
 /// to say "this line is not a store" in a format that has one shape. `stop` kills it like any
 /// other line.
 fn start_pd(binary: &Path, data_dir: &Path, address: &str) -> Result<(Node, Child), String> {
-    let mut process = Process::new(binary);
-    process
-        .arg("pd")
-        .arg("serve")
-        .arg("--data-dir")
-        .arg(data_dir.join("pd"))
-        .arg("--listen")
-        .arg(address);
-    let child = process
+    let child = pd_command(binary, data_dir, address)
         .spawn()
         .map_err(|error| format!("starting the placement driver: {error}"))?;
     Ok((
@@ -183,6 +175,24 @@ fn start_pd(binary: &Path, data_dir: &Path, address: &str) -> Result<(Node, Chil
         },
         child,
     ))
+}
+
+/// The driver's command line, from the data directory and the address.
+///
+/// **One place, for the reason [`store_command`] is one place**: the driver is started and now
+/// also restarted, and a supervisor that rebuilt this in a second place would eventually restart
+/// a driver pointed at a different directory than the one it replaced — with the cluster looking
+/// healthy while its timestamps came from an empty database.
+fn pd_command(binary: &Path, data_dir: &Path, address: &str) -> Process {
+    let mut process = Process::new(binary);
+    process
+        .arg("pd")
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(data_dir.join("pd"))
+        .arg("--listen")
+        .arg(address);
+    process
 }
 
 /// Where the placement driver listens when `--pd` is given: one above the last node.
@@ -704,6 +714,42 @@ fn what(id: u64) -> String {
     }
 }
 
+/// The command that starts child `id` again — the driver's, or a store's.
+///
+/// # Why the driver is restarted at all
+///
+/// It was not, and the comment that said so gave a reason about experiments rather than about
+/// safety: *"a cluster whose driver is gone has lost the thing that hands out timestamps"*. That
+/// is true and it is an argument for bringing it **back**, not for leaving it down. The exposure
+/// is total while it is down — no node can start a transaction, so no statement runs at all,
+/// reads included, and every session sees `08006` (`esker-coord/h1-driver-kill.md` §2).
+///
+/// And a restart cannot repeat a timestamp. The oracle fsyncs its high-water mark `save_interval`
+/// **ahead** of every timestamp it hands out and resumes at `max(clock, mark)`
+/// (`esker-pd/src/tso.rs`), so the whole cost of the restart is the window in which nothing could
+/// `BEGIN`.
+///
+/// **What this buys is the availability of recovery, and not availability.** A single driver is
+/// still a single point: it is replicated in the algorithm ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md),
+/// [ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md))
+/// and singular in every deployment this command can produce. Restarting it turns "down until an
+/// operator notices" into "down for one driver start"; it does not make the cluster survive
+/// losing it.
+///
+/// One thing had to be true first, and now is: the directory the new driver opens is the one the
+/// old one held. `try_wait` returned a status, so that process is reaped and the kernel has
+/// released the claim `Db::open` takes on its data directory (#116) — without which this restart
+/// would race the corpse for the database that holds the mark.
+fn restart_command(binary: &Path, layout: &Layout<'_>, id: u64) -> Result<Process, String> {
+    if id != 0 {
+        return store_command(binary, layout, id);
+    }
+    let address = layout
+        .pd
+        .ok_or_else(|| "the placement driver has no address to restart on".to_owned())?;
+    Ok(pd_command(binary, layout.data_dir, address))
+}
+
 /// Blocks until ctrl-C, naming any child that exits along the way.
 ///
 /// A child that dies while the cluster is up used to be invisible: this process blocked on a
@@ -764,10 +810,7 @@ fn wait_for_interrupt(
                         if let Ok(Some(status)) = child.try_wait() {
                             reported.push(*id);
                             eprintln!("esker cluster: {} exited with {status}", what(*id));
-                            // The driver is not restarted: a cluster whose driver is gone has lost
-                            // the thing that hands out timestamps and names regions, and bringing
-                            // it back under a chaos run would be a different experiment.
-                            if respawn && *id != 0 {
+                            if respawn {
                                 exited.push(*id);
                             }
                         }
@@ -788,10 +831,10 @@ fn wait_for_interrupt(
                         .collect();
                     for id in ready {
                         due.remove(&id);
-                        match store_command(binary, layout, id).and_then(|mut command| {
+                        match restart_command(binary, layout, id).and_then(|mut command| {
                             command
                                 .spawn()
-                                .map_err(|error| format!("restarting node {id}: {error}"))
+                                .map_err(|error| format!("restarting {}: {error}", what(id)))
                         }) {
                             Ok(child) => {
                                 let pid = child.id();
