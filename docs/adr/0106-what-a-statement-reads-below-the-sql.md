@@ -436,6 +436,23 @@ still wins, on two grounds the measurement supports:
 file from 1,466 s to **496 s = 8.3 min**, two thirds off. That is the before-number, measured at
 full file length on a quiet box.
 
+### Where this meets #50, which arrived the same day
+
+[ADR 0105](0105-a-catalog-read-never-waits.md) opened `debts-v1.1.md` #50 on the same key: a
+catalog reader that meets a DDL's Percolator lock on the version counter waits out the client's
+budget and is refused `40001`. It states independently that there are **two views per ordinary
+statement**, which is what this census counted from the other side — two `version(t1)`, two
+`version(t<cluster>)`, two `layout` per statement.
+
+**The two rows do not overlap and neither blocks the other.** Option B keeps exactly one version
+read per statement — it is the validator — so it does not touch the key #50 is about, and #50's fix
+makes that read not wait, which B's one read wants as much as today's two do. What B removes is the
+*other* fifty-eight reads.
+
+**And it sharpens one of this plan's exclusions.** *"No change to how many catalog views a
+statement opens"* was excluded as a separate smaller row; ADR 0105 is where that row now lives, so
+the exclusion is a boundary rather than a deferral.
+
 ### One figure that did not reconcile
 
 The summary relayed to this lane gave the version read as **452,832 reads x 175 us = 79 s = 5.0%**.

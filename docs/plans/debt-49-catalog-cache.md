@@ -46,8 +46,10 @@ design.
   nothing to them and must not.
 * **No cross-statement cache of *rows*.** Only catalog records. A row is the data.
 * **No change to how many catalog views a statement opens.** The census shows two per statement
-  (two `version` reads, two `layout`); halving that is a separate, smaller row and mixing it in
-  would make this plan's numbers unreadable.
+  (two `version` reads, two `layout`), which [ADR 0105](../adr/0105-a-catalog-read-never-waits.md)
+  states independently from the other side. That key is **#50's**, not this plan's: option (b)
+  keeps exactly one version read per statement because it is the validator, and #50's fix makes
+  that read not wait. A boundary, not a deferral.
 * **No batching and no pipelining** — those are ADR 0106's options (a) and (c), and B removes the
   reads (a) would batch.
 * **No `pg_catalog` row-builder rewrite.** The builders keep their shape; only the reader they call
