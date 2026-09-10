@@ -1,0 +1,180 @@
+# **Which types `GREATEST`/`LEAST` compare** — the whole probe list asked in one query.
+#
+# PostgreSQL 19beta1, 2026-09-10, `127.0.0.1:55432`, one `BEGIN … ROLLBACK` with every probe in
+# its own `SAVEPOINT`/`ROLLBACK TO` and `statement_timeout` set. Wire v3 family **F1a** of
+# `esker-coord/b4-wire-v3-families.md`, 63 census rows and the largest single family.
+#
+# Each row was asked as, with the value bound rather than spliced:
+#
+#     SELECT pg_typeof(GREATEST(x, x)) FROM (SELECT $1::<type> AS x) t
+#     SELECT pg_typeof(LEAST(x, x))    FROM (SELECT $1::<type> AS x) t
+#
+# **Provenance**: `hstore`, `ltree` and `citext` were created inside the rolled-back transaction if
+# absent; `ltree` was already installed. Nothing was left behind.
+#
+# ## What the list is, exactly
+#
+# `esker-coord/wire-v3-probes.txt`'s type column has **166 rows** and **100 distinct spellings**.
+# The difference is `text`: **67 rows** carry `type=text` because their conversion lives in the
+# template (`{op}::regclass`, `wire-v3-format.md`'s `cast_at_use`), so the operand's own type is
+# `text` and only the template differs. All 166 rows were asked; the answers below are the 100.
+#
+# **`645ec0c5`'s commit message says "all 166 type spellings", which is the row count and not the
+# spelling count.** The measurement it reports is unchanged — the sweep did cover every row — but
+# the number reads as 166 distinct types and there are 100.
+#
+# ## The finding
+#
+# **Exactly 20 spellings refuse**, all with `42883`, and every one of the other 80 answers its own
+# type:
+#
+#     scalars (11)  box  circle  json  line  lquery  lseg  path  point  polygon  void  xml
+#     arrays  (9)   box[] circle[] json[] line[] lseg[] path[] point[] polygon[] xml[]
+#
+# **`GREATEST` and `LEAST` agree on every one of the 166 rows** — same answer, same refusal, same
+# sentence — which is why they are one arm and why `least` had to go into the probe list beside
+# `greatest` (319 rows added; twenty shapes had one and not the other).
+#
+# **An array refuses exactly when its element does.** `point` refuses and so does `point[]`;
+# `hstore` answers and so does `hstore[]`. That is `btree`'s array opclass delegating to the
+# element's, and it is the property F2's arm two files over got wrong in the other direction by
+# copying a *scalar's* measured rule onto its array.
+#
+# ## The two spellings the list does not carry, asked separately
+#
+#     lquery[]   !42883 could not identify a comparison function for type lquery[]
+#     void[]     !42704 type "void[]" does not exist
+#
+# `lquery[]` is a real type that refuses; **this node has no `LQueryArray`**, so its absence from
+# the gate is not a hole. `void[]` is not a type at all on 19beta1, so nothing can ask it. Both are
+# written down because a refusal list that silently omits a spelling is exactly the F2 mistake.
+#
+# ## The refusal carries nothing else, and it comes from the executor
+#
+# Measured with the full error fields, for `GREATEST(json)`, `LEAST(json)`, `GREATEST(point)`,
+# `LEAST(lquery)` and `GREATEST(void)` — identical in all five:
+#
+#     SQLSTATE  42883
+#     PRIMARY   could not identify a comparison function for type <type>
+#     DETAIL    (none)
+#     HINT      (none)
+#     CONTEXT   (none)
+#     LOCATION  ExecInitExprRec, execExpr.c:2274
+#
+# `min`'s refusal for a type with no aggregate is `ParseFuncOrColumn, parse_func.c:643` and carries
+# both a `DETAIL` and a `HINT` (`tests/captures/pg19_min_max_greatest.txt`). Same sqlstate, two
+# different places, two different sentences — the structural reason these are two domains and not
+# one list.
+#
+# **`ExecInitExprRec` is executor *init*, not evaluation**, so the refusal does not wait for a row:
+# `SELECT GREATEST(j, j) FROM t WHERE false` refuses over an empty scan. The node's gate is at
+# resolution for the same reason.
+#
+# ## The raw answers, one line per DISTINCT spelling
+#
+#     <type> <TAB> GREATEST=<type> <TAB> LEAST=<type>          answered
+#     <type> <TAB> !<sqlstate> <TAB> <message>                 refused
+#
+# The 67 `text` rows answered identically and are collapsed to one, marked in place. Every other
+# spelling appears once in the list, so the 99 remaining lines are the 99 remaining rows.
+#
+"char"	GREATEST="char"	LEAST="char"
+"char"[]	GREATEST="char"[]	LEAST="char"[]
+bigint	GREATEST=bigint	LEAST=bigint
+bigint[]	GREATEST=bigint[]	LEAST=bigint[]
+bit	GREATEST=bit	LEAST=bit
+bit[]	GREATEST=bit[]	LEAST=bit[]
+boolean	GREATEST=boolean	LEAST=boolean
+boolean[]	GREATEST=boolean[]	LEAST=boolean[]
+box	!42883	could not identify a comparison function for type box
+box[]	!42883	could not identify a comparison function for type box[]
+bytea	GREATEST=bytea	LEAST=bytea
+bytea[]	GREATEST=bytea[]	LEAST=bytea[]
+character	GREATEST=character	LEAST=character
+character varying	GREATEST=character varying	LEAST=character varying
+character varying[]	GREATEST=character varying[]	LEAST=character varying[]
+character[]	GREATEST=character[]	LEAST=character[]
+cidr	GREATEST=cidr	LEAST=cidr
+cidr[]	GREATEST=cidr[]	LEAST=cidr[]
+circle	!42883	could not identify a comparison function for type circle
+circle[]	!42883	could not identify a comparison function for type circle[]
+citext	GREATEST=citext	LEAST=citext
+citext[]	GREATEST=citext[]	LEAST=citext[]
+date	GREATEST=date	LEAST=date
+date[]	GREATEST=date[]	LEAST=date[]
+daterange	GREATEST=daterange	LEAST=daterange
+daterange[]	GREATEST=daterange[]	LEAST=daterange[]
+double precision	GREATEST=double precision	LEAST=double precision
+double precision[]	GREATEST=double precision[]	LEAST=double precision[]
+hstore	GREATEST=hstore	LEAST=hstore
+hstore[]	GREATEST=hstore[]	LEAST=hstore[]
+inet	GREATEST=inet	LEAST=inet
+inet[]	GREATEST=inet[]	LEAST=inet[]
+int2vector	GREATEST=int2vector	LEAST=int2vector
+int4range	GREATEST=int4range	LEAST=int4range
+int4range[]	GREATEST=int4range[]	LEAST=int4range[]
+int8range	GREATEST=int8range	LEAST=int8range
+int8range[]	GREATEST=int8range[]	LEAST=int8range[]
+integer	GREATEST=integer	LEAST=integer
+integer[]	GREATEST=integer[]	LEAST=integer[]
+interval	GREATEST=interval	LEAST=interval
+interval[]	GREATEST=interval[]	LEAST=interval[]
+json	!42883	could not identify a comparison function for type json
+json[]	!42883	could not identify a comparison function for type json[]
+jsonb	GREATEST=jsonb	LEAST=jsonb
+jsonb[]	GREATEST=jsonb[]	LEAST=jsonb[]
+line	!42883	could not identify a comparison function for type line
+line[]	!42883	could not identify a comparison function for type line[]
+lquery	!42883	could not identify a comparison function for type lquery
+lseg	!42883	could not identify a comparison function for type lseg
+lseg[]	!42883	could not identify a comparison function for type lseg[]
+ltree	GREATEST=ltree	LEAST=ltree
+ltree[]	GREATEST=ltree[]	LEAST=ltree[]
+macaddr	GREATEST=macaddr	LEAST=macaddr
+macaddr[]	GREATEST=macaddr[]	LEAST=macaddr[]
+money	GREATEST=money	LEAST=money
+money[]	GREATEST=money[]	LEAST=money[]
+name	GREATEST=name	LEAST=name
+name[]	GREATEST=name[]	LEAST=name[]
+numeric	GREATEST=numeric	LEAST=numeric
+numeric[]	GREATEST=numeric[]	LEAST=numeric[]
+numrange	GREATEST=numrange	LEAST=numrange
+numrange[]	GREATEST=numrange[]	LEAST=numrange[]
+oid	GREATEST=oid	LEAST=oid
+oid[]	GREATEST=oid[]	LEAST=oid[]
+oidvector	GREATEST=oidvector	LEAST=oidvector
+path	!42883	could not identify a comparison function for type path
+path[]	!42883	could not identify a comparison function for type path[]
+point	!42883	could not identify a comparison function for type point
+point[]	!42883	could not identify a comparison function for type point[]
+polygon	!42883	could not identify a comparison function for type polygon
+polygon[]	!42883	could not identify a comparison function for type polygon[]
+real	GREATEST=real	LEAST=real
+real[]	GREATEST=real[]	LEAST=real[]
+regclass	GREATEST=regclass	LEAST=regclass
+regclass[]	GREATEST=regclass[]	LEAST=regclass[]
+regproc	GREATEST=regproc	LEAST=regproc
+regproc[]	GREATEST=regproc[]	LEAST=regproc[]
+regtype	GREATEST=regtype	LEAST=regtype
+regtype[]	GREATEST=regtype[]	LEAST=regtype[]
+smallint	GREATEST=smallint	LEAST=smallint
+smallint[]	GREATEST=smallint[]	LEAST=smallint[]
+text	GREATEST=text	LEAST=text        <- 67 identical rows, collapsed
+text[]	GREATEST=text[]	LEAST=text[]
+time	GREATEST=time without time zone	LEAST=time without time zone
+timestamp	GREATEST=timestamp without time zone	LEAST=timestamp without time zone
+timestamp with time zone	GREATEST=timestamp with time zone	LEAST=timestamp with time zone
+timestamp with time zone[]	GREATEST=timestamp with time zone[]	LEAST=timestamp with time zone[]
+tsquery	GREATEST=tsquery	LEAST=tsquery
+tsquery[]	GREATEST=tsquery[]	LEAST=tsquery[]
+tsrange	GREATEST=tsrange	LEAST=tsrange
+tsrange[]	GREATEST=tsrange[]	LEAST=tsrange[]
+tstzrange	GREATEST=tstzrange	LEAST=tstzrange
+tstzrange[]	GREATEST=tstzrange[]	LEAST=tstzrange[]
+tsvector	GREATEST=tsvector	LEAST=tsvector
+tsvector[]	GREATEST=tsvector[]	LEAST=tsvector[]
+uuid	GREATEST=uuid	LEAST=uuid
+uuid[]	GREATEST=uuid[]	LEAST=uuid[]
+void	!42883	could not identify a comparison function for type void
+xml	!42883	could not identify a comparison function for type xml
+xml[]	!42883	could not identify a comparison function for type xml[]

@@ -888,6 +888,22 @@ pub enum SqlError {
     #[error("could not identify an ordering operator for type {0}")]
     NoOrderingOperator(&'static str),
 
+    /// `GREATEST`/`LEAST` over a type with no **comparison function**: `42883 could not identify a
+    /// comparison function for type json`.
+    ///
+    /// **A third sentence beside [`SqlError::NoEqualityOperator`] and
+    /// [`SqlError::NoOrderingOperator`], and the difference is which lookup failed.** PostgreSQL
+    /// raises this one from `ExecInitExprRec` (`execExpr.c`) when a `btree` opclass has no
+    /// comparison function for the type — measured, and it carries **no `DETAIL` and no `HINT`**,
+    /// where its two neighbours carry more.
+    ///
+    /// **Not `min`/`max`'s domain.** That one is a `pg_proc` lookup in the parser and refuses a
+    /// different set: `min(point[])` is answered and `GREATEST(point[], point[])` is refused;
+    /// `min(hstore)` is refused and `GREATEST(hstore)` is answered
+    /// (`tests/captures/pg19_min_max_greatest.txt`). The two lists must not be shared.
+    #[error("could not identify a comparison function for type {0}")]
+    NoComparisonFunction(&'static str),
+
     /// `'<a>'::xml`: text that is not well-formed XML content. **`2200N`, its own class**, where
     /// every other input function raises `22P02` — and the DETAIL names the line, which is
     /// `libxml`'s own message reaching the client through PostgreSQL.
@@ -3312,6 +3328,7 @@ impl SqlError {
             // btree family `DISTINCT` needs. Same class, different sentence.
             | SqlError::NoEqualityOperator(_)
             | SqlError::NoOrderingOperator(_)
+            | SqlError::NoComparisonFunction(_)
             | SqlError::UndefinedOperator { .. }
             | SqlError::UndefinedAggregate { .. }
             | SqlError::UndefinedFunction(_)
