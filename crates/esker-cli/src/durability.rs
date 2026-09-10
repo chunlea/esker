@@ -397,6 +397,8 @@ pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
     let mut log = vec![format!("seed {seed}")];
     let mut killed = 0u64;
     let mut refused = 0u64;
+    // What the state file named last round, so a skipped round can say whether the pids moved.
+    let mut previous: Vec<u32> = Vec::new();
     // **Its own deadline.** The arm ends whether or not anything answers: 134 orphaned busy loops
     // once drove this host to a load of 237 and only the lane that started them could stop them.
     while began.elapsed() < options.run_for {
@@ -413,9 +415,26 @@ pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
         // back, and another kill would only make the log longer.
         if let Err(reason) = probe(&client, &options.keyspace, killed) {
             refused += 1;
+            // **What was observed, and not why.** This line used to end "Nothing is restarting
+            // stores — the recipe needs a supervisor", which on run 120 was false in both
+            // halves: the supervisor restarted a store four times, and one of the kills that
+            // *did* land hit a pid it had produced. A tool that guesses a cause is worse than
+            // one that reports a fact, because the guess is what gets quoted. So the line says
+            // what the state file says, and whether it moved since the last round — which is
+            // the evidence for "is anything restarting these" and is cheap to look at.
+            let pids = live_pids(options);
+            let stores = match &pids {
+                Ok(now) if now.is_empty() => "the state file names no stores".to_owned(),
+                Ok(now) if *now == previous => format!("the same stores as last round: {now:?}"),
+                Ok(now) => format!("stores {now:?}, which is not last round's {previous:?}"),
+                Err(reason) => format!("the state file could not be read ({reason})"),
+            };
+            if let Ok(now) = pids {
+                previous = now;
+            }
             log.push(format!(
-                "{at:>8} ms  no kill: the cluster could not acknowledge a write ({reason}). \
-                 Nothing is restarting stores — the recipe needs a supervisor."
+                "{at:>8} ms  no kill: the cluster could not acknowledge a write ({reason}); \
+                 {stores}"
             ));
             continue;
         }
@@ -434,6 +453,7 @@ pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
                 continue;
             }
         };
+        previous.clone_from(&pids);
         let pid = pids[usize::try_from(rng.next_u32()).unwrap_or(0) % pids.len()];
         let outcome = kill9(pid);
         killed += u64::from(outcome.is_ok());
