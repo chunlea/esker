@@ -78,6 +78,28 @@ use crate::error::{Result, SqlError};
 
 pub use esker_keys::value::{ColumnType, Datum, f64_of_sort_bits, sort_bits_of_f64};
 
+/// One value's text **as a cast writes it**, which is not always the text it prints.
+///
+/// [`to_text_under`] is the output function — what a client is *shown* — and for one type the
+/// cast writes something else: a `boolean` prints `t` and casts to `true`. PostgreSQL has a
+/// separate `booltext` for exactly this, and every other type casts to what it prints.
+///
+/// **One function because three readers wanted the same fact and two of them knew it.**
+/// `exec::cursor`'s `ToText` arm had the rule (`SELECT true::text` is `true`) and so did `||`
+/// (`'a' || true` is `atrue`), both measured; the evaluator's `Expr::Cast` arm fell through to the
+/// output function and wrote `t` into a `varchar` or a `bpchar` — two rows of
+/// `tests/captures/pg19_cast_matrix.txt`, and the one an application sees, because a client that
+/// writes a boolean into a character column gets `t` here and `true` there
+/// (`debts-v1.1.md` #44). The `::text` spelling was right the whole time, which is what made it
+/// invisible: `bool::text` lowers to `ToText` and never reaches the cast.
+#[must_use]
+pub fn cast_text_under(value: &Datum, rendering: Rendering) -> Option<String> {
+    match value {
+        Datum::Bool(flag) => Some((if *flag { "true" } else { "false" }).to_owned()),
+        other => to_text_under(other, rendering),
+    }
+}
+
 /// One value's text **under the session's `IntervalStyle`**.
 ///
 /// [`PgDatum::to_text`] is the output function under the boot style, which is what an index key,

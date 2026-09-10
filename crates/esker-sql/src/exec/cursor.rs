@@ -1541,11 +1541,11 @@ fn text_concat(left: Option<&Datum>, right: Option<&Datum>) -> Result<Datum> {
     }
     // **A boolean contributes `true`, not `t`.** `PgDatum::to_text` renders what a client is
     // *shown* — `t`/`f`, which is what psql prints — and `||` concatenates what the value casts
-    // to, which for a boolean is the word. Measured: `'a' || true` is `atrue`.
-    let cast = |value: &Datum| match value {
-        Datum::Bool(flag) => Some((if *flag { "true" } else { "false" }).to_owned()),
-        other => PgDatum::to_text(other),
-    };
+    // to, which for a boolean is the word. Measured: `'a' || true` is `atrue`. One reader for it
+    // now (`crate::value::cast_text_under`), because the evaluator's `Expr::Cast` arm had the same
+    // question and a different answer.
+    let cast =
+        |value: &Datum| crate::value::cast_text_under(value, crate::value::Rendering::default());
     let (Some(left), Some(right)) = (cast(left), cast(right)) else {
         return Ok(Datum::Null);
     };
@@ -2494,7 +2494,12 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 // and the date parser read the day off it. Measured
                 // (`tests/captures/pg19_time_zone.txt`), and the same reasoning `ToText` below
                 // already applied for an `interval`'s dialect.
-                let text = crate::value::to_text_under(&value, env.settings.rendering)
+                // **The cast's text and not the output function's**, which differ for exactly
+                // one type: a `boolean` prints `t` and casts to `true`. This arm wrote `t` into a
+                // `varchar` and a `bpchar` while `ToText` beside it and `||` below both had the
+                // rule (`debts-v1.1.md` #44). `crate::value::cast_text_under` is the one reader
+                // now.
+                let text = crate::value::cast_text_under(&value, env.settings.rendering)
                     .ok_or_else(|| SqlError::DatatypeMismatch("a value with no text".to_owned()))?;
                 // The modifier the cast wrote, applied the way a column's is: `$1::varchar(3)`
                 // bounds the string exactly as a `varchar(3)` column would.
@@ -2517,18 +2522,20 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     None => Datum::Null,
                 }
             }
-            // **A boolean is the one type whose cast is not its output function.** `SELECT true`
-            // prints `t` and `SELECT true::text` is `true`; PostgreSQL has a separate `booltext`
-            // for the cast. Measured — every other type here casts to exactly what it prints.
-            Datum::Bool(flag) => Datum::Text(if flag { "true" } else { "false" }.to_owned()),
             value => {
                 // **The output function, which is the session's for an `interval`** — the same
                 // rule the `SELECT` funnel applies to a column, applied here so that
                 // `SELECT term` and `SELECT term::text` cannot answer in two dialects in one
                 // session. Measured on 19beta1: under `iso_8601` the cast, `||`, `format`,
                 // `::varchar`, `array_to_string` and `jsonb_build_object` all say `P1Y`.
-                let text =
-                    crate::value::to_text_under(&value, env.settings.rendering).unwrap_or_default();
+                // **The cast's text**, which is the output function for every type but one: a
+                // `boolean` prints `t` and casts to `true`, and PostgreSQL has a separate
+                // `booltext` for it. That used to be an arm of its own here and is now
+                // `crate::value::cast_text_under`, shared with the evaluator's `Expr::Cast` arm
+                // and with `||` — three readers of one measured fact, and the cast arm was the one
+                // that did not have it (`debts-v1.1.md` #44).
+                let text = crate::value::cast_text_under(&value, env.settings.rendering)
+                    .unwrap_or_default();
                 Datum::Text(if *strip_blanks {
                     text.trim_end_matches(' ').to_owned()
                 } else {
