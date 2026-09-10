@@ -1,0 +1,49 @@
+crates/esker-cli/src/pd.rs
+  s_e5c0c6e78b5662::t_c11e98d35b45f7 13,705-708,710
+crates/esker-cli/tests/cluster_start.rs
+  s_e5c0c6e78b5662::t_37f7f514b5fd27 143-161,169,171-179,268-275
+crates/esker-engine/src/fs/mod.rs
+  s_e5c0c6e78b5662::t_8f89b729f4886a 324-327,329-332,342,347-350,353-384
+crates/esker-engine/src/db/checkpoint.rs
+  s_e5c0c6e78b5662::t_c293bb4239cb00 64-68
+crates/esker-engine/src/db/compact.rs
+  s_e5c0c6e78b5662::t_f59a67bee74433 186
+crates/esker-engine/src/db/flush.rs
+  s_e5c0c6e78b5662::t_8cf8ad49e469ee 101,121
+crates/esker-engine/src/db/mod.rs
+  s_e5c0c6e78b5662::t_c6de937df37c68 140-141,143-145,371,396
+crates/esker-engine/src/db/open.rs
+  s_e5c0c6e78b5662::t_791b7cf6f048a5 65,69,77-84,92,96-101,113,147-158,175,288-408,423,451-455,457-458,491-494,506,557-561
+crates/esker-engine/src/db/write.rs
+  s_e5c0c6e78b5662::t_132250601e1a27 75-91,93-94
+crates/esker-engine/src/error.rs
+  s_e5c0c6e78b5662::t_cc8d9be8a33a1e 98,102-106
+crates/esker-engine/src/lib.rs
+  s_e5c0c6e78b5662::t_be328dc64614bb 86
+crates/esker-engine/src/options.rs
+  s_e5c0c6e78b5662::t_d2aa6aa06feed3 255-291,297-320,369-376,381
+crates/esker-engine/tests/directory_lock.rs
+  s_e5c0c6e78b5662::t_7cd219e1020e95 42-50
+crates/esker-engine/tests/read_only.rs
+  s_e5c0c6e78b5662::t_3400f7d1a20d3a 1-276
+crates/esker-pd/src/inspect.rs
+  s_e5c0c6e78b5662::t_e1ea2df5f54c55 1,10-19,57-60,64
+crates/esker-store/src/error.rs
+  s_e5c0c6e78b5662::t_ce40076d17ef2d 100-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "08218610c7d58bcbe1380f9d25e337738439b2d4",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
