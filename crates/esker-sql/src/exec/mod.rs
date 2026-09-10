@@ -206,7 +206,8 @@ pub struct Executor {
     ///
     /// A `Cell` because `catalog_view` takes `&self` — it hands out a view that borrows the
     /// transaction — and because an executor belongs to one session and one thread.
-    catalog_version: std::cell::Cell<Option<u64>>,
+    /// `(the version, the catalog generation it was read at)`.
+    catalog_version: std::cell::Cell<Option<(u64, u64)>>,
     /// The `CREATE INDEX CONCURRENTLY` this statement declared, to be driven **after** it commits.
     ///
     /// PostgreSQL answers a concurrent build when the build is done, and so does this node
@@ -3886,11 +3887,18 @@ impl Executor {
         if self.catalog_written {
             return self.catalog.view_uncached(txn, self.tenant);
         }
-        if let Some(version) = self.catalog_version.get() {
+        // **The generation is what makes the pin safe against a statement that writes the catalog
+        // in the middle of itself.** `SELECT esker_schema_step(…)` is not a DDL statement and does
+        // exactly that: reads the catalog, writes it, reads it again. `catalog::bump_version` is
+        // the one place a catalog write can happen, so a pin taken before it is refused after it.
+        if let Some((version, generation)) = self.catalog_version.get()
+            && generation == crate::catalog::generation()
+        {
             return Ok(self.catalog.view_pinned(txn, self.tenant, version));
         }
+        let generation = crate::catalog::generation();
         let view = self.catalog.view(txn, self.tenant)?;
-        self.catalog_version.set(Some(view.version()));
+        self.catalog_version.set(Some((view.version(), generation)));
         Ok(view)
     }
 

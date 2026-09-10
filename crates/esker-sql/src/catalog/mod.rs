@@ -4590,6 +4590,19 @@ fn stamp_layout(txn: &mut dyn Txn) -> Result<()> {
     Ok(())
 }
 
+/// How many catalog writes this process has made.
+///
+/// A pinned catalog version is only usable while this has not moved since it was taken — the whole
+/// of what makes `Catalog::view_pinned` safe against a statement that writes the catalog in the
+/// middle of itself.
+static PINS_STALE_AFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The generation a pinned catalog version has to still match to be usable.
+#[must_use]
+pub fn generation() -> u64 {
+    PINS_STALE_AFTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Moves the catalog version forward, which is what makes every node's cache notice.
 ///
 /// Every DDL statement writes **its tenant's** key, so two concurrent DDL statements *in one
@@ -4605,7 +4618,23 @@ fn stamp_layout(txn: &mut dyn Txn) -> Result<()> {
 ///
 /// Cluster-scoped objects — roles, databases — pass `record::CLUSTER_TENANT`, which every view
 /// reads beside its own.
+///
+/// Bumping it also invalidates every pinned catalog version in this process: see
+/// [`generation`] and `Executor::catalog_view`.
 pub fn bump_version(txn: &mut dyn Txn, tenant: u64) -> Result<()> {
+    // **Every pinned version in this process is now stale, and this is the only place that can
+    // say so.** `Executor::catalog_view` may answer a second view of one transaction from the
+    // version the first read — safe while the transaction's snapshot is fixed, and *not* safe
+    // across a write this transaction itself makes. A statement can make one without being a DDL
+    // statement: `SELECT esker_schema_step(…)` reads the catalog, writes it, and reads it again,
+    // and a pin taken before the write answered the read after it with the state before it
+    // (`XX000 … cannot go from write-only to absent in one step`, two tests, deterministic).
+    //
+    // A counter here rather than a flag on the transaction: `Txn` is a trait with wrappers —
+    // `savepoint::Recording` among them — and a defaulted method is a silent opt-out for every
+    // one of them. Bumping across sessions is over-invalidation, which costs a read and cannot be
+    // wrong.
+    PINS_STALE_AFTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     stamp_layout(txn)?;
     let key = record::version_key(tenant);
     let current = match txn.get(&key)? {
