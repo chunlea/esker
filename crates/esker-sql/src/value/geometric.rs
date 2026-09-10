@@ -533,6 +533,56 @@ fn segments_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) ->
     (s1 * s2 < 0.0) && (s3 * s4 < 0.0)
 }
 
+/// Whether two polygons are the same ring, as `~=` means.
+///
+/// **A polygon is the same as its own rotation and its own reversal.** The vertex list may start
+/// anywhere and run either way; an arbitrary shuffle of the same points is a different polygon.
+/// PostgreSQL does *not* normalise the text — a rotation prints differently and compares same — so
+/// comparing canonical forms, which is the first thing a node that stores canonical text reaches
+/// for, answers `f` on every rotation. Measured in `tests/captures/pg19_same_as.txt`.
+pub(crate) fn polygons_same(left: &str, right: &str) -> Option<bool> {
+    let (left, right) = (ring(left)?, ring(right)?);
+    if left.len() != right.len() {
+        return Some(false);
+    }
+    if left.is_empty() {
+        return Some(true);
+    }
+    let matches_from = |reversed: bool, start: usize| {
+        left.iter().enumerate().all(|(at, point)| {
+            let index = if reversed {
+                (start + right.len() - at) % right.len()
+            } else {
+                (start + at) % right.len()
+            };
+            same_point(*point, right[index])
+        })
+    };
+    Some((0..right.len()).any(|start| matches_from(false, start) || matches_from(true, start)))
+}
+
+/// Whether two points are the same one, fuzzily — the shared epsilon, per coordinate.
+///
+/// **`NaN` is the same as `NaN`**, because every comparison against one is false and this is the
+/// negation of "differs by more than the epsilon". `point_ne` is the same rule read the other way.
+pub(crate) fn same_point(left: (f64, f64), right: (f64, f64)) -> bool {
+    !((left.0 - right.0).abs() > EPSILON || (left.1 - right.1).abs() > EPSILON)
+}
+
+/// Whether two geometric values of the same kind are the same, as `~=` means.
+pub(crate) fn same_as(kind: super::ColumnType, left: &str, right: &str) -> Option<bool> {
+    if kind == super::ColumnType::Polygon {
+        return polygons_same(left, right);
+    }
+    // Every other shape this node has is its vertices in order, and a point is one of them.
+    let (left, right) = (ring(left)?, ring(right)?);
+    (left.len() == right.len()).then(|| {
+        left.iter()
+            .zip(right.iter())
+            .all(|(a, b)| same_point(*a, *b))
+    })
+}
+
 /// Whether the polygon `outer` contains the polygon `inner`, as `@>` means.
 ///
 /// **Two questions, and the second is the one a plausible implementation leaves out**: every vertex
@@ -713,6 +763,40 @@ mod tests {
 
 #[cfg(test)]
 mod contains_tests {
+    /// **Every `~=` cell**, likewise read out of its capture.
+    #[test]
+    fn every_measured_same_as_cell_agrees() {
+        let capture = include_str!("../../tests/captures/pg19_same_as.txt");
+        let mut checked = 0;
+        for line in capture.lines().filter(|line| !line.starts_with('#')) {
+            let mut fields = line.split('\t');
+            let (Some(statement), Some(_), Some(expected)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let Some(inner) = statement
+                .strip_prefix("SELECT ('")
+                .and_then(|rest| rest.strip_suffix(") AS v"))
+            else {
+                continue;
+            };
+            let Some((left, rest)) = inner.split_once("'::polygon ~= '") else {
+                continue;
+            };
+            let Some(right) = rest.strip_suffix("'::polygon") else {
+                continue;
+            };
+            assert_eq!(
+                super::polygons_same(left, right),
+                Some(expected == "t"),
+                "{left} ~= {right}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 8, "only {checked} cells read");
+    }
+
     /// **Every measured cell of the capture**, read rather than restated.
     ///
     /// The capture is the specification — `value::geometric` had no predicates at all before this,
