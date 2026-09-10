@@ -424,30 +424,54 @@ session.
 the SQL layer's graph is not consulted at all. §3 is for the *statement* path, and it is what stands
 between `transactions_test.rb` and a wait that nothing ends — see below.
 
-### §4 — the commit path's budget reports the wrong condition  *(store/txn — h1)*
+### §4 — **refuted, 2026-09-10, by its own examination** — *(no code)*
 
-`Transaction::prewrite` gives up after `MAX_LOCK_RESOLUTIONS = 8` rounds and reports
-`LockNotCleared` → `40001`. Against a *dead* holder that is right and the budget is what stops an
-infinite loop. Against a **live, heartbeating** holder it is a spurious failure: PostgreSQL would go
-on waiting, and the transaction being refused has lost no race — it has met a lock that is still
-somebody's.
+The draft said: `Transaction::prewrite` gives up after `MAX_LOCK_RESOLUTIONS = 8` rounds and
+reports `LockNotCleared` → `40001`; against a live, heartbeating holder that is a spurious
+failure, so it should say `55P03` instead, and it should check its own fate first and say `40P01`
+if it was wounded. Both halves are wrong, and writing them down is what showed it.
 
-Two changes, neither of them a new bound:
+**(a) `55P03` is wrong because the caller is usually not an acquirer.** `LockNotCleared` has three
+producers, and only one of them is a transaction that wanted a lock:
 
-* **Ask why the budget ran out.** A refusal after eight rounds against a holder that was *alive on
-  every one of them* is not a serialization failure; it is this transaction failing to acquire. The
-  honest code for it is `55P03` (`SqlError::LockNotAvailable` / `LockTimeout`, both already mapped),
-  and the honest sentence names the holder. `40001` tells a client to retry an identical
-  transaction, which will meet the same live lock and fail the same way.
-* **Check our own fate before reporting.** A transaction that has been wounded is holding a primary
-  with somebody else's rollback marker on it, and `primary_fate` (`esker-client/src/txn.rs:1841`)
-  already asks that question atomically. Asking it *before* returning `LockNotCleared` turns a
-  wound the victim has not noticed yet into the `40P01` it is, at the step where PostgreSQL raises
-  it, rather than one statement later.
+| producer | who is asking | `esker-client/src/txn.rs` |
+|---|---|---|
+| `call_resolving`'s budget | a **reader** — `get`, `scan_page`, `latest_commit` | 1785 |
+| `prewrite_range_checks`'s budget | a **read set** asserting a range did not move (§1) | 1609 |
+| `prewrite`'s budget | an **acquirer**, the only one | 1439 |
 
-§4 is not required by any of the three tests once §2 lands. It is here because ③ is the second time
-this project has read a `LockNotCleared` as evidence of something it is not, and because the first
-of the two changes is what makes a *long* transaction survive a *slow* one.
+(A fourth site, `check`'s `Locked` arm at 1747, is documented as unreachable — *"reaching here
+means the caller skipped the resolution, which is a bug in this crate"* — and §1 is what made it
+reachable for a range, which is why §1 gave that path a loop of its own.)
+
+A reader that gave up did not fail to obtain a lock; it holds nothing and wanted nothing. Telling
+it `55P03 could not obtain lock on row` — which Rails maps to `LockWaitTimeout` — would be a worse
+lie than the one it replaces, and the class is not rare: `catalog/record.rs` documents an ordinary
+`SELECT` meeting a DDL's lock on the catalog's version counter and becoming *"a serialization
+failure in a transaction that serializes with nothing"*.
+
+**And it is wrong for the acquirer too.** The draft's argument was that *"`40001` tells a client to
+retry an identical transaction, which will meet the same live lock and fail the same way"*. That
+assumes the holder is immortal. It is not: it holds a three-second lease and is, in the case this
+is about, committing. A retry usually succeeds, which is exactly what `40001` promises and what
+`55P03` would tell the client not to bother with.
+
+**(b) cannot be built on this wire, and that is a fact rather than a preference.**
+`esker_txn::rollback` is idempotent by design — *"Already marked. Idempotent: the answer is the
+same and there is nothing to write"* — so the store answers `TxnStatus::Ok` whether the marker was
+already there or has just been written. A client therefore **cannot tell "somebody wounded me"
+from "I have just killed myself by asking"**, and `primary_fate` is that same destructive question.
+Making the answer distinguish the two would change an existing method's meaning for every caller of
+`Rollback`, which is a much larger change than the one §4 was proposing to justify it.
+
+**What survives is the symptom, and it is a measurement, not an argument.** A healthy transaction
+*is* refused when a slow but live holder outlasts a fixed eight-round budget, and PostgreSQL, whose
+`lock_timeout` defaults to `0`, would have waited. The question is not which SQLSTATE to rename —
+it is whether the budget is too small, and that is answerable: count `LockNotCleared` by producer
+under the Rails suite on the real topology, and separate the refusals whose holder was **alive on
+every round** from those that met a dead one. If the first group is non-empty under ordinary load,
+the budget is the defect and the fix is in the budget. Nothing in this section should be built
+before that number exists.
 
 ### §5 — savepoint interaction, stated once
 
@@ -545,8 +569,8 @@ choose between them.
   gate-reverse-dependents care that a new proto variant always needs.
 * **§3 makes a `40P01` reachable where the node used to hang.** A test that passed by waiting will
   now be told, which is the direction we want and is still a behaviour change.
-* **§4 moves one condition from `40001` to `55P03`.** A client retrying on `40001` alone stops
-  retrying that case, which is correct — the retry could not have worked — and is visible.
+* **§4 changes nothing**, and the SQLSTATE it proposed to move would have been wrong in both
+  directions — see its refutation above. The symptom it named survives as a measurement to make.
 * **Nothing here changes a SQLSTATE mapping, a message, or an on-disk record.** The three tests need
   the store to decide differently, not the SQL layer to say it differently.
 
