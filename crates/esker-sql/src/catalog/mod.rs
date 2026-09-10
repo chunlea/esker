@@ -47,7 +47,7 @@ pub mod pg_index;
 pub mod pg_relations;
 pub use quote::quote_identifier;
 mod quote;
-mod record;
+pub(crate) mod record;
 /// What the catalog's region costs, counted where every statement passes
 /// ([ADR 0102](../../../../docs/adr/0102-the-catalogs-read-path.md)). Off unless
 /// `ESKER_CATALOG_STATS` is set.

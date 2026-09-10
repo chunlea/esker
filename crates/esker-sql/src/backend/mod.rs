@@ -861,6 +861,13 @@ impl Txn for MemoryTxn {
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        // **Counted at the door, as `StoreBackend::get` counts it** — before the buffer, because
+        // the question `debts-v1.1.md` #49 asks is what the SQL layer *asked for*, and the client
+        // answering one from its own buffer is a saving rather than a read that never happened.
+        // Recorded here as well as there so the composition of a statement's reads can be listed
+        // without a cluster: which keys a statement reads is a property of the catalog code and
+        // not of the topology, and only the round-trip count needs a real client.
+        crate::stmt_stats::record_point(key);
         // Read-your-writes: the buffer wins, and a buffered delete hides a committed value. A read
         // served from here is this transaction's own value, so nobody else can invalidate it and it
         // is not part of the read set (ADR 0062 §1).
@@ -880,6 +887,7 @@ impl Txn for MemoryTxn {
         if start >= end {
             return Ok(Vec::new());
         }
+        crate::stmt_stats::record_range(start, end);
         // **The range, not the keys it answered.** A key that did not exist when this ran is in no
         // read set and is exactly the phantom a range is here to catch (ADR 0062).
         self.record_range(start, end);

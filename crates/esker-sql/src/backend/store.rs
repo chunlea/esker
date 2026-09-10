@@ -453,13 +453,13 @@ impl Txn for StoreTxn {
         // eleven point reads is a different shape from one making a scan of eleven rows, and the
         // fix for each is a different fix. Not the same number as the client's round trips: a read
         // the client answers from its own buffer passes here and never reaches a wire.
-        crate::stmt_stats::record_point();
+        crate::stmt_stats::record_point(key);
         self.open()?.get(key).map_err(translate)
     }
 
     fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>> {
         self.record_range(start, end);
-        crate::stmt_stats::record_range();
+        crate::stmt_stats::record_range(start, end);
         self.open()?.scan(start, end, limit).map_err(translate)
     }
 
