@@ -96,3 +96,39 @@ fn what_four_statements_read() {
     );
     assert!(!esker_sql::stmt_stats::last_trace().is_empty());
 }
+
+/// **What a DDL statement reads for itself**, which is a different question from introspection.
+///
+/// h1's `esker-coord/h1-ddl-cost.md` measured that a DDL's own catalog reads are **40-66% of its
+/// round trips** — a `CREATE TABLE` reads nine times before writing five keys — and asked whether
+/// those readers are the ones `docs/plans/debt-49-catalog-cache.md` routes. A count cannot answer
+/// that; a key and a **call site** can, which is what `ESKER_STMT_STATS_CALLERS=1` adds.
+///
+/// ```text
+/// ESKER_STMT_STATS=1 ESKER_STMT_STATS_TRACE=1 ESKER_STMT_STATS_CALLERS=1 \
+///   cargo nextest run -p esker-sql --test statement_reads --run-ignored all --no-capture
+/// ```
+#[test]
+#[ignore = "a #49 measurement: wants ESKER_STMT_STATS=1 ESKER_STMT_STATS_TRACE=1 (and CALLERS=1)"]
+fn what_three_ddl_statements_read() {
+    assert!(
+        esker_sql::stmt_stats::tracing_reads(),
+        "set ESKER_STMT_STATS=1 and ESKER_STMT_STATS_TRACE=1, or this says nothing"
+    );
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE d0 (id bigserial primary key, a int8, b text)",
+        "CREATE TABLE d1 (id bigserial primary key, a int8)",
+        "CREATE INDEX d0_a ON d0 (a)",
+    ]);
+    census(
+        &mut node,
+        "CREATE TABLE",
+        "CREATE TABLE d2 (id bigserial primary key, a int8, b text)",
+    );
+    census(
+        &mut node,
+        "ALTER TABLE ... DISABLE TRIGGER ALL",
+        "ALTER TABLE d0 DISABLE TRIGGER ALL",
+    );
+    census(&mut node, "DROP TABLE", "DROP TABLE d1");
+}

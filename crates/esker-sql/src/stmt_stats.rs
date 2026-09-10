@@ -106,8 +106,9 @@ pub(crate) fn record_point(key: &[u8]) {
     POINTS.with(|points| points.set(points.get().saturating_add(1)));
     if tracing_reads() {
         trace(format!(
-            "get  {}",
-            crate::catalog::record::describe_key(key)
+            "get  {}{}",
+            crate::catalog::record::describe_key(key),
+            caller()
         ));
     }
 }
@@ -120,10 +121,43 @@ pub(crate) fn record_range(start: &[u8], end: &[u8]) {
     RANGES.with(|ranges| ranges.set(ranges.get().saturating_add(1)));
     if tracing_reads() {
         trace(format!(
-            "scan {}",
-            crate::catalog::record::describe_range(start, end)
+            "scan {}{}",
+            crate::catalog::record::describe_range(start, end),
+            caller()
         ));
     }
+}
+
+/// Whether each traced read also names the **call site** that made it, read once.
+///
+/// A third switch, and the most expensive: it captures a backtrace per read. The trace says *what*
+/// was read and this says *who asked*, which is the question `debts-v1.1.md` #49's plan is a list
+/// of call sites for — a read that is not attributed cannot be checked off against it.
+#[must_use]
+pub fn tracing_callers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| tracing_reads() && std::env::var_os("ESKER_STMT_STATS_CALLERS").is_some())
+}
+
+/// The innermost frame that is neither this module nor the backend plumbing under it.
+///
+/// **Parsed from `Backtrace`'s `Display`, which is not a stable format** — acceptable because this
+/// is a diagnostic behind two switches and a wrong line here costs a confusing label, never a
+/// wrong answer. `force_capture` rather than `capture`, so it does not depend on `RUST_BACKTRACE`
+/// being set as well as the switch.
+fn caller() -> String {
+    if !tracing_callers() {
+        return String::new();
+    }
+    let text = std::backtrace::Backtrace::force_capture().to_string();
+    let frame = text.lines().find_map(|line| {
+        let frame = line.trim().split_once(": ")?.1.trim();
+        (frame.contains("esker_sql::")
+            && !frame.contains("stmt_stats")
+            && !frame.contains("esker_sql::backend::"))
+        .then(|| frame.trim_start_matches('<').to_owned())
+    });
+    frame.map_or_else(String::new, |frame| format!("   <- {frame}"))
 }
 
 /// Appends one line to this statement's trace.

@@ -27,6 +27,128 @@ way, and **not** the reads this plan removes.
 So the work is **routing**, not construction. That is why this plan is a file list and not a
 design.
 
+## A DDL statement's own reads — h1's question, answered by call site
+
+Taken 2026-09-10 with `ESKER_STMT_STATS_CALLERS=1`, which adds the **call site** beside each
+key. `esker-coord/h1-ddl-cost.md` measured that a DDL's own catalog reads are **40–66% of its
+round trips** and asked whether those readers are the ones this plan routes. A count cannot
+answer that; a key and a caller can.
+
+```text
+=== CREATE TABLE
+    17 reads: 17 point, 0 range
+        1 x  get  layout   <- esker_sql::catalog::refuse_an_older_layout
+        2 x  get  layout   <- esker_sql::catalog::stamp_layout
+        1 x  get  name(t1,"d2")   <- esker_sql::catalog::View>::relation
+        1 x  get  name(t1,"d2")   <- esker_sql::catalog::create_table
+        1 x  get  name(t1,"d2_id_seq")   <- esker_sql::catalog::create_sequence
+        1 x  get  name(t1,"d2_id_seq")   <- esker_sql::catalog::name_exists
+        1 x  get  name(t1,"d2_pkey")   <- esker_sql::catalog::create_table
+        1 x  get  name(t1,"d2_pkey")   <- esker_sql::catalog::name_exists
+        2 x  get  next-id(t1)   <- esker_sql::catalog::allocate_id
+        2 x  get  schema(t1,"esker")   <- esker_sql::catalog::schema_exists
+        1 x  get  version(t1)   <- esker_sql::catalog::Catalog>::view_at::{closure#0}
+        2 x  get  version(t1)   <- esker_sql::catalog::bump_version
+        1 x  get  version(t18446744073709551615)   <- esker_sql::catalog::Catalog>::view_at::{closure#0}
+=== ALTER TABLE ... DISABLE TRIGGER ALL
+    17 reads: 16 point, 1 range
+        3 x  get  layout   <- esker_sql::catalog::refuse_an_older_layout
+        1 x  get  layout   <- esker_sql::catalog::stamp_layout
+        2 x  get  name(t1,"d0")   <- esker_sql::catalog::View>::relation
+        2 x  get  schema(t1,"esker")   <- esker_sql::catalog::schema_exists
+        1 x  get  table(t1,#16384)   <- esker_sql::catalog::View>::table_by_id
+        3 x  get  version(t1)   <- esker_sql::catalog::Catalog>::view_at::{closure#0}
+        1 x  get  version(t1)   <- esker_sql::catalog::bump_version
+        3 x  get  version(t18446744073709551615)   <- esker_sql::catalog::Catalog>::view_at::{closure#0}
+        1 x  scan sequence(t1,#16384)..sequence(t1,#16384,…)   <- esker_sql::catalog::table_sequences
+=== DROP TABLE
+    29 reads: 19 point, 10 range
+        3 x  get  layout   <- esker_sql::catalog::refuse_an_older_layout
+        1 x  get  layout   <- esker_sql::catalog::stamp_layout
+        2 x  get  name(t1,"d1")   <- esker_sql::catalog::View>::relation
+        2 x  get  schema(t1,"esker")   <- esker_sql::catalog::schema_exists
+        1 x  get  table(t1,#16384)   <- esker_sql::catalog::pg_relations::load_table
+        1 x  get  table(t1,#16386)   <- esker_sql::catalog::View>::table_by_id
+        1 x  get  table(t1,#16386)   <- esker_sql::catalog::pg_relations::load_table
+        1 x  get  table(t1,#16389)   <- esker_sql::catalog::pg_relations::load_table
+        3 x  get  version(t1)   <- esker_sql::catalog::Catalog>::view_at::{closure#0}
+        1 x  get  version(t1)   <- esker_sql::catalog::bump_version
+        3 x  get  version(t18446744073709551615)   <- esker_sql::catalog::Catalog>::view_at::{closure#0}
+        1 x  scan fk-backref(t1,#16386)..fk-backref(t1,#16386,…)   <- esker_sql::exec::ddl::drop_table
+        1 x  scan name(t1)..name(t1,…)   <- esker_sql::catalog::pg_relations::Relations>::read
+        1 x  scan row(t1,#16386)..sql-index   <- esker_sql::exec::for_each_page::<esker_sql::exec::ddl::drop_one_table::{closure#0}>
+        1 x  scan sequence(t1,#16384)..sequence(t1,#16384,…)   <- esker_sql::catalog::table_sequences
+        2 x  scan sequence(t1,#16386)..sequence(t1,#16386,…)   <- esker_sql::catalog::table_sequences
+        1 x  scan sequence(t1,#16389)..sequence(t1,#16389,…)   <- esker_sql::catalog::table_sequences
+        1 x  scan type(t1)..type(t1,…)   <- esker_sql::catalog::user_types
+        2 x  scan view(t1)..view(t1,…)   <- esker_sql::catalog::views
+```
+
+### The verdict, reader by reader
+
+| reader | in this plan's list? | cacheable? |
+|---|---|---|
+| `catalog::schema_exists` | **covered** | yes |
+| `pg_relations::Relations::read` / `load_table` | **covered** | yes |
+| `catalog::views`, `user_types`, `table_sequences` | **covered** | yes |
+| `View::relation`, `View::table_by_id` | already cached today | yes |
+| `catalog::refuse_an_older_layout`, `stamp_layout` | **NOT covered — add** | yes, it is a store-wide **constant** |
+| `catalog::name_exists`, `create_table`, `create_sequence` | **NOT covered — add** | yes, the same `names` map `View::relation` fills |
+| `exec::ddl::drop_table` (`fk-backref` prefix scan) | **NOT covered — add** | yes, per table |
+| `Catalog::view_at` (`version` x2 per view) | out of scope | **no — it is the validator**, and it is #50's key |
+| `catalog::bump_version` | out of scope | **no** — a DDL's own read-modify-write |
+| `catalog::allocate_id` (`next-id`) | out of scope | **no** — a counter that must be fresh |
+| `exec::for_each_page` (row scan in `DROP`) | out of scope | no — that is data |
+
+### How much of each statement this plan reaches
+
+| statement | reads | already in the plan | cacheable, **to add** | irreducible |
+|---|---|---|---|---|
+| `CREATE TABLE` | 17 | 2 (12%) | **8** (3 layout, 5 name) | 6 (4 version, 2 next-id) |
+| `ALTER … DISABLE TRIGGER ALL` | 17 | 3 (18%) | **4** (layout) | 7 (version) |
+| `DROP TABLE` | 29 | 13 (45%) | **5** (4 layout, 1 fk-backref) | 7 (version) + 1 row scan |
+
+`DROP` is the one this plan already reaches, which matches h1's reading that its cost is catalog
+enumeration. `CREATE` is the one it barely touches, and what it misses there is not exotic: **five
+name-existence point reads and three reads of a store-wide constant.**
+
+### The bound nobody had stated: a DDL turns the cache off on purpose
+
+`Catalog::view_at` takes `cached: bool`, and a transaction that has **written** the catalog gets
+`catalog: None` so that it reads its own uncommitted DDL. That is correct and must stay. It means
+**option (b) helps a DDL statement only up to its first catalog write** — the resolution and
+enumeration phases, which for `DROP` is most of the statement and for `CREATE TABLE` is the front
+half. Any estimate that ignores this is too generous, and the numbers above are counted from the
+real trace rather than from the rule, so they already include it.
+
+### And a bigger DDL item that belongs to #50, not here
+
+**Every DDL statement opens three catalog views**, not two: `version(t1)` and
+`version(t<cluster>)` are read three times each in `ALTER` and `DROP`, plus `bump_version`'s own —
+**7 of 17 reads in an `ALTER`, 41% of the statement.** For an ordinary `SELECT` it is 2 of 9. That
+is the key [ADR 0105](../adr/0105-a-catalog-read-never-waits.md) and #50 are about, and going from
+three views to one would save four reads per DDL — **more than this plan saves on `CREATE TABLE`.**
+Recorded here because the measurement found it; it is not this plan's to take.
+
+### What it does to the milestone's arithmetic
+
+Run 117 puts DDL at about **19%** of `transactions_test` (`DROP TABLE` 5.4%, the trigger pair
+~11.5% inside `other`, `CREATE TABLE` 1.5%, `CREATE INDEX` 0.6%). Weighting each statement's
+covered fraction by its share:
+
+    this plan as written        0.45 x 5.4 + 0.18 x 11.5 + 0.12 x 1.5   = ~4.7% of the file
+    with the three readers added  + 0.17 x 5.4 + 0.24 x 11.5 + 0.47 x 1.5 = ~9% of the file
+
+**And for DDL that arithmetic is more trustworthy than it is for introspection.** A DDL's reads are
+almost all **point** reads — 17 of 17 in `CREATE TABLE`, 16 of 17 in `ALTER` — so read count tracks
+round trips tracks time. Introspection's are tenant-wide scans, where one read is O(catalog) and
+the count says nothing about the clock.
+
+So: **#49 (b) is worth about 9% of the file on DDL, on top of introspection's 72.4%** — and the
+three readers that take it from 4.7% to 9% are five name lookups, a constant, and one prefix scan.
+The milestone's account should carry both numbers, because only the second one is a decision about
+this plan's scope.
+
 ## Scope
 
 **In:**
@@ -39,17 +161,32 @@ design.
    that a table hydrated once in a statement is hydrated once.
 4. `hydrate`'s own second reads (`table_sequences`, `column_user_types`) go through the same view.
 
+**Added 2026-09-10 after the DDL census above**, because a DDL statement's own reads turned out to
+be 40-66% of its round trips and mostly *not* in the list this plan started with:
+
+5. **The layout marker is read once per process**, not once per catalog view.
+   `refuse_an_older_layout` and `stamp_layout` read a store-wide **constant** one to three times a
+   statement; every DDL measured pays four.
+6. **`name_exists`, `create_table` and `create_sequence` resolve names through `View::relation`**
+   rather than reading `name_key` themselves — the same `names` map the cache already fills. Five
+   of `CREATE TABLE`'s seventeen reads.
+7. **`exec::ddl::drop_table`'s `fk-backref` prefix scan** joins the per-table entries.
+
 **Out, and each for a stated reason:**
 
 * **No new invalidation mechanism.** The version counter and the schema lease
   ([ADR 0028](../adr/0028-the-schema-lease.md)) are what already invalidate; this plan adds
   nothing to them and must not.
 * **No cross-statement cache of *rows*.** Only catalog records. A row is the data.
-* **No change to how many catalog views a statement opens.** The census shows two per statement
-  (two `version` reads, two `layout`), which [ADR 0105](../adr/0105-a-catalog-read-never-waits.md)
-  states independently from the other side. That key is **#50's**, not this plan's: option (b)
-  keeps exactly one version read per statement because it is the validator, and #50's fix makes
-  that read not wait. A boundary, not a deferral.
+* **No change to how many catalog views a statement opens.** Two per ordinary statement and
+  **three per DDL** (`version` x2 each, plus `bump_version`'s own — 7 of an `ALTER`'s 17 reads),
+  which [ADR 0105](../adr/0105-a-catalog-read-never-waits.md) states independently from the other
+  side. That key is **#50's**, not this plan's: option (b) keeps exactly one version read per
+  statement because it is the validator, and #50's fix makes that read not wait. A boundary, not a
+  deferral — **and for DDL it is worth more than this plan is**, which is recorded above rather
+  than quietly taken.
+* **No change to `allocate_id` or `bump_version`.** Both are read-modify-writes of a counter that
+  must be fresh; caching either would be a wrong answer, not a saving.
 * **No batching and no pipelining** — those are ADR 0106's options (a) and (c), and B removes the
   reads (a) would batch.
 * **No `pg_catalog` row-builder rewrite.** The builders keep their shape; only the reader they call
@@ -59,13 +196,13 @@ design.
 
 | file | change |
 |---|---|
-| `crates/esker-sql/src/catalog/mod.rs` | `Cache` gains `schemas`, `views`, `types`, `sequences`; `View` gains the four accessors; `schema_exists`, `schemas`, `views`, `user_types`, `table_sequences` move behind them; `hydrate` takes a `&View` |
+| `crates/esker-sql/src/catalog/mod.rs` | `Cache` gains `schemas`, `views`, `types`, `sequences`; `View` gains the four accessors; `schema_exists`, `schemas`, `views`, `user_types`, `table_sequences` move behind them; `hydrate` takes a `&View`. **And, from the DDL census**: `refuse_an_older_layout`/`stamp_layout` memoise the layout constant; `name_exists`, `create_table`, `create_sequence` resolve through `View::relation` |
 | `crates/esker-sql/src/catalog/pg_relations.rs` | `Relations::read(&View, tenant)`; `load_table` calls `View::table_by_id` |
 | `crates/esker-sql/src/catalog/pg_catalog.rs` | 8 `Relations::read` call sites |
 | `crates/esker-sql/src/catalog/information_schema.rs` | 4 |
 | `crates/esker-sql/src/catalog/pg_attribute.rs` | 2 |
 | `crates/esker-sql/src/catalog/pg_index.rs`, `pg_constraint.rs` | 1 each |
-| `crates/esker-sql/src/exec/ddl.rs` | 4 `Relations::read`, and every `schema_exists` |
+| `crates/esker-sql/src/exec/ddl.rs` | 4 `Relations::read`, every `schema_exists`, and `drop_table`'s `fk-backref` scan |
 | `crates/esker-sql/src/exec/mod.rs` | 3 `Relations::read`; the per-statement view is already there |
 | `crates/esker-sql/src/exec/typedef.rs` | 3 `Relations::read`, 1 `schema_exists` |
 | `crates/esker-sql/src/exec/cursor.rs` | 1 |
