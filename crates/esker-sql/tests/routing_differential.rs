@@ -1639,10 +1639,28 @@ async fn what_a_catalog_read_costs_with_stores_under_it() {
         for n in 1..=ROWS {
             // **The transients a splitting, electing cluster answers with are waited out, not
             // failed on.** `40003` is an outcome nobody can know, `08006` is a client that spent
-            // its attempts, and both mean *not now*. The retry is safe here for the reason
-            // `cluster_harness::run` gives: every insert names its own primary key, so a second
-            // attempt either writes the row or meets `23505` on the row its first attempt wrote —
-            // and that is a success, accepted only *after* an ambiguous answer.
+            // its attempts, and both mean *not now*.
+            //
+            // **A `23505` after any earlier attempt is that attempt's own row, and is a success.**
+            // Every insert names its own primary key, the table is created empty by this test, and
+            // nothing else writes it — so the only value that can collide with `(n, n)` is the one
+            // an earlier turn of this loop wrote. The rule used to accept a `23505` only after an
+            // answer that said in so many words that it *may or may not have been applied*, and
+            // that is one of **three** shapes the client has for "the write's fate is unknown":
+            // `esker_client::Error` also has `RetriesExhausted` — `gave up after N attempts` —
+            // and `DeadlineExceeded`, and neither of those proves the write did not land either.
+            // A request that went out and lost its answer surfaces as `08006 could not reach the
+            // store`, which this loop was already retrying *as though the write had not
+            // happened*: the first attempt landed, the second met its own row, `unknown` was
+            // still false, and the assertion below fired —
+            // `INSERT INTO t VALUES (249, 249) never landed: duplicate key value violates unique
+            // constraint`, on r1's real-topology run of the Gate directory measurement.
+            //
+            // So the condition is the attempt number and not the wording. Wording is a list that
+            // has to be kept in step with a taxonomy in another crate; the attempt number is the
+            // fact the acceptance actually rests on. A `23505` on the **first** attempt is still a
+            // failure, because then nothing of this loop's has run and the row came from somewhere
+            // this measurement is not about.
             let statement = format!("INSERT INTO t VALUES ({n}, {n})");
             let mut unknown = false;
             for attempt in 0..40 {
@@ -1650,7 +1668,7 @@ async fn what_a_catalog_read_costs_with_stores_under_it() {
                     Ok(_) => break,
                     Err(error) => {
                         let text = error.to_string();
-                        if unknown && text.contains("23505") {
+                        if attempt > 0 && text.contains("23505") {
                             break;
                         }
                         unknown |= text.contains("may or may not have been applied");
