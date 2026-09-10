@@ -124,11 +124,21 @@ thing `describe_key` was placed next to its builders to avoid.
 Every one of these is a test that can go red, and the counterfactual is named beside the ones where
 a passing test would otherwise prove nothing.
 
-1. **`a_statements_catalog_reads_do_not_grow_with_its_from_list`** — `pk_and_sequence_for` over a
-   five-relation `FROM`, with `ESKER_STMT_STATS=1`: assert the point reads and range scans against
-   a **one**-relation control, as a ratio. Today it is 5×; after, it must be 1×.
-   *Counterfactual*: revert the `Relations::read` routing and the ratio returns to 5, or the test
-   is measuring something else.
+1. **Written, red, and committed: `crates/esker-sql/tests/catalog_read_slope.rs`.** Two tests,
+   both `#[ignore]`d until this plan lands, both run and read before being committed:
+
+   * **`one_statement_reads_no_key_twice`** — no key may be read more than twice in one statement,
+     two being the catalog views a statement opens. **Red at 7 offenders in 60 reads**: sixteen
+     `schema(t1,"esker")` and five each of the four tenant-wide reads. Deterministic, no clock.
+   * **`a_repeated_statement_stops_tracking_the_catalog`** — the slope, on the **second** run at an
+     unchanged version, which is the run that has to become flat. **Red at 6.2x for 5x the
+     catalog** (20 relations 4.09 ms, 100 relations 25.33 ms; control 0.57 → 3.38 ms).
+
+   **Two and not one**, because neither catches the other: a tenant-wide scan is one read whatever
+   it walks, so the count barely moves with the catalog while the cost moves faster than linearly.
+   *Counterfactual for the first*: revert the `Relations::read` routing and the offenders return.
+   **Delete the `#[ignore]`s when this lands** — nothing else about them should need changing, and
+   if something does, the change is not option (b).
 2. **`the_first_statement_after_a_ddl_sees_the_new_catalog`** — the counterfactual this plan is
    most at risk from, and it is the one `a-catalog-write-must-bump-the-version` records: session A
    caches, session B runs `CREATE TABLE` / `ALTER TABLE … ADD COLUMN` / `CREATE SCHEMA` /
