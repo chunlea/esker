@@ -3325,6 +3325,29 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 args.push(left);
                 args.push(right);
             }
+            // **`GREATEST`/`LEAST` needs a comparison function, and eleven types have none.**
+            // Checked here rather than in the evaluator because PostgreSQL's is at *executor
+            // init* (`ExecInitExprRec`, `execExpr.c`), so `WHERE false` refuses too — an
+            // evaluator-side gate would leave a row-less query answering.
+            //
+            // **Not `min`/`max`'s list, and it must never become one.** That one is a `pg_proc`
+            // lookup in the parser; this is a `btree` opclass lookup. Measured, they disagree in
+            // both directions: `min(point[])` is answered and `GREATEST(point[], point[])` is
+            // refused; `min(hstore)` is refused and `GREATEST(hstore)` is answered
+            // (`tests/captures/pg19_min_max_greatest.txt`).
+            //
+            // The list was measured **whole** — `GREATEST` and `LEAST` asked of all 166 type
+            // spellings the wire v3 probe list has, of which exactly these twenty refuse — rather
+            // than extended a type at a time, which is how the arm above it came to carry a
+            // scalar's rule on its array (`debts-v1.1.md`, wire v3 families F1b and F2).
+            if matches!(call.func, CatalogFunc::Greatest | CatalogFunc::Least) {
+                for arg in &args {
+                    let ty = expr_type(arg, scope)?;
+                    if !comparable_by_btree(ty) {
+                        return Err(SqlError::NoComparisonFunction(ty.name()));
+                    }
+                }
+            }
             match (call.func, args.first()) {
                 (CatalogFunc::PgTypeof, Some(arg)) if args.len() == 1 => {
                     let named = pg_typeof_of(arg, scope)?;
@@ -5791,6 +5814,42 @@ fn pg_typeof_of(expr: &Expr, scope: &Scope<'_>) -> Result<Datum> {
         });
     }
     Ok(crate::value::regtype_of_oid(expr_type(expr, scope)?.oid()))
+}
+
+/// **Whether a type has a `btree` comparison function**, which is what `GREATEST`/`LEAST` needs.
+///
+/// The eleven that do not, and the arrays of them this node has — measured on 19beta1 over every
+/// type spelling the wire v3 probe list carries, 166 of them, of which exactly twenty refuse
+/// (`tests/captures/pg19_min_max_greatest.txt`). `lquery[]` refuses there too and is absent here
+/// because this node has no such type; `void` has no array on either server.
+///
+/// **Everything else has one**, `int2vector`, `oidvector`, `hstore`, `tsvector`, `tsquery`,
+/// `money`, `macaddr`, `bit`, `citext`, `ltree`, `jsonb`, `uuid` and every range included — which
+/// is why this is a refusal list rather than an allow list, and why it was measured whole.
+fn comparable_by_btree(ty: ColumnType) -> bool {
+    !matches!(
+        ty,
+        ColumnType::Json
+            | ColumnType::JsonArray
+            | ColumnType::Xml
+            | ColumnType::XmlArray
+            | ColumnType::Point
+            | ColumnType::PointArray
+            | ColumnType::Lseg
+            | ColumnType::LsegArray
+            | ColumnType::Box
+            | ColumnType::BoxArray
+            | ColumnType::Path
+            | ColumnType::PathArray
+            | ColumnType::Polygon
+            | ColumnType::PolygonArray
+            | ColumnType::Circle
+            | ColumnType::CircleArray
+            | ColumnType::Line
+            | ColumnType::LineArray
+            | ColumnType::LQuery
+            | ColumnType::Void
+    )
 }
 
 fn arrow_fetch(func: CatalogFunc, args: &[Expr], scope: &Scope<'_>) -> CatalogFunc {
