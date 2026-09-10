@@ -2751,12 +2751,112 @@ fn pg_type_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Da
             ]
         })
         .collect();
+    rows.extend(information_schema_domain_rows());
     rows.extend(user_type_rows(txn, tenant)?);
     rows.sort_by_key(|row| match row.first() {
         Some(Datum::Int8(oid)) => *oid,
         _ => 0,
     });
     Ok(rows)
+}
+
+/// The `information_schema` domains, which are real domains on a real server and were base types
+/// here.
+///
+/// **`(domain oid, array oid, name, base, default)`, and the oids are PostgreSQL 19beta1's own.**
+/// Measured 2026-09-10 (`tests/captures/pg19_domain_type.txt`). Using the measured numbers rather
+/// than allocating from this node's own sequence costs nothing and is safe by construction: they
+/// sit inside PostgreSQL's built-in range — `pg_type`'s built-ins run 16 to 13744 — and this node
+/// hands out user ids from [`super::FIRST_USER_ID`] (16384) upwards, so nothing it allocates can
+/// collide with one.
+///
+/// **The array oid is the domain's minus one**, for all five, because `initdb` allocates the array
+/// type first. This node's own convention for a user type is `oid + 1`, which is why the pairs are
+/// written out rather than derived: a rule read off one of these would be wrong about the others'
+/// direction.
+///
+/// **`time_stamp` has a default and the rest do not** — `CURRENT_TIMESTAMP(2)`, measured, and not a
+/// thing a reader would guess a domain carried.
+///
+/// `typlen` and `typcategory` are the **base's**, which is the rule `TypeKind::Domain` already
+/// applies to a user domain: measured, `sql_identifier` is 64 (`name`'s width) and `S`,
+/// `cardinal_number` is 4 and `N`, `time_stamp` is 8 and `D`, and the two over `varchar` are -1
+/// and `S`.
+///
+/// **They come before the wire, never after.** `ActiveRecord` loads its type map with
+/// `WHERE t.typtype IN ('r', 'e', 'd')` on every connection — 712 occurrences across 164 captured
+/// files — and an oid this node sends that does not come back from that query has no decoder, so a
+/// correct value arrives as a string. These rows are what makes sending one safe
+/// ([ADR 0103](../../../../docs/adr/0103-a-domain-is-a-type-a-client-can-be-sent.md),
+/// `debts-v1.1.md` #37).
+const INFORMATION_SCHEMA_DOMAINS: [(i64, i64, &str, ColumnType, Option<&str>); 5] = [
+    (13_356, 13_355, "cardinal_number", ColumnType::Int4, None),
+    (13_359, 13_358, "character_data", ColumnType::Varchar, None),
+    (13_361, 13_360, "sql_identifier", ColumnType::Name, None),
+    (
+        13_367,
+        13_366,
+        "time_stamp",
+        ColumnType::TimestampTz,
+        Some("CURRENT_TIMESTAMP(2)"),
+    ),
+    (13_369, 13_368, "yes_or_no", ColumnType::Varchar, None),
+];
+
+/// The oid this node's `pg_namespace` gives `information_schema`.
+///
+/// **Its own number and not PostgreSQL's 13342**, for the reason the built-in rows' `typnamespace`
+/// comment already gives: the schema model is what differs, not this column. What matters to a
+/// client is that the join lands in a schema called `information_schema`, and it does.
+const INFORMATION_SCHEMA_NAMESPACE_OID: i64 = 13;
+
+/// A `pg_type` row per `information_schema` domain, and one per array of one.
+fn information_schema_domain_rows() -> Vec<Vec<Datum>> {
+    let mut rows = Vec::with_capacity(INFORMATION_SCHEMA_DOMAINS.len() * 2);
+    for (oid, array_oid, name, base, default) in INFORMATION_SCHEMA_DOMAINS {
+        rows.push(vec![
+            Datum::Int8(oid),
+            Datum::Text(name.to_owned()),
+            // A domain over a scalar has no element type, however its base prints.
+            Datum::Int8(0),
+            Datum::Text(",".to_owned()),
+            Datum::Text("domain_in".to_owned()),
+            Datum::Text("d".to_owned()),
+            Datum::Int8(i64::from(base.oid())),
+            Datum::Int8(super::pg_attribute::typcollation(base)),
+            Datum::Int8(INFORMATION_SCHEMA_NAMESPACE_OID),
+            Datum::Int2(base.type_len()),
+            Datum::Text(typcategory(base).to_owned()),
+            Datum::Int8(array_oid),
+            // Only a composite owns a `pg_class` row.
+            Datum::Int8(0),
+            // None of the five is `NOT NULL`, measured.
+            Datum::Bool(false),
+            default.map_or(Datum::Null, |text| Datum::Text(text.to_owned())),
+        ]);
+        rows.push(vec![
+            Datum::Int8(array_oid),
+            Datum::Text(format!("_{name}")),
+            // **The array's element is the domain**, which is how a client reaches it: the
+            // type-map query asks for `typtype IN ('r','e','d')` and an array is `b`, so
+            // `ActiveRecord` never sees this row directly and finds it through the domain's.
+            Datum::Int8(oid),
+            Datum::Text(",".to_owned()),
+            Datum::Text("array_in".to_owned()),
+            // An array **of** a domain is a base type; the `d` belongs to what it is an array of.
+            Datum::Text("b".to_owned()),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(INFORMATION_SCHEMA_NAMESPACE_OID),
+            Datum::Int2(-1),
+            Datum::Text("A".to_owned()),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Bool(false),
+            Datum::Null,
+        ]);
+    }
+    rows
 }
 
 /// One row per user-defined type, and **one more for the array type `CREATE TYPE` made with it**.
