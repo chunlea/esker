@@ -18,8 +18,8 @@ SELECT array_agg(c) FROM (VALUES ('r'::"char"),('v'::"char")) s(c)	"char"[]	{r,v
 SELECT '{r,v}'::"char"[]	"char"[]	{r,v}
 SELECT pg_typeof('{r,v}'::"char"[])	regtype	"char"[]
 SELECT typcategory, typdelim FROM pg_type WHERE typname = 'text'	"char","char"	S|,
-SELECT 'r'::"char" || 'x'	!42725 operator is not unique: "char" || unknown
-SELECT pg_typeof('r'::"char" || 'x')	!42725 operator is not unique: "char" || unknown
+SELECT 'r'::"char" || 'x'	!42725 operator is not unique: "char" || unknown DETAIL: Could not choose a best candidate operator. HINT: You might need to add explicit type casts.
+SELECT pg_typeof('r'::"char" || 'x')	!42725 operator is not unique: "char" || unknown DETAIL: Could not choose a best candidate operator. HINT: You might need to add explicit type casts.
 SELECT relkind::text FROM pg_class WHERE relname = 'pg_class'	text	r
 SELECT c.relkind, c.relkind = 'r' AS is_table FROM pg_class c WHERE c.relname = 'pg_class'	"char",boolean	r|t
 SELECT format_type(18, -1), format_type(1002, -1)	text,text	"char"|"char"[]

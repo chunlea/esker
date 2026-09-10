@@ -1,0 +1,159 @@
+# **Which pairs `||` concatenates, and what it answers** — the whole probe list, three shapes.
+#
+# PostgreSQL 19beta1, 2026-09-10, `127.0.0.1:55432`, one `BEGIN … ROLLBACK` with a
+# `SAVEPOINT`/`ROLLBACK TO` per probe and `statement_timeout` set. Wire v3 families **F3a** (12
+# rows) and **F3b** (10 rows), which are one `match` and therefore one unit.
+#
+# Each of the 100 distinct type spellings the wire v3 probe list carries was asked three ways,
+# value bound rather than spliced:
+#
+#     SELECT pg_typeof(x || x)           FROM (SELECT $1::<type> AS x) t
+#     SELECT pg_typeof(x || 'a'::text)   FROM (SELECT $1::<type> AS x) t
+#     SELECT pg_typeof('a'::text || x)   FROM (SELECT $1::<type> AS x) t
+#
+# **Three shapes because `||` is not one operator.** `pg_operator` carries `text || text`,
+# `anynonarray || text`, `text || anynonarray`, `anyarray || anyarray`, `anyarray || anyelement`,
+# `anyelement || anyarray`, and a handful of same-type ones. A probe that only asks `x || x` sees
+# a third of it, which is what the census's 22 rows are.
+#
+# ## The rule, read off the answers below
+#
+#   x || x
+#     every ARRAY type          -> itself                  (`anyarray || anyarray`)
+#     character, varchar,       -> text                    (they reach `text || text`; note
+#       citext, name                                        `citext || citext` is **text**)
+#     bit                       -> **bit varying**, not bit — the widening is measured
+#     bytea, tsvector, tsquery, -> itself                  (one same-type operator each)
+#       jsonb, hstore, ltree
+#     int2vector                -> **smallint[]**          (PostgreSQL's int2vector IS an array)
+#     oidvector                 -> **oid[]**
+#     everything else (39)      -> 42883
+#     "char"                    -> **42725 operator is not unique**, a third sqlstate
+#
+#   x || text   and   text || x
+#     every non-array scalar    -> text                    (49 of them; `anynonarray || text`)
+#     ltree                     -> ltree                   (a real `ltree || text` operator)
+#     arrays of the string      -> the array, and the side decides which:
+#       types                     `varchar[] || text` is `character varying[]`
+#                                 `text || varchar[]` is `text[]`
+#     every other array         -> 42883
+#     "char"                    -> 42725 both ways
+#
+# **The `42725` is not a variant of the `42883`.** "operator is not unique" means two candidates
+# matched and neither is preferred; "does not exist" means none did. A node that answered one for
+# the other would be telling a client the opposite thing about its query.
+#
+# ## What this node answered, before the fix
+#
+#   105 of the 300 shape-rows diverged:
+#     91  node ANSWERS text where PostgreSQL refuses 42883      — F3a, and it is 91 and not 12
+#      6  node REFUSES where PostgreSQL answers                 — F3b's bit/bytea/tsquery, plus
+#         `hstore || text` (`42601 syntax error in hstore`, both sides) and `text || tsvector`
+#         (`0A000 || over text is not supported`), which no census row reached
+#      8  both answer, different type                           — the string arrays, `tsvector ||
+#         text`, and `int2vector`/`oidvector`
+#
+# ## The raw answers, one line per distinct spelling
+#
+#     <type> <TAB> self=<answer> <TAB> right=<x || text> <TAB> left=<text || x>
+#
+"char"	self=!42725 operator is not unique: "char" || "char"	right=!42725 operator is not unique: "char" || text	left=!42725 operator is not unique: text || "char"
+"char"[]	self="char"[]	right=!42883 operator does not exist: "char"[] || text	left=!42883 operator does not exist: text || "char"[]
+bigint	self=!42883 operator does not exist: bigint || bigint	right=text	left=text
+bigint[]	self=bigint[]	right=!42883 operator does not exist: bigint[] || text	left=!42883 operator does not exist: text || bigint[]
+bit	self=bit varying	right=text	left=text
+bit[]	self=bit[]	right=!42883 operator does not exist: bit[] || text	left=!42883 operator does not exist: text || bit[]
+boolean	self=!42883 operator does not exist: boolean || boolean	right=text	left=text
+boolean[]	self=boolean[]	right=!42883 operator does not exist: boolean[] || text	left=!42883 operator does not exist: text || boolean[]
+box	self=!42883 operator does not exist: box || box	right=text	left=text
+box[]	self=box[]	right=!42883 operator does not exist: box[] || text	left=!42883 operator does not exist: text || box[]
+bytea	self=bytea	right=text	left=text
+bytea[]	self=bytea[]	right=!42883 operator does not exist: bytea[] || text	left=!42883 operator does not exist: text || bytea[]
+character	self=text	right=text	left=text
+character varying	self=text	right=text	left=text
+character varying[]	self=character varying[]	right=character varying[]	left=text[]
+character[]	self=character[]	right=character[]	left=text[]
+cidr	self=!42883 operator does not exist: cidr || cidr	right=text	left=text
+cidr[]	self=cidr[]	right=!42883 operator does not exist: cidr[] || text	left=!42883 operator does not exist: text || cidr[]
+circle	self=!42883 operator does not exist: circle || circle	right=text	left=text
+circle[]	self=circle[]	right=!42883 operator does not exist: circle[] || text	left=!42883 operator does not exist: text || circle[]
+citext	self=text	right=text	left=text
+citext[]	self=citext[]	right=text[]	left=text[]
+date	self=!42883 operator does not exist: date || date	right=text	left=text
+date[]	self=date[]	right=!42883 operator does not exist: date[] || text	left=!42883 operator does not exist: text || date[]
+daterange	self=!42883 operator does not exist: daterange || daterange	right=text	left=text
+daterange[]	self=daterange[]	right=!42883 operator does not exist: daterange[] || text	left=!42883 operator does not exist: text || daterange[]
+double precision	self=!42883 operator does not exist: double precision || double precision	right=text	left=text
+double precision[]	self=double precision[]	right=!42883 operator does not exist: double precision[] || text	left=!42883 operator does not exist: text || double precision[]
+hstore	self=hstore	right=text	left=text
+hstore[]	self=hstore[]	right=!42883 operator does not exist: hstore[] || text	left=!42883 operator does not exist: text || hstore[]
+inet	self=!42883 operator does not exist: inet || inet	right=text	left=text
+inet[]	self=inet[]	right=!42883 operator does not exist: inet[] || text	left=!42883 operator does not exist: text || inet[]
+int2vector	self=smallint[]	right=!42883 operator does not exist: int2vector || text	left=!42883 operator does not exist: text || int2vector
+int4range	self=!42883 operator does not exist: int4range || int4range	right=text	left=text
+int4range[]	self=int4range[]	right=!42883 operator does not exist: int4range[] || text	left=!42883 operator does not exist: text || int4range[]
+int8range	self=!42883 operator does not exist: int8range || int8range	right=text	left=text
+int8range[]	self=int8range[]	right=!42883 operator does not exist: int8range[] || text	left=!42883 operator does not exist: text || int8range[]
+integer	self=!42883 operator does not exist: integer || integer	right=text	left=text
+integer[]	self=integer[]	right=!42883 operator does not exist: integer[] || text	left=!42883 operator does not exist: text || integer[]
+interval	self=!42883 operator does not exist: interval || interval	right=text	left=text
+interval[]	self=interval[]	right=!42883 operator does not exist: interval[] || text	left=!42883 operator does not exist: text || interval[]
+json	self=!42883 operator does not exist: json || json	right=text	left=text
+json[]	self=json[]	right=!42883 operator does not exist: json[] || text	left=!42883 operator does not exist: text || json[]
+jsonb	self=jsonb	right=text	left=text
+jsonb[]	self=jsonb[]	right=!42883 operator does not exist: jsonb[] || text	left=!42883 operator does not exist: text || jsonb[]
+line	self=!42883 operator does not exist: line || line	right=text	left=text
+line[]	self=line[]	right=!42883 operator does not exist: line[] || text	left=!42883 operator does not exist: text || line[]
+lquery	self=!42883 operator does not exist: lquery || lquery	right=text	left=text
+lseg	self=!42883 operator does not exist: lseg || lseg	right=text	left=text
+lseg[]	self=lseg[]	right=!42883 operator does not exist: lseg[] || text	left=!42883 operator does not exist: text || lseg[]
+ltree	self=ltree	right=ltree	left=ltree
+ltree[]	self=ltree[]	right=!42883 operator does not exist: ltree[] || text	left=!42883 operator does not exist: text || ltree[]
+macaddr	self=!42883 operator does not exist: macaddr || macaddr	right=text	left=text
+macaddr[]	self=macaddr[]	right=!42883 operator does not exist: macaddr[] || text	left=!42883 operator does not exist: text || macaddr[]
+money	self=!42883 operator does not exist: money || money	right=text	left=text
+money[]	self=money[]	right=!42883 operator does not exist: money[] || text	left=!42883 operator does not exist: text || money[]
+name	self=text	right=text	left=text
+name[]	self=name[]	right=name[]	left=text[]
+numeric	self=!42883 operator does not exist: numeric || numeric	right=text	left=text
+numeric[]	self=numeric[]	right=!42883 operator does not exist: numeric[] || text	left=!42883 operator does not exist: text || numeric[]
+numrange	self=!42883 operator does not exist: numrange || numrange	right=text	left=text
+numrange[]	self=numrange[]	right=!42883 operator does not exist: numrange[] || text	left=!42883 operator does not exist: text || numrange[]
+oid	self=!42883 operator does not exist: oid || oid	right=text	left=text
+oid[]	self=oid[]	right=!42883 operator does not exist: oid[] || text	left=!42883 operator does not exist: text || oid[]
+oidvector	self=oid[]	right=!42883 operator does not exist: oidvector || text	left=!42883 operator does not exist: text || oidvector
+path	self=!42883 operator does not exist: path || path	right=text	left=text
+path[]	self=path[]	right=!42883 operator does not exist: path[] || text	left=!42883 operator does not exist: text || path[]
+point	self=!42883 operator does not exist: point || point	right=text	left=text
+point[]	self=point[]	right=!42883 operator does not exist: point[] || text	left=!42883 operator does not exist: text || point[]
+polygon	self=!42883 operator does not exist: polygon || polygon	right=text	left=text
+polygon[]	self=polygon[]	right=!42883 operator does not exist: polygon[] || text	left=!42883 operator does not exist: text || polygon[]
+real	self=!42883 operator does not exist: real || real	right=text	left=text
+real[]	self=real[]	right=!42883 operator does not exist: real[] || text	left=!42883 operator does not exist: text || real[]
+regclass	self=!42883 operator does not exist: regclass || regclass	right=text	left=text
+regclass[]	self=regclass[]	right=!42883 operator does not exist: regclass[] || text	left=!42883 operator does not exist: text || regclass[]
+regproc	self=!42883 operator does not exist: regproc || regproc	right=text	left=text
+regproc[]	self=regproc[]	right=!42883 operator does not exist: regproc[] || text	left=!42883 operator does not exist: text || regproc[]
+regtype	self=!42883 operator does not exist: regtype || regtype	right=text	left=text
+regtype[]	self=regtype[]	right=!42883 operator does not exist: regtype[] || text	left=!42883 operator does not exist: text || regtype[]
+smallint	self=!42883 operator does not exist: smallint || smallint	right=text	left=text
+smallint[]	self=smallint[]	right=!42883 operator does not exist: smallint[] || text	left=!42883 operator does not exist: text || smallint[]
+text	self=text	right=text	left=text
+text[]	self=text[]	right=text[]	left=text[]
+time	self=!42883 operator does not exist: time without time zone || time without time zone	right=text	left=text
+timestamp	self=!42883 operator does not exist: timestamp without time zone || timestamp without time zone	right=text	left=text
+timestamp with time zone	self=!42883 operator does not exist: timestamp with time zone || timestamp with time zone	right=text	left=text
+timestamp with time zone[]	self=timestamp with time zone[]	right=!42883 operator does not exist: timestamp with time zone[] || text	left=!42883 operator does not exist: text || timestamp with time zone[]
+tsquery	self=tsquery	right=text	left=text
+tsquery[]	self=tsquery[]	right=!42883 operator does not exist: tsquery[] || text	left=!42883 operator does not exist: text || tsquery[]
+tsrange	self=!42883 operator does not exist: tsrange || tsrange	right=text	left=text
+tsrange[]	self=tsrange[]	right=!42883 operator does not exist: tsrange[] || text	left=!42883 operator does not exist: text || tsrange[]
+tstzrange	self=!42883 operator does not exist: tstzrange || tstzrange	right=text	left=text
+tstzrange[]	self=tstzrange[]	right=!42883 operator does not exist: tstzrange[] || text	left=!42883 operator does not exist: text || tstzrange[]
+tsvector	self=tsvector	right=text	left=text
+tsvector[]	self=tsvector[]	right=!42883 operator does not exist: tsvector[] || text	left=!42883 operator does not exist: text || tsvector[]
+uuid	self=!42883 operator does not exist: uuid || uuid	right=text	left=text
+uuid[]	self=uuid[]	right=!42883 operator does not exist: uuid[] || text	left=!42883 operator does not exist: text || uuid[]
+void	self=!42883 operator does not exist: void || void	right=text	left=text
+xml	self=!42883 operator does not exist: xml || xml	right=text	left=text
+xml[]	self=xml[]	right=!42883 operator does not exist: xml[] || text	left=!42883 operator does not exist: text || xml[]

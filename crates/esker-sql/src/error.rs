@@ -3557,6 +3557,14 @@ impl SqlError {
             SqlError::AmbiguousFunction { .. } => {
                 Some("Could not choose a best candidate function.".to_owned())
             }
+            // **`operator`, where the line above says `function`** — measured beside it:
+            // `'x'::"char" || 'y'::"char"` is `42725 operator is not unique` with
+            // `DETAIL: Could not choose a best candidate operator.` This carried no `DETAIL` and no
+            // `HINT` at all until the `||` table was measured whole, which is the only way a
+            // missing explanation on a refusal that was otherwise right gets noticed.
+            SqlError::AmbiguousConcat { .. } => {
+                Some("Could not choose a best candidate operator.".to_owned())
+            }
             SqlError::ForwardCteReference(name) => Some(format!(
                 "There is a WITH item named \"{name}\", but it cannot be referenced from this \
                  part of the query."
@@ -3835,6 +3843,7 @@ impl SqlError {
             // The same sentence for all four, which is what a real server sends: an operator or
             // a function that will not resolve is a cast away from one that would.
             SqlError::AmbiguousFunction { .. }
+            | SqlError::AmbiguousConcat { .. }
             | SqlError::UndefinedOperator { .. }
             | SqlError::UndefinedAggregate { .. }
             | SqlError::UndefinedFunctionTypes(_) => {
