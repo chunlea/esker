@@ -64,6 +64,24 @@ thread_local! {
     static POINTS: Cell<u64> = const { Cell::new(0) };
     /// Range scans, counted apart from the point reads for the reason the module note gives.
     static RANGES: Cell<u64> = const { Cell::new(0) };
+    /// **What each of them read**, in order, when `ESKER_STMT_STATS_TRACE` is set.
+    ///
+    /// A count cannot answer `debts-v1.1.md` #49's question. A statement that reads the version
+    /// key thirty-five times and one that reads thirty-five different relations are the same
+    /// number and different problems — one is a cache, the other is a batch — and the fix for
+    /// each is a different fix. This is the list that tells them apart.
+    static TRACE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether each read gets a line of its own, read once from the environment.
+///
+/// **A second switch and not the same one**, because the two are read by different people: the
+/// counters are what a suite is read by and are cheap enough to leave on for one, and this
+/// allocates a string per read and prints a paragraph per statement. It is a hunt's instrument.
+#[must_use]
+pub fn tracing_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| enabled() && std::env::var_os("ESKER_STMT_STATS_TRACE").is_some())
 }
 
 /// Statements finished, and what they did between them.
@@ -92,19 +110,74 @@ static MICROS: AtomicU64 = AtomicU64::new(0);
 static WORST_MICROS: AtomicU64 = AtomicU64::new(0);
 
 /// Records one point read at the store boundary.
-pub(crate) fn record_point() {
+pub(crate) fn record_point(key: &[u8]) {
     if !enabled() {
         return;
     }
     POINTS.with(|points| points.set(points.get().saturating_add(1)));
+    if tracing_reads() {
+        trace(format!(
+            "get  {}{}",
+            crate::catalog::record::describe_key(key),
+            caller()
+        ));
+    }
 }
 
 /// Records one range scan at the store boundary.
-pub(crate) fn record_range() {
+pub(crate) fn record_range(start: &[u8], end: &[u8]) {
     if !enabled() {
         return;
     }
     RANGES.with(|ranges| ranges.set(ranges.get().saturating_add(1)));
+    if tracing_reads() {
+        trace(format!(
+            "scan {}{}",
+            crate::catalog::record::describe_range(start, end),
+            caller()
+        ));
+    }
+}
+
+/// Whether each traced read also names the **call site** that made it, read once.
+///
+/// A third switch, and the most expensive: it captures a backtrace per read. The trace says *what*
+/// was read and this says *who asked*, which is the question `debts-v1.1.md` #49's plan is a list
+/// of call sites for — a read that is not attributed cannot be checked off against it.
+#[must_use]
+pub fn tracing_callers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| tracing_reads() && std::env::var_os("ESKER_STMT_STATS_CALLERS").is_some())
+}
+
+/// The innermost frame that is neither this module nor the backend plumbing under it.
+///
+/// **Parsed from `Backtrace`'s `Display`, which is not a stable format** — acceptable because this
+/// is a diagnostic behind two switches and a wrong line here costs a confusing label, never a
+/// wrong answer. `force_capture` rather than `capture`, so it does not depend on `RUST_BACKTRACE`
+/// being set as well as the switch.
+fn caller() -> String {
+    if !tracing_callers() {
+        return String::new();
+    }
+    let text = std::backtrace::Backtrace::force_capture().to_string();
+    let frame = text.lines().find_map(|line| {
+        let frame = line.trim().split_once(": ")?.1.trim();
+        (frame.contains("esker_sql::")
+            && !frame.contains("stmt_stats")
+            && !frame.contains("esker_sql::backend::"))
+        .then(|| frame.trim_start_matches('<').to_owned())
+    });
+    frame.map_or_else(String::new, |frame| format!("   <- {frame}"))
+}
+
+/// Appends one line to this statement's trace.
+fn trace(line: String) {
+    TRACE.with(|reads| {
+        if let Ok(mut reads) = reads.try_borrow_mut() {
+            reads.push(line);
+        }
+    });
 }
 
 /// Starts one statement's accounting, and reports it when the guard drops.
@@ -118,6 +191,13 @@ pub(crate) fn begin(source: &str) -> Guard {
     }
     POINTS.with(|points| points.set(0));
     RANGES.with(|ranges| ranges.set(0));
+    if tracing_reads() {
+        TRACE.with(|reads| {
+            if let Ok(mut reads) = reads.try_borrow_mut() {
+                reads.clear();
+            }
+        });
+    }
     esker_client::stmt_stats::reset();
     start_reporting();
     Guard {
@@ -154,6 +234,19 @@ impl Drop for Guard {
         WAITED_MICROS.fetch_add(waited, Ordering::Relaxed);
         MICROS.fetch_add(micros, Ordering::Relaxed);
         WORST_MICROS.fetch_max(micros, Ordering::Relaxed);
+        if tracing_reads() {
+            let reads = TRACE.with(|reads| {
+                reads
+                    .try_borrow()
+                    .map(|reads| reads.join("\n    "))
+                    .unwrap_or_default()
+            });
+            tracing::info!(
+                target: "esker::stmt::stats",
+                "{source}\n  {points} point reads, {ranges} range scans, {trips} round trips, \
+                 {regions} regions, {micros} us\n    {reads}"
+            );
+        }
         if micros >= per_statement_ms().saturating_mul(1_000) {
             tracing::info!(
                 target: "esker::stmt::stats",
@@ -186,6 +279,39 @@ fn start_reporting() {
                 tracing::info!(target: "esker::stmt::stats", "{}", summary());
             }
         });
+}
+
+/// Empties this thread's trace, so a caller can tell "read nothing" from "was never asked".
+///
+/// A statement that does not reach the per-statement guard — transaction control goes a different
+/// way — would otherwise leave the previous statement's list in place and a census would read it
+/// as its own.
+///
+/// **Not a link to `begin`**, which is `pub(crate)`: a `pub` item's doc that links a private one is
+/// `cargo doc`'s `-D warnings` on the workspace, and it is invisible to `cargo clippy --all-targets`
+/// — which is how this reached a gate (`intra-doc links resolve where they are written`).
+pub fn clear_trace() {
+    TRACE.with(|reads| {
+        if let Ok(mut reads) = reads.try_borrow_mut() {
+            reads.clear();
+        }
+    });
+}
+
+/// **What the statement this thread just ran read**, in order — empty unless
+/// `ESKER_STMT_STATS_TRACE` is set.
+///
+/// Read after the statement rather than out of the log, because a measurement harness wants the
+/// list and not a subscriber: the guard leaves it in place until the next statement begins, and
+/// the executor runs an in-process statement on the caller's thread.
+#[must_use]
+pub fn last_trace() -> Vec<String> {
+    TRACE.with(|reads| {
+        reads
+            .try_borrow()
+            .map(|reads| reads.clone())
+            .unwrap_or_default()
+    })
 }
 
 /// The counters, for a measurement that wants a difference rather than a line.
@@ -312,7 +438,7 @@ mod tests {
         let before = counts();
         {
             let _guard = begin("SELECT 1");
-            record_point();
+            record_point(b"m");
         }
         assert_eq!(counts(), before);
         assert!(

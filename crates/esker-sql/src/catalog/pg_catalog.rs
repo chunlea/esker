@@ -2963,7 +2963,9 @@ fn information_schema_domain_types() -> &'static std::collections::BTreeMap<u64,
 /// Public because `psql` does exactly this and the parity corpora record its answer: `\gdesc` of
 /// `information_schema.columns.is_nullable` prints `character varying(3)`, not
 /// `information_schema.yes_or_no`, while the `RowDescription` behind it carries 13369 — measured
-/// on 19beta1 through `pg_prepared_statements.result_types`, which reads the wire and says
+/// on 19beta1 through `pg_prepared_statements.result_types`, which is the **plan's** type and
+/// **not the wire's** — the `RowDescription` carries a domain column's *base* type, measured
+/// (ADR 0103) — and says
 /// `{information_schema.sql_identifier, information_schema.yes_or_no,
 /// information_schema.cardinal_number}`. Two renderings of one oid, and a corpus holds the
 /// client's, so `tests/parity_harness` needs the same table to compare against it.

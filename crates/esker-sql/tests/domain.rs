@@ -159,73 +159,90 @@ fn a_domains_array_is_a_base_type_that_points_back_at_it() {
     );
 }
 
-/// **A bare `information_schema` column declares its domain on every protocol path** —
-/// `debts-v1.1.md` #37, family three, and [ADR 0103](../../../docs/adr/0103-a-domain-is-a-type-a-client-can-be-sent.md)'s shape A.
+/// **A domain column declares its BASE type on the wire, with the domain's typmod** — and this
+/// test says the opposite of what it said when `37745bc7` wrote it, because that was wrong.
 ///
-/// The oids and the widths are 19beta1's own, measured
-/// (`tests/captures/pg19_domain_type.txt`): `sql_identifier` is 13361 over `name`, so `typlen` is
-/// 64; `yes_or_no` is 13369 over `character varying(3)`, so `typlen` is -1 and the **width is the
-/// type's** — `pg_type.typtypmod` is 7 and `atttypmod` is -1 on every one of the 122
-/// `information_schema` columns.
+/// Measured on 19beta1 through `PG::Result#ftype`, which reads the `RowDescription` bytes:
 ///
-/// **`Describe` is asked as well as the simple path**, for the reason
-/// `enum_extended_protocol.rs` exists: a corpus replays the simple protocol, so a declared type
-/// that is right there and wrong under `Describe` survives every corpus in this crate. That was a
-/// live bug for three runs once (ADR 0050).
+/// ```text
+/// SELECT table_name, is_nullable, ordinal_position FROM information_schema.columns
+///   table_name        ftype 19   (name)      fmod -1
+///   is_nullable       ftype 1043 (varchar)   fmod 7     <- the DOMAIN's typmod, on the BASE type
+///   ordinal_position  ftype 23   (int4)      fmod -1
+/// SELECT d FROM wt   -- d is a user domain over integer
+///   d                 ftype 23   (int4)      fmod -1
+/// ```
+///
+/// **The mistake was reading a server-side view as the wire.** ADR 0103's third family was built
+/// on `pg_prepared_statements.result_types`, which for the first query says
+/// `{information_schema.sql_identifier}` — and that is the **plan's** type. PostgreSQL's
+/// `printtup.c` replaces it on the way out: *"If column is a domain, send the base type and typmod
+/// instead"*. Two answers, one of them the bytes, and only the bytes are the wire.
+///
+/// **`is_nullable`'s `fmod 7` is the half a base-type-only fix would still get wrong**, and it is
+/// why the domain's typmod moved off the column list in the first place: `atttypmod` is -1 on
+/// every `information_schema` column and the width lives on `pg_type.typtypmod`. The wire wants it
+/// back — on the base type.
+///
+/// **The `pg_type` rows stay.** `ActiveRecord` loads its type map with `typtype IN ('r','e','d')`
+/// and a real server has those rows too; what it must never see is an oid on the wire that its
+/// decoder was not registered for. Sending the base is what makes both true.
+///
+/// **`Describe` is asked as well as the simple path**, for the reason `enum_extended_protocol.rs`
+/// exists.
+/// One column as the wire declares it: `(oid, type_size, type_modifier)`.
+type Declared = (u32, i16, i32);
+
 #[test]
-fn an_information_schema_column_declares_its_domain() {
+fn a_domain_column_declares_its_base_type_on_the_wire() {
     use esker_sql::parse::parse_statements;
     use esker_sql::pgwire::session::Execute;
 
-    let mut node = parity::Node::new(&["CREATE TABLE t (a int)"]);
-    let statement = "SELECT table_name, is_nullable, ordinal_position \
-                     FROM information_schema.columns WHERE table_name = 't'";
-
-    let esker_sql::pgwire::session::Outcome::Rows { fields, rows, .. } =
-        node.run(statement).expect("the view answers")
-    else {
-        panic!("no rows");
-    };
-    let declared: Vec<(u32, i16, i32)> = fields
-        .iter()
-        .map(|field| (field.type_oid, field.type_size, field.type_modifier))
-        .collect();
-    assert_eq!(
-        declared,
-        vec![(13_361, 64, -1), (13_369, -1, -1), (13_356, 4, -1)],
-        "the simple protocol"
-    );
-    // **And the values are what they always were.** A domain adds a constraint, not a
-    // representation, so nothing about the row moves — which is the whole reason this change is
-    // safe to make and the reason no corpus could ever have caught it missing.
-    assert_eq!(
-        rows[0]
-            .iter()
-            .map(|value| value
-                .as_deref()
-                .map(|bytes| String::from_utf8_lossy(bytes).into_owned()))
-            .collect::<Vec<_>>(),
-        vec![
-            Some("t".to_owned()),
-            Some("YES".to_owned()),
-            Some("1".to_owned())
-        ]
-    );
-
-    let parsed = parse_statements(statement).expect("it parses");
-    let described = node
-        .executor
-        .describe(&parsed[0], &[])
-        .expect("it describes");
-    let fields = described.fields.expect("a SELECT returns rows");
-    assert_eq!(
-        fields
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE t (a int)",
+        "CREATE DOMAIN wt_dom AS integer",
+        "CREATE TABLE wt (d wt_dom, t text)",
+        "INSERT INTO wt VALUES (1, 'x')",
+    ]);
+    // Per statement, what 19beta1 puts on the wire for each of its columns.
+    let cases: &[(&str, &[Declared])] = &[
+        (
+            "SELECT table_name, is_nullable, ordinal_position FROM information_schema.columns \
+             WHERE table_name = 't'",
+            &[(19, 64, -1), (1043, -1, 7), (23, 4, -1)],
+        ),
+        ("SELECT d, t FROM wt", &[(23, 4, -1), (25, -1, -1)]),
+    ];
+    for (statement, expected) in cases {
+        let esker_sql::pgwire::session::Outcome::Rows { fields, .. } =
+            node.run(statement).expect("it answers")
+        else {
+            panic!("no rows: {statement}");
+        };
+        let declared: Vec<Declared> = fields
             .iter()
             .map(|field| (field.type_oid, field.type_size, field.type_modifier))
-            .collect::<Vec<_>>(),
-        vec![(13_361, 64, -1), (13_369, -1, -1), (13_356, 4, -1)],
-        "the extended protocol"
-    );
+            .collect();
+        assert_eq!(&declared, expected, "simple protocol: {statement}");
+
+        let parsed = parse_statements(statement).expect("it parses");
+        let described = node
+            .executor
+            .describe(&parsed[0], &[])
+            .expect("it describes");
+        let fields = described.fields.expect("a SELECT returns rows");
+        assert_eq!(
+            &fields
+                .iter()
+                .map(|field| (field.type_oid, field.type_size, field.type_modifier))
+                .collect::<Vec<Declared>>(),
+            expected,
+            "extended protocol: {statement}"
+        );
+    }
+    // **And the values are untouched**, which is what makes this a declared type and not an
+    // answer: a domain adds a constraint, not a representation.
+    assert_eq!(node.rows("SELECT d, t FROM wt"), vec![vec!["1", "x"]]);
 }
 
 /// **Every column of every `information_schema` view is a domain**, which is the ratchet under

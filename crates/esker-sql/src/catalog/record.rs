@@ -702,6 +702,122 @@ fn type_of(tag: u8) -> Result<ColumnType> {
 /// collide with one; it is a reserved value and not a tenant that exists.
 pub(crate) const CLUSTER_TENANT: u64 = u64::MAX;
 
+/// **What a key *is*, in one short phrase** — for the instrument that lists what a statement read.
+///
+/// `debts-v1.1.md` #49 asks which catalog reads a statement makes, and a count cannot answer it: a
+/// statement that reads the version key 35 times and one that reads 35 different relations are the
+/// same number and different problems. So `crate::stmt_stats`'s trace prints this beside each
+/// read.
+///
+/// **Here and not in the instrument**, because this is the inverse of the builders above it and a
+/// reader that took a key apart itself would be a second place to update when the layout moves —
+/// the rule `esker_keys::prefix::row_key_table` already keeps for a row key
+/// (`CLAUDE.md` invariant 7). Best effort by contract: an unrecognised key answers its bytes
+/// rather than failing, because this is a diagnostic and a panic in one would be worse than a
+/// vague line.
+///
+/// **The tenant is read only for a lower-case kind**, which is the convention `KIND_DATABASE`'s
+/// own comment states: *"a lower-case kind is written under a tenant, an upper-case one is not"*.
+#[must_use]
+pub(crate) fn describe_key(key: &[u8]) -> String {
+    if let Some((tenant, table)) = prefix::row_key_table(key) {
+        return format!("row(t{tenant},#{table})");
+    }
+    let Some(rest) = key
+        .strip_prefix(&[prefix::META])
+        .and_then(|rest| rest.strip_prefix(SQL))
+    else {
+        // Not a catalog key at all: a raw or transaction key, or a SQL index entry.
+        return match key.first() {
+            Some(&prefix::SQL) => "sql-index".to_owned(),
+            Some(&byte) => format!("{}?", byte as char),
+            None => "<empty>".to_owned(),
+        };
+    };
+    let Some((&kind, tail)) = rest.split_first() else {
+        return "catalog?".to_owned();
+    };
+    let name = kind_name(kind);
+    // Lower-case kinds carry a tenant; upper-case ones are cluster-wide and the tail is a name.
+    if !kind.is_ascii_lowercase() {
+        return match std::str::from_utf8(tail) {
+            Ok(text) if !text.is_empty() => format!("{name}(\"{text}\")"),
+            _ => name.to_owned(),
+        };
+    }
+    let Ok((tenant, tail)) = codec::decode_u64(tail) else {
+        return name.to_owned();
+    };
+    if tail.is_empty() {
+        return format!("{name}(t{tenant})");
+    }
+    // What follows a tenant is either an id or a name, and which is a property of the kind. Trying
+    // the id first and falling back to text is deliberate: an id is fixed-width and a name is not,
+    // so a name that happens to be eight bytes long prints as a number — visible in the trace as
+    // an absurd id rather than silently wrong, and no reader of this needs it to be exact.
+    match std::str::from_utf8(tail) {
+        Ok(text) if !text.is_empty() && text.chars().all(|c| !c.is_control()) => {
+            format!("{name}(t{tenant},\"{text}\")")
+        }
+        _ => match codec::decode_u64(tail) {
+            Ok((id, rest)) => match codec::decode_u64(rest) {
+                Ok((second, _)) => format!("{name}(t{tenant},#{id},#{second})"),
+                Err(_) if rest.is_empty() => format!("{name}(t{tenant},#{id})"),
+                Err(_) => format!("{name}(t{tenant},#{id},…)"),
+            },
+            Err(_) => format!("{name}(t{tenant},…)"),
+        },
+    }
+}
+
+/// The word a kind byte stands for. Not derived: the bytes are the layout and this is their index.
+fn kind_name(kind: u8) -> &'static str {
+    match kind {
+        KIND_VERSION => "version",
+        KIND_LAYOUT => "layout",
+        KIND_NEXT_ID => "next-id",
+        KIND_TABLE => "table",
+        KIND_NAME => "name",
+        KIND_INDEX => "index",
+        KIND_PRIMARY_KEY => "primary-key",
+        KIND_RETENTION_DEFAULT => "retention-default",
+        KIND_RETENTION => "retention",
+        KIND_ROW_ID => "row-id",
+        KIND_CHECKPOINT => "checkpoint",
+        KIND_JOB => "job",
+        KIND_FLASHBACK => "flashback",
+        KIND_SEQUENCE => "sequence",
+        KIND_SEQUENCE_VALUE => "sequence-value",
+        KIND_FK_BACKREF => "fk-backref",
+        KIND_EXTENSION => "extension",
+        KIND_FUNCTION => "function",
+        KIND_TYPE => "type",
+        KIND_SCHEMA => "schema",
+        KIND_VIEW => "view",
+        KIND_DATABASE => "database",
+        KIND_ROLE => "role",
+        KIND_NEXT_ROLE => "next-role",
+        KIND_NEXT_DATABASE => "next-database",
+        _ => "unknown-kind",
+    }
+}
+
+/// The same for a **range**, which is what a scan reads.
+///
+/// A scan of one kind's whole space is the shape that matters — `name`, `type`, `schema` and
+/// `view` are all read that way — so a range whose two ends describe to the same phrase prints it
+/// once with a `*`, and only a range that spans kinds prints both ends.
+#[must_use]
+pub(crate) fn describe_range(start: &[u8], end: &[u8]) -> String {
+    let (from, to) = (describe_key(start), describe_key(end));
+    if from == to {
+        return format!("{from}*");
+    }
+    // A prefix scan's end is the start with its last byte bumped, so the two descriptions differ
+    // only in the id or the name; naming the start and marking it open is what a reader wants.
+    format!("{from}..{to}")
+}
+
 /// `'m' ++ "sql" ++ 'v' ++ tenant`. One counter **per tenant**, read once per transaction.
 ///
 /// # Why the tenant is in the key

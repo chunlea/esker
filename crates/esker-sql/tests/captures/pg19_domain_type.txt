@@ -109,3 +109,24 @@
 #
 # is the census; `format_type` prints `information_schema.sql_identifier`, so the catalog's own
 # printer names the domain where `\gdesc` names the base.
+#
+# ## CORRECTION, 2026-09-10: `result_types` is the PLAN, and the wire sends the BASE
+#
+# The section above quotes `pg_prepared_statements.result_types` as "the wire". It is not. Measured
+# through `PG::Result#ftype`, which reads the `RowDescription` bytes:
+#
+#   SELECT table_name, is_nullable, ordinal_position FROM information_schema.columns
+#     table_name        ftype 19   (name)      fmod -1
+#     is_nullable       ftype 1043 (varchar)   fmod 7     <- the DOMAIN's typmod on the BASE type
+#     ordinal_position  ftype 23   (int4)      fmod -1
+#   SELECT d FROM wt   -- d is a user CREATE DOMAIN wt_dom AS integer
+#     d                 ftype 23   (int4)      fmod -1    -- simple AND extended protocol
+#
+#   for the same query:  result_types = {information_schema.sql_identifier}   (the plan)
+#                        \gdesc      = name                                  (the client)
+#                        the wire    = 19                                    (the bytes)
+#
+# PostgreSQL's `printtup.c`, `SendRowDescriptionCols_Internal`: *"If column is a domain, send the
+# base type and typmod instead"*. So a type has three answers and only one of them is the wire.
+# The `pg_type` domain rows above are unaffected and stay: a real server has them too, and
+# `ActiveRecord` needs them to know the domain exists at all.
