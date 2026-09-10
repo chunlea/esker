@@ -1,0 +1,486 @@
+BEGIN		-
+CREATE TABLE castprobe (c_bit bit(3), c_bool boolean, c_box box, c_bpchar character(4), c_bytea bytea, c_char "char", c_cidr cidr, c_circle circle, c_date date, c_float4 real, c_float8 double precision, c_inet inet, c_interval interval, c_json json, c_jsonb jsonb, c_lseg lseg, c_money money, c_name name, c_numeric numeric, c_oid oid, c_path path, c_point point, c_polygon polygon, c_regclass regclass, c_regproc regproc, c_regtype regtype, c_text text, c_time time, c_timestamp timestamp, c_timestamptz timestamptz, c_uuid uuid, c_varbit bit varying(8), c_varchar varchar(8), c_xml xml)		-
+INSERT INTO castprobe VALUES (B'101', true, '((0,0),(1,1))', 'ab', '\x4142', 'a', '10.0.0.0/8', '<(0,0),1>', '2020-01-02', 1.5, 1.5, '10.0.0.1', '1 day', '{"a":1}', '{"a":1}', '[(0,0),(1,1)]', '12.34', 'nm', 12.34, 16384, '((0,0),(1,1))', '(1,2)', '((0,0),(1,1),(2,0))', 'pg_class', 'int4in', 'integer', '42', '01:02:03', '2020-01-02 03:04:05', '2020-01-02 03:04:05+00', '00000000-0000-0000-0000-000000000001', B'1010', '42', '<a/>')		-
+SAVEPOINT sp_bit_bit		-
+SELECT (c_bit)::bit FROM castprobe		1
+ROLLBACK TO sp_bit_bit		-
+SAVEPOINT sp_bit_varbit		-
+SELECT (c_bit)::varbit FROM castprobe		101
+ROLLBACK TO sp_bit_varbit		-
+SAVEPOINT sp_bool_bpchar		-
+SELECT (c_bool)::bpchar FROM castprobe		true
+ROLLBACK TO sp_bool_bpchar		-
+SAVEPOINT sp_bool_text		-
+SELECT (c_bool)::text FROM castprobe		true
+ROLLBACK TO sp_bool_text		-
+SAVEPOINT sp_bool_varchar		-
+SELECT (c_bool)::varchar FROM castprobe		true
+ROLLBACK TO sp_bool_varchar		-
+SAVEPOINT sp_box_circle		-
+SELECT (c_box)::circle FROM castprobe		<(0.5,0.5),0.7071067811865476>
+ROLLBACK TO sp_box_circle		-
+SAVEPOINT sp_box_lseg		-
+SELECT (c_box)::lseg FROM castprobe		[(1,1),(0,0)]
+ROLLBACK TO sp_box_lseg		-
+SAVEPOINT sp_box_point		-
+SELECT (c_box)::point FROM castprobe		(0.5,0.5)
+ROLLBACK TO sp_box_point		-
+SAVEPOINT sp_box_polygon		-
+SELECT (c_box)::polygon FROM castprobe		((0,0),(0,1),(1,1),(1,0))
+ROLLBACK TO sp_box_polygon		-
+SAVEPOINT sp_bpchar_bpchar		-
+SELECT (c_bpchar)::bpchar FROM castprobe		ab  
+ROLLBACK TO sp_bpchar_bpchar		-
+SAVEPOINT sp_bpchar_char		-
+SELECT (c_bpchar)::char FROM castprobe		a
+ROLLBACK TO sp_bpchar_char		-
+SAVEPOINT sp_bpchar_name		-
+SELECT (c_bpchar)::name FROM castprobe		ab
+ROLLBACK TO sp_bpchar_name		-
+SAVEPOINT sp_bpchar_text		-
+SELECT (c_bpchar)::text FROM castprobe		ab
+ROLLBACK TO sp_bpchar_text		-
+SAVEPOINT sp_bpchar_varchar		-
+SELECT (c_bpchar)::varchar FROM castprobe		ab
+ROLLBACK TO sp_bpchar_varchar		-
+SAVEPOINT sp_bpchar_xml		-
+SELECT (c_bpchar)::xml FROM castprobe		ab  
+ROLLBACK TO sp_bpchar_xml		-
+SAVEPOINT sp_bytea_uuid		-
+SELECT (c_bytea)::uuid FROM castprobe		!invalid input length for type uuid\nDETAIL:  Expected 16 bytes, got 2.
+ROLLBACK TO sp_bytea_uuid		-
+SAVEPOINT sp_char_bpchar		-
+SELECT (c_char)::bpchar FROM castprobe		a
+ROLLBACK TO sp_char_bpchar		-
+SAVEPOINT sp_char_text		-
+SELECT (c_char)::text FROM castprobe		a
+ROLLBACK TO sp_char_text		-
+SAVEPOINT sp_char_varchar		-
+SELECT (c_char)::varchar FROM castprobe		a
+ROLLBACK TO sp_char_varchar		-
+SAVEPOINT sp_cidr_bpchar		-
+SELECT (c_cidr)::bpchar FROM castprobe		10.0.0.0/8
+ROLLBACK TO sp_cidr_bpchar		-
+SAVEPOINT sp_cidr_inet		-
+SELECT (c_cidr)::inet FROM castprobe		10.0.0.0/8
+ROLLBACK TO sp_cidr_inet		-
+SAVEPOINT sp_cidr_text		-
+SELECT (c_cidr)::text FROM castprobe		10.0.0.0/8
+ROLLBACK TO sp_cidr_text		-
+SAVEPOINT sp_cidr_varchar		-
+SELECT (c_cidr)::varchar FROM castprobe		10.0.0.0/8
+ROLLBACK TO sp_cidr_varchar		-
+SAVEPOINT sp_circle_box		-
+SELECT (c_circle)::box FROM castprobe		(0.7071067811865475,0.7071067811865475),(-0.7071067811865475,-0.7071067811865475)
+ROLLBACK TO sp_circle_box		-
+SAVEPOINT sp_circle_point		-
+SELECT (c_circle)::point FROM castprobe		(0,0)
+ROLLBACK TO sp_circle_point		-
+SAVEPOINT sp_circle_polygon		-
+SELECT (c_circle)::polygon FROM castprobe		((-1,0),(-0.8660254037844387,0.49999999999999994),(-0.5000000000000001,0.8660254037844386),(-6.123233995736766e-17,1),(0.4999999999999998,0.8660254037844387),(0.8660254037844385,0.5000000000000003),(1,1.2246467991473532e-16),(0.8660254037844388,-0.4999999999999997),(0.5000000000000004,-0.8660254037844384),(1.8369701987210297e-16,-1),(-0.49999999999999933,-0.866025403784439),(-0.8660254037844384,-0.5000000000000004))
+ROLLBACK TO sp_circle_polygon		-
+SAVEPOINT sp_date_timestamp		-
+SELECT (c_date)::timestamp FROM castprobe		2020-01-02 00:00:00
+ROLLBACK TO sp_date_timestamp		-
+SAVEPOINT sp_date_timestamptz		-
+SELECT (c_date)::timestamptz FROM castprobe		2020-01-02 00:00:00+00
+ROLLBACK TO sp_date_timestamptz		-
+SAVEPOINT sp_float4_float8		-
+SELECT (c_float4)::float8 FROM castprobe		1.5
+ROLLBACK TO sp_float4_float8		-
+SAVEPOINT sp_float4_numeric		-
+SELECT (c_float4)::numeric FROM castprobe		1.5
+ROLLBACK TO sp_float4_numeric		-
+SAVEPOINT sp_float8_float4		-
+SELECT (c_float8)::float4 FROM castprobe		1.5
+ROLLBACK TO sp_float8_float4		-
+SAVEPOINT sp_float8_numeric		-
+SELECT (c_float8)::numeric FROM castprobe		1.5
+ROLLBACK TO sp_float8_numeric		-
+SAVEPOINT sp_inet_bpchar		-
+SELECT (c_inet)::bpchar FROM castprobe		10.0.0.1/32
+ROLLBACK TO sp_inet_bpchar		-
+SAVEPOINT sp_inet_cidr		-
+SELECT (c_inet)::cidr FROM castprobe		10.0.0.1/32
+ROLLBACK TO sp_inet_cidr		-
+SAVEPOINT sp_inet_text		-
+SELECT (c_inet)::text FROM castprobe		10.0.0.1/32
+ROLLBACK TO sp_inet_text		-
+SAVEPOINT sp_inet_varchar		-
+SELECT (c_inet)::varchar FROM castprobe		10.0.0.1/32
+ROLLBACK TO sp_inet_varchar		-
+SAVEPOINT sp_interval_interval		-
+SELECT (c_interval)::interval FROM castprobe		1 day
+ROLLBACK TO sp_interval_interval		-
+SAVEPOINT sp_interval_time		-
+SELECT (c_interval)::time FROM castprobe		00:00:00
+ROLLBACK TO sp_interval_time		-
+SAVEPOINT sp_json_jsonb		-
+SELECT (c_json)::jsonb FROM castprobe		{"a": 1}
+ROLLBACK TO sp_json_jsonb		-
+SAVEPOINT sp_jsonb_bool		-
+SELECT (c_jsonb)::bool FROM castprobe	!cannot cast jsonb object to type boolean
+ROLLBACK TO sp_jsonb_bool		-
+SAVEPOINT sp_jsonb_float4		-
+SELECT (c_jsonb)::float4 FROM castprobe	!cannot cast jsonb object to type real
+ROLLBACK TO sp_jsonb_float4		-
+SAVEPOINT sp_jsonb_float8		-
+SELECT (c_jsonb)::float8 FROM castprobe	!cannot cast jsonb object to type double precision
+ROLLBACK TO sp_jsonb_float8		-
+SAVEPOINT sp_jsonb_json		-
+SELECT (c_jsonb)::json FROM castprobe		{"a": 1}
+ROLLBACK TO sp_jsonb_json		-
+SAVEPOINT sp_jsonb_numeric		-
+SELECT (c_jsonb)::numeric FROM castprobe	!cannot cast jsonb object to type numeric
+ROLLBACK TO sp_jsonb_numeric		-
+SAVEPOINT sp_lseg_point		-
+SELECT (c_lseg)::point FROM castprobe		(0.5,0.5)
+ROLLBACK TO sp_lseg_point		-
+SAVEPOINT sp_money_numeric		-
+SELECT (c_money)::numeric FROM castprobe		12.34
+ROLLBACK TO sp_money_numeric		-
+SAVEPOINT sp_name_bpchar		-
+SELECT (c_name)::bpchar FROM castprobe		nm
+ROLLBACK TO sp_name_bpchar		-
+SAVEPOINT sp_name_text		-
+SELECT (c_name)::text FROM castprobe		nm
+ROLLBACK TO sp_name_text		-
+SAVEPOINT sp_name_varchar		-
+SELECT (c_name)::varchar FROM castprobe		nm
+ROLLBACK TO sp_name_varchar		-
+SAVEPOINT sp_numeric_float4		-
+SELECT (c_numeric)::float4 FROM castprobe		12.34
+ROLLBACK TO sp_numeric_float4		-
+SAVEPOINT sp_numeric_float8		-
+SELECT (c_numeric)::float8 FROM castprobe		12.34
+ROLLBACK TO sp_numeric_float8		-
+SAVEPOINT sp_numeric_money		-
+SELECT (c_numeric)::money FROM castprobe		$12.34
+ROLLBACK TO sp_numeric_money		-
+SAVEPOINT sp_numeric_numeric		-
+SELECT (c_numeric)::numeric FROM castprobe		12.34
+ROLLBACK TO sp_numeric_numeric		-
+SAVEPOINT sp_oid_regclass		-
+SELECT (c_oid)::regclass FROM castprobe		16384
+ROLLBACK TO sp_oid_regclass		-
+SAVEPOINT sp_oid_regproc		-
+SELECT (c_oid)::regproc FROM castprobe		16384
+ROLLBACK TO sp_oid_regproc		-
+SAVEPOINT sp_oid_regtype		-
+SELECT (c_oid)::regtype FROM castprobe		16384
+ROLLBACK TO sp_oid_regtype		-
+SAVEPOINT sp_path_polygon		-
+SELECT (c_path)::polygon FROM castprobe		((0,0),(1,1))
+ROLLBACK TO sp_path_polygon		-
+SAVEPOINT sp_point_box		-
+SELECT (c_point)::box FROM castprobe		(1,2),(1,2)
+ROLLBACK TO sp_point_box		-
+SAVEPOINT sp_polygon_box		-
+SELECT (c_polygon)::box FROM castprobe		(2,1),(0,0)
+ROLLBACK TO sp_polygon_box		-
+SAVEPOINT sp_polygon_circle		-
+SELECT (c_polygon)::circle FROM castprobe		<(1,0.3333333333333333),0.9249505911485288>
+ROLLBACK TO sp_polygon_circle		-
+SAVEPOINT sp_polygon_path		-
+SELECT (c_polygon)::path FROM castprobe		((0,0),(1,1),(2,0))
+ROLLBACK TO sp_polygon_path		-
+SAVEPOINT sp_polygon_point		-
+SELECT (c_polygon)::point FROM castprobe		(1,0.3333333333333333)
+ROLLBACK TO sp_polygon_point		-
+SAVEPOINT sp_regclass_oid		-
+SELECT (c_regclass)::oid FROM castprobe		1259
+ROLLBACK TO sp_regclass_oid		-
+SAVEPOINT sp_regproc_oid		-
+SELECT (c_regproc)::oid FROM castprobe		42
+ROLLBACK TO sp_regproc_oid		-
+SAVEPOINT sp_regtype_oid		-
+SELECT (c_regtype)::oid FROM castprobe		23
+ROLLBACK TO sp_regtype_oid		-
+SAVEPOINT sp_text_bpchar		-
+SELECT (c_text)::bpchar FROM castprobe		42
+ROLLBACK TO sp_text_bpchar		-
+SAVEPOINT sp_text_char		-
+SELECT (c_text)::char FROM castprobe		4
+ROLLBACK TO sp_text_char		-
+SAVEPOINT sp_text_name		-
+SELECT (c_text)::name FROM castprobe		42
+ROLLBACK TO sp_text_name		-
+SAVEPOINT sp_text_regclass		-
+SELECT (c_text)::regclass FROM castprobe	!relation "42" does not exist
+ROLLBACK TO sp_text_regclass		-
+SAVEPOINT sp_text_varchar		-
+SELECT (c_text)::varchar FROM castprobe		42
+ROLLBACK TO sp_text_varchar		-
+SAVEPOINT sp_text_xml		-
+SELECT (c_text)::xml FROM castprobe		42
+ROLLBACK TO sp_text_xml		-
+SAVEPOINT sp_time_interval		-
+SELECT (c_time)::interval FROM castprobe		01:02:03
+ROLLBACK TO sp_time_interval		-
+SAVEPOINT sp_time_time		-
+SELECT (c_time)::time FROM castprobe		01:02:03
+ROLLBACK TO sp_time_time		-
+SAVEPOINT sp_timestamp_date		-
+SELECT (c_timestamp)::date FROM castprobe		2020-01-02
+ROLLBACK TO sp_timestamp_date		-
+SAVEPOINT sp_timestamp_time		-
+SELECT (c_timestamp)::time FROM castprobe		03:04:05
+ROLLBACK TO sp_timestamp_time		-
+SAVEPOINT sp_timestamp_timestamp		-
+SELECT (c_timestamp)::timestamp FROM castprobe		2020-01-02 03:04:05
+ROLLBACK TO sp_timestamp_timestamp		-
+SAVEPOINT sp_timestamp_timestamptz		-
+SELECT (c_timestamp)::timestamptz FROM castprobe		2020-01-02 03:04:05+00
+ROLLBACK TO sp_timestamp_timestamptz		-
+SAVEPOINT sp_timestamptz_date		-
+SELECT (c_timestamptz)::date FROM castprobe		2020-01-02
+ROLLBACK TO sp_timestamptz_date		-
+SAVEPOINT sp_timestamptz_time		-
+SELECT (c_timestamptz)::time FROM castprobe		03:04:05
+ROLLBACK TO sp_timestamptz_time		-
+SAVEPOINT sp_timestamptz_timestamp		-
+SELECT (c_timestamptz)::timestamp FROM castprobe		2020-01-02 03:04:05
+ROLLBACK TO sp_timestamptz_timestamp		-
+SAVEPOINT sp_timestamptz_timestamptz		-
+SELECT (c_timestamptz)::timestamptz FROM castprobe		2020-01-02 03:04:05+00
+ROLLBACK TO sp_timestamptz_timestamptz		-
+SAVEPOINT sp_uuid_bytea		-
+SELECT (c_uuid)::bytea FROM castprobe		\\x00000000000000000000000000000001
+ROLLBACK TO sp_uuid_bytea		-
+SAVEPOINT sp_varbit_bit		-
+SELECT (c_varbit)::bit FROM castprobe		1
+ROLLBACK TO sp_varbit_bit		-
+SAVEPOINT sp_varbit_varbit		-
+SELECT (c_varbit)::varbit FROM castprobe		1010
+ROLLBACK TO sp_varbit_varbit		-
+SAVEPOINT sp_varchar_bpchar		-
+SELECT (c_varchar)::bpchar FROM castprobe		42
+ROLLBACK TO sp_varchar_bpchar		-
+SAVEPOINT sp_varchar_char		-
+SELECT (c_varchar)::char FROM castprobe		4
+ROLLBACK TO sp_varchar_char		-
+SAVEPOINT sp_varchar_name		-
+SELECT (c_varchar)::name FROM castprobe		42
+ROLLBACK TO sp_varchar_name		-
+SAVEPOINT sp_varchar_regclass		-
+SELECT (c_varchar)::regclass FROM castprobe	!relation "42" does not exist
+ROLLBACK TO sp_varchar_regclass		-
+SAVEPOINT sp_varchar_text		-
+SELECT (c_varchar)::text FROM castprobe		42
+ROLLBACK TO sp_varchar_text		-
+SAVEPOINT sp_varchar_varchar		-
+SELECT (c_varchar)::varchar FROM castprobe		42
+ROLLBACK TO sp_varchar_varchar		-
+SAVEPOINT sp_varchar_xml		-
+SELECT (c_varchar)::xml FROM castprobe		42
+ROLLBACK TO sp_varchar_xml		-
+SAVEPOINT sp_xml_bpchar		-
+SELECT (c_xml)::bpchar FROM castprobe		<a/>
+ROLLBACK TO sp_xml_bpchar		-
+SAVEPOINT sp_xml_text		-
+SELECT (c_xml)::text FROM castprobe		<a/>
+ROLLBACK TO sp_xml_text		-
+SAVEPOINT sp_xml_varchar		-
+SELECT (c_xml)::varchar FROM castprobe		<a/>
+ROLLBACK TO sp_xml_varchar		-
+CREATE TABLE castprobe2 (c_int2 int2, c_int4 int4, c_int8 int8)		-
+INSERT INTO castprobe2 VALUES (65, 65, 65)		-
+SAVEPOINT sp2_bool_int4		-
+SELECT (c_bool)::int4 FROM castprobe		1
+ROLLBACK TO sp2_bool_int4		-
+SAVEPOINT sp2_bytea_int8		-
+SELECT (c_bytea)::int8 FROM castprobe		16706
+ROLLBACK TO sp2_bytea_int8		-
+SAVEPOINT sp2_bytea_int2		-
+SELECT (c_bytea)::int2 FROM castprobe		16706
+ROLLBACK TO sp2_bytea_int2		-
+SAVEPOINT sp2_bytea_int4		-
+SELECT (c_bytea)::int4 FROM castprobe		16706
+ROLLBACK TO sp2_bytea_int4		-
+SAVEPOINT sp2_char_int4		-
+SELECT (c_char)::int4 FROM castprobe		97
+ROLLBACK TO sp2_char_int4		-
+SAVEPOINT sp2_int8_bytea		-
+SELECT (c_int8)::bytea FROM castprobe2		\x0000000000000041
+ROLLBACK TO sp2_int8_bytea		-
+SAVEPOINT sp2_int8_int2		-
+SELECT (c_int8)::int2 FROM castprobe2		65
+ROLLBACK TO sp2_int8_int2		-
+SAVEPOINT sp2_int8_int4		-
+SELECT (c_int8)::int4 FROM castprobe2		65
+ROLLBACK TO sp2_int8_int4		-
+SAVEPOINT sp2_int8_regproc		-
+SELECT (c_int8)::regproc FROM castprobe2		int4eq
+ROLLBACK TO sp2_int8_regproc		-
+SAVEPOINT sp2_int8_oid		-
+SELECT (c_int8)::oid FROM castprobe2		65
+ROLLBACK TO sp2_int8_oid		-
+SAVEPOINT sp2_int8_float4		-
+SELECT (c_int8)::float4 FROM castprobe2		65
+ROLLBACK TO sp2_int8_float4		-
+SAVEPOINT sp2_int8_float8		-
+SELECT (c_int8)::float8 FROM castprobe2		65
+ROLLBACK TO sp2_int8_float8		-
+SAVEPOINT sp2_int8_money		-
+SELECT (c_int8)::money FROM castprobe2		$65.00
+ROLLBACK TO sp2_int8_money		-
+SAVEPOINT sp2_int8_bit		-
+SELECT (c_int8)::bit FROM castprobe2		1
+ROLLBACK TO sp2_int8_bit		-
+SAVEPOINT sp2_int8_numeric		-
+SELECT (c_int8)::numeric FROM castprobe2		65
+ROLLBACK TO sp2_int8_numeric		-
+SAVEPOINT sp2_int8_regclass		-
+SELECT (c_int8)::regclass FROM castprobe2		65
+ROLLBACK TO sp2_int8_regclass		-
+SAVEPOINT sp2_int8_regtype		-
+SELECT (c_int8)::regtype FROM castprobe2		65
+ROLLBACK TO sp2_int8_regtype		-
+SAVEPOINT sp2_int2_bytea		-
+SELECT (c_int2)::bytea FROM castprobe2		\x0041
+ROLLBACK TO sp2_int2_bytea		-
+SAVEPOINT sp2_int2_int8		-
+SELECT (c_int2)::int8 FROM castprobe2		65
+ROLLBACK TO sp2_int2_int8		-
+SAVEPOINT sp2_int2_int4		-
+SELECT (c_int2)::int4 FROM castprobe2		65
+ROLLBACK TO sp2_int2_int4		-
+SAVEPOINT sp2_int2_regproc		-
+SELECT (c_int2)::regproc FROM castprobe2		int4eq
+ROLLBACK TO sp2_int2_regproc		-
+SAVEPOINT sp2_int2_oid		-
+SELECT (c_int2)::oid FROM castprobe2		65
+ROLLBACK TO sp2_int2_oid		-
+SAVEPOINT sp2_int2_float4		-
+SELECT (c_int2)::float4 FROM castprobe2		65
+ROLLBACK TO sp2_int2_float4		-
+SAVEPOINT sp2_int2_float8		-
+SELECT (c_int2)::float8 FROM castprobe2		65
+ROLLBACK TO sp2_int2_float8		-
+SAVEPOINT sp2_int2_numeric		-
+SELECT (c_int2)::numeric FROM castprobe2		65
+ROLLBACK TO sp2_int2_numeric		-
+SAVEPOINT sp2_int2_regclass		-
+SELECT (c_int2)::regclass FROM castprobe2		65
+ROLLBACK TO sp2_int2_regclass		-
+SAVEPOINT sp2_int2_regtype		-
+SELECT (c_int2)::regtype FROM castprobe2		65
+ROLLBACK TO sp2_int2_regtype		-
+SAVEPOINT sp2_int4_bool		-
+SELECT (c_int4)::bool FROM castprobe2		t
+ROLLBACK TO sp2_int4_bool		-
+SAVEPOINT sp2_int4_bytea		-
+SELECT (c_int4)::bytea FROM castprobe2		\x00000041
+ROLLBACK TO sp2_int4_bytea		-
+SAVEPOINT sp2_int4_char		-
+SELECT (c_int4)::"char" FROM castprobe2		A
+ROLLBACK TO sp2_int4_char		-
+SAVEPOINT sp2_int4_int8		-
+SELECT (c_int4)::int8 FROM castprobe2		65
+ROLLBACK TO sp2_int4_int8		-
+SAVEPOINT sp2_int4_int2		-
+SELECT (c_int4)::int2 FROM castprobe2		65
+ROLLBACK TO sp2_int4_int2		-
+SAVEPOINT sp2_int4_regproc		-
+SELECT (c_int4)::regproc FROM castprobe2		int4eq
+ROLLBACK TO sp2_int4_regproc		-
+SAVEPOINT sp2_int4_oid		-
+SELECT (c_int4)::oid FROM castprobe2		65
+ROLLBACK TO sp2_int4_oid		-
+SAVEPOINT sp2_int4_float4		-
+SELECT (c_int4)::float4 FROM castprobe2		65
+ROLLBACK TO sp2_int4_float4		-
+SAVEPOINT sp2_int4_float8		-
+SELECT (c_int4)::float8 FROM castprobe2		65
+ROLLBACK TO sp2_int4_float8		-
+SAVEPOINT sp2_int4_money		-
+SELECT (c_int4)::money FROM castprobe2		$65.00
+ROLLBACK TO sp2_int4_money		-
+SAVEPOINT sp2_int4_bit		-
+SELECT (c_int4)::bit FROM castprobe2		1
+ROLLBACK TO sp2_int4_bit		-
+SAVEPOINT sp2_int4_numeric		-
+SELECT (c_int4)::numeric FROM castprobe2		65
+ROLLBACK TO sp2_int4_numeric		-
+SAVEPOINT sp2_int4_regclass		-
+SELECT (c_int4)::regclass FROM castprobe2		65
+ROLLBACK TO sp2_int4_regclass		-
+SAVEPOINT sp2_int4_regtype		-
+SELECT (c_int4)::regtype FROM castprobe2		65
+ROLLBACK TO sp2_int4_regtype		-
+SAVEPOINT sp2_regproc_int8		-
+SELECT (c_regproc)::int8 FROM castprobe		42
+ROLLBACK TO sp2_regproc_int8		-
+SAVEPOINT sp2_regproc_int4		-
+SELECT (c_regproc)::int4 FROM castprobe		42
+ROLLBACK TO sp2_regproc_int4		-
+SAVEPOINT sp2_text_char		-
+SELECT (c_text)::"char" FROM castprobe		4
+ROLLBACK TO sp2_text_char		-
+SAVEPOINT sp2_oid_int8		-
+SELECT (c_oid)::int8 FROM castprobe		16384
+ROLLBACK TO sp2_oid_int8		-
+SAVEPOINT sp2_oid_int4		-
+SELECT (c_oid)::int4 FROM castprobe		16384
+ROLLBACK TO sp2_oid_int4		-
+SAVEPOINT sp2_float4_int8		-
+SELECT (c_float4)::int8 FROM castprobe		2
+ROLLBACK TO sp2_float4_int8		-
+SAVEPOINT sp2_float4_int2		-
+SELECT (c_float4)::int2 FROM castprobe		2
+ROLLBACK TO sp2_float4_int2		-
+SAVEPOINT sp2_float4_int4		-
+SELECT (c_float4)::int4 FROM castprobe		2
+ROLLBACK TO sp2_float4_int4		-
+SAVEPOINT sp2_float8_int8		-
+SELECT (c_float8)::int8 FROM castprobe		2
+ROLLBACK TO sp2_float8_int8		-
+SAVEPOINT sp2_float8_int2		-
+SELECT (c_float8)::int2 FROM castprobe		2
+ROLLBACK TO sp2_float8_int2		-
+SAVEPOINT sp2_float8_int4		-
+SELECT (c_float8)::int4 FROM castprobe		2
+ROLLBACK TO sp2_float8_int4		-
+SAVEPOINT sp2_bpchar_char		-
+SELECT (c_bpchar)::"char" FROM castprobe		a
+ROLLBACK TO sp2_bpchar_char		-
+SAVEPOINT sp2_varchar_char		-
+SELECT (c_varchar)::"char" FROM castprobe		4
+ROLLBACK TO sp2_varchar_char		-
+SAVEPOINT sp2_bit_int8		-
+SELECT (c_bit)::int8 FROM castprobe		5
+ROLLBACK TO sp2_bit_int8		-
+SAVEPOINT sp2_bit_int4		-
+SELECT (c_bit)::int4 FROM castprobe		5
+ROLLBACK TO sp2_bit_int4		-
+SAVEPOINT sp2_numeric_int8		-
+SELECT (c_numeric)::int8 FROM castprobe		12
+ROLLBACK TO sp2_numeric_int8		-
+SAVEPOINT sp2_numeric_int2		-
+SELECT (c_numeric)::int2 FROM castprobe		12
+ROLLBACK TO sp2_numeric_int2		-
+SAVEPOINT sp2_numeric_int4		-
+SELECT (c_numeric)::int4 FROM castprobe		12
+ROLLBACK TO sp2_numeric_int4		-
+SAVEPOINT sp2_regclass_int8		-
+SELECT (c_regclass)::int8 FROM castprobe		1259
+ROLLBACK TO sp2_regclass_int8		-
+SAVEPOINT sp2_regclass_int4		-
+SELECT (c_regclass)::int4 FROM castprobe		1259
+ROLLBACK TO sp2_regclass_int4		-
+SAVEPOINT sp2_regtype_int8		-
+SELECT (c_regtype)::int8 FROM castprobe		23
+ROLLBACK TO sp2_regtype_int8		-
+SAVEPOINT sp2_regtype_int4		-
+SELECT (c_regtype)::int4 FROM castprobe		23
+ROLLBACK TO sp2_regtype_int4		-
+SAVEPOINT sp2_jsonb_int8		-
+SELECT (c_jsonb)::int8 FROM castprobe	!22023 cannot cast jsonb object to type bigint
+ROLLBACK TO sp2_jsonb_int8		-
+SAVEPOINT sp2_jsonb_int2		-
+SELECT (c_jsonb)::int2 FROM castprobe	!22023 cannot cast jsonb object to type smallint
+ROLLBACK TO sp2_jsonb_int2		-
+SAVEPOINT sp2_jsonb_int4		-
+SELECT (c_jsonb)::int4 FROM castprobe	!22023 cannot cast jsonb object to type integer
+ROLLBACK TO sp2_jsonb_int4		-
+ROLLBACK		-

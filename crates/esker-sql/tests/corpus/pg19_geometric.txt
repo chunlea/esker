@@ -20,6 +20,14 @@
 #   its own sentence.
 # * `poly_in`, not `polygon_in` — the input function is named for the C type, as `money`'s is
 #   `cash_in`.
+# * **Fourteen conversions between the shapes, and PostgreSQL computes every one** — a `box` to
+#   a `circle` is the circumscribed one, a `circle` to a `box` the inscribed one, a `polygon` to
+#   a `point` the mean of its vertices. `point` is one end of five of them and is not one of the
+#   six. The lines below take each of the six sources through a **literal**, which is the fold's
+#   path; `cast_matrix.rs` takes the same fourteen through a *column*, which is the evaluator's.
+# * **Two of the fourteen can refuse, in two different classes**: an open `path` has no polygon
+#   to become (`22023`, an invalid parameter) and a `circle` of radius zero has no twelve
+#   vertices (`0A000`, a feature a real server says it does not have). Measured, both.
 BEGIN		-
 SELECT 'r', typname, oid, typarray, typlen, typcategory, typinput FROM pg_type WHERE typname IN ('lseg','box','path','polygon','circle','line') ORDER BY typname	text,name,oid,oid,smallint,"char",regproc	r|box|603|1020|32|G|box_in ; r|circle|718|719|24|G|circle_in ; r|line|628|629|24|G|line_in ; r|lseg|601|1018|32|G|lseg_in ; r|path|602|1019|-1|G|path_in ; r|polygon|604|1027|-1|G|poly_in
 # **A `box` separates array elements with a semicolon**, alone among the 78 — its own text
@@ -57,13 +65,27 @@ SELECT 'r', '(0,0),(1,3)'::line, '(1,3),(0,0)'::line	text,line,line	r|{3,-1,0}|{
 SELECT 'r', '(0,-0),(1,-0)'::line	text,line	r|{0,-1,-0}
 SELECT 'r', '(1e10,1),(2e10,3)'::line	text,line	r|{2e-10,-1,-1}
 SELECT 'r', '[(2,3),(4,6)]'::line = '(2,3),(4,6)'::line	text,boolean	r|t
+SAVEPOINT sl1		-
 SELECT 'r', '(2,3),(2,3)'::line	!22P02 invalid line specification: must be two distinct points
+ROLLBACK TO SAVEPOINT sl1		-
+SAVEPOINT sl2		-
 SELECT 'r', '{1,2}'::line	!22P02 invalid input syntax for type line: "{1,2}"
+ROLLBACK TO SAVEPOINT sl2		-
+SAVEPOINT sl3		-
 SELECT 'r', '{1,2,3,4}'::line	!22P02 invalid input syntax for type line: "{1,2,3,4}"
+ROLLBACK TO SAVEPOINT sl3		-
+SAVEPOINT sl4		-
 SELECT 'r', '(2,3)'::line	!22P02 invalid input syntax for type line: "(2,3)"
+ROLLBACK TO SAVEPOINT sl4		-
+SAVEPOINT sl5		-
 SELECT 'r', '[(2,3)]'::line	!22P02 invalid input syntax for type line: "[(2,3)]"
+ROLLBACK TO SAVEPOINT sl5		-
+SAVEPOINT sl6		-
 SELECT 'r', 'nonsense'::line	!22P02 invalid input syntax for type line: "nonsense"
+ROLLBACK TO SAVEPOINT sl6		-
+SAVEPOINT sl7		-
 SELECT 'r', ''::line	!22P02 invalid input syntax for type line: ""
+ROLLBACK TO SAVEPOINT sl7		-
 INSERT INTO l (id, a_line) VALUES (2, '(2,3),(4,6)'), (3, '(0,0),(0,1)')		-
 SELECT 'r', id, a_line FROM l ORDER BY id		r|1|{2,3,5.5} ; r|2|{1.5,-1,0} ; r|3|{-1,0,0}
 DELETE FROM l WHERE id > 1		-
@@ -90,6 +112,16 @@ SAVEPOINT s7		-
 SELECT 'r', '{0,0,0}'::line	!22P02 invalid line specification: A and B cannot both be zero
 ROLLBACK TO SAVEPOINT s7		-
 SELECT 'r', '(2,3),(5.5,7)'::lseg::text, '2,3,5.5,7'::box::text	text,text,text	r|[(2,3),(5.5,7)]|(5.5,7),(2,3)
+SAVEPOINT s8		-
+SELECT 'r', '[(0,0),(1,1)]'::path::polygon	!22023 open path cannot be converted to polygon
+ROLLBACK TO SAVEPOINT s8		-
+SAVEPOINT s9		-
+SELECT 'r', '<(0,0),0>'::circle::polygon	!0A000 cannot convert circle with radius zero to polygon
+ROLLBACK TO SAVEPOINT s9		-
+SELECT 'r', '((0,0),(1,1))'::box::circle, '((0,0),(1,1))'::box::lseg, '((0,0),(1,1))'::box::point, '((0,0),(1,1))'::box::polygon	text,circle,lseg,point,polygon	r|<(0.5,0.5),0.7071067811865476>|[(1,1),(0,0)]|(0.5,0.5)|((0,0),(0,1),(1,1),(1,0))
+SELECT 'r', '<(0,0),1>'::circle::box, '<(0,0),1>'::circle::point, '<(0,0),1>'::circle::polygon	text,box,point,polygon	r|(0.7071067811865475,0.7071067811865475),(-0.7071067811865475,-0.7071067811865475)|(0,0)|((-1,0),(-0.8660254037844387,0.49999999999999994),(-0.5000000000000001,0.8660254037844386),(-6.123233995736766e-17,1),(0.4999999999999998,0.8660254037844387),(0.8660254037844385,0.5000000000000003),(1,1.2246467991473532e-16),(0.8660254037844388,-0.4999999999999997),(0.5000000000000004,-0.8660254037844384),(1.8369701987210297e-16,-1),(-0.49999999999999933,-0.866025403784439),(-0.8660254037844384,-0.5000000000000004))
+SELECT 'r', '[(0,0),(1,1)]'::lseg::point, '((0,0),(1,1))'::path::polygon, '(1,2)'::point::box	text,point,polygon,box	r|(0.5,0.5)|((0,0),(1,1))|(1,2),(1,2)
+SELECT 'r', '((0,0),(1,1),(2,0))'::polygon::box, '((0,0),(1,1),(2,0))'::polygon::circle, '((0,0),(1,1),(2,0))'::polygon::path, '((0,0),(1,1),(2,0))'::polygon::point	text,box,circle,path,point	r|(2,1),(0,0)|<(1,0.3333333333333333),0.9249505911485288>|((0,0),(1,1),(2,0))|(1,0.3333333333333333)
 DROP TABLE l		-
 DROP TABLE g		-
 ROLLBACK		-
