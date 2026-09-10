@@ -3647,28 +3647,11 @@ fn start_peer(
     pool: Arc<DriverPool>,
     columnar: Option<Arc<ColumnarSlot>>,
 ) -> Result<crate::peer::Reservation> {
-    let voters: Vec<u64> = region
-        .peers
-        .iter()
-        .filter(|peer| peer.role == PeerRole::Voter)
-        .map(|peer| peer.peer_id)
-        .collect();
-    // **The learners come too.** Dropping them was the last of phase-4 acceptance's stalls: a peer
-    // started from a record that already lists learners — a split child inheriting its parent's,
-    // a store reopening, a region adopted from a snapshot — built a core configuration of voters
-    // only. The region record then said "peer 21 is a learner" while the Raft core had never heard
-    // of peer 21, so the leader had no `Progress` for it, sent it nothing, and never promoted it:
-    // a learner at `applied = 0` for the life of the cluster (`docs/plans/phase-4.md` §20).
-    let learners: Vec<u64> = region
-        .peers
-        .iter()
-        // **Both kinds.** `esker-raft` has one notion of learner and ADR 0022 leaves it that way:
-        // a columnar replica is a raft learner whose *apply* differs, so the core must know about
-        // it or the leader keeps no `Progress` for it, sends it nothing, and it sits at
-        // `applied = 0` for the life of the cluster — which is phase-4 §20's bug, exactly.
-        .filter(|peer| matches!(peer.role, PeerRole::Learner | PeerRole::ColumnarLearner))
-        .map(|peer| peer.peer_id)
-        .collect();
+    // The one reader of the region record's membership, so the core's configuration and the
+    // peer's `applied_conf` cannot answer the same question differently
+    // ([`crate::region::membership`] carries why the learners come too).
+    let conf = crate::region::membership(region);
+    let (voters, learners) = (conf.voters, conf.learners);
     let peer_id = region
         .peers
         .iter()

@@ -193,6 +193,49 @@ impl RegionMeta {
     }
 }
 
+/// The membership a region record names, in the core's vocabulary.
+///
+/// **This is the record that answers "the membership as of the apply index."** A conf change
+/// writes the region record in the very batch that carries the apply index it applied at
+/// (`crate::peer`'s `stage_conf_change`), so the two move together or neither does. Everything
+/// that has to know the applied membership at open reads it from here — the core's bootstrap
+/// configuration and the peer's `applied_conf` both — so the two cannot answer one question
+/// differently.
+///
+/// **The learners come too, and both kinds of them.** Dropping them was the last of phase-4
+/// acceptance's stalls: a peer started from a record that already lists learners — a split child
+/// inheriting its parent's, a store reopening, a region adopted from a snapshot — built a
+/// configuration of voters only, so the region record said "peer 21 is a learner" while the Raft
+/// core had never heard of peer 21, the leader kept no `Progress` for it, sent it nothing, and
+/// never promoted it: a learner at `applied = 0` for the life of the cluster
+/// (`docs/plans/phase-4.md` §20). `esker-raft` has one notion of learner and
+/// [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) leaves it that way,
+/// so a columnar replica — a raft learner whose *apply* differs — is one of them here.
+#[must_use]
+pub fn membership(region: &Region) -> esker_raft::ConfState {
+    let mut conf = esker_raft::ConfState {
+        voters: region
+            .peers
+            .iter()
+            .filter(|peer| peer.role == esker_proto::PeerRole::Voter)
+            .map(|peer| peer.peer_id)
+            .collect(),
+        learners: region
+            .peers
+            .iter()
+            .filter(|peer| {
+                matches!(
+                    peer.role,
+                    esker_proto::PeerRole::Learner | esker_proto::PeerRole::ColumnarLearner
+                )
+            })
+            .map(|peer| peer.peer_id)
+            .collect(),
+    };
+    conf.normalize();
+    conf
+}
+
 /// The key range one `TxnKv` request touches, so a stale epoch can be answered with the regions
 /// that now cover it rather than with the one that was asked for.
 ///
