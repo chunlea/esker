@@ -34,6 +34,7 @@ use esker_proto::{
 };
 
 use crate::apply::Command;
+use crate::census;
 use crate::columnar::ColumnarOptions;
 use crate::columnar::region::ColumnarSlot;
 use crate::driver::DriverPool;
@@ -123,6 +124,12 @@ pub struct StoreOptions {
     /// the region has changed, since a change beats immediately. Configurable because a test that
     /// waited sixty seconds for a membership change would not be run.
     pub region_heartbeat: std::time::Duration,
+    /// How often each region's peer says what it believes, or `None` for never.
+    ///
+    /// **Off unless asked for**, and it is a diagnostic rather than a part of how the store
+    /// works: nothing reads what it emits, and turning it on changes nothing but the log. See
+    /// [`crate::census`] for what one round costs and why it is a cadence and never an event.
+    pub region_census: Option<std::time::Duration>,
     /// When a region is split, and how finely the boundary is chosen.
     ///
     /// Splitting needs cluster-unique ids, so it needs a placement driver: a store with
@@ -215,6 +222,7 @@ impl StoreOptions {
             heartbeat_tick: std::time::Duration::from_millis(esker_raft::TICK_MS),
             store_heartbeat: std::time::Duration::from_millis(crate::STORE_HEARTBEAT_MS),
             region_heartbeat: std::time::Duration::from_millis(crate::REGION_HEARTBEAT_MS),
+            region_census: None,
             split: SplitOptions::new(),
             engine: Options {
                 create_if_missing: true,
@@ -561,6 +569,7 @@ impl Store {
             heartbeat_tick,
             store_heartbeat,
             region_heartbeat,
+            region_census,
             split,
         } = options;
         // The collector is built before the engine, because the engine has to be opened *with*
@@ -661,6 +670,12 @@ impl Store {
                 region_heartbeat,
             );
             store.spawn_split_checker(pd, heartbeat_tick);
+        }
+        // **After the peers and independent of the placement driver.** The census reports what
+        // this store's own peers believe, which is worth having on a store that has no driver at
+        // all — and is worth having most on one whose driver it can no longer reach.
+        if let Some(every) = region_census {
+            store.spawn_region_census(every);
         }
         Ok(store)
     }
@@ -1212,6 +1227,139 @@ impl Store {
     /// placement driver that had gone away would hold it for the whole timeout, every ten
     /// seconds, on every store. The schedule travels into the closure and back out, because it
     /// is the state that must survive the round.
+    /// Starts the region census, on the runtime this store was opened on.
+    ///
+    /// One `info` event per region per period ([`crate::census`]). Nothing reads it and nothing
+    /// depends on it: it exists so that a run which stops serving can be diagnosed from the
+    /// stores' own beliefs rather than from a client's refusals.
+    ///
+    /// A weak reference, like every other schedule here, so a dropped store ends the task rather
+    /// than being kept alive by the thing that reports it.
+    fn spawn_region_census(self: &Arc<Self>, every: std::time::Duration) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let task = runtime.spawn(async move {
+            let mut interval = tokio::time::interval(every);
+            // Skip and not burst: a round that ran long because a driver would not answer must
+            // not be followed by a catch-up flurry of rounds asking the same wedged driver.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(store) = weak.upgrade() else {
+                    return;
+                };
+                for census in store.take_region_census(every).await {
+                    census.emit();
+                }
+            }
+        });
+        if let Ok(mut tickers) = self.tickers.lock() {
+            tickers.push(task);
+        }
+    }
+
+    /// One census round: every region this store hosts, as its peer for it believes it to be.
+    ///
+    /// `budget` bounds the whole round, and [`census::ANSWER_WITHIN`] bounds each region's share
+    /// of it. Regions the budget did not reach are still reported — with `unanswered` saying so —
+    /// because a census that skipped them would read as a store that had stopped hosting them.
+    async fn take_region_census(&self, budget: std::time::Duration) -> Vec<census::RegionCensus> {
+        let started = std::time::Instant::now();
+        let mut taken = Vec::new();
+        for state in self.regions.states() {
+            let region = state.region();
+            let record_peers = region.peers.iter().map(|peer| peer.peer_id).collect();
+            let Some(peer) = state.peer() else {
+                // An unreplicated region has no core to ask and no election to have. It is still
+                // reported, because "this store hosts a region with no consensus" is a fact a
+                // reader of this log would otherwise have to infer from an absence.
+                taken.push(census::RegionCensus {
+                    region_id: region.id,
+                    epoch: region.epoch,
+                    handle_peer: 0,
+                    answered_by: None,
+                    term: 0,
+                    role: None,
+                    is_leader: true,
+                    believes_leader: None,
+                    voted_for: None,
+                    applied: 0,
+                    commit: None,
+                    last_index: None,
+                    core_voters: Vec::new(),
+                    core_learners: Vec::new(),
+                    record_peers,
+                    elections: None,
+                    unanswered: Some("this region is not replicated".to_owned()),
+                });
+                continue;
+            };
+            // The published half first, and without waiting on anything: these are what the
+            // request path itself reads, so they are the store's answer even when its driver
+            // cannot give one.
+            let mut census = census::RegionCensus {
+                region_id: region.id,
+                epoch: region.epoch,
+                handle_peer: peer.peer_id(),
+                answered_by: None,
+                term: peer.term(),
+                role: None,
+                is_leader: peer.is_leader(),
+                believes_leader: peer.leader(),
+                voted_for: None,
+                applied: peer.applied_index(),
+                commit: None,
+                last_index: None,
+                core_voters: Vec::new(),
+                core_learners: Vec::new(),
+                record_peers,
+                elections: None,
+                unanswered: None,
+            };
+            let Some(left) = census::left_of(budget, started) else {
+                census.unanswered = Some("the census round ran out of time".to_owned());
+                taken.push(census);
+                continue;
+            };
+            let within = left.min(census::ANSWER_WITHIN);
+            match tokio::time::timeout(within, peer.status()).await {
+                Ok(Ok(status)) => {
+                    census.answered_by = Some(status.id);
+                    census.role = Some(format!("{:?}", status.role));
+                    census.voted_for = status.voted_for;
+                    census.commit = Some(status.commit);
+                    census.last_index = Some(status.last_index);
+                    census.core_voters.clone_from(&status.conf.voters);
+                    census.core_learners.clone_from(&status.conf.learners);
+                }
+                Ok(Err(error)) => census.unanswered = Some(format!("the peer answered: {error}")),
+                Err(_) => {
+                    census.unanswered =
+                        Some(format!("the driver did not answer within {within:?}"));
+                }
+            }
+            if census.unanswered.is_none()
+                && let Some(left) = census::left_of(budget, started)
+            {
+                let within = left.min(census::ANSWER_WITHIN);
+                match tokio::time::timeout(within, peer.counters()).await {
+                    Ok(Ok(counters)) => census.elections = Some(counters),
+                    Ok(Err(error)) => {
+                        census.unanswered = Some(format!("the counters: {error}"));
+                    }
+                    Err(_) => {
+                        census.unanswered =
+                            Some(format!("the counters did not arrive within {within:?}"));
+                    }
+                }
+            }
+            taken.push(census);
+        }
+        taken
+    }
+
     fn spawn_heartbeats(
         self: &Arc<Self>,
         pd: Arc<dyn PdClient>,
