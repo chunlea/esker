@@ -1,0 +1,72 @@
+crates/esker-keys/src/array.rs
+  h_44076b318daf9c 141-210
+crates/esker-keys/src/row.rs
+  h_44076b318daf9c 767-774,1323-1336
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 1464-1493,3171-3174
+crates/esker-sql/src/exec/aggregate.rs
+  h_44076b318daf9c 178,611,619,1587-1593,1614-1650
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 37-42,77-89,100,2097,2099-2129,2366-2380,2732,2908-2931,3750-3766
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 6272
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 663,772,774-795,858-868,2116-2123
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 1470-1474,1480,1484-1498,1804-1811,2293-2294,2298
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 3002-3003,3275,3309-3335,3359,4086,4099,4534-4553,5559
+crates/esker-sql/src/exec/subquery.rs
+  h_44076b318daf9c 1011-1022
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 4428,4718-4719,5955,8857
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 133-141
+crates/esker-sql/src/plan/query.rs
+  h_44076b318daf9c 1379
+crates/esker-sql/src/plan/subquery.rs
+  h_44076b318daf9c 244
+crates/esker-sql/src/sqlstate.rs
+  h_44076b318daf9c 60-74
+crates/esker-sql/tests/array_of_array.rs
+  h_44076b318daf9c 1-175
+crates/esker-sql/tests/array_subquery.rs
+  h_44076b318daf9c 41,44-50
+crates/esker-sql/tests/captures/pg19_array_of_array.txt
+  h_44076b318daf9c 1-86
+crates/esker-sql/tests/captures/pg19_regclass_index.txt
+  h_44076b318daf9c 1-30
+crates/esker-sql/tests/captures/pg19_regclass_literal.txt
+  h_44076b318daf9c 1-35
+crates/esker-sql/tests/captures/pg19_regclass_name_at_runtime.txt
+  h_44076b318daf9c 1-35
+crates/esker-sql/tests/corpus/pg19_array_of_array.txt
+  h_44076b318daf9c 1-51
+crates/esker-sql/tests/corpus/pg19_regclass_literal.txt
+  h_44076b318daf9c 1-31
+crates/esker-sql/tests/regclass_index.rs
+  h_44076b318daf9c 1-87
+crates/esker-sql/tests/regclass_literal.rs
+  h_44076b318daf9c 1-90
+crates/esker-sql/tests/regclass_name_at_runtime.rs
+  h_44076b318daf9c 1-114
+crates/esker-sql/tests/routing_differential.rs
+  h_44076b318daf9c 579,987,1445-1499
+crates/esker-sql/tests/stored_regclass.rs
+  h_44076b318daf9c 140,142-145,147-158
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,117,126-128
+docs/plans/split-region.md
+  h_44076b318daf9c 265-329
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "d40746d3e497f1b53d7f0e578f2885bbbbd5d937",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
