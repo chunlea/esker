@@ -1468,7 +1468,28 @@ pub(super) fn substitute_placeholders(statement: &mut Statement, types: &[Column
         if let Expr::Parameter(number) = expr {
             let at = (*number as usize).saturating_sub(1);
             let ty = types.get(at).copied().unwrap_or(ColumnType::Text);
-            *expr = Expr::Literal(Literal::Typed(Box::new(placeholder(ty))));
+            let stand_in = Expr::Literal(Literal::Typed(Box::new(placeholder(ty))));
+            // **A placeholder carries a representation; a parameter has a *type*.** For most types
+            // those are the same thing and the datum answers for both. For the ones that share
+            // `text`'s storage — `hstore`, `xml`, `void`, the two vectors — the stand-in *is* a
+            // `Datum::Text`, so everything downstream read `text` and `WHERE hstore_col = $1` was
+            // described as `42883 operator does not exist: hstore = text`. That is a `Describe`
+            // answering something `Execute` does not: with a value bound, the parameter is read
+            // *as* the inferred type and the same statement runs. r1's param census found it from
+            // the wire, and it took a `Describe` between the `Parse` and the `Bind` to see —
+            // `ActiveRecord`'s driver sends one and this crate's own tests did not.
+            //
+            // The cast carries the type the representation cannot, and only where they differ, so
+            // no statement that already described correctly gains a node.
+            *expr = if placeholder(ty).column_type() == Some(ty) {
+                stand_in
+            } else {
+                Expr::Cast {
+                    operand: Box::new(stand_in),
+                    to: ty,
+                    typmod: crate::value::NO_TYPMOD,
+                }
+            };
         }
     });
 }

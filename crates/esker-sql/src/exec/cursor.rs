@@ -2442,6 +2442,20 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             {
                 crate::value::assignment_cast(value, *to, crate::value::Rendering::default())?
             }
+            // **The fourteen geometric conversions are computed, not read back through the text.**
+            // A `box` to a `circle` is the circumscribed one and a `polygon` to a `point` the mean
+            // of its vertices; none of that is anywhere in the source's *output*, so the round
+            // trip below either refused — `circle_in` will not read `(1,1),(0,0)` — or, for the
+            // four pairs whose texts happen to be readable by the other's input function, answered
+            // the wrong shape: `'((0,0),(1,1))'::box::polygon` was the two-point polygon
+            // `((1,1),(0,0))` where a real server gives the four corners. Permission is
+            // `pg_cast`'s as everywhere else (`casts_to` carries the fourteen rows); this arm is
+            // only who performs it. `debts-v1.1.md` #43, first mechanism.
+            value @ (Datum::Geometry { .. } | Datum::Point { .. })
+                if crate::value::is_geometric(*to) =>
+            {
+                crate::value::geometric_cast(&value, *to)?
+            }
             value => {
                 // **The session's output function, not the boot one.** A cast between two types
                 // here is a text round trip, so the text it goes through has to be the text the
@@ -3218,6 +3232,11 @@ fn catalog_function(
         args.push(evaluate_in(arg, row, env)?);
     }
     Ok(match call.func {
+        // **Reached only for the types that *have* `~=` on a real server**, since resolution has
+        // already refused the rest with PostgreSQL's own sentence. `point` and `polygon` answer it
+        // there and this node does not implement it, so the refusal is the one it always was — a
+        // gap a client can read, and a row of `pg19_no_equality_types.txt` in the (b) direction.
+        CatalogFunc::SameAs => return Err(SqlError::unsupported("the operator ~=")),
         // **Sleeps in short steps and checks between them.** A single `sleep` for the whole
         // duration would ignore `statement_timeout` and a cancel until it was over, and being
         // interruptible is the entire reason this node has `pg_sleep` — it is how a test makes a
