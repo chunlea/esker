@@ -60,6 +60,18 @@ pub fn to_byte(text: &str) -> u8 {
     text.as_bytes().first().copied().unwrap_or(0)
 }
 
+/// The `int4` a `"char"` casts to: its byte, **signed**.
+///
+/// `'r'::"char"::int4` is 114 and `'\303'::"char"::int4` is **-61**, not 195 — PostgreSQL's
+/// `chartoi4` reads the byte as the signed C type, and one measurement is enough to see it where
+/// reasoning goes the other way. Both callers of this cast use this function: `parse::lower`'s
+/// fold, which knows the literal's declared type, and `exec::cursor`, which has to ask the
+/// *plan* for it because a `"char"` and a `text` are the same `Datum::Text`.
+#[must_use]
+pub fn to_int4(text: &str) -> i32 {
+    i32::from(i8::from_ne_bytes([to_byte(text)]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{of_text, render, to_byte};

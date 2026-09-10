@@ -2147,7 +2147,7 @@ fn pg_depend_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<
 ///
 /// `(castsource, casttarget, castcontext, castmethod)`. `castcontext` is `e` explicit, `a`
 /// assignment, `i` implicit; `castmethod` is `f` a function, `b` binary-coercible, `i` I/O.
-pub const CASTS: [(i64, i64, &str, &str); 137] = [
+pub const CASTS: [(i64, i64, &str, &str); 148] = [
     // **A bit string's eight rows, measured** rather than reasoned:
     //
     //     SELECT castsource::regtype, casttarget::regtype, castcontext, castmethod
@@ -2207,6 +2207,42 @@ pub const CASTS: [(i64, i64, &str, &str); 137] = [
     (19, 25, "i", "f"),
     (19, 1042, "a", "f"),
     (19, 1043, "a", "f"),
+    // **The nine rows an integer, a `regproc`, a `regtype` and a `money` have between them**,
+    // measured as a family rather than one pair at a time:
+    //
+    //     SELECT castsource::regtype, casttarget::regtype, castcontext, castmethod, castfunc
+    //       FROM pg_cast
+    //      WHERE (castsource IN (21,23,20) AND casttarget IN (24,790))
+    //         OR (casttarget IN (21,23,20) AND castsource IN (24,2206));
+    //
+    // Nine and no more, and the gaps are the point: there is **no `int2 -> money`** and **no
+    // `regproc -> int2`**, so `2::int2::money` is `42846` on a real server exactly as it was here
+    // before these rows, and the family is not "an integer converts to a name" but three widths
+    // with three different answers. `int2 -> regproc` is *implicit* and goes by `int4(smallint)`,
+    // which is the only reason a `smallint` reaches a `regproc` at all.
+    //
+    // Without these rows `casts_to` refused all nine — `42846 cannot cast type integer to
+    // regproc` for a statement a real server answers `int4eq` — the same shape the geometric
+    // fourteen had, and the second half of `debts-v1.1.md` #43's first mechanism.
+    //
+    // **`money`'s own two are here for a reason found by adding the rest.** `money -> numeric` and
+    // back are the whole of what `money` converts to besides the strings — there is no
+    // `money -> float8` and no `money -> int8`, which is the asymmetry `parse::lower`'s
+    // `refused_cast` already recorded — and they were *missing* from this table while the fold
+    // converted them anyway. Adding the `casts_to` gate to the fold is what said so: `money`'s
+    // corpus went red on `567.89::numeric::money`, a statement that had worked for months on a
+    // `pg_cast` row this node did not have.
+    (20, 24, "i", "f"),
+    (20, 790, "a", "f"),
+    (790, 1700, "a", "f"),
+    (1700, 790, "a", "f"),
+    (21, 24, "i", "f"),
+    (23, 24, "i", "b"),
+    (23, 790, "a", "f"),
+    (24, 20, "a", "f"),
+    (24, 23, "a", "b"),
+    (2206, 20, "a", "f"),
+    (2206, 23, "a", "b"),
     (20, 17, "e", "f"),
     (20, 21, "a", "f"),
     (20, 23, "a", "f"),

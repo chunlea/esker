@@ -29,10 +29,15 @@ mod parity;
 
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
-    // What is left is not about `"char"` at all: `'r'::"char"::int4` differs only in `int4`'s own
-    // width, which the literal ladder settled (ADR 0087). The `oid` and `regproc` halves of this
-    // sentence closed with their own units (ADR 0097, ADR 0098). Every row agrees.
-    types: &["SELECT 'r'::\"char\"::text, 'r'::\"char\"::int4, 65::int4::\"char\""],
+    // **Empty, and the last entry closed for a reason nobody had written down.** It declared the
+    // declared types of `SELECT 'r'::"char"::text, 'r'::"char"::int4, 65::int4::"char"` and said
+    // the difference was `int4`'s own width, settled by the literal ladder (ADR 0087). It was the
+    // *third* column: a folded `65::int4::"char"` produced a bare `Datum::Text`, which says
+    // `text`, where a real server says `"char"`. ADR 0086's rule with a third type in it — the
+    // value cannot carry the type it was given, so the cast that gave it stays — and it closed
+    // the day `"char"`'s conversions were written (`debts-v1.1.md` #43). The `oid` and `regproc`
+    // halves of the same sentence closed with their own units (ADR 0097, ADR 0098).
+    types: &[],
     answers: &[
         // The oracle's catalog and this node's are different databases, so a count over `pg_class`
         // is each server's own. They are in the corpus because they are how a client *uses* the

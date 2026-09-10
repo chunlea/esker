@@ -33,7 +33,7 @@ use crate::error::{Result, SqlError};
 const MICROS_PER_SECOND: i64 = 1_000_000;
 const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SECOND;
 const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
-const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
+pub(super) const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
 
 /// The three fields, as they are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

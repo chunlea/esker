@@ -837,6 +837,131 @@ pub fn geometric_kind(ty: ColumnType) -> Option<geometric::Kind> {
     })
 }
 
+/// The conversions PostgreSQL performs **by a function or a binary coercion** rather than by
+/// writing the value out and reading it back.
+///
+/// `pg_cast.castmethod` is the fact this is written against. `i` is the I/O conversion — render
+/// the value, hand the text to the target's input function — and that is what `exec::cursor`'s
+/// `Expr::Cast` arm does for every pair; `f` and `b` are the pairs where a real server never sees
+/// the text at all. Asking here **before** rendering is what makes `float8 -> int4` the `2` a real
+/// server rounds to rather than `22P02 invalid input syntax for type integer: "1.5"`.
+///
+/// `None` means this node has no such conversion and the caller should take the text road. That is
+/// the right answer for every pair whose method really is `i` — and the wrong one for a method-`f`
+/// pair not implemented here yet. `tests/cast_matrix.rs` is the list of which,
+/// probed against a **column** so the answer comes from the evaluator; `debts-v1.1.md` #43.
+///
+/// **Wider than [`assignment_cast`], deliberately.** This is what an *explicit* cast may do, and
+/// several of these pairs are explicit-only on a real server: `'\x4142'::bytea::int4` is `16706`
+/// and writing a `bytea` into an `integer` column is still a type error. Where the two agree the
+/// rule lives in `assignment_cast` and this function calls it, so a cast and a write cannot
+/// disagree about what rounding is.
+///
+/// **A `"char"` is missing from the table and cannot be added from here.** `'r'::"char"::int4` is
+/// `114` on a real server, and a `"char"` is a `Datum::Text` exactly as a `text` is — where
+/// `text -> int4` really is an I/O conversion, `42` and all. The evaluator cannot tell the two
+/// apart, so this pair is right in `parse::lower`'s fold, where the literal's declared type is
+/// known, and wrong per row. Fixing it means the `Cast` node carrying the type it casts *from*,
+/// or a `"char"` carrying its own type the way `Datum::Geometry` and `Datum::Bit` carry theirs
+/// (ADR 0050) — a unit of its own, and `cast_matrix.rs` declares the pair meanwhile.
+pub fn convert_without_text(value: &Datum, to: ColumnType) -> Option<Result<Datum>> {
+    let integer =
+        |ty: ColumnType| matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8);
+    match (value, to) {
+        // **A float or a `numeric` into an integer rounds**, and the two round differently —
+        // half to even and half away from zero. Both rules, and the `22003` that goes with them,
+        // are `assignment_cast`'s, because a column write asks the same question.
+        (Datum::Double(_) | Datum::Real(_) | Datum::Numeric(_), _) if integer(to) => {
+            Some(assignment_cast(value.clone(), to, Rendering::default()))
+        }
+        // **A `bool` and an `int4`, both ways.** `pg_cast` has the two rows and no others in the
+        // family: `true::int4` is `1`, `0::int4::bool` is `false` and anything else is `true`.
+        // Through the text this was `int4in` reading `t`.
+        (Datum::Bool(flag), ColumnType::Int4) => Some(Ok(Datum::Int4(i32::from(*flag)))),
+        (Datum::Int4(number), ColumnType::Bool) => Some(Ok(Datum::Bool(*number != 0))),
+        // **A `bytea` and an integer are the same bytes**, big-endian and two's complement, and
+        // the width is the *target's*: `'\xffff'::bytea::int2` is `-1` where `'\xff'::bytea::int2`
+        // is `255`, because the shorter string is padded on the left with zeros and only then read
+        // as signed. A string wider than the target is `22003`, not a truncation. Measured, every
+        // length from nothing to one byte too many.
+        (Datum::Bytea(bytes), _) if integer(to) => {
+            let width = match to {
+                ColumnType::Int2 => 2,
+                ColumnType::Int4 => 4,
+                _ => 8,
+            };
+            if bytes.len() > width {
+                return Some(Err(SqlError::IntegerLiteralOutOfRange(to.name())));
+            }
+            let mut padded = [0_u8; 8];
+            padded[width - bytes.len()..width].copy_from_slice(bytes);
+            Some(Ok(match to {
+                ColumnType::Int2 => Datum::Int2(i16::from_be_bytes([padded[0], padded[1]])),
+                ColumnType::Int4 => Datum::Int4(i32::from_be_bytes([
+                    padded[0], padded[1], padded[2], padded[3],
+                ])),
+                _ => Datum::Int8(i64::from_be_bytes(padded)),
+            }))
+        }
+        // The same fact from the other side, and the width is the *source's*: `65::int2::bytea` is
+        // two bytes and `65::int8::bytea` is eight.
+        (Datum::Int2(number), ColumnType::Bytea) => {
+            Some(Ok(Datum::Bytea(number.to_be_bytes().to_vec())))
+        }
+        (Datum::Int4(number), ColumnType::Bytea) => {
+            Some(Ok(Datum::Bytea(number.to_be_bytes().to_vec())))
+        }
+        (Datum::Int8(number), ColumnType::Bytea) => {
+            Some(Ok(Datum::Bytea(number.to_be_bytes().to_vec())))
+        }
+        // **An `interval` to a `time` keeps the clock and drops the calendar**, then wraps: the
+        // months and days go entirely — `'1 mon'::interval::time` and `'1 day'::interval::time`
+        // are both `00:00:00` — and what is left is taken modulo a day, so `'25:00:00'` is
+        // `01:00:00` and `'-1:00:00'` is `23:00:00`. Measured, six spellings including the
+        // negatives, which are the half a `%` would get wrong. Through the text this was
+        // `time`'s input function reading `1 day`, which is `22007 invalid input syntax` for a
+        // pair a real server converts and calls an *assignment* cast.
+        (Datum::Interval { micros, .. }, ColumnType::Time) => {
+            Some(Ok(Datum::Time(micros.rem_euclid(interval::MICROS_PER_DAY))))
+        }
+        // **`money` to `numeric` is the cents as a decimal, not the printed money read back.**
+        // `money`'s output function writes `$12.34` and `numeric`'s input function refuses the
+        // dollar sign, so the round trip made a conversion a real server performs into a `22P02`
+        // about punctuation. The other direction needs nothing and is not here: `567.89` and
+        // `12345` are both spellings `cash_in` reads, rounding half away from zero as `numeric`
+        // does — `567.895` is `$567.90` and `567.885` is `$567.89`, measured beside each other.
+        // `parse::lower` has had this one arm for a literal since `money` arrived; the evaluator
+        // had nothing, which is the split this table exists to close.
+        (Datum::Money(cents), ColumnType::Numeric) => Some(Datum::from_text(
+            ColumnType::Numeric,
+            &money::to_numeric_text(*cents),
+        )),
+        // **A `reg*` is an oid and an oid is a number** (`pg_cast` 24 -> 23 and 2206 -> 23, method
+        // `b`, a reinterpretation). Through the text this was `regproc`'s *name* handed to
+        // `int4in`: `22P02 invalid input syntax for type integer: "int4in"` for a statement a real
+        // server answers `42`. The evaluator had an arm of its own for this and the fold had
+        // nothing, which is the split this table exists to close.
+        (Datum::RegType { oid, .. } | Datum::RegProc { oid, .. }, _)
+            if integer(to) || to == ColumnType::Oid =>
+        {
+            Some(assignment_cast(Datum::Oid(*oid), to, Rendering::default()))
+        }
+        // **A `uuid` is sixteen bytes and its `bytea` is those bytes**, not the thirty-six
+        // characters it prints as. The first member of this family anyone measured
+        // (`debts-v1.1.md` #44) and the one that named the shape.
+        (Datum::Uuid(bytes), ColumnType::Bytea) => Some(Ok(Datum::Bytea(bytes.to_vec()))),
+        // **An `int4` into a `"char"` is the byte, and only `-128..=127` is a byte.** `65` is `A`;
+        // `200` is `22003 "char" out of range` on a real server, where this node's fold used to
+        // wrap it round with a `rem_euclid` and answer. The message is the short one every
+        // integer overflow here uses, which is what PostgreSQL calls it too.
+        (Datum::Int4(number), ColumnType::Char) => Some(match i8::try_from(*number) {
+            Ok(byte) => Ok(Datum::Text(char_type::render(byte.to_ne_bytes()[0]))),
+            Err(_) => Err(SqlError::IntegerLiteralOutOfRange(ColumnType::Char.name())),
+        }),
+        _ => None,
+    }
+}
+
 /// Whether a cast between two of these types is one of the **fourteen geometric conversions**.
 ///
 /// Says which performer answers, not whether the cast is allowed: permission is `pg_cast`'s and

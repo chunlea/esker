@@ -6319,22 +6319,49 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             && lower_type(data_type).ok().map(|(ty, _)| ty) == Some(ColumnType::Int4)
             && let Some(text) = cast_literal_text(expr)?
         {
+            // **Signed**, which one measurement is enough to see and reasoning is not:
+            // `chr(200)::"char"::int4` is `-61` on 19beta1, not `195`. A `"char"` is one *byte*
+            // and PostgreSQL's `chartoi4` reads it as `int8`, the C type, which is signed.
             return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-                Datum::Int4(i32::from(value::char_type::to_byte(&text))),
+                Datum::Int4(value::char_type::to_int4(&text)),
             ))));
         }
         // The other direction, and it is the same fact: the number **is** the byte, so `65` is `A`
         // and not the first character of `65`.
-        if matches!(
-            source_type(expr)?,
-            Some(ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
-        ) && lower_type(data_type).ok().map(|(ty, _)| ty) == Some(ColumnType::Char)
+        // **`int4` and no other width.** `pg_cast` has one row into a `"char"` from a number and
+        // it is `integer`: `2::int2::"char"` and `2::int8::"char"` are each
+        // `42846 cannot cast type smallint to "char"` on 19beta1, measured, and this arm used to
+        // fold all three — two casts a real server refuses, answered. The gate below is what
+        // refuses them now, and it is `pg_cast`'s own table doing it.
+        if source_type(expr)? == Some(ColumnType::Int4)
+            && lower_type(data_type).ok().map(|(ty, _)| ty) == Some(ColumnType::Char)
             && let Some(text) = cast_literal_text(expr)?
         {
-            let byte = u8::try_from(text.parse::<i64>().unwrap_or(0).rem_euclid(256)).unwrap_or(0);
-            return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
-                Datum::Text(value::char_type::render(byte)),
-            ))));
+            // **And only `-128..=127` is a byte.** `200::int4::"char"` is
+            // `22003 "char" out of range` on a real server, where this arm used to wrap the value
+            // round with a `rem_euclid` and answer — a number outside the type answering as if it
+            // were inside it. The rule and the message are `value::convert_without_text`'s, so the
+            // fold and the per-row cast cannot disagree about where the type ends.
+            let number = text.parse::<i64>().unwrap_or(0);
+            let converted = i32::try_from(number)
+                .ok()
+                .and_then(|number| {
+                    value::convert_without_text(&Datum::Int4(number), ColumnType::Char)
+                })
+                .unwrap_or_else(|| {
+                    Err(SqlError::IntegerLiteralOutOfRange(ColumnType::Char.name()))
+                })?;
+            // **And the node stays**, because a `"char"` is a `Datum::Text` and a `Datum::Text`
+            // says `text`: `pg_typeof(65::int4::"char")` is `"char"` on a real server and was
+            // `text` here, which is ADR 0086's rule with a third type in it — the value cannot
+            // carry the type it was given, so the cast that gave it stays to say so.
+            return Ok(plan::Expr::Cast {
+                operand: Box::new(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                    converted,
+                )))),
+                to: ColumnType::Char,
+                typmod: NO_TYPMOD,
+            });
         }
         // **`money::numeric` is the cents as a decimal, not the printed money read back.** The
         // output function writes `$567.89` and `numeric`'s input function refuses it, so the
@@ -6380,13 +6407,23 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `22P02` for a pair that does not exist at all. Two readers of one fact, and this is the
         // second asking the first.
         //
-        // Asked here only where a bit string is involved, because that family's rows are a
-        // measured census (see `pg_catalog::CASTS`) and the other families' folds are not this
-        // unit's to re-decide.
+        // **Asked for every pair, and it used to be a list.** It began with the bit strings,
+        // gained `"char"` the day `int2 -> "char"` was found folding where a real server says
+        // `42846`, and gained `money`, `regproc` and `regtype` the day after — three families in a
+        // row, each found by a probe rather than by reading, each a pair this node **folded** and
+        // a real server refuses (`int2 -> "char"`, `2::int2::money`, `'int4in'::regproc::int2`).
+        // A list that grows every time somebody measures is the wrong shape.
+        //
+        // `casts_to` is `pg_cast`'s own table, and `exec::query` asks it for every cast over an
+        // *expression*; there is no reason a cast over a **constant** should be licensed by a
+        // different rule, and every time the two rules differed the constant was the wrong one.
+        // Two readers of one fact, reading it the same way (`debts-v1.1.md` #43).
+        //
+        // **`refused_cast` runs first and keeps its own sentences** — the `date`/number pairs, the
+        // `money` asymmetry, a `numeric` NaN — so this widens what is refused and changes nothing
+        // that was already refused. What it adds is the pairs nobody had written a rule for.
         if let Some(from) = source_type(expr)?
             && let Ok((to, _)) = lower_type(data_type)
-            && (matches!(from, ColumnType::Bit | ColumnType::VarBit)
-                || matches!(to, ColumnType::Bit | ColumnType::VarBit))
             && !catalog::pg_catalog::casts_to(from, to)
         {
             return Err(SqlError::CannotCast {
@@ -6447,7 +6484,32 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 // `'abcdef'::varchar(3)` a `22001` where a real server answers `abc`, and it was
                 // invisible from the *other* side of the same seam, where `bit` was wired the
                 // opposite way round (`debts-v1.1.md` #36).
-                let value = value::truncate_to_typmod(Datum::from_text(ty, &text)?, ty, typmod)?;
+                // **A conversion a real server performs without the text is performed here
+                // too.** The line below is the fold's I/O conversion — the literal's characters
+                // read by the *target's* input function — and for a pair whose `pg_cast` method is
+                // `f` or `b` that is the wrong road: `1.5::float8::int4` was
+                // `22P02 invalid input syntax for type integer: "1.5"` for a value a real server
+                // rounds to `2`, and `'\x4142'::bytea::int4` was the same shape. The value this
+                // produces then goes through exactly the same questions as any other — the
+                // `fold_keeps_the_digits` guard below keeps the node when the conversion loses
+                // the digits, which is why `1.5::float8::int4` still *prints* as the cast it was
+                // written as. Same table the evaluator asks (`debts-v1.1.md` #43).
+                //
+                // A `numeric` source is left out on purpose: its road is already below and is
+                // #30's, and short-circuiting it here would fold away a node a real server prints.
+                let converted = match source_type(expr)? {
+                    Some(from) if from != ty && from != ColumnType::Numeric => {
+                        Datum::from_text(from, &text)
+                            .ok()
+                            .and_then(|datum| value::convert_without_text(&datum, ty))
+                            .transpose()?
+                    }
+                    _ => None,
+                };
+                let value = match converted {
+                    Some(value) => value,
+                    None => value::truncate_to_typmod(Datum::from_text(ty, &text)?, ty, typmod)?,
+                };
                 // **A folded cast still carries the type it named.** Several types share one
                 // `Datum` — `text`, `varchar`, `bpchar` and `name` are all a `Datum::Text` — so
                 // folding `'x'::name` to its value alone threw the *declared* type away and the
