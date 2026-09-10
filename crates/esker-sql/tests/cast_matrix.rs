@@ -35,12 +35,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         ),
         (
             "SELECT (c_interval)::time FROM castprobe",
-            "**#43 group 3 -- two conversions of their own.** `interval -> time` is `00:00:00` on a real server (the day part is dropped, the clock part kept) and `22007` here, which is the node reading the interval's *text* rather than converting it. `regclass -> oid` is `22003 out of range` because a system relation's oid here is synthetic and wider than `int4` -- a fixture-sensitive answer, and the one row of this matrix whose fix may be the oid space rather than the cast.",
+            "**#43 group 3 -- a conversion of its own.** `interval -> time` is `00:00:00` on a real server (the day part is dropped, the clock part kept) and `22007` here, which is the node reading the interval's *text* rather than converting it. This group had a second member, `regclass -> oid`, and it turned out not to be a conversion gap at all -- see the entry below.",
             "pg19_cast_matrix.txt:116",
         ),
         (
             "SELECT (c_regclass)::oid FROM castprobe",
-            "**#43 group 3 -- two conversions of their own.** `interval -> time` is `00:00:00` on a real server (the day part is dropped, the clock part kept) and `22007` here, which is the node reading the interval's *text* rather than converting it. `regclass -> oid` is `22003 out of range` because a system relation's oid here is synthetic and wider than `int4` -- a fixture-sensitive answer, and the one row of this matrix whose fix may be the oid space rather than the cast.",
+            "**Not a conversion gap: the boundary of ADR 0097, ruled 2026-09-09 (`debts-v1.1.md` #45).** A relation id here is a `u64` and an `oid` is four bytes, so `'pg_class'::regclass::oid` on a live relation is `22003 value ... is out of range for type oid` where a real server answers a small number. Narrowing the id is the allocation change ADR 0097 weighed and declined, and answering a truncated oid would be a wrong value wearing a right type. Measured here before the ruling and kept as the row that shows what that boundary looks like from the cast's side; the aggregates reach the same edge through the implicit cast, which is how #45 was found.",
             "pg19_cast_matrix.txt:191",
         ),
         (
