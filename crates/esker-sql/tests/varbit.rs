@@ -46,6 +46,12 @@ mod parity;
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
+        // **The three `length`/`octet_length` rows are gone**, closed by the scalar-overload
+        // table: `length(varbit)` counts **bits** and `octet_length(varbit)` counts bytes — two of
+        // the eight `pg_proc` rows over four counting names, and they do not agree with each other
+        // (`tests/captures/pg19_length_overloads.txt`). The empty bit string was kept as the value
+        // that would let a wrong implementation look right, and it is now asserted rather than
+        // declared. `bit_length` stays: this node has none of its three overloads and says so.
         // **The four `||` entries that stood here are gone**, closed by wire v3 family F3b's
         // second unit: `bit`, `bytea` and `tsquery` each have a same-type `||` on a real server
         // and this crate now builds the value. The note they carried is worth keeping — `||` is
@@ -53,19 +59,9 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // the shifts all answer a plain `bit` — and `varbit || bit(2)` is what says the answer is
         // `bit varying` rather than the wider of the two.
         (
-            "SELECT length('101'::varbit)",
-            "**`length` has no bit-string overload here.** It is the string one, so the refusal names the argument type the way a real server names a function it does not have. The answer is the number of *bits*, which is why it cannot be the string overload reading the digits: `length('101')` is 3 either way and `length('1010'::varbit)` is 4 where the text of a padded `bit(8)` is 8.",
-            "pg19_varbit.txt:91",
-        ),
-        (
             "SELECT bit_length('101'::varbit)",
             "`bit_length` is not built for any type, so this is `0A000` where the others are `42883`. Over a bit string it is `length`'s answer; over a string it is eight times the octet count, which is the half that makes it a function rather than an alias.",
             "pg19_varbit.txt:92",
-        ),
-        (
-            "SELECT octet_length('101'::varbit)",
-            "**Not `length` in another unit**: a bit string's octet count is its bits rounded *up*, so three bits are one octet and nine are two. The same gap as `length`, and the arithmetic is the reason it is a separate entry.",
-            "pg19_varbit.txt:93",
         ),
         (
             "SELECT '101'::varbit & '110'::varbit",
@@ -96,11 +92,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT position('11'::varbit in '10110'::varbit)",
             "`position(x in y)` is not built for any type: the refusal names the whole expression. Over a bit string it counts from 1 and answers 0 for no match, which is the string rule applied to bits.",
             "pg19_varbit.txt:100",
-        ),
-        (
-            "SELECT length(''::varbit)",
-            "The same missing overload as line 91, over the empty bit string — kept because it is the one value that would let a wrong implementation look right: `''` has length 0 whether it is read as bits or as characters.",
-            "pg19_varbit.txt:114",
         ),
         // **The three assignment rows are gone**, closed by `debts-v1.1.md` #36 with the unit
         // this file opened. They said one function held the *cast's* answer for both callers, and

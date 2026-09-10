@@ -2383,7 +2383,46 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                         .unwrap_or(i32::MAX),
                 )
             }
-            Datum::Range { subtype, text } if !matches!(func, crate::plan::ScalarFunc::Abs) => {
+            // **Only `lower` and `upper`**, and the guard used to read "anything but `abs`" — so
+            // `length(daterange)` came back as the range's **upper bound**, a date where 19beta1
+            // says `42883 function length(daterange) does not exist`. A guard written as "not the
+            // one I was thinking of" admits everything nobody was thinking of.
+            // **`length` counts what the type is made of, and that is a different thing per
+            // type** — bits for a `bit`, bytes for a `bytea`, lexemes for a `tsvector` (the arm
+            // above), and the **geometric** length for an `lseg` or a `path`, which is a
+            // `double precision` and not a count. Eight `pg_proc` rows over four names on 19beta1
+            // (`tests/captures/pg19_length_overloads.txt`), and `char_length` has none of these.
+            // `resolve` refuses the pairs that have no overload, so what arrives here is a pair
+            // that does.
+            Datum::Bit { bits, .. } if matches!(func, crate::plan::ScalarFunc::Length) => {
+                Datum::Int4(i32::try_from(bits.chars().count()).unwrap_or(i32::MAX))
+            }
+            Datum::Bytea(bytes)
+                if matches!(
+                    func,
+                    crate::plan::ScalarFunc::Length | crate::plan::ScalarFunc::OctetLength
+                ) =>
+            {
+                Datum::Int4(i32::try_from(bytes.len()).unwrap_or(i32::MAX))
+            }
+            // `octet_length` over a `bit` is its **bytes**, which is the pair that says the two
+            // names are not one: `octet_length('1'::bit)` is 1 and `length('1'::bit)` is 1 too,
+            // but `octet_length('101010101'::varbit)` is 2 where `length` is 9.
+            Datum::Bit { bits, .. } if matches!(func, crate::plan::ScalarFunc::OctetLength) => {
+                Datum::Int4(i32::try_from(bits.chars().count().div_ceil(8)).unwrap_or(i32::MAX))
+            }
+            Datum::Geometry { kind, text }
+                if matches!(func, crate::plan::ScalarFunc::Length)
+                    && let Some(shape) = crate::value::geometric_kind(*kind) =>
+            {
+                Datum::Double(crate::value::geometric::length(shape, &text)?)
+            }
+            Datum::Range { subtype, text }
+                if matches!(
+                    func,
+                    crate::plan::ScalarFunc::Lower | crate::plan::ScalarFunc::Upper
+                ) =>
+            {
                 let range = range::from_text(*subtype, &text)?;
                 match func {
                     crate::plan::ScalarFunc::Lower => range.lower.unwrap_or(Datum::Null),
@@ -2405,7 +2444,15 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     Datum::Int4(text.chars().next().map_or(0, |first| first as i32))
                 }
                 // Characters against bytes, and the two differ for anything non-ASCII.
-                crate::plan::ScalarFunc::Length => {
+                //
+                // **The three names agree here and nowhere else**: over a string `length`,
+                // `char_length` and `character_length` all count characters, and over a `bit`, a
+                // `bytea`, a `tsvector`, an `lseg` or a `path` only `length` has an overload at
+                // all. `resolve` is what tells them apart, because only the plan knows the
+                // argument's declared type.
+                crate::plan::ScalarFunc::Length
+                | crate::plan::ScalarFunc::CharLength
+                | crate::plan::ScalarFunc::CharacterLength => {
                     Datum::Int4(i32::try_from(text.chars().count()).unwrap_or(i32::MAX))
                 }
                 crate::plan::ScalarFunc::OctetLength => {

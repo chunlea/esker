@@ -20,11 +20,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // kept it diverging by the end was the **declared type** — this node said `text` where a
         // real server says `integer`, with the value always right. Typing the counting functions
         // closed it. The `convert_to` line below is a different gap and stays.
-        (
-            "SELECT length(convert_to('Ruby on Rails', 'UTF8'))",
-            "`length` is a different function and not one statement 738 calls. The line is in the corpus because it is what pins `concat`'s NULL rule as a *length* — `concat('a', NULL, 'b')` is two characters, not four and not NULL — and that half agrees: the string this node builds is the string PostgreSQL builds.",
-            "UNMEASURED",
-        ),
+        // **And `SELECT length(convert_to('Ruby on Rails', 'UTF8'))` is gone too**, closed by the
+        // same unit one step further: `length(bytea)` is a real overload on 19beta1 — bytes, not
+        // characters — and this node had no `length` over a `bytea` at all. `pg_proc` has eight
+        // rows over the four counting names and they do not agree with each other
+        // (`tests/captures/pg19_length_overloads.txt`).
         (
             "SELECT convert_to('A', 'LATIN1')",
             "**A real encoding this node cannot transcode to.** `LATIN1` is in PostgreSQL's list, so the answer is a refusal naming it and not the `22023` an unknown name gets — the two are told apart deliberately (`crate::value::encoding`). Returning the UTF-8 bytes under another encoding's name would be a wrong answer wearing a right one's label: `é` is `\\xc3a9` in UTF-8 and `\\xe9` in LATIN1, and only one of them is what was asked for.",

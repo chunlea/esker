@@ -48,18 +48,11 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // the suite: `length`/`octet_length`, the bitwise `& | # ~`, and the shifts. Each is
         // measured now — `tests/varbit.rs` carries them with capture lines instead of
         // `UNMEASURED` — and still not built.
-        (
-            "SELECT 'r', length('10101'::bit(5)), octet_length('10101'::bit(5))",
-            "the bit-string functions are their own unit",
-            "UNMEASURED",
-        ),
-        // The same unit, reached through the literal: the `B'1010'` and the `B''` beside it are
-        // right and the `length` is what refuses, which is why the whole statement is here.
-        (
-            "SELECT 'r', B'1010', length(B'1010'), B''",
-            "the bit-string functions are their own unit",
-            "UNMEASURED",
-        ),
+        // **The two `length`/`octet_length` rows are gone**, closed by the scalar-overload table:
+        // `length(bit)` counts **bits** and `octet_length(bit)` counts bytes, two of eight
+        // `pg_proc` rows over four counting names that do not agree with each other
+        // (`tests/captures/pg19_length_overloads.txt`). The bitwise operators and the shifts below
+        // are still their own unit.
         (
             "SELECT 'r', '101'::bit(3) & '110'::bit(3), '101'::bit(3) | '110'::bit(3)",
             "the bitwise operators are their own unit",
