@@ -114,6 +114,17 @@ fn start_reporting() {
         });
 }
 
+/// The two counters, for a measurement that wants a difference rather than a line.
+///
+/// `(views, repeats of the same version)`.
+#[must_use]
+pub fn counts() -> (u64, u64) {
+    (
+        VIEWS.load(Ordering::Relaxed),
+        REPEATS.load(Ordering::Relaxed),
+    )
+}
+
 /// One line, for a log a harness can grep.
 #[must_use]
 pub fn summary() -> String {
