@@ -253,6 +253,34 @@ there are and not in what each costs), and its correctness premises are three ru
 has rather than three it would need. What it asks the user for is the milestone: a cache whose
 staleness is a wrong answer is a decision, not a refactor.
 
+## What run 117 has to answer, written before it lands
+
+r1's run 117 prices `transactions_test` per statement on the real topology. **The criteria are
+fixed here, before the numbers, for the reason [ADR 0102](0102-the-catalogs-read-path.md) fixed
+its own in advance: so that reading them cannot choose the answer.** Three questions, and each has
+an outcome that would move this ADR rather than confirm it.
+
+1. **What does an ordinary statement cost, and how much of it is below the SQL?** The census says
+   such a statement makes 9 KV reads, 8 of them catalog. If the 907 ordinary statements come out
+   near the pass mean (519 ms) **and** their round trips are near their read count, option B is
+   sized right. **If their round trips are far below their read count**, the client is already
+   answering most of them from its buffer and B buys less than this ADR claims.
+2. **What is a `BEGIN` / `SAVEPOINT` / `RELEASE` / `COMMIT` worth?** They read nothing, so if they
+   are *cheap*, the reads really are where the time is. **If they are expensive**, the cost is the
+   TSO, the prewrite or the wire — none of which any of the three options touches — and the row
+   moves to a different ADR.
+3. **Does `pk_and_sequence_for` still hold 26.5%?** Run 114's is a desktop projection. **If the
+   real per-statement prices redistribute it**, the arithmetic that ranks B above A changes with
+   it, and the ranking is what this ADR is for.
+
+**A fourth thing to look for that nobody asked about**: whether the per-statement times are
+*bimodal*. A mean of 519 ms over 1,354 statements is consistent with every statement costing
+519 ms and with a hundred costing five seconds — and only the second is a hunt with a target. The
+tap prints per statement, so this is free to check and is the first thing to check.
+
+**What run 117 said** — to be filled from the report; empty on purpose until it exists, because an
+ADR with a section titled after a measurement it does not have is how a projection becomes a fact.
+
 **Not decided here, and stated so a reader does not infer it:** whether any of this is in v1.2 at
 all, and whether run 117's per-statement prices change the ranking. If the 907 statements turn out
 to be dominated by something this census cannot see — the TSO, the commit, the wire — then none of
