@@ -292,3 +292,103 @@ fn four_clients_leave_no_hole_in_the_record() {
          broken recorder and refuses to give a verdict on"
     );
 }
+
+/// The state file's store pids, `id address pid` with the driver on id 0.
+fn store_pids(dir: &Path) -> Vec<u32> {
+    let text = std::fs::read_to_string(dir.join("cluster.state")).unwrap_or_default();
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields[..] {
+                [id, _, pid] if id != "0" => pid.parse::<u32>().ok(),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Whether a pid is still a live process.
+fn alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// **A killed store comes back, with a new pid, and the state file says so.**
+///
+/// Run 118 fired fourteen shots at corpses and run 119 could only fire one, because
+/// `esker cluster start` reported a death and did not undo it. The chaos loop the acceptance wants
+/// — kill, wait for the cluster to serve again, kill again — needs a partner that restarts.
+///
+/// The two halves that matter are both asserted: the store **comes back**, and its **pid changes**.
+/// The second is what `esker durability chaos --state` depends on: a list of pids taken once names
+/// corpses after the first round, and the supervisor rewriting the state file is the only thing
+/// that keeps the loop pointed at live processes.
+#[test]
+#[ignore = "starts three store processes and kills them; run with --run-ignored all"]
+fn a_killed_store_is_restarted_and_the_state_file_follows_it() {
+    let cluster = start();
+    let dir = cluster.dir.path().to_path_buf();
+
+    let before = store_pids(&dir);
+    assert_eq!(before.len(), NODES, "the state file names every store");
+
+    let victim = before[0];
+    assert!(alive(victim), "the store to kill is running");
+    assert!(
+        Command::new("kill")
+            .arg("-9")
+            .arg(victim.to_string())
+            .status()
+            .unwrap()
+            .success(),
+        "SIGKILL was sent"
+    );
+
+    // The supervisor ticks every 250 ms and backs off 500 ms before the first restart, so this is
+    // generous rather than tight — a bound against hanging the suite, not the assertion.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let after = loop {
+        let now = store_pids(&dir);
+        if now.len() == NODES && !now.contains(&victim) && now.iter().all(|pid| alive(*pid)) {
+            break now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "30 s after `kill -9 {victim}` the state file still reads {now:?} — the supervisor did \
+             not restart the store, so a chaos loop has nothing to wait for"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+
+    assert_ne!(
+        after[0], victim,
+        "the restarted store must have a new pid, or nothing has actually restarted"
+    );
+
+    // And it can be killed again, which is the loop the acceptance needs.
+    let second = after[0];
+    assert!(
+        Command::new("kill")
+            .arg("-9")
+            .arg(second.to_string())
+            .status()
+            .unwrap()
+            .success(),
+        "the restarted store can be killed in its turn"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let now = store_pids(&dir);
+        if now.len() == NODES && !now.contains(&second) && now.iter().all(|pid| alive(*pid)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!("the second kill was not undone, so the loop stops after one round");
+}

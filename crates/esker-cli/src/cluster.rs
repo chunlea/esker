@@ -23,7 +23,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use esker_proto::TransportConfig;
 
@@ -63,6 +63,15 @@ pub(crate) enum ClusterOptions {
         /// is one it also has to be able to stop, and an address it was handed might belong to
         /// somebody else's driver.
         pd: bool,
+        /// **Do not restart a store that exits.**
+        ///
+        /// The default is to restart it, because a supervisor that only reports a death leaves a
+        /// chaos run with nothing to wait for: `esker durability chaos` kills, waits for the
+        /// cluster to serve again, and kills again, and without a restart it gets exactly one
+        /// kill out of a window (run 118 and 119). The switch keeps the old behaviour for anyone
+        /// who wants a death to stay a death — watching a cluster degrade, or a test that asserts
+        /// a node stayed down.
+        no_respawn: bool,
     },
     /// Stop a cluster `start` launched.
     Stop {
@@ -90,6 +99,7 @@ pub(crate) fn run(options: &ClusterOptions) -> Result<(), String> {
             sst_store,
             write_buffer_size,
             pd,
+            no_respawn,
         } => start(
             *nodes,
             data_dir,
@@ -97,7 +107,10 @@ pub(crate) fn run(options: &ClusterOptions) -> Result<(), String> {
             *seed,
             sst_store.as_deref(),
             *write_buffer_size,
-            *pd,
+            Supervision {
+                pd: *pd,
+                respawn: !*no_respawn,
+            },
         ),
         ClusterOptions::Stop { data_dir } => stop(data_dir),
     }
@@ -183,6 +196,45 @@ struct Layout<'a> {
     peers: &'a [String],
 }
 
+/// One store's command line, from the layout.
+///
+/// **One place, because a store is restarted as well as started.** A supervisor that rebuilt the
+/// arguments in a second place would eventually restart a store that is not the one it replaced —
+/// a different `--sst-store` prefix, a forgotten `--pd` — and the cluster would look healthy while
+/// one member was quietly a different thing.
+fn store_command(binary: &Path, layout: &Layout<'_>, id: u64) -> Result<Process, String> {
+    let dir = dir_of(layout.data_dir, id);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("creating {}: {error}", dir.display()))?;
+
+    let mut process = Process::new(binary);
+    process
+        .arg("server")
+        .arg("--data-dir")
+        .arg(&dir)
+        .arg("--listen")
+        .arg(address_of(layout.base_port, id))
+        .arg("--store-id")
+        .arg(id.to_string())
+        .arg("--seed")
+        .arg(layout.seed.to_string());
+    if let Some(store_url) = layout.sst_store {
+        process
+            .arg("--sst-store")
+            .arg(crate::sst_store::for_node(store_url, id));
+    }
+    if let Some(size) = layout.write_buffer_size {
+        process.arg("--write-buffer-size").arg(size.to_string());
+    }
+    if let Some(address) = layout.pd {
+        process.arg("--pd").arg(address);
+    }
+    for peer in layout.peers {
+        process.arg("--peer").arg(peer);
+    }
+    Ok(process)
+}
+
 /// Starts one store per node, recording each in `children` and `launched`.
 ///
 /// Stops at the first that will not spawn and leaves the cleanup to the caller, which is holding
@@ -194,37 +246,7 @@ fn spawn_stores(
     launched: &mut Vec<Node>,
 ) -> Result<(), String> {
     for id in 1..=layout.nodes {
-        let dir = dir_of(layout.data_dir, id);
-        std::fs::create_dir_all(&dir)
-            .map_err(|error| format!("creating {}: {error}", dir.display()))?;
-
-        let mut process = Process::new(binary);
-        process
-            .arg("server")
-            .arg("--data-dir")
-            .arg(&dir)
-            .arg("--listen")
-            .arg(address_of(layout.base_port, id))
-            .arg("--store-id")
-            .arg(id.to_string())
-            .arg("--seed")
-            .arg(layout.seed.to_string());
-        if let Some(store_url) = layout.sst_store {
-            process
-                .arg("--sst-store")
-                .arg(crate::sst_store::for_node(store_url, id));
-        }
-        if let Some(size) = layout.write_buffer_size {
-            process.arg("--write-buffer-size").arg(size.to_string());
-        }
-        if let Some(address) = layout.pd {
-            process.arg("--pd").arg(address);
-        }
-        for peer in layout.peers {
-            process.arg("--peer").arg(peer);
-        }
-
-        let child = process
+        let child = store_command(binary, layout, id)?
             .spawn()
             .map_err(|error| format!("starting node {id}: {error}"))?;
         launched.push(Node {
@@ -244,7 +266,7 @@ fn start(
     seed: u64,
     sst_store: Option<&str>,
     write_buffer_size: Option<usize>,
-    with_pd: bool,
+    supervision: Supervision,
 ) -> Result<(), String> {
     if nodes == 0 {
         return Err("`--nodes` must be at least 1".to_owned());
@@ -283,7 +305,7 @@ fn start(
     // (`docs/bench/columnar-learner.md`, "One more thing the real binaries said"). So this waits
     // until the driver answers a driver's question, and fails loudly if it never does —
     // *answers*, not *accepts*: `wait_until_the_driver_answers` says what a bare connect cost.
-    let pd = with_pd.then(|| pd_address_of(base_port, nodes));
+    let pd = supervision.pd.then(|| pd_address_of(base_port, nodes));
     if let Some(address) = &pd {
         let (node, mut child) = start_pd(&binary, data_dir, address)?;
         if let Err(error) = wait_until_the_driver_answers(address, &mut child, PD_START_TIMEOUT) {
@@ -294,21 +316,19 @@ fn start(
         children.push((0, child));
     }
 
-    if let Err(error) = spawn_stores(
-        &binary,
-        &Layout {
-            nodes,
-            data_dir,
-            base_port,
-            seed,
-            sst_store,
-            write_buffer_size,
-            pd: pd.as_deref(),
-            peers: &peers,
-        },
-        &mut children,
-        &mut launched,
-    ) {
+    // Named once and used twice: `spawn_stores` starts them and the supervisor restarts them, and
+    // a store is whatever this says it is.
+    let layout = Layout {
+        nodes,
+        data_dir,
+        base_port,
+        seed,
+        sst_store,
+        write_buffer_size,
+        pd: pd.as_deref(),
+        peers: &peers,
+    };
+    if let Err(error) = spawn_stores(&binary, &layout, &mut children, &mut launched) {
         // A node that will not start leaves the cluster short of a quorum, so the ones already
         // running are stopped rather than left half-formed.
         for (_, mut child) in children {
@@ -337,9 +357,17 @@ fn start(
         data_dir.display()
     );
 
-    // Supervise until ctrl-C, naming any child that dies on the way but leaving the rest running:
-    // killing one node while the others carry on is what this command is for.
-    wait_for_interrupt(&mut children);
+    // Supervise until ctrl-C, naming any child that dies on the way — and, unless `--no-respawn`
+    // says otherwise, starting it again. Killing one node while the others carry on is what this
+    // command is for; bringing it back is what makes a *repeated* kill a test of recovery rather
+    // than of attrition, which is what a chaos run needs (`esker durability chaos`).
+    wait_for_interrupt(
+        &mut children,
+        &binary,
+        &layout,
+        &mut launched,
+        supervision.respawn,
+    );
     println!("esker cluster: stopping");
     for (id, child) in &mut children {
         signal(child.id(), "TERM");
@@ -433,7 +461,29 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const STORE_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often the supervisor looks at its children while waiting for ctrl-C.
+/// What the supervisor does besides start things: whether it also runs a driver, and whether it
+/// puts a store back when one exits. Two booleans in one argument, because a call with eight
+/// positional parameters is a call whose fifth and sixth get swapped one day.
+#[derive(Debug, Clone, Copy)]
+struct Supervision {
+    /// Start a placement driver beside the stores and point every node at it.
+    pd: bool,
+    /// Restart a store that exits.
+    respawn: bool,
+}
+
 const SUPERVISE_TICK: Duration = Duration::from_millis(250);
+
+/// How long after a store exits before it is started again, doubling on each consecutive failure.
+///
+/// Short, because the point of restarting is that a chaos run has something to wait for: a kill
+/// that took thirty seconds to undo would make every later kill land on a cluster still recovering
+/// from the last, and the run would measure the backoff rather than the cluster.
+const RESPAWN_BACKOFF: Duration = Duration::from_millis(500);
+
+/// The ceiling that doubling reaches. A store that cannot open its data directory is not going to
+/// start on the ninth attempt either, and a supervisor spinning on it drowns its own log.
+const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(8);
 
 /// Waits until `address` answers **as a placement driver**, or says why it never will.
 ///
@@ -467,7 +517,7 @@ fn wait_until_the_driver_answers(
     child: &mut Child,
     within: Duration,
 ) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + within;
+    let deadline = Instant::now() + within;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(
@@ -481,7 +531,7 @@ fn wait_until_the_driver_answers(
             Ok(()) => return Ok(()),
             Err(why) => why,
         };
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             let _ = child.kill();
             return Err(format!(
                 "the placement driver did not answer on {address} within {within:?}: {refusal}"
@@ -551,7 +601,7 @@ fn wait_until_the_stores_answer(
         .map(|node| (node.id, node.address.clone()))
         .collect();
     let stores = waiting.len();
-    let mut budget = Budget::new(std::time::Instant::now(), within, stores);
+    let mut budget = Budget::new(Instant::now(), within, stores);
     loop {
         // A child that has exited is the precise answer and it is available at once. Without this
         // arm a store that cannot open would spend the whole budget failing to connect, and the
@@ -567,7 +617,7 @@ fn wait_until_the_stores_answer(
         // The probes themselves are what takes the time, so the clock is read after them and the
         // same reading decides both. A store that answered in this round is progress even though
         // others in it did not: what the budget is for is telling a slow start from a stuck one.
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         if waiting.len() < before {
             budget.progress(now);
         }
@@ -600,7 +650,7 @@ fn ask_a_store(address: &str) -> Result<(), String> {
         .map_err(|error| format!("connecting to {address}: {error}"))?;
     match store.call(
         esker_proto::Request::Admin(esker_proto::AdminReq::Regions),
-        std::time::Instant::now() + PROBE_TIMEOUT,
+        Instant::now() + PROBE_TIMEOUT,
     ) {
         Ok(esker_proto::Response::Admin(_)) => Ok(()),
         Ok(other) => Err(format!(
@@ -645,7 +695,13 @@ fn what(id: u64) -> String {
 /// The startup check is the one that fails the command, and it is a different question:
 /// [`first_child_that_died`] runs before anything is announced, where a dead child means the
 /// cluster never formed rather than that somebody is testing it.
-fn wait_for_interrupt(children: &mut [(u64, Child)]) {
+fn wait_for_interrupt(
+    children: &mut [(u64, Child)],
+    binary: &Path,
+    layout: &Layout<'_>,
+    nodes: &mut [Node],
+    respawn: bool,
+) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -653,9 +709,16 @@ fn wait_for_interrupt(children: &mut [(u64, Child)]) {
         eprintln!("esker cluster: cannot listen for ctrl-c; stopping immediately");
         return;
     };
-    // One line per child and never more: a reaped child answers `try_wait` with its status for
-    // ever, and a supervisor that said so every tick would bury the log it exists to write.
+    // One line per child and never more *when nothing is restarted*: a reaped child answers
+    // `try_wait` with its status for ever, and a supervisor that said so every tick would bury the
+    // log it exists to write. With `respawn` the entry is replaced instead, so the next exit is a
+    // new fact and is reported again.
     let mut reported: Vec<u64> = Vec::new();
+    // How long before this id is started again, doubling on each consecutive failure. A store that
+    // cannot open its data directory would otherwise be restarted as fast as this loop ticks.
+    let mut backoff: std::collections::BTreeMap<u64, Duration> = std::collections::BTreeMap::new();
+    let mut due: std::collections::BTreeMap<u64, Instant> = std::collections::BTreeMap::new();
+
     runtime.block_on(async {
         let interrupt = tokio::signal::ctrl_c();
         tokio::pin!(interrupt);
@@ -668,6 +731,7 @@ fn wait_for_interrupt(children: &mut [(u64, Child)]) {
                     return;
                 }
                 () = tokio::time::sleep(SUPERVISE_TICK) => {
+                    let mut exited: Vec<u64> = Vec::new();
                     for (id, child) in children.iter_mut() {
                         if reported.contains(id) {
                             continue;
@@ -675,6 +739,59 @@ fn wait_for_interrupt(children: &mut [(u64, Child)]) {
                         if let Ok(Some(status)) = child.try_wait() {
                             reported.push(*id);
                             eprintln!("esker cluster: {} exited with {status}", what(*id));
+                            // The driver is not restarted: a cluster whose driver is gone has lost
+                            // the thing that hands out timestamps and names regions, and bringing
+                            // it back under a chaos run would be a different experiment.
+                            if respawn && *id != 0 {
+                                exited.push(*id);
+                            }
+                        }
+                    }
+                    for id in exited {
+                        let wait = backoff
+                            .get(&id)
+                            .copied()
+                            .unwrap_or(RESPAWN_BACKOFF)
+                            .min(RESPAWN_BACKOFF_MAX);
+                        due.insert(id, Instant::now() + wait);
+                        backoff.insert(id, wait.saturating_mul(2).min(RESPAWN_BACKOFF_MAX));
+                    }
+                    let ready: Vec<u64> = due
+                        .iter()
+                        .filter(|(_, at)| Instant::now() >= **at)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for id in ready {
+                        due.remove(&id);
+                        match store_command(binary, layout, id).and_then(|mut command| {
+                            command
+                                .spawn()
+                                .map_err(|error| format!("restarting node {id}: {error}"))
+                        }) {
+                            Ok(child) => {
+                                let pid = child.id();
+                                eprintln!("esker cluster: {} restarted as pid {pid}", what(id));
+                                reported.retain(|seen| *seen != id);
+                                if let Some(slot) =
+                                    children.iter_mut().find(|(seen, _)| *seen == id)
+                                {
+                                    slot.1 = child;
+                                }
+                                // **The state file is what a chaos arm reads to find a pid**, and a
+                                // restarted store has a new one. A file that still named the dead
+                                // pid would send every later kill to a corpse, which is exactly the
+                                // shape run 118 spent fourteen shots on.
+                                if let Some(node) = nodes.iter_mut().find(|node| node.id == id) {
+                                    node.pid = pid;
+                                }
+                                if let Err(error) = write_state(layout.data_dir, nodes) {
+                                    eprintln!("esker cluster: {error}");
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("esker cluster: {error}");
+                                due.insert(id, Instant::now() + RESPAWN_BACKOFF_MAX);
+                            }
                         }
                     }
                 }

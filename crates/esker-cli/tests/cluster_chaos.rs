@@ -64,6 +64,9 @@ struct Cluster {
     data_dir: TempDir,
     base_port: u16,
     nodes: Vec<Node>,
+    /// The nodes *this test* restarted, kept so [`Cluster::kill`] can tell a running process
+    /// from a pid that died on a lost bind. Three at most, so a `Vec` is the whole index.
+    restarted: Vec<(u64, Child)>,
 }
 
 /// A run of `NODES` consecutive ports, **held** until the caller hands them over.
@@ -177,6 +180,17 @@ impl Cluster {
             .arg(base_port.to_string())
             .arg("--seed")
             .arg(SEED.to_string())
+            // **This test restarts its own nodes**, so the supervisor must not: two managers for
+            // one store id means two processes racing for one port, whichever loses dies on the
+            // bind, and this test is then holding a pid that is already a corpse — so every
+            // later `kill` signals nothing and the leader is never actually killed.
+            //
+            // That is measured, not feared. Fifty kills, one commit, the only difference this
+            // flag: with the supervisor also restarting, 46s, 7 refused writes, worst
+            // convergence 2.2s; with the restarts left to this test, 152s, 226 refused, 4.5s.
+            // The fast, clean run is the one that was shooting corpses. [`Cluster::kill`] now
+            // refuses to be that run.
+            .arg("--no-respawn")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         // **Released here and nowhere earlier.** Everything above this line happened while the run
@@ -196,6 +210,7 @@ impl Cluster {
                     data_dir,
                     base_port,
                     nodes: Vec::new(),
+                    restarted: Vec::new(),
                 });
                 return None;
             }
@@ -207,6 +222,7 @@ impl Cluster {
             data_dir,
             base_port,
             nodes,
+            restarted: Vec::new(),
         })
     }
 
@@ -219,21 +235,44 @@ impl Cluster {
     /// Shelling out to `kill` for the same reason `esker-cli` does: `libc` is a `*-sys`-shaped
     /// dependency this project does not take (`CLAUDE.md`), and a test is not worth an
     /// exception.
-    fn kill(&self, id: u64) {
-        let Some(node) = self.nodes.iter().find(|node| node.id == id) else {
+    fn kill(&mut self, id: u64) {
+        self.restarts_are_still_running();
+        let Some(pid) = self
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| node.pid)
+        else {
             return;
         };
-        let _ = Command::new("kill")
-            .arg("-9")
-            .arg(node.pid.to_string())
-            .status();
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+    }
+
+    /// Every node this test restarted is still a process.
+    ///
+    /// **A kill that kills nothing is a silent pass**, and it is silent in the direction that
+    /// looks like health: the cluster never loses its leader, so it converges instantly and
+    /// refuses almost nothing. The restarted nodes are this test's own children, so `try_wait`
+    /// answers without a signal and without `libc`; between rounds every one of them is supposed
+    /// to be running, and one that is not means its port went to another manager.
+    fn restarts_are_still_running(&mut self) {
+        for (id, child) in &mut self.restarted {
+            let Some(status) = child.try_wait().expect("a restarted node's status") else {
+                continue;
+            };
+            panic!(
+                "node {id} exited ({status}) after this test restarted it, before the next kill \
+                 — its port went to another manager, so the kills from here on would signal a \
+                 pid that is already dead and every assertion after them would be vacuous"
+            );
+        }
     }
 
     /// Starts node `id` again, with the arguments the supervisor gave it.
     ///
-    /// The supervisor does not restart what dies — it waits for ctrl-C — so a test that wants
-    /// the node back has to bring it back itself, which is also what an operator would do. The
-    /// new pid is recorded so a later kill finds the process that is actually running.
+    /// The supervisor is started with `--no-respawn`, so a test that wants the node back has to
+    /// bring it back itself, which is also what an operator would do. The new pid is recorded so
+    /// a later kill finds the process that is actually running.
     fn restart(&mut self, id: u64) {
         let peers: Vec<String> = (1..=NODES)
             .map(|peer| format!("{peer}@{}", address_of(self.base_port, peer)))
@@ -260,9 +299,18 @@ impl Cluster {
         if let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) {
             node.pid = child.id();
         }
-        // The child is deliberately not waited on: it runs until this test kills it, and
-        // `stop` kills every recorded pid.
-        std::mem::forget(child);
+        // Kept, not forgotten: the handle is the only thing that can tell a running node from
+        // one that lost its bind, and `restarts_are_still_running` asks it before every kill.
+        match self.restarted.iter_mut().find(|(at, _)| *at == id) {
+            Some(slot) => {
+                // The handle it replaces belongs to the process this round already killed, so
+                // reaping it returns at once — and keeps a fifty-kill run from leaving fifty
+                // zombies behind it.
+                let _ = slot.1.wait();
+                slot.1 = child;
+            }
+            None => self.restarted.push((id, child)),
+        }
     }
 
     /// Kills every node and the supervisor. Called on the way out, including after a panic, so
@@ -273,6 +321,9 @@ impl Cluster {
                 .arg("-9")
                 .arg(node.pid.to_string())
                 .status();
+        }
+        for (_, child) in &mut self.restarted {
+            let _ = child.wait();
         }
         let _ = self.supervisor.kill();
         let _ = self.supervisor.wait();
