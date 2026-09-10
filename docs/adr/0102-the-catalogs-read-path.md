@@ -48,22 +48,67 @@ a correctness rule rather than a preference:
 
 ## The three shapes
 
-### (a) A cached version with an invalidation the store pushes
+### (a) A cached version — and the lease it needs is already built
 
-The node keeps the version it last read and uses it without asking, until the store tells it the
-version moved.
+The node keeps the version it last read and answers later transactions from it, instead of reading
+the counters again.
 
-* **Consistency**: an invalidation that is *late* serves a stale definition, which rule 3 exists to
-  forbid — so the push has to be ordered against the DDL's commit, not merely sent after it. The
-  honest version of this is a lease: the node may use the cached version for as long as the store
-  has promised not to acknowledge a DDL without telling it, and the fallback when the lease lapses
-  is the read we do today.
-* **The once-per-transaction contract** survives untouched: it becomes once-per-transaction *from
-  the cache*, and the version is still a single value the whole transaction is answered at.
-* **What it needs**: a subscription in the wire protocol — a new tag, since nothing today lets a
-  store push to a SQL node — and a lease with a clock, which is the part that needs an ADR of its
-  own rather than a paragraph in this one.
-* **What it saves**: the two point reads per transaction, in the common case where no DDL has run.
+**The draft said this needs a push and a new wire tag. It does not.**
+[ADR 0028](0028-the-schema-lease.md) already ships the guarantee: `Pd::SchemaLease` (0x0307)
+answers `lease_ms` — *how long a node may serve writes from a cached schema* — and PD's schema-change
+step clock is timed against it, so a step cannot outrun a live lease. That is exactly the promise a
+version cache needs, and `Backend::schema_lease_remaining` already returns it, already fails closed
+on `None`, and is already refreshed once per lease period rather than per statement.
+
+**So the proposal, concretely:**
+
+* **What is cached**: for one tenant, the version `view_at` computes — the sum of that tenant's
+  `catalog_version` and the cluster tenant's — together with the instant it was read. One entry per
+  tenant, on the node, beside the definition cache that is already keyed by that version.
+* **When it may be used**: while `schema_lease_remaining()` is `Some(d)` **and** the entry is
+  younger than the lease that was live when it was read. Both halves, because a lease that lapsed
+  and came back is not the same lease: a DDL may have stepped in between, which is the whole reason
+  the clock is a timer.
+* **Where it is dropped**, and this is the list that has to be exhaustive:
+  1. `schema_lease_remaining()` returns `None`, or a shorter remaining time than the entry's age —
+     the fail-closed path ADR 0028 already has;
+  2. this node commits catalog DDL — the same points `Executor::catalog_written` is set, which the
+     pin below already hooks;
+  3. the entry's own age passes `lease_ms`, whether or not a refresh has happened since;
+  4. `LeaseRefresher` observes a lease it did not renew — a gap, not a renewal.
+* **What it does not cover**: another node's DDL *within* the lease window. It does not have to —
+  that is what the lease's timer buys, and it is the same bound writes already run under.
+
+### How it relates to `view_pinned`, which is already in the tree
+
+They are not the same mechanism and the difference is the safety argument:
+
+| | `view_pinned` (built) | the version cache (this option) |
+|---|---|---|
+| scope | inside **one transaction** | across transactions, on the node |
+| why it is safe | the transaction's snapshot is fixed, so the version cannot move | PD promised not to step a schema change faster than the lease |
+| what it removes | the second and later reads of one statement — measured 22 → 12 | the **first** read of each transaction, which is what is left |
+| what invalidates it | the transaction ending, or writing the catalog | the four points above |
+
+The pin is the cheap half and it is done. The cache is the half that crosses a snapshot boundary,
+which is why it needs a promise from outside the node rather than an argument about one.
+
+### The test that has to exist before it lands
+
+**"After an invalidation, no statement reads the old version"** — asserted on the *consequence*
+rather than on the counter, which is this register's own rule (`a-catalog-write-must-bump-the-version`):
+
+1. two sessions on one node: session A runs `ALTER TABLE t ADD COLUMN c`, commits; session B — a
+   different session, so a different transaction and a different pin — then runs
+   `INSERT INTO t (…, c) VALUES (…)` and **must** see the column. This is the local invalidation,
+   point 2 above;
+2. the lease's own path, which is the one a unit test cannot fake: a node whose
+   `schema_lease_remaining` is driven to `None` must re-read rather than answer from the entry, and
+   the assertion is again a consequence — a statement that would be wrong under the old version;
+3. and the one that decides whether the bound is real: **two SQL nodes**, DDL on the first, a
+   statement on the second before its lease would have expired. Under the proposal that statement
+   may still see the old definition, and the test's job is to pin *how long* that window is and
+   that it never exceeds `lease_ms`. `cluster_harness` starts one SQL node today; this needs two.
 
 ### (b) A lease read, or a follower read, of the version
 
@@ -115,6 +160,25 @@ read needs the client's routing to report what it chose, which is a larger chang
 instrument. The fourth row above therefore needs a second instrument, and until it exists (c) is
 argued from the key space rather than measured.
 
+### ①b What the two runs actually measured, and on which topology
+
+| | run 111 (Rails suite) | run 112's calibration (two files) |
+|---|---|---|
+| backend | **`MemoryBackend`** — `esker-sql HOST:PORT` with no store addresses: an in-process `BTreeMap`, no store, no PD, no Raft, no socket | **the real topology**, node `534604a5` |
+| catalog views | 4,790,406 | 53,387 |
+| mean per read | **≤0.5 µs** — a table lookup | **232 µs** |
+| distribution | `<100us` 4,790,317 · `<1ms` 86 · `<10ms` 3 | `<100us` 903 · `<1ms` 52,183 |
+| repeats of the same version | not measured — the field was a constant then | **41,061, or 77%** |
+
+**Three things follow, and the third is the one that decides.** The read is **not free** once a
+store is under it. The distribution **moved as a whole** rather than growing a tail — 52,183 of
+53,387 land in the same bucket — so this is a cost, not a stall. And **three quarters of the reads
+return the version the read before them returned.**
+
+For scale beside it: the same calibration puts the real topology at about **110× the wall clock of
+the fake backend per file** (229 s against 2 s). The Raft round trip a statement makes is the bulk
+of that; a catalog read is one of its parts.
+
 ### ② Where the instrument lives
 
 `crates/esker-sql/src/catalog/stats.rs`, counting at `Catalog::view_at` — **the one place every
@@ -151,6 +215,82 @@ about a real workload's shape.
      read, which needs no new tag and does need the client to be able to address a replica;
    * neither, and the pain is that one region carries everything → **(c)**, which is the cheapest
      and the only one that removes the coupling rather than the round trip.
+### A unit that is not this ADR's, and comes before it
+
+**Measured, and the first claim about it was wrong.** This paragraph said "thirteen places, and
+each one re-reads the two version counters", which was inferred from counting call sites and never
+measured. Counting them per statement instead
+(`crates/esker-sql/tests/catalog_reads.rs`, with the instrument on):
+
+| statement | views | of which repeats |
+|---|---:|---:|
+| `CREATE TABLE` | 1 | 0 |
+| `INSERT`, one row | 2 | 1 |
+| `INSERT`, three rows | 2 | 2 |
+| `SELECT`, point | 2 | 2 |
+| `SELECT`, range | 2 | 2 |
+| `UPDATE`, point | 2 | 2 |
+| `DELETE`, point | 2 | 2 |
+| `ALTER TABLE ADD COLUMN` | 3 | 3 |
+| `SELECT`, self join | 4 | 3 |
+| `BEGIN` / `COMMIT` | 0 | 0 |
+| **the whole run** | **22** | **19** |
+
+**Two per ordinary statement, not thirteen** — the call sites do not all fire — and **19 of 22 are
+repeats**: 86% of the reads return the version the read before them returned. So the redundancy is
+real and it is a factor of two, not of thirteen. Against run 111's 4,790,406 views that is about
+2.4 million statements, which is the right order for that suite.
+
+That is not this ADR's question — every one of its three shapes changes *where* the version is read
+from, and this changes *how many times* — and it should be a small unit of its own, for three
+reasons:
+
+* **it is cheaper than any shape here**: caching the view per transaction inside the executor needs
+  no wire tag, no placement-driver change, no lease and no ADR — and it halves the reads rather
+  than removing them, which is worth knowing before it is built;
+* **it comes first, or this ADR measures the wrong thing.** A statement that reads the version
+  thirteen times multiplies whatever a read costs by a number that belongs to the executor's
+  structure and not to the catalog's read path. Measuring (a), (b) or (c) against that is measuring
+  the executor;
+* **and the obvious worry is already answered, which is why this is a cost question and not a
+  correctness one**: every one of those reads goes through the same `txn`, and a transaction's
+  snapshot is fixed, so the version cannot move between them. A statement cannot see two shapes of
+  one table by taking two views. What it can do is pay for the same answer thirteen times.
+
+The shape of the unit, in the order this lane has learned to do them: **count the reads per
+statement class first** — done, above — **then merge them**, **then count again**, so the change is
+reported as a difference and not as an intention.
+
+**Done, and measured on both sides** (`crates/esker-sql/tests/catalog_reads.rs`, the same
+instrument):
+
+| statement | before | after |
+|---|---:|---:|
+| `CREATE TABLE` | 1 | 1 |
+| `INSERT`, one row | 2 | **1** |
+| `SELECT`, point | 2 | **1** |
+| `SELECT`, range | 2 | **1** |
+| `UPDATE` / `DELETE`, point | 2 | **1** |
+| `ALTER TABLE ADD COLUMN` | 3 | 3 |
+| `SELECT`, self join | 4 | **1** |
+| **the whole run** | **22** | **12** |
+
+**An ordinary statement now reads the catalog version once, and a self-join once instead of four
+times.** `ALTER TABLE` is unchanged and must be: a transaction that has written the catalog reads
+its own uncommitted DDL, so it takes an uncached view every time. At run 112's 232 µs a read that
+is about **232 µs saved per ordinary statement** and 700 µs on the self-join.
+
+**Why it is safe, in one sentence**: the version is a property of the transaction's snapshot, so it
+cannot move while the transaction lives — and the pin is dropped at every place `catalog_written`
+is set or cleared, which is every point a transaction begins, ends, or becomes a DDL one.
+
+**What the middle step waited on, and no longer does.** Halving a read is worth
+building when the read costs something; run 111's half-microsecond is a `MemoryBackend` table
+lookup and says nothing about a read that crosses a socket and Raft. Building the merge before that
+number exists would be the mistake
+[ADR 0100](0100-a-region-between-leaders-waits-on-the-callers-deadline.md) records: a change that
+looks like a fix, ships a smaller number, and leaves the question unanswered.
+
 3. **The tail is what decides against the median.** A mean of 200 µs with a `rest` bucket that is
    never empty is a different system from a flat 200 µs, and the second is the one nothing needs to
    be done about.

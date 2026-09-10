@@ -1603,6 +1603,82 @@ async fn how_the_leaderless_window_moves_with_the_drivers() {
     }
 }
 
+/// **What the catalog read costs on a topology that has stores in it** —
+/// [ADR 0102](../../../../docs/adr/0102-the-catalogs-read-path.md)'s numbers, taken where run 111
+/// could not take them.
+///
+/// Run 111 counted 4,790,406 catalog views in one `ActiveRecord` pass at a mean of under half a
+/// microsecond, and the mean is the tell: the harness starts `esker-sql 127.0.0.1:PORT` with no
+/// store addresses, so its backend is `MemoryBackend` — an in-process `BTreeMap` with no store, no
+/// placement driver, no Raft and no socket. The count is real and topology-independent; the cost
+/// is a table lookup and says nothing about the read this ADR is about.
+///
+/// This `Gate` is the other thing: real `Store`s behind real listeners, a real placement driver, a
+/// `StoreBackend` over a router with a lease. A catalog view here crosses a socket and Raft, which
+/// is what the criteria in §④ are written against.
+///
+/// **Prints and asserts nothing.** The numbers go in `docs/bench/v1.1.md` and the ADR; a
+/// measurement that fails a build is a gate, and this is not one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "an ADR 0102 measurement: a cluster, and it wants ESKER_CATALOG_STATS=1"]
+async fn what_a_catalog_read_costs_with_stores_under_it() {
+    const ROWS: i64 = 2_000;
+    let gate = Gate::start_splitting(u64::MAX).await;
+    println!("{}", the_box_right_now("catalog measurement"));
+    if std::env::var_os("ESKER_CATALOG_STATS").is_none() {
+        println!(
+            "  ESKER_CATALOG_STATS is not set: the counters stay at zero and this run says nothing"
+        );
+    }
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        settle(&mut session, "CREATE TABLE t (id int8 PRIMARY KEY, n int8)");
+        let before = esker_sql::catalog::stats::summary();
+        // One statement per round trip on purpose: each takes its own catalog view, which is the
+        // thing being counted. A batched insert would count one view for five hundred rows.
+        for n in 1..=ROWS {
+            // **The transients a splitting, electing cluster answers with are waited out, not
+            // failed on.** `40003` is an outcome nobody can know, `08006` is a client that spent
+            // its attempts, and both mean *not now*. The retry is safe here for the reason
+            // `cluster_harness::run` gives: every insert names its own primary key, so a second
+            // attempt either writes the row or meets `23505` on the row its first attempt wrote —
+            // and that is a success, accepted only *after* an ambiguous answer.
+            let statement = format!("INSERT INTO t VALUES ({n}, {n})");
+            let mut unknown = false;
+            for attempt in 0..40 {
+                match session.run(&statement) {
+                    Ok(_) => break,
+                    Err(error) => {
+                        let text = error.to_string();
+                        if unknown && text.contains("23505") {
+                            break;
+                        }
+                        unknown |= text.contains("may or may not have been applied");
+                        assert!(
+                            unknown
+                                || text.contains("not the leader")
+                                || text.contains("could not reach the store"),
+                            "`{statement}` was refused by something this measurement is not \
+                             about: {error}"
+                        );
+                        assert!(attempt < 39, "`{statement}` never landed: {error}");
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+        let after_writes = esker_sql::catalog::stats::summary();
+        for n in 1..=ROWS {
+            let _ = rows(&mut session, &format!("SELECT n FROM t WHERE id = {n}"));
+        }
+        println!("\n  {ROWS} point writes and {ROWS} point reads through a store-backed node");
+        println!("  before      {before}");
+        println!("  after writes {after_writes}");
+        println!("  after reads  {}", esker_sql::catalog::stats::summary());
+    });
+    gate.stop().await;
+}
+
 /// **Whether the region nobody leads is one whose handle lost its core** — ADR 0099's state,
 /// asked while the stall is happening rather than after it.
 ///

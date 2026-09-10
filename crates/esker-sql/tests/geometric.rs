@@ -35,13 +35,27 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 
 #[test]
 fn every_geometric_answer_is_postgresql_19_s() {
-    let checked = parity::replay(
+    let replayed = parity::replay_reporting(
         include_str!("corpus/pg19_geometric.txt"),
         CORPUS_FIXTURE,
         &DIVERGENCES,
     );
     assert!(
-        checked > 20,
-        "only {checked} statements ran; the corpus did not load"
+        replayed.checked > 20,
+        "only {} statements ran; the corpus did not load",
+        replayed.checked
+    );
+    // **Zero, and it was forty-four.** `'(2,3),(2,3)'::line` is a refusal on both sides and had no
+    // `SAVEPOINT` around it, so it aborted the transaction and everything after it — half this
+    // file, the whole `line` column, the index and `DISTINCT` probes, and the seven `SAVEPOINT`
+    // blocks that were supposed to guard the *other* refusals — came back `25P02` and was compared
+    // by nobody. The test was green throughout, and stayed green when an expected value was
+    // replaced by nonsense, which is how it was found.
+    //
+    // Rule 3 in the harness catches this only for a *declared* divergence; a refusal that agrees
+    // swallows just as much and nothing was watching. This assertion is that watch for this file.
+    assert_eq!(
+        replayed.swallowed, 0,
+        "an aborted transaction is swallowing statements this corpus is supposed to compare"
     );
 }

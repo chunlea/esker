@@ -190,6 +190,262 @@ pub fn from_text(kind: Kind, text: &str) -> Result<String> {
     }
 }
 
+/// `cos` and `sin` at the twelve angles a `circle` becomes a `polygon` at, **as PostgreSQL
+/// computes them**.
+///
+/// The cast's vertex count is fixed at twelve, so the angles are a finite table and a table is
+/// what this is: `cos(i · 2π/12)` and `sin(i · 2π/12)` read off the oracle, one probe, by asking
+/// for `polygon('<(0,0),1>'::circle)` — with a unit circle at the origin the vertex *is* the pair,
+/// `(-cos, sin)`. Reproduced against eight random circles afterwards, exactly, which is what says
+/// the table is the whole of it.
+///
+/// **Calling `f64::cos` here instead would answer differently on a different libm.** These twelve
+/// doubles are glibc's, which is what the oracle runs and what the container the gate runs in
+/// runs; this machine's own libm disagrees in the last bit at `i = 4` and `i = 7`, so the corpus
+/// row would be green in the container and red on the host. A distance has no such table — its
+/// inputs are the value's — and uses [`f64::hypot`], which is the same call PostgreSQL makes.
+const TWELFTHS: [(f64, f64); 12] = [
+    (1.0, 0.0),
+    (0.866_025_403_784_438_7, 0.499_999_999_999_999_94),
+    (0.500_000_000_000_000_1, 0.866_025_403_784_438_6),
+    (6.123_233_995_736_766e-17, 1.0),
+    (-0.499_999_999_999_999_8, 0.866_025_403_784_438_7),
+    (-0.866_025_403_784_438_5, 0.500_000_000_000_000_3),
+    (-1.0, 1.224_646_799_147_353_2e-16),
+    (-0.866_025_403_784_438_8, -0.499_999_999_999_999_7),
+    (-0.500_000_000_000_000_4, -0.866_025_403_784_438_4),
+    (-1.836_970_198_721_029_7e-16, -1.0),
+    (0.499_999_999_999_999_33, -0.866_025_403_784_439),
+    (0.866_025_403_784_438_4, -0.500_000_000_000_000_4),
+];
+
+/// The numbers of a shape's **own** canonical text, which is what it is stored as.
+fn coordinates(kind: Kind, text: &str) -> Result<Vec<f64>> {
+    numbers(text).ok_or_else(|| SqlError::InvalidTextRepresentation {
+        ty: kind.name(),
+        value: text.to_owned(),
+    })
+}
+
+/// One point printed the way both `point` and every shape made of points prints one.
+fn point(x: f64, y: f64) -> String {
+    format!("({},{})", num(x), num(y))
+}
+
+/// Nine of the fourteen conversions PostgreSQL has between the shapes: the ones whose *both* ends
+/// are one of the six. The other five have a `point` at one end — [`to_point`] and
+/// [`box_of_point`] — because a `point` is its own `Datum` and has no [`Kind`].
+///
+/// **Computed, not read back through the text.** The evaluator's ordinary cast is the target's
+/// input function over the source's output, and for these pairs that is either a refusal or, worse,
+/// an answer: a `box`'s text is two corners and `poly_in` reads any list of points, so
+/// `'((0,0),(1,1))'::box::polygon` was the *two-point* polygon `((1,1),(0,0))` where a real server
+/// gives the four corners, and an **open** `path` converted silently where a real server refuses
+/// it. Wrong and green, both of them.
+///
+/// Every formula was measured on 19beta1, and measured *inside* the server where the shape of the
+/// question allowed it, so the answer does not depend on this machine's libm: a `box`'s circle has
+/// the radius `centre <-> high corner` and not half the diagonal (500 random boxes, no
+/// exceptions), a `polygon`'s circle is centred on the mean of its vertices with the mean distance
+/// for a radius (150), and a `circle`'s polygon is twelve vertices at
+/// `(cx - r·cos θ, cy + r·sin θ)` (200). `tests/captures/pg19_cast_matrix.txt` holds one probe per
+/// pair and `tests/corpus/pg19_geometric.txt` the literal forms of all fourteen.
+pub fn convert(from: Kind, to: Kind, text: &str) -> Result<String> {
+    let parts = coordinates(from, text)?;
+    let refuse = || SqlError::CannotCast {
+        from: from.name(),
+        to: to.name(),
+    };
+    match (from, to) {
+        // A `box`'s canonical text is `(high),(low)`, which is where these four read their corners.
+        (Kind::Box, _) => {
+            let [hx, hy, lx, ly] = parts[..] else {
+                return Err(refuse());
+            };
+            let (cx, cy) = (middle(hx, lx), middle(hy, ly));
+            match to {
+                // **The circumscribed circle**, centred on the box and reaching its corner.
+                Kind::Circle => Ok(format!(
+                    "<{},{}>",
+                    point(cx, cy),
+                    num((cx - hx).hypot(cy - hy))
+                )),
+                // The diagonal, high end first — the order the box itself is written in.
+                Kind::Lseg => Ok(format!("[{},{}]", point(hx, hy), point(lx, ly))),
+                // **Anticlockwise from the lower left**, which is not the order the box's own two
+                // corners are in and is the reason this is a table rather than a re-spelling.
+                Kind::Polygon => Ok(format!(
+                    "({},{},{},{})",
+                    point(lx, ly),
+                    point(lx, hy),
+                    point(hx, hy),
+                    point(hx, ly)
+                )),
+                _ => Err(refuse()),
+            }
+        }
+        (Kind::Circle, _) => {
+            let [cx, cy, r] = parts[..] else {
+                return Err(refuse());
+            };
+            match to {
+                // **The inscribed box**, whose half-side is `r / √2` — the largest square the
+                // circle contains, not the smallest that contains it.
+                Kind::Box => {
+                    let delta = r / 2.0_f64.sqrt();
+                    Ok(format!(
+                        "{},{}",
+                        point(cx + delta, cy + delta),
+                        point(cx - delta, cy - delta)
+                    ))
+                }
+                // **Twelve vertices, and a radius of zero is `0A000` rather than twelve copies of
+                // the centre.** Measured: a real server calls it a feature it does not have, where
+                // the neighbouring refusal in this same function is a `22023`.
+                Kind::Polygon => {
+                    if r == 0.0 {
+                        return Err(SqlError::CircleWithRadiusZeroIsNotAPolygon);
+                    }
+                    let vertices: Vec<String> = TWELFTHS
+                        .iter()
+                        .map(|(cos, sin)| point(cx - r * cos, cy + r * sin))
+                        .collect();
+                    Ok(format!("({})", vertices.join(",")))
+                }
+                _ => Err(refuse()),
+            }
+        }
+        // **A `polygon` is closed and a `path` need not be**, so the one direction that can refuse
+        // is this one: `22023`, an invalid *parameter* — the text read fine and it is the shape
+        // that will not convert. The bracket is the whole of the question (`from_text` above).
+        (Kind::Path, Kind::Polygon) => {
+            if text.starts_with('[') {
+                return Err(SqlError::OpenPathIsNotAPolygon);
+            }
+            Ok(text.to_owned())
+        }
+        (Kind::Polygon, _) => {
+            let vertices: Vec<(f64, f64)> = parts.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+            let [first, ..] = vertices[..] else {
+                return Err(refuse());
+            };
+            match to {
+                // The bounding box, which is what a real server keeps beside every polygon.
+                Kind::Box => {
+                    let (mut hx, mut hy, mut lx, mut ly) = (first.0, first.1, first.0, first.1);
+                    for &(x, y) in &vertices {
+                        hx = hx.max(x);
+                        hy = hy.max(y);
+                        lx = lx.min(x);
+                        ly = ly.min(y);
+                    }
+                    Ok(format!("{},{}", point(hx, hy), point(lx, ly)))
+                }
+                // **The mean of the vertices, and the mean distance to them** — summed and then
+                // divided, in the polygon's own order, because that is where the last bit of a
+                // float comes from.
+                Kind::Circle => {
+                    let (cx, cy) = centroid(&vertices);
+                    let mut radius = 0.0;
+                    for &(x, y) in &vertices {
+                        radius += (x - cx).hypot(y - cy);
+                    }
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "the divisor is a vertex count; PostgreSQL divides by the same one"
+                    )]
+                    Ok(format!(
+                        "<{},{}>",
+                        point(cx, cy),
+                        num(radius / vertices.len() as f64)
+                    ))
+                }
+                // A `polygon` is a closed `path` and prints as one.
+                Kind::Path => Ok(text.to_owned()),
+                _ => Err(refuse()),
+            }
+        }
+        _ => Err(refuse()),
+    }
+}
+
+/// The four conversions whose target is a `point`, as the pair a `Datum::Point` holds.
+///
+/// A `point` is not a [`Kind`] — it is two floats and its own `Datum`, and this module is written
+/// against canonical *text* — so the five conversions it is an end of are here and in
+/// [`box_of_point`] rather than in [`convert`]'s table.
+pub fn to_point(from: Kind, text: &str) -> Result<(f64, f64)> {
+    let parts = coordinates(from, text)?;
+    let refuse = || SqlError::CannotCast {
+        from: from.name(),
+        to: "point",
+    };
+    match from {
+        // The midpoint of the segment, and the centre of the box: the same arithmetic on the same
+        // four numbers, which is why a real server has one function for the two of them.
+        Kind::Lseg | Kind::Box => {
+            let [x1, y1, x2, y2] = parts[..] else {
+                return Err(refuse());
+            };
+            Ok((middle(x1, x2), middle(y1, y2)))
+        }
+        Kind::Circle => {
+            let [x, y, _radius] = parts[..] else {
+                return Err(refuse());
+            };
+            Ok((x, y))
+        }
+        // **The mean of the vertices, not the centre of the bounding box** — measured, and it goes
+        // through the same circle `polygon -> circle` answers, which is why the two agree.
+        Kind::Polygon => {
+            let vertices: Vec<(f64, f64)> = parts.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+            if vertices.is_empty() {
+                return Err(refuse());
+            }
+            Ok(centroid(&vertices))
+        }
+        Kind::Path | Kind::Line => Err(refuse()),
+    }
+}
+
+/// `point -> box`: the degenerate box at the point, which is the one conversion a `point` is the
+/// **source** of. `'(1,2)'::point::box` is `(1,2),(1,2)`, measured.
+#[must_use]
+pub fn box_of_point(x: f64, y: f64) -> String {
+    format!("{},{}", point(x, y), point(x, y))
+}
+
+/// Halfway between two coordinates, **`(a + b) / 2` and deliberately not [`f64::midpoint`]**.
+///
+/// PostgreSQL adds and then divides, and its addition checks for overflow: the centre of
+/// `box(point(1e308,1e308), point(1.5e308,1e308))` is `22003 value out of range: overflow` on
+/// 19beta1, measured. `midpoint` exists to route around exactly that sum and would answer
+/// `1.25e308` — a number a real server does not give. Clippy suggests it; the suggestion is a
+/// different function.
+fn middle(a: f64, b: f64) -> f64 {
+    #[expect(
+        clippy::manual_midpoint,
+        reason = "PostgreSQL adds and then divides; see the doc comment above"
+    )]
+    let mid = (a + b) / 2.0;
+    mid
+}
+
+/// The mean of a vertex list, summed in the polygon's own order and divided once.
+fn centroid(vertices: &[(f64, f64)]) -> (f64, f64) {
+    let (mut x, mut y) = (0.0, 0.0);
+    for &(vx, vy) in vertices {
+        x += vx;
+        y += vy;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the divisor is a vertex count; PostgreSQL divides by the same one"
+    )]
+    let count = vertices.len() as f64;
+    (x / count, y / count)
+}
+
 /// The numbers in a shape's text, in order, ignoring every bracket and comma between them.
 ///
 /// One reader for all six because that is what PostgreSQL's own are: `'2,3,5.5,7'::box` and
