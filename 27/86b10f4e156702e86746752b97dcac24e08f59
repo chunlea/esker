@@ -1,0 +1,21 @@
+crates/esker-sql/tests/captures/pg19_comparison_matrix_column.txt
+  s_6f7019c05b578b::t_73a5e367e03ef8 1-2784
+crates/esker-sql/tests/comparison_matrix.rs
+  s_6f7019c05b578b::t_e7e8a72dd14409 114-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2786b10f4e156702e86746752b97dcac24e08f59",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
