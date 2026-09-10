@@ -1,0 +1,53 @@
+# **How a `reg*` compares** — PostgreSQL 19beta1, 2026-09-10, `127.0.0.1:55432`, one
+# `BEGIN … ROLLBACK` with a `SAVEPOINT`/`ROLLBACK TO` per probe. Wire v3 family **F8**, second step.
+#
+# A temp table per type, the value written **by name**, then every comparison shape.
+#
+#     CREATE TEMP TABLE gc (c regclass);  INSERT INTO gc VALUES ('ra'), ('rb');
+#     CREATE TEMP TABLE gp (c regproc);   INSERT INTO gp VALUES ('int4in'), ('int8in');
+#     CREATE TEMP TABLE gt (c regtype);   INSERT INTO gt VALUES ('int4'), ('text');
+#
+# ## The finding: the comparison is `oid`'s, so an `unknown` is digits and not a name
+#
+#     shape                          regclass          regproc            regtype
+#     c = '<name>'                   !22P02            !22P02             !22P02
+#     c > '<name>'                   !22P02            !22P02             !22P02
+#     '<name>' = c                   !22P02            !22P02             !22P02
+#     c IN ('<name>')                !22P02            !22P02             !22P02
+#     c IN ('<a>','<b>')             2 rows            2 rows             2 rows
+#     c IN ('<a>', 1)                1 row             —                  1 row
+#     c = '<name>'::<type>           1 row             1 row              1 row
+#     c = <number>                   t (1259)          f (26)             t (23)
+#     c > <number>                   —                 —                  t (20)
+#     c::text = '<printed>'          1 row             1 row              1 row
+#     c = ANY(ARRAY['<name>'])       !42883 operator does not exist: <type> = text
+#     INSERT … VALUES ('<name>')     ok                ok                 ok
+#     INSERT … VALUES ($1)           ok                ok                 ok
+#     WHERE c = $1  ($1 = '<name>')  !22P02            !22P02             !22P02
+#     WHERE c = $1  ($1 = '<oid>')   1 row             1 row              1 row
+#
+# The whole `22P02` reads `invalid input syntax for type **oid**: "<name>"` — for a column of
+# `regtype`. That is the tell: `pg_operator` has **no `=` for any of the three**, so `=` resolves
+# to `oideq` and the `unknown` operand is handed to `oidin`.
+#
+#     SELECT oprname, oprleft::regtype, oprright::regtype, oprcode
+#     FROM pg_operator WHERE oprname = '=' AND (oprleft = 'regtype'::regtype::oid OR …)
+#     -> no rows
+#
+# **It was never a parameter defect.** The literal and the bound parameter behave identically, and
+# the `INSERT` takes the name either way — the census's `param` shape simply happened to be where
+# it was first seen.
+#
+# ## `IN` is two rules and the length decides
+#
+# A list of **two or more** becomes a `ScalarArrayOpExpr` whose array is built through the *type's
+# input function*, so the names resolve. A list of **one** is rewritten to `=` and goes through the
+# operator. `c IN ('ra', 1)` answering one row is the same rule seen from the middle: the name
+# resolves and the number is an oid.
+#
+# ## The asymmetry in one line
+#
+# `regtypein` resolves a name; `oideq`'s operand is an oid. The same text is read two ways
+# depending on **where it stands**, which is why an assignment and a comparison of the same value
+# disagree — and why this crate's `Datum::from_text(RegType, …)`, which is the input function's
+# rule, was the wrong answer for a comparison.

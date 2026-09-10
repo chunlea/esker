@@ -2440,6 +2440,14 @@ impl Literal {
                     // compares one against a plain number.
                     | ColumnType::Oid
                     | ColumnType::RegProc
+                    // **And its two siblings, which were missing.** Measured on 19beta1:
+                    // `'pg_class'::regclass = 1259` is `t`, `'int4'::regtype = 23` is `t` and
+                    // `'int4'::regtype > 20` is `t` — every `reg*` compares as the oid it is, so
+                    // a plain number reaches all four and not two of them. This node answered
+                    // `42883 operator does not exist: regtype = integer` for the third
+                    // (wire v3 family F8).
+                    | ColumnType::RegClass
+                    | ColumnType::RegType
                     | ColumnType::Numeric
             ),
             Literal::Decimal(_) => matches!(

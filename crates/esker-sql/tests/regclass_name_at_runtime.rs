@@ -93,15 +93,22 @@ fn a_runtime_text_becomes_a_regclass() {
 ///
 /// **`= ANY` and `IN` are one rule everywhere but here.** This crate folds `x = ANY(array)` and
 /// `x <> ALL(array)` into the same `InList` node as a written `IN`, so an index seek can use a
-/// list it can see — and the two differ in exactly one place: a bare literal in the list. `IN`
-/// coerces it through the *type's* input function and resolves the name; `= ANY` really is `=`, so
-/// `r = ANY('{ra}')` is `22P02`. Measured, both. That is why the node carries an `any` flag rather
+/// list it can see — and the two differ in exactly one place: a bare literal in the list. An `IN`
+/// **of two or more** coerces it through the *type's* input function and resolves the name;
+/// `= ANY` really is `=`, so `r = ANY('{ra}')` is `22P02`. Measured, both. That is why the node carries an `any` flag rather
 /// than the two being one thing or two variants.
 ///
 /// **And it has to be decided before the common-type coercion.** That step gives every `unknown`
 /// in the list the list's type, which for a `regclass` operand means reading the name as an oid —
 /// the comparison's rule, arriving one step early. Putting this after it made `IN` a `22P02` no
 /// matter what the flag said.
+/// **And the length decides which of the two rules it is.** Measured on 19beta1 and added after
+/// this test had stood for a while with only its first half: a list of **two or more** becomes a
+/// `ScalarArrayOpExpr` whose array is built through the type's input function, and a list of
+/// **one** is rewritten to `=` — so `r IN ('ra')` is `22P02 invalid input syntax for type oid` and
+/// `r IN ('ra','rb')` answers. `r IN ('ra', 1)` answers one row, which is the same rule from the
+/// middle: the name resolves and the number is an oid. All three `reg*` types behave alike
+/// (`tests/captures/pg19_reg_comparison.txt`).
 #[test]
 fn an_in_list_resolves_its_names() {
     let mut node = node();
@@ -110,5 +117,16 @@ fn an_in_list_resolves_its_names() {
     assert_eq!(
         node.rows("SELECT id FROM rh WHERE r IN ('ra','rb') ORDER BY id"),
         vec![vec!["1"], vec!["2"]]
+    );
+    assert_eq!(
+        node.rows("SELECT id FROM rh WHERE r IN ('ra', 1) ORDER BY id"),
+        vec![vec!["1"]],
+        "a name and an oid in one list: both readings, one statement"
+    );
+    assert_eq!(
+        node.answer("SELECT id FROM rh WHERE r IN ('ra')")
+            .to_string(),
+        "!22P02 invalid input syntax for type oid: \"ra\"",
+        "a list of one is an `=`, and `=` over a regclass is oideq"
     );
 }

@@ -18,6 +18,16 @@
 //! of the six and call the sixth clean. Two rows were added to
 //! `esker-coord/wire-v3-probes.txt`, `expected` measured (`1563`, `bit varying[]`). Measure the
 //! arm, not the rows — the same rule that put `least` in the list beside `greatest`.
+//!
+//! **The `reg*` half of this family is closed and its tests moved.** A test stood in this file
+//! pinning the divergence — a bare name beside a `reg*` column answered where 19beta1 refuses —
+//! and `tests/reg_comparison.rs` closed it: `pg_operator` has no `=` for any of the three, the
+//! comparison is `oid`'s, and an `unknown` beside one is digits and not a name. Deleted rather
+//! than kept, because a pin whose divergence is gone is a test that measures the past.
+//!
+//! What the census called a *parameter* defect was a **comparison** one: the literal and the
+//! bound parameter behave identically and the `INSERT` takes the name either way. The shape of
+//! the probe is what made it look otherwise.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -168,38 +178,5 @@ fn an_array_cast_this_node_answers_and_postgresql_refuses() {
         node.answer("SELECT '{1}'::bit[]::money[]").to_string(),
         "money[]\t{$1.00}",
         "19beta1 refuses this with 42846 cannot cast type bit[] to money[]"
-    );
-}
-
-/// **`reg*` compares as an `oid`, and this node compares it as a name** — the family's other half,
-/// pinned at today's answer because closing it is its own step.
-///
-/// Measured on 19beta1, and it is **not** about parameters at all — the literal does the same:
-///
-/// ```text
-/// WHERE c = 'int4'::regtype   1 row          WHERE c = 23      1 row
-/// WHERE c = 'int4'            !22P02 invalid input syntax for type oid: "int4"
-/// WHERE c = $1  ($1='int4')   !22P02        WHERE c = $1 ($1='23')   1 row
-/// ```
-///
-/// `pg_operator` has **no `=` for `regtype`**: the comparison is `oid`'s, so an `unknown` beside a
-/// `reg*` column is read as an oid — digits, not a name. This node reads it as a name and
-/// **answers**, which is ADR 0031's worse direction.
-#[test]
-fn a_reg_type_still_compares_by_name_here() {
-    let mut node = parity::Node::new(&[
-        "CREATE TABLE r (c regtype)",
-        "INSERT INTO r VALUES ('int4')",
-    ]);
-    assert_eq!(
-        node.rows("SELECT c::text FROM r WHERE c = 'int4'"),
-        vec![vec!["integer"]],
-        "19beta1 refuses this with 22P02 invalid input syntax for type oid: \"int4\"; F8's second \
-         step closes it, and until then it must not change quietly"
-    );
-    assert_eq!(
-        node.rows("SELECT c::text FROM r WHERE c = 'int4'::regtype"),
-        vec![vec!["integer"]],
-        "the cast spelling is the one both servers answer"
     );
 }

@@ -3679,20 +3679,33 @@ fn resolve_in_list(
             any,
         });
     }
-    // **`IN` follows the assignment rule and not the comparison's** (`debts-v1.1.md` #41).
-    // Measured: `r = 'ra'` over a `regclass` is `22P02` — `=` is `oideq`, so the literal goes to
-    // `oidin` — while `r IN ('ra','rb')` **answers**, because a list is coerced through the
-    // *type's* input function. So each string item becomes a cast the row evaluator resolves with
-    // the executor's own name rule, and it is decided **before** the common-type coercion below:
-    // that one gives every `unknown` the list's type, which for a `regclass` operand means reading
-    // the name as an oid — the comparison's rule, arriving one step too early.
-    if !any && matches!(expr_type(&operand, scope), Ok(ColumnType::RegClass)) {
+    // **A list of two or more follows the assignment rule; a list of one is an `=`.**
+    // Measured on 19beta1 over all three `reg*` types (`tests/captures/pg19_reg_comparison.txt`):
+    //
+    //     c IN ('ra','rb')   2 rows      c IN ('ra')   22P02 invalid input syntax for type oid
+    //     c IN ('ra', 1)     1 row       c = 'ra'      22P02
+    //
+    // A multi-item `IN` becomes a `ScalarArrayOpExpr` whose array is built through the **type's
+    // input function**, so the names resolve; a single-item one is rewritten to `=` and goes
+    // through `oideq`, whose operand is an `oid`. Both halves are one rule and this had only the
+    // first — `c IN ('ra')` answered where a real server refuses — and only for `regclass`, so
+    // `regproc IN ('int4in','int8in')` and the `regtype` pair took the *comparison's* rule and
+    // refused where a real server answers (wire v3 family F8, `debts-v1.1.md` #41).
+    //
+    // Decided **before** the common-type coercion below: that one gives every `unknown` the
+    // list's type, which for a `reg*` operand means reading the name as an oid — the comparison's
+    // rule, arriving one step too early.
+    if !any
+        && items.len() >= 2
+        && let Ok(reg @ (ColumnType::RegClass | ColumnType::RegProc | ColumnType::RegType)) =
+            expr_type(&operand, scope)
+    {
         let mut cast = Vec::with_capacity(items.len());
         for item in items {
             cast.push(match item {
                 Expr::Literal(Literal::String(_)) => Expr::Cast {
                     operand: Box::new(item),
-                    to: ColumnType::RegClass,
+                    to: reg,
                     typmod: crate::value::NO_TYPMOD,
                 },
                 other => other,
@@ -4985,6 +4998,19 @@ fn retype(
         return Ok(Literal::Typed(Box::new(crate::value::regclass_of_oid(
             i64::from(oid),
         ))));
+    }
+    // **And a `regtype`, which is the third of three and was the one this rule never reached.**
+    // Measured on a `regtype` column holding `int4`: `c = 'int4'`, `c > 'int4'`, `'int4' = c` and
+    // `c IN ('int4')` are all `22P02 invalid input syntax for type oid: "int4"` on 19beta1, and
+    // this node answered every one of them — `Datum::from_text(RegType, …)` resolves the *name*,
+    // which is `regtypein`'s rule and the **input function's** question, not the operator's.
+    // `pg_operator` has no `=` for `regtype` at all: the comparison is `oid`'s, so the `unknown`
+    // goes to `oidin` (wire v3 family F8).
+    if matches!(ty, ColumnType::RegType)
+        && let Literal::String(text) = literal
+    {
+        let oid = crate::value::oid::from_text(text)?;
+        return Ok(Literal::Typed(Box::new(crate::value::regtype_of_oid(oid))));
     }
     match literal.assign(ty, "?column?") {
         // Reduced to a value of the column's own type, so the comparison is between two of them.
