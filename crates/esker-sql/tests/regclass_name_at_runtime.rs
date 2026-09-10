@@ -19,20 +19,21 @@
 //! be. It answered `an oid is an integer, not Text("pg_class")`, which is the shape of a value
 //! arriving somewhere its type was decided without it.
 //!
-//! # Why these are `#[ignore]` and not deleted
+//! # Where the rule lives, and why not in `Env`
 //!
-//! They are the handover: a red test says what a bug report cannot. **The mechanism is settled and
-//! the plumbing is not.** Resolving a relation *name* needs `Executor::stored_name_written` —
-//! `pg_temp` rewriting, then the search path walked against the catalog view — and every piece of
-//! that is Executor state. `Env`, which is what the row evaluator has, carries a transaction, a
-//! catalog snapshot and the search path, so a *nearly* faithful resolver could be written there —
-//! and that is exactly the mistake this repository has paid for before: a second reader of one
-//! name grammar, agreeing with the first until it does not.
+//! Resolving a relation *name* needs `Executor::stored_name_written` — `pg_temp` rewriting, then
+//! the search path walked against the catalog view — and every piece of that is Executor state.
+//! `Env`, which is what the row evaluator has, carries a transaction, a catalog snapshot and the
+//! search path, so a *nearly* faithful resolver could have been written there. That is exactly the
+//! mistake this repository has already paid for: a second reader of one name grammar, agreeing
+//! with the first until it does not.
 //!
-//! So the shape is the one #35 already uses in the other direction: the Executor builds the rule —
-//! a `&dyn Fn(&str) -> Result<i64>`, the mirror of the `oid -> name` closure `decode_row` takes —
-//! and hands it down. `Env` gains a field, its three construction sites pass it, and the three
-//! shapes above become one arm each: a `Datum::Text` cast to `regclass` in `exec::cursor`, the
+//! So the shape is the one #35 uses in the other direction. The Executor builds the rule —
+//! `Executor::name_rule`, a `&dyn Fn(&str) -> Result<i64>` wrapping `relation_oid`, the mirror of
+//! the `oid -> name` closure `decode_row` takes — and hands it down. It hangs on
+//! `cursor::Settings::names` rather than on `Env`: the same seam, three construction sites instead
+//! of `Env`'s, which is the deviation from the sketch above and was taken deliberately. Each of
+//! the three shapes is then one arm: a `Datum::Text` cast to `regclass` in `exec::cursor`, the
 //! assignment in `exec::dml`, and `resolve_in_list` wrapping each string item in that cast rather
 //! than reconciling it as an oid.
 //!
