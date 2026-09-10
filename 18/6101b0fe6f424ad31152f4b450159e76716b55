@@ -1,0 +1,25 @@
+crates/esker-sql/tests/captures/pg19_cast_matrix.txt
+  s_6f7019c05b578b::t_9ee74a915de511 286-485
+crates/esker-sql/tests/cast_matrix.rs
+  s_6f7019c05b578b::t_ea42361d31a25c 11,15-31,139-288
+crates/esker-sql/tests/corpus/pg19_cast_matrix.txt
+  s_6f7019c05b578b::t_89123a4d2572d5 286-485
+docs/plans/debts-v1.1.md
+  s_6f7019c05b578b::t_66e10138764755 117-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "186101b0fe6f424ad31152f4b450159e76716b55",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
