@@ -217,7 +217,13 @@ impl Cluster {
             .arg("--seed")
             .arg(SEED.to_string())
             .arg("--write-buffer-size")
-            .arg(WRITE_BUFFER.to_string());
+            .arg(WRITE_BUFFER.to_string())
+            // The victim has to *stay* dead: this test kills node 3 and then deletes the SSTs
+            // off its disk, and its evidence is that those exact files come back from the
+            // bucket. A supervisor that restarts the node by itself would have it running again
+            // before the deletion, so this flag is not tidiness here — it is what keeps the
+            // deletion from happening under a live store. See `cluster_chaos.rs`.
+            .arg("--no-respawn");
         if let Some(url) = store_url {
             command.arg("--sst-store").arg(url);
         }

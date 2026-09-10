@@ -94,6 +94,13 @@ pub(crate) struct DurabilityOptions {
     /// The store processes `chaos` may kill, by pid. **Given rather than discovered**: a lane never
     /// kills by name pattern, and the only pids this may signal are ones its caller named.
     pub(crate) pids: Vec<u32>,
+    /// A cluster's state file, re-read before every kill.
+    ///
+    /// **A restarted store has a new pid**, so a list given once on the command line names corpses
+    /// after the first round — which is what makes `--pids` a one-shot and this the loop. The
+    /// supervisor rewrites this file when it restarts a store (`esker cluster start`), so it is the
+    /// only place that knows which pid is current.
+    pub(crate) state: Option<String>,
     /// The key prefix, so two runs on one cluster cannot read each other's keys.
     pub(crate) keyspace: String,
 }
@@ -108,6 +115,7 @@ impl DurabilityOptions {
             run_for: Duration::from_secs(60),
             every: Duration::from_secs(7),
             pids: Vec::new(),
+            state: None,
             keyspace: "durability".to_owned(),
         }
     }
@@ -367,11 +375,12 @@ pub(crate) fn verify(options: &DurabilityOptions) -> Result<String, String> {
 /// firing would take the quorum. If nothing brings stores back, the run stops early and says so,
 /// which is a true statement about the cluster rather than fourteen shots at nothing.
 pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
-    if options.pids.len() < 3 {
+    let named = live_pids(options)?;
+    if named.len() < 3 {
         return Err(format!(
-            "--pids named {} store processes; a cluster this kills from needs at least three, so \
+            "{} store processes were named; a cluster this kills from needs at least three, so \
              that taking one never takes the quorum",
-            options.pids.len()
+            named.len()
         ));
     }
     let (transport, resolver) = crate::bench_route::routed(&options.pd)?;
@@ -410,7 +419,22 @@ pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
             ));
             continue;
         }
-        let pid = options.pids[usize::try_from(rng.next_u32()).unwrap_or(0) % options.pids.len()];
+        // **Re-read every round**, because a store the supervisor restarted has a new pid and a
+        // list taken once names corpses after the first kill.
+        let pids = match live_pids(options) {
+            Ok(pids) if !pids.is_empty() => pids,
+            Ok(_) => {
+                log.push(format!(
+                    "{at:>8} ms  no kill: the state file names no stores"
+                ));
+                continue;
+            }
+            Err(reason) => {
+                log.push(format!("{at:>8} ms  no kill: {reason}"));
+                continue;
+            }
+        };
+        let pid = pids[usize::try_from(rng.next_u32()).unwrap_or(0) % pids.len()];
         let outcome = kill9(pid);
         killed += u64::from(outcome.is_ok());
         log.push(format!(
@@ -426,6 +450,35 @@ pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
         began.elapsed(),
         log.join("\n"),
     ))
+}
+
+/// The store pids to choose from: the state file when one was given, else `--pids`.
+///
+/// `id address pid`, one node per line, written by `esker cluster start` and **rewritten when it
+/// restarts a store**. The driver is on line one with id 0 and is not a store, so it is skipped —
+/// killing the driver is a different experiment and `chaos` is not it.
+fn live_pids(options: &DurabilityOptions) -> Result<Vec<u32>, String> {
+    let Some(path) = &options.state else {
+        return Ok(options.pids.clone());
+    };
+    let text = std::fs::read_to_string(path).map_err(|error| format!("reading {path}: {error}"))?;
+    let mut pids = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [id, _address, pid] = fields[..] else {
+            return Err(format!(
+                "{path} has a line that is not `id address pid`: {line}"
+            ));
+        };
+        if id == "0" {
+            continue;
+        }
+        pids.push(
+            pid.parse::<u32>()
+                .map_err(|error| format!("{path} names a pid that is not a number: {error}"))?,
+        );
+    }
+    Ok(pids)
 }
 
 /// Commits one key, to ask whether the cluster is still serving.

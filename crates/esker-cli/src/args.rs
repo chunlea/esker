@@ -189,7 +189,8 @@ Commands:
   manifest-dump <dir>   Print a database's manifest and reconstructed version
   raw <verb> ...        Read or write keys over the network
   server                Open a store and serve the RawKV API
-  cluster start|stop    Start or stop a local cluster replicating one region
+  cluster start|stop    Start or stop a local cluster replicating one region;
+                        `start` restarts a store that exits unless --no-respawn
                         (--nodes, --data-dir, --base-port, --seed, --sst-store,
                         --write-buffer-size; each node gets its own prefix under
                         the one given). --pd also starts a placement driver on
@@ -205,7 +206,7 @@ Commands:
   durability record|chaos|verify
                         Prove no acknowledged write is lost when a store is
                         killed (--pd, --out/--in, --clients, --for, --every,
-                        --pids, --keyspace)
+                        --pids or --state, --keyspace)
 
 Options:
   -V, --version         Print the version
@@ -944,6 +945,7 @@ fn parse_durability(arguments: &[String]) -> Result<Command, ParseError> {
                     value: text.clone(),
                 })?;
             }
+            "--state" => options.state = Some(value("--state")?),
             "--pids" => {
                 let text = value("--pids")?;
                 options.pids = text
@@ -1438,6 +1440,7 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
     let mut sst_store: Option<String> = None;
     let mut write_buffer_size: Option<usize> = None;
     let mut pd = false;
+    let mut no_respawn = false;
     let mut index = 0;
 
     while index < rest.len() {
@@ -1493,6 +1496,7 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
             // cannot collide with the nodes', and it is printed. A cluster this command starts is
             // one it also has to be able to stop.
             "--pd" => pd = true,
+            "--no-respawn" => no_respawn = true,
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
             }
@@ -1509,6 +1513,7 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
             sst_store,
             write_buffer_size,
             pd,
+            no_respawn,
         })),
         "stop" => Ok(Command::Cluster(ClusterOptions::Stop { data_dir })),
         other => Err(ParseError::UnknownCommand(format!("cluster {other}"))),
@@ -2378,6 +2383,7 @@ mod tests {
             sst_store,
             write_buffer_size,
             pd,
+            no_respawn,
         }) = parse_ok(&[
             "cluster",
             "start",
@@ -2400,6 +2406,18 @@ mod tests {
             "and keeps the engine's memtable size"
         );
         assert!(!pd, "a cluster starts no placement driver unless asked");
+        assert!(
+            !no_respawn,
+            "a store that exits is restarted unless the operator says otherwise — a chaos run \
+             needs something to wait for"
+        );
+
+        let Command::Cluster(ClusterOptions::Start { no_respawn, .. }) =
+            parse_ok(&["cluster", "start", "--no-respawn"])
+        else {
+            panic!("expected a cluster start");
+        };
+        assert!(no_respawn, "--no-respawn keeps the old behaviour");
 
         let Command::Cluster(ClusterOptions::Stop { data_dir }) =
             parse_ok(&["cluster", "stop", "--data-dir", "/tmp/c"])
