@@ -90,6 +90,94 @@ fn key_order(left: &str, right: &str) -> std::cmp::Ordering {
 ///
 /// Both arguments are already canonical — this is only ever called on stored `jsonb` — so parsing
 /// cannot fail on anything a caller can reach, and a failure is returned rather than assumed away.
+/// Where `left` sorts against `right` as two `jsonb` values.
+///
+/// **Written against the measured cells and not derived from a model**, because the model that
+/// explains the ordering is false: "a scalar is internally a one-element array, so a zero-length
+/// array wins on length" accounts for every ordering cell on 19beta1 and predicts `[null] = null`
+/// and `[1] = 1`, which are both `f`. See `tests/captures/pg19_jsonb_order.txt`, where the two
+/// refuting rows sit beside the cells they refute.
+///
+/// So the rank below is the measurement: `[] < null < string < number < boolean < array < object`,
+/// with **the empty array below every scalar** and every other array above every scalar. Within a
+/// kind: numbers compare as `numeric` (`1.0 = 1.00`, `2 < 10`, where text says otherwise), arrays
+/// by length before contents (`[2] < [1,1]`), objects by pair count before keys and then values.
+/// Key order is not part of the value because [`canonicalise`] already sorted it.
+pub(crate) fn compare(left: &str, right: &str) -> Result<std::cmp::Ordering> {
+    Ok(order(
+        &parse(left, Nulls::Refuse)?,
+        &parse(right, Nulls::Refuse)?,
+    ))
+}
+
+/// The rank a value sorts in, measured — see [`compare`].
+fn rank(value: &Json) -> u8 {
+    match value {
+        // Not a mistake and not derivable: `'[]' < 'null'` while `'[1]' > 'true'`.
+        Json::Array(items) if items.is_empty() => 0,
+        Json::Null => 1,
+        Json::Str(_) => 2,
+        Json::Number(_) => 3,
+        Json::Bool(_) => 4,
+        Json::Array(_) => 5,
+        Json::Object(_) => 6,
+    }
+}
+
+fn order(left: &Json, right: &Json) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match rank(left).cmp(&rank(right)) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    match (left, right) {
+        (Json::Bool(a), Json::Bool(b)) => a.cmp(b),
+        // As `numeric`, which is the whole reason this is not a text comparison.
+        (Json::Number(a), Json::Number(b)) => {
+            match (
+                crate::value::numeric::from_text(a),
+                crate::value::numeric::from_text(b),
+            ) {
+                (Ok(a), Ok(b)) => crate::value::numeric::pg_cmp(&a, &b),
+                // Unreachable for a parsed document; ordering by the canonical digits is the
+                // honest fallback rather than a panic on a value that has already been accepted.
+                _ => a.cmp(b),
+            }
+        }
+        (Json::Str(a), Json::Str(b)) => a.cmp(b),
+        (Json::Array(a), Json::Array(b)) => a
+            .len()
+            .cmp(&b.len())
+            .then_with(|| compare_in_order(a.iter().zip(b.iter()))),
+        (Json::Object(a), Json::Object(b)) => a.len().cmp(&b.len()).then_with(|| {
+            // Keys before values, and both in the canonical key order.
+            a.iter()
+                .zip(b.iter())
+                .find_map(|((ka, _), (kb, _))| match key_order(ka, kb) {
+                    Ordering::Equal => None,
+                    other => Some(other),
+                })
+                .unwrap_or_else(|| {
+                    compare_in_order(a.iter().map(|(_, v)| v).zip(b.iter().map(|(_, v)| v)))
+                })
+        }),
+        // Two values of one rank are one kind, and the three that reach here — two nulls, two
+        // empty arrays, and a rank shared by nothing else — are equal by having nothing to
+        // compare.
+        _ => Ordering::Equal,
+    }
+}
+
+fn compare_in_order<'a>(pairs: impl Iterator<Item = (&'a Json, &'a Json)>) -> std::cmp::Ordering {
+    for (a, b) in pairs {
+        match order(a, b) {
+            std::cmp::Ordering::Equal => {}
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 pub(crate) fn concat(left: &str, right: &str) -> Result<String> {
     let left = parse(left, Nulls::Refuse)?;
     let right = parse(right, Nulls::Refuse)?;
@@ -505,4 +593,62 @@ fn numeric_text(digits: &str) -> Option<String> {
         }
     }
     Some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+
+    /// **Every cell of the capture, checked against the implementation.**
+    ///
+    /// The capture is the specification for this family — the header says to implement against the
+    /// cells and not to derive them — so the test reads the cells rather than restating them. A row
+    /// that is re-measured differently on a later PostgreSQL fails here without anybody editing a
+    /// list.
+    #[test]
+    fn every_measured_cell_agrees() {
+        let capture = include_str!("../../tests/captures/pg19_jsonb_order.txt");
+        let mut checked = 0;
+        for line in capture.lines().filter(|line| !line.starts_with('#')) {
+            let mut fields = line.split('\t');
+            let (Some(statement), Some(_), Some(rows)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            // `SELECT ('<a>'::jsonb <op> '<b>'::jsonb) AS v`
+            let Some(inner) = statement
+                .strip_prefix("SELECT ('")
+                .and_then(|rest| rest.strip_suffix(") AS v"))
+            else {
+                continue;
+            };
+            let Some((left, rest)) = inner.split_once("'::jsonb ") else {
+                continue;
+            };
+            let Some((op, right)) = rest.split_once(" '") else {
+                continue;
+            };
+            let Some(right) = right.strip_suffix("'::jsonb") else {
+                continue;
+            };
+            let ordering = super::compare(left, right).expect("both sides parse");
+            let ours = match op {
+                "<" => ordering == Ordering::Less,
+                ">" => ordering == Ordering::Greater,
+                "=" => ordering == Ordering::Equal,
+                _ => continue,
+            };
+            assert_eq!(
+                ours,
+                rows == "t",
+                "{left} {op} {right}: PostgreSQL says {rows}"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 45,
+            "only {checked} cells read; the capture did not load"
+        );
+    }
 }
