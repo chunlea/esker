@@ -1,0 +1,66 @@
+# **`length` is four names and four overload sets** — PostgreSQL 19beta1, 2026-09-10,
+# `127.0.0.1:55432`, one `BEGIN … ROLLBACK` with a `SAVEPOINT`/`ROLLBACK TO` per probe.
+#
+# Found beside wire v3 family F3b, where a test reached for `length('101'::bit(3) || '01'::bit(2))`
+# and got `42883`. It was written down as "a missing function". It is not.
+#
+# ## `pg_proc`, all of it
+#
+#     bit_length   (bit)        int4      length      (bit)        int4
+#     bit_length   (bytea)      int4      length      (bytea)      int4
+#     bit_length   (text)       int4      length      (bytea, name) int4
+#     char_length  (character)  int4      length      (character)  int4
+#     char_length  (text)       int4      length      (lseg)       **float8**
+#     octet_length (bit)        int4      length      (path)       **float8**
+#     octet_length (bytea)      int4      length      (text)       int4
+#     octet_length (character)  int4      length      (tsvector)   int4
+#     octet_length (text)       int4
+#
+# ## What each name counts
+#
+#                     length          char_length   octet_length   bit_length
+#     text/character  characters      characters    bytes          bytes x 8
+#     bit / varbit    **bits**        -             bytes          bits
+#     bytea           bytes           -             bytes          bytes x 8
+#     tsvector        **lexemes**     -             -              -
+#     lseg / path     **float8**      -             -              -
+#
+# `char_length` and `character_length` are the **same two** overloads under two spellings, and a
+# `42883` names the spelling the caller wrote — which is why they are two variants here.
+#
+# ## Over the wire v3 probe list's 100 spellings
+#
+# `length` answers **eleven**: `"char"`, `bit`, `bytea`, `character`, `character varying`, `citext`,
+# `lseg`, `name`, `path`, `text`, `tsvector`. `upper`/`lower` answer **twelve** — the six string
+# types and the **six ranges**, where they are the bounds.
+#
+# **This node answered ninety-nine of the hundred for `length`**, because every scalar function read
+# its operand as `text`. Seventeen rows diverged and **thirteen were the worse direction** — a value
+# where a real server raises:
+#
+#     length(daterange)   node 2020-01-02   -- the range's UPPER BOUND
+#     length(json)        node 7            length(jsonb)   node 8
+#     length(xml)         node 4            length(lquery)  node 3
+#     length(int2vector)  node 3            length(oidvector) node 3
+#     length(tsrange)     node 2020-01-02 00:00:00
+#
+# and four the other way: `bit`, `bytea`, `lseg`, `path` refused where 19beta1 answers.
+#
+# ## The geometric length, measured
+#
+#     length('[(0,0),(3,4)]'::lseg)        5        length('[(1,1),(1,1)]'::lseg)   0
+#     length('[(0,0),(3,4)]'::path)        5        -- open, one segment
+#     length('((0,0),(3,4))'::path)        10       -- **closed: the edge back counts**
+#     length('[(0,0),(3,4),(3,0)]'::path)  9        -- 5 + 4
+#     length('((0,0),(3,4),(3,0))'::path)  12       -- 5 + 4 + 3
+#     length('[(0,0)]'::path)              0
+#
+# A `path`'s bracket says whether it is open, and the closing edge is counted at two points as
+# well as at three.
+#
+# ## The one this does not close
+#
+# `bit_length` has three overloads on 19beta1 — `bit_length('abc')` is 24, `bit_length('1'::bit)`
+# is 1, `bit_length('\x0102'::bytea)` is 16 — and this node has none of them. It answers
+# `0A000 the function bit_length is not supported`, which is a **named** refusal and not a wrong
+# value. Its own small item, pinned in `tests/length_overloads.rs`.

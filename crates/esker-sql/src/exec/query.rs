@@ -2962,6 +2962,22 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
         // the storage — `octet_length(c)` is `4` where `length(c)` is `1`, measured.
         Expr::Scalar { func, operand } => {
             let operand = resolve(operand, scope)?;
+            // **A scalar function has an overload list and this read everything as `text`.**
+            // Measured over the wire v3 probe list's 100 spellings
+            // (`tests/captures/pg19_length_overloads.txt`): `length` answers eleven of them and
+            // this node answered ninety-nine, because `read_as_text` gave every operand `text`'s
+            // reading — the same shape `||` had. Thirteen of the seventeen diverging rows were the
+            // *worse* direction, a value where a real server raises: `length(daterange)` came back
+            // as the range's **upper bound**.
+            if let Ok(ty) = expr_type(&operand, scope)
+                && !scalar_accepts(*func, ty)
+            {
+                return Err(SqlError::UndefinedFunctionTypes(format!(
+                    "{}({})",
+                    func.name(),
+                    ty.name()
+                )));
+            }
             Expr::Scalar {
                 func: *func,
                 operand: Box::new(if *func == crate::plan::ScalarFunc::OctetLength {
@@ -5809,6 +5825,84 @@ fn same_comparison_family(left: ColumnType, right: ColumnType) -> bool {
     matches!((family(left), family(right)), (Some(a), Some(b)) if a == b)
 }
 
+/// The type one of the counting functions answers, or `None` for the rest.
+///
+/// **All of them are `integer` except one**: `length` over an `lseg` or a `path` is a
+/// `double precision`, the geometric length, which is the one overload of the eight whose answer
+/// is not a count. Measured: `pg_typeof(length('[(0,0),(3,4)]'::lseg))` is `double precision`.
+fn counting_type(
+    func: crate::plan::ScalarFunc,
+    operand: &Expr,
+    scope: &Scope<'_>,
+) -> Option<ColumnType> {
+    use crate::plan::ScalarFunc;
+    match func {
+        ScalarFunc::Length
+            if matches!(
+                expr_type(operand, scope),
+                Ok(ColumnType::Lseg | ColumnType::Path)
+            ) =>
+        {
+            Some(ColumnType::Double)
+        }
+        ScalarFunc::Length
+        | ScalarFunc::CharLength
+        | ScalarFunc::CharacterLength
+        | ScalarFunc::OctetLength
+        | ScalarFunc::Ascii => Some(ColumnType::Int4),
+        _ => None,
+    }
+}
+
+/// **Which types a scalar function has an overload for** — `pg_proc`, measured rather than
+/// assumed.
+///
+/// Eight rows over the four counting names on 19beta1, and they do **not** agree with each other:
+///
+/// ```text
+///                 length          char_length   octet_length   bit_length
+/// text/character  characters      characters    bytes          bytes x 8
+/// bit / varbit    **bits**        -             bytes          bits
+/// bytea           bytes           -             bytes          bytes x 8
+/// tsvector        **lexemes**     -             -              -
+/// lseg / path     **float8**      -             -              -
+/// ```
+///
+/// `lower` and `upper` have a **range** overload beside the string one — they are the bounds — and
+/// that is the pair this crate already told apart by the operand. Everything else here is the same
+/// rule for the other five names.
+///
+/// `abs` is not in the table: it is the numeric one and its path is untouched.
+fn scalar_accepts(func: crate::plan::ScalarFunc, ty: ColumnType) -> bool {
+    use crate::plan::ScalarFunc;
+    let stringy = concat_stringy(ty) || ty == ColumnType::Char;
+    match func {
+        // The bounds of a range, or the case of a string.
+        ScalarFunc::Lower | ScalarFunc::Upper => stringy || esker_keys::row::is_range(ty),
+        ScalarFunc::Reverse
+        | ScalarFunc::Ascii
+        | ScalarFunc::CharLength
+        | ScalarFunc::CharacterLength => stringy,
+        ScalarFunc::Length => {
+            stringy
+                || matches!(
+                    ty,
+                    ColumnType::Bit
+                        | ColumnType::VarBit
+                        | ColumnType::Bytea
+                        | ColumnType::TsVector
+                        | ColumnType::Lseg
+                        | ColumnType::Path
+                )
+        }
+        ScalarFunc::OctetLength => {
+            stringy || matches!(ty, ColumnType::Bit | ColumnType::VarBit | ColumnType::Bytea)
+        }
+        // Untouched: the numeric one, whose operand the evaluator has always decided.
+        ScalarFunc::Abs => true,
+    }
+}
+
 /// The types that reach `text || text` through an implicit cast, which is why
 /// `citext || citext` answers `text` and not `citext`.
 fn concat_stringy(ty: ColumnType) -> bool {
@@ -6350,13 +6444,7 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         // only a client that binds by the declared type could see it, which is exactly what
         // `ActiveRecord` does. Found while wiring `length(tsvector)`, which is the same function
         // over a fourth operand.
-        Expr::Scalar {
-            func:
-                crate::plan::ScalarFunc::Length
-                | crate::plan::ScalarFunc::OctetLength
-                | crate::plan::ScalarFunc::Ascii,
-            ..
-        } => ColumnType::Int4,
+        Expr::Scalar { func, operand } if let Some(ty) = counting_type(*func, operand, scope) => ty,
         // **The session functions answer `name`, and the plural answers `name[]`.** Measured:
         // `current_schema()`, `current_database()` and `current_user` are `name` on a real server
         // and `current_schemas(bool)` is `name[]`, where `current_setting()` is a `text` and stays

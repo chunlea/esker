@@ -6110,6 +6110,25 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
         // constructor folded and then read again at the target's element type. Going through the
         // text is `array_in` doing the element conversion, so a value that does not fit the new
         // element type fails with that type's own message.
+        // **And the pair still has to have a cast.** Going through the text is `array_in`, which
+        // reads whatever the target's element reader accepts — so `'{x}'::"char"[]::bytea[]`
+        // answered `{"\\x78"}` here while 19beta1 says
+        // `42846 cannot cast type "char"[] to bytea[]`, and `'{1}'::bit[]::money[]` answered
+        // `{$1.00}`. The **scalar** pair was refused and the same pair through a **column** was
+        // refused; only a literal array slipped, because this arm returns before the general
+        // `casts_to` guard below ever runs.
+        //
+        // Measured over every ordered pair of the wire v3 probe list's 100 spellings — 9,900 casts
+        // on both servers (`tests/captures/pg19_cast_matrix.txt`): **308 of them** were a value
+        // where a real server raises, which is the class ADR 0031 ranks worst.
+        if let Ok(Some(from)) = source_type(expr)
+            && !catalog::pg_catalog::casts_to(from, array)
+        {
+            return Err(SqlError::CannotCast {
+                from: from.name(),
+                to: array.name(),
+            });
+        }
         let text = match cast_literal_text(expr)? {
             Some(text) => Some(text),
             None => match lower_expr(expr) {

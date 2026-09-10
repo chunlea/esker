@@ -29,18 +29,13 @@ const CORPUS_FIXTURE: &[&str] = &[];
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    // **One row, and it is not about `lower`.** Both refuse with `42883`, both give the same
-    // DETAIL and HINT, and they name a different integer: PostgreSQL says `lower(integer)` because
-    // a bare `1` is an `int4` there, and this node says `lower(bigint)` because it types an
-    // unsuffixed integer literal as `int8`. A divergence of the *literal*, which every type's
-    // `= 1` says — `tests/uuid.rs` carries the same sentence for `uuid_cmp`.
-    answers: &[(
-        "SELECT lower(1)",
-        "`lower(bigint)` where PostgreSQL says `lower(integer)`: an unsuffixed integer literal is \
-         an `int8` here and an `int4` there. The refusal, its DETAIL and its HINT all agree; only \
-         the literal's type name differs",
-        "UNMEASURED",
-    )],
+    // **`SELECT lower(1)` stood here and is gone.** It said the two refusals named a different
+    // integer — `lower(integer)` there, `lower(bigint)` here — because an unsuffixed literal is an
+    // `int8` in this node. The `int4` rung (ADR 0087) had already closed the literal's width; what
+    // kept the row diverging was **where the refusal came from**: the evaluator, out of the datum,
+    // which is still an `i64`. The scalar-overload table moved it to resolution, where the
+    // declared type has been `integer` all along, and the whole sentence now matches.
+    answers: &[],
 };
 
 #[test]

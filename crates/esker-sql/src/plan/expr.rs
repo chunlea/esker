@@ -661,9 +661,18 @@ pub enum ScalarFunc {
     /// `ascii(text)`: the code point of the **first** character, as an `int4`. An empty string
     /// is `0`.
     Ascii,
-    /// `length(text)`, and its two aliases `char_length` and `character_length`: **characters**,
-    /// not bytes.
+    /// `length(x)`, and it is **not** the same function as `char_length`.
+    ///
+    /// Eight `pg_proc` rows over four names on 19beta1, and they do not agree: `length` counts
+    /// **characters** for a string, **bits** for a `bit`, **bytes** for a `bytea`, **lexemes** for
+    /// a `tsvector`, and answers a **`double precision`** for an `lseg` or a `path` — the
+    /// geometric length. `char_length` has two overloads and neither is any of those.
     Length,
+    /// `char_length(x)`: **characters**, and only over `text` and `character`.
+    CharLength,
+    /// `character_length(x)`: the same two overloads under the other spelling, kept apart because
+    /// a `42883` names the spelling the caller wrote.
+    CharacterLength,
     /// `octet_length(text)`: **bytes**, which is a different number for anything non-ASCII — the
     /// pair is only interesting because the suite's generated columns use both.
     OctetLength,
@@ -680,6 +689,8 @@ impl ScalarFunc {
             ScalarFunc::Reverse => "reverse",
             ScalarFunc::Ascii => "ascii",
             ScalarFunc::Length => "length",
+            ScalarFunc::CharLength => "char_length",
+            ScalarFunc::CharacterLength => "character_length",
             ScalarFunc::OctetLength => "octet_length",
         }
     }
@@ -693,7 +704,9 @@ impl ScalarFunc {
             "abs" => Some(ScalarFunc::Abs),
             "reverse" => Some(ScalarFunc::Reverse),
             "ascii" => Some(ScalarFunc::Ascii),
-            "length" | "char_length" | "character_length" => Some(ScalarFunc::Length),
+            "length" => Some(ScalarFunc::Length),
+            "char_length" => Some(ScalarFunc::CharLength),
+            "character_length" => Some(ScalarFunc::CharacterLength),
             "octet_length" => Some(ScalarFunc::OctetLength),
             _ => None,
         }

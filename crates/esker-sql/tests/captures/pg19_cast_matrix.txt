@@ -1,0 +1,664 @@
+# **Every cast between two of the probe list's types** — PostgreSQL 19beta1, 2026-09-10,
+# `127.0.0.1:55432`, one `BEGIN … ROLLBACK` with a `SAVEPOINT`/`ROLLBACK TO` per probe.
+#
+# Every **ordered pair** of the wire v3 probe list's 100 distinct type spellings — 9,900 casts —
+# asked as `SELECT ($1::<source>::<target>) IS NOT NULL` with the source's own probe value bound.
+# 2.8 seconds of oracle time, which is what makes the complete sweep cheaper than the estimate it
+# replaces.
+#
+# ## What 19beta1 answers
+#
+#     ok        1,037      !42846    8,243      !22P02      522
+#     !22007       40      !22023       14      !42601       11
+#     !42P01        9      !42883        9
+#
+# `42846` is by far the common answer: **most pairs of types have no cast at all**, and a node that
+# reads a value's text through the target's input function will answer where a real server refuses.
+#
+# ## What this node answered, before and after the literal-array guard
+#
+#                                  before    after
+#     node answers, PG refuses        391       95     <- ADR 0031's worst class
+#     node refuses, PG answers        121      121
+#     both refuse, different code   3,501      293
+#                                   -----     -----
+#                                   4,013       509
+#
+# **3,504 rows closed and none regressed**, by one check. `parse::lower`'s array arm reads a
+# literal array's *text* and hands it to the target's `array_in` — which is right for a pair that
+# has a cast and wrong for a pair that does not — and it returns before the general `casts_to`
+# guard below it. So `'{x}'::"char"[]::bytea[]` answered `{"\x78"}` while the **scalar**
+# `'x'::"char"::bytea` and the same pair through a **column** both refused correctly.
+#
+# The sqlstate half is the same fix: a pair with no cast used to reach `array_in` and fail as the
+# element reader's `22P02` — "invalid input syntax" for a conversion that does not exist — where a
+# real server says `42846` before reading anything.
+#
+# ## What is left, and it is not one thing
+#
+#     95   node answers, PG refuses    — mostly `text ->` something the reader accepts too freely
+#     121  node refuses, PG answers    — pairs whose `pg_cast` row this node's table does not carry
+#     293  both refuse, different code
+#
+# The 121 overlap family F9's forty `pg_cast` rows: a stock-server capture could not see the
+# extension casts, and some `reg*` pairs were left out of a set that is otherwise complete. Sized
+# from this sweep rather than from a name.
+#
+# ## Which casts exist — the 1,037 `ok` rows, one line per source
+#
+#     <source> <TAB> <every target it casts to>
+#
+"char"	character character varying citext integer name text
+"char"[]	character character varying character varying[] character[] citext citext[] integer[] name name[] text text[]
+bigint	bit bytea character character varying citext double precision integer money name numeric oid real regclass regproc regtype smallint text
+bigint[]	bit[] bytea[] character character varying character varying[] character[] citext citext[] double precision[] integer[] money[] name name[] numeric[] oid[] real[] regclass[] regproc[] regtype[] smallint[] text text[]
+bit	bigint character character varying citext integer name text
+bit[]	bigint[] character character varying character varying[] character[] citext citext[] integer[] name name[] text text[]
+boolean	character character varying citext integer name text
+boolean[]	character character varying character varying[] character[] citext citext[] integer[] name name[] text text[]
+box	character character varying circle citext lseg name point polygon text
+box[]	character character varying character varying[] character[] circle[] citext citext[] lseg[] name name[] point[] polygon[] text text[]
+bytea	bigint character character varying citext integer name smallint text
+bytea[]	bigint[] character character varying character varying[] character[] citext citext[] integer[] name name[] smallint[] text text[]
+character	"char" bit bytea character varying citext lquery ltree name text tsquery tsvector void xml
+character varying	"char" bit bytea character citext lquery ltree name text tsquery tsvector void xml
+character varying[]	"char"[] bit[] bytea[] character character varying character[] citext citext[] ltree[] name name[] text text[] tsquery[] tsvector[] xml[]
+character[]	"char"[] bit[] bytea[] character character varying character varying[] citext citext[] ltree[] name name[] text text[] tsquery[] tsvector[] xml[]
+cidr	character character varying citext inet name text
+cidr[]	character character varying character varying[] character[] citext citext[] inet[] name name[] text text[]
+circle	box character character varying citext name point polygon text
+circle[]	box[] character character varying character varying[] character[] citext citext[] name name[] point[] polygon[] text text[]
+citext	"char" bit bytea character character varying lquery ltree name text tsquery tsvector void xml
+citext[]	"char"[] bit[] bytea[] character character varying character varying[] character[] citext ltree[] name name[] text text[] tsquery[] tsvector[] xml[]
+date	character character varying citext name text timestamp timestamp with time zone
+date[]	character character varying character varying[] character[] citext citext[] name name[] text text[] timestamp with time zone[]
+daterange	character character varying citext name text
+daterange[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+double precision	bigint character character varying citext integer name numeric real smallint text
+double precision[]	bigint[] character character varying character varying[] character[] citext citext[] integer[] name name[] numeric[] real[] smallint[] text text[]
+hstore	character character varying citext json jsonb name text
+hstore[]	character character varying character varying[] character[] citext citext[] json[] jsonb[] name name[] text text[]
+inet	character character varying cidr citext name text
+inet[]	character character varying character varying[] character[] cidr[] citext citext[] name name[] text text[]
+int2vector	bigint[] bytea[] character character varying character varying[] character[] citext citext[] double precision[] integer[] name name[] numeric[] oid[] real[] regclass[] regproc[] regtype[] smallint[] text text[]
+int4range	character character varying citext name text
+int4range[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+int8range	character character varying citext name text
+int8range[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+integer	"char" bigint bit boolean bytea character character varying citext double precision money name numeric oid real regclass regproc regtype smallint text
+integer[]	"char"[] bigint[] bit[] boolean[] bytea[] character character varying character varying[] character[] citext citext[] double precision[] money[] name name[] numeric[] oid[] real[] regclass[] regproc[] regtype[] smallint[] text text[]
+interval	character character varying citext name text time
+interval[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+json	character character varying citext jsonb name text
+json[]	character character varying character varying[] character[] citext citext[] jsonb[] name name[] text text[]
+jsonb	character character varying citext json name text
+jsonb[]	character character varying character varying[] character[] citext citext[] json[] name name[] text text[]
+line	character character varying citext name text
+line[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+lquery	character character varying citext name text
+lseg	character character varying citext name point text
+lseg[]	character character varying character varying[] character[] citext citext[] name name[] point[] text text[]
+ltree	character character varying citext name text
+ltree[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+macaddr	character character varying citext name text
+macaddr[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+money	character character varying citext name numeric text
+money[]	character character varying character varying[] character[] citext citext[] name name[] numeric[] text text[]
+name	"char" bit bytea character character varying citext lquery ltree text tsquery tsvector void xml
+name[]	"char"[] bit[] bytea[] character character varying character varying[] character[] citext citext[] ltree[] name text text[] tsquery[] tsvector[] xml[]
+numeric	bigint character character varying citext double precision integer money name real smallint text
+numeric[]	bigint[] character character varying character varying[] character[] citext citext[] double precision[] integer[] money[] name name[] real[] smallint[] text text[]
+numrange	character character varying citext name text
+numrange[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+oid	bigint character character varying citext integer name regclass regproc regtype text
+oid[]	bigint[] character character varying character varying[] character[] citext citext[] integer[] name name[] regclass[] regproc[] regtype[] text text[]
+oidvector	bigint[] character character varying character varying[] character[] citext citext[] integer[] name name[] oid[] regclass[] regproc[] regtype[] text text[]
+path	character character varying citext name polygon text
+path[]	character character varying character varying[] character[] citext citext[] name name[] polygon[] text text[]
+point	box character character varying citext name text
+point[]	box[] character character varying character varying[] character[] citext citext[] name name[] text text[]
+polygon	box character character varying circle citext name path point text
+polygon[]	box[] character character varying character varying[] character[] circle[] citext citext[] name name[] path[] point[] text text[]
+real	bigint character character varying citext double precision integer name numeric smallint text
+real[]	bigint[] character character varying character varying[] character[] citext citext[] double precision[] integer[] name name[] numeric[] smallint[] text text[]
+regclass	bigint character character varying citext integer name oid text
+regclass[]	bigint[] character character varying character varying[] character[] citext citext[] integer[] name name[] oid[] text text[]
+regproc	bigint character character varying citext integer name oid text
+regproc[]	bigint[] character character varying character varying[] character[] citext citext[] integer[] name name[] oid[] text text[]
+regtype	bigint character character varying citext integer name oid text
+regtype[]	bigint[] character character varying character varying[] character[] citext citext[] integer[] name name[] oid[] text text[]
+smallint	bigint bytea character character varying citext double precision integer name numeric oid real regclass regproc regtype text
+smallint[]	bigint[] bytea[] character character varying character varying[] character[] citext citext[] double precision[] integer[] name name[] numeric[] oid[] real[] regclass[] regproc[] regtype[] text text[]
+text	"char" bit bytea character character varying citext hstore int2vector ltree money name oidvector tsquery tsvector void xml
+text[]	"char"[] bit[] bytea[] character character varying character varying[] character[] citext citext[] ltree[] name name[] text tsquery[] tsvector[] xml[]
+time	character character varying citext interval name text
+timestamp	character character varying citext date name text time timestamp with time zone
+timestamp with time zone	character character varying citext date name text time timestamp
+timestamp with time zone[]	character character varying character varying[] character[] citext citext[] date[] name name[] text text[]
+tsquery	character character varying citext name text
+tsquery[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+tsrange	character character varying citext name text
+tsrange[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+tstzrange	character character varying citext name text
+tstzrange[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+tsvector	character character varying citext name text
+tsvector[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+uuid	bytea character character varying citext name text
+uuid[]	bytea[] character character varying character varying[] character[] citext citext[] name name[] text text[]
+void	character character varying citext name text
+xml	character character varying citext name text
+xml[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
+
+# ## The pairs this node still gets wrong, whole
+#
+#     <source> <TAB> <target> <TAB> node <TAB> pg
+#
+"char"	oid	!22P02	!42846
+"char"	oidvector	!22P02	!42846
+"char"	regclass	!42P01	!42846
+"char"	regtype	!42704	!42846
+"char"[]	integer[]	!22P02	ok
+"char"[]	oid	!22P02	!42846
+"char"[]	regclass	!42804	!42846
+"char"[]	regtype	!42804	!42846
+bigint[]	oid	!22P02	!42846
+bigint[]	oidvector	ok	!42846
+bigint[]	regclass	!42804	!42846
+bigint[]	regtype	!42804	!42846
+bigint[]	regtype[]	!42704	ok
+bit	oid	ok	!42846
+bit	regclass	!42804	!42846
+bit	regtype	!42804	!42846
+bit[]	oid	!22P02	!42846
+bit[]	regclass	!42804	!42846
+bit[]	regtype	!42804	!42846
+boolean	oid	!22P02	!42846
+boolean	regclass	!42804	!42846
+boolean	regtype	!42804	!42846
+boolean[]	integer[]	!22P02	ok
+boolean[]	oid	!22P02	!42846
+boolean[]	regclass	!42804	!42846
+boolean[]	regtype	!42804	!42846
+box	oid	!22P02	!42846
+box	regclass	!42804	!42846
+box	regtype	!42804	!42846
+box[]	character[]	!22001	ok
+box[]	circle[]	!22P02	ok
+box[]	lseg[]	!22P02	ok
+box[]	oid	!22P02	!42846
+box[]	point[]	!22P02	ok
+box[]	polygon[]	!22P02	ok
+box[]	regclass	!42804	!42846
+box[]	regtype	!42804	!42846
+bytea	oid	!22P02	!42846
+bytea	regclass	!42804	!42846
+bytea	regtype	!42804	!42846
+bytea[]	bigint[]	!22P02	ok
+bytea[]	character[]	!22001	ok
+bytea[]	integer[]	!22P02	ok
+bytea[]	oid	!22P02	!42846
+bytea[]	regclass	!42804	!42846
+bytea[]	regtype	!42804	!42846
+bytea[]	smallint[]	!22P02	ok
+bytea[]	uuid[]	!22P02	!22P03
+character varying[]	bit[]	!22026	ok
+character varying[]	oid	!22P02	!42846
+character varying[]	regclass	!42804	!42846
+character varying[]	regclass[]	!42804	!42P01
+character varying[]	regtype	!42804	!42846
+character[]	bit[]	!22026	ok
+character[]	oid	!22P02	!42846
+character[]	regclass	!42804	!42846
+character[]	regclass[]	!42804	!42P01
+character[]	regtype	!42804	!42846
+cidr	oid	!22P02	!42846
+cidr	regclass	!42804	!42846
+cidr	regtype	!42804	!42846
+cidr[]	character[]	!22001	ok
+cidr[]	oid	!22P02	!42846
+cidr[]	regclass	!42804	!42846
+cidr[]	regtype	!42804	!42846
+circle	oid	!22P02	!42846
+circle	regclass	!42804	!42846
+circle	regtype	!42804	!42846
+circle[]	box[]	!22P02	ok
+circle[]	character[]	!22001	ok
+circle[]	oid	!22P02	!42846
+circle[]	point[]	!22P02	ok
+circle[]	polygon[]	!22P02	ok
+circle[]	regclass	!42804	!42846
+circle[]	regtype	!42804	!42846
+citext	money	!42846	!22P02
+citext	regclass	!42804	!42P01
+citext	regtype	!42804	!42704
+citext	time	!42846	!22007
+citext[]	bit[]	!22026	ok
+citext[]	oid	!22P02	!42846
+citext[]	regclass	!42804	!42846
+citext[]	regclass[]	!42804	!42P01
+citext[]	regtype	!42804	!42846
+date	oid	!22P02	!42846
+date	regclass	!42804	!42846
+date	regtype	!42804	!42846
+date[]	character[]	!22001	ok
+date[]	oid	!22P02	!42846
+date[]	regclass	!42804	!42846
+date[]	regtype	!42804	!42846
+daterange	oid	!22P02	!42846
+daterange	regclass	!42804	!42846
+daterange	regtype	!42804	!42846
+daterange[]	character[]	!22001	ok
+daterange[]	oid	!22P02	!42846
+daterange[]	regclass	!42804	!42846
+daterange[]	regtype	!42804	!42846
+double precision	oid	!22P02	!42846
+double precision	regclass	!42804	!42846
+double precision	regtype	!42804	!42846
+double precision[]	bigint[]	!22P02	ok
+double precision[]	character[]	!22001	ok
+double precision[]	integer[]	!22P02	ok
+double precision[]	oid	!22P02	!42846
+double precision[]	regclass	!42804	!42846
+double precision[]	regtype	!42804	!42846
+double precision[]	smallint[]	!22P02	ok
+hstore	json	!42846	ok
+hstore	jsonb	!42846	ok
+hstore	oid	!22P02	!42846
+hstore	regclass	!42804	!42846
+hstore	regtype	!42804	!42846
+hstore[]	character[]	!22001	ok
+hstore[]	json[]	!42846	ok
+hstore[]	jsonb[]	!42846	ok
+hstore[]	oid	!22P02	!42846
+hstore[]	regclass	!42804	!42846
+hstore[]	regtype	!42804	!42846
+inet	oid	!22P02	!42846
+inet	regclass	!42804	!42846
+inet	regtype	!42804	!42846
+inet[]	character[]	!22001	ok
+inet[]	oid	!22P02	!42846
+inet[]	regclass	!42804	!42846
+inet[]	regtype	!42804	!42846
+int2vector	bigint[]	!42846	ok
+int2vector	bytea[]	!42846	ok
+int2vector	character varying[]	!42846	ok
+int2vector	character[]	!42846	ok
+int2vector	citext[]	!42846	ok
+int2vector	double precision[]	!42846	ok
+int2vector	integer[]	!42846	ok
+int2vector	name[]	!42846	ok
+int2vector	numeric[]	!42846	ok
+int2vector	oid	!22P02	!42846
+int2vector	oid[]	!42846	ok
+int2vector	oidvector	ok	!42846
+int2vector	real[]	!42846	ok
+int2vector	regclass	!42P01	!42846
+int2vector	regclass[]	!42846	ok
+int2vector	regproc[]	!42846	ok
+int2vector	regtype	!42704	!42846
+int2vector	regtype[]	!42846	ok
+int2vector	smallint[]	!42846	ok
+int2vector	text[]	!42846	ok
+int4range	oid	!22P02	!42846
+int4range	regclass	!42804	!42846
+int4range	regtype	!42804	!42846
+int4range[]	character[]	!22001	ok
+int4range[]	oid	!22P02	!42846
+int4range[]	regclass	!42804	!42846
+int4range[]	regtype	!42804	!42846
+int8range	oid	!22P02	!42846
+int8range	regclass	!42804	!42846
+int8range	regtype	!42804	!42846
+int8range[]	character[]	!22001	ok
+int8range[]	oid	!22P02	!42846
+int8range[]	regclass	!42804	!42846
+int8range[]	regtype	!42804	!42846
+integer[]	oid	!22P02	!42846
+integer[]	oidvector	ok	!42846
+integer[]	regclass	!42804	!42846
+integer[]	regtype	!42804	!42846
+integer[]	regtype[]	!42704	ok
+interval	citext	!42846	ok
+interval	name	!42846	ok
+interval	oid	!22P02	!42846
+interval	regclass	!42804	!42846
+interval	regtype	!42804	!42846
+interval[]	character[]	!22001	ok
+interval[]	oid	!22P02	!42846
+interval[]	regclass	!42804	!42846
+interval[]	regtype	!42804	!42846
+json	oid	!22P02	!42846
+json	oidvector	!22P02	!42846
+json	regclass	!42P01	!42846
+json	regtype	!42704	!42846
+json[]	character[]	!22001	ok
+json[]	oid	!22P02	!42846
+json[]	regclass	!42804	!42846
+json[]	regtype	!42804	!42846
+jsonb	oid	!22P02	!42846
+jsonb	oidvector	!22P02	!42846
+jsonb	regclass	!42P01	!42846
+jsonb	regtype	!42704	!42846
+jsonb[]	bigint[]	!22P02	!22023
+jsonb[]	boolean[]	!22P02	!22023
+jsonb[]	character[]	!22001	ok
+jsonb[]	double precision[]	!22P02	!22023
+jsonb[]	integer[]	!22P02	!22023
+jsonb[]	numeric[]	!22P02	!22023
+jsonb[]	oid	!22P02	!42846
+jsonb[]	real[]	!22P02	!22023
+jsonb[]	regclass	!42804	!42846
+jsonb[]	regtype	!42804	!42846
+jsonb[]	smallint[]	!22P02	!22023
+line	box	!22P02	!42846
+line	circle	!22P02	!42846
+line	lseg	!22P02	!42846
+line	oid	!22P02	!42846
+line	path	!22P02	!42846
+line	point	!22P02	!42846
+line	polygon	!22P02	!42846
+line	regclass	!42804	!42846
+line	regtype	!42804	!42846
+line[]	character[]	!22001	ok
+line[]	oid	!22P02	!42846
+line[]	regclass	!42804	!42846
+line[]	regtype	!42804	!42846
+lquery	oid	!22P02	!42846
+lquery	oidvector	!22P02	!42846
+lquery	regclass	!42P01	!42846
+lquery	regtype	!42704	!42846
+lseg	oid	!22P02	!42846
+lseg	regclass	!42804	!42846
+lseg	regtype	!42804	!42846
+lseg[]	character[]	!22001	ok
+lseg[]	oid	!22P02	!42846
+lseg[]	point[]	!22P02	ok
+lseg[]	regclass	!42804	!42846
+lseg[]	regtype	!42804	!42846
+ltree	oid	!22P02	!42846
+ltree	regclass	!42804	!42846
+ltree	regtype	!42804	!42846
+ltree[]	character[]	!22001	ok
+ltree[]	oid	!22P02	!42846
+ltree[]	regclass	!42804	!42846
+ltree[]	regtype	!42804	!42846
+macaddr	oid	!22P02	!42846
+macaddr	regclass	!42804	!42846
+macaddr	regtype	!42804	!42846
+macaddr[]	character[]	!22001	ok
+macaddr[]	oid	!22P02	!42846
+macaddr[]	regclass	!42804	!42846
+macaddr[]	regtype	!42804	!42846
+money	citext	!42846	ok
+money	name	!42846	ok
+money	oid	!22P02	!42846
+money	regclass	!42804	!42846
+money	regtype	!42804	!42846
+money[]	character[]	!22001	ok
+money[]	numeric[]	!22P02	ok
+money[]	oid	!22P02	!42846
+money[]	regclass	!42804	!42846
+money[]	regtype	!42804	!42846
+name	money	!42846	!22P02
+name	time	!42846	!22007
+name[]	bit[]	!22026	ok
+name[]	oid	!22P02	!42846
+name[]	regclass	!42804	!42846
+name[]	regclass[]	!42804	!42P01
+name[]	regtype	!42804	!42846
+numeric	oid	!22P02	!42846
+numeric	regclass	!42804	!42846
+numeric	regtype	!42804	!42846
+numeric[]	bigint[]	!22P02	ok
+numeric[]	character[]	!22001	ok
+numeric[]	integer[]	!22P02	ok
+numeric[]	oid	!22P02	!42846
+numeric[]	regclass	!42804	!42846
+numeric[]	regtype	!42804	!42846
+numeric[]	smallint[]	!22P02	ok
+numrange	oid	!22P02	!42846
+numrange	regclass	!42804	!42846
+numrange	regtype	!42804	!42846
+numrange[]	character[]	!22001	ok
+numrange[]	oid	!22P02	!42846
+numrange[]	regclass	!42804	!42846
+numrange[]	regtype	!42804	!42846
+oid[]	oid	!22P02	!42846
+oid[]	oidvector	ok	!42846
+oid[]	regclass	!42804	!42846
+oid[]	regtype	!42804	!42846
+oid[]	regtype[]	!42704	ok
+oidvector	bigint[]	!42846	ok
+oidvector	character varying[]	!42846	ok
+oidvector	character[]	!42846	ok
+oidvector	citext[]	!42846	ok
+oidvector	integer[]	!42846	ok
+oidvector	name[]	!42846	ok
+oidvector	oid	!22P02	!42846
+oidvector	oid[]	!42846	ok
+oidvector	regclass	!42P01	!42846
+oidvector	regclass[]	!42846	ok
+oidvector	regproc[]	!42846	ok
+oidvector	regtype	!42704	!42846
+oidvector	regtype[]	!42846	ok
+oidvector	text[]	!42846	ok
+path	oid	!22P02	!42846
+path	regclass	!42804	!42846
+path	regtype	!42804	!42846
+path[]	character[]	!22001	ok
+path[]	oid	!22P02	!42846
+path[]	regclass	!42804	!42846
+path[]	regtype	!42804	!42846
+point	oid	!22P02	!42846
+point	regclass	!42804	!42846
+point	regtype	!42804	!42846
+point[]	box[]	!22P02	ok
+point[]	character[]	!22001	ok
+point[]	oid	!22P02	!42846
+point[]	regclass	!42804	!42846
+point[]	regtype	!42804	!42846
+polygon	oid	!22P02	!42846
+polygon	regclass	!42804	!42846
+polygon	regtype	!42804	!42846
+polygon[]	box[]	!22P02	ok
+polygon[]	character[]	!22001	ok
+polygon[]	circle[]	!22P02	ok
+polygon[]	oid	!22P02	!42846
+polygon[]	point[]	!22P02	ok
+polygon[]	regclass	!42804	!42846
+polygon[]	regtype	!42804	!42846
+real	oid	!22P02	!42846
+real	regclass	!42804	!42846
+real	regtype	!42804	!42846
+real[]	bigint[]	!22P02	ok
+real[]	character[]	!22001	ok
+real[]	integer[]	!22P02	ok
+real[]	oid	!22P02	!42846
+real[]	regclass	!42804	!42846
+real[]	regtype	!42804	!42846
+real[]	smallint[]	!22P02	ok
+regclass	integer	!22003	ok
+regclass	oid	!22003	ok
+regclass	regtype	ok	!42846
+regclass[]	integer[]	!22003	ok
+regclass[]	oid[]	!22003	ok
+regclass[]	oidvector	ok	!42846
+regclass[]	regclass	!42804	!42846
+regclass[]	regtype	!42804	!42846
+regproc	oid	!22P02	ok
+regproc	regclass	!42804	!42846
+regproc	regtype	!42804	!42846
+regproc[]	bigint[]	!22P02	ok
+regproc[]	character[]	!22001	ok
+regproc[]	integer[]	!22P02	ok
+regproc[]	oid	!22P02	!42846
+regproc[]	oid[]	!22P02	ok
+regproc[]	regclass	!42804	!42846
+regproc[]	regtype	!42804	!42846
+regtype	regclass	ok	!42846
+regtype[]	bigint[]	!22P02	ok
+regtype[]	character[]	!22001	ok
+regtype[]	integer[]	!22P02	ok
+regtype[]	oid	!22P02	!42846
+regtype[]	oid[]	!22P02	ok
+regtype[]	oidvector	ok	!42846
+regtype[]	regclass	!42804	!42846
+regtype[]	regtype	!42804	!42846
+smallint[]	line[]	!42846	!42846NOTICE:  text-search query doesn't contain lexemes: ""
+smallint[]	oid	!22P02	!42846
+smallint[]	regclass	!42804	!42846
+smallint[]	regtype	!42804	!42846
+smallint[]	regtype[]	!42704	ok
+text	"char"[]	ok	!22P02
+text	bigint	ok	!22P02
+text	bigint[]	ok	!22P02
+text	bit[]	ok	!22P02
+text	boolean	ok	!22P02
+text	boolean[]	ok	!22P02
+text	box	ok	!22P02
+text	box[]	ok	!22P02
+text	bytea[]	ok	!22P02
+text	character varying[]	ok	!22P02
+text	character[]	ok	!22P02
+text	cidr	ok	!22P02
+text	cidr[]	ok	!22P02
+text	circle	ok	!22P02
+text	circle[]	ok	!22P02
+text	citext[]	ok	!22P02
+text	date	ok	!22007
+text	date[]	ok	!22P02
+text	daterange	ok	!22P02
+text	daterange[]	ok	!22P02
+text	double precision	ok	!22P02
+text	double precision[]	ok	!22P02
+text	hstore[]	ok	!22P02
+text	inet	ok	!22P02
+text	inet[]	ok	!22P02
+text	int4range	ok	!22P02
+text	int4range[]	ok	!22P02
+text	int8range	ok	!22P02
+text	int8range[]	ok	!22P02
+text	integer	ok	!22P02
+text	integer[]	ok	!22P02
+text	interval	ok	!22007
+text	interval[]	ok	!22P02
+text	json	ok	!22P02
+text	json[]	ok	!22P02
+text	jsonb	ok	!22P02
+text	jsonb[]	ok	!22P02
+text	line	ok	!22P02
+text	line[]	ok	!22P02
+text	lquery	ok	!42601
+text	lseg	ok	!22P02
+text	lseg[]	ok	!22P02
+text	ltree[]	ok	!22P02
+text	macaddr	ok	!22P02
+text	macaddr[]	ok	!22P02
+text	money[]	ok	!22P02
+text	name[]	ok	!22P02
+text	numeric	ok	!22P02
+text	numeric[]	ok	!22P02
+text	numrange	ok	!22P02
+text	numrange[]	ok	!22P02
+text	oid	ok	!22P02
+text	oid[]	ok	!22P02
+text	path	ok	!22P02
+text	path[]	ok	!22P02
+text	point	ok	!22P02
+text	point[]	ok	!22P02
+text	polygon	ok	!22P02
+text	polygon[]	ok	!22P02
+text	real	ok	!22P02
+text	real[]	ok	!22P02
+text	regclass	ok	!42602
+text	regclass[]	ok	!22P02
+text	regproc	ok	!42602
+text	regproc[]	ok	!22P02
+text	regtype	ok	!42601
+text	regtype[]	ok	!22P02
+text	smallint	ok	!22P02
+text	smallint[]	ok	!22P02
+text	text[]	ok	!22P02
+text	time	ok	!22007
+text	timestamp	ok	!22007
+text	timestamp with time zone	ok	!22007
+text	timestamp with time zone[]	ok	!22P02
+text	tsquery[]	ok	!22P02
+text	tsrange	ok	!22P02
+text	tsrange[]	ok	!22P02
+text	tstzrange	ok	!22P02
+text	tstzrange[]	ok	!22P02
+text	tsvector[]	ok	!22P02
+text	uuid	ok	!22P02
+text	uuid[]	ok	!22P02
+text	xml[]	ok	!22P02
+text[]	bit[]	!22026	ok
+text[]	hstore	!42846	!2202E
+text[]	oid	!22P02	!42846
+text[]	regclass	!42804	!42846
+text[]	regclass[]	!42804	!42P01
+text[]	regtype	!42804	!42846
+time	citext	!42846	ok
+time	interval	!42846	ok
+time	name	!42846	ok
+time	oid	!22P02	!42846
+time	regclass	!42804	!42846
+time	regtype	!42804	!42846
+timestamp	oid	!22P02	!42846
+timestamp	regclass	!42804	!42846
+timestamp	regtype	!42804	!42846
+timestamp with time zone	oid	!22P02	!42846
+timestamp with time zone	regclass	!42804	!42846
+timestamp with time zone	regtype	!42804	!42846
+timestamp with time zone[]	character[]	!22001	ok
+timestamp with time zone[]	oid	!22P02	!42846
+timestamp with time zone[]	regclass	!42804	!42846
+timestamp with time zone[]	regtype	!42804	!42846
+tsquery	oid	!22P02	!42846
+tsquery	regclass	!42804	!42846
+tsquery	regtype	!42804	!42846
+tsquery[]	character[]	!22001	ok
+tsquery[]	oid	!22P02	!42846
+tsquery[]	regclass	!42804	!42846
+tsquery[]	regtype	!42804	!42846
+tsrange	oid	!22P02	!42846
+tsrange	regclass	!42804	!42846
+tsrange	regtype	!42804	!42846
+tsrange[]	character[]	!22001	ok
+tsrange[]	oid	!22P02	!42846
+tsrange[]	regclass	!42804	!42846
+tsrange[]	regtype	!42804	!42846
+tstzrange	oid	!22P02	!42846
+tstzrange	regclass	!42804	!42846
+tstzrange	regtype	!42804	!42846
+tstzrange[]	character[]	!22001	ok
+tstzrange[]	oid	!22P02	!42846
+tstzrange[]	regclass	!42804	!42846
+tstzrange[]	regtype	!42804	!42846
+tsvector	oid	!22P02	!42846
+tsvector	regclass	!42804	!42846
+tsvector	regtype	!42804	!42846
+tsvector[]	character[]	!22001	ok
+tsvector[]	oid	!22P02	!42846
+tsvector[]	regclass	!42804	!42846
+tsvector[]	regtype	!42804	!42846
+uuid	citext	!42846	ok
+uuid	name	!42846	ok
+uuid	oid	!22P02	!42846
+uuid	regclass	!42804	!42846
+uuid	regtype	!42804	!42846
+uuid[]	character[]	!22001	ok
+uuid[]	oid	!22P02	!42846
+uuid[]	regclass	!42804	!42846
+uuid[]	regtype	!42804	!42846
+void	oidvector	ok	!42846
+void	regclass	ok	!42846
+void	regtype	ok	!42846
+xml	oid	!22P02	!42846
+xml	oidvector	!22P02	!42846
+xml	regclass	!42P01	!42846
+xml	regtype	!42704	!42846
+xml[]	character[]	!22001	ok
+xml[]	oid	!22P02	!42846
+xml[]	regclass	!42804	!42846
+xml[]	regtype	!42804	!42846

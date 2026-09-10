@@ -27,14 +27,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              the line above this one.",
             "UNMEASURED",
         ),
-        (
-            "SELECT length(convert_to('hello', 'UTF8'))",
-            "`length` is not implemented, for any type — contract C2, and it is in the corpus \
-             because it is the statement that would prove `convert_to` counted the bytes rather \
-             than the characters. The two disagree only on multi-byte input, and the byte string \
-             itself is checked directly in the test below.",
-            "UNMEASURED",
-        ),
+        // **`SELECT length(convert_to('hello', 'UTF8'))` stood here and is gone.** Its reason said
+        // `length` was "not implemented, for any type", which stopped being true a while ago —
+        // what was missing by the end was the **`bytea` overload**, one of eight `pg_proc` rows
+        // over four counting names that do not agree with each other. It is now the statement it
+        // was put in the corpus to be: the one that proves `convert_to` counted **bytes** and not
+        // characters.
         // **Both arithmetic entries are deleted** (ADR 0031, rule 2). They recorded that this
         // node had no arithmetic operator of any kind, so `random() * 100` and `1 + 1` — two of
         // statement 738's ten defaults — were refused by the operator's name. The arithmetic

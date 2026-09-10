@@ -227,6 +227,50 @@ fn coordinates(kind: Kind, text: &str) -> Result<Vec<f64>> {
     })
 }
 
+/// **The geometric length of an `lseg` or a `path`** — what `length()` answers for the two shapes
+/// it takes, and it is a `double precision` and not a count.
+///
+/// Measured on 19beta1:
+///
+/// ```text
+/// length('[(0,0),(3,4)]'::lseg)          5
+/// length('[(1,1),(1,1)]'::lseg)          0
+/// length('[(0,0),(3,4)]'::path)          5      -- open, one segment
+/// length('((0,0),(3,4))'::path)          10     -- **closed: the edge back counts**
+/// length('[(0,0),(3,4),(3,0)]'::path)    9      -- 5 + 4
+/// length('((0,0),(3,4),(3,0))'::path)    12     -- 5 + 4 + 3
+/// length('[(0,0)]'::path)                0
+/// ```
+///
+/// A `path`'s bracket says whether it is open, which [`from_text`] normalises and keeps — so the
+/// closing edge is decided by the stored text and not by a flag beside it.
+pub fn length(kind: Kind, text: &str) -> Result<f64> {
+    let parts = coordinates(kind, text)?;
+    if parts.len() % 2 != 0 {
+        return Err(SqlError::InvalidTextRepresentation {
+            ty: kind.name(),
+            value: text.to_owned(),
+        });
+    }
+    let points: Vec<(f64, f64)> = parts.chunks(2).map(|pair| (pair[0], pair[1])).collect();
+    let between = |a: (f64, f64), b: (f64, f64)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    let mut total = points
+        .windows(2)
+        .map(|pair| between(pair[0], pair[1]))
+        .sum::<f64>();
+    // **A closed path walks back to where it started**, and that holds at two points as well as at
+    // three: `((0,0),(3,4))` is `10` and not `5`, because the edge back is walked. An open path
+    // and an `lseg` do not.
+    if kind == Kind::Path
+        && !text.starts_with('[')
+        && points.len() >= 2
+        && let (Some(first), Some(last)) = (points.first(), points.last())
+    {
+        total += between(*last, *first);
+    }
+    Ok(total)
+}
+
 /// One point printed the way both `point` and every shape made of points prints one.
 fn point(x: f64, y: f64) -> String {
     format!("({},{})", num(x), num(y))

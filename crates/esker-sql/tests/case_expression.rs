@@ -101,47 +101,75 @@ fn a_case_index_prints_over_five_lines_with_its_else_filled_in() {
     );
 }
 
-/// The branch a `CASE` chooses is the **only** one evaluated, which is observable and not an
-/// optimisation.
+/// The branch a `CASE` chooses is the **only** one evaluated — and that is about *evaluation*, not
+/// about resolution.
 ///
-/// PostgreSQL proves this with `1/0` — `CASE WHEN true THEN 1 ELSE 1/0 END` is `1` there and
-/// `CASE WHEN false THEN 1 WHEN 1/0 = 0 THEN 2 ELSE 3 END` is `22012`, both captured — and this
-/// node cannot write either, because it has no arithmetic operators: `/` is `0A000` naming itself,
-/// which is why those three corpus lines are declared divergences rather than answers.
+/// **This test used to say the opposite of what a real server does**, because the property it put
+/// it with was the wrong kind of error. It asserted that
+/// `CASE WHEN true THEN name ELSE lower(id) END` answers, "the ELSE was not reached, so its
+/// `42883` was not raised" — and 19beta1 **refuses it**, measured:
 ///
-/// So the same property is put with the error this node *does* raise per row: `lower` of a
-/// `bigint` is `42883`, from the evaluator rather than the planner. Unreached, it must not raise;
-/// reached, it must. An implementation that evaluated every branch and then selected gets the
-/// first wrong, and one that never evaluated a branch at all gets the second wrong.
+/// ```text
+/// CASE WHEN true  THEN name ELSE lower(id) END        !42883 function lower(bigint) does not exist
+/// CASE WHEN false THEN name ELSE lower(id) END        !42883
+/// CASE WHEN true  THEN name ELSE length(json) END     !42883 function length(json) does not exist
+/// CASE WHEN true  THEN 1    ELSE 1/0 END              1
+/// CASE WHEN true  THEN name ELSE lower(id::text) END  Alpha
+/// ```
+///
+/// A function that does not exist is settled when the statement is **resolved**, and every branch
+/// is resolved whether or not it is chosen. A division by zero is settled when a **row** is
+/// evaluated, and an unchosen branch never gets one. The old assertion held only because this
+/// crate raised `lower(bigint)` from the evaluator, which the scalar-overload table moved to
+/// resolution where a real server has it.
+///
+/// This node still cannot write PostgreSQL's own `1/0` demonstration — `/` is `0A000` naming
+/// itself, which is why those corpus lines are declared divergences — so the laziness is asserted
+/// through the one runtime error it *can* raise, and the resolution half is asserted beside it so
+/// the two are not confused again.
 #[test]
 fn only_the_chosen_branch_is_evaluated() {
     let mut node = parity::Node::new(&[]);
     for statement in [
         "CREATE TABLE cs (id int8 PRIMARY KEY, name text)",
-        "INSERT INTO cs VALUES (1, 'Alpha')",
+        "INSERT INTO cs VALUES (1, 'Alpha'), (2, '7')",
     ] {
         node.run(statement).unwrap();
     }
+    // **Resolution does not care which branch is chosen.** Both spellings refuse on 19beta1.
+    for when in ["true", "false"] {
+        let error = node
+            .run(&format!(
+                "SELECT CASE WHEN {when} THEN name ELSE lower(id) END FROM cs"
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error.sqlstate(),
+            "42883",
+            "lower(bigint) has no overload, and an unchosen branch is still resolved"
+        );
+    }
+    // **Evaluation does.** `'Alpha'::int8` is a `22P02` per row, and the row that would raise it is
+    // in the branch the `CASE` does not choose — so it never runs.
     assert_eq!(
-        node.rows("SELECT CASE WHEN true THEN name ELSE lower(id) END FROM cs"),
-        [["Alpha"]],
-        "the ELSE was not reached, so its 42883 was not raised"
+        node.rows("SELECT CASE WHEN id = 2 THEN name::int8 ELSE 0 END FROM cs WHERE id = 1"),
+        [["0"]],
+        "the THEN was not reached for this row, so its 22P02 was not raised"
     );
     let error = node
-        .run("SELECT CASE WHEN false THEN name ELSE lower(id) END FROM cs")
+        .run("SELECT CASE WHEN id = 1 THEN name::int8 ELSE 0 END FROM cs WHERE id = 1")
         .unwrap_err();
-    assert_eq!(error.sqlstate(), "42883");
-    // The second `WHEN` is reached because the first did not match, and its condition raises.
-    let error = node
-        .run(
-            "SELECT CASE WHEN false THEN name WHEN lower(id) = 'x' THEN name ELSE name END FROM cs",
-        )
-        .unwrap_err();
-    assert_eq!(error.sqlstate(), "42883");
-    // And it is not reached when the first one matches.
+    assert_eq!(
+        error.sqlstate(),
+        "22P02",
+        "and it is raised for the row that does reach it"
+    );
+    // The same, one clause over: a `WHEN` condition is evaluated only when the ones before it
+    // did not match.
     assert_eq!(
         node.rows(
-            "SELECT CASE WHEN true THEN name WHEN lower(id) = 'x' THEN name ELSE name END FROM cs"
+            "SELECT CASE WHEN id = 1 THEN name WHEN name::int8 = 7 THEN 'seven' ELSE 'no' END \
+             FROM cs WHERE id = 1"
         ),
         [["Alpha"]]
     );
