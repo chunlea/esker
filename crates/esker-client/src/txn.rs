@@ -739,8 +739,9 @@ impl Transaction {
     /// there — a transaction that reads as `Missing` and can be rolled back by anyone.
     ///
     /// **But it cannot simply be refused**, and that is the case this method exists for: the
-    /// primary is *the smallest key already buffered, or the key being locked when nothing is*
-    /// ([`Transaction::pin_primary`]), and a savepoint whose first act is `SELECT … FOR UPDATE`
+    /// primary is *the smallest key already buffered, or the key being locked when nothing is* —
+    /// `pin_primary`, private to this module and so named rather than linked — and a savepoint
+    /// whose first act is `SELECT … FOR UPDATE`
     /// over a transaction that has written nothing — which is precisely Rails' shape — pins that
     /// very row. Refusing it would leave the savepoint's own lock behind, which is the bug.
     ///
