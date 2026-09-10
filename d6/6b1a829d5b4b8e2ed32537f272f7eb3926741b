@@ -1,0 +1,23 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_2bed4ac2b1c944::t_5173b845ba6151 2459-2479
+crates/esker-sql/src/exec/mod.rs
+  s_2bed4ac2b1c944::t_1aebaa8a965114 205-209,826,1026,1073,1094,1127,3871-3884,3889-3900,4494,4586,4619
+docs/adr/0102-the-catalogs-read-path.md
+  s_2bed4ac2b1c944::t_65785bcedbafd0 118-136,219-242
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d66b1a829d5b4b8e2ed32537f272f7eb3926741b",
+  "prompts": {},
+  "sessions": {
+    "s_2bed4ac2b1c944": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4f6349e3-bab7-46d5-9126-1c846fb96167",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
