@@ -574,56 +574,38 @@ Two consequence tests, red before either change:
   back to its savepoint and both commit: **both commits succeed and exactly one `40P01` was
   raised.** Fails today with `40001` from the survivor's commit (§2).
 
-## `transactions_test.rb`'s 1800 s — candidates, and what would settle it
+## `transactions_test.rb`'s 1800 s — it finished, and the 27% is not attributed
 
-Not diagnosed. The node log for run 112a carries no statement log, so which test stopped is not in
-the evidence, and this section names what the code makes possible rather than what happened.
+**Run 117 finished the file**: 105 runs, 484 assertions, 0 failures, 0 errors, 1,465 s, and
+`could not be cleared` and `40001` reported zero times. The watchdog that ran 112a and run 114 out
+of time is no longer reached.
 
-The file's only concurrency is `ConcurrentTransactionTest`, two tests, both **three or four sessions
-writing one row**:
+**The hang shape this section proposed is refuted.** r1 walked run 114's trace to the instant it was
+killed (`esker-rails-harness` traces, `esker-coord/r1-0104-attribution.md`): the last twenty
+statements are an ordinary per-test loop with its savepoints already released, and 112a never
+reached the tests at all. There is no rolled-back-savepoint-then-stuck moment in either. The three
+candidates this section listed — the restart loop, the invisible hold-and-wait, the killed
+connection's lock — are not what happened, because **nothing was stuck**.
 
-* `test_transaction_per_thread` (`transactions_test.rb:1707`) — 3 threads, each
-  `BEGIN; SELECT topics WHERE id=1; UPDATE; UPDATE; COMMIT`.
-* `test_transaction_isolation__read_committed` (`transactions_test.rb:1725`) — 3 threads doing
-  `find/save/find/save/find` on `developers` id 1, plus a fourth doing ten read-only transactions.
+What changed is that statements got cheaper:
 
-Both are `Reach::Node` writes only — no `FOR UPDATE` — so the invisible wait §3 examined needs a
-`FOR UPDATE` that these tests do not have, and neither should be able to reach the hold-and-wait
-shape. What they
-*can* reach is the restart loop: `changed_since_statement` → `restart_statement` →
-`StatementMustRestart`, capped at `MAX_STATEMENT_RESTARTS = 32` (`exec/mod.rs:572`), with each
-attempt's wait unbounded because neither `lock_timeout` nor `statement_timeout` is set. Thirty-two
-bounded restarts do not hang; thirty-two **unbounded waits** can, if a holder never releases.
+    run 114   3,470 statements / 1,800 s  =  519 ms per statement   (killed at 82%)
+    run 117   3,875 statements / 1,465 s  =  378 ms per statement   (finished)
 
-A holder that never releases is the third candidate and the one I would look at first.
-`test_rollback_when_thread_killed` (`transactions_test.rb:1100`) kills a thread inside an open
-transaction, mid-`UPDATE topics … WHERE id = 1`, and never rolls it back. That lock is released by
-`StoreTxn`'s `Drop` (`backend/store.rs:208`), so it lives exactly as long as the session's open
-transaction object does — and a connection sitting idle in a transaction in the pool keeps it
-indefinitely. `RowLocks` is the one lock space in this system with **no TTL at all**
-(`backend/locks.rs:15`: *"a holder is alive exactly while its transaction is"*), and the node's
-`idle_in_transaction_session_timeout` — which would end such a session — defaults to `0` here as it
-does on a real server (`pgwire/server.rs:242`).
+A **uniform ~27% per-statement speedup**, not a block being released. At 378 ms the file takes
+1,465 s, which is what it took; at 519 ms it would take 2,010 s, which is past the watchdog. The
+file finished because every statement got faster.
 
-**The test that leaves the lock is not the test that hangs.** Its own assertions are plain `SELECT`s
-and never wait; what waits is the *next* test in the file that writes `topics` id 1, and minitest
-does not run them in source order. That is the shape to look for in (2) below, and it is one this
-project has met before — a `psql` that answered instantly while a pass sat still, and the cause was
-a lock left by a killed connection.
+**That is consistent with §2 as a broad cost and it is not attributed to it.** The range
+`4e5c5e51..47cee86a` also carries #37, #19 and others, so the 27% has at least three candidates and
+this measurement cannot separate them. Writing §2's name against it would be the third wrong
+attribution this lane has made from a plausible interval — the first two were refuted by a chain log
+and a dated transcript.
 
-What would settle it, in the order I would spend the time:
-
-1. **`RUST_LOG` at a level that logs the statement**, or the harness's `log_statement` tap, so the
-   watchdog's last statement is in the record. One re-run of that one file.
-2. **`SELECT * FROM pg_locks` against the node while it is stuck.** The node answers new sessions,
-   which is what makes this cheap, and `LockView` reports both holders and waiters with their
-   backend pids (`backend/locks.rs:75`). A holder with a pid no session owns is the killed-connection
-   answer; a pair of waiters is a cycle the graph could not see.
-3. Only then a constructed reproduction.
-
-Until (1) or (2), *"a lock wait with no timeout and no deadlock detection"* is a well-formed
-hypothesis with three candidate mechanisms and no evidence separating them, and this ADR does not
-choose between them.
+**What would isolate it** is recorded rather than done: revert §2 alone and re-run this one file
+with the statement tap. Ruled not worth a cluster window on 2026-09-10 — 72.4% of the file's
+statement time is `pk_and_sequence_for`, so the interesting number is not in the transaction family
+at all.
 
 ## Consequences
 

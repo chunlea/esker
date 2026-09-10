@@ -70,6 +70,21 @@ pub(crate) enum Command {
     Region(RegionOptions),
     /// Compare an SST store prefix against a database's manifest.
     SstStore(SstStoreCommand),
+    /// Prove that no acknowledged write is lost when a store is killed
+    /// (`CLAUDE.md` invariant 1).
+    Durability(DurabilityCommand),
+}
+
+/// The `durability` verbs. Three, and separate processes on purpose: the verdict is computed after
+/// the run, from a file, rather than by something that may itself have been killed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DurabilityCommand {
+    /// Write, and record every acknowledged commit.
+    Record(crate::durability::DurabilityOptions),
+    /// Kill a store at random, on a cadence, with its own deadline.
+    Chaos(crate::durability::DurabilityOptions),
+    /// Read every recorded write back at the timestamp it was acknowledged at.
+    Verify(crate::durability::DurabilityOptions),
 }
 
 /// The `sst-store` verbs.
@@ -187,6 +202,10 @@ Commands:
   sst-store reconcile <url>
                         Compare an SST store prefix against a database's manifest
                         and say what nothing references any more
+  durability record|chaos|verify
+                        Prove no acknowledged write is lost when a store is
+                        killed (--pd, --out/--in, --clients, --for, --every,
+                        --pids, --keyspace)
 
 Options:
   -V, --version         Print the version
@@ -461,6 +480,7 @@ where
         "pd" => parse_pd(&arguments[1..]),
         "region" => parse_region(&arguments[1..]),
         "sst-store" => parse_sst_store(&arguments[1..]),
+        "durability" => parse_durability(&arguments[1..]),
         other if other.starts_with('-') => Err(ParseError::UnknownFlag(other.to_owned())),
         other => Err(ParseError::UnknownCommand(other.to_owned())),
     }
@@ -867,6 +887,102 @@ fn read_key(word: &str, hex: bool) -> Result<bytes::Bytes, ParseError> {
 
 /// `esker pd serve|inspect [--data-dir PATH] [--listen HOST:PORT]`.
 /// `sst-store reconcile <s3://bucket/prefix> --data-dir DIR [--delete]`.
+/// `durability record|chaos|verify`, which share their options.
+fn parse_durability(arguments: &[String]) -> Result<Command, ParseError> {
+    let Some(verb) = arguments.first() else {
+        return Err(ParseError::MissingArgument("a durability command"));
+    };
+    if verb == "--help" || verb == "-h" || verb == "help" {
+        return Ok(Command::Help);
+    }
+    let mut options = crate::durability::DurabilityOptions::new();
+    let mut index = 1;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        index += 1;
+        if argument == "--help" || argument == "-h" {
+            return Ok(Command::Help);
+        }
+        let (flag, inline) = match argument.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (argument.as_str(), None),
+        };
+        let mut value = |flag: &'static str| -> Result<String, ParseError> {
+            if let Some(inline) = inline.clone() {
+                return Ok(inline);
+            }
+            let Some(next) = arguments.get(index) else {
+                return Err(ParseError::MissingValue(flag));
+            };
+            index += 1;
+            Ok(next.clone())
+        };
+        match flag {
+            "--pd" => options.pd = value("--pd")?,
+            "--out" | "--in" => options.file = value("--out")?,
+            "--keyspace" => options.keyspace = value("--keyspace")?,
+            "--clients" => {
+                options.clients =
+                    value("--clients")?
+                        .parse()
+                        .map_err(|_| ParseError::InvalidValue {
+                            flag: "--clients",
+                            value: String::new(),
+                        })?;
+            }
+            "--for" => {
+                let text = value("--for")?;
+                options.run_for = parse_duration(&text).ok_or(ParseError::InvalidValue {
+                    flag: "--for",
+                    value: text.clone(),
+                })?;
+            }
+            "--every" => {
+                let text = value("--every")?;
+                options.every = parse_duration(&text).ok_or(ParseError::InvalidValue {
+                    flag: "--every",
+                    value: text.clone(),
+                })?;
+            }
+            "--pids" => {
+                let text = value("--pids")?;
+                options.pids = text
+                    .split(',')
+                    .filter(|part| !part.is_empty())
+                    .map(|part| {
+                        part.parse::<u32>().map_err(|_| ParseError::InvalidValue {
+                            flag: "--pids",
+                            value: part.to_owned(),
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+            }
+            other => return Err(ParseError::UnknownFlag(other.to_owned())),
+        }
+    }
+    if options.pd.is_empty() {
+        return Err(ParseError::MissingArgument("--pd"));
+    }
+    match verb.as_str() {
+        "record" => Ok(Command::Durability(DurabilityCommand::Record(options))),
+        "chaos" => Ok(Command::Durability(DurabilityCommand::Chaos(options))),
+        "verify" => Ok(Command::Durability(DurabilityCommand::Verify(options))),
+        other => Err(ParseError::UnknownCommand(format!("durability {other}"))),
+    }
+}
+
+/// `120s`, `2m`, `500ms` — the same shapes `bench --for` takes.
+fn parse_duration(text: &str) -> Option<std::time::Duration> {
+    let (digits, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit())?);
+    let count: u64 = digits.parse().ok()?;
+    match unit {
+        "ms" => Some(std::time::Duration::from_millis(count)),
+        "s" => Some(std::time::Duration::from_secs(count)),
+        "m" => Some(std::time::Duration::from_secs(count * 60)),
+        _ => None,
+    }
+}
+
 fn parse_sst_store(arguments: &[String]) -> Result<Command, ParseError> {
     let Some(verb) = arguments.first() else {
         return Err(ParseError::MissingArgument("an sst-store command"));

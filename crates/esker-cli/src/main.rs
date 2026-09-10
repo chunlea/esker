@@ -16,6 +16,7 @@ mod bench_route;
 mod bench_txn;
 mod bytes;
 mod cluster;
+mod durability;
 mod manifest_dump;
 mod pd;
 mod raw;
@@ -63,6 +64,28 @@ fn run_sst_store(command: &args::SstStoreCommand) -> ExitCode {
 
 /// `bench-mpp`, out of line for the same reason [`run_sst_store`] is: `main` stays a dispatch
 /// table, and clippy holds it to a hundred lines.
+/// One of the three durability verbs.
+///
+/// **A lost write leaves a non-zero exit**, so a harness that reads only the status still stops:
+/// this is `CLAUDE.md` invariant 1 and it must not be possible to miss.
+fn run_durability(command: &args::DurabilityCommand) -> ExitCode {
+    let outcome = match command {
+        args::DurabilityCommand::Record(options) => durability::record(options),
+        args::DurabilityCommand::Chaos(options) => durability::chaos(options),
+        args::DurabilityCommand::Verify(options) => durability::verify(options),
+    };
+    match outcome {
+        Ok(report) => {
+            println!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(reason) => {
+            eprintln!("{reason}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn run_bench_mpp(options: &bench_mpp::BenchMppOptions) -> ExitCode {
     match bench_mpp::run(options) {
         Ok(()) => ExitCode::SUCCESS,
@@ -101,6 +124,7 @@ fn main() -> ExitCode {
             }
         },
         Ok(Command::BenchMpp(options)) => run_bench_mpp(&options),
+        Ok(Command::Durability(command)) => run_durability(&command),
         Ok(Command::SstDump(options)) => {
             let mut stdout = std::io::stdout().lock();
             match sst_dump::run(&options, &mut stdout) {
