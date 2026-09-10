@@ -1,0 +1,84 @@
+# **`jsonb` comparison and ordering** — PostgreSQL 19beta1, 2026-09-09.
+# `ON_ERROR_ROLLBACK on`, one `BEGIN … ROLLBACK`, no fixture.
+#
+# The (b) direction of the no-equality census: PostgreSQL answers these and this node refuses them
+# with `0A000`, because `jsonb` shares `text`'s representation and byte order is not `jsonb` order
+# (ADR 0042). `crate::value::json` already parses and canonicalises into a `Json` with kinds, so
+# what is missing is a comparison over that, not a new `Datum`.
+#
+# ## THINGS REASONING WOULD GET WRONG
+#
+#   * **The kind rank is `null < string < number < boolean < array < object`** — measured
+#     pairwise, and it is *not* the order the values print in nor the order a reader guesses.
+#   * **The empty array does not follow it.** `'[]' < 'null'` is true while `'[1]' > 'true'` is
+#     true, and `'{}' > 'null'` — so `[]` sorts below every scalar and `[1]` does not. Any
+#     implementation that ranks by kind and then compares within it is wrong on exactly this
+#     value, and `[]` is not a rare one.
+#
+#     **The obvious explanation is false and was tested.** "A scalar is internally a one-element
+#     array, so `[]` wins on length" accounts for every ordering cell above — and it predicts
+#     `'[null]' = 'null'` and `'[1]' = '1'`, both of which are **false**. So the ordering behaves
+#     that way and equality does not, and this capture records the measurements rather than a
+#     mechanism. Implement against the cells; do not derive them.
+#   * **Numbers compare as `numeric`, not as text**: `1.0 = 1.00` is true and `2 < 10` is true,
+#     where a byte comparison says false and false.
+#   * **Arrays compare by length before contents**, so `[2] < [1,1]`.
+#   * **Objects compare by pair count before keys**, so `{"z":1} < {"a":1,"b":1}`.
+#   * **Key order is not part of the value** — the canonical form already sorted them, which is
+#     why `{"a":1,"b":2} = {"b":2,"a":1}`.
+#
+# ## The measurements
+#
+SELECT ('null'::jsonb < '"a"'::jsonb) AS v	boolean	t
+SELECT ('null'::jsonb = '"a"'::jsonb) AS v	boolean	f
+SELECT ('"a"'::jsonb < '1'::jsonb) AS v	boolean	t
+SELECT ('"a"'::jsonb = '1'::jsonb) AS v	boolean	f
+SELECT ('1'::jsonb < 'true'::jsonb) AS v	boolean	t
+SELECT ('1'::jsonb = 'true'::jsonb) AS v	boolean	f
+SELECT ('true'::jsonb < '[1]'::jsonb) AS v	boolean	t
+SELECT ('true'::jsonb = '[1]'::jsonb) AS v	boolean	f
+SELECT ('[1]'::jsonb < '{}'::jsonb) AS v	boolean	t
+SELECT ('[1]'::jsonb = '{}'::jsonb) AS v	boolean	f
+SELECT ('false'::jsonb < 'true'::jsonb) AS v	boolean	t
+SELECT ('false'::jsonb = 'true'::jsonb) AS v	boolean	f
+SELECT ('[]'::jsonb < 'null'::jsonb) AS v	boolean	t
+SELECT ('[]'::jsonb = 'null'::jsonb) AS v	boolean	f
+SELECT ('[]'::jsonb < '"a"'::jsonb) AS v	boolean	t
+SELECT ('[]'::jsonb = '"a"'::jsonb) AS v	boolean	f
+SELECT ('[]'::jsonb < '{}'::jsonb) AS v	boolean	t
+SELECT ('[]'::jsonb = '{}'::jsonb) AS v	boolean	f
+SELECT ('[]'::jsonb < '[1]'::jsonb) AS v	boolean	t
+SELECT ('[]'::jsonb = '[1]'::jsonb) AS v	boolean	f
+SELECT ('{}'::jsonb < 'null'::jsonb) AS v	boolean	f
+SELECT ('{}'::jsonb = 'null'::jsonb) AS v	boolean	f
+SELECT ('1.0'::jsonb < '1.00'::jsonb) AS v	boolean	f
+SELECT ('1.0'::jsonb = '1.00'::jsonb) AS v	boolean	t
+SELECT ('2'::jsonb < '10'::jsonb) AS v	boolean	t
+SELECT ('2'::jsonb = '10'::jsonb) AS v	boolean	f
+SELECT ('-1'::jsonb < '1'::jsonb) AS v	boolean	t
+SELECT ('-1'::jsonb = '1'::jsonb) AS v	boolean	f
+SELECT ('[1,2]'::jsonb < '[1,1,1]'::jsonb) AS v	boolean	t
+SELECT ('[1,2]'::jsonb = '[1,1,1]'::jsonb) AS v	boolean	f
+SELECT ('[2]'::jsonb < '[1,1]'::jsonb) AS v	boolean	t
+SELECT ('[2]'::jsonb = '[1,1]'::jsonb) AS v	boolean	f
+SELECT ('[1,2]'::jsonb < '[1,3]'::jsonb) AS v	boolean	t
+SELECT ('[1,2]'::jsonb = '[1,3]'::jsonb) AS v	boolean	f
+SELECT ('[1,2]'::jsonb < '[1,2]'::jsonb) AS v	boolean	f
+SELECT ('[1,2]'::jsonb = '[1,2]'::jsonb) AS v	boolean	t
+SELECT ('{"z":1}'::jsonb < '{"a":1,"b":1}'::jsonb) AS v	boolean	t
+SELECT ('{"z":1}'::jsonb = '{"a":1,"b":1}'::jsonb) AS v	boolean	f
+SELECT ('{"a":1}'::jsonb < '{"b":1}'::jsonb) AS v	boolean	t
+SELECT ('{"a":1}'::jsonb = '{"b":1}'::jsonb) AS v	boolean	f
+SELECT ('{"a":1}'::jsonb < '{"a":2}'::jsonb) AS v	boolean	t
+SELECT ('{"a":1}'::jsonb = '{"a":2}'::jsonb) AS v	boolean	f
+SELECT ('{"a":1,"b":2}'::jsonb < '{"b":2,"a":1}'::jsonb) AS v	boolean	f
+SELECT ('{"a":1,"b":2}'::jsonb = '{"b":2,"a":1}'::jsonb) AS v	boolean	t
+SELECT ('{"a":[1,2]}'::jsonb < '{"a":[1,3]}'::jsonb) AS v	boolean	t
+SELECT ('{"a":[1,2]}'::jsonb = '{"a":[1,3]}'::jsonb) AS v	boolean	f
+SELECT ('[[1]]'::jsonb < '[[2]]'::jsonb) AS v	boolean	t
+SELECT ('[[1]]'::jsonb = '[[2]]'::jsonb) AS v	boolean	f
+SELECT c FROM (VALUES ('{"b":1}'::jsonb),('[1]'),('null'),('2'),('"s"'),('true'),('[]')) s(c) ORDER BY c	jsonb	[] ; null ; "s" ; 2 ; true ; [1] ; {"b": 1}
+SELECT count(DISTINCT c) AS v FROM (VALUES ('1.0'::jsonb),('1.00'),('1')) s(c)	bigint	1
+SELECT ('[null]'::jsonb = 'null'::jsonb) AS v	boolean	f
+SELECT ('[1]'::jsonb = '1'::jsonb) AS v	boolean	f
+SELECT ('{}'::jsonb > 'null'::jsonb) AS v	boolean	t
