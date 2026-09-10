@@ -1,0 +1,21 @@
+crates/esker-sql/src/parse/lower.rs
+  s_6f7019c05b578b::t_0372a433541e8d 5477-5507,5550-5555,5646-5648
+crates/esker-sql/tests/corpus/pg19_array_of_array.txt
+  s_6f7019c05b578b::t_4b119ce435dea1 13-20,51-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8c860c4867491a0a4752338c168579d91aa0d5ba",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
