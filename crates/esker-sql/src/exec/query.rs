@@ -3650,6 +3650,15 @@ fn resolve_case(
             // `42804 CASE types text and "char" cannot be matched`, because their `typcategory`
             // letters differ and PostgreSQL's `select_common_type` has nothing to pick. Measured,
             // both halves.
+            // **And a type unifies with itself before either test is asked.** `same_family` is a
+            // *comparison* predicate and is deliberately false for `json` beside `json` — the
+            // type has no equality operator, which its own doc comment records — so asking it
+            // here refused `CASE WHEN true THEN j ELSE j END` on a type 19beta1 settles without
+            // comparing anything. Measured over all 100 spellings of the wire v3 probe list: on a
+            // real server every one of them unifies with itself, and this node refused three
+            // (`json`, `json[]`, `xml`). `unify`'s own first line is `left == right`, so the
+            // family test in front of it was the whole of it.
+            Some(chosen) if chosen == ty => {}
             Some(chosen) if same_family(chosen, ty) && unify(chosen, ty).is_ok() => {
                 common = Some(unify(chosen, ty).unwrap_or(chosen));
             }
@@ -3706,6 +3715,9 @@ fn resolve_coalesce(args: &[Expr], scope: &Scope<'_>) -> Result<Expr> {
             // server — the integer is promoted — so the common type is taken from the same
             // promotion table arithmetic uses (ADR 0046) rather than from whichever argument came
             // first. A pair with no promotion between them keeps the family test's answer.
+            // The same first question a `CASE`'s branches ask, for the same reason: a type
+            // unifies with itself whatever `same_family` says about comparing it.
+            Some(chosen) if chosen == ty => {}
             Some(chosen) if same_family(chosen, ty) => {
                 common = Some(
                     crate::value::arith::result_type(crate::plan::ArithOp::Add, chosen, ty)

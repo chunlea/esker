@@ -1,0 +1,161 @@
+# **What `COALESCE` and `CASE` settle two branches on** — the whole probe list, both shapes.
+#
+# PostgreSQL 19beta1, 2026-09-10, `127.0.0.1:55432`, one `BEGIN … ROLLBACK` with a
+# `SAVEPOINT`/`ROLLBACK TO` per probe and `statement_timeout` set. Wire v3 family **F4**, 22 rows.
+#
+# Each of the 100 distinct type spellings the wire v3 probe list carries was asked as, with the
+# value bound rather than spliced:
+#
+#     SELECT pg_typeof(COALESCE(x, x))                    FROM (SELECT $1::<type> AS x) t
+#     SELECT pg_typeof(CASE WHEN true THEN x ELSE x END)  FROM (SELECT $1::<type> AS x) t
+#
+# ## The finding: a same-type unification never refuses
+#
+# **All 100 answer their own type, on both shapes, with no exceptions.** `json`, `xml`, `point`,
+# `void`, `lquery` and the nine array types that `GREATEST` refuses for want of a comparison
+# function are all answered here — because unifying two branches needs no comparison at all. That
+# is the whole distinction between this family and F1a: `min(json)` and `GREATEST(json, json)` are
+# refused on 19beta1 and `COALESCE(json, json)` is `json`.
+#
+# The only two spellings whose answer is not the string that was asked are `time` and `timestamp`,
+# which come back in their canonical form (`time without time zone`,
+# `timestamp without time zone`) — the same rendering `\gdesc` gives, not a different type.
+#
+# **This node refused three**: `json`, `json[]` and `xml`, both shapes, with
+# `42804 COALESCE types json and json cannot be matched` — a sentence naming the same type twice.
+# `xml[]` was already answered, because an array carries its own family number and the scalar's
+# rule never reached it. After the fix all 100 agree.
+#
+# ## The lower bound, measured beside it: two DIFFERENT types still refuse
+#
+#     COALESCE(json, text)     !42804 COALESCE types json and text cannot be matched
+#     CASE     json / text     !42804 CASE types text and json cannot be matched
+#     COALESCE(xml, text)      !42804 COALESCE types xml and text cannot be matched
+#     COALESCE(integer, text)  !42804 COALESCE types integer and text cannot be matched
+#     COALESCE(json[], json)   !42804 COALESCE types json[] and json cannot be matched
+#     COALESCE(json, jsonb)    !42846 COALESCE could not convert type jsonb to json
+#     COALESCE(xml, json)      !42846 COALESCE could not convert type json to xml
+#
+# **Two sqlstates, two questions.** `42804` is "these two have no common type in this category";
+# `42846` is "they have one and this value cannot be converted to it". A fix that unified
+# everything would answer the 100 above and break all seven of these.
+#
+# **And the two shapes name the pair in different orders**, which is not a divergence:
+# `COALESCE` walks its arguments left to right, a `CASE` starts at its `ELSE`. So the same pair is
+# `types json and text` in one and `types text and json` in the other, on 19beta1 itself.
+#
+# ## `json` still compares with nothing, and that is why the family test existed
+#
+#     SELECT '{"a":1}'::json = '{"a":1}'::json
+#       42883 operator does not exist: json = json
+#       DETAIL: No operator of that name accepts the given argument types.
+#       HINT:   You might need to add explicit type casts.
+#
+# Same for `xml`. This node's sentence is word for word the same, `DETAIL` and `HINT` included.
+# `exec::query`'s `same_family` is false for these pairs on purpose and must stay false; what was
+# wrong was asking it whether two branches could unify.
+#
+# ## The raw answers, one line per distinct spelling
+#
+#     <type> <TAB> coalesce=<type> <TAB> case=<type>
+#
+"char"	coalesce="char"	case="char"
+"char"[]	coalesce="char"[]	case="char"[]
+bigint	coalesce=bigint	case=bigint
+bigint[]	coalesce=bigint[]	case=bigint[]
+bit	coalesce=bit	case=bit
+bit[]	coalesce=bit[]	case=bit[]
+boolean	coalesce=boolean	case=boolean
+boolean[]	coalesce=boolean[]	case=boolean[]
+box	coalesce=box	case=box
+box[]	coalesce=box[]	case=box[]
+bytea	coalesce=bytea	case=bytea
+bytea[]	coalesce=bytea[]	case=bytea[]
+character	coalesce=character	case=character
+character varying	coalesce=character varying	case=character varying
+character varying[]	coalesce=character varying[]	case=character varying[]
+character[]	coalesce=character[]	case=character[]
+cidr	coalesce=cidr	case=cidr
+cidr[]	coalesce=cidr[]	case=cidr[]
+circle	coalesce=circle	case=circle
+circle[]	coalesce=circle[]	case=circle[]
+citext	coalesce=citext	case=citext
+citext[]	coalesce=citext[]	case=citext[]
+date	coalesce=date	case=date
+date[]	coalesce=date[]	case=date[]
+daterange	coalesce=daterange	case=daterange
+daterange[]	coalesce=daterange[]	case=daterange[]
+double precision	coalesce=double precision	case=double precision
+double precision[]	coalesce=double precision[]	case=double precision[]
+hstore	coalesce=hstore	case=hstore
+hstore[]	coalesce=hstore[]	case=hstore[]
+inet	coalesce=inet	case=inet
+inet[]	coalesce=inet[]	case=inet[]
+int2vector	coalesce=int2vector	case=int2vector
+int4range	coalesce=int4range	case=int4range
+int4range[]	coalesce=int4range[]	case=int4range[]
+int8range	coalesce=int8range	case=int8range
+int8range[]	coalesce=int8range[]	case=int8range[]
+integer	coalesce=integer	case=integer
+integer[]	coalesce=integer[]	case=integer[]
+interval	coalesce=interval	case=interval
+interval[]	coalesce=interval[]	case=interval[]
+json	coalesce=json	case=json
+json[]	coalesce=json[]	case=json[]
+jsonb	coalesce=jsonb	case=jsonb
+jsonb[]	coalesce=jsonb[]	case=jsonb[]
+line	coalesce=line	case=line
+line[]	coalesce=line[]	case=line[]
+lquery	coalesce=lquery	case=lquery
+lseg	coalesce=lseg	case=lseg
+lseg[]	coalesce=lseg[]	case=lseg[]
+ltree	coalesce=ltree	case=ltree
+ltree[]	coalesce=ltree[]	case=ltree[]
+macaddr	coalesce=macaddr	case=macaddr
+macaddr[]	coalesce=macaddr[]	case=macaddr[]
+money	coalesce=money	case=money
+money[]	coalesce=money[]	case=money[]
+name	coalesce=name	case=name
+name[]	coalesce=name[]	case=name[]
+numeric	coalesce=numeric	case=numeric
+numeric[]	coalesce=numeric[]	case=numeric[]
+numrange	coalesce=numrange	case=numrange
+numrange[]	coalesce=numrange[]	case=numrange[]
+oid	coalesce=oid	case=oid
+oid[]	coalesce=oid[]	case=oid[]
+oidvector	coalesce=oidvector	case=oidvector
+path	coalesce=path	case=path
+path[]	coalesce=path[]	case=path[]
+point	coalesce=point	case=point
+point[]	coalesce=point[]	case=point[]
+polygon	coalesce=polygon	case=polygon
+polygon[]	coalesce=polygon[]	case=polygon[]
+real	coalesce=real	case=real
+real[]	coalesce=real[]	case=real[]
+regclass	coalesce=regclass	case=regclass
+regclass[]	coalesce=regclass[]	case=regclass[]
+regproc	coalesce=regproc	case=regproc
+regproc[]	coalesce=regproc[]	case=regproc[]
+regtype	coalesce=regtype	case=regtype
+regtype[]	coalesce=regtype[]	case=regtype[]
+smallint	coalesce=smallint	case=smallint
+smallint[]	coalesce=smallint[]	case=smallint[]
+text	coalesce=text	case=text
+text[]	coalesce=text[]	case=text[]
+time	coalesce=time without time zone	case=time without time zone
+timestamp	coalesce=timestamp without time zone	case=timestamp without time zone
+timestamp with time zone	coalesce=timestamp with time zone	case=timestamp with time zone
+timestamp with time zone[]	coalesce=timestamp with time zone[]	case=timestamp with time zone[]
+tsquery	coalesce=tsquery	case=tsquery
+tsquery[]	coalesce=tsquery[]	case=tsquery[]
+tsrange	coalesce=tsrange	case=tsrange
+tsrange[]	coalesce=tsrange[]	case=tsrange[]
+tstzrange	coalesce=tstzrange	case=tstzrange
+tstzrange[]	coalesce=tstzrange[]	case=tstzrange[]
+tsvector	coalesce=tsvector	case=tsvector
+tsvector[]	coalesce=tsvector[]	case=tsvector[]
+uuid	coalesce=uuid	case=uuid
+uuid[]	coalesce=uuid[]	case=uuid[]
+void	coalesce=void	case=void
+xml	coalesce=xml	case=xml
+xml[]	coalesce=xml[]	case=xml[]
