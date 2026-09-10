@@ -200,10 +200,10 @@ impl TableCache {
 
     /// Forgets `number`, which must be done before its file is deleted.
     pub(crate) fn evict(&self, number: u64) {
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(entry) = state.open.remove(&number) {
-                state.recency.remove(&entry.used_at);
-            }
+        if let Ok(mut state) = self.state.lock()
+            && let Some(entry) = state.open.remove(&number)
+        {
+            state.recency.remove(&entry.used_at);
         }
     }
 

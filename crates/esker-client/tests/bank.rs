@@ -231,7 +231,7 @@ impl Plan {
     ///
     /// The sixty-second run is where the fault plan is exercised properly.
     fn one_seed(seed: u64) -> Self {
-        if seed % 4 == 0 {
+        if seed.is_multiple_of(4) {
             // Three seconds, not the 1.5 this was. A killed seed spends its first quarter
             // waiting for the audit's own lag to elapse and the rest sharing the run with a
             // leader kill, so 1.5 s left room for one or two audit attempts — measured, one

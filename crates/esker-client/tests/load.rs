@@ -206,7 +206,7 @@ fn drive(addr: SocketAddr, deadline: Instant) -> Outcome {
                     }
 
                     // A scan every so often, so the range path is under load too.
-                    if index % 16 == 0 {
+                    if index.is_multiple_of(16) {
                         let start = key_of(client, 0);
                         if let Err(error) = raw.scan(&start, b"", 32) {
                             failures.lock().unwrap().push(Failure {

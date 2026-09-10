@@ -570,7 +570,7 @@ impl super::store::Store for SkipList {
 /// [`BRANCHING`], up to [`MAX_HEIGHT`].
 fn draw_height(rng: &mut Pcg32) -> u32 {
     let mut height = 1;
-    while height < MAX_HEIGHT_U32 && rng.next_u32() % BRANCHING == 0 {
+    while height < MAX_HEIGHT_U32 && rng.next_u32().is_multiple_of(BRANCHING) {
         height += 1;
     }
     height

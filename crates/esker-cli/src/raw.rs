@@ -224,7 +224,7 @@ fn to_hex(bytes: &[u8]) -> String {
 
 /// Reads a hex string back into bytes. An odd length or a non-hex digit is a usage error.
 pub(crate) fn from_hex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     let digits = text.as_bytes();

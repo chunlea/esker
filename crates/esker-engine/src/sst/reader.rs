@@ -152,10 +152,8 @@ impl BlockSource<'_> {
         let payload = decode_block(&raw, self.context)?;
         let bytes: Arc<[u8]> = Arc::from(payload.into_boxed_slice());
 
-        if fill_cache {
-            if let Some(cache) = self.cache {
-                cache.insert(key, Arc::clone(&bytes), bytes.len());
-            }
+        if fill_cache && let Some(cache) = self.cache {
+            cache.insert(key, Arc::clone(&bytes), bytes.len());
         }
         Ok(bytes)
     }
