@@ -1,0 +1,27 @@
+crates/esker-sql/tests/collation_family.rs
+  s_6f7019c05b578b::t_695efbe90d6704 13-24,28-30
+crates/esker-sql/tests/corpus/pg19_collation_family.txt
+  s_6f7019c05b578b::t_3e3db3c1e99720 41-72
+docs/acceptance/v1.1.md
+  s_6f7019c05b578b::t_c7921514b08bed 411
+docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md
+  s_6f7019c05b578b::t_a675ae0b07b60a 1-197
+docs/plans/debts-v1.1.md
+  s_6f7019c05b578b::t_f5b6ba3e279b80 111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "93a7f08851780fc221d85a7667bc03045dae0934",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
