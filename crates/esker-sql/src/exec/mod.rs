@@ -457,6 +457,9 @@ fn wait_for_the_lock(
                 // another transaction's commit, which is not a contended resource that a longer
                 // back-off relieves — it is an event, and the only cost of asking again is a lock
                 // on a map.
+                esker_client::stmt_stats::record_wait(std::time::Duration::from_millis(
+                    WAIT_STEP_MS,
+                ));
                 std::thread::sleep(std::time::Duration::from_millis(WAIT_STEP_MS));
                 waited = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
             }

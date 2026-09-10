@@ -93,6 +93,17 @@ static ROUND_TRIPS: AtomicU64 = AtomicU64::new(0);
 /// overall: the question is how many a statement touches, and averaging that over statements is
 /// what the summary reports.
 static REGIONS: AtomicU64 = AtomicU64::new(0);
+/// Timestamps taken from the oracle, which on a real cluster is a round trip to the driver.
+static TSO: AtomicU64 = AtomicU64::new(0);
+/// `Prewrite` calls — a transaction's first phase.
+static PREWRITES: AtomicU64 = AtomicU64::new(0);
+/// `Commit` calls — its second.
+static COMMITS: AtomicU64 = AtomicU64::new(0);
+/// Mutations sent in those prewrites: the keys a statement actually wrote or checked.
+static KEYS: AtomicU64 = AtomicU64::new(0);
+/// Time spent asleep behind somebody else's lock, which is the one part of a statement's cost
+/// that is not its own work.
+static WAITED_MICROS: AtomicU64 = AtomicU64::new(0);
 static MICROS: AtomicU64 = AtomicU64::new(0);
 /// The worst statement seen, and what it did — kept as four numbers rather than a string so that
 /// nothing here allocates on the path.
@@ -208,12 +219,19 @@ impl Drop for Guard {
         let micros = u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX);
         let points = POINTS.with(Cell::get);
         let ranges = RANGES.with(Cell::get);
-        let (trips, regions) = esker_client::stmt_stats::taken();
+        let cost = esker_client::stmt_stats::taken();
+        let (trips, regions) = (cost.round_trips, cost.regions);
+        let waited = u64::try_from(cost.waited.as_micros()).unwrap_or(u64::MAX);
         STATEMENTS.fetch_add(1, Ordering::Relaxed);
         POINT_READS.fetch_add(points, Ordering::Relaxed);
         RANGE_SCANS.fetch_add(ranges, Ordering::Relaxed);
         ROUND_TRIPS.fetch_add(trips, Ordering::Relaxed);
         REGIONS.fetch_add(u64::try_from(regions).unwrap_or(0), Ordering::Relaxed);
+        TSO.fetch_add(cost.tso, Ordering::Relaxed);
+        PREWRITES.fetch_add(cost.prewrites, Ordering::Relaxed);
+        COMMITS.fetch_add(cost.commits, Ordering::Relaxed);
+        KEYS.fetch_add(cost.keys, Ordering::Relaxed);
+        WAITED_MICROS.fetch_add(waited, Ordering::Relaxed);
         MICROS.fetch_add(micros, Ordering::Relaxed);
         WORST_MICROS.fetch_max(micros, Ordering::Relaxed);
         if tracing_reads() {
@@ -233,7 +251,13 @@ impl Drop for Guard {
             tracing::info!(
                 target: "esker::stmt::stats",
                 "{micros} us · point reads {points} · range scans {ranges} · round trips {trips} \
-                 · regions {regions} · {source}"
+                 · regions {regions} · tso {tso} · prewrites {prewrites} · commits {commits} \
+                 · keys {keys} · waited {waited} us · {source}",
+                tso = cost.tso,
+                prewrites = cost.prewrites,
+                commits = cost.commits,
+                keys = cost.keys,
+                waited = waited
             );
         }
     }
@@ -320,13 +344,81 @@ pub fn summary() -> String {
     };
     format!(
         "statements {statements}, mean {} us, worst {} us, per statement: point reads {}, \
-         range scans {}, round trips {}, regions {}",
+         range scans {}, round trips {}, regions {}, tso {}, prewrites {}, commits {}, keys {}, \
+         waited {} us",
         micros.checked_div(statements).unwrap_or(0),
         WORST_MICROS.load(Ordering::Relaxed),
         per(points),
         per(ranges),
         per(trips),
         per(regions),
+        per(TSO.load(Ordering::Relaxed)),
+        per(PREWRITES.load(Ordering::Relaxed)),
+        per(COMMITS.load(Ordering::Relaxed)),
+        per(KEYS.load(Ordering::Relaxed)),
+        WAITED_MICROS
+            .load(Ordering::Relaxed)
+            .checked_div(statements)
+            .unwrap_or(0),
+    )
+}
+
+/// **Names the key heads `esker-client` recorded**, which it deliberately cannot do itself.
+///
+/// The client keeps a fixed window of bytes per read and knows nothing about what they mean
+/// (`CLAUDE.md` invariant 7). Here is where they become a catalog kind: the reserved layout puts
+/// `'m'` in front of every metadata key, `esker-sql`'s own records follow it with `"sql"` and one
+/// byte naming the kind (`catalog/record.rs`'s header), and everything else is named by its
+/// namespace alone.
+///
+/// A `Vec` of `(name, count)` rather than a map of bytes, because the only caller is a measurement
+/// that prints it and a byte array in a report is a puzzle rather than an answer.
+#[must_use]
+pub fn name_heads(
+    heads: &std::collections::BTreeMap<[u8; esker_client::stmt_stats::HEAD], u64>,
+) -> Vec<(String, u64)> {
+    // **Merged by name, because the head is wider than a kind.** The client keeps eight opaque
+    // bytes; a kind is five, and the rest is the start of a tenant — so one kind read for two
+    // tenants arrives as two entries. Merging here rather than narrowing the window keeps the
+    // client's record free of any assumption about where a kind ends.
+    let mut merged: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for (head, count) in heads {
+        *merged.entry(name_of_head(head)).or_default() += count;
+    }
+    merged.into_iter().collect()
+}
+
+/// One head, named. Split out so the mapping is testable without building a map.
+fn name_of_head(head: &[u8]) -> String {
+    match head.first().copied() {
+        Some(esker_keys::prefix::META) => {
+            // `'m' ++ "sql" ++ kind` for this crate's records; another component's metadata keys
+            // are named by their namespace and left alone.
+            if head.len() > 4 && &head[1..4] == b"sql" {
+                let kind = head[4];
+                format!("catalog '{}'", char::from(kind))
+            } else {
+                "metadata (not the catalog's)".to_owned()
+            }
+        }
+        Some(esker_keys::prefix::SQL) => "row or index data".to_owned(),
+        Some(esker_keys::prefix::TXN) => "txn record".to_owned(),
+        Some(esker_keys::prefix::RAW) => "raw".to_owned(),
+        Some(other) => format!("namespace {other:#04x}"),
+        None => "empty key".to_owned(),
+    }
+}
+
+/// The write side of [`counts`], for a test that prices one statement at a time:
+/// `(tso, prewrites, commits, keys, waited micros)`.
+#[must_use]
+pub fn write_counts() -> (u64, u64, u64, u64, u64) {
+    (
+        TSO.load(Ordering::Relaxed),
+        PREWRITES.load(Ordering::Relaxed),
+        COMMITS.load(Ordering::Relaxed),
+        KEYS.load(Ordering::Relaxed),
+        WAITED_MICROS.load(Ordering::Relaxed),
     )
 }
 

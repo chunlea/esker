@@ -167,6 +167,7 @@ impl Backend for StoreBackend {
     }
 
     fn now(&self) -> Result<u64> {
+        esker_client::stmt_stats::record_tso();
         self.oracle
             .timestamp()
             .map_err(|error| SqlError::StoreUnavailable(error.to_string()))
@@ -383,6 +384,7 @@ impl Txn for StoreTxn {
         // The oracle's refusal is a `ProtoError` rather than the client's error type, so it is
         // named here rather than run through `translate`: a statement that cannot get a timestamp
         // is a statement that cannot read, and saying which is more use than a generic internal.
+        esker_client::stmt_stats::record_tso();
         let at = self.oracle.timestamp().map_err(|error| {
             SqlError::Internal(format!("no timestamp for this statement: {error}"))
         })?;
@@ -401,6 +403,7 @@ impl Txn for StoreTxn {
     /// is what three real stores answered before this existed: `a commit at 1007 beat this
     /// transaction at 1004`.
     fn restart_statement(&mut self) -> Result<()> {
+        esker_client::stmt_stats::record_tso();
         let at = self.oracle.timestamp().map_err(|error| {
             SqlError::Internal(format!("no timestamp for this statement: {error}"))
         })?;

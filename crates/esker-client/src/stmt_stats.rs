@@ -21,8 +21,11 @@
 //! number.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
+use std::time::Duration;
+
+use crate::wire::Method;
 
 /// Whether the instrument is on, read once from the environment.
 #[must_use]
@@ -38,13 +41,105 @@ thread_local! {
     /// distinct* regions a statement touches: a scan that walks four regions is a different shape
     /// from a point read that retries four times on one.
     static REGIONS: RefCell<BTreeSet<u64>> = const { RefCell::new(BTreeSet::new()) };
+
+    // -- the write side ------------------------------------------------------------------
+    //
+    // #49's numbers are a *read* statement's. A DDL statement is priced by different things and
+    // the round-trip total hides all of them: a `CREATE TABLE` and a `SELECT` that both make six
+    // calls are not the same six. What a write pays for is timestamps, the two phases of its
+    // commit, the keys it writes, and whatever it spent waiting for somebody else.
+
+    /// Timestamps taken from the oracle. Each is a round trip to the placement driver on a real
+    /// cluster, and it is **not** counted in `ROUND_TRIPS`, which counts store calls.
+    static TSO: Cell<u64> = const { Cell::new(0) };
+    /// `Prewrite` calls — phase one, once per region a transaction's keys fall in, plus one per
+    /// range check and one per eager lock.
+    static PREWRITES: Cell<u64> = const { Cell::new(0) };
+    /// `Commit` calls — phase two, the primary alone and then the secondaries by region.
+    static COMMITS: Cell<u64> = const { Cell::new(0) };
+    /// Mutations sent in those prewrites: the keys this statement actually wrote or checked.
+    static KEYS: Cell<u64> = const { Cell::new(0) };
+    /// Time spent asleep waiting for somebody else's lock, in microseconds. Separated because it
+    /// is the one part of a statement's cost that is not this statement's own work.
+    static WAITED: Cell<u64> = const { Cell::new(0) };
+
+    /// **Where the reads went**, as the opaque head of the key each addressed.
+    ///
+    /// A count of scans says a `DROP TABLE` makes nine of them and says nothing about what they
+    /// are for. The head of a key is what tells one record kind from another, and grouping by it
+    /// turns "nine scans" into "nine scans of *these*".
+    ///
+    /// **Opaque here.** This crate does not know what a key means (`CLAUDE.md` invariant 7): it
+    /// records a fixed window of bytes and `esker-sql` names them. `HEAD` is wider than any
+    /// namespace's kind marker so that no length here encodes a layout, and a short key is padded
+    /// rather than skipped — a key too short to have a kind is a fact worth seeing.
+    static READ_HEADS: RefCell<BTreeMap<[u8; HEAD], u64>> = const { RefCell::new(BTreeMap::new()) };
+    /// The same for range scans, kept apart because they are the number `DROP` is priced by.
+    static SCAN_HEADS: RefCell<BTreeMap<[u8; HEAD], u64>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// How many leading bytes of a key are kept to tell record kinds apart. Opaque to this crate.
+pub const HEAD: usize = 8;
+
+/// What one statement cost the cluster, as this crate sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Cost {
+    /// Wire calls to a store, one per attempt.
+    pub round_trips: u64,
+    /// Distinct regions those calls addressed.
+    pub regions: usize,
+    /// Timestamps taken from the oracle.
+    pub tso: u64,
+    /// `Prewrite` calls.
+    pub prewrites: u64,
+    /// `Commit` calls.
+    pub commits: u64,
+    /// Mutations sent in prewrites.
+    pub keys: u64,
+    /// Time asleep behind somebody else's lock.
+    pub waited: Duration,
+    /// Key heads the point reads addressed, and how many each took.
+    pub read_heads: BTreeMap<[u8; HEAD], u64>,
+    /// Key heads the range scans addressed.
+    pub scan_heads: BTreeMap<[u8; HEAD], u64>,
+}
+
+/// How many mutations a body carries, which is zero for everything but a `Prewrite`.
+///
+/// Here rather than in the router, so that the router goes on knowing only that it is sending a
+/// body: what a prewrite is made of is this module's business and the wire's, not routing's.
+#[must_use]
+pub fn mutations_in(body: &crate::wire::Body) -> usize {
+    match body {
+        crate::wire::Body::Txn(crate::wire::TxnKvReq::Prewrite { mutations, .. }) => {
+            mutations.len()
+        }
+        _ => 0,
+    }
+}
+
+/// Records a timestamp taken from the oracle.
+pub fn record_tso() {
+    if !enabled() {
+        return;
+    }
+    TSO.with(|tso| tso.set(tso.get().saturating_add(1)));
+}
+
+/// Records time this statement spent waiting for a lock it did not hold.
+pub fn record_wait(waited: Duration) {
+    if !enabled() {
+        return;
+    }
+    let micros = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX);
+    WAITED.with(|w| w.set(w.get().saturating_add(micros)));
 }
 
 /// Records one wire call to `region_id`.
 ///
 /// Called with the region the attempt was addressed to, which is zero only when the resolver could
 /// not name one — and then no wire call happens, so this is not reached with it.
-pub fn record_call(region_id: u64) {
+pub fn record_call(region_id: u64, body: &crate::wire::Body) {
     if !enabled() {
         return;
     }
@@ -52,26 +147,64 @@ pub fn record_call(region_id: u64) {
     REGIONS.with_borrow_mut(|regions| {
         regions.insert(region_id);
     });
+    // **By phase, because that is what a write is priced by.** The mutation count is meaningful
+    // only for a prewrite, and is not counted anywhere else rather than guessed at.
+    match body.method() {
+        Method::TxnPrewrite => {
+            PREWRITES.with(|n| n.set(n.get().saturating_add(1)));
+            KEYS.with(|n| n.set(n.get().saturating_add(mutations_in(body) as u64)));
+        }
+        Method::TxnCommit => COMMITS.with(|n| n.set(n.get().saturating_add(1))),
+        // **Where a read went**, by the head of the key it routed by — which for a scan is its
+        // lower bound, and is exactly the prefix the scan walks from.
+        Method::TxnGet => bump(&READ_HEADS, body.routing_key()),
+        Method::TxnScan => bump(&SCAN_HEADS, body.routing_key()),
+        _ => {}
+    }
 }
 
-/// What this thread has done since the last [`reset`]: `(round trips, distinct regions)`.
+/// Adds one to `map`'s count for the head of `key`, padded when the key is shorter than [`HEAD`].
+fn bump(map: &'static std::thread::LocalKey<RefCell<BTreeMap<[u8; HEAD], u64>>>, key: &[u8]) {
+    let mut head = [0u8; HEAD];
+    let take = key.len().min(HEAD);
+    head[..take].copy_from_slice(&key[..take]);
+    map.with_borrow_mut(|counts| *counts.entry(head).or_default() += 1);
+}
+
+/// What this thread has done since the last [`reset`].
 #[must_use]
-pub fn taken() -> (u64, usize) {
-    (
-        ROUND_TRIPS.with(Cell::get),
-        REGIONS.with_borrow(BTreeSet::len),
-    )
+pub fn taken() -> Cost {
+    Cost {
+        round_trips: ROUND_TRIPS.with(Cell::get),
+        regions: REGIONS.with_borrow(BTreeSet::len),
+        tso: TSO.with(Cell::get),
+        prewrites: PREWRITES.with(Cell::get),
+        commits: COMMITS.with(Cell::get),
+        keys: KEYS.with(Cell::get),
+        waited: Duration::from_micros(WAITED.with(Cell::get)),
+        read_heads: READ_HEADS.with_borrow(Clone::clone),
+        scan_heads: SCAN_HEADS.with_borrow(Clone::clone),
+    }
 }
 
 /// Starts a new statement's accounting on this thread.
 pub fn reset() {
     ROUND_TRIPS.with(|trips| trips.set(0));
     REGIONS.with_borrow_mut(BTreeSet::clear);
+    TSO.with(|n| n.set(0));
+    PREWRITES.with(|n| n.set(0));
+    COMMITS.with(|n| n.set(0));
+    KEYS.with(|n| n.set(0));
+    WAITED.with(|n| n.set(0));
+    READ_HEADS.with_borrow_mut(BTreeMap::clear);
+    SCAN_HEADS.with_borrow_mut(BTreeMap::clear);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{enabled, record_call, reset, taken};
+    use std::time::Duration;
+
+    use super::{Cost, enabled, record_call, record_tso, record_wait, reset, taken};
 
     /// **Off by default, and off records nothing.** The instrument sits on the path of every wire
     /// call, so a build nobody switched on must not pay for it or count for it.
@@ -83,7 +216,20 @@ mod tests {
         }
         assert!(!enabled());
         reset();
-        record_call(7);
-        assert_eq!(taken(), (0, 0));
+        record_call(
+            7,
+            &crate::wire::Body::Txn(crate::wire::TxnKvReq::Get {
+                key: bytes::Bytes::from_static(b"k"),
+                ts: 1,
+            }),
+        );
+        record_tso();
+        record_wait(Duration::from_millis(5));
+        assert_eq!(
+            taken(),
+            Cost::default(),
+            "every counter, not only the two that existed first — a write-side counter that \
+             recorded while the instrument was off would be paid for by every build"
+        );
     }
 }
