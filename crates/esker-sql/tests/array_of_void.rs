@@ -67,7 +67,9 @@ fn every_other_type_still_builds_an_array() {
 /// owns each — 19beta1 answers an array type for all three and this node answers `text[]`.
 ///
 /// `lquery[]`, `int2vector[]` and `oidvector[]` are types this node does not have: closing them
-/// adds a `ColumnType`, which is five places and a format decision, not a gate. **F6.**
+/// adds a `ColumnType`, which is five places and a format decision, not a gate. **F6**, and
+/// [ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
+/// is the decision — `lquery` in its step one, the two vectors in its step two.
 #[test]
 fn the_three_arrays_this_node_does_not_have() {
     let mut node = parity::Node::new(&["CREATE EXTENSION IF NOT EXISTS ltree"]);

@@ -159,6 +159,9 @@ fn node() -> parity::Node {
 
 /// **Two spellings this unit does not close**, pinned so they are not mistaken for coverage.
 ///
+/// **[ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
+/// is the decision this waits on**, and its step two is what turns this test red.
+///
 /// `int2vector || int2vector` is `smallint[]` on 19beta1 and `oidvector || oidvector` is `oid[]` —
 /// PostgreSQL's two vectors really are arrays. Here they are `Datum::Text`, so answering the array
 /// type would mean *parsing* the value and not only declaring a type: that is family **F6**, the
