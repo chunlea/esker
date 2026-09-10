@@ -237,6 +237,14 @@ pub(crate) struct Run {
     /// database in this process. The engine options above are the server's business then, not
     /// this driver's, and are ignored.
     pub(crate) remote: Option<String>,
+    /// Drive the workload through a **placement driver** instead of at one store.
+    ///
+    /// `--remote` names a store and routes nothing: its client is built on a resolver that says
+    /// the whole key space is one region there, which is right for measuring an engine behind a
+    /// socket and wrong for measuring a cluster. This asks PD where each key lives, so the four
+    /// bands of `docs/bench/v1.1.md` can be taken against four stores and a real placement
+    /// driver — the topology that record is about.
+    pub(crate) pd: Option<String>,
     /// Tier the SSTs into `s3://bucket/prefix` instead of leaving them on local disk.
     ///
     /// The endpoint and the credentials come from the environment — `ESKER_S3_ENDPOINT`,
@@ -301,6 +309,7 @@ impl Default for Run {
             duration_secs: 0,
             bloom_bits: 10,
             remote: None,
+            pd: None,
             write_buffer_size: None,
             target_file_size: None,
             block_size: None,
@@ -329,6 +338,28 @@ pub(crate) fn value_of(size: u32, seed: u64) -> Vec<u8> {
 /// `--remote` drives the same workload over the network instead, against a server that owns
 /// its own database; the engine options here are that server's business and are ignored.
 pub(crate) fn run(options: &Run) -> Result<Report, String> {
+    // **Refused together rather than ranked.** One names a store and routes nothing, the other
+    // routes everything; a run that quietly picked one of them would be a number nobody could
+    // read back.
+    if options.remote.is_some() && options.pd.is_some() {
+        return Err(
+            "`--remote` drives one store and `--pd` routes through a placement driver; give one"
+                .to_owned(),
+        );
+    }
+    if let Some(pd) = &options.pd {
+        if options.workload.is_placement_driver() {
+            return Err(format!(
+                "`--pd {pd}` routes a workload to stores; the `{}` workload measures a placement \
+                 driver in this process",
+                options.workload.name()
+            ));
+        }
+        if options.workload.is_transactional() {
+            return crate::bench_txn::run_routed(options, pd);
+        }
+        return crate::bench_remote::run_routed(options, pd);
+    }
     if let Some(addr) = &options.remote {
         // `--remote` drives a store, and a placement driver is not one. Refused rather than
         // ignored: a flag that quietly measures something else is worse than one that does not
@@ -802,6 +833,7 @@ mod tests {
             duration_secs: 0,
             bloom_bits: 10,
             remote: None,
+            pd: None,
             write_buffer_size: None,
             target_file_size: None,
             block_size: None,
