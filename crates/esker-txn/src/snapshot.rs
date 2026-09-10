@@ -1,4 +1,4 @@
-//! The five questions the Percolator rules ask of stored state, and an in-memory answer to
+//! The questions the Percolator rules ask of stored state, and an in-memory answer to
 //! them for tests.
 //!
 //! Everything in [`crate::percolator`] is a pure function of a [`TxnSnapshot`], which is what
@@ -6,10 +6,11 @@
 //! real implementation is `esker-store`'s, over an engine snapshot pinned for the duration of
 //! one request; this trait is the seam between them.
 //!
-//! # Why these five
+//! # Why these
 //!
 //! They are the smallest set the rules of `docs/txn-spec.md` §5 can be written against, and
-//! each is a different shape of engine access:
+//! each is a different shape of engine access. The first five are the protocol's; the two range
+//! scans are the read set's, and each looks in the column family the other cannot see:
 //!
 //! | Question | Engine | Asked by |
 //! |---|---|---|
@@ -18,6 +19,8 @@
 //! | [`newest_write_after`](TxnSnapshot::newest_write_after) | seek, `write` CF | prewrite's conflict check |
 //! | [`write_of_txn`](TxnSnapshot::write_of_txn) | bounded scan, `write` CF | classifying a transaction's own fate |
 //! | [`get_value`](TxnSnapshot::get_value) | point get, `default` CF | reads |
+//! | [`newest_write_in_range`](TxnSnapshot::newest_write_in_range) | range scan, `write` CF | a read set's range check |
+//! | [`foreign_lock_in_range`](TxnSnapshot::foreign_lock_in_range) | range scan, `lock` CF | the same check, against a phantom still in flight |
 //!
 //! [`write_of_txn`](TxnSnapshot::write_of_txn) is the only scan, and it is bounded: a
 //! transaction's own record sits at some `commit_ts >= start_ts`, so the walk runs from the
@@ -102,6 +105,37 @@ pub trait TxnSnapshot {
         Ok(None)
     }
 
+    /// **A lock inside `[start, end)` that belongs to somebody other than `mine`** — the half of
+    /// the phantom test that [`newest_write_in_range`](TxnSnapshot::newest_write_in_range) cannot
+    /// see ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
+    /// §1).
+    ///
+    /// A commit inside a read range is a phantom that already happened; a **lock** inside one is a
+    /// phantom in flight, and the range check that looks only at the `write` CF walks straight
+    /// past it. Two transactions that both scan a range and both insert into it therefore both
+    /// prewrite — different keys, so nothing collides — and both commit, which is the write skew
+    /// PostgreSQL's SSI refuses.
+    ///
+    /// **`mine` is excluded, and it has to be.** The client prewrites its own keys *before* it
+    /// sends the range checks, so by the time this is asked the checking transaction's own new row
+    /// is locked inside the very range it read. Reporting that would refuse every transaction that
+    /// writes into a range it scanned — which is all of them.
+    ///
+    /// Answers the key as well as the record: the lock is not on the range's bound, and a client
+    /// that has to resolve it needs the key it actually sits on.
+    ///
+    /// The default answers `None` for the same reason the write scan's does — a snapshot with no
+    /// range access cannot claim a range is unlocked — and every implementation here overrides it.
+    fn foreign_lock_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        mine: u64,
+    ) -> Result<Option<(Vec<u8>, LockRecord)>> {
+        let _ = (start, end, mine);
+        Ok(None)
+    }
+
     /// The record the transaction at `start_ts` left on this key — a commit, or the rollback
     /// marker at `commit_ts == start_ts`.
     ///
@@ -126,6 +160,14 @@ impl<T: TxnSnapshot + ?Sized> TxnSnapshot for &T {
     }
     fn newest_write_in_range(&self, start: &[u8], end: &[u8], ts: u64) -> Result<Option<Version>> {
         (**self).newest_write_in_range(start, end, ts)
+    }
+    fn foreign_lock_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        mine: u64,
+    ) -> Result<Option<(Vec<u8>, LockRecord)>> {
+        (**self).foreign_lock_in_range(start, end, mine)
     }
     fn newest_write_after(&self, user_key: &[u8], ts: u64) -> Result<Option<Version>> {
         (**self).newest_write_after(user_key, ts)
@@ -238,6 +280,30 @@ mod memory {
                 .get(&crate::key::lock(user_key))
                 .map(|bytes| LockRecord::decode(bytes))
                 .transpose()
+        }
+
+        fn foreign_lock_in_range(
+            &self,
+            start: &[u8],
+            end: &[u8],
+            mine: u64,
+        ) -> Result<Option<(Vec<u8>, LockRecord)>> {
+            if start >= end {
+                return Ok(None);
+            }
+            // A lock key is `'x' ++ enc(user_key)` with no timestamp suffix, so the CF is ordered
+            // by the same encoded user key the bounds are built from and the range is the
+            // half-open one the caller asked for.
+            for (key, value) in self
+                .lock
+                .range(crate::key::lock(start)..crate::key::lock(end))
+            {
+                let record = LockRecord::decode(value)?;
+                if record.start_ts != mine {
+                    return Ok(Some((crate::key::split_lock(key)?, record)));
+                }
+            }
+            Ok(None)
         }
 
         fn seek_write(&self, user_key: &[u8], ts: u64) -> Result<Option<Version>> {

@@ -1502,16 +1502,40 @@ impl Transaction {
                     end: end.clone(),
                 }],
             };
-            match self.call_resolving(&request)? {
-                TxnKvResp::Prewrite { keys } => {
-                    if let Some(status) = keys.first() {
-                        // The range's lower bound is the key the conflict is reported against: it
-                        // is what the request routed by, and it is the only key of the range this
-                        // client can name.
-                        self.check(status.clone(), Some(start))?;
-                    }
+            // **A lock inside the range is resolved here, and never wounded**
+            // ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
+            // §1). Without this loop the `Locked` the store now answers falls through to
+            // `check`, whose `Locked` arm reports `LockNotCleared` on sight — a `40001` for a
+            // holder that may be about to roll back, which is a phantom that never existed.
+            for round in 0..=self.max_lock_resolutions {
+                let status = match self.call_resolving(&request)? {
+                    TxnKvResp::Prewrite { keys } => keys.into_iter().next(),
+                    other => return Err(unexpected(Method::TxnPrewrite, &other)),
+                };
+                let Some(status) = status else { break };
+                let TxnStatus::Locked(lock) = status else {
+                    // The range's lower bound is the key the conflict is reported against: it
+                    // is what the request routed by, and it is the only key of the range this
+                    // client can name.
+                    self.check(status, Some(start))?;
+                    break;
+                };
+                if round == self.max_lock_resolutions {
+                    return Err(Error::LockNotCleared {
+                        start_ts: lock.start_ts,
+                        key: lock.key.clone(),
+                    });
                 }
-                other => return Err(unexpected(Method::TxnPrewrite, &other)),
+                // **`may_wound: false`, and that is the decision this loop exists to make.** A
+                // wound is for an *acquirer* — a transaction that holds locks and wants one more,
+                // which is half of a cycle. A range check acquires nothing: it asserts that a
+                // range it read has not moved. Killing the holder to make that assertion true
+                // would abort a transaction that did nothing wrong and would answer `40P01` where
+                // the condition is `40001`. So this waits, the way a reader waits, and asks again
+                // — and when the holder commits, the write scan sees it and the answer becomes
+                // the `Conflict` it always was.
+                let last = round + 1 == self.max_lock_resolutions;
+                self.resolve(&lock, vec![lock.key.clone()], round, last, false)?;
             }
         }
         Ok(())

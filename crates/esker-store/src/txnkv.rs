@@ -201,6 +201,45 @@ impl TxnSnapshot for EngineSnapshot<'_> {
         Ok(None)
     }
 
+    /// The first lock in `[start, end)` that is not `mine`.
+    ///
+    /// The mirror of the scan above over the other column family, and the bounds are the same
+    /// bytes: a `lock` key is `'x' ++ enc(user_key)` with no timestamp suffix, which is exactly
+    /// the prefix a `write` key carries in front of its suffix. **First and not newest** — a lock
+    /// has no version to be newest of, and any one of them is enough to refuse the check.
+    fn foreign_lock_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        mine: u64,
+    ) -> esker_txn::Result<Option<(Vec<u8>, LockRecord)>> {
+        if start >= end {
+            return Ok(None);
+        }
+        let mut iter = self
+            .db
+            .iter(cf::LOCK, &self.options)
+            .map_err(|error| storage(&error))?;
+        iter.seek(&key::prefix(start));
+        let upper = key::prefix(end);
+        while iter.valid() {
+            if iter.key() >= &upper[..] {
+                break;
+            }
+            let record = LockRecord::decode(iter.value())?;
+            // **Our own lock is not a phantom.** The client prewrites its keys before it sends
+            // the range checks, so the row this transaction just inserted into the range it read
+            // is locked and sitting here — see the trait's note.
+            if record.start_ts != mine {
+                let user_key = key::split_lock(iter.key())?;
+                return Ok(Some((user_key, record)));
+            }
+            iter.next();
+        }
+        iter.status().map_err(|error| storage(&error))?;
+        Ok(None)
+    }
+
     fn write_of_txn(&self, user_key: &[u8], start_ts: u64) -> esker_txn::Result<Option<Version>> {
         // Bounded below by `start_ts`: a transaction's own record is a commit above it or its
         // rollback marker exactly at it, so there is nothing to find further down.
@@ -416,7 +455,23 @@ pub fn prewrite(
                         commit_ts: version.commit_ts,
                     });
                 }
-                None => statuses.push(TxnStatus::Ok),
+                // **A commit is a verdict; a lock is a question** ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §1).
+                // Asked in this order because a commit inside the range is decided — this
+                // transaction has lost, whatever anyone else is holding — and the lock below is
+                // not: its owner may still roll back, in which case nothing was ever in the range
+                // and refusing over it would be a `40001` for a phantom that never existed. So a
+                // lock is answered the way a key-level check answers one, and the client does with
+                // it what it already does: settle the holder, then ask again.
+                None => match snapshot
+                    .foreign_lock_in_range(start, end, start_ts)
+                    .map_err(txn_to_proto)?
+                {
+                    Some((user_key, lock)) => {
+                        refused = true;
+                        statuses.push(TxnStatus::Locked(lock_info(&user_key, &lock)));
+                    }
+                    None => statuses.push(TxnStatus::Ok),
+                },
             }
             continue;
         }
