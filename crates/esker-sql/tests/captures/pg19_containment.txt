@@ -69,3 +69,24 @@ SELECT (a @> b) AS v FROM (VALUES ('{"a":1,"b":2}'::jsonb, '{"a":1}'::jsonb)) s(
 SELECT (a <@ b) AS v FROM (VALUES ('{"a":1}'::jsonb, '{"a":1,"b":2}'::jsonb)) s(a,b)	boolean	t
 SELECT (a @> b) AS v FROM (VALUES ('((0,0),(4,0),(4,4),(0,4))'::polygon, '((1,1),(2,1),(2,2),(1,2))'::polygon)) s(a,b)	boolean	t
 SELECT (a <@ b) AS v FROM (VALUES ('((1,1),(2,1),(2,2),(1,2))'::polygon, '((0,0),(4,0),(4,4),(0,4))'::polygon)) s(a,b)	boolean	t
+#
+# ## The polygon half, and the one cell that decides its implementation
+#
+# **`poly_contain` checks edges, not vertices.** The three rows below are one experiment: both
+# vertices of an inner edge are inside a concave outer, the midpoint of that edge is outside, and
+# the containment is `f`. A vertices-only implementation — which is what "all points of B are
+# inside A" reads like, and what this node would plausibly have shipped — answers `t` there.
+#
+# The boundary counts as inside: a polygon contains itself and contains one sharing an edge with
+# it. Touching at a single vertex while lying outside is not containment.
+#
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((0,0),(2,0),(2,2),(0,2))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((4,4),(5,4),(5,5),(4,5))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon @> '((2,2),(6,2),(6,6),(2,6))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(1,0),(1,1),(0,1))'::polygon @> '((5,5),(6,5),(6,6),(5,6))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(2,1),(0,4))'::polygon @> '(1,2)'::point) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(2,1),(0,4))'::polygon @> '(3,2)'::point) AS v	boolean	t
+SELECT ('((0,0),(4,0),(4,4),(2,1),(0,4))'::polygon @> '(2,2)'::point) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(2,1),(0,4))'::polygon @> '((1,2),(3,2),(3,2.2),(1,2.2))'::polygon) AS v	boolean	f
+SELECT ('((0,0),(4,0),(4,4),(0,4))'::polygon && '((2,2),(6,2),(6,6),(2,6))'::polygon) AS v	boolean	t
+SELECT ('((0,0),(1,0),(1,1),(0,1))'::polygon && '((5,5),(6,5),(6,6),(5,6))'::polygon) AS v	boolean	f
