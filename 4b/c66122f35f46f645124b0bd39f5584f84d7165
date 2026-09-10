@@ -1,0 +1,25 @@
+crates/esker-store/src/peer.rs
+  s_b249f065cef854::t_e0d1e9fcaa3746 368-373,1422-1434
+crates/esker-store/src/region.rs
+  s_b249f065cef854::t_4b5686107a3f18 196-238
+crates/esker-store/src/server.rs
+  s_b249f065cef854::t_90abcb07b8dd3c 3650-3654
+crates/esker-store/tests/membership_across_restart.rs
+  s_b249f065cef854::t_35c7f1d6c96163 1-298
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4bc66122f35f46f645124b0bd39f5584f84d7165",
+  "prompts": {},
+  "sessions": {
+    "s_b249f065cef854": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7c1a94ab-56c5-4769-8981-7863defc92e8",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
