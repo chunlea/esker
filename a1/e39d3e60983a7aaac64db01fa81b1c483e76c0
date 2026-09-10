@@ -1,0 +1,21 @@
+crates/esker-sql/src/parse/lower.rs
+  s_2d916f5f540186::t_c548588e94611a 1911-1918
+docs/plans/debts-v1.1.md
+  s_2d916f5f540186::t_0f2aad7f2a6a60 24,120-121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "a1e39d3e60983a7aaac64db01fa81b1c483e76c0",
+  "prompts": {},
+  "sessions": {
+    "s_2d916f5f540186": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "41f74fb7-31ea-4465-891b-5f2309c89f02",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
