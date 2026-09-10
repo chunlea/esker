@@ -1,0 +1,25 @@
+crates/esker-client/src/router.rs
+  s_6f7019c05b578b::t_a8e6d3a58f776e 263
+crates/esker-client/src/stmt_stats.rs
+  s_6f7019c05b578b::t_56b9fd0e91b3d3 24,65-78,81-83,85,101-104,142,150-152,155,158-161,166-173,185-186,199-200,207,219-225
+crates/esker-sql/src/stmt_stats.rs
+  s_6f7019c05b578b::t_a1db310d176859 240-285
+crates/esker-sql/tests/ddl_cost.rs
+  s_6f7019c05b578b::t_044b559afbffd5 56-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d3759cd38eb4dd23885bbd3639449b106b6ddbd7",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
