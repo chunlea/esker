@@ -1,4 +1,5 @@
-//! **Every cast `pg_cast` defines between two types this node has, run against the evaluator.**
+//! **The casts `pg_cast` defines between the shapes and scalars below, run against the
+//! evaluator** — ninety-four of them, and see the paragraph on what is *not* here.
 //!
 //! `debts-v1.1.md` #43's first mechanism. The operand is a **column**, not a literal, and that is
 //! the whole point: a literal under a cast is folded at lowering (`parse::lower::lower_cast`), so
@@ -7,10 +8,17 @@
 //! `text` and could go no further precisely because that arm knows fewer conversions than the
 //! fold does — this file is how many fewer.
 //!
-//! 94 pairs, taken from `pg_cast` on 19beta1 restricted to the types this node has, each with a
-//! representative value of the source type and **each in its own savepoint**: a refusal that
-//! aborts the transaction would otherwise swallow every probe after it, which is what the first
-//! draft of this capture did.
+//! 94 pairs, each with a representative value of the source type and **each in its own
+//! savepoint**: a refusal that aborts the transaction would otherwise swallow every probe after
+//! it, which is what the first draft of this capture did.
+//!
+//! **Ninety-four is not every pair, and this line used to say it was.** The probes come from
+//! `pg_cast` restricted to the **thirty-four types `castprobe` declares a column for**, which is
+//! not the same set as the types this node has: `int2`, `int4` and `int8` are missing from both
+//! axes, and so are `line`, `macaddr` and the text-search types. The integers are the expensive
+//! omission — `pg_cast` gives them rows against every number, `oid`, `"char"`, `money` and both
+//! bit strings — so the eighteen missing conversions this file sized are a floor and not a total.
+//! Corrected here as soon as it was noticed; the rows themselves were always what they say.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
