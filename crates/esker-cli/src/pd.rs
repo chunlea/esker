@@ -10,7 +10,7 @@
 //! replicate with `esker-raft` (`prompts/04-multiraft-pd.md`).
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::rpc_tls::RpcTlsFlags;
@@ -693,6 +693,25 @@ fn print_history(pd: &PdInspector, out: &mut impl std::io::Write) -> Result<(), 
 /// every region.
 ///
 /// It opens the database, so it is for a PD that is **stopped** — the same rule the other
+/// Why `inspect` could not open `dir`.
+///
+/// **The refusal that has an answer gets one.** An engine open is not read-only — it replays the
+/// log, writes a WAL segment and appends a manifest edit — so a running driver's directory is
+/// claimed and this cannot have it. That is the rule this tool's own module doc has always stated
+/// (`esker_pd::inspect`: "a **stopped** placement driver's files"); before the claim, nothing
+/// enforced it, and inspecting a live driver wrote into the database it was reading.
+fn cannot_inspect(dir: &Path, error: &esker_pd::PdError) -> String {
+    if let esker_pd::PdError::Engine(esker_engine::Error::InUse { .. }) = error {
+        return format!(
+            "{} is open in another process, so a placement driver is running on it. \
+             `pd inspect` reads a driver's files and needs it stopped; a *running* one answers \
+             `esker pd status --pd <address>` and `esker pd members --pd <address>`.",
+            dir.display()
+        );
+    }
+    format!("opening {}: {error}", dir.display())
+}
+
 /// `dump` commands follow.
 pub(crate) fn inspect(
     options: &InspectOptions,
@@ -703,7 +722,7 @@ pub(crate) fn inspect(
     // not create or move what it was asked to look at — and a typo in a path should be an error,
     // not an empty database that reads like a wiped cluster.
     let pd = PdInspector::open(&options.data_dir, esker_engine::Options::default())
-        .map_err(|error| format!("opening {}: {error}", options.data_dir.display()))?;
+        .map_err(|error| cannot_inspect(&options.data_dir, &error))?;
 
     let write = |error: std::io::Error| format!("writing: {error}");
 

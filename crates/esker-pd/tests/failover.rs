@@ -388,15 +388,24 @@ impl Group {
     /// what it had applied.
     fn restart(&mut self, id: NodeId) {
         let at = slot(id);
-        // Dropped first, so its driver thread is joined and its database closed before the
-        // replacement opens the same files.
-        self.pds[at] = open(
+        // **Dropped first, and it takes two statements to be.** `self.pds[at] = open(…)`
+        // evaluates the replacement before it drops what it replaces, so the two overlapped: the
+        // old member's driver thread was still running and its database still open while its
+        // successor opened the same files. The comment here has claimed the opposite since this
+        // harness was written, and nothing could check it until `Db` began claiming its data
+        // directory — this restart is the only place in the group where two members could ever
+        // be on one. `remove` and `insert` rather than an assignment, so the drop is a statement
+        // of its own and the slot keeps its position.
+        let stopped = self.pds.remove(at);
+        drop(stopped);
+        let fresh = open(
             id,
             &self.members,
             self.dirs[at].path(),
             &self.clocks[at],
             &self.wire,
         );
+        self.pds.insert(at, fresh);
         self.wire.join(id, &self.pds[at]);
     }
 }

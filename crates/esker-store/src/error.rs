@@ -65,6 +65,8 @@ impl From<StoreError> for ProtoError {
 ///   can this layer promise the write did not land, so it does not.
 /// * [`EngineError::ShuttingDown`] is [`ProtoError::ServerIsBusy`]: retryable, because the
 ///   client's next attempt belongs somewhere else and a backoff is how it gets there.
+/// * [`EngineError::InUse`] cannot reach a request at all — a store opens its database once,
+///   before it serves — so it is [`ProtoError::Internal`] rather than anything retryable.
 #[must_use]
 pub fn engine_to_proto(error: &EngineError) -> ProtoError {
     match error {
@@ -91,6 +93,12 @@ pub fn engine_to_proto(error: &EngineError) -> ProtoError {
         }
         EngineError::Poisoned(detail) => {
             ProtoError::internal(format!("the database must be reopened: {detail}"))
+        }
+        // Reachable only from an open, which a store does once before it serves — so no request
+        // can produce this and none should be told it might. Mapped anyway, because a variant
+        // that reached a client as something vaguer would be a worse answer than the true one.
+        EngineError::InUse { dir } => {
+            ProtoError::internal(format!("{} is open in another process", dir.display()))
         }
     }
 }

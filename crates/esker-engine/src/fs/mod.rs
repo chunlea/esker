@@ -112,6 +112,22 @@ pub trait FileSystem: Send + Sync + fmt::Debug {
     /// instead of copying them (`docs/DESIGN.md` §4.1).
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()>;
 
+    /// Claims `dir` for this process, for as long as the returned value lives.
+    ///
+    /// A data directory has exactly one writer. Nothing in the engine enforced that until this
+    /// existed, and the shape that finds it is a supervisor and an operator restarting the same
+    /// node: both binaries **open their database before they bind their port**, so the one that
+    /// loses the port has already opened the database — two writers on one LSM tree, for as long
+    /// as it takes the loser to exit.
+    ///
+    /// `io::ErrorKind::WouldBlock` means somebody else holds it. Any other error is the
+    /// filesystem's own.
+    ///
+    /// No default implementation, for the reason [`WritableFile::sync_all`] gives: a default that
+    /// answered `Ok` would be a claim nobody checked, in a trait whose implementations are the
+    /// simulator's and the fault injector's — exactly the ones where a silent opt-out survives.
+    fn lock_directory(&self, dir: &Path) -> io::Result<Box<dyn DirectoryLock>>;
+
     /// The object-storage tier behind this filesystem, if it has one.
     ///
     /// `None` for every implementation that is only a filesystem, which is the default and
@@ -195,6 +211,14 @@ pub trait WritableFile: Send {
     /// compiler is the only reviewer that reads every implementation.
     fn sync_all(&mut self) -> io::Result<()>;
 }
+
+/// A claim on a data directory, released when it is dropped.
+///
+/// **Released by the kernel too.** [`LocalFileSystem`]'s holds an open file whose lock lives on
+/// the open file description, so a `kill -9` releases it with every other descriptor the process
+/// had. That is what makes this safe in a system whose acceptance run is fifty `SIGKILL`s: a
+/// claim that outlived its holder would turn one crash into a node that can never start again.
+pub trait DirectoryLock: Send + Sync + fmt::Debug {}
 
 /// A file read by position, concurrently, without a shared cursor.
 pub trait RandomAccessFile: Send + Sync {
@@ -280,7 +304,42 @@ impl FileSystem for LocalFileSystem {
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
         fs::hard_link(from, to)
     }
+
+    fn lock_directory(&self, dir: &Path) -> io::Result<Box<dyn DirectoryLock>> {
+        let path = dir.join(LOCK_FILE);
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        // Not truncated and never written: the file is a handle to hold a lock on, and an empty
+        // one says the same thing on a second open as it did on the first. `try_lock` and not
+        // `lock`, because a second node blocking for ever on a directory reads as a hang.
+        match file.try_lock() {
+            Ok(()) => Ok(Box::new(LocalDirectoryLock { _file: file })),
+            Err(fs::TryLockError::WouldBlock) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("{} is held by another process", path.display()),
+            )),
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
 }
+
+/// The name of the file [`LocalFileSystem::lock_directory`] locks.
+///
+/// Uppercase like `CURRENT`, and — like every name the engine does not recognise —
+/// [`crate::filename::classify`] answers `None` for it, which is what keeps the obsolete-file
+/// sweep from deleting the lock out from under its holder.
+pub const LOCK_FILE: &str = "LOCK";
+
+/// A claim on a local directory: an open file whose kernel lock is released when it closes.
+#[derive(Debug)]
+struct LocalDirectoryLock {
+    _file: File,
+}
+
+impl DirectoryLock for LocalDirectoryLock {}
 
 /// An appendable file on the local filesystem.
 #[derive(Debug)]

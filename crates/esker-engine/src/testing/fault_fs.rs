@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use esker_base::hash::mix64;
 use esker_base::rng::Pcg32;
 
-use crate::fs::{FileSystem, RandomAccessFile, WritableFile};
+use crate::fs::{DirectoryLock, FileSystem, RandomAccessFile, WritableFile};
 
 use super::plan::{Fault, FaultPlan, FaultRecord, Operation};
 
@@ -349,6 +349,16 @@ impl FileSystem for FaultFileSystem {
             return Err(injected(&operation, fault));
         }
         self.shared.inner.hard_link(from, to)
+    }
+
+    /// Passed through without an injectable fault.
+    ///
+    /// A claim is taken once, before anything is read or written, and a fault here would test
+    /// the caller's handling of "the filesystem refused" rather than anything about crashes —
+    /// which is what every other operation in this file is for. The refusal that matters is
+    /// `WouldBlock`, and it is produced by a real second holder in the tests that want it.
+    fn lock_directory(&self, dir: &Path) -> io::Result<Box<dyn DirectoryLock>> {
+        self.shared.inner.lock_directory(dir)
     }
 }
 

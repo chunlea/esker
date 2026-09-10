@@ -57,8 +57,8 @@ use std::time::{Duration, Instant};
 
 use esker_engine::memfs::MemFileSystem;
 use esker_engine::{
-    Db, Durability, FileSystem, Options, RandomAccessFile, ReadOptions, WalSyncMode, WritableFile,
-    WriteOptions, cf,
+    Db, DirectoryLock, Durability, FileSystem, Options, RandomAccessFile, ReadOptions, WalSyncMode,
+    WritableFile, WriteOptions, cf,
 };
 
 const DIR: &str = "/db";
@@ -180,6 +180,10 @@ impl FileSystem for CrashFs {
     }
     fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.inner.hard_link(from, to)
+    }
+
+    fn lock_directory(&self, dir: &Path) -> io::Result<Box<dyn DirectoryLock>> {
+        self.inner.lock_directory(dir)
     }
 }
 
