@@ -4198,12 +4198,17 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
         // neither side is a column, and without it `'2020-01-01'::date = 1` compares a `Datum` to
         // a `Datum`, falls through `pg_cmp`'s cross-variant order and answers **`f`** — a value
         // where a real server raises, which is the worst class ADR 0031 ranks.
+        // **The two sites below name `missing_symbol`, not the spelling.** `IS DISTINCT FROM` is
+        // built on `=` and a real server refusing it says `operator does not exist: json = json`.
+        // Found by marking every `UndefinedOperator` in this crate with its own line and running
+        // the census once — three readings of the code had blamed three other sites, and these two
+        // are the pair that fires.
         (Expr::Literal(left_literal), Expr::Literal(right_literal)) => {
             match (literal_type(left_literal), literal_type(right_literal)) {
                 (Some(a), Some(b)) if !same_family(a, b) => {
                     return Err(SqlError::UndefinedOperator {
                         left: a.name().to_owned(),
-                        op: op.symbol(),
+                        op: op.missing_symbol(),
                         right: b.name().to_owned(),
                     });
                 }
@@ -4229,7 +4234,7 @@ fn reconcile(op: BinaryOp, left: Expr, right: Expr) -> Result<(Expr, Expr)> {
             };
             return Err(SqlError::UndefinedOperator {
                 left: a.name().to_owned(),
-                op: op.symbol(),
+                op: op.missing_symbol(),
                 right: b.name().to_owned(),
             });
         }
