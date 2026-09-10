@@ -1187,8 +1187,10 @@ fn resolve_aggregate_order_by(call: &AggregateCall, scope: &Scope<'_>) -> Result
     call.order_by
         .iter()
         .map(|item| {
+            let expr = super::query::resolve(&item.expr, scope)?;
             Ok(SortKey {
-                expr: super::query::resolve(&item.expr, scope)?,
+                ty: super::query::expr_type(&expr, scope).ok(),
+                expr,
                 descending: item.descending,
                 nulls_first: item
                     .nulls_first

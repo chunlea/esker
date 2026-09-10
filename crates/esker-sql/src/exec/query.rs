@@ -780,6 +780,7 @@ fn set_order_keys(select: &Select, columns: &[OutputColumn]) -> Result<Vec<SortK
                 ty: columns[at].ty,
                 typmod: columns[at].typmod,
             },
+            ty: Some(columns[at].ty),
             descending: item.descending,
             // The same default as everywhere else: NULLs last ascending, first descending.
             nulls_first: item.nulls_first.unwrap_or(item.descending),
@@ -1363,15 +1364,10 @@ fn refuse_json_sort(keys: &[SortKey]) -> Result<()> {
         ) {
             return Err(SqlError::NoOrderingOperator(ty.name()));
         }
-        // **A `jsonb` is ordered on a real server** — it has a btree operator class and its
-        // comparison is the *document's*, kind first and numbers numerically, which the stored
-        // canonical text does not reproduce. So this half stays a `0A000` gap this node owns.
-        if matches!(ty, ColumnType::Jsonb) {
-            return Err(SqlError::unsupported(format!(
-                "ORDER BY over a {} column",
-                ty.name()
-            )));
-        }
+        // **A `jsonb` is ordered on a real server and is ordered here.** Its comparison is the
+        // *document's* — kind first and numbers numerically — which the stored canonical text does
+        // not reproduce, so what makes it sortable is the declared type travelling on the
+        // `SortKey` to the comparator rather than a `Datum` of its own (`plan::SortKey::ty`).
     }
     Ok(())
 }
@@ -1472,6 +1468,7 @@ fn order_keys(
             resolved
         };
         keys.push(SortKey {
+            ty: expr_type(&expr, scope).ok(),
             expr,
             descending: item.descending,
             // PostgreSQL's default is NULLS LAST ascending and NULLS FIRST descending, which is
