@@ -358,6 +358,32 @@ impl RegionResolver for PdConn {
     }
 }
 
+/// **The driver's clock, which is the only one this system may order by** — `CLAUDE.md`
+/// invariant 6, *"timestamps come only from PD's TSO. No node uses its wall clock for ordering."*
+///
+/// A node built without `--pd` keeps a local counter, and for one node that is a correct oracle:
+/// it is monotonic and it is the only source. **For two it is not.** Two `esker-sql` processes each
+/// counting from one hand the same `start_ts` to different transactions, and every MVCC decision in
+/// this system — visibility, first-committer-wins, lock ownership — is made against that number.
+/// `tests/two_nodes_one_clock.rs` is the arrangement and what it costs: a node reading at 1 cannot
+/// see what another node committed at 2.
+///
+/// The same connection as the routing, deliberately. A second socket to the same driver would be a
+/// second thing to notice had failed, and the driver answers both questions from the same leader.
+impl esker_client::TimestampOracle for PdConn {
+    fn tso(&self, count: u32) -> Result<u64, ProtoError> {
+        // Counterfactual, for whoever changes this next: swapping the line below for a local
+        // counter makes `two_nodes_on_one_driver_never_share_a_timestamp` fail on its first
+        // comparison, because the two nodes then count independently from one.
+        match self.call(&PdReq::Tso { count })? {
+            PdResp::Tso { start_ts, .. } => Ok(start_ts),
+            other => Err(ProtoError::invalid(format!(
+                "the placement driver answered {other:?} to a timestamp request"
+            ))),
+        }
+    }
+}
+
 impl ColumnarReport for PdConn {
     fn report(&self, wishes: Vec<ColumnarWish>) -> Result<(), ProtoError> {
         self.report_columnar(wishes)

@@ -350,15 +350,28 @@ fn connect(
     // learner, because a learner joins through a conf change long after any table was written
     // down. Without `--pd` the old table stands, which is a node told where the stores are and
     // nothing else.
-    let resolver: Arc<dyn esker_client::RegionResolver> = if let Some(address) = pd {
-        Arc::new(PdConn::new(address))
+    // **One connection, both questions.** The driver says where the regions are *and* what time it
+    // is, and a node that asked two different things about the cluster over two sockets would have
+    // two ways to be half-connected.
+    let (resolver, oracle): (
+        Arc<dyn esker_client::RegionResolver>,
+        Arc<dyn esker_client::TimestampOracle>,
+    ) = if let Some(address) = pd {
+        let conn = Arc::new(PdConn::new(address));
+        (Arc::clone(&conn) as Arc<_>, conn as Arc<_>)
     } else {
+        // **A local counter is a correct oracle for exactly one node**, and without `--pd` there is
+        // no driver to ask. It is *not* correct for two: two processes counting from one hand the
+        // same `start_ts` to different transactions, which is `CLAUDE.md` invariant 6 gone and
+        // every MVCC decision with it (`tests/two_nodes_one_clock.rs`). So this arm is the
+        // single-node one and says so.
         let store_ids = transport.store_ids();
-        Arc::new(esker_client::StaticRegion::replicated(1, &store_ids))
+        (
+            Arc::new(esker_client::StaticRegion::replicated(1, &store_ids)) as Arc<_>,
+            Arc::new(esker_client::CountingOracle::starting_at(1)) as Arc<_>,
+        )
     };
     let router = Arc::new(esker_client::Router::new(Arc::new(transport), resolver));
-    let oracle: Arc<dyn esker_client::TimestampOracle> =
-        Arc::new(esker_client::CountingOracle::starting_at(1));
     Ok((
         esker_client::TxnClient::on_router(Arc::clone(&router), Arc::clone(&oracle)),
         oracle,
