@@ -3223,6 +3223,14 @@ fn catalog_function(
         // there and this node does not implement it, so the refusal is the one it always was — a
         // gap a client can read, and a row of `pg19_no_equality_types.txt` in the (b) direction.
         CatalogFunc::SameAs => return Err(SqlError::unsupported("the operator ~=")),
+        // **A `jsonb` containment.** Both operands are the canonical text the type stores, so
+        // re-parsing is faithful. NULL in, NULL out.
+        CatalogFunc::JsonbContains => match (args.first(), args.get(1)) {
+            (Some(Datum::Text(left)), Some(Datum::Text(right))) => {
+                Datum::Bool(crate::value::json::contains(left, right)?)
+            }
+            _ => Datum::Null,
+        },
         // **A `jsonb` comparison, as `-1`, `0` or `1`.** Both operands are the canonical text the
         // type stores, so re-parsing them is faithful — `crate::value::json::canonicalise` ran on
         // the way in. NULL in, NULL out, as every comparison is.

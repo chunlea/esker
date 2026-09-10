@@ -3219,6 +3219,25 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                 } else {
                     (args.first(), args.get(1))
                 };
+                // **A document containment is the document's**, and `@>` alone cannot say which of
+                // the three types it was written for — an hstore, a range or a `jsonb` — because
+                // by evaluation a `jsonb` is a `Datum::Text`. Rewritten here, where the operand's
+                // type is known, exactly as the six comparisons are. `args` is already in
+                // `@>` order, so the flip is undone once, here, and never again.
+                if matches!(symbol, "@>" | "<@")
+                    && let Some(operand) = written_left
+                    && let Ok(ColumnType::Jsonb) = expr_type(operand, scope)
+                {
+                    let (left, right) = if flipped {
+                        (args[1].clone(), args[0].clone())
+                    } else {
+                        (args[0].clone(), args[1].clone())
+                    };
+                    return Ok(Expr::CatalogFunc(Box::new(crate::plan::CatalogFuncCall {
+                        func: CatalogFunc::JsonbContains,
+                        args: vec![left, right],
+                    })));
+                }
                 if let Some(operand) = written_left
                     && let Ok(left) = expr_type(operand, scope)
                     && !crate::value::operator_exists(symbol, left)

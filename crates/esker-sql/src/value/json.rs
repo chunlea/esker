@@ -90,6 +90,48 @@ fn key_order(left: &str, right: &str) -> std::cmp::Ordering {
 ///
 /// Both arguments are already canonical — this is only ever called on stored `jsonb` — so parsing
 /// cannot fail on anything a caller can reach, and a failure is returned rather than assumed away.
+/// Whether `left` contains `right`, as `jsonb`'s `@>`.
+///
+/// **The array-contains-scalar exception is top level only, and it is scalars only.** `'[2]' @> '2'`
+/// is `t` while `'{"a":[1,2]}' @> '{"a":1}'` is `f` and `'[{"a":1}]' @> '{"a":1}'` is `f` — so the
+/// exception cannot live in the recursion, which is where a reading of the documentation would put
+/// it. Measured, all four, in `tests/captures/pg19_containment.txt`.
+///
+/// That one placement is also what makes nesting match in both directions: with the exception out
+/// of the recursion, `'[[1,2]]' @> '[1,2]'` is `f` because a scalar on the right cannot match an
+/// array on the left, and `'[1,2]' @> '[[1,2]]'` is `f` because an array on the right cannot match
+/// a scalar. A containment that flattens is wrong twice, and both are cells here.
+pub(crate) fn contains(left: &str, right: &str) -> Result<bool> {
+    let (left, right) = (parse(left, Nulls::Refuse)?, parse(right, Nulls::Refuse)?);
+    // The exception: an array contains a bare scalar it holds. Only here, only a scalar.
+    if let (Json::Array(items), Json::Null | Json::Bool(_) | Json::Number(_) | Json::Str(_)) =
+        (&left, &right)
+    {
+        return Ok(items.iter().any(|item| within(item, &right)));
+    }
+    Ok(within(&left, &right))
+}
+
+/// The recursion, which has no exceptions: like matches like, or nothing matches.
+fn within(left: &Json, right: &Json) -> bool {
+    match (left, right) {
+        // Every element on the right must be inside *some* element on the left — so order and
+        // duplicates are free, and `'[1,2]' @> '[]'` is vacuously true.
+        (Json::Array(a), Json::Array(b)) => b.iter().all(|r| a.iter().any(|l| within(l, r))),
+        // Every pair on the right must be present on the left, and its value contained rather
+        // than merely equal: `'{"a":{"b":1,"c":2}}' @> '{"a":{"b":1}}'`.
+        (Json::Object(a), Json::Object(b)) => b.iter().all(|(key, value)| {
+            a.iter()
+                .any(|(k, v)| key_order(k, key) == std::cmp::Ordering::Equal && within(v, value))
+        }),
+        // A container never matches a scalar in here, and that is the whole of the nesting rule.
+        (Json::Array(_) | Json::Object(_), _) | (_, Json::Array(_) | Json::Object(_)) => false,
+        // Two scalars: contained means equal, and equal is the document's equality, so `1.0`
+        // contains `1.00`.
+        _ => order(left, right) == std::cmp::Ordering::Equal,
+    }
+}
+
 /// Where `left` sorts against `right` as two `jsonb` values.
 ///
 /// **Written against the measured cells and not derived from a model**, because the model that
@@ -598,6 +640,53 @@ fn numeric_text(digits: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
+
+    /// **Every containment cell of the capture, checked against the implementation.**
+    ///
+    /// Same rule as the ordering test below: the capture is the specification, so the test reads
+    /// it rather than restating it.
+    #[test]
+    fn every_measured_containment_cell_agrees() {
+        let capture = include_str!("../../tests/captures/pg19_containment.txt");
+        let mut checked = 0;
+        for line in capture.lines().filter(|line| !line.starts_with('#')) {
+            let mut fields = line.split('\t');
+            let (Some(statement), Some(_), Some(rows)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let Some(inner) = statement
+                .strip_prefix("SELECT ('")
+                .and_then(|rest| rest.strip_suffix(") AS v"))
+            else {
+                continue;
+            };
+            let Some((left, rest)) = inner.split_once("'::jsonb ") else {
+                continue;
+            };
+            let Some((op, right)) = rest.split_once(" '") else {
+                continue;
+            };
+            let Some(right) = right.strip_suffix("'::jsonb") else {
+                continue;
+            };
+            // `<@` is `@>` with the operands the other way round — measured, and the reason one
+            // implementation answers both.
+            let ours = match op {
+                "@>" => super::contains(left, right),
+                "<@" => super::contains(right, left),
+                _ => continue,
+            }
+            .expect("both sides parse");
+            assert_eq!(ours, rows == "t", "{left} {op} {right}");
+            checked += 1;
+        }
+        assert!(
+            checked > 28,
+            "only {checked} cells read; the capture did not load"
+        );
+    }
 
     /// **Every cell of the capture, checked against the implementation.**
     ///
