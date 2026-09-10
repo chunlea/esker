@@ -1,0 +1,23 @@
+crates/esker-sql/tests/array_of_void.rs
+  s_6f7019c05b578b::t_75ab9126fce565 70-72
+crates/esker-sql/tests/concat_operator.rs
+  s_6f7019c05b578b::t_a61f88dca64001 162-164
+docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md
+  s_6f7019c05b578b::t_845b12fa18a074 1-141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "dc44396dbd3231b0be8384e4fc3cfad546ff4f3c",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
