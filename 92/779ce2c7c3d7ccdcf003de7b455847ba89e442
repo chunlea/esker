@@ -1,0 +1,19 @@
+docs/bench/v1.1.md
+  s_6f7019c05b578b::t_19c93da7b3c517 7-8,10-11,99-190
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "92779ce2c7c3d7ccdcf003de7b455847ba89e442",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
