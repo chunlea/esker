@@ -1,0 +1,68 @@
+# **The values `||` builds for the pairs a type table can only name** — wire v3 family **F3b**,
+# the second of its two units.
+#
+# PostgreSQL 19beta1, 2026-09-10, `127.0.0.1:55432`, one `BEGIN … ROLLBACK` with a
+# `SAVEPOINT`/`ROLLBACK TO` per probe. `pg19_concat_operator.txt` is the type half.
+#
+# ## The three same-type operators this node did not have
+#
+#     '101'::bit(3) || '01'::bit(2)      bit varying   10101
+#     '1'::bit || '0'::bit               bit varying   10
+#     '\x0102'::bytea || '\x03'::bytea   bytea         \x010203
+#     ''::bytea || '\x03'::bytea         bytea         \x03
+#     'a'::tsquery || 'b'::tsquery       tsquery       'a' | 'b'
+#     'a & b'::tsquery || 'c'::tsquery   tsquery       'a' & 'b' | 'c'
+#
+# **A bit widens**: `bit(3) || bit(2)` is a `bit varying` of five and not a `bit(5)` — the type has
+# stopped promising a width. **A tsquery's `||` is an OR**, not a join of its text, and the printed
+# form re-parenthesises by precedence, which is why the answer has to be built as a tree.
+#
+# ## The two the evaluator had and used where PostgreSQL does not
+#
+#     'a=>1'::hstore || 'x'::text        text          "a"=>"1"x
+#     'x'::text || 'a=>1'::hstore        text          x"a"=>"1"
+#     'a b'::tsvector || 'x'::text       text          'a' 'b'x
+#     'x'::text || 'a b'::tsvector       text          x'a' 'b'
+#
+# The operand is rendered the way a real server renders it — an hstore canonically quoted, a
+# tsvector as its sorted lexemes — and joined as text.
+#
+# ## And the rule that makes those two decidable at all: an `unknown` is not a `text`
+#
+#     'a=>1'::hstore || 'b=>2'           hstore        "a"=>"1", "b"=>"2"
+#     'b=>2' || 'a=>1'::hstore           hstore        "a"=>"1", "b"=>"2"
+#     '1'::bit || '0'                    bit varying   10
+#     '\x01'::bytea || '\x02'            bytea         \x0102
+#     'a'::tsquery || 'b'                tsquery       'a' | 'b'
+#     'a'::tsvector || 'b'               tsvector      'a' 'b'
+#     'a.b'::ltree || 'c'                ltree         a.b.c
+#     '{"a":1}'::jsonb || '{"b":2}'      jsonb         {"a": 1, "b": 2}
+#     1 || 'x'                           text          1x
+#     '2020-01-01'::date || 'x'          text          2020-01-01x
+#     'x' || 'y'                         text          xy
+#     ARRAY[1,2] || 'x'                  !22P02 malformed array literal: "x"
+#
+# **An `unknown` literal takes the other operand's type when that type has a `||` with itself, and
+# the pair is `text` otherwise.** Not "the unknown takes the other side's type": `hstore` has an
+# `hstore || hstore` so the unknown becomes one, while `integer` has no `integer || integer` and
+# the pair resolves through `anynonarray || text` instead. `'a=>1'::hstore || 'b=>2'` and
+# `'a=>1'::hstore || 'x'::text` differ **only** in whether the second operand has a type, and they
+# arrive at an evaluator as the same pair of values — which is why the plan has to decide and
+# coerce.
+#
+# ## NULL still propagates
+#
+#     NULL::bit || '1'::bit              bit varying   NULL
+#     NULL::bytea || '\x03'::bytea       bytea         NULL
+#
+# ## Found beside this unit, and not part of it
+#
+#     length('101'::bit(3))                     3
+#     length('10101'::varbit)                   5
+#     length('101'::bit(3) || '01'::bit(2))     5
+#     bit_length('101'::bit(3))                 3
+#     length('\x0102'::bytea)                   2
+#
+# `length` over a bit string is the **number of bits** on 19beta1 and is
+# `42883 function length(bit varying) does not exist` on this node. A missing *function*, not a
+# missing operator — its own unit.

@@ -46,26 +46,12 @@ mod parity;
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
-        (
-            "SELECT '101'::varbit || '11'::varbit",
-            "**Concatenation over bit strings is not built.** `||` is text's here and a bit string reaches no overload, so the refusal is `42883` naming both operand types — the sentence a real server gives for a pair it does not have, about a pair it does. Named rather than approximated, which is what this crate does with every operator it has not built.",
-            "pg19_varbit.txt:87",
-        ),
-        (
-            "SELECT pg_typeof('101'::varbit || '11'::varbit)",
-            "The same gap, read through `pg_typeof`. The answer it would carry is worth recording: `||` is the one bit-string operator that keeps `bit varying`, where the four bitwise ones and the shifts all answer a plain `bit`.",
-            "pg19_varbit.txt:88",
-        ),
-        (
-            "SELECT '101'::varbit || '11'::bit(2)",
-            "The same gap with one operand of each type, which is the pair that says the result type is `bit varying` rather than the wider of the two.",
-            "pg19_varbit.txt:89",
-        ),
-        (
-            "SELECT pg_typeof('101'::varbit || '11'::bit(2))",
-            "The same, read through `pg_typeof`.",
-            "pg19_varbit.txt:90",
-        ),
+        // **The four `||` entries that stood here are gone**, closed by wire v3 family F3b's
+        // second unit: `bit`, `bytea` and `tsquery` each have a same-type `||` on a real server
+        // and this crate now builds the value. The note they carried is worth keeping — `||` is
+        // the one bit-string operator that keeps `bit varying`, where the four bitwise ones and
+        // the shifts all answer a plain `bit` — and `varbit || bit(2)` is what says the answer is
+        // `bit varying` rather than the wider of the two.
         (
             "SELECT length('101'::varbit)",
             "**`length` has no bit-string overload here.** It is the string one, so the refusal names the argument type the way a real server names a function it does not have. The answer is the number of *bits*, which is why it cannot be the string overload reading the digits: `length('101')` is 3 either way and `length('1010'::varbit)` is 4 where the text of a padded `bit(8)` is 8.",

@@ -3372,19 +3372,40 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             // it asks `column_type()`, is told `text`, and concatenates. That is the borrowed
             // representation reaching a second decision, and the plan is the only place that still
             // knows what the operand is.
-            if call.func == CatalogFunc::HstoreConcat
-                && args.len() == 2
-                && let Ok(left) = expr_type(&args[0], scope)
-                && let Ok(right) = expr_type(&args[1], scope)
-                && left != ColumnType::Char
-                && right != ColumnType::Char
-                && concat_pair(left, right).is_none()
-            {
-                return Err(SqlError::UndefinedOperator {
-                    left: left.name().to_owned(),
-                    op: "||",
-                    right: right.name().to_owned(),
-                });
+            if call.func == CatalogFunc::HstoreConcat && args.len() == 2 {
+                let left = concat_operand_type(&args[0], scope)?;
+                let right = concat_operand_type(&args[1], scope)?;
+                if left != Some(ColumnType::Char)
+                    && right != Some(ColumnType::Char)
+                    && concat_answer(left, right).is_none()
+                {
+                    return Err(SqlError::UndefinedOperator {
+                        left: left.map_or("unknown", ColumnType::name).to_owned(),
+                        op: "||",
+                        right: right.map_or("unknown", ColumnType::name).to_owned(),
+                    });
+                }
+                // **An operand the pair settled on `text` for is coerced here**, which is what a
+                // real server's parser does and what the evaluator cannot: `'a=>1'::hstore ||
+                // 'x'::text` is string concatenation on 19beta1 (`"a"=>"1"x`) while
+                // `'a=>1'::hstore || 'b=>2'` is an hstore merge, and the two reach the evaluator
+                // as the same pair of `Datum`s — an `unknown` has no mark on it once it is a
+                // value. Only the operands with a `||` of their own are wrapped: the rest already
+                // render as themselves.
+                if concat_answer(left, right) == Some(ColumnType::Text) {
+                    for (at, ty) in [(0, left), (1, right)] {
+                        if let Some(ty) = ty
+                            && !concat_stringy(ty)
+                            && concat_pair(ty, ty).is_some()
+                        {
+                            args[at] = Expr::Cast {
+                                operand: Box::new(args[at].clone()),
+                                to: ColumnType::Text,
+                                typmod: crate::value::NO_TYPMOD,
+                            };
+                        }
+                    }
+                }
             }
             match (call.func, args.first()) {
                 (CatalogFunc::PgTypeof, Some(arg)) if args.len() == 1 => {
@@ -5682,6 +5703,56 @@ fn same_comparison_family(left: ColumnType, right: ColumnType) -> bool {
     matches!((family(left), family(right)), (Some(a), Some(b)) if a == b)
 }
 
+/// The types that reach `text || text` through an implicit cast, which is why
+/// `citext || citext` answers `text` and not `citext`.
+fn concat_stringy(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Text
+            | ColumnType::Varchar
+            | ColumnType::Bpchar
+            | ColumnType::Citext
+            | ColumnType::Name
+    )
+}
+
+/// One operand's type for `||`, where **`None` means `unknown`** — an unquoted string literal or a
+/// bare `NULL`, neither of which has a type until an operator gives it one.
+///
+/// `expr_type` answers `text` for both, which is right almost everywhere and wrong here: `unknown`
+/// is what makes `'a=>1'::hstore || 'b=>2'` an **hstore** on a real server while
+/// `'a=>1'::hstore || 'x'::text` is `text`. The two differ only in whether the second operand has
+/// a type, and nothing below the plan can tell.
+fn concat_operand_type(expr: &Expr, scope: &Scope<'_>) -> Result<Option<ColumnType>> {
+    if matches!(expr, Expr::Literal(Literal::String(_) | Literal::Null)) {
+        return Ok(None);
+    }
+    expr_type(expr, scope).map(Some)
+}
+
+/// The type `a || b` answers, `unknown` operands included, or `None` for a pair with no operator.
+///
+/// **An `unknown` takes the other operand's type when that type has a `||` with itself**, and the
+/// pair is `text` otherwise. Measured, and it is not "the unknown takes the other side's type":
+///
+/// ```text
+/// 'a=>1'::hstore || 'b=>2'   hstore      '1'::bit  || '0'    bit varying
+/// 'a'::tsquery   || 'b'      tsquery     'a.b'::ltree || 'c' ltree
+/// 1              || 'x'      text        '2020-01-01'::date || 'x'  text
+/// ```
+///
+/// `hstore` has an `hstore || hstore`, so the unknown becomes one; `integer` has no
+/// `integer || integer`, so the pair resolves through `anynonarray || text` instead.
+fn concat_answer(left: Option<ColumnType>, right: Option<ColumnType>) -> Option<ColumnType> {
+    match (left, right) {
+        (Some(left), Some(right)) => concat_pair(left, right),
+        (Some(known), None) | (None, Some(known)) => {
+            concat_pair(known, known).or(Some(ColumnType::Text))
+        }
+        (None, None) => Some(ColumnType::Text),
+    }
+}
+
 /// **Which pairs `||` has an operator for, and the type it answers** — `pg_operator`'s entries for
 /// the symbol, measured rather than accumulated.
 ///
@@ -5703,20 +5774,9 @@ fn same_comparison_family(left: ColumnType, right: ColumnType) -> bool {
 /// `42725`, decided in `resolve` before this is asked, because a real server has a candidate at
 /// every string width and category `Z` prefers none of them.
 fn concat_pair(left: ColumnType, right: ColumnType) -> Option<ColumnType> {
-    /// The types that reach `text || text` through an implicit cast, which is why
-    /// `citext || citext` answers `text` and not `citext`.
-    fn stringy(ty: ColumnType) -> bool {
-        matches!(
-            ty,
-            ColumnType::Text
-                | ColumnType::Varchar
-                | ColumnType::Bpchar
-                | ColumnType::Citext
-                | ColumnType::Name
-        )
-    }
     use esker_keys::array::ArrayValue;
     let element_of = ArrayValue::element_of;
+    let stringy = concat_stringy;
     match (element_of(left), element_of(right)) {
         // **`anyarray || anyarray` is `unify` on the elements**, which is what `unify` already
         // does — measured on seven pairs the probe list cannot ask, because its rows carry one
@@ -5800,10 +5860,18 @@ fn concat_scalars(
     if left == right && matches!(left, ColumnType::Int2Vector | ColumnType::OidVector) {
         return Some(ColumnType::Text);
     }
+    // **The widening, and it does not need the two spellings to match**: `bit(3) || bit(2)`,
+    // `varbit || varbit` and `varbit || bit(2)` are all `bit varying` on 19beta1
+    // (`tests/corpus/pg19_varbit.txt`). Written first as `left == right` only, which left
+    // `varbit || bit(2)` refused — a declared divergence that stayed declared because the pair
+    // was never asked with two spellings.
+    if matches!(left, ColumnType::Bit | ColumnType::VarBit)
+        && matches!(right, ColumnType::Bit | ColumnType::VarBit)
+    {
+        return Some(ColumnType::VarBit);
+    }
     if left == right {
         return match left {
-            // **The widening**: two `bit`s make a `bit varying`, measured.
-            ColumnType::Bit | ColumnType::VarBit => Some(ColumnType::VarBit),
             ColumnType::Bytea
             | ColumnType::TsVector
             | ColumnType::TsQuery
@@ -5833,17 +5901,17 @@ fn concat_type(call: &crate::plan::CatalogFuncCall, scope: &Scope<'_>) -> Column
     // A pair [`concat_pair`] has no operator for cannot be reached: `resolve` refuses it with
     // `42883` before anything asks for a type. `text` is the total answer for that unreachable
     // case and for the `unknown` literals, which is what they resolve to.
-    let mut folded: Option<ColumnType> = None;
+    let mut folded: Option<Option<ColumnType>> = None;
     for arg in &call.args {
-        let Ok(ty) = expr_type(arg, scope) else {
+        let Ok(ty) = concat_operand_type(arg, scope) else {
             return ColumnType::Text;
         };
         folded = Some(match folded {
             None => ty,
-            Some(left) => concat_pair(left, ty).unwrap_or(ColumnType::Text),
+            Some(left) => concat_answer(left, ty),
         });
     }
-    folded.unwrap_or(ColumnType::Text)
+    folded.flatten().unwrap_or(ColumnType::Text)
 }
 
 /// Which fetch a `->` is, from the **declared type of its operand**.

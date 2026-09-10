@@ -30,6 +30,12 @@
 //!
 //! **`bit || bit` is `bit varying`, not `bit`**, and **`citext || citext` is `text`, not `citext`**
 //! — two widenings an arm written by hand gets wrong, and the reason the table is a table.
+//!
+//! **Two units, and this file is the first.** It decides *which pairs have a `||` and what type it
+//! answers*; `tests/concat_values.rs` decides *what the value is*. Six rows were pinned here at
+//! today's answer while the second was outstanding — `bit`, `bytea` and `tsquery` beside
+//! themselves, `hstore || text` both ways, `text || tsvector` — and every one is now asserted like
+//! the rest, because that unit landed. The two vectors are still pinned: they are **F6**.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -159,61 +165,6 @@ fn node() -> parity::Node {
 /// borrowed representation, and it is a different unit.
 const BORROWED: [&str; 2] = ["int2vector", "oidvector"];
 
-/// **The six shape-rows this unit leaves open, and why each is a different unit.**
-///
-/// This unit is the *table*: which pairs have a `||` and what type it answers, decided in
-/// `resolve` where the declared types are. Every one of these needs the **evaluator** to build a
-/// value it cannot build yet, and a declared type without a value is worse than a refusal — a
-/// client is told `bytea` and handed an error. Family **F3b**, next unit.
-///
-/// ```text
-/// bit || bit          19beta1 bit varying   here 42883, from `text_concat`: neither side is text
-/// bytea || bytea      19beta1 bytea         same
-/// tsquery || tsquery  19beta1 tsquery       same, and its `||` is a query OR, not a join
-/// hstore || text      19beta1 text          here 42601 syntax error in hstore, both sides: the
-/// text || hstore                            evaluator reads the text operand as an hstore because
-///                                           one side is one, and a datum cannot say `unknown`
-/// text || tsvector    19beta1 text          here 0A000 || over text is not supported
-/// ```
-const EVALUATOR: [(&str, Shape, &str, &str); 6] = [
-    (
-        "bit",
-        Shape::Both,
-        "bit varying",
-        "!42883 operator does not exist: bit || bit",
-    ),
-    (
-        "bytea",
-        Shape::Both,
-        "bytea",
-        "!42883 operator does not exist: bytea || bytea",
-    ),
-    (
-        "tsquery",
-        Shape::Both,
-        "tsquery",
-        "!42883 operator does not exist: tsquery || tsquery",
-    ),
-    (
-        "hstore",
-        Shape::Right,
-        "text",
-        "!42601 syntax error in hstore",
-    ),
-    (
-        "hstore",
-        Shape::Left,
-        "text",
-        "!42601 syntax error in hstore",
-    ),
-    (
-        "tsvector",
-        Shape::Left,
-        "text",
-        "!0A000 || over text is not supported",
-    ),
-];
-
 /// Which of the three probes a row is about: `x || x`, `x || text`, `text || x`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shape {
@@ -238,32 +189,6 @@ impl Shape {
     }
 }
 
-/// **What this unit does not close, pinned at today's answer** — not `#[ignore]`d, because an
-/// ignored test that would pass is worse than no test, and not asserted at 19beta1's answer,
-/// because that would be a red test standing in for a plan.
-#[test]
-fn the_six_the_evaluator_cannot_build_yet() {
-    let mut node = node();
-    for (ty, shape, pg, today) in EVALUATOR {
-        let lit = literal_of(ty);
-        let answer = node.answer(&shape.sql(lit, false)).to_string();
-        assert!(
-            answer.starts_with(today),
-            "F3b's unit closes this one — 19beta1 answers {pg}. Until then it must not change \
-             quietly.\n  {}\n  expected to still begin {today}\n  and it answered {answer}",
-            shape.sql(lit, false)
-        );
-    }
-}
-
-/// The literal `CONCAT` carries for one spelling.
-fn literal_of(ty: &str) -> &'static str {
-    CONCAT
-        .iter()
-        .find(|(name, ..)| *name == ty)
-        .map_or("NULL::text", |(_, lit, ..)| *lit)
-}
-
 /// **Every pair 19beta1 concatenates, and the type it answers.**
 #[test]
 fn the_pairs_postgresql_concatenates() {
@@ -274,15 +199,12 @@ fn the_pairs_postgresql_concatenates() {
             (of_right, Shape::Right),
             (of_left, Shape::Left),
         ] {
-            // The refusals are the other test's, the two vectors are F6's, and the six the
-            // evaluator cannot build yet are F3b's — each pinned in its own test rather than
-            // skipped in silence.
-            if expected.starts_with('!')
-                || BORROWED.contains(&ty)
-                || EVALUATOR
-                    .iter()
-                    .any(|(name, open, ..)| *name == ty && *open == shape)
-            {
+            // The refusals are the other test's and the two vectors are F6's, pinned in a test
+            // of their own rather than skipped in silence. **The six rows that were skipped here
+            // for the evaluator are not skipped any more** — `tests/concat_values.rs` built their
+            // values, so `bit`, `bytea`, `tsquery`, `hstore || text` and `text || tsvector` are
+            // asserted below like every other pair.
+            if expected.starts_with('!') || BORROWED.contains(&ty) {
                 continue;
             }
             let sql = shape.sql(lit, true);
