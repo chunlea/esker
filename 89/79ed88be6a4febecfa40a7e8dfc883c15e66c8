@@ -1,0 +1,19 @@
+docs/plans/debt-49-catalog-cache.md
+  s_6f7019c05b578b::t_81dd454bb33c8b 127-141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8979ed88be6a4febecfa40a7e8dfc883c15e66c8",
+  "prompts": {},
+  "sessions": {
+    "s_6f7019c05b578b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b7ad1bd-6314-4221-98e0-fbe5334f3415",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
