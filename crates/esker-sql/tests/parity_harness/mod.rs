@@ -798,6 +798,20 @@ fn agrees(expected: &Answer, actual: &Answer) -> bool {
 /// The number is what the capture holds, so leaving it out would make every corpus with a
 /// `varchar(n)`, a `character(n)` or a `timestamp(p)` in it agree by not looking.
 fn type_name(oid: u32, typmod: i32) -> String {
+    // **A domain is printed as its base, which is what the capture holds.** `psql` resolves
+    // `typbasetype` for display: `\gdesc` of `information_schema.columns.is_nullable` says
+    // `character varying(3)` where the `RowDescription` carries 13369 — measured on 19beta1
+    // through `pg_prepared_statements.result_types`, which reads the wire and says
+    // `information_schema.yes_or_no`. The corpora were captured through the client, so this side
+    // has to render the same way or two servers that agree exactly would be reported as
+    // disagreeing (ADR 0103, `debts-v1.1.md` #37).
+    //
+    // The width comes with the base, because the column's typmod is -1 and the domain's is 7.
+    // Only the five `information_schema` domains are here; a **user** domain would need the
+    // tenant's catalog, which this function has no reader for, and no corpus declares one's type
+    // today.
+    let (oid, typmod) = esker_sql::catalog::pg_catalog::information_schema_domain_base(oid)
+        .map_or((oid, typmod), |(base, width)| (base.oid(), width));
     esker_sql::value::ColumnType::ALL
         .into_iter()
         .find(|ty| ty.oid() == oid)

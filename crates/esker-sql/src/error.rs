@@ -913,6 +913,23 @@ pub enum SqlError {
     #[error("open path cannot be converted to polygon")]
     OpenPathIsNotAPolygon,
 
+    /// `'\x4142'::bytea::uuid`: a `bytea` that is not sixteen bytes.
+    ///
+    /// **A length, not a syntax**, and PostgreSQL has a class of its own for it: `22P03`, invalid
+    /// binary representation — where a `uuid` read from *text* that will not parse is the ordinary
+    /// `22P02`. This node routed the cast through the text and blamed the syntax of `\x4142`,
+    /// which is a sentence about the wrong thing: the bytes are perfectly good bytes and there are
+    /// two of them.
+    ///
+    /// Measured on 19beta1, 2026-09-10, with `VERBOSITY verbose`:
+    /// `22P03: invalid input length for type uuid` with `DETAIL:  Expected 16 bytes, got 2.`
+    /// (`debts-v1.1.md` #44, group 5).
+    #[error("invalid input length for type uuid")]
+    UuidLength {
+        /// How many bytes arrived, which the `DETAIL` names.
+        got: usize,
+    },
+
     /// `'{"a":1}'::jsonb::numeric`: a `jsonb` whose **shape** is not the target's.
     ///
     /// **The shape is refused before the value is read**, which is the whole of this variant:
@@ -2229,6 +2246,45 @@ pub enum SqlError {
     #[error("collations are not supported by type {0}")]
     CollationNotSupported(&'static str),
 
+    /// Two **explicit** `COLLATE` clauses that disagree, meeting in one expression: `42P21`.
+    ///
+    /// PostgreSQL's own sentence, and **no `HINT`** — measured on 19beta1, which is the pair of
+    /// facts that tells this apart from `42P22`: there the user named nothing and the server could
+    /// not derive an ordering, and the hint asks for a clause; here the user named two and the
+    /// server will not pick between them, so there is nothing to suggest.
+    ///
+    /// **The names are in the order the expression writes them**, measured:
+    /// `((t COLLATE "POSIX") < (u COLLATE "C"))` says `"POSIX" and "C"`.
+    ///
+    /// It is not only comparison: `||`, `COALESCE` and `CASE` raise it too, and it propagates up
+    /// through a function — `upper('a' COLLATE "C") < ('b' COLLATE "POSIX")` is this. Anywhere two
+    /// explicit clauses **merge**
+    /// ([ADR 0096](../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md)).
+    #[error("collation mismatch between explicit collations \"{left}\" and \"{right}\"")]
+    CollationMismatch {
+        /// The one the expression writes first.
+        left: String,
+        /// And the one that disagreed with it.
+        right: String,
+    },
+
+    /// A collation-using operation in a **generated column** whose collation cannot be derived:
+    /// `42P22`, naming the operation.
+    ///
+    /// PostgreSQL's own sentence and its own six names — `lower() function`, `upper() function`,
+    /// `initcap() function`, `string comparison`, `LIKE`/`ILIKE`, `regular expression` — measured
+    /// over 43 shapes at once (`tests/captures/pg19_collation_operations.txt`).
+    ///
+    /// **Only a generated column raises it.** A `DEFAULT`, an index expression, an index predicate
+    /// and a `CHECK` all accept `upper('a')` on 19beta1; the corpus header that said three
+    /// contexts ask is corrected beside its own rows
+    /// ([ADR 0096](../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md)).
+    ///
+    /// It carries a `HINT`, where [`SqlError::CollationMismatch`] carries none — the difference
+    /// being that here nobody named an ordering and there the user named two.
+    #[error("could not determine which collation to use for {0}")]
+    IndeterminateCollation(&'static str),
+
     /// `CREATE INDEX … USING gin(name)` where the type has no default class **for that method**.
     /// The same sentence [`SqlError::NoDefaultOperatorClass`] gives, with the method named too —
     /// measured, and the two are one message with the access method substituted.
@@ -3149,6 +3205,8 @@ impl SqlError {
             // `COLLATE "C"` on an `integer`: the collation exists, the type has no ordering for it
             // to override. `42804`, measured — and `42704` is what the *name* being unknown gets.
             | SqlError::CollationNotSupported(_) => sqlstate::DATATYPE_MISMATCH,
+            SqlError::CollationMismatch { .. } => sqlstate::COLLATION_MISMATCH,
+            SqlError::IndeterminateCollation(_) => sqlstate::INDETERMINATE_COLLATION,
 
             SqlError::DuplicateTrigger { .. }
             // A label a `CREATE`/`ALTER TYPE` would add twice is a duplicate object like any other.
@@ -3208,6 +3266,10 @@ impl SqlError {
             | SqlError::FloatOverflow => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
             SqlError::DivisionByZero => sqlstate::DIVISION_BY_ZERO,
             SqlError::MalformedArrayLiteral { .. } => sqlstate::INVALID_TEXT_REPRESENTATION,
+            // **The bytes are not the text**, which is why this is not the `22P02` beside it: a
+            // `bytea` handed to a `uuid` is sixteen bytes or it is nothing, and its length is the
+            // complaint. Measured.
+            SqlError::UuidLength { .. } => sqlstate::INVALID_BINARY_REPRESENTATION,
             SqlError::ArrayExpressionDimensions
             | SqlError::ArrayAccumulateDimensions
             | SqlError::ArrayAccumulateEmpty => sqlstate::ARRAY_SUBSCRIPT_ERROR,
@@ -3460,6 +3522,9 @@ impl SqlError {
             SqlError::InvalidCidrValue(_) => {
                 Some("Value has bits set to right of mask.".to_owned())
             }
+            // Measured: `Expected 16 bytes, got 2.` — the count is the bytes that arrived, and the
+            // sixteen is the type's own width rather than a number this sentence carries.
+            SqlError::UuidLength { got } => Some(format!("Expected 16 bytes, got {got}.")),
             // Empty for the `timezone` spellings, which carry no DETAIL on a real server.
             SqlError::DateTruncUnitNotSupported { detail, .. } if !detail.is_empty() => {
                 Some(detail.clone())
@@ -3647,6 +3712,11 @@ impl SqlError {
             // measured beside this one — so the two are not one message with a shared tail.
             SqlError::NoOrderingOperator(_) => Some(
                 "Use an explicit ordering operator or modify the query.".to_owned(),
+            ),
+            // PostgreSQL's own, word for word — and the clause it asks for is the one that would
+            // make the collation *explicit*, which is the only thing that helps here.
+            SqlError::IndeterminateCollation(_) => Some(
+                "Use the COLLATE clause to set the collation explicitly.".to_owned(),
             ),
             SqlError::SetFunctionNotAllowed(message)
                 if message.starts_with("aggregate function calls") =>

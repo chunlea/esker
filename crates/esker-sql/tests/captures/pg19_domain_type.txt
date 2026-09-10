@@ -1,0 +1,111 @@
+# **A domain is a type a client can be sent** — PostgreSQL 19beta1, 2026-09-10, one
+# `BEGIN … ROLLBACK`. [ADR 0103](../../../../docs/adr/0103-a-domain-is-a-type-a-client-can-be-sent.md),
+# `debts-v1.1.md` #37.
+#
+# ## The constraint this whole row has to meet
+#
+# `ActiveRecord` loads its type map on **every** connection with
+#
+#   SELECT t.oid, t.typname, t.typelem, t.typdelim, t.typinput, r.rngsubtype, t.typtype, t.typbasetype
+#     FROM pg_type as t LEFT JOIN pg_range as r ON oid = rngtypid
+#    WHERE t.typtype IN ('r', 'e', 'd')
+#
+# — 712 occurrences across 164 captured files. **If this node sends a domain's oid on the wire and
+# that oid does not come back from this query, ActiveRecord has no decoder for it** and the value
+# arrives as a string. So the `pg_type` rows come first and the wire follows them, never the
+# other way round.
+#
+# ## What the query returns for the five `information_schema` domains
+#
+#   oid    typname          typelem  typdelim  typinput   rngsubtype  typtype  typbasetype
+#   13356  cardinal_number  0        ,         domain_in  NULL        d        23    (int4)
+#   13359  character_data   0        ,         domain_in  NULL        d        1043  (varchar)
+#   13361  sql_identifier   0        ,         domain_in  NULL        d        19    (name)
+#   13367  time_stamp       0        ,         domain_in  NULL        d        1184  (timestamptz)
+#   13369  yes_or_no        0        ,         domain_in  NULL        d        1043  (varchar)
+#
+# **`typinput` is `domain_in` for every one of them**, not the base's input function, and
+# `typelem` is 0 — a domain over a scalar is not an array however its base prints.
+#
+# ## A domain's array type is not a domain
+#
+#   oid    typname           typtype  typelem  typbasetype
+#   13358  _character_data   b        13359    0
+#   13360  _sql_identifier   b        13361    0
+#
+# **`typtype` is `b`**, so the type-map query above does *not* return it; `ActiveRecord` reaches it
+# through `typelem` from the domain's own row. An array of a domain therefore needs the domain's
+# row to exist and needs nothing of its own.
+#
+# ## A user domain is the same shape
+#
+#   CREATE DOMAIN dom_probe AS integer
+#   oid > 16383, typname dom_probe, typelem 0, typdelim ',', typinput domain_in, typtype d,
+#   typbasetype 23
+#
+# ## What a domain declares, and where it stops
+#
+#   SELECT pg_typeof(table_name) FROM information_schema.tables         information_schema.sql_identifier
+#   SELECT pg_typeof(array_agg(table_name)) FROM information_schema.tables  information_schema.sql_identifier[]
+#   SELECT pg_typeof(table_name || '') FROM information_schema.tables   text
+#
+# **The aggregate keeps it and the wrap loses it**, which is exactly ADR 0103's split between
+# shapes A and B: A is right for a bare column and wrong the moment it is wrapped; the aggregate is
+# what B exists for. r1 accepted the array divergence in `results/run-107.md:43`.
+#
+# ## And the thing a reader gets backwards
+#
+#   CREATE DOMAIN dom_probe AS integer; CREATE TABLE dtab (d dom_probe)
+#   SELECT a.atttypid, format_type(a.atttypid, a.atttypmod) …   331275 | dom_probe
+#   SELECT data_type, udt_name FROM information_schema.columns … integer | int4
+#
+# **`information_schema.columns` reports the BASE for a domain column** — `integer` and `int4`, not
+# the domain — because the SQL standard puts the domain in `domain_name`/`domain_schema` instead.
+# The `USER-DEFINED` / `udt_name` assertion ADR 0103 cites from `timestamp_test.rb` is about an
+# **enum**, not a domain, and would pass either way. `pg_attribute.atttypid` *is* the domain, and
+# `format_type` prints its name.
+#
+# ## Family three's measurement: what the **wire** declares, which `\gdesc` does not show
+#
+# `\gdesc` is not the wire, and reading it as the wire would have got this backwards. Measured
+# 2026-09-10, both from one session:
+#
+#   PREPARE p1 AS SELECT table_name, is_nullable, ordinal_position FROM information_schema.columns
+#   SELECT result_types FROM pg_prepared_statements WHERE name = 'p1'
+#     {information_schema.sql_identifier, information_schema.yes_or_no,
+#      information_schema.cardinal_number}          -- oids 13361, 13369, 13356
+#
+#   \gdesc of the same three columns
+#     name | character varying(3) | integer        -- the BASE types, with the domain's width
+#
+# **The `RowDescription` carries the domain and the client prints the base.** `psql` resolves
+# `typbasetype` for display, which is why this project's parity corpora — captured through the
+# client — hold `name` and `character varying(3)` for columns whose declared oid is a domain's.
+# A node that read the corpus as the wire would answer `name` and be wrong in the one place
+# `ActiveRecord` looks.
+#
+# ## Where the width lives
+#
+#   pg_type.typtypmod       yes_or_no 7   time_stamp 2   the other three -1
+#   pg_attribute.atttypmod  -1 on every one of the 122 information_schema columns
+#
+# So `character varying(3)` is the **type**'s width, not the column's, and a node that puts 7 on
+# the column has one fact in two places.
+#
+# ## Every information_schema column is a domain, and its name decides which
+#
+# 122 columns across the seven views this node has; four domains, and **no column name maps to two
+# of them**:
+#
+#   sql_identifier   65     character_data   22     cardinal_number  19     yes_or_no  16
+#
+# `time_stamp` serves none of them — the views that carry one (`triggers`, `routines`, the
+# `role_*` family) are not views this node has.
+#
+#   SELECT c.relname, a.attname, a.attnum, format_type(a.atttypid, a.atttypmod)
+#     FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+#     JOIN pg_namespace n ON n.oid = c.relnamespace
+#    WHERE n.nspname = 'information_schema' AND a.attnum > 0 AND NOT a.attisdropped
+#
+# is the census; `format_type` prints `information_schema.sql_identifier`, so the catalog's own
+# printer names the domain where `\gdesc` names the base.

@@ -1435,14 +1435,25 @@ impl Executor {
     /// **And what `pg_stat_activity` shows while it runs**, which is where an in-process session
     /// gets a `query` column too: the executor is the one layer every session goes through, socket
     /// or not.
+    /// **And what it cost below the SQL**, which is the fourth guard: `crate::stmt_stats` counts
+    /// this statement's KV reads, wire round trips and distinct regions between the two ends of
+    /// the tuple. Here for the same reason the cancellation flag is — this is the one layer every
+    /// session goes through, socket or not — and off unless `ESKER_STMT_STATS` says otherwise
+    /// (`debts-v1.1.md` #49).
     fn statement_guards(
         &self,
         source: &str,
-    ) -> (cancel::Guard, cancel::FlagGuard, crate::session::Running) {
+    ) -> (
+        cancel::Guard,
+        cancel::FlagGuard,
+        crate::session::Running,
+        crate::stmt_stats::Guard,
+    ) {
         (
             cancel::until(self.statement_deadline()),
             cancel::with_session(self.identity.pid, Arc::clone(&self.identity.cancel)),
             self.identity.running(source),
+            crate::stmt_stats::begin(source),
         )
     }
 

@@ -1,8 +1,9 @@
 # ADR 0103 — A domain is a type a client can be sent
 
-Status: **proposed** (2026-09-09) · Numbered 0103 by the coordinator; 0102 is h1's draft on `main`.
-**No decision is made here.** This records what the shapes are and what each costs, so the
-milestone is the user's to set. Debt `debts-v1.1.md` #37 is this row.
+Status: **accepted — shape A, 2026-09-10** (proposed 2026-09-09) · Numbered 0103 by the
+coordinator; 0102 is h1's draft on `main`. The body below is the record as it was written *before*
+the decision, kept unedited so that what was known then is legible; **what the building measured,
+including two things this text has wrong, is at the end.** Debt `debts-v1.1.md` #37 is this row.
 
 ## Context — the values are already right; the *name* is not
 
@@ -190,3 +191,61 @@ That does not make C the answer — `udt_name` is one schema-dumper change away 
 this project has been bitten three times by *right bytes, wrong declared type* (ADR 0086). It makes
 the milestone a **choice about when**, with no test currently forcing it, which is what a milestone
 the user sets should look like.
+
+## Decided: shape A, 2026-09-10
+
+**Status: accepted.** The user's ruling was to build it, and this section is what was built and
+what the building measured. The three families landed as three commits, `pg_type` rows before the
+wire in both order and argument.
+
+### What decided the shape
+
+The constraint at the top of "Who branches on `typtype = 'd'`" is the whole of it: **an oid this
+node sends that does not come back from `WHERE t.typtype IN ('r','e','d')` has no decoder.** So
+family two gave the five domains real `pg_type` rows and only then did family three put their oids
+on the wire. The array half is still shape B and is still not built — `pg_typeof(array_agg(x))` is
+`name[]` here and `information_schema.sql_identifier[]` there, the divergence r1 accepted in
+`results/run-107.md:43`, now pinned by a test so that closing it is a decision rather than a
+surprise.
+
+### Three things the building measured that this ADR had wrong or did not know
+
+**1. `\gdesc` is not the wire, and the corpora hold `\gdesc`.** Measured from one session on
+19beta1: `pg_prepared_statements.result_types` for
+`SELECT table_name, is_nullable, ordinal_position FROM information_schema.columns` is
+`{information_schema.sql_identifier, information_schema.yes_or_no,
+information_schema.cardinal_number}` — oids 13361, 13369, 13356 — while `\gdesc` of the same three
+columns prints `name`, `character varying(3)`, `integer`. **The `RowDescription` carries the domain
+and the client prints the base**, because `psql` resolves `typbasetype` for display. Every parity
+corpus in this repository was captured through the client, so a node that read those files as the
+wire would answer the base and be wrong in the one place `ActiveRecord` looks. The harness now
+renders a domain oid the way `psql` does, which is what makes the two agree.
+
+**2. The width is the type's, not the column's.** `pg_type.typtypmod` is 7 for `yes_or_no` and 2
+for `time_stamp`; **`pg_attribute.atttypmod` is -1 on every one of the 122 `information_schema`
+columns.** This node had `character varying(3)` on the six `yes_or_no` columns instead, which was
+one fact in two places and became visibly so the moment the columns had a type of their own.
+
+**3. The lookup this ADR named was already fixed, and a different one was not.** "The lookup is
+`table.enums`, not any user type" was true when this was written and is not now:
+`exec::assign::user_type_of` answers for any kind, so a **user** domain already declared itself —
+`pg_typeof` of a `CREATE DOMAIN` column was its own name before this row was touched. What was
+missing was the `information_schema` views' own columns, which are built from a `const` list that
+had nowhere to say a column was a domain. And `pg_attribute`'s rows for catalog relations were
+built from that same `const` list rather than from the `TableDef` every other reader uses, so with
+the wire fixed the catalog still said `name` — one relation described two ways.
+
+### And one wrong value found on the way
+
+`pg_typeof` of a type **in a schema** printed the stored name raw — `s\0dom_probe`, a NUL on the
+wire, where a real server says `s.dom_probe`. `format_type` had it right one screen away, which is
+how it was found. Same shape as the `ds_s.ds` measurement that fixed `format_type`, and the second
+reader of one stored name had simply never been asked.
+
+### The scope this leaves
+
+* a bare `information_schema` column declares its domain on the simple **and** the extended path;
+* a **user** domain already did, and now prints with a dot;
+* `pg_attribute.atttypid` and `format_type` name the domain, as they do on a real server;
+* an **aggregate** and a **wrap** both lose it — the wrap loses it on a real server too, and the
+  aggregate is shape B, unbuilt and pinned.

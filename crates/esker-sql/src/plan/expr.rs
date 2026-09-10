@@ -416,6 +416,27 @@ pub enum Expr {
         /// that type would.
         typmod: i32,
     },
+    /// `<expr> COLLATE "C"` — the clause, **kept**.
+    ///
+    /// It used to be checked and dropped, on the reasoning that `C` and `POSIX` both order by byte
+    /// so there was nothing for the plan to carry. Two things say otherwise, and both are measured
+    /// ([ADR 0096](../../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md)):
+    ///
+    /// * **a stored expression prints it back.** `upper(t COLLATE "C")` deparses as
+    ///   `upper((t COLLATE "C"))` on a real server and printed `upper(t)` here, so the catalog
+    ///   disagreed with the statement that wrote it;
+    /// * **it is what makes a collation *derivable***, and two of them that disagree are
+    ///   `42P21 collation mismatch between explicit collations`. A clause that is dropped cannot
+    ///   be compared with another one.
+    ///
+    /// The value is the operand's, unchanged — this node is about derivation and printing, never
+    /// about bytes, because both collations this node has are byte order (ADR 0076).
+    Collate {
+        /// What the clause was written on.
+        operand: Box<Expr>,
+        /// The name, folded upper as [`crate::parse`] checks it: `C` or `POSIX`.
+        collation: String,
+    },
     /// `<expr>::text`, evaluated per row.
     ///
     /// The **output function** of whatever the operand turns out to be, which is what a cast to
@@ -2922,6 +2943,7 @@ fn describe(expr: &Expr) -> &'static str {
     match expr {
         Expr::ToText { .. } => "a cast to text",
         Expr::Cast { .. } => "a cast",
+        Expr::Collate { .. } => "a COLLATE clause",
         Expr::Array { .. } => "an ARRAY constructor",
         Expr::Scalar { func, .. } => func.name(),
         Expr::Literal(_) => "a literal",

@@ -1299,6 +1299,9 @@ fn render(expr: &Expr, columns: &[String]) -> String {
         // Its own parentheses, as the comparison operators print theirs — `EXPLAIN` shows the
         // grouping the parser chose rather than the one the user typed.
         Expr::Negate(operand) => format!("(- {})", render(operand, columns)),
+        Expr::Collate { operand, collation } => {
+            format!("({} COLLATE \"{collation}\")", render(operand, columns))
+        }
         Expr::Array { elements, .. } => format!(
             "ARRAY[{}]",
             elements

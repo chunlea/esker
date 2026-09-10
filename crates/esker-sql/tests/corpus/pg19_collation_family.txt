@@ -8,7 +8,14 @@
 # ## Half one: which operations need a collation
 #
 # An operation that *uses* a collation is refused when every input is a literal; one that does not
-# use one is accepted. The message names the operation, and the three names are its own:
+# use one is accepted. The message names the operation, and the names are its own.
+#
+# **Three names here and six in the family** — this file reached the operations its placements
+# happened to use; `tests/captures/pg19_collation_operations.txt` asked 43 shapes in one session
+# and added `initcap() function`, `ILIKE` beside `LIKE`, and `regular expression`, and put
+# `greatest`, `least`, `nullif`, `strpos`, `split_part`, `string_to_array` and `array_position`
+# in the `string comparison` bucket. **The type decides, not the operator**: `(1 = 2)` is accepted
+# and `('a' = 'b')` is not.
 #
 #   REFUSED  upper('a')  lower('a')  upper('a'::text)  upper(1::text)   -> "upper()/lower() function"
 #   REFUSED  ('a' < 'b')  ('a' = 'b')  replace('abc','b','x')           -> "string comparison"
@@ -38,15 +45,38 @@
 #   DEFAULT upper('a')                         accepted, and prints `upper('a'::text)`
 #   DEFAULT ('a' < 'b')                        accepted, and prints `('a'::text < 'b'::text)`
 #   GENERATED ALWAYS AS (upper('a')) STORED    42P22
-#   CREATE INDEX ON t ((upper('a')))           42P22
-#   CHECK (upper('a') = 'A')                   42P22
+#   CREATE INDEX ON t ((upper('a')))           accepted -- the rows below say so
+#   CHECK (upper('a') = 'A')                   accepted -- and so do they
 #
-# So a `DEFAULT` is **not** a collation-requiring context and the other three stored contexts are —
-# which is a distinction about what the value is *for*: a default is evaluated per row when the row
-# is written, while a generated column, an index key and a check constraint are values that get
-# **compared**, and a comparison is what needs the collation. That reading is consistent with every
-# row above and is not asserted by any of them; the `why` is PostgreSQL's own and is not measured
-# here.
+# **Corrected 2026-09-10, and the rows below were right all along.** The two lines above said
+# `42P22` and this header's own capture says `-`: `CREATE INDEX g1co_ix1 ON g1co ((upper('a')))`
+# and `ALTER TABLE g1co ADD CONSTRAINT g1co_ck1 CHECK (upper('a') = 'A')` are both **accepted** by
+# 19beta1, and re-measuring built the index and the constraint. **One context asks, not three.**
+#
+# The reading that came with the wrong table is refuted by it: *"a generated column, an index key
+# and a check constraint are values that get compared, and a comparison is what needs the
+# collation"* -- an index key and a `CHECK` are compared and do not ask. It was marked as a reading
+# rather than a measurement, and it is struck rather than deleted, because a corpus that hides its
+# wrong readings teaches nothing.
+#
+# ## Half three: there are two mechanisms, and an empty table cannot tell them apart
+#
+# The first pass ran every probe against a table with **no rows**. Asking the same statements with
+# one row in it separates them:
+#
+#                                        empty table   one row
+#   SELECT u < v          (C vs POSIX)   accepted      42P22 string comparison
+#   GENERATED AS (u < v)  (C vs POSIX)   accepted      42P22 string comparison
+#   GENERATED AS (upper('a'))            42P22         42P22 upper()/lower() function
+#
+# * a conflict between two **implicit** collations is an **evaluation-time** error -- it fires when
+#   a row reaches the operator, in a query and in a generated column alike, and never on an empty
+#   table;
+# * a generated column's expression needing a collation **derivable from a column** is a **DDL**
+#   check -- it fires with or without rows, and only there.
+#
+# Reading the first as the second is how "three contexts" happened. See
+# [ADR 0096](../../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md).
 #
 # **Two read-backs go through `replace(..., '|', '!')`, and debt #20 is why.** A corpus row is
 # `statement TAB types TAB rows` with columns split on `'|'` and no escape, so a *value* holding a

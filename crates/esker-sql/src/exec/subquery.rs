@@ -857,6 +857,7 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
         Expr::Not(inner)
         | Expr::Cast { operand: inner, .. }
         | Expr::ToText { operand: inner, .. }
+        | Expr::Collate { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. }
         | Expr::IsNull { operand: inner, .. }
         | Expr::Negate(inner) => substitute_in_expr(inner, outer, depth),
@@ -1438,6 +1439,7 @@ pub(super) fn walk(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         Expr::Not(inner)
         | Expr::Cast { operand: inner, .. }
         | Expr::ToText { operand: inner, .. }
+        | Expr::Collate { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => walk(inner, visit),
         Expr::Like {
             operand, pattern, ..
@@ -1543,6 +1545,7 @@ pub(super) fn walk_mut(
         Expr::Not(inner)
         | Expr::Cast { operand: inner, .. }
         | Expr::ToText { operand: inner, .. }
+        | Expr::Collate { operand: inner, .. }
         | Expr::Scalar { operand: inner, .. } => walk_mut(inner, visit)?,
         Expr::Like {
             operand, pattern, ..

@@ -22,15 +22,18 @@ mod parity;
 
 /// What this node answers differently, and why.
 ///
-/// **Group 10 is the whole of the first block, and it is a type-system gap rather than an
-/// aggregate one.** `information_schema.tables.table_name` is a *domain* on a real server —
-/// `sql_identifier`, `typtype = 'd'`, base `name` — with an array type of its own, and
-/// `array_agg` of it answers that array. This node has no way to say so: `ColumnType` is a closed
-/// enum of storage types, a domain is carried beside a column rather than as one, and the oid a
-/// client is sent has to come from the enum. Answering `_name` is the base type's array, which is
-/// the right *values* under the wrong name. Closing it is the domain half of the type surface,
-/// which is a unit with an ADR in it and not an arm in this one — **`debts-v1.1.md` #37**, which
-/// is where the sizing lives so that this list does not have to carry it.
+/// **Group 10 was the whole of the first block and is now one row of it**, which is the shape a
+/// type-system gap closes in. `information_schema.tables.table_name` is a *domain* on a real
+/// server — `sql_identifier`, `typtype = 'd'`, base `name` — with an array type of its own.
+/// `debts-v1.1.md` #37 built that (ADR 0103, shape A, 2026-09-10): the five domains have real
+/// `pg_type` rows, the column declares 13361 on both protocol paths, and three of the four entries
+/// below came off under rule 2 the day it landed.
+///
+/// **What is left is the aggregate, and it is shape B.** The identity travels on a `ColumnDef` and
+/// the query pipeline carries a `ColumnType`, so the moment a value passes through an aggregate
+/// there is nothing holding a domain to derive `_sql_identifier` from. Answering `_name` is the
+/// base type's array — the right *values* under the wrong name — and r1 accepted it in
+/// `results/run-107.md:43`: `ActiveRecord` decodes 1003 as an array either way.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
@@ -38,32 +41,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT pg_typeof(array_agg(table_name)) FROM (SELECT table_name FROM information_schema.tables LIMIT 2) s",
             "**A domain's array, which this node has no type for.** `table_name` is the domain \
              `sql_identifier` on a real server and `array_agg` of it is `_sql_identifier` (13360); \
-             here the column is its base type `name` and the aggregate answers `_name` (1003). \
-             The values are identical — a domain adds a constraint, not a representation — and \
-             what differs is the name a client is told.",
+             here the *column* is the domain too, since #37, and the **aggregate** is what loses \
+             it: `_name` (1003), because the identity travels on a `ColumnDef` and the pipeline \
+             carries a `ColumnType`. The values are identical — a domain adds a constraint, not a \
+             representation — and what differs is the name a client is told. Accepted by r1 in \
+             `results/run-107.md:43`; closing it is ADR 0103's shape **B**.",
             "pg19_aggregate_groups.txt:77",
-        ),
-        (
-            "SELECT pg_typeof(table_name) FROM information_schema.tables LIMIT 1",
-            "The same gap one step earlier, and the one that causes it: the *column* is the domain \
-             on a real server and its base type here. Every `information_schema` column is one of \
-             five such domains there.",
-            "pg19_aggregate_groups.txt:78",
-        ),
-        (
-            "SELECT oid, typname, typtype, typbasetype, typarray FROM pg_type WHERE typname = 'sql_identifier'",
-            "No row: this node's `pg_type` has no `sql_identifier`, because it has no domain to \
-             put there. The oids are recorded in the capture rather than asserted — 13361 and \
-             13360 are assigned when `information_schema` is created, not fixed by catalog \
-             version — and what a reader needs from them is the *shape*: `typtype = 'd'`, \
-             `typbasetype` 19, and an array of its own.",
-            "pg19_aggregate_groups.txt:79",
-        ),
-        (
-            "SELECT oid, typname, typtype, typelem FROM pg_type WHERE typname = '_sql_identifier'",
-            "The other half of the same absence: a domain's array is an ordinary base-type row \
-             pointing back at the domain, which is what makes 13360 a type a client can be sent.",
-            "pg19_aggregate_groups.txt:80",
         ),
         (
             "SELECT string_agg(t, ',') FILTER (WHERE t <> 'a') FROM ag",

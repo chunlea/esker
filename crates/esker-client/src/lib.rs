@@ -35,6 +35,7 @@ pub mod region_cache;
 mod renew;
 pub mod retry;
 pub mod router;
+pub mod stmt_stats;
 pub mod tcp;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

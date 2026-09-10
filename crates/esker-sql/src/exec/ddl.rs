@@ -5432,17 +5432,47 @@ fn index_key_column(table: &TableDef, expr: &str) -> Option<usize> {
 /// translated; every other one [`refuse_unless_immutable`] raises already names its own cause
 /// (`0A000 the function md5`, `42P02 there is no parameter $1`).
 fn generated_column_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)> {
-    deparsed_expression(table, expr).map_err(|error| match error {
+    deparsed_expression_into(table, expr, Stored::GeneratedColumn).map_err(|error| match error {
         SqlError::NotImmutableInIndex => SqlError::NotImmutableInGeneratedColumn,
         other => other,
     })
 }
 
+/// Which stored context an expression is being written into.
+///
+/// **It decides exactly one thing**, and that one thing is measured: whether a collation-using
+/// operation with nothing to derive an ordering from is `42P22`. A generated column asks; an index
+/// key, an index predicate, a `CHECK` and a `DEFAULT` all accept `upper('a')` on 19beta1
+/// ([ADR 0096](../../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md),
+/// `tests/captures/pg19_collation_operations.txt`). Everything else about the two paths — the
+/// immutability rule, the deparse, the read-back guard — is the same, which is why this is a flag
+/// on one function rather than two functions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stored {
+    /// An index key, an index predicate, a `CHECK` or a `DEFAULT`.
+    Elsewhere,
+    /// `GENERATED ALWAYS AS (…) STORED`.
+    GeneratedColumn,
+}
+
 fn deparsed_expression(table: &TableDef, expr: &str) -> Result<(String, ColumnType)> {
+    deparsed_expression_into(table, expr, Stored::Elsewhere)
+}
+
+fn deparsed_expression_into(
+    table: &TableDef,
+    expr: &str,
+    into: Stored,
+) -> Result<(String, ColumnType)> {
     let parsed = crate::parse::parse_stored_expr(expr)?;
     let scope = crate::exec::query::Scope::single(table);
     let resolved = crate::exec::query::resolve(&parsed, &scope)?;
     refuse_unless_immutable(&resolved, &scope)?;
+    if into == Stored::GeneratedColumn {
+        plan::collation::refuse_underivable(&resolved, &|node| {
+            crate::exec::query::expr_type(node, &scope).ok()
+        })?;
+    }
     let ty = crate::exec::query::expr_type(&resolved, &scope)?;
     let printed = deparse(&resolved, table, ty);
     if reads_back(table, &printed, ty) {
@@ -6057,6 +6087,10 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
         | Expr::ToText { .. }
         | Expr::Scalar { .. }
         | Expr::Coalesce(_)
+        // **A `COLLATE` gains a pair of its own**: `upper(t COLLATE "C")` prints back as
+        // `upper((t COLLATE "C"))`, measured — which is why it is on this list and why the
+        // clause is kept in the plan at all (ADR 0096).
+        | Expr::Collate { .. }
         | Expr::Case { .. } => true,
         // **A catalog function whose name is an operator**, which today is `||` and which
         // [`deparse`] prints as one. Gated on the same condition `deparse`'s own arm uses, because
@@ -6161,6 +6195,13 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
             |column| catalog::quote_identifier(&column.name),
         ),
         Expr::Literal(literal) => deparse_literal(literal, ty),
+        // **Its own pair, and the name quoted.** `upper(t COLLATE "C")` is stored and
+        // printed by a real server as `upper((t COLLATE "C"))`; this node dropped the
+        // clause at lowering and printed `upper(t)`, so the catalog disagreed with the
+        // statement that wrote it (ADR 0096, `tests/corpus/pg19_collation_family.txt`).
+        Expr::Collate { operand, collation } => {
+            format!("({} COLLATE \"{collation}\")", sub(operand))
+        }
         Expr::Array { elements, .. } => {
             format!(
                 "ARRAY[{}]",

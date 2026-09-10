@@ -1122,6 +1122,30 @@ impl TypeKind {
         }
     }
 
+    /// `pg_type.typinput`: the function that reads one of these from text.
+    ///
+    /// **It is the *kind*'s function, not the type's name.** Measured on 19beta1, 2026-09-10, one
+    /// `CREATE` per kind: `domain_in`, `enum_in`, `range_in`, `record_in` — and `array_in` for
+    /// every array, which the array row beside this one already said. This node wrote
+    /// `format!("{name}_in")`, so a domain called `dom_probe` claimed a `dom_probe_in` that exists
+    /// on no server: four kinds, one wrong rule, and it is the column `ActiveRecord`'s type-map
+    /// load selects on every connection (`debts-v1.1.md` #37,
+    /// `tests/captures/pg19_domain_type.txt`).
+    ///
+    /// **A domain's is `domain_in` and not its base's**, which is the one a reader guesses wrong:
+    /// the *output* side is the base's — `int4out` for a domain over `integer`, measured — because
+    /// reading a domain has to check its constraints and printing one does not. This node has no
+    /// `typoutput` column, so only the half that is here is answered here.
+    #[must_use]
+    pub fn typinput(&self) -> &'static str {
+        match self {
+            TypeKind::Range { .. } => "range_in",
+            TypeKind::Composite { .. } => "record_in",
+            TypeKind::Enum { .. } => "enum_in",
+            TypeKind::Domain { .. } => "domain_in",
+        }
+    }
+
     /// `pg_type.typlen`: how many bytes the value is, or `-1` for a varlena.
     ///
     /// **An enum is 4**, measured on 19beta1 — it is an oid there, whatever it is stored as here —

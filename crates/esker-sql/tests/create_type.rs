@@ -111,3 +111,48 @@ fn pg_type_reports_the_three_kinds_and_the_array_type_each_one_made() {
         .is_empty()
     );
 }
+
+/// **`typinput` is the kind's function, not the type's name** — `debts-v1.1.md` #37.
+///
+/// This node wrote `format!("{name}_in")`, so a domain called `dom_probe` claimed a `dom_probe_in`
+/// that exists on no server, and nothing pinned the column: four kinds, one wrong rule, and it is
+/// the column `ActiveRecord`'s type-map load selects on **every connection**
+/// (`WHERE t.typtype IN ('r', 'e', 'd')`, 712 occurrences across 164 captured files).
+///
+/// Measured on 19beta1, 2026-09-10, one `CREATE` per kind
+/// (`tests/captures/pg19_domain_type.txt`):
+///
+/// ```text
+/// c_probe  c  record_in     _c_probe  b  array_in
+/// d_probe  d  domain_in     _d_probe  b  array_in
+/// e_probe  e  enum_in       _e_probe  b  array_in
+/// r_probe  r  range_in      _r_probe  b  array_in
+/// ```
+///
+/// **A domain's is `domain_in` and not its base's**, which is the one a reader guesses wrong: the
+/// *output* side is the base's — `int4out` for a domain over `integer`, measured — because reading
+/// a domain checks its constraints and printing one does not. This node has no `typoutput` column,
+/// so only the half that is here is answered here.
+#[test]
+fn typinput_is_the_kinds_function_and_not_the_types_name() {
+    let mut node = parity::Node::new(&[
+        "CREATE DOMAIN d_probe AS integer",
+        "CREATE TYPE e_probe AS ENUM ('a','b')",
+        "CREATE TYPE c_probe AS (x int, y int)",
+    ]);
+    assert_eq!(
+        node.rows(
+            "SELECT typname, typtype, typinput FROM pg_type \
+             WHERE typname IN ('d_probe','e_probe','c_probe','_d_probe','_e_probe','_c_probe') \
+             ORDER BY typname"
+        ),
+        vec![
+            vec!["_c_probe".to_owned(), "b".to_owned(), "array_in".to_owned()],
+            vec!["_d_probe".to_owned(), "b".to_owned(), "array_in".to_owned()],
+            vec!["_e_probe".to_owned(), "b".to_owned(), "array_in".to_owned()],
+            vec!["c_probe".to_owned(), "c".to_owned(), "record_in".to_owned()],
+            vec!["d_probe".to_owned(), "d".to_owned(), "domain_in".to_owned()],
+            vec!["e_probe".to_owned(), "e".to_owned(), "enum_in".to_owned()],
+        ]
+    );
+}

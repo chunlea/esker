@@ -1062,3 +1062,75 @@ fn a_driver_whose_job_is_finished_inside_its_step_does_not_unwind_the_change() {
     assert_eq!(b.index_entries("t"), usize::try_from(ROWS).unwrap());
     assert!(b.jobs().is_empty(), "a finished job is forgotten");
 }
+
+/// **A re-driver is one row in `pg_stat_activity`, however many passes it takes** —
+/// `debts-v1.1.md` #48.
+///
+/// It registered a fresh session per executor — twice a pass — and `session::deregister` is called
+/// from exactly one place, a connection's destructor, so nothing ever took them out again. An
+/// **idle** cluster with no clients and no runner grew by one row per pass for ever: r1 measured
+/// 2–4 a minute and about 160 in forty minutes on a node with nothing but a listening socket.
+///
+/// **Not #47.** No client is involved at all, which is why closing that one did not touch this.
+///
+/// The assertion is the *shape* PostgreSQL has, measured on 19beta1 2026-09-10: an idle server
+/// shows eight rows, seven of them background — `autovacuum launcher`, `background writer`,
+/// `checkpointer`, `io worker` twice, `logical replication launcher`, `walwriter` — and **each is
+/// one row for the life of the process**, named for what it does, with a NULL `client_addr` and a
+/// set `backend_start`.
+#[test]
+fn a_re_driver_is_one_session_however_many_passes_it_takes() {
+    // **Every session, not the re-driver's own.** The first draft counted only rows whose
+    // `backend_type` was `schema re-driver` and **passed with the defect reinstated**: the leaked
+    // sessions came from `session::register()` with the default type, so they were `client
+    // backend` and the filter could not see them. A test that names what it expects to find
+    // cannot see what it did not expect.
+    fn sessions() -> usize {
+        esker_sql::session::snapshot().len()
+    }
+    fn re_drivers() -> usize {
+        esker_sql::session::snapshot()
+            .into_iter()
+            .filter(|(_, activity)| activity.client.backend_type == "schema re-driver")
+            .count()
+    }
+    let cluster = Cluster::new();
+    let mut node = cluster.node();
+    // One pass was enough to register under the old rule; ten is enough to be unmistakable.
+    let before = sessions();
+    for _ in 0..10 {
+        let _ = node.redriver.pass();
+    }
+    let after = sessions();
+    assert_eq!(
+        after, before,
+        "ten passes changed the session count from {before} to {after}"
+    );
+    assert_eq!(
+        re_drivers(),
+        1,
+        "a re-driver should be exactly one session, and named"
+    );
+
+    // **And it looks like a background worker, not a client**, which is the half an operator
+    // reads: a NULL address beside `client backend` sends somebody hunting a client that was
+    // never there.
+    let row = esker_sql::session::snapshot()
+        .into_iter()
+        .find(|(_, activity)| activity.client.backend_type == "schema re-driver")
+        .expect("the re-driver's own row");
+    assert!(row.1.client.address.is_none(), "{:?}", row.1.client);
+    assert!(row.1.client.port.is_none(), "{:?}", row.1.client);
+    assert!(row.1.client.started.is_none(), "{:?}", row.1.client);
+
+    // Dropping it takes the row out, for the same reason a connection's destructor does.
+    drop(node);
+    assert_eq!(
+        esker_sql::session::snapshot()
+            .into_iter()
+            .filter(|(_, activity)| activity.client.backend_type == "schema re-driver")
+            .count(),
+        0,
+        "the re-driver's session outlived the re-driver"
+    );
+}

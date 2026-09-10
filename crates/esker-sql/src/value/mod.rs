@@ -88,7 +88,7 @@ pub use esker_keys::value::{ColumnType, Datum, f64_of_sort_bits, sort_bits_of_f6
 /// `exec::cursor`'s `ToText` arm had the rule (`SELECT true::text` is `true`) and so did `||`
 /// (`'a' || true` is `atrue`), both measured; the evaluator's `Expr::Cast` arm fell through to the
 /// output function and wrote `t` into a `varchar` or a `bpchar` — two rows of
-/// `tests/captures/pg19_cast_matrix.txt`, and the one an application sees, because a client that
+/// `tests/corpus/pg19_cast_matrix.txt`, and the one an application sees, because a client that
 /// writes a boolean into a character column gets `t` here and `true` there
 /// (`debts-v1.1.md` #44). The `::text` spelling was right the whole time, which is what made it
 /// invisible: `bool::text` lowers to `ToText` and never reaches the cast.
@@ -990,6 +990,16 @@ pub fn convert_without_text(value: &Datum, to: ColumnType) -> Option<Result<Datu
         // characters it prints as. The first member of this family anyone measured
         // (`debts-v1.1.md` #44) and the one that named the shape.
         (Datum::Uuid(bytes), ColumnType::Bytea) => Some(Ok(Datum::Bytea(bytes.to_vec()))),
+        // **And back, where the length is the whole check.** A `bytea` is sixteen bytes or it is
+        // not a `uuid`, and PostgreSQL says so in a class of its own — `22P03 invalid input length
+        // for type uuid`, with `DETAIL: Expected 16 bytes, got 2.` This node went through the text
+        // and answered `22P02 invalid input syntax for type uuid: "\x4142"`, a sentence about the
+        // wrong thing: the bytes are perfectly good bytes and there are two of them. Measured on
+        // 19beta1 with `VERBOSITY verbose` (`debts-v1.1.md` #44, group 5).
+        (Datum::Bytea(bytes), ColumnType::Uuid) => Some(match <[u8; 16]>::try_from(&bytes[..]) {
+            Ok(uuid) => Ok(Datum::Uuid(uuid)),
+            Err(_) => Err(SqlError::UuidLength { got: bytes.len() }),
+        }),
         // **An `int4` into a `"char"` is the byte, and only `-128..=127` is a byte.** `65` is `A`;
         // `200` is `22003 "char" out of range` on a real server, where this node's fold used to
         // wrap it round with a `rem_euclid` and answer. The message is the short one every

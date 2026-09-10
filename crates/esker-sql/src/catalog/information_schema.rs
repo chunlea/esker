@@ -120,28 +120,27 @@ pub fn domains(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
 
 /// **`yes_or_no`'s length**: a domain over `character varying(3)`, so `3 + 4`.
 ///
-/// Measured, and it is the only length anywhere in this node's catalog: no `pg_catalog` column has
-/// a typmod at all on a real server (`atttypmod` is `-1` for every one of them), and of
-/// `information_schema`'s five domains only this one and `time_stamp` — which none of the views
-/// here serves — carry a modifier. `sql_identifier`, `character_data` and `cardinal_number` are
-/// `name`, `character varying` and `integer` with no length.
-///
-/// It reaches a client twice: in `RowDescription`, which is what makes `\gdesc` say
-/// `character varying(3)`, and in `pg_attribute.atttypmod` for the view's own column.
+/// **It belongs to the domain and not to the column**, which is the correction ADR 0103's third
+/// family made: `pg_type.typtypmod` is 7 for `yes_or_no` and 2 for `time_stamp`, and
+/// **`atttypmod` is `-1` on every one of the 122 `information_schema` columns** — measured on
+/// 19beta1. It sat on the six columns here until the columns became domains, and a width in both
+/// places would have been one fact with two readers. So the column lists below declare
+/// [`NO_LENGTH`] and this number is the type's, read by
+/// `pg_catalog::INFORMATION_SCHEMA_DOMAINS`.
 ///
 /// **The number and not the arithmetic**, because a column list is a `const` and
 /// [`value::typmod_of_length`] is not a `const fn` — and that function's own doc asks that nothing
 /// else in this crate know the number is `n + 4`. So the literal is tied back to it by
-/// `a_yes_or_no_column_declares_three_characters` below rather than by a reader's memory.
-const YES_OR_NO: i32 = 7;
+/// `a_yes_or_no_domain_is_three_characters_wide` below rather than by a reader's memory.
+pub(super) const YES_OR_NO: i32 = 7;
 
 /// The columns of `information_schema.views`, in the standard's order.
 pub const VIEWS_COLUMNS: &[(&str, ColumnType, i32)] = &[
     ("table_schema", ColumnType::Name, NO_LENGTH),
     ("table_name", ColumnType::Name, NO_LENGTH),
     ("view_definition", ColumnType::Varchar, NO_LENGTH),
-    ("is_updatable", ColumnType::Varchar, YES_OR_NO),
-    ("is_insertable_into", ColumnType::Varchar, YES_OR_NO),
+    ("is_updatable", ColumnType::Varchar, NO_LENGTH),
+    ("is_insertable_into", ColumnType::Varchar, NO_LENGTH),
 ];
 
 /// Whether PostgreSQL would treat this view's query as **automatically updatable**.
@@ -617,14 +616,14 @@ pub const COLUMNS_COLUMNS: &[(&str, ColumnType, i32)] = &[
     ("column_name", ColumnType::Name, NO_LENGTH),
     ("ordinal_position", ColumnType::Int4, NO_LENGTH),
     ("column_default", ColumnType::Varchar, NO_LENGTH),
-    ("is_nullable", ColumnType::Varchar, YES_OR_NO),
+    ("is_nullable", ColumnType::Varchar, NO_LENGTH),
     ("data_type", ColumnType::Varchar, NO_LENGTH),
     ("character_maximum_length", ColumnType::Int4, NO_LENGTH),
     ("numeric_precision", ColumnType::Int4, NO_LENGTH),
     ("numeric_scale", ColumnType::Int4, NO_LENGTH),
     ("datetime_precision", ColumnType::Int4, NO_LENGTH),
     ("udt_name", ColumnType::Name, NO_LENGTH),
-    ("is_identity", ColumnType::Varchar, YES_OR_NO),
+    ("is_identity", ColumnType::Varchar, NO_LENGTH),
     ("identity_generation", ColumnType::Varchar, NO_LENGTH),
     ("is_generated", ColumnType::Varchar, NO_LENGTH),
     // **Last**, the rule `pg_type`'s columns follow: `SELECT *` expands in declared order, so a
@@ -670,8 +669,8 @@ pub const TABLE_CONSTRAINTS_COLUMNS: &[(&str, ColumnType, i32)] = &[
     ("table_schema", ColumnType::Name, NO_LENGTH),
     ("table_name", ColumnType::Name, NO_LENGTH),
     ("constraint_type", ColumnType::Varchar, NO_LENGTH),
-    ("is_deferrable", ColumnType::Varchar, YES_OR_NO),
-    ("initially_deferred", ColumnType::Varchar, YES_OR_NO),
+    ("is_deferrable", ColumnType::Varchar, NO_LENGTH),
+    ("initially_deferred", ColumnType::Varchar, NO_LENGTH),
 ];
 
 /// The columns of `information_schema.key_column_usage`, in the standard's order.
@@ -698,22 +697,25 @@ pub const REFERENTIAL_CONSTRAINTS_COLUMNS: &[(&str, ColumnType, i32)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{COLUMNS_COLUMNS, YES_OR_NO};
+    use super::{COLUMNS_COLUMNS, NO_LENGTH, YES_OR_NO};
     use crate::value::{self, ColumnType};
 
     /// The literal above is `typmod_of_length(3)`, and this is what says so.
     #[test]
-    fn a_yes_or_no_column_declares_three_characters() {
+    fn a_yes_or_no_domain_is_three_characters_wide() {
         assert_eq!(YES_OR_NO, value::typmod_of_length(3));
         assert_eq!(value::length_of_typmod(YES_OR_NO), Some(3));
-        // And it is on the column a client reads it from.
+        // **And the column carries none**, which is the half that changed: the width is the
+        // domain's (`pg_type.typtypmod`), and `atttypmod` is -1 on every `information_schema`
+        // column on a real server. `an_information_schema_column_declares_its_domain` in
+        // `tests/domain.rs` is where the other end of that is asserted, through the wire.
         let is_nullable = COLUMNS_COLUMNS
             .iter()
             .find(|(name, ..)| *name == "is_nullable")
             .expect("information_schema.columns declares is_nullable");
         assert_eq!(
             (is_nullable.1, is_nullable.2),
-            (ColumnType::Varchar, YES_OR_NO)
+            (ColumnType::Varchar, NO_LENGTH)
         );
     }
 }

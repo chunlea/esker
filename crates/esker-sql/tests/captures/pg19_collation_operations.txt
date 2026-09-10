@@ -1,0 +1,109 @@
+# **Which operations need a collation, and what PostgreSQL calls each of them.**
+#
+# PostgreSQL 19beta1, 2026-09-10, one `BEGIN … ROLLBACK`, every probe inside its own
+# `SAVEPOINT`/`ROLLBACK TO`. Each row is `ALTER TABLE g ADD COLUMN c <type> GENERATED ALWAYS AS
+# (<expr>) STORED` over `CREATE TABLE g (t text, n integer)` — a **generated column**, which
+# [ADR 0096](../../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md)
+# measured to be the one context that asks, and every operand is a **literal**, which is the one
+# derivation that has nowhere to get an ordering from.
+#
+# `debts-v1.1.md` #19. `tests/corpus/pg19_collation_family.txt` is the same family measured one
+# placement at a time; this is the same question asked of **43 operations at once**, because
+# "which operations" is a list and a list has an enumerable domain.
+#
+# ## The finding: six names, not three
+#
+# `pg19_collation_family.txt`'s header lists three — `upper()/lower() function`,
+# `string comparison`, `LIKE`. There are **six**, and the three it does not have are the ones a
+# reader would not guess:
+#
+#   lower() function        lower('a')
+#   upper() function        upper('a')
+#   initcap() function      initcap('a')          <- its own name, not upper/lower's
+#   string comparison       the list below
+#   LIKE / ILIKE            two names, one per spelling
+#   regular expression      'a' ~ 'b'   'a' ~* 'b'
+#
+# ## And `string comparison` is much wider than `<`
+#
+# Fourteen shapes answer to that one name, and the surprises are the functions: a function that
+# **compares** needs a collation and one that only **cuts** does not.
+#
+#   refused   ('a' < 'b')  ('a' = 'b')  ('a' <> 'b')  ('a' >= 'b')
+#   refused   ('a' IN ('b'))   ('a' BETWEEN 'a' AND 'b')
+#   refused   (CASE WHEN 'a' = 'b' THEN 'x' ELSE 'y' END)
+#   refused   (ARRAY['a'] = ARRAY['b'])
+#   refused   split_part  string_to_array  strpos  greatest  least  nullif  replace
+#   refused   array_position(ARRAY['a'],'a')
+#   refused   (('a')::varchar < 'b')    (('a')::char(1) < 'b')
+#
+#   accepted  reverse  ascii  length  octet_length  abs  md5
+#   accepted  ('a' || 'b')   btrim  ltrim  rtrim  substr  substring
+#   accepted  COALESCE('a','b')
+#   accepted  (1 = 2)   (1 < 2)          <- the type decides, not the operator
+#
+# **`replace` compares and `substr` does not**; **`greatest`, `least` and `nullif` compare**, which
+# is the shape nobody would put on a list of string functions; **`COALESCE` does not**, because it
+# picks rather than compares, where `CASE` does because its `WHEN` is a comparison; and **`||`
+# needs none at all**.
+#
+# **The type decides, not the operator**: `(1 = 2)` and `(1 < 2)` are accepted and `('a' = 'b')`
+# is not, so the rule is a comparison over a *collatable* type — which is the same predicate
+# `catalog::pg_attribute::collatable` already answers for a `COLLATE` clause on a column.
+#
+# ## Two refusals that are **not** this family, and say so
+#
+#   concat('a','b')                          generation expression is not immutable
+#   to_tsvector('a')                         generation expression is not immutable
+#   (to_tsvector('a') @@ to_tsquery('b'))    generation expression is not immutable
+#
+# A different sentence for a different reason: `concat` is variadic-any and `to_tsvector`'s
+# one-argument form reads `default_text_search_config`, so both are `42P17` rather than `42P22`.
+# Recorded because a census that reported them as "refused" would have put two immutability rows
+# in a collation list.
+#
+# ## The raw census
+#
+#   lower('a')                                   could not determine which collation to use for lower() function
+#   upper('a')                                   could not determine which collation to use for upper() function
+#   reverse('a')                                 accepted
+#   ascii('a')                                   accepted
+#   length('a')                                  accepted
+#   octet_length('a')                            accepted
+#   abs(1)                                       accepted
+#   md5('a')                                     accepted
+#   initcap('a')                                 could not determine which collation to use for initcap() function
+#   ('a' || 'b')                                 accepted
+#   concat('a','b')                              generation expression is not immutable
+#   split_part('a,b', ',', 1)                    could not determine which collation to use for string comparison
+#   string_to_array('a,b', ',')                  could not determine which collation to use for string comparison
+#   strpos('abc','b')                            could not determine which collation to use for string comparison
+#   btrim(' a ')                                 accepted
+#   ltrim(' a ')                                 accepted
+#   rtrim('a ')                                  accepted
+#   greatest('a','b')                            could not determine which collation to use for string comparison
+#   least('a','b')                               could not determine which collation to use for string comparison
+#   nullif('a','b')                              could not determine which collation to use for string comparison
+#   substr('abc',1,2)                            accepted
+#   substring('abc' from 1 for 2)                accepted
+#   replace('abc','b','x')                       could not determine which collation to use for string comparison
+#   array_position(ARRAY['a'],'a')               could not determine which collation to use for string comparison
+#   to_tsvector('a')                             generation expression is not immutable
+#   (to_tsvector('a') @@ to_tsquery('b'))        generation expression is not immutable
+#   ('a' < 'b')                                  could not determine which collation to use for string comparison
+#   ('a' = 'b')                                  could not determine which collation to use for string comparison
+#   ('a' <> 'b')                                 could not determine which collation to use for string comparison
+#   ('a' >= 'b')                                 could not determine which collation to use for string comparison
+#   ('ab' LIKE 'a%')                             could not determine which collation to use for LIKE
+#   ('ab' ILIKE 'a%')                            could not determine which collation to use for ILIKE
+#   ('a' ~ 'b')                                  could not determine which collation to use for regular expression
+#   ('a' ~* 'b')                                 could not determine which collation to use for regular expression
+#   ('a' IN ('b'))                               could not determine which collation to use for string comparison
+#   ('a' BETWEEN 'a' AND 'b')                    could not determine which collation to use for string comparison
+#   (CASE WHEN 'a' = 'b' THEN 'x' ELSE 'y' END)  could not determine which collation to use for string comparison
+#   COALESCE('a','b')                            accepted
+#   (1 = 2)                                      accepted
+#   (1 < 2)                                      accepted
+#   (ARRAY['a'] = ARRAY['b'])                    could not determine which collation to use for string comparison
+#   (('a')::varchar < 'b')                       could not determine which collation to use for string comparison
+#   (('a')::char(1) < 'b')                       could not determine which collation to use for string comparison

@@ -11,7 +11,8 @@
 //! same edit that declared it a divergence, so from that moment nothing could have caught it.
 //!
 //! So every divergence cites the capture line its answer was read from, and this module
-//! **resolves** the citation against `tests/captures/` ([ADR
+//! **resolves** the citation against `tests/captures/` — or `tests/corpus/`, for a capture that a
+//! harness replays as its script ([ADR
 //! 0075](../../../../docs/adr/0075-the-oracle-captures-live-in-the-repository.md)). Filling the
 //! citations in once would be bookkeeping; re-reading them every run is what keeps them true when
 //! a capture is re-taken or a row moves.
@@ -34,9 +35,21 @@ pub(crate) const UNMEASURED: &str = "UNMEASURED";
 /// When a provenance is missing, malformed, names a capture that is not there, points past the end
 /// of one, or points at a line carrying a different statement.
 pub(crate) fn check(answers: &[Divergence]) {
-    let captures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("captures");
+    // **`captures/` first, then `corpus/`** — and the order is the whole of it.
+    //
+    // Measured on 2026-09-10: **124 filenames exist in both directories, 71 byte-identical and 53
+    // not**, and the 53 differ in their *header prose* — a capture carries the note that says how
+    // it was measured, a corpus carries the note that says how its fields are read. Same rows,
+    // different headers, so **a line number is not interchangeable between the two copies**.
+    // Every citation in this repository is indexed against the `captures/` copy, which is why
+    // that one is tried first and why this fallback can only fire for a file that is not there.
+    //
+    // It exists because `pg19_cast_matrix.txt` is now under `corpus/` alone: its two copies *were*
+    // byte-identical, `cast_matrix.rs` replays the corpus one, and the captures one had no reader
+    // — so it went, and eleven citations pointed at a file that was no longer there. If a second
+    // copy is ever added back, the statement check below is what catches the mismatched lines.
+    let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let places = [tests.join("captures"), tests.join("corpus")];
     let mut wrong = Vec::new();
     for (sql, _, provenance) in answers {
         if *provenance == UNMEASURED {
@@ -52,8 +65,13 @@ pub(crate) fn check(answers: &[Divergence]) {
             wrong.push(format!("{sql}\n    {provenance:?} has no line number"));
             continue;
         };
-        let Ok(text) = std::fs::read_to_string(captures.join(file)) else {
-            wrong.push(format!("{sql}\n    there is no tests/captures/{file}"));
+        let Some(text) = places
+            .iter()
+            .find_map(|place| std::fs::read_to_string(place.join(file)).ok())
+        else {
+            wrong.push(format!(
+                "{sql}\n    there is no tests/captures/{file} and no tests/corpus/{file}"
+            ));
             continue;
         };
         let Some(cited) = text.lines().nth(at.saturating_sub(1)) else {

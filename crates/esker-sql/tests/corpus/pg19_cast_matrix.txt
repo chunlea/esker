@@ -1,3 +1,12 @@
+# **The cast matrix**: every `pg_cast` pair between two types this node and PostgreSQL 19beta1
+# both have, probed with a **column** operand so the answer comes from the evaluator and not
+# from the parse-time fold. Generated from `castprobe` and `castprobe2`, which the first lines
+# below create; `crates/esker-sql/tests/cast_matrix.rs` reads it and is the **only** reader.
+#
+# **One copy, and it lives here.** A byte-identical second copy sat under `tests/captures/`
+# until 2026-09-10 with nothing reading it; a round was spent correcting that one and watching
+# the test report the old text. A capture kept in two places is a capture that will disagree
+# with itself.
 BEGIN		-
 CREATE TABLE castprobe (c_bit bit(3), c_bool boolean, c_box box, c_bpchar character(4), c_bytea bytea, c_char "char", c_cidr cidr, c_circle circle, c_date date, c_float4 real, c_float8 double precision, c_inet inet, c_interval interval, c_json json, c_jsonb jsonb, c_lseg lseg, c_money money, c_name name, c_numeric numeric, c_oid oid, c_path path, c_point point, c_polygon polygon, c_regclass regclass, c_regproc regproc, c_regtype regtype, c_text text, c_time time, c_timestamp timestamp, c_timestamptz timestamptz, c_uuid uuid, c_varbit bit varying(8), c_varchar varchar(8), c_xml xml)		-
 INSERT INTO castprobe VALUES (B'101', true, '((0,0),(1,1))', 'ab', '\x4142', 'a', '10.0.0.0/8', '<(0,0),1>', '2020-01-02', 1.5, 1.5, '10.0.0.1', '1 day', '{"a":1}', '{"a":1}', '[(0,0),(1,1)]', '12.34', 'nm', 12.34, 16384, '((0,0),(1,1))', '(1,2)', '((0,0),(1,1),(2,0))', 'pg_class', 'int4in', 'integer', '42', '01:02:03', '2020-01-02 03:04:05', '2020-01-02 03:04:05+00', '00000000-0000-0000-0000-000000000001', B'1010', '42', '<a/>')		-
@@ -47,7 +56,7 @@ SAVEPOINT sp_bpchar_xml		-
 SELECT (c_bpchar)::xml FROM castprobe		ab  
 ROLLBACK TO sp_bpchar_xml		-
 SAVEPOINT sp_bytea_uuid		-
-SELECT (c_bytea)::uuid FROM castprobe		!invalid input length for type uuid\nDETAIL:  Expected 16 bytes, got 2.
+SELECT (c_bytea)::uuid FROM castprobe	!22P03 invalid input length for type uuid DETAIL: Expected 16 bytes, got 2.
 ROLLBACK TO sp_bytea_uuid		-
 SAVEPOINT sp_char_bpchar		-
 SELECT (c_char)::bpchar FROM castprobe		a
@@ -206,7 +215,7 @@ SAVEPOINT sp_text_name		-
 SELECT (c_text)::name FROM castprobe		42
 ROLLBACK TO sp_text_name		-
 SAVEPOINT sp_text_regclass		-
-SELECT (c_text)::regclass FROM castprobe	!relation "42" does not exist
+SELECT (c_text)::regclass FROM castprobe	!42P01 relation "42" does not exist
 ROLLBACK TO sp_text_regclass		-
 SAVEPOINT sp_text_varchar		-
 SELECT (c_text)::varchar FROM castprobe		42
@@ -263,7 +272,7 @@ SAVEPOINT sp_varchar_name		-
 SELECT (c_varchar)::name FROM castprobe		42
 ROLLBACK TO sp_varchar_name		-
 SAVEPOINT sp_varchar_regclass		-
-SELECT (c_varchar)::regclass FROM castprobe	!relation "42" does not exist
+SELECT (c_varchar)::regclass FROM castprobe	!42P01 relation "42" does not exist
 ROLLBACK TO sp_varchar_regclass		-
 SAVEPOINT sp_varchar_text		-
 SELECT (c_varchar)::text FROM castprobe		42
