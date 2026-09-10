@@ -8,7 +8,14 @@
 # ## Half one: which operations need a collation
 #
 # An operation that *uses* a collation is refused when every input is a literal; one that does not
-# use one is accepted. The message names the operation, and the three names are its own:
+# use one is accepted. The message names the operation, and the names are its own.
+#
+# **Three names here and six in the family** — this file reached the operations its placements
+# happened to use; `tests/captures/pg19_collation_operations.txt` asked 43 shapes in one session
+# and added `initcap() function`, `ILIKE` beside `LIKE`, and `regular expression`, and put
+# `greatest`, `least`, `nullif`, `strpos`, `split_part`, `string_to_array` and `array_position`
+# in the `string comparison` bucket. **The type decides, not the operator**: `(1 = 2)` is accepted
+# and `('a' = 'b')` is not.
 #
 #   REFUSED  upper('a')  lower('a')  upper('a'::text)  upper(1::text)   -> "upper()/lower() function"
 #   REFUSED  ('a' < 'b')  ('a' = 'b')  replace('abc','b','x')           -> "string comparison"

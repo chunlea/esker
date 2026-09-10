@@ -68,20 +68,38 @@ evaluated.
 ### What the rules are, measured
 
 **Which operations use a collation** — and the message names the operation, in PostgreSQL's own
-three words:
+words. **Six names**, from a census of 43 shapes asked in one session
+(`tests/captures/pg19_collation_operations.txt`); the placement-by-placement corpus had reached
+three, and the three it had not are the ones a reader would not guess:
 
 ```text
-upper('a')  lower('a')  upper('a'::text)  upper('a'::varchar)  upper(1::text)
-                                                     -> "upper()/lower() function"
-('a' < 'b')   ('a' = 'b')   replace('abc','b','x')   -> "string comparison"
+lower('a')                                           -> "lower() function"
+upper('a')  upper('a'::text)  upper(1::text)         -> "upper() function"
+initcap('a')                                         -> "initcap() function"
+('a' < 'b')  ('a' = 'b')  ('a' <> 'b')  ('a' >= 'b')
+('a' IN ('b'))  ('a' BETWEEN 'a' AND 'b')
+(CASE WHEN 'a' = 'b' THEN … END)  (ARRAY['a'] = ARRAY['b'])
+replace  split_part  strpos  string_to_array
+greatest  least  nullif  array_position               -> "string comparison"
 ('ab' LIKE 'a%')                                     -> "LIKE"
+('ab' ILIKE 'a%')                                    -> "ILIKE"
+('a' ~ 'b')   ('a' ~* 'b')                           -> "regular expression"
 
-no collation: 'a'  ('a')::text  (1 + 2)  length  octet_length  md5  substr  btrim
+no collation: 'a'  ('a')::text  (1 + 2)  (1 = 2)  (1 < 2)  length  octet_length  md5  abs
+              ascii  reverse  substr  substring  btrim  ltrim  rtrim
               ('a' || 'b')  COALESCE('a','b')  CASE WHEN true THEN 'a' ELSE 'b' END
 ```
 
 **`replace` compares and `substr` does not**, which is the pair that says this is not a rule about
-names, and `||` needs no collation at all. Neither is derivable; both are rows in the corpus.
+names; `greatest`, `least` and `nullif` compare, which nobody would put on a list of string
+functions; `COALESCE` picks rather than compares and does not, where a `CASE` asks through the
+comparison in its `WHEN`; and `||` needs no collation at all. **The type decides, not the
+operator**: `(1 = 2)` is accepted and `('a' = 'b')` is not. None of it is derivable; all of it is
+rows in the census.
+
+**And two refusals in that census are not this family**: `concat('a','b')` and `to_tsvector('a')`
+are `42P17 generation expression is not immutable`. Recorded because a census that reported them
+as "refused" would have put two immutability rows in a collation list.
 
 **Only a column settles it, and any column will do.** An explicit `COLLATE` on anything that is not
 a column does not help, wherever it is written; a column does, even through a cast and even when
@@ -122,24 +140,43 @@ ask, each has the whole expression in hand, and a recursive function answering
 three-valued thing — **none**, **implicit**, **explicit** — and it is what makes the four measured
 rules one rule:
 
-| an operand is | collation | derivation |
-|---|---|---|
-| a literal, or anything built only from literals | the type's default | **none** |
-| a column reference | the column's | **implicit** |
-| `x COLLATE "C"` | `C` | **explicit** |
-| a cast, `COALESCE`, `CASE`, `\|\|`, `substr`, … | the merge of its inputs | the merge |
+| an operand is | collation | derivation | a column under it |
+|---|---|---|---|
+| a literal, or anything built only from literals | the type's default | **none** | no |
+| a column reference | the column's | **implicit** | **yes** |
+| `x COLLATE "C"` | `C` | **explicit** | whatever `x` had |
+| a cast, `COALESCE`, `CASE`, `\|\|`, `substr`, … | the merge of its inputs | the merge | either input's |
 
 and the merge of two operands is: **explicit wins**; two disagreeing explicits are `42P21`; two
 disagreeing implicits are a *conflict* that survives to evaluation; otherwise the stronger one.
+
+**The fourth column is not the third, and the build is what proved it.** An explicit clause names
+an ordering and does **not** make one derivable: `upper(t COLLATE "C")` builds and
+`upper('a' COLLATE "C")` is `42P22`, and both are `explicit`. So rule 2 below asks *"is a column
+under this operation"*, not *"is the derivation stronger than none"* — a check on the strength
+accepts four statements a real server refuses, which is exactly the direction this row exists to
+close. Measured one placement at a time; the four came off `tests/collation_family.rs`'s declared
+list the moment the predicate was corrected.
 
 Then:
 
 1. **`42P21`, at parse time, everywhere.** Two explicit collations that disagree under one
    collation-using operation. This is the one rule that has nothing to do with context.
 2. **`42P22`, at DDL time, for a generated column only.** Its expression is walked; a
-   collation-using operation whose derivation is **none** is refused, naming the operation.
+   collation-using operation with **no column under it** is refused, naming the operation.
    An index expression, an index predicate, a `CHECK` and a `DEFAULT` are **not** walked, because
    a real server does not walk them.
+
+   **Six operation names, not three, and `string comparison` is much wider than `<`.** The
+   placement-by-placement corpus reached three; asking **43 shapes in one session**
+   (`tests/captures/pg19_collation_operations.txt`) found `lower() function`, `upper() function`,
+   `initcap() function`, `string comparison`, `LIKE`/`ILIKE` and `regular expression` — and put
+   `greatest`, `least`, `nullif`, `strpos`, `split_part`, `string_to_array`, `array_position` and
+   `replace` in the comparison bucket while leaving `substr`, `btrim`, `ltrim`, `rtrim`, `reverse`,
+   `length`, `||` and `COALESCE` out of it. **The type decides, not the operator**: `(1 = 2)` is
+   accepted and `('a' = 'b')` is not, so a comparison asks only over a *collatable* type. None of
+   that is derivable from a name, which is why it is a list and why the list was measured whole
+   rather than extended one function at a time.
 3. **`42P22`, at evaluation time, everywhere.** A collation-using operation whose operands carry
    two disagreeing implicit collations. This is where the conflict from the merge lands.
 4. **The deparser keeps `COLLATE`.** `plan::Expr` gains the clause so a stored expression prints

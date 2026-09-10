@@ -2268,6 +2268,23 @@ pub enum SqlError {
         right: String,
     },
 
+    /// A collation-using operation in a **generated column** whose collation cannot be derived:
+    /// `42P22`, naming the operation.
+    ///
+    /// PostgreSQL's own sentence and its own six names — `lower() function`, `upper() function`,
+    /// `initcap() function`, `string comparison`, `LIKE`/`ILIKE`, `regular expression` — measured
+    /// over 43 shapes at once (`tests/captures/pg19_collation_operations.txt`).
+    ///
+    /// **Only a generated column raises it.** A `DEFAULT`, an index expression, an index predicate
+    /// and a `CHECK` all accept `upper('a')` on 19beta1; the corpus header that said three
+    /// contexts ask is corrected beside its own rows
+    /// ([ADR 0096](../../../docs/adr/0096-a-collation-is-derived-from-a-column-or-from-nothing.md)).
+    ///
+    /// It carries a `HINT`, where [`SqlError::CollationMismatch`] carries none — the difference
+    /// being that here nobody named an ordering and there the user named two.
+    #[error("could not determine which collation to use for {0}")]
+    IndeterminateCollation(&'static str),
+
     /// `CREATE INDEX … USING gin(name)` where the type has no default class **for that method**.
     /// The same sentence [`SqlError::NoDefaultOperatorClass`] gives, with the method named too —
     /// measured, and the two are one message with the access method substituted.
@@ -3189,6 +3206,7 @@ impl SqlError {
             // to override. `42804`, measured — and `42704` is what the *name* being unknown gets.
             | SqlError::CollationNotSupported(_) => sqlstate::DATATYPE_MISMATCH,
             SqlError::CollationMismatch { .. } => sqlstate::COLLATION_MISMATCH,
+            SqlError::IndeterminateCollation(_) => sqlstate::INDETERMINATE_COLLATION,
 
             SqlError::DuplicateTrigger { .. }
             // A label a `CREATE`/`ALTER TYPE` would add twice is a duplicate object like any other.
@@ -3694,6 +3712,11 @@ impl SqlError {
             // measured beside this one — so the two are not one message with a shared tail.
             SqlError::NoOrderingOperator(_) => Some(
                 "Use an explicit ordering operator or modify the query.".to_owned(),
+            ),
+            // PostgreSQL's own, word for word — and the clause it asks for is the one that would
+            // make the collation *explicit*, which is the only thing that helps here.
+            SqlError::IndeterminateCollation(_) => Some(
+                "Use the COLLATE clause to set the collation explicitly.".to_owned(),
             ),
             SqlError::SetFunctionNotAllowed(message)
                 if message.starts_with("aggregate function calls") =>
