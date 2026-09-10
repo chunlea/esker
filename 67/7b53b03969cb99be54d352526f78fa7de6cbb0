@@ -1,0 +1,43 @@
+crates/esker-sql/tests/bit_string.rs
+  s_e5c0c6e78b5662::t_e147638f25b4e4 51-55
+crates/esker-sql/tests/case_expression.rs
+  s_e5c0c6e78b5662::t_811ab1e5dc2c94 104-105,107-110,112-129,135,139-153,155-157,160,162-168,171-172
+crates/esker-sql/tests/default_expression.rs
+  s_e5c0c6e78b5662::t_98e3c1221e5e53 30-35
+crates/esker-sql/tests/lower_upper.rs
+  s_e5c0c6e78b5662::t_510b746e55645e 32-38
+crates/esker-sql/tests/scalar_functions.rs
+  s_e5c0c6e78b5662::t_dbfbd11415a4f6 23-27
+crates/esker-sql/tests/varbit.rs
+  s_e5c0c6e78b5662::t_1c7596c09ab807 49-54
+crates/esker-sql/src/exec/cursor.rs
+  s_e5c0c6e78b5662::t_c478190c495d3d 2386-2425,2447-2455
+crates/esker-sql/src/exec/ddl.rs
+  s_e5c0c6e78b5662::t_c87facd702f84b 5717,5727-5728
+crates/esker-sql/src/exec/query.rs
+  s_e5c0c6e78b5662::t_25ecbf7c4ca919 2965-2980,5828-5905,6447
+crates/esker-sql/src/plan/expr.rs
+  s_e5c0c6e78b5662::t_36e947906898e5 664-669,671-675,692-693,707-709
+crates/esker-sql/src/value/geometric.rs
+  s_e5c0c6e78b5662::t_9f6539a4090142 230-273
+crates/esker-sql/tests/captures/pg19_length_overloads.txt
+  s_e5c0c6e78b5662::t_df9b5b72ce5b44 1-66
+crates/esker-sql/tests/length_overloads.rs
+  s_e5c0c6e78b5662::t_221565a193337e 1-162
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "677b53b03969cb99be54d352526f78fa7de6cbb0",
+  "prompts": {},
+  "sessions": {
+    "s_e5c0c6e78b5662": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "77b3f705-ac0b-41a5-b05d-68062b025f9c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
