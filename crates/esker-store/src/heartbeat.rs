@@ -168,7 +168,11 @@ impl Heartbeats {
             // **A round of its own, on the same cadence** (ADR 0110). A store holds no reads, so
             // it reports `None` and takes the answer. A failure is dropped like the heartbeat's:
             // the store keeps the safepoint it has, which keeps more history rather than less.
-            match self.pd.safepoint(self.store_id, None) {
+            // **Reporter zero: this is a question.** A store holds no reads of its own, and
+            // reporting "nothing open" under its own id would make every cluster's registry
+            // non-empty and let the window publish a safepoint nobody's reader floor is under
+            // (ADR 0110).
+            match self.pd.safepoint(0, None) {
                 Ok(published) => safepoint = Some(published),
                 Err(error) => {
                     tracing::debug!(store_id = self.store_id, %error, "no safepoint this round");

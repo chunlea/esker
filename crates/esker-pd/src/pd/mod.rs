@@ -935,7 +935,17 @@ impl Pd {
             .safepoints
             .lock()
             .map_err(|_| PdError::internal("the safepoint registry is poisoned"))?;
-        safepoints.report(reporter, oldest_read, now);
+        // **Reporter zero is asking, not reporting.** A store holds no reads — it wants the
+        // number so it can collect to it — and registering it as a reporter that has nothing open
+        // turns "nobody has said anything" into "somebody says nothing is open", which is exactly
+        // the distinction that decides whether the window may apply (ADR 0110). It cost six tests:
+        // a store asking made every cluster's registry non-empty, the window published
+        // `now − retention` off PD's real clock, and every read on a counting oracle was below it.
+        //
+        // Ids are allocated from one upward, so zero is nobody's.
+        if reporter != 0 {
+            safepoints.report(reporter, oldest_read, now);
+        }
         Ok(safepoints.safepoint(now))
     }
 

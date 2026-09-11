@@ -57,6 +57,7 @@ async fn main() -> std::io::Result<()> {
     // The router the client was built on, kept so the fragment path can share it: one region cache
     // for both, so an entry a row read warmed is warm for a fragment.
     let mut router: Option<Arc<esker_client::Router>> = None;
+    let mut reads: Option<Arc<esker_client::TxnClient>> = None;
     let backend: Arc<dyn Backend> = if stores.is_empty() {
         if !pd.is_empty() {
             // The fake keeps nothing and is in this process; a lease from a real placement driver
@@ -84,7 +85,11 @@ async fn main() -> std::io::Result<()> {
                 .await
                 .map_err(std::io::Error::other)??;
         router = Some(built);
-        let backend = StoreBackend::new(Arc::new(client), oracle);
+        let client = Arc::new(client);
+        // Kept so the safepoint reporter can ask it what it still has open (ADR 0110). The
+        // backend owns it either way; this is a second handle, not a second client.
+        reads = Some(Arc::clone(&client));
+        let backend = StoreBackend::new(client, oracle);
         match &lease {
             Some(lease) => Arc::new(backend.with_schema_lease(Arc::clone(lease) as Arc<_>)),
             None => Arc::new(backend),
@@ -99,7 +104,7 @@ async fn main() -> std::io::Result<()> {
     // with no address to renew it at, or an address with no lease to fill in, would both be this
     // function having gone wrong.
     let columnar: Option<Arc<dyn ColumnarReport>> = if let Some(lease) = lease {
-        Some(attach_pd(&pd, lease, &backend).await?)
+        Some(attach_pd(&pd, lease, &backend, reads.clone()).await?)
     } else {
         tracing::info!(
             "no placement driver given: writes are unrestricted, no schema lease is held, and \
@@ -300,14 +305,31 @@ async fn attach_pd(
     members: &[std::net::SocketAddr],
     lease: Arc<PdLease>,
     backend: &Arc<dyn Backend>,
+    reads: Option<Arc<esker_client::TxnClient>>,
 ) -> std::io::Result<Arc<dyn ColumnarReport>> {
     let conn = Arc::new(
         PdConn::to_group(members, esker_proto::TransportConfig::new())
             .map_err(std::io::Error::other)?,
     );
     let address = conn.address();
-    let refresher = LeaseRefresher::new(Arc::clone(&conn), lease)
+    let mut refresher = LeaseRefresher::new(Arc::clone(&conn), lease)
         .asserting_columnar_for(Arc::clone(backend), TENANT);
+    // **The reader floor of the cluster's safepoint** (ADR 0110). A node that does not report
+    // holds nothing down, so failing to take an id is loud but not fatal: PD's per-reporter TTL
+    // decides what a silent node means, and the window is the other half.
+    if let Some(client) = reads {
+        match conn.alloc_id(1) {
+            Ok(reporter_id) => {
+                tracing::info!(reporter_id, "reporting this node's oldest open read to PD");
+                refresher = refresher.reporting_reads_from(client, reporter_id);
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "could not take a reporter id; this node will not report its open reads, and the \
+                 safepoint will rest on the retention window alone"
+            ),
+        }
+    }
     // Onto a blocking thread and back, because this function is inside `#[tokio::main]`'s
     // `block_on`: a synchronous client refuses a thread that is *driving* a runtime, and
     // `spawn_blocking` is the seam for exactly that — the same one every statement takes

@@ -187,6 +187,26 @@ impl PdConn {
         }
     }
 
+    /// A block of cluster-unique ids, for a node that needs an identity PD agrees with.
+    ///
+    /// One is what the safepoint reporter takes at startup: PD's registry is keyed by reporter,
+    /// and two nodes sharing a key would each overwrite the other's oldest read — the one bug in
+    /// that registry that loses history rather than keeping too much (ADR 0110).
+    pub fn alloc_id(&self, count: u64) -> Result<u64, ProtoError> {
+        match self.call(&PdReq::AllocId { count })? {
+            PdResp::AllocId {
+                start,
+                count: granted,
+            } if granted == count => Ok(start),
+            PdResp::AllocId { count: granted, .. } => Err(ProtoError::invalid(format!(
+                "asked PD for {count} ids and it granted {granted}"
+            ))),
+            other => Err(ProtoError::internal(format!(
+                "PD answered {other:?} to an id request"
+            ))),
+        }
+    }
+
     /// Reports this node's oldest open read and answers with the safepoint in force.
     ///
     /// **The node reports because it is the thing that can reach PD** — `esker-client` keeps the
