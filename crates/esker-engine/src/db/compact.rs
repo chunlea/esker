@@ -234,7 +234,13 @@ impl Db {
                     self.inner
                         .run_compaction(&handle, &version, &compaction, &picker, &tombstones);
                 self.inner.release(&compaction)?;
+                // Before the sweep, never after: this is the version the compaction read, and
+                // while it is held its inputs are live and the sweep reclaims nothing. An
+                // operator who just ran `esker admin compact` and then measured the directory
+                // is exactly who notices.
+                drop(version);
                 outcome?;
+                self.inner.purge_and_evict()?;
             }
         }
         Ok(())
@@ -292,7 +298,11 @@ impl DbInner {
             }
             let outcome = self.run_compaction(&cf, &version, &compaction, &picker, &tombstones);
             self.release(&compaction)?;
+            // See `compact_range`: the sweep cannot reclaim this compaction's inputs while the
+            // version it read them from is still pinned.
+            drop(version);
             outcome?;
+            self.purge_and_evict()?;
             return Ok(true);
         }
         Ok(false)
@@ -503,7 +513,10 @@ impl DbInner {
                 self.note_durable_sst(file.number);
             }
         }
-        self.purge_and_evict()?;
+        // **The sweep is the caller's**, and it has to be. This compaction was computed from a
+        // version its caller still holds, and a pinned version's files are live by definition —
+        // so a sweep from in here finds every input of the compaction that just finished still
+        // named, and reclaims nothing. The caller drops the version and then sweeps.
         if !applied {
             tracing::debug!(
                 cf = compaction.cf,
