@@ -4720,9 +4720,22 @@ fn reconcile_enum(
     let (def, other, flipped) = match (enum_of(left), enum_of(right)) {
         (Some(def), None) => (def, right, false),
         (None, Some(def)) => (def, left, true),
-        // Neither side is one, or **both are**: two ordinals compare as they stand, and the
-        // ordinary path is already right for them.
-        _ => return Ok(None),
+        // **Both are, and the ordinary path is right only if they are the same enum.** Two
+        // ordinals compare as they stand — which is exactly the trap: a `mood` and an
+        // `other_mood` are both `int2` in the row, so comparing them answered a boolean where
+        // 19beta1 says `42883 operator does not exist: mood = other_mood`. Measured, and it is a
+        // wrong *answer* rather than a wrong message (`debts-v1.1.md` #57).
+        (Some(left), Some(right)) => {
+            if left.oid == right.oid {
+                return Ok(None);
+            }
+            return Err(SqlError::UndefinedOperator {
+                left: left.name.clone(),
+                op: op.symbol(),
+                right: right.name.clone(),
+            });
+        }
+        (None, None) => return Ok(None),
     };
     let coerced = match other {
         // Still nothing, whatever the type it was written with.
@@ -4738,8 +4751,8 @@ fn reconcile_enum(
         // message this node cannot write until an expression's user type is readable from
         // anywhere but here (recorded, not fixed).
         Expr::Literal(Literal::Typed {
-            user: Some(oid), ..
-        }) if *oid == def.oid => return Ok(None),
+            user: Some(user), ..
+        }) if user.oid == def.oid => return Ok(None),
         // The `unknown` literal, and the only spelling that is coerced.
         Expr::Literal(Literal::String(text)) => {
             match crate::catalog::enum_ordinal(enum_labels(def)?, text) {
@@ -4754,8 +4767,18 @@ fn reconcile_enum(
         }
         // Anything with a type of its own, including a cast that folded to one.
         other => {
-            let named = expr_type(other, scope)
-                .map_or_else(|_| "unknown".to_owned(), |ty| ty.name().to_owned());
+            // **A value of another user-defined type is named by that type.** A cast folded to an
+            // enum's ordinal carries the `TypeDef` it was cast to, so `m = 'sad'::other_mood` is
+            // `42883 operator does not exist: mood = other_mood` the way 19beta1 says it; reading
+            // the ordinal's own `expr_type` answered `smallint`, which names the representation
+            // rather than the type (`debts-v1.1.md` #57).
+            let named = match other {
+                Expr::Literal(Literal::Typed {
+                    user: Some(user), ..
+                }) => user.name.clone(),
+                other => expr_type(other, scope)
+                    .map_or_else(|_| "unknown".to_owned(), |ty| ty.name().to_owned()),
+            };
             let (left, right) = if flipped {
                 (named, def.name.clone())
             } else {
