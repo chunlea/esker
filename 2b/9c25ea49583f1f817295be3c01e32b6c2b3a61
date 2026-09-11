@@ -1,0 +1,19 @@
+docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md
+  s_e59614afdddccb::t_fc42cae08ffc6c 3,176-198
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2b9c25ea49583f1f817295be3c01e32b6c2b3a61",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
