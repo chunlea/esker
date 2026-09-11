@@ -453,3 +453,75 @@ fn greatest_takes_the_common_type_and_not_the_wider_one() {
         vec![vec!["2", "1"]]
     );
 }
+
+/// **The `Describe` of a set operation answers the first arm's type, not the set's.**
+///
+/// Found by r1's wire-types gate on run 127 (`esker-coord/r1-127-wire-caveat.txt` §4): seventeen
+/// `UNION` pairs where the `RowDescription` this node sends is the **left** arm's oid and 19beta1
+/// sends the promotion. Diagnosed here rather than assumed, by asking the two paths the same
+/// seventeen questions:
+///
+/// ```text
+///   pair                    simple  describe   pg_typeof   pg19
+///   int2  UNION int4            23        21   integer       23
+///   int8  UNION float4         700        20   real          700
+///   numeric UNION float8       701      1700   double …      701
+///   varchar UNION name          19      1043   name           19
+/// ```
+///
+/// **The simple path is right in every one of the seventeen, and so is the value** —
+/// `exec::query::common_of` is `select_common_type`, it *does* reach `UNION`, and it answers
+/// exactly what 19beta1 answers. What the extended protocol sends is the head arm's, because
+/// `Executor::described_in` calls `query::plan` directly where `plan_select` would have
+/// dispatched on `set_arms` to `plan_set_operation` — the one place the unification lives. A set
+/// operation **nested** anywhere is right, measured: inside a derived table and inside a `WITH`
+/// body both answer 23, because those are planned by `subquery::plan_subqueries`, which calls
+/// `append`. It is the top level and only the top level.
+///
+/// Two shapes beyond the gate's seventeen, because the gate records the type oid and nothing else:
+///
+/// * the **typmod** is the first arm's too — `varchar(3) UNION varchar(5)` describes as
+///   `1043/7` where the simple path says `1043/-1`, which is what a real server says;
+/// * `INTERSECT` and `EXCEPT` are `0A000` on the simple path and **answer a shape** here, so a
+///   client that prepares one is told its columns and refused at `Execute` instead of at
+///   `Describe`.
+///
+/// `#[ignore]`d rather than deleted: this is the acceptance for the fix, and the fix is a lane
+/// decision rather than this unit's — see `esker-coord/b4-wire-v3-families.md` F11.
+#[test]
+#[ignore = "F11: Describe reports the first arm's type; the diagnosis is in this header"]
+fn a_prepared_set_operation_describes_the_common_type() {
+    let mut node = parity::Node::new(FIXTURE);
+    // Every pair r1's gate measured, with 19beta1's answer beside it.
+    for (left, right, expected) in [
+        ("int2", "int4", 23_u32),
+        ("int2", "int8", 20),
+        ("int2", "numeric", 1700),
+        ("int2", "float4", 700),
+        ("int2", "float8", 701),
+        ("int4", "int8", 20),
+        ("int4", "numeric", 1700),
+        ("int4", "float4", 700),
+        ("int4", "float8", 701),
+        ("int8", "numeric", 1700),
+        ("int8", "float4", 700),
+        ("int8", "float8", 701),
+        ("numeric", "float4", 700),
+        ("numeric", "float8", 701),
+        ("float4", "float8", 701),
+        ("varchar", "name", 19),
+        ("bpchar", "name", 19),
+    ] {
+        let sql = format!("SELECT '1'::{left} AS v UNION SELECT '1'::{right}");
+        let fields = node.describe(&sql).unwrap().fields.unwrap();
+        assert_eq!(fields[0].type_oid, expected, "Describe of {sql}");
+    }
+    // And the typmod, which the wire gate does not record: neither arm's width survives.
+    let widths = "SELECT '1'::varchar(3) AS v UNION SELECT '1'::varchar(5)";
+    let fields = node.describe(widths).unwrap().fields.unwrap();
+    assert_eq!(
+        (fields[0].type_oid, fields[0].type_modifier),
+        (1043, -1),
+        "a varchar(3) beside a varchar(5) is a varchar with no length"
+    );
+}
