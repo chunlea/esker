@@ -3269,6 +3269,7 @@ impl Store {
         match request {
             TxnKvReq::Get { key, ts } => {
                 state.meta().check_key(&key)?;
+                self.check_snapshot(ts)?;
                 crate::txnkv::get(&self.db, &key, ts)
             }
             TxnKvReq::Scan {
@@ -3279,6 +3280,7 @@ impl Store {
                 reverse,
             } => {
                 state.meta().check_range(&start, &end)?;
+                self.check_snapshot(ts)?;
                 crate::txnkv::scan(&self.db, &start, &end, limit, ts, reverse)
             }
             // **A read, and it is answered here for the same reason `Get` is**: it asks what the
@@ -3417,6 +3419,28 @@ impl Store {
         // to read it leaves the policy that was working, which keeps more rather than less.
         load_retention(&self.db, &self.collector);
         now
+    }
+
+    /// Refuses a read whose snapshot is below this store's safepoint.
+    ///
+    /// **The floor is enforced here and not only in the collector**, which is
+    /// [ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)'s
+    /// decision 5 and the thing that makes the rest of that design safe to build: the collector
+    /// may already have taken the versions this read wants, and answering from what is left is a
+    /// **wrong answer** where refusing is a loud failure. A safepoint that is wrong by a second
+    /// should cost a transaction, not a row.
+    ///
+    /// `ts == safepoint` is allowed: the safepoint is the timestamp below which versions may go,
+    /// so a read exactly at it still has everything it needs.
+    fn check_snapshot(&self, ts: u64) -> std::result::Result<(), ProtoError> {
+        let safepoint = self.safepoint();
+        if ts < safepoint {
+            return Err(ProtoError::SnapshotTooOld {
+                start_ts: ts,
+                safepoint,
+            });
+        }
+        Ok(())
     }
 
     /// The garbage-collection safepoint this store is working to.

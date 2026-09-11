@@ -1266,6 +1266,14 @@ fn golden_responses() -> Vec<(&'static str, Response)> {
 fn golden_errors() -> Vec<(&'static str, ProtoError)> {
     vec![
         (
+            // ADR 0110 decision 5: the read is refused rather than answered from what is left.
+            "snapshot-too-old",
+            ProtoError::SnapshotTooOld {
+                start_ts: 262_144_000,
+                safepoint: 262_144_999,
+            },
+        ),
+        (
             "not-leader",
             ProtoError::NotLeader {
                 region_id: 1,

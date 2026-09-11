@@ -58,6 +58,7 @@ pub mod pd;
 pub mod raft_log;
 pub mod record;
 pub mod routing;
+pub mod safepoint;
 pub mod schedule;
 pub mod service;
 pub mod transport;
