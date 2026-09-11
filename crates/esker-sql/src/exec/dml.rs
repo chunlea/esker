@@ -669,7 +669,7 @@ pub(super) fn insert(
         // `DEFAULT`. It runs **after** the values, so a `bigserial` the user did write keeps their
         // number and does not consume one — which is what a real server does, and the reason the
         // next insert can collide with it.
-        for sequence in &table.sequences {
+        for sequence in &table.derived()?.sequences {
             // **Only a sequence that fills a column writes one.** A table may own a sequence that
             // fills nothing — `CREATE SEQUENCE s OWNED BY t.c` makes one — and it has no column
             // to put a value in.
@@ -1921,25 +1921,28 @@ fn inheritance_targets(
     txn: &dyn Txn,
     table: &std::sync::Arc<TableDef>,
 ) -> Result<Vec<Target>> {
-    let alone = |table: &std::sync::Arc<TableDef>| {
-        if table.child_scans.is_empty() {
-            return std::sync::Arc::clone(table);
+    // `Result` rather than a bare clone: reading "no children" off a table nobody hydrated would
+    // silently target the parent alone and leave every child's rows out of the statement.
+    let alone = |table: &std::sync::Arc<TableDef>| -> Result<std::sync::Arc<TableDef>> {
+        if table.derived()?.child_scans.is_empty() {
+            return Ok(std::sync::Arc::clone(table));
         }
         let mut alone = (**table).clone();
-        alone.child_scans.clear();
-        std::sync::Arc::new(alone)
+        alone.hydrated_mut().child_scans.clear();
+        Ok(std::sync::Arc::new(alone))
     };
-    let mut targets = vec![(alone(table), None)];
+    let mut targets = vec![(alone(table)?, None)];
     // Breadth first from the named table, so a grandchild is reached through its own parent's
     // list rather than being missed for not being named directly.
     let mut queue: std::collections::VecDeque<(u64, Vec<usize>)> = table
+        .derived()?
         .child_scans
         .iter()
         .map(|child| (child.table_id, child.project.clone()))
         .collect();
     while let Some((child_id, project)) = queue.pop_front() {
         let child = executor.table_by_id(txn, child_id)?;
-        for grandchild in &child.child_scans {
+        for grandchild in &child.derived()?.child_scans {
             // Composed, so a grandchild's row lands in the *named* table's columns and not in its
             // own parent's — the two differ as soon as either adds a column.
             let composed = project
@@ -1948,7 +1951,7 @@ fn inheritance_targets(
                 .collect();
             queue.push_back((grandchild.table_id, composed));
         }
-        targets.push((alone(&child), Some(project)));
+        targets.push((alone(&child)?, Some(project)));
     }
     Ok(targets)
 }
@@ -2450,7 +2453,7 @@ fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {
         // domain, which is what a real server does (ADR 0065).
         if let Some(crate::catalog::TypeKind::Domain { not_null: true, .. }) = column
             .user_type
-            .and_then(|oid| table.enums.get(&oid))
+            .and_then(|oid| table.hydrated()?.enums.get(&oid))
             .map(|def| &def.kind)
         {
             return Err(SqlError::DomainNotNull(
@@ -2472,7 +2475,7 @@ fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {
 fn domain_name_of<'a>(table: &'a TableDef, column: &crate::catalog::ColumnDef) -> &'a str {
     column
         .user_type
-        .and_then(|oid| table.enums.get(&oid))
+        .and_then(|oid| table.hydrated()?.enums.get(&oid))
         .map_or("", |def| crate::catalog::split_qualified(&def.name).1)
 }
 
@@ -2499,11 +2502,14 @@ fn bind_domain_value(expr: &mut crate::plan::Expr, column: &str) {
 /// the stored text is parsed and `VALUE` resolved against that column, and the rest of the
 /// evaluation is the one a table's own `CHECK` goes through (ADR 0065).
 fn check_domain_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {
-    if table.enums.is_empty() {
+    if table.derived()?.enums.is_empty() {
         return Ok(());
     }
     for (ordinal, column) in table.columns.iter().enumerate() {
-        let Some(def) = column.user_type.and_then(|oid| table.enums.get(&oid)) else {
+        let Some(def) = column
+            .user_type
+            .and_then(|oid| table.hydrated()?.enums.get(&oid))
+        else {
             continue;
         };
         let crate::catalog::TypeKind::Domain {

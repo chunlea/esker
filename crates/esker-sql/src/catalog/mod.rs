@@ -982,6 +982,8 @@ pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
     Arc::new(TableDef {
         matview: None,
         on_commit: OnCommit::default(),
+        // Synthetic — a sequence read as a three-column relation, with nothing derived.
+        hydrated: Some(Hydrated::default()),
         id: SEQUENCE_RELATION_ID_BASE.wrapping_add(sequence_id),
         name: name.to_owned(),
         columns: vec![
@@ -994,20 +996,17 @@ pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
         indexes: Vec::new(),
         primary_key_name: String::new(),
         schema_version: 1,
-        sequences: Vec::new(),
         checks: Vec::new(),
         foreign_keys: Vec::new(),
         triggers_disabled: false,
         parents: Vec::new(),
         children: Vec::new(),
         triggers: Vec::new(),
-        child_scans: Vec::new(),
         excludes: Vec::new(),
         partition_by: None,
         partition_bound: None,
         comment: None,
         primary_key_comment: None,
-        enums: BTreeMap::new(),
     })
 }
 
@@ -1162,6 +1161,47 @@ impl TypeKind {
     }
 }
 
+/// The derived half of a [`TableDef`]: everything the stored record does not carry.
+///
+/// Separated from the record so that the two states have two types (#63). `Relations::read`
+/// decodes a record per relation and hydrates none of them — at three hundred relations that was
+/// three hundred sequence scans nothing read — and the compiler is what now says which readers
+/// need the derived half, rather than a grep somebody has to repeat.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Hydrated {
+    /// The sequences that fill this table's columns — `bigserial` and identity columns.
+    ///
+    /// **Not part of the table record**, and that is deliberate. A sequence is keyed by the column
+    /// it fills (`crate::catalog::record`), so a table's sequences are one prefix scan, and the
+    /// scan happens where the table is loaded and cached. The table record has a format version
+    /// and readers on both sides of it; a feature that can be added without touching it is a
+    /// feature that cannot break one.
+    ///
+    /// In column order, which is the order the scan returns them in.
+    pub sequences: Vec<SequenceDef>,
+    /// The user-defined types this table's columns were declared as, by oid.
+    ///
+    /// **Not part of the table record either**, and for the same reason [`TableDef::sequences`] is
+    /// not: the type is its own catalog record, keyed by name, and a column stores only its oid
+    /// ([`ColumnDef::user_type`], ADR 0050). Hydrating it where the table is loaded is what makes
+    /// every consumer able to answer without a catalog of its own — resolution has a `Scope`, and
+    /// a `Scope` holds `TableDef`s.
+    ///
+    /// **Only read when a column has one**, so a table of ordinary columns costs nothing: the
+    /// lookup is skipped entirely rather than fetching an empty map.
+    ///
+    /// This is what makes an enum's label a label. The row holds the `int2` of the label's
+    /// position — which is what gives it PostgreSQL's ordering — and the labels here are how it is
+    /// written back out and how a literal on the way in is read.
+    pub enums: BTreeMap<u64, TypeDef>,
+    /// How to read each child's rows **as this table's**, filled where the table is loaded.
+    ///
+    /// Derived rather than stored, exactly as [`TableDef::sequences`] is: a scan of a parent
+    /// returns its children's rows too, and the planner has no catalog in reach to work out how.
+    /// A record decoded straight from bytes therefore has none.
+    pub child_scans: Vec<ChildScan>,
+}
+
 /// A table, its columns, its primary key and its indexes — everything needed to write a row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableDef {
@@ -1211,31 +1251,6 @@ pub struct TableDef {
     /// online-DDL design in `docs/adr/0020-online-schema-change.md` needs to attach per-column
     /// states to.
     pub schema_version: u64,
-    /// The sequences that fill this table's columns — `bigserial` and identity columns.
-    ///
-    /// **Not part of the table record**, and that is deliberate. A sequence is keyed by the column
-    /// it fills (`crate::catalog::record`), so a table's sequences are one prefix scan, and the
-    /// scan happens where the table is loaded and cached. The table record has a format version
-    /// and readers on both sides of it; a feature that can be added without touching it is a
-    /// feature that cannot break one.
-    ///
-    /// In column order, which is the order the scan returns them in.
-    pub sequences: Vec<SequenceDef>,
-    /// The user-defined types this table's columns were declared as, by oid.
-    ///
-    /// **Not part of the table record either**, and for the same reason [`TableDef::sequences`] is
-    /// not: the type is its own catalog record, keyed by name, and a column stores only its oid
-    /// ([`ColumnDef::user_type`], ADR 0050). Hydrating it where the table is loaded is what makes
-    /// every consumer able to answer without a catalog of its own — resolution has a `Scope`, and
-    /// a `Scope` holds `TableDef`s.
-    ///
-    /// **Only read when a column has one**, so a table of ordinary columns costs nothing: the
-    /// lookup is skipped entirely rather than fetching an empty map.
-    ///
-    /// This is what makes an enum's label a label. The row holds the `int2` of the label's
-    /// position — which is what gives it PostgreSQL's ordering — and the labels here are how it is
-    /// written back out and how a literal on the way in is read.
-    pub enums: BTreeMap<u64, TypeDef>,
     /// `CHECK` constraints, in the order `pg_constraint` lists them — by name.
     ///
     /// Each holds its predicate as **text**, not as a parsed tree, and is re-lowered when the
@@ -1298,12 +1313,15 @@ pub struct TableDef {
     /// `None` for everything that is not a partition, including a table that merely *inherits*:
     /// the two share an edge and not this.
     pub partition_bound: Option<PartitionBound>,
-    /// How to read each child's rows **as this table's**, filled where the table is loaded.
+    /// The **derived** half: what a record decoded straight from bytes does not carry, filled
+    /// where a table is loaded through [`View::table_by_id`] and absent everywhere else.
     ///
-    /// Derived rather than stored, exactly as [`TableDef::sequences`] is: a scan of a parent
-    /// returns its children's rows too, and the planner has no catalog in reach to work out how.
-    /// A record decoded straight from bytes therefore has none.
-    pub child_scans: Vec<ChildScan>,
+    /// `None` is not "this table has no sequences" — it is "nobody has looked yet", and the
+    /// difference is the whole reason this is an `Option` and not three empty collections (#63).
+    /// A relations listing decodes every record and hydrates none of them, because the row it
+    /// builds needs only [`TableDef::matview`]; a reader that needs the derived half asks the
+    /// catalog for the table instead, where it is read once and cached.
+    pub hydrated: Option<Hydrated>,
     /// `COMMENT ON TABLE t IS '…'`, or `None`.
     ///
     /// Separate from the columns' comments, exactly as `pg_description` keeps them separate:
@@ -2136,8 +2154,44 @@ impl TableDef {
 
     /// The sequence that fills column `at`, if one does.
     #[must_use]
+    /// The derived half, or `None` for a record nobody has hydrated.
+    ///
+    /// **There is deliberately no shorthand that answers "empty" instead.** An un-hydrated record
+    /// has no sequences *known*, which is not the same as having none, and a reader handed the
+    /// empty answer renders "this column has no default" — a wrong answer rather than a loud one.
+    /// Every caller decides what to do with `None`, and the compiler is what finds them (#63).
+    pub fn hydrated(&self) -> Option<&Hydrated> {
+        self.hydrated.as_ref()
+    }
+
+    /// The derived half of a table **loaded through the catalog**, which always hydrates.
+    ///
+    /// For the readers that cannot carry on without it and have an error to return: a `TableDef`
+    /// from [`View::table_by_id`] or [`Catalog::require_table`] has been hydrated, so `None` here
+    /// means a record reached a reader that needed more than a record — a wiring mistake, loud
+    /// rather than silent, and never a wrong answer to a user.
+    pub fn derived(&self) -> Result<&Hydrated> {
+        self.hydrated.as_ref().ok_or_else(|| {
+            SqlError::Internal(format!(
+                "table {} reached a reader that needs its derived half without being hydrated",
+                self.name
+            ))
+        })
+    }
+
+    /// The derived half to write into, creating it if this record has none.
+    ///
+    /// Every caller is a `CREATE`/`ALTER` path building the table it is about to store, where an
+    /// absent half means "nothing derived yet" rather than a mistake.
+    pub fn hydrated_mut(&mut self) -> &mut Hydrated {
+        self.hydrated.get_or_insert_with(Hydrated::default)
+    }
+
+    /// The sequence that fills column `at`, if one does — `None` also when nobody has hydrated
+    /// this record, which is why the readers that must tell the two apart use [`TableDef::derived`].
     pub fn sequence_for(&self, at: usize) -> Option<&SequenceDef> {
-        self.sequences
+        self.hydrated()?
+            .sequences
             .iter()
             .find(|sequence| sequence.column == Some(at))
     }
@@ -2763,6 +2817,35 @@ impl<'a> View<'a> {
     }
 
     /// A table by id.
+    /// One table's **record**, decoded and deliberately not hydrated.
+    ///
+    /// What a relations listing wants: the row it builds needs [`TableDef::matview`] to tell a
+    /// table from a materialized view, and nothing else the record does not carry. Hydrating each
+    /// one cost a sequence scan per relation that no listing ever read — three hundred of them at
+    /// three hundred relations (#63).
+    ///
+    /// **The result is never cached as if it were a `TableDef`.** The `tables` cache holds
+    /// hydrated definitions and every later `table_by_id` trusts it; a record left there would be
+    /// a table whose sequences had silently vanished. A hydrated copy already in the cache is
+    /// strictly more than a record, so it is used when it is there and never written when it is
+    /// not.
+    pub fn table_record_by_id(&self, table_id: u64) -> Result<Option<Arc<TableDef>>> {
+        if let Some(cache) = self.cache()
+            && let Some(hit) = cache.lock().tables.get(&(self.tenant, table_id))
+        {
+            return Ok(Some(Arc::clone(hit)));
+        }
+        let Some(bytes) = self.txn.get(&record::table_key(self.tenant, table_id))? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(record::decode_table(&bytes)?)))
+    }
+
+    /// A table by id, **hydrated** — the derived half read once and cached with it.
+    ///
+    /// The entry point every statement goes through, and the one a catalog view asks when it
+    /// needs more than the record a relations listing carries (see
+    /// [`View::table_record_by_id`]).
     pub fn table_by_id(&self, table_id: u64) -> Result<Option<Arc<TableDef>>> {
         let cache = self.cache();
         let key = (self.tenant, table_id);
@@ -3043,14 +3126,14 @@ pub fn type_by_name(txn: &dyn Txn, tenant: u64, name: &str) -> Result<Option<Typ
 /// type. **A field added to a `TableDef` outside its record belongs here and nowhere else.**
 pub(crate) fn hydrate(view: &View<'_>, table: &mut TableDef) -> Result<()> {
     let (txn, tenant) = (view.txn, view.tenant);
-    table
-        .sequences
-        .clone_from(view.table_sequences(table.id)?.as_ref());
+    let mut sequences = view.table_sequences(table.id)?.as_ref().clone();
     // And the parents' — see `inherited_sequences` for why the record stays theirs.
-    let inherited = inherited_sequences(view, table, &table.parents.clone())?;
-    table.sequences.extend(inherited);
-    table.child_scans = child_scans(txn, tenant, table)?;
-    table.enums = column_user_types(view, table)?;
+    sequences.extend(inherited_sequences(view, table, &table.parents.clone())?);
+    table.hydrated = Some(Hydrated {
+        sequences,
+        child_scans: child_scans(txn, tenant, table)?,
+        enums: column_user_types(view, table)?,
+    });
     Ok(())
 }
 
@@ -3173,8 +3256,16 @@ pub fn replace_table(
     // like any other relation, and `DROP COLUMN` takes the sequence out of the definition — so
     // without this the name outlived it, and the name a `serial` column's sequence holds is
     // exactly the name the *next* `CREATE TABLE` wants. Run 55's schema loads stopped there.
-    for sequence in &previous.sequences {
-        if !table.sequences.iter().any(|kept| kept.id == sequence.id) {
+    // Both sides are tables the caller loaded through the catalog, so both are hydrated; a
+    // record that reached here without its derived half would name no sequences and silently
+    // leave every one of them behind, which is the shape `derived()` exists to make loud.
+    for sequence in &previous.derived()?.sequences {
+        if !table
+            .derived()?
+            .sequences
+            .iter()
+            .any(|kept| kept.id == sequence.id)
+        {
             txn.delete(&record::sequence_key(tenant, previous.id, sequence.id));
             txn.delete(&record::name_key(tenant, &sequence.name));
             txn.delete(&record::sequence_value_key(tenant, sequence.id));
@@ -3234,7 +3325,7 @@ pub fn drop_table(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()
     // A sequence owned by a column goes with the column. PostgreSQL does the same and says so:
     // `DROP SEQUENCE` on an owned one is `2BP01` naming the table that depends on it, and a
     // `DROP TABLE` takes it without being asked.
-    drop_sequences(txn, tenant, table);
+    drop_sequences(txn, tenant, table)?;
     // A relation id is never reused, so an orphan override could not be mistaken for another
     // table's -- but it would sit in the collector's scan of every override for ever.
     clear_table_retention(txn, tenant, table.id);
@@ -4197,14 +4288,14 @@ impl ViewDef {
             name: self.name.clone(),
             columns,
             matview: None,
+            // Synthetic, and nothing here reads the derived half.
+            hydrated: Some(Hydrated::default()),
             on_commit: OnCommit::default(),
             persistence: Persistence::Permanent,
             primary_key: Vec::new(),
             indexes: Vec::new(),
             primary_key_name: String::new(),
             schema_version: 1,
-            sequences: Vec::new(),
-            enums: BTreeMap::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             triggers_disabled: false,
@@ -4214,7 +4305,6 @@ impl ViewDef {
             triggers: Vec::new(),
             partition_by: None,
             partition_bound: None,
-            child_scans: Vec::new(),
             comment: None,
             primary_key_comment: None,
         })
@@ -4751,12 +4841,13 @@ pub fn restart_sequence(txn: &mut dyn Txn, tenant: u64, sequence_id: u64) {
 }
 
 /// Removes one table's sequences: their records, their names and their counters.
-fn drop_sequences(txn: &mut dyn Txn, tenant: u64, table: &TableDef) {
-    for sequence in &table.sequences {
+fn drop_sequences(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()> {
+    for sequence in &table.derived()?.sequences {
         txn.delete(&record::sequence_key(tenant, table.id, sequence.id));
         txn.delete(&record::name_key(tenant, &sequence.name));
         txn.delete(&record::sequence_value_key(tenant, sequence.id));
     }
+    Ok(())
 }
 
 /// Reserves `count` consecutive values of one sequence and answers with the first.
@@ -5014,8 +5105,8 @@ mod tests {
         Catalog, ColumnDef, DEFAULT_RETENTION_MS, Identity, IndexDef, IndexKey, KeyOrder, KeyPart,
         MAX_IDENTIFIER_BYTES, RETENTION_FOREVER, Relation, SchemaState, SequenceDef, TableDef,
         allocate_database_id, allocate_id, clear_table_retention, create_database, create_schema,
-        create_table, database_id, databases, default_retention, drop_database, drop_table,
-        fold_identifier, record, replace_table, schemas, set_default_retention,
+        create_sequence, create_table, database_id, databases, default_retention, drop_database,
+        drop_table, fold_identifier, record, replace_table, schemas, set_default_retention,
         set_table_retention, table_retention,
     };
     use crate::backend::{Backend, MemoryBackend};
@@ -5038,6 +5129,86 @@ mod tests {
             let _ = write!(out, "{byte:02x}");
             out
         })
+    }
+
+    /// The fixture as a **live** table: what the catalog hands back, derived half and all.
+    ///
+    /// [`accounts`] is what a *record* decodes to, which the golden pins — and a record knows
+    /// nothing derived (#63). A test that creates, replaces or drops the table is holding the
+    /// other thing, so it says so here rather than each caller reaching for `hydrated_mut`.
+    /// **#63's equivalence guard.** What a relations listing carries is the *record*; what the
+    /// catalog hands back is the record **and** its derived half — and on every other field the
+    /// two are the same table, to the byte.
+    ///
+    /// The fixture carries all three derived things on purpose: a sequence the table owns, a
+    /// child that makes a `child_scan`, and the columns those imply. A change that hydrated less
+    /// than it used to would pass a test built on a plain table and fail here.
+    #[test]
+    fn a_listing_carries_the_record_and_the_catalog_carries_the_derived_half() {
+        let backend = MemoryBackend::new();
+        let catalog = Catalog::new();
+
+        let sequence = SequenceDef {
+            id: 40,
+            name: "accounts_id_seq".into(),
+            table_id: 1,
+            column: Some(0),
+            owner_column: Some(0),
+            identity: Identity::Always,
+            start: 1,
+            increment: 1,
+        };
+        let mut parent = live_accounts(1);
+        parent.children = vec![2];
+        parent.hydrated_mut().sequences.push(sequence.clone());
+
+        let mut child = live_accounts(2);
+        child.name = "accounts_child".into();
+        child.primary_key_name = "accounts_child_pkey".into();
+        child.indexes.clear();
+        child.parents = vec![1];
+
+        let mut ddl = backend.begin().unwrap();
+        create_table(&mut *ddl, 1, &parent).unwrap();
+        create_sequence(&mut *ddl, 1, &sequence).unwrap();
+        create_table(&mut *ddl, 1, &child).unwrap();
+        ddl.commit().unwrap();
+
+        let txn = backend.begin().unwrap();
+        let view = catalog.view(&*txn, 1).unwrap();
+
+        let record = view.table_record_by_id(1).unwrap().unwrap();
+        assert!(
+            record.hydrated().is_none(),
+            "a record carries nothing derived, and this one claims to have looked"
+        );
+
+        let whole = view.table_by_id(1).unwrap().unwrap();
+        let derived = whole.derived().expect("the catalog hydrates");
+        assert_eq!(
+            derived.sequences.len(),
+            1,
+            "the table's own sequence is not in its derived half"
+        );
+        assert_eq!(
+            derived.child_scans.len(),
+            1,
+            "the child is not in the parent's scans"
+        );
+
+        // And nothing else moved: lift the derived half across and the two are one table.
+        let mut lifted = (*record).clone();
+        lifted.hydrated = whole.hydrated.clone();
+        assert_eq!(
+            lifted, *whole,
+            "the record and the hydrated table disagree on a field the record carries"
+        );
+    }
+
+    fn live_accounts(id: u64) -> TableDef {
+        let mut table = accounts(id);
+        table.hydrated_mut();
+        table
     }
 
     fn accounts(id: u64) -> TableDef {
@@ -5098,7 +5269,6 @@ mod tests {
             }],
             primary_key_name: "accounts_pkey".into(),
             schema_version: 1,
-            sequences: Vec::new(),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
             triggers_disabled: false,
@@ -5106,10 +5276,12 @@ mod tests {
             children: Vec::new(),
             triggers: Vec::new(),
             excludes: Vec::new(),
-            child_scans: Vec::new(),
             partition_by: None,
             partition_bound: None,
-            enums: std::collections::BTreeMap::new(),
+            // **`None`, because this fixture is what a record decodes to.** The derived half is
+            // read where a table is loaded and is not in the bytes — so a decoded record that
+            // claimed an empty one would be claiming it had looked (#63).
+            hydrated: None,
         }
     }
 
@@ -6412,7 +6584,7 @@ mod tests {
 
         let mut ddl = backend.begin().unwrap();
         let id = allocate_id(&mut *ddl, 1).unwrap();
-        let table = accounts(id);
+        let table = live_accounts(id);
         create_table(&mut *ddl, 1, &table).unwrap();
         ddl.commit().unwrap();
 
@@ -6515,7 +6687,7 @@ mod tests {
         let catalog = Catalog::new();
 
         let mut ddl = backend.begin().unwrap();
-        create_table(&mut *ddl, 1, &accounts(1)).unwrap();
+        create_table(&mut *ddl, 1, &live_accounts(1)).unwrap();
         ddl.commit().unwrap();
 
         let first = backend.begin().unwrap();
@@ -6528,7 +6700,7 @@ mod tests {
         assert_eq!(before.indexes.len(), 1);
 
         let mut adding = backend.begin().unwrap();
-        let mut with_more = accounts(1);
+        let mut with_more = live_accounts(1);
         with_more.indexes.push(IndexDef {
             access_method: super::BTREE_ACCESS_METHOD.to_owned(),
             id: 5,
@@ -6543,7 +6715,7 @@ mod tests {
             constraint: None,
             comment: None,
         });
-        replace_table(&mut *adding, 1, &accounts(1), &with_more).unwrap();
+        replace_table(&mut *adding, 1, &live_accounts(1), &with_more).unwrap();
         adding.commit().unwrap();
 
         let second = backend.begin().unwrap();
@@ -6567,7 +6739,7 @@ mod tests {
         let catalog = Catalog::new();
 
         let mut ddl = backend.begin().unwrap();
-        let table = accounts(1);
+        let table = live_accounts(1);
         create_table(&mut *ddl, 1, &table).unwrap();
         let mut without = table.clone();
         without.indexes.clear();
@@ -6587,7 +6759,7 @@ mod tests {
     fn an_index_cannot_take_a_name_a_table_already_has() {
         let backend = MemoryBackend::new();
         let mut ddl = backend.begin().unwrap();
-        let table = accounts(1);
+        let table = live_accounts(1);
         create_table(&mut *ddl, 1, &table).unwrap();
 
         let mut clash = table.clone();
@@ -6608,7 +6780,7 @@ mod tests {
         let error = replace_table(&mut *ddl, 1, &table, &clash).unwrap_err();
         assert_eq!(error.sqlstate(), sqlstate::DUPLICATE_TABLE);
 
-        let mut again = accounts(2);
+        let mut again = live_accounts(2);
         again.indexes.clear();
         assert_eq!(
             create_table(&mut *ddl, 1, &again).unwrap_err().sqlstate(),
@@ -6876,7 +7048,7 @@ mod tests {
         clear_table_retention(&mut *txn, 1, 7);
         assert_eq!(table_retention(&*txn, 1, 7).unwrap(), None);
 
-        let table = accounts(7);
+        let table = live_accounts(7);
         create_table(&mut *txn, 1, &table).unwrap();
         set_table_retention(&mut *txn, 1, 7, RETENTION_FOREVER);
         drop_table(&mut *txn, 1, &table).unwrap();

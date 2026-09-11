@@ -1405,6 +1405,20 @@ impl Env<'_> {
         }
     }
 
+    /// One table, **hydrated** — for the catalog functions that ask about a table's sequences,
+    /// which the relations listing does not carry (#63).
+    fn hydrated_table(&self, table_id: u64) -> Result<Option<Arc<crate::catalog::TableDef>>> {
+        let Some(txn) = self.txn else {
+            return Err(SqlError::Internal(
+                "a catalog function reached an evaluator with no transaction to read in".to_owned(),
+            ));
+        };
+        self.settings
+            .catalog
+            .view(txn, self.tenant)
+            .table_by_id(table_id)
+    }
+
     /// The tenant's relations, read the first time one is asked for and shared after that.
     fn relations(&self) -> Result<&crate::catalog::pg_relations::Relations> {
         let (Some(cell), Some(txn)) = (self.catalog, self.txn) else {
@@ -4388,7 +4402,10 @@ fn catalog_function(
             // raises never produces the fallback.
             let Some(def) = relations
                 .by_name(&stored)
-                .and_then(|row| relations.table(row))
+                .map(|row| row.table_id)
+                .map(|id| env.hydrated_table(id))
+                .transpose()?
+                .flatten()
             else {
                 return Err(SqlError::UndefinedTable(crate::catalog::written_display(
                     table,
@@ -4402,6 +4419,7 @@ fn catalog_function(
             };
             // A column that owns no sequence **is** the NULL this function has.
             let sequence = def
+                .derived()?
                 .sequences
                 .iter()
                 .find(|sequence| sequence.column == Some(at));

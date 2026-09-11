@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use esker_keys::value::Datum;
 
-use crate::catalog::{ColumnDef, DERIVED_TABLE_ID, TableDef};
+use crate::catalog::{ColumnDef, DERIVED_TABLE_ID, Hydrated, TableDef};
 use crate::error::{Result, SqlError};
 use crate::plan::{Expr, Node, TableRef, ValuesList};
 use crate::value::ColumnType;
@@ -67,20 +67,19 @@ pub(super) fn def(entry: &TableRef) -> Result<Arc<TableDef>> {
         indexes: Vec::new(),
         primary_key_name: String::new(),
         schema_version: 1,
-        sequences: Vec::new(),
+        // Synthetic: built here rather than read, and nothing is derived.
+        hydrated: Some(Hydrated::default()),
         checks: Vec::new(),
         foreign_keys: Vec::new(),
         triggers_disabled: false,
         parents: Vec::new(),
         children: Vec::new(),
         triggers: Vec::new(),
-        child_scans: Vec::new(),
         excludes: Vec::new(),
         partition_by: None,
         partition_bound: None,
         comment: None,
         primary_key_comment: None,
-        enums: std::collections::BTreeMap::new(),
     }))
 }
 

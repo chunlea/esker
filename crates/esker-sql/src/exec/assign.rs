@@ -208,7 +208,7 @@ pub(super) fn user_type_of<'a>(
     table: &'a crate::catalog::TableDef,
     column: &ColumnDef,
 ) -> Option<&'a crate::catalog::TypeDef> {
-    table.enums.get(&column.user_type?)
+    table.hydrated()?.enums.get(&column.user_type?)
 }
 
 /// A **literal** meeting an enum column, as the value it stands for.

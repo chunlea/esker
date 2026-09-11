@@ -43,7 +43,7 @@ use super::NO_LENGTH;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use crate::catalog::{ColumnDef, TableDef};
+use crate::catalog::{ColumnDef, Hydrated, TableDef};
 use crate::error::{Result, SqlError};
 use crate::value::{ColumnType, Datum, PgType};
 use esker_keys::array::ArrayValue;
@@ -1314,7 +1314,19 @@ impl CatalogView {
                         indexes: Vec::new(),
                         primary_key_name: String::new(),
                         schema_version: 1,
-                        sequences: Vec::new(),
+                        // Synthetic: built here rather than read. The one derived thing a
+                        // catalog view has is the other half of the domain pair — a column holds
+                        // a type's **oid** and the definition lives on the table, so both have to
+                        // be here or the lookup finds nothing and the field falls back to the
+                        // base type.
+                        hydrated: Some(Hydrated {
+                            enums: if view.schema() == super::INFORMATION_SCHEMA {
+                                information_schema_domain_types().clone()
+                            } else {
+                                std::collections::BTreeMap::new()
+                            },
+                            ..Hydrated::default()
+                        }),
                         checks: Vec::new(),
                         foreign_keys: Vec::new(),
                         triggers_disabled: false,
@@ -1322,19 +1334,10 @@ impl CatalogView {
                         children: Vec::new(),
                         triggers: Vec::new(),
                         excludes: Vec::new(),
-                        child_scans: Vec::new(),
                         partition_by: None,
                         partition_bound: None,
                         comment: None,
                         primary_key_comment: None,
-                        // The other half of the pair: a column holds a type's **oid** and the
-                        // definition lives on the table, so both have to be here or the lookup
-                        // finds nothing and the field falls back to the base type.
-                        enums: if view.schema() == super::INFORMATION_SCHEMA {
-                            information_schema_domain_types().clone()
-                        } else {
-                            std::collections::BTreeMap::new()
-                        },
                     })
                 })
                 .collect()
@@ -2154,8 +2157,14 @@ fn pg_depend_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
     let class_oid = i64::try_from(CatalogView::PgClass.table_def().id).unwrap_or(i64::MAX);
     let relations = view.relations()?;
     let mut rows = Vec::new();
-    for table in relations.tables() {
-        for sequence in &table.sequences {
+    // **Hydrated, like `pg_sequence`**: this view is *about* the sequences a table owns, and the
+    // listing carries records, which do not know them (#63).
+    let ids: Vec<u64> = relations.tables().map(|table| table.id).collect();
+    for id in ids {
+        let Some(table) = view.table_by_id(id)? else {
+            continue;
+        };
+        for sequence in &table.derived()?.sequences {
             let Some(column) = sequence.column else {
                 continue;
             };
@@ -2654,10 +2663,28 @@ fn pg_sequence_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> 
             standalone.push(sequence);
         }
     }
+    // **Hydrated on purpose.** The relations listing carries records, and a record does not know
+    // its sequences (#63) — so this view asks the catalog for each table, where the sequences are
+    // read once and cached. Reading them off the listing would answer *no rows at all*, which is
+    // the silent shape the split exists to make impossible.
+    // The same set `relations.tables()` had — a materialized view is a table record too, and
+    // narrowing to `RelKind::Table` would have dropped its sequences from this view.
+    let ids: Vec<u64> = relations.tables().map(|table| table.id).collect();
+    let mut owners = Vec::new();
+    for id in ids {
+        if let Some(table) = view.table_by_id(id)? {
+            owners.push(table);
+        }
+    }
     let mut rows = Vec::new();
-    for (table, sequence) in relations
-        .tables()
-        .flat_map(|table| table.sequences.iter().map(move |s| (Some(table), s)))
+    for (table, sequence) in owners
+        .iter()
+        .flat_map(|table| {
+            table
+                .hydrated()
+                .into_iter()
+                .flat_map(move |half| half.sequences.iter().map(move |s| (Some(&**table), s)))
+        })
         .chain(standalone.iter().map(|s| (None, s)))
     {
         // **A serial's sequence counts in the column's type, not always in `bigint`** — a
