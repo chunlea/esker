@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/query.rs
+  s_e59614afdddccb::t_bba63e4e9ec741 1133,1823,1826-1850,1946-1947,1949-1992,1995,2000-2004,2007-2050,2052-2084,2088,2091-2102,2438-2450,2455-2456,2458-2463,2469,2478-2481,2488
+crates/esker-sql/tests/catalog_join_slope.rs
+  s_e59614afdddccb::t_25cb53cfd4bcd7 90-104,136-137,179
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4375e5205d7dcf4d6f0efdff28f91ff4e1f356ac",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
