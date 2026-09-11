@@ -28,6 +28,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::admin::{AdminCommand, AdminOptions};
 use crate::bench::{Run as BenchOptions, Workload};
 use crate::bench_mpp::BenchMppOptions;
 use crate::cluster::ClusterOptions;
@@ -68,6 +69,9 @@ pub(crate) enum Command {
     Pd(PdCommand),
     /// Look at, split, or hand over a region.
     Region(RegionOptions),
+    /// Ask one store to flush or compact its own storage
+    /// ([ADR 0109](../../../docs/adr/0109-an-operator-can-ask-a-store-to-flush-and-to-compact.md)).
+    Admin(AdminOptions),
     /// Compare an SST store prefix against a database's manifest.
     SstStore(SstStoreCommand),
     /// Prove that no acknowledged write is lost when a store is killed
@@ -201,6 +205,9 @@ Commands:
                         Run the placement driver, print what a stopped one has
                         stored, or ask a running one what it is doing
   region <verb> ...     Look at, split, or hand over a region
+  admin flush|compact   Ask one store (--store) to write its memtables out as SSTs, or
+                        to compact a column family (--cf, default all). Both answer
+                        when the work is done, with the SSTs the store then holds
   sst-store reconcile <url>
                         Compare an SST store prefix against a database's manifest
                         and say what nothing references any more
@@ -488,6 +495,7 @@ where
         "cluster" => parse_cluster(&arguments[1..]),
         "pd" => parse_pd(&arguments[1..]),
         "region" => parse_region(&arguments[1..]),
+        "admin" => parse_admin(&arguments[1..]),
         "sst-store" => parse_sst_store(&arguments[1..]),
         "durability" => parse_durability(&arguments[1..]),
         other if other.starts_with('-') => Err(ParseError::UnknownFlag(other.to_owned())),
@@ -808,6 +816,60 @@ fn parse_manifest_dump(arguments: &[String]) -> Result<Command, ParseError> {
 /// The verb decides how many bare words are expected, so a missing value is named rather than
 /// silently defaulted — the same rule the rest of this parser follows.
 /// `esker region ls | split <key> | transfer-leader <region> <peer>`.
+/// `esker admin flush|compact --store <addr> [--cf <name>]` (ADR 0109).
+///
+/// `--store` and not `--pd`: a flush is about one store's own memtables, so there is nothing for
+/// the placement driver to route and nothing for it to know. That also makes the verb work against
+/// a store started with no driver at all.
+fn parse_admin(arguments: &[String]) -> Result<Command, ParseError> {
+    let Some(verb) = arguments.first() else {
+        return Err(ParseError::MissingArgument("an admin command"));
+    };
+    if verb == "--help" || verb == "-h" {
+        return Ok(Command::Help);
+    }
+
+    let mut options = AdminOptions::default();
+    let mut cf = String::new();
+    let mut index = 1;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        index += 1;
+        if argument == "--help" || argument == "-h" {
+            return Ok(Command::Help);
+        }
+        let (flag, inline) = match argument.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (argument.as_str(), None),
+        };
+        match flag {
+            "--store" => options.store = take_value(arguments, &mut index, inline, "--store")?,
+            "--cf" => cf = take_value(arguments, &mut index, inline, "--cf")?,
+            other if other.starts_with('-') => {
+                return Err(ParseError::UnknownFlag(other.to_owned()));
+            }
+            other => return Err(ParseError::UnexpectedArgument(other.to_owned())),
+        }
+    }
+
+    options.command = match verb.as_str() {
+        "flush" => {
+            // Refused rather than ignored: a `--cf` here would read as "flush this one", and
+            // `flush_all` is what the store does. Silently dropping it would be the wrong answer
+            // given confidently.
+            if !cf.is_empty() {
+                return Err(ParseError::UnknownFlag(
+                    "--cf (admin flush writes them all)".to_owned(),
+                ));
+            }
+            AdminCommand::Flush
+        }
+        "compact" => AdminCommand::Compact { cf },
+        other => return Err(ParseError::UnknownCommand(format!("admin {other}"))),
+    };
+    Ok(Command::Admin(options))
+}
+
 fn parse_region(arguments: &[String]) -> Result<Command, ParseError> {
     let Some(verb) = arguments.first() else {
         return Err(ParseError::MissingArgument("a region command"));

@@ -65,6 +65,13 @@ const RECORD_CATCHUP_WAIT: std::time::Duration = std::time::Duration::from_milli
 /// nothing to subscribe to; two milliseconds is far below what it is waiting for.
 const RECORD_CATCHUP_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 
+/// How long between attempts, once one has been refused.
+///
+/// Short, because the expensive waiting already happened inside the attempt: a `RemotePd` spends
+/// its own redirect budget before it returns. This is the interval for the in-process driver,
+/// where an attempt costs nothing at all.
+const PD_LEADER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// How many consecutive leaderless heartbeat rounds make a region worth asking PD about.
 ///
 /// A throttle rather than a bound; see [`Store::sweep_orphaned_regions`] for why the safety is
@@ -124,6 +131,12 @@ pub struct StoreOptions {
     /// the region has changed, since a change beats immediately. Configurable because a test that
     /// waited sixty seconds for a membership change would not be run.
     pub region_heartbeat: std::time::Duration,
+    /// How long the **first** open waits for a placement-driver group to produce a leader.
+    ///
+    /// Defaults to [`crate::PD_LEADER_WAIT`], and is a field for the reason `region_heartbeat`
+    /// is one:
+    /// a test that waited thirty seconds for the bound to expire would not be run.
+    pub pd_leader_wait: std::time::Duration,
     /// How often each region's peer says what it believes, or `None` for never.
     ///
     /// **Off unless asked for**, and it is a diagnostic rather than a part of how the store
@@ -222,6 +235,7 @@ impl StoreOptions {
             heartbeat_tick: std::time::Duration::from_millis(esker_raft::TICK_MS),
             store_heartbeat: std::time::Duration::from_millis(crate::STORE_HEARTBEAT_MS),
             region_heartbeat: std::time::Duration::from_millis(crate::REGION_HEARTBEAT_MS),
+            pd_leader_wait: crate::PD_LEADER_WAIT,
             region_census: None,
             split: SplitOptions::new(),
             engine: Options {
@@ -568,6 +582,7 @@ impl Store {
             address,
             heartbeat_tick,
             store_heartbeat,
+            pd_leader_wait,
             region_heartbeat,
             region_census,
             split,
@@ -601,6 +616,7 @@ impl Store {
                     address: &address,
                     raft: raft.as_ref(),
                     pd: pd.as_ref(),
+                    pd_leader_wait,
                 },
             )?);
         }
@@ -2032,6 +2048,36 @@ impl Store {
             AdminReq::Regions => Ok(AdminResp::Regions {
                 regions: self.region_statuses(),
             }),
+            // ADR 0109. Both answer only when the work is done: `Db::flush_all` blocks on the
+            // flush job and `compact_range` on the compaction it schedules, so neither adds a
+            // cadence of its own — and an operator's flush that returned early would be useless
+            // to the measurement it exists for.
+            AdminReq::Flush => {
+                self.flush()?;
+                Ok(AdminResp::Flushed {
+                    families: self.sst_files()?,
+                })
+            }
+            AdminReq::Compact { cf } => {
+                if cf.is_empty() {
+                    for name in self.cf_names() {
+                        self.compact_cf(&name)?;
+                    }
+                } else {
+                    // Named and absent is an operator's typo, and it is worth saying which names
+                    // there are rather than handing back the engine's "no such column family".
+                    if !self.cf_names().contains(&cf) {
+                        return Err(ProtoError::invalid(format!(
+                            "no column family named `{cf}`; this store holds {}",
+                            self.cf_names().join(", ")
+                        )));
+                    }
+                    self.compact_cf(&cf)?;
+                }
+                Ok(AdminResp::Compacted {
+                    families: self.sst_files()?,
+                })
+            }
             AdminReq::TransferLeader {
                 region_id,
                 to_peer_id,
@@ -3361,8 +3407,42 @@ impl Store {
     /// For an operator forcing a collection, and for the tests that check one happened: a
     /// safepoint changes nothing until a compaction reads the entries it applies to.
     pub fn compact_write_cf(&self) -> Result<()> {
-        self.db.compact_range(cf::WRITE, None, None)?;
+        self.compact_cf(cf::WRITE)
+    }
+
+    /// Compacts one column family, end to end, and returns when it has finished
+    /// ([ADR 0109](../../../docs/adr/0109-an-operator-can-ask-a-store-to-flush-and-to-compact.md)).
+    ///
+    /// The general form of [`Store::compact_write_cf`], which is the one `esker bench --compact`
+    /// has always meant: `write` is where MVCC versions are.
+    pub fn compact_cf(&self, cf: &str) -> Result<()> {
+        self.db.compact_range(cf, None, None)?;
         Ok(())
+    }
+
+    /// Every column family this store holds, with the SSTs in each (ADR 0109).
+    ///
+    /// The **level** is carried and not only a count, because that is the distinction the
+    /// measurement this exists for turns on: one file in L0 and one in L1 are the difference
+    /// between versions that are all still there and versions that were merged away.
+    pub fn sst_files(&self) -> Result<Vec<esker_proto::CfFiles>> {
+        let mut families = Vec::new();
+        for cf in self.db.cf_names() {
+            let mut files = Vec::new();
+            for (level, number) in self.db.files_by_level(&cf)? {
+                let level = u32::try_from(level).map_err(|_| {
+                    StoreError::Bootstrap(format!("{cf} reports a level of {level}"))
+                })?;
+                files.push((level, number));
+            }
+            families.push(esker_proto::CfFiles { cf, files });
+        }
+        Ok(families)
+    }
+
+    /// The column families this store holds, for a request that names one.
+    pub fn cf_names(&self) -> Vec<String> {
+        self.db.cf_names()
     }
 
     /// How many `write` records this store holds for one user key.
@@ -3405,6 +3485,7 @@ struct BootstrapOptions<'a> {
     address: &'a str,
     raft: Option<&'a RaftOptions>,
     pd: Option<&'a Arc<dyn PdClient>>,
+    pd_leader_wait: std::time::Duration,
 }
 
 /// Decides what a store with no region records of its own should host, and writes the records.
@@ -3429,10 +3510,7 @@ struct BootstrapOptions<'a> {
 fn bootstrap(db: &Arc<Db>, options: &BootstrapOptions<'_>) -> Result<Option<Region>> {
     let region = match options.pd {
         Some(pd) => {
-            let answer = pd.bootstrap(&StoreInfo {
-                store_id: options.store_id,
-                address: options.address.to_owned(),
-            })?;
+            let answer = register_with_the_driver(pd.as_ref(), options)?;
             tracing::info!(
                 store_id = options.store_id,
                 cluster_id = answer.cluster_id,
@@ -3464,6 +3542,75 @@ fn bootstrap(db: &Arc<Db>, options: &BootstrapOptions<'_>) -> Result<Option<Regi
         "bootstrapped a region covering the whole key space"
     );
     Ok(Some(region))
+}
+
+/// Registers this store with the placement driver, waiting out an election rather than exiting.
+///
+/// # Why the open waits at all
+///
+/// A store that exited on [`ProtoError::PdNotLeader`] turned a one-second election into a dead
+/// node, and only on a machine slow enough to lose the race: four ADR 0108 tests failed this way
+/// on a loaded gate and were green on a quiet one, each after `esker cluster start` reported
+/// `node 1 exited with exit status: 1` (#59). The refusal itself is exactly the one worth waiting
+/// on — the member **provably did nothing**, and its answer cannot change until the election ends.
+///
+/// The client side of this already had its rule, in `esker_proto::LeaderBook`; what it does not
+/// have is a store's question, which is asked once, before anything is serving, and has no caller
+/// above it to retry.
+///
+/// # And why it does not wait for everything
+///
+/// A driver that was never dialled is **not** an election. `esker cluster start` orders the driver
+/// before the stores on purpose — *"a store whose PD is not up yet fails to open, which is the
+/// behaviour that makes a cluster's start order matter here and nowhere else"* — and a mistyped
+/// `--pd` should say so in a second rather than in half a minute. So an unreachable member is
+/// waited on **only after some member has said an election is running**, which is the point at
+/// which the group is known to exist. That is the sequence a store started before the rest of its
+/// group actually meets: one member up and leaderless, the others not yet listening.
+fn register_with_the_driver(
+    pd: &dyn PdClient,
+    options: &BootstrapOptions<'_>,
+) -> Result<crate::pd::Bootstrapped> {
+    let info = StoreInfo {
+        store_id: options.store_id,
+        address: options.address.to_owned(),
+    };
+    let began = std::time::Instant::now();
+    // Set by the first `PdNotLeader`, and the whole of what separates "a group is electing" from
+    // "there is nothing there".
+    let mut electing = false;
+    let mut said = false;
+    loop {
+        let refusal = match pd.bootstrap(&info) {
+            Ok(answer) => return Ok(answer),
+            Err(error) => error,
+        };
+        let mid_election = matches!(refusal, ProtoError::PdNotLeader { .. });
+        electing |= mid_election;
+        let worth_waiting_on = mid_election || (electing && esker_proto::is_unreachable(&refusal));
+        if !worth_waiting_on {
+            // Returned exactly as it arrived: this is the path an operator with a mistyped
+            // `--pd` takes, and the socket's own words are what tells them so.
+            return Err(StoreError::from(refusal));
+        }
+        if began.elapsed() >= options.pd_leader_wait {
+            // The bound, and it says it *is* one — a bare "placement driver is not the leader"
+            // after half a minute of waiting reads like the refusal came back instantly.
+            return Err(StoreError::Bootstrap(format!(
+                "no placement driver led the group within {:?}: {refusal}",
+                began.elapsed()
+            )));
+        }
+        if !said {
+            said = true;
+            tracing::info!(
+                store_id = options.store_id,
+                wait_ms = options.pd_leader_wait.as_millis(),
+                "waiting for a placement driver to lead before registering"
+            );
+        }
+        std::thread::sleep(PD_LEADER_POLL);
+    }
 }
 
 /// The membership change an operator asks for, or `None` when there is nothing to propose.

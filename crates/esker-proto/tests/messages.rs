@@ -348,6 +348,19 @@ fn golden_requests() -> Vec<(&'static str, Request)> {
             "admin-regions",
             Request::Admin(esker_proto::AdminReq::Regions),
         ),
+        // ADR 0109's two, and the compact one carries a name so the string half of the encoding
+        // is exercised rather than only the empty body.
+        ("admin-flush", Request::Admin(esker_proto::AdminReq::Flush)),
+        (
+            "admin-compact",
+            Request::Admin(esker_proto::AdminReq::Compact {
+                cf: "write".to_owned(),
+            }),
+        ),
+        (
+            "admin-compact-all",
+            Request::Admin(esker_proto::AdminReq::Compact { cf: String::new() }),
+        ),
         (
             "raft-snapshot",
             Request::Snapshot(esker_proto::SnapshotRequest {
@@ -1086,6 +1099,40 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
     ]
 }
 
+/// ADR 0109's two, lifted out of [`golden_responses`] because that function is at the line lint's
+/// limit — the lint is a property of the whole list and every future message would pay for it.
+///
+/// An empty family beside a multi-level one: the level is a `u32` narrowed from a varint on the
+/// way back, and the nesting is a count inside a count.
+fn golden_storage_responses() -> Vec<(&'static str, Response)> {
+    vec![
+        (
+            "admin-flushed",
+            Response::Admin(esker_proto::AdminResp::Flushed {
+                families: vec![
+                    esker_proto::CfFiles {
+                        cf: "write".to_owned(),
+                        files: vec![(0, 7), (1, 8), (6, 9)],
+                    },
+                    esker_proto::CfFiles {
+                        cf: "lock".to_owned(),
+                        files: Vec::new(),
+                    },
+                ],
+            }),
+        ),
+        (
+            "admin-compacted",
+            Response::Admin(esker_proto::AdminResp::Compacted {
+                families: vec![esker_proto::CfFiles {
+                    cf: "default".to_owned(),
+                    files: vec![(0, 1)],
+                }],
+            }),
+        ),
+    ]
+}
+
 fn golden_responses() -> Vec<(&'static str, Response)> {
     let region = |id: u64| Region {
         id,
@@ -1517,7 +1564,10 @@ fn golden_request_bodies() {
 
 #[test]
 fn golden_response_bodies() {
-    for (name, response) in golden_responses() {
+    for (name, response) in golden_responses()
+        .into_iter()
+        .chain(golden_storage_responses())
+    {
         assert_eq!(
             hex(&response.encode()),
             hex(&golden("response", name)),
@@ -1551,7 +1601,8 @@ fn the_goldens_cover_every_method_and_every_error_code() {
         .map(|(_, request)| request.method())
         .collect();
     let pinned_responses: std::collections::BTreeSet<Method> = golden_responses()
-        .iter()
+        .into_iter()
+        .chain(golden_storage_responses())
         .map(|(_, response)| response.method())
         .collect();
     let all: std::collections::BTreeSet<Method> = Method::ALL.into_iter().collect();

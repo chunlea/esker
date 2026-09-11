@@ -189,3 +189,20 @@ one, both of which `--pd-nodes 3` produces by construction.
   start five and nothing here claims anything about them.
 * **TLS between members is unchanged**, and `--pd-nodes` passes the same `RpcTlsFlags` every driver
   already takes.
+
+* **A store's first open now waits for the group to elect** (#59, added after the fact by this
+  ADR's own tests). The four rules above are a **client's** rules, about one request; a store asks
+  its question once, before anything serves, with no caller above it to retry — so a group that had
+  not yet elected made `Store::open` fail and the node exit. On a quiet machine the election won
+  the race and nothing was ever seen; on a loaded gate all four tests here failed at once, each
+  after `esker cluster start` reported `node 1 exited with exit status: 1`.
+
+  The budget is its own (`StoreOptions::pd_leader_wait`, thirty seconds) and **nests inside** the
+  redirect budget rather than replacing it: `REDIRECT_BUDGET` rotates the endpoint list looking for
+  a leader that exists and gives up in about three seconds, which is right for *finding* one and
+  wrong for *waiting for the first one*. Raising it would make every later redirect on every client
+  slower to give up.
+
+  It waits on `PdNotLeader`, and on an unreachable member **only once some member has said an
+  election is running** — before that, a driver that cannot be dialled is the fast, clear failure
+  `esker cluster start`'s ordering already depends on.
