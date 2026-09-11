@@ -205,9 +205,12 @@ Commands:
                         Run the placement driver, print what a stopped one has
                         stored, or ask a running one what it is doing
   region <verb> ...     Look at, split, or hand over a region
-  admin flush|compact   Ask one store (--store) to write its memtables out as SSTs, or
-                        to compact a column family (--cf, default all). Both answer
-                        when the work is done, with the SSTs the store then holds
+  admin flush|compact|gc
+                        Ask one store (--store) to write its memtables out as SSTs, or
+                        to compact a column family (--cf, default all). `gc
+                        --safepoint <ts>` raises the collection safepoint and
+                        collects below it, answering with what is left. All three
+                        answer when the work is done
   sst-store reconcile <url>
                         Compare an SST store prefix against a database's manifest
                         and say what nothing references any more
@@ -831,6 +834,7 @@ fn parse_admin(arguments: &[String]) -> Result<Command, ParseError> {
 
     let mut options = AdminOptions::default();
     let mut cf = String::new();
+    let mut safepoint: Option<u64> = None;
     let mut index = 1;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -845,6 +849,13 @@ fn parse_admin(arguments: &[String]) -> Result<Command, ParseError> {
         match flag {
             "--store" => options.store = take_value(arguments, &mut index, inline, "--store")?,
             "--cf" => cf = take_value(arguments, &mut index, inline, "--cf")?,
+            "--safepoint" => {
+                let value = take_value(arguments, &mut index, inline, "--safepoint")?;
+                safepoint = Some(value.parse().map_err(|_| ParseError::InvalidValue {
+                    flag: "--safepoint",
+                    value: value.clone(),
+                })?);
+            }
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
             }
@@ -865,6 +876,14 @@ fn parse_admin(arguments: &[String]) -> Result<Command, ParseError> {
             AdminCommand::Flush
         }
         "compact" => AdminCommand::Compact { cf },
+        "gc" => {
+            // Required rather than defaulted: a safepoint of zero collects nothing, so a default
+            // would be a command that silently did nothing and reported success.
+            let Some(safepoint) = safepoint else {
+                return Err(ParseError::MissingArgument("admin gc --safepoint <ts>"));
+            };
+            AdminCommand::Gc { safepoint }
+        }
         other => return Err(ParseError::UnknownCommand(format!("admin {other}"))),
     };
     Ok(Command::Admin(options))

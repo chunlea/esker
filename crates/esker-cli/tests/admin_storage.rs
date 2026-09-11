@@ -299,3 +299,95 @@ fn sst_dump_opens_a_table_a_store_wrote() {
     assert!(opened > 0, "the flush wrote no sst to dump");
     assert!(entries > 0, "{opened} tables held no entries between them");
 }
+
+/// Sums `entry_count` over every SST under `dir`, by dumping each one.
+///
+/// An **independent** count: `sst-dump` reads the files from disk and knows nothing about the verb
+/// under test, so a receipt that agreed with it agreed with something it did not produce.
+fn entries_on_disk(data: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![data.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(at) = stack.pop() {
+        for entry in std::fs::read_dir(&at).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|end| end == "sst") {
+                files.push(path);
+            }
+        }
+    }
+    for path in files {
+        let (ok, report) = cli(&["sst-dump", path.to_str().unwrap()]);
+        assert!(ok, "sst-dump refused {}:\n{report}", path.display());
+        let count: u64 = report
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("entry_count"))
+            .and_then(|rest| rest.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no entry_count in:\n{report}"));
+        total += count;
+    }
+    total
+}
+
+/// **ADR 0110 step ① over a socket**: an operator hands a store a safepoint and gets a receipt.
+///
+/// What collection *does* is asserted where the versions are real —
+/// `esker-store/tests/safepoint_collects.rs`, through prewrite and commit, `write` 96 → 8. This is
+/// the other half: that the verb reaches a running store, that the safepoint it reports is the one
+/// in force, and that the counts it answers with are the counts on disk.
+///
+/// It writes through `RawKV` because that is what the CLI has, and a raw key has no MVCC versions —
+/// so this asserts the **round trip and the receipt**, not the collection. Saying which test proves
+/// which half is the point: a single test that did both badly would prove neither.
+#[test]
+fn a_safepoint_an_operator_handed_over_comes_back_with_a_receipt() {
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("node");
+    let log = dir.path().join("server.log");
+    let port = free_port();
+    let address = format!("127.0.0.1:{port}");
+
+    let mut server = start(&data, port, &log);
+    wait_until_listening(&mut server, &log);
+    for at in 0..ROWS {
+        let (ok, said) = cli(&[
+            "raw",
+            "put",
+            &format!("k{at:05}"),
+            "value",
+            "--addr",
+            &address,
+        ]);
+        assert!(ok, "`raw put` failed: {said}");
+    }
+
+    let (ok, said) = cli(&["admin", "gc", "--safepoint", "4096", "--store", &address]);
+    assert!(ok, "`admin gc` failed: {said}");
+    assert!(
+        said.contains("safepoint 4096 in force"),
+        "the receipt must name the safepoint that took effect:\n{said}"
+    );
+    assert!(
+        said.contains("write") && said.contains("entries"),
+        "the receipt must name each column family and its entries:\n{said}"
+    );
+
+    // The verb compacts, so the rows written above are on disk by now, and the entry total it
+    // reported has to be the one `sst-dump` reads back out of the files it left behind.
+    let on_disk = entries_on_disk(&data);
+    assert!(on_disk > 0, "the collection left no SST to count:\n{said}");
+    assert!(
+        said.contains(&on_disk.to_string()),
+        "the receipt does not name the {on_disk} entries sst-dump counts:\n{said}"
+    );
+
+    // A safepoint never moves backwards, and the receipt says so rather than pretending.
+    let (ok, lowered) = cli(&["admin", "gc", "--safepoint", "1", "--store", &address]);
+    assert!(ok, "`admin gc` failed: {lowered}");
+    assert!(
+        lowered.contains("safepoint 4096 in force"),
+        "a lower safepoint must not lower the one in force:\n{lowered}"
+    );
+}

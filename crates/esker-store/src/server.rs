@@ -2058,6 +2058,24 @@ impl Store {
                     families: self.sst_files()?,
                 })
             }
+            // ADR 0110 step 1. The collector has been able to do this since ADR 0021 and has
+            // never been given a number: every sender of `TxnKvReq::GcSafepoint` in this
+            // repository is a test. This is the hand-operated publisher, so the question it
+            // answers — does collecting flatten the climb — can be asked before PD is taught to
+            // publish one, which is a different decision.
+            AdminReq::Gc { safepoint } => {
+                let in_force = self.raise_safepoint(safepoint);
+                // Compact afterwards rather than waiting: a filter only runs when a compaction
+                // does, and an operator asking for this wants the answer now, not at whatever
+                // hour the next one is scheduled.
+                for name in self.cf_names() {
+                    self.compact_cf(&name)?;
+                }
+                Ok(AdminResp::Collected {
+                    safepoint: in_force,
+                    families: self.cf_entries()?,
+                })
+            }
             AdminReq::Compact { cf } => {
                 if cf.is_empty() {
                     for name in self.cf_names() {
@@ -3380,13 +3398,25 @@ impl Store {
     /// has already been collected, and PD's own safepoint only ever rises — so a lower number
     /// here is a stale message overtaking a fresh one, not a decision.
     fn set_safepoint(&self, safepoint: u64) -> TxnKvResp {
+        TxnKvResp::GcSafepoint {
+            safepoint: self.raise_safepoint(safepoint),
+        }
+    }
+
+    /// Raises the collector's safepoint and re-reads the retention policy, answering with the one
+    /// now in force.
+    ///
+    /// Named because two verbs reach it — `TxnKvReq::GcSafepoint` and ADR 0110 step 1's
+    /// `AdminReq::Gc` — and a second copy of "never lower it, then reload the policy" is how the
+    /// two would drift.
+    pub fn raise_safepoint(&self, safepoint: u64) -> u64 {
         let now = self.collector.set_published(safepoint);
         // The policy is re-read on every safepoint rather than cached for ever: a `retention`
         // DDL writes a catalog record and bumps nothing, deliberately (ADR 0021 decision 4), so
         // the collector's own next pass is where a change is meant to be picked up. A failure
         // to read it leaves the policy that was working, which keeps more rather than less.
         load_retention(&self.db, &self.collector);
-        TxnKvResp::GcSafepoint { safepoint: now }
+        now
     }
 
     /// The garbage-collection safepoint this store is working to.
@@ -3436,6 +3466,24 @@ impl Store {
                 files.push((level, number));
             }
             families.push(esker_proto::CfFiles { cf, files });
+        }
+        Ok(families)
+    }
+
+    /// Every column family's SST and entry totals, as ADR 0110 step 1's receipt.
+    ///
+    /// The entry count is the one that answers *"did the versions go"*: a compaction rewrites
+    /// files whether or not it dropped anything, so a file count can fall, rise or stay while the
+    /// history is untouched.
+    pub fn cf_entries(&self) -> Result<Vec<esker_proto::CfEntries>> {
+        let mut families = Vec::new();
+        for cf in self.db.cf_names() {
+            let ssts = self.db.sst_entries(&cf)?;
+            families.push(esker_proto::CfEntries {
+                cf,
+                ssts: ssts.len() as u64,
+                entries: ssts.iter().map(|(_, _, entries)| entries).sum(),
+            });
         }
         Ok(families)
     }

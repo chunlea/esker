@@ -362,6 +362,12 @@ fn golden_requests() -> Vec<(&'static str, Request)> {
             Request::Admin(esker_proto::AdminReq::Compact { cf: String::new() }),
         ),
         (
+            "admin-gc",
+            Request::Admin(esker_proto::AdminReq::Gc {
+                safepoint: 469_002_181_806_129_152,
+            }),
+        ),
+        (
             "raft-snapshot",
             Request::Snapshot(esker_proto::SnapshotRequest {
                 region_id: 3,
@@ -1106,6 +1112,24 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
 /// way back, and the nesting is a count inside a count.
 fn golden_storage_responses() -> Vec<(&'static str, Response)> {
     vec![
+        (
+            "admin-collected",
+            Response::Admin(esker_proto::AdminResp::Collected {
+                safepoint: 469_002_181_806_129_152,
+                families: vec![
+                    esker_proto::CfEntries {
+                        cf: "write".to_owned(),
+                        ssts: 3,
+                        entries: 1_024,
+                    },
+                    esker_proto::CfEntries {
+                        cf: "lock".to_owned(),
+                        ssts: 0,
+                        entries: 0,
+                    },
+                ],
+            }),
+        ),
         (
             "admin-flushed",
             Response::Admin(esker_proto::AdminResp::Flushed {

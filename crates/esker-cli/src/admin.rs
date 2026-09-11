@@ -35,6 +35,13 @@ pub(crate) enum AdminCommand {
         /// Which column family, or empty for all of them.
         cf: String,
     },
+    /// Hand the store a garbage-collection safepoint and collect below it
+    /// ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)
+    /// step 1).
+    Gc {
+        /// The safepoint to raise to.
+        safepoint: u64,
+    },
 }
 
 /// How `esker admin` was configured.
@@ -77,18 +84,27 @@ pub(crate) fn run(options: &AdminOptions) -> Result<(), String> {
             "compacting",
             Request::Admin(AdminReq::Compact { cf: cf.clone() }),
         ),
+        AdminCommand::Gc { safepoint } => (
+            "collecting on",
+            Request::Admin(AdminReq::Gc {
+                safepoint: *safepoint,
+            }),
+        ),
     };
     let response = store
         .call(request, std::time::Instant::now() + CALL_TIMEOUT)
         .map_err(|error| format!("{what} {address}: {error}"))?;
 
-    let esker_proto::Response::Admin(
-        AdminResp::Flushed { families } | AdminResp::Compacted { families },
-    ) = response
-    else {
-        return Err(format!("the store answered {response:?}"));
-    };
-    report(&families);
+    match response {
+        esker_proto::Response::Admin(
+            AdminResp::Flushed { families } | AdminResp::Compacted { families },
+        ) => report(&families),
+        esker_proto::Response::Admin(AdminResp::Collected {
+            safepoint,
+            families,
+        }) => report_collection(safepoint, &families),
+        other => return Err(format!("the store answered {other:?}")),
+    }
     Ok(())
 }
 
@@ -125,4 +141,27 @@ fn report(families: &[esker_proto::CfFiles]) {
         );
     }
     println!("\n{total} sst in {} column families", families.len());
+}
+
+/// Prints what a collection left, one line per column family and a total.
+///
+/// The **entry** count leads, because it is the number that says whether the versions went: a
+/// compaction rewrites files whether or not it dropped anything, so the file count can fall, rise
+/// or stay while the history is untouched.
+fn report_collection(safepoint: u64, families: &[esker_proto::CfEntries]) {
+    println!("safepoint {safepoint} in force");
+    let mut entries = 0;
+    let mut ssts = 0;
+    for family in families {
+        entries += family.entries;
+        ssts += family.ssts;
+        println!(
+            "{:>8}  {} entries in {} sst",
+            family.cf, family.entries, family.ssts
+        );
+    }
+    println!(
+        "\n{entries} entries in {ssts} sst across {} column families",
+        families.len()
+    );
 }

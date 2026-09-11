@@ -126,6 +126,10 @@ pub enum Method {
     AdminFlush = 0x0504,
     /// `Admin::Compact` — compact a column family, for `esker-cli admin compact` (ADR 0109).
     AdminCompact = 0x0505,
+    /// `Admin::Gc` — hand a store a garbage-collection safepoint and collect below it, for
+    /// `esker-cli admin gc`
+    /// ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md) step 1).
+    AdminGc = 0x0506,
 
     /// `RaftTransport::Snapshot` — a follower asking a leader for a region's contents.
     ///
@@ -216,7 +220,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 43] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -257,6 +261,7 @@ impl Method {
         Self::AdminRegions,
         Self::AdminFlush,
         Self::AdminCompact,
+        Self::AdminGc,
         Self::FragmentEvaluate,
         Self::SchemaFetch,
     ];
@@ -313,6 +318,7 @@ impl Method {
             0x0503 => Some(Self::AdminRegions),
             0x0504 => Some(Self::AdminFlush),
             0x0505 => Some(Self::AdminCompact),
+            0x0506 => Some(Self::AdminGc),
             _ => None,
         }
     }
@@ -366,6 +372,7 @@ impl Method {
             Self::AdminRegions => "Admin::Regions",
             Self::AdminFlush => "Admin::Flush",
             Self::AdminCompact => "Admin::Compact",
+            Self::AdminGc => "Admin::Gc",
             Self::RaftBatch => "RaftTransport::Batch",
             Self::RaftSnapshot => "RaftTransport::Snapshot",
             Self::TxnGet => "TxnKv::Get",
@@ -1028,6 +1035,18 @@ pub enum AdminReq {
     /// crosses `write_buffer_size` and a flush job runs — so a measurement that wants both sides
     /// of "before and after a flush" has no lever at all without this.
     Flush,
+    /// Raise this store's garbage-collection safepoint and collect below it
+    /// ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md) step 1).
+    ///
+    /// **A measurement, not the mechanism.** Safepoint collection has been built since ADR 0021
+    /// and no production sender has ever given it a number, so this lets one store be told a
+    /// safepoint by hand — enough to answer *"does collecting flatten the climb"* before PD is
+    /// taught to publish one, which is step 2 and is a different decision.
+    Gc {
+        /// The safepoint to raise to. A store never lowers its own: a safepoint that moved
+        /// backwards would promise a reader history that has already been collected.
+        safepoint: u64,
+    },
     /// Compact one column family, or every one when `cf` is empty (ADR 0109).
     Compact {
         /// Which column family, or empty for all of them. `write` is where MVCC versions are,
@@ -1046,6 +1065,7 @@ impl AdminReq {
             Self::Regions => Method::AdminRegions,
             Self::Flush => Method::AdminFlush,
             Self::Compact { .. } => Method::AdminCompact,
+            Self::Gc { .. } => Method::AdminGc,
         }
     }
 
@@ -1067,6 +1087,7 @@ impl AdminReq {
             }
             Self::Regions | Self::Flush => {}
             Self::Compact { cf } => out.put_str(cf),
+            Self::Gc { safepoint } => out.put_varint(*safepoint),
         }
     }
 
@@ -1084,6 +1105,9 @@ impl AdminReq {
             Method::AdminFlush => Self::Flush,
             Method::AdminCompact => Self::Compact {
                 cf: input.get_str("admin.cf")?.to_owned(),
+            },
+            Method::AdminGc => Self::Gc {
+                safepoint: input.get_varint("admin.safepoint")?,
             },
             other => {
                 return Err(DecodeError::invalid(
@@ -1305,6 +1329,19 @@ pub enum AdminResp {
         /// One entry per column family, in the order the store holds them.
         families: Vec<CfFiles>,
     },
+    /// What one store holds after a safepoint collection
+    /// ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md) step 1).
+    ///
+    /// A shape of its own rather than another [`CfFiles`] list, because the number that answers
+    /// *"did the versions go"* is the **entry count**, and ADR 0109's shape carries file numbers.
+    /// Adding a field to that one would change bytes already on the wire; this adds a message.
+    Collected {
+        /// The safepoint now in force, which is not always the one asked for: a store never
+        /// lowers its own.
+        safepoint: u64,
+        /// One entry per column family.
+        families: Vec<CfEntries>,
+    },
     /// Every SST this store holds, after a compaction that has finished (ADR 0109).
     ///
     /// A separate variant from [`AdminResp::Flushed`] carrying the same shape, because
@@ -1337,6 +1374,20 @@ fn decode_families(input: &mut Decoder<'_>) -> Result<Vec<CfFiles>, DecodeError>
     Ok(families)
 }
 
+/// One column family's totals after a collection, as a store reports them (ADR 0110 step 1).
+///
+/// Counts rather than file numbers: what says whether the versions went is how many **entries**
+/// are left, and a file number says only which files exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfEntries {
+    /// The column family's name.
+    pub cf: String,
+    /// SSTs it holds.
+    pub ssts: u64,
+    /// Stored entries across all of them, summed from each table's own properties.
+    pub entries: u64,
+}
+
 /// One column family's SSTs, as a store reports them to an operator (ADR 0109).
 ///
 /// The **level** is carried and not only the count, because that is the distinction the
@@ -1360,6 +1411,7 @@ impl AdminResp {
             Self::Regions { .. } => Method::AdminRegions,
             Self::Flushed { .. } => Method::AdminFlush,
             Self::Compacted { .. } => Method::AdminCompact,
+            Self::Collected { .. } => Method::AdminGc,
         }
     }
 
@@ -1378,6 +1430,18 @@ impl AdminResp {
                     out.put_bool(status.is_leader);
                     out.put_varint(status.approximate_size);
                     out.put_varint(status.applied_index);
+                }
+            }
+            Self::Collected {
+                safepoint,
+                families,
+            } => {
+                out.put_varint(*safepoint);
+                out.put_varint(families.len() as u64);
+                for family in families {
+                    out.put_str(&family.cf);
+                    out.put_varint(family.ssts);
+                    out.put_varint(family.entries);
                 }
             }
             Self::Flushed { families } | Self::Compacted { families } => {
@@ -1421,6 +1485,22 @@ impl AdminResp {
             Method::AdminCompact => Self::Compacted {
                 families: decode_families(input)?,
             },
+            Method::AdminGc => {
+                let safepoint = input.get_varint("admin.safepoint")?;
+                let count = input.get_count("admin.families")?;
+                let mut families = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    families.push(CfEntries {
+                        cf: input.get_str("admin.cf")?.to_owned(),
+                        ssts: input.get_varint("admin.ssts")?,
+                        entries: input.get_varint("admin.entries")?,
+                    });
+                }
+                Self::Collected {
+                    safepoint,
+                    families,
+                }
+            }
             other => {
                 return Err(DecodeError::invalid(
                     "method",
@@ -1695,7 +1775,8 @@ mod tests {
                 | Method::AdminTransferLeader
                 | Method::AdminRegions
                 | Method::AdminFlush
-                | Method::AdminCompact => SERVICE_ADMIN,
+                | Method::AdminCompact
+                | Method::AdminGc => SERVICE_ADMIN,
                 Method::PdBootstrap
                 | Method::PdStoreHeartbeat
                 | Method::PdRegionHeartbeat

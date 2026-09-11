@@ -611,6 +611,33 @@ impl Db {
         }
     }
 
+    /// Every SST this database holds for `cf`, as `(level, file number, entry count)`.
+    ///
+    /// The entry count comes from each table's **own properties**, read through the same cache a
+    /// read uses, rather than from the manifest: `FileMeta` carries a size and not a count, and
+    /// putting one there would change the manifest's bytes.
+    ///
+    /// It is the number that says whether garbage collection did anything — files can be rewritten
+    /// without dropping a single version — which is what
+    /// [ADR 0110](../../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)
+    /// step 1 needs to answer its question.
+    pub fn sst_entries(&self, cf: &str) -> Result<Vec<(usize, u64, u64)>> {
+        let handle = self.inner.cf_by_name(cf)?;
+        let options = self.inner.table_options(&handle);
+        let version = lock(&self.inner.versions)?.current();
+        let levels = version
+            .cf(handle.id())
+            .map_or(0, crate::version::CfVersion::num_levels);
+        let mut out = Vec::new();
+        for level in 0..levels {
+            for file in version.files(handle.id(), level) {
+                let reader = self.inner.table_cache.get(file.number, &options)?;
+                out.push((level, file.number, reader.properties().entry_count));
+            }
+        }
+        Ok(out)
+    }
+
     /// Every SST this database currently holds for `cf`, as `(level, file number)`.
     ///
     /// Exists for the invariant that keeps range tombstones sound — *no SST below L0 holds
