@@ -7,6 +7,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod admin;
 mod args;
 mod bench;
 mod bench_mpp;
@@ -96,6 +97,16 @@ fn run_bench_mpp(options: &bench_mpp::BenchMppOptions) -> ExitCode {
     }
 }
 
+fn run_admin(options: &admin::AdminOptions) -> ExitCode {
+    match admin::run(options) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(reason) => {
+            eprintln!("esker admin: {reason}");
+            ExitCode::from(EXIT_FAILURE)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     match args::parse(std::env::args().skip(1)) {
         Ok(Command::Version) => {
@@ -166,6 +177,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Ok(Command::Admin(options)) => run_admin(&options),
         Ok(Command::Region(options)) => match region::run(&options) {
             Ok(()) => ExitCode::SUCCESS,
             Err(reason) => {

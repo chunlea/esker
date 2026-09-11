@@ -130,6 +130,9 @@ request txn-release-lock 0b02010203042a010161
 request admin-split 010503016d
 request admin-transfer-leader 02050307
 request admin-regions 0305
+request admin-flush 0405
+request admin-compact 0505057772697465
+request admin-compact-all 050500
 
 response txn-get 0102010176
 response txn-get-absent 010200
@@ -153,6 +156,8 @@ response txn-reclaim-range 0a02016600808080808040
 response admin-split 0105010161016d010201010a01020161016d010201010a01
 response admin-transfer-leader 0205
 response admin-regions 030501010161016d010201010a010a0180202a
+response admin-flushed 04050205777269746503000701080609046c6f636b00
+response admin-compacted 0505010764656661756c74010001
 
 # The payload inside an Error frame's `Locked`: { key, primary, start_ts, ttl_ms }.
 lockinfo account 096163636f756e742f31096163636f756e742f30808080808040b817

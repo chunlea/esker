@@ -121,6 +121,11 @@ pub enum Method {
     AdminTransferLeader = 0x0502,
     /// `Admin::Regions` — what this store hosts, for `esker-cli region ls`.
     AdminRegions = 0x0503,
+    /// `Admin::Flush` — write every memtable out as an SST, for `esker-cli admin flush`
+    /// ([ADR 0109](../../../docs/adr/0109-an-operator-can-ask-a-store-to-flush-and-to-compact.md)).
+    AdminFlush = 0x0504,
+    /// `Admin::Compact` — compact a column family, for `esker-cli admin compact` (ADR 0109).
+    AdminCompact = 0x0505,
 
     /// `RaftTransport::Snapshot` — a follower asking a leader for a region's contents.
     ///
@@ -211,7 +216,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 42] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -250,6 +255,8 @@ impl Method {
         Self::AdminSplit,
         Self::AdminTransferLeader,
         Self::AdminRegions,
+        Self::AdminFlush,
+        Self::AdminCompact,
         Self::FragmentEvaluate,
         Self::SchemaFetch,
     ];
@@ -304,6 +311,8 @@ impl Method {
             0x0501 => Some(Self::AdminSplit),
             0x0502 => Some(Self::AdminTransferLeader),
             0x0503 => Some(Self::AdminRegions),
+            0x0504 => Some(Self::AdminFlush),
+            0x0505 => Some(Self::AdminCompact),
             _ => None,
         }
     }
@@ -355,6 +364,8 @@ impl Method {
             Self::AdminSplit => "Admin::Split",
             Self::AdminTransferLeader => "Admin::TransferLeader",
             Self::AdminRegions => "Admin::Regions",
+            Self::AdminFlush => "Admin::Flush",
+            Self::AdminCompact => "Admin::Compact",
             Self::RaftBatch => "RaftTransport::Batch",
             Self::RaftSnapshot => "RaftTransport::Snapshot",
             Self::TxnGet => "TxnKv::Get",
@@ -1010,6 +1021,19 @@ pub enum AdminReq {
     },
     /// Every region this store hosts, with what it knows about each.
     Regions,
+    /// Write every column family's memtable out as an SST, and answer once it is on disk
+    /// ([ADR 0109](../../../docs/adr/0109-an-operator-can-ask-a-store-to-flush-and-to-compact.md)).
+    ///
+    /// Everything that decides when an SST appears is otherwise inside the store — a memtable
+    /// crosses `write_buffer_size` and a flush job runs — so a measurement that wants both sides
+    /// of "before and after a flush" has no lever at all without this.
+    Flush,
+    /// Compact one column family, or every one when `cf` is empty (ADR 0109).
+    Compact {
+        /// Which column family, or empty for all of them. `write` is where MVCC versions are,
+        /// and is what `esker bench --compact` has always meant.
+        cf: String,
+    },
 }
 
 impl AdminReq {
@@ -1020,6 +1044,8 @@ impl AdminReq {
             Self::Split { .. } => Method::AdminSplit,
             Self::TransferLeader { .. } => Method::AdminTransferLeader,
             Self::Regions => Method::AdminRegions,
+            Self::Flush => Method::AdminFlush,
+            Self::Compact { .. } => Method::AdminCompact,
         }
     }
 
@@ -1039,7 +1065,8 @@ impl AdminReq {
                 out.put_varint(*region_id);
                 out.put_varint(*to_peer_id);
             }
-            Self::Regions => {}
+            Self::Regions | Self::Flush => {}
+            Self::Compact { cf } => out.put_str(cf),
         }
     }
 
@@ -1054,6 +1081,10 @@ impl AdminReq {
                 to_peer_id: input.get_varint("admin.to_peer_id")?,
             },
             Method::AdminRegions => Self::Regions,
+            Method::AdminFlush => Self::Flush,
+            Method::AdminCompact => Self::Compact {
+                cf: input.get_str("admin.cf")?.to_owned(),
+            },
             other => {
                 return Err(DecodeError::invalid(
                     "method",
@@ -1268,6 +1299,55 @@ pub enum AdminResp {
         /// One entry per region, in key order.
         regions: Vec<RegionStatus>,
     },
+    /// Every SST this store holds, after a flush that has finished writing them
+    /// ([ADR 0109](../../../docs/adr/0109-an-operator-can-ask-a-store-to-flush-and-to-compact.md)).
+    Flushed {
+        /// One entry per column family, in the order the store holds them.
+        families: Vec<CfFiles>,
+    },
+    /// Every SST this store holds, after a compaction that has finished (ADR 0109).
+    ///
+    /// A separate variant from [`AdminResp::Flushed`] carrying the same shape, because
+    /// [`AdminResp::method`] answers which method a response belongs to and one variant cannot
+    /// answer two.
+    Compacted {
+        /// One entry per column family, in the order the store holds them.
+        families: Vec<CfFiles>,
+    },
+}
+
+/// The column families of an [`AdminResp::Flushed`] or [`AdminResp::Compacted`], which encode
+/// identically and so decode in one place.
+fn decode_families(input: &mut Decoder<'_>) -> Result<Vec<CfFiles>, DecodeError> {
+    let count = input.get_count("admin.families")?;
+    let mut families = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let cf = input.get_str("admin.cf")?.to_owned();
+        let files_count = input.get_count("admin.files")?;
+        let mut files = Vec::with_capacity(files_count.min(65_536));
+        for _ in 0..files_count {
+            let level = input.get_varint("admin.level")?;
+            let level = u32::try_from(level).map_err(|_| {
+                DecodeError::invalid("admin.level", format!("{level} is not a level"))
+            })?;
+            files.push((level, input.get_varint("admin.file")?));
+        }
+        families.push(CfFiles { cf, files });
+    }
+    Ok(families)
+}
+
+/// One column family's SSTs, as a store reports them to an operator (ADR 0109).
+///
+/// The **level** is carried and not only the count, because that is the distinction the
+/// measurement this exists for turns on: one file in L0 and one file in L1 are the difference
+/// between versions that are still all there and versions that were merged away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfFiles {
+    /// The column family's name.
+    pub cf: String,
+    /// Its files, as `(level, file number)`, in level order.
+    pub files: Vec<(u32, u64)>,
 }
 
 impl AdminResp {
@@ -1278,6 +1358,8 @@ impl AdminResp {
             Self::Split { .. } => Method::AdminSplit,
             Self::TransferLeader => Method::AdminTransferLeader,
             Self::Regions { .. } => Method::AdminRegions,
+            Self::Flushed { .. } => Method::AdminFlush,
+            Self::Compacted { .. } => Method::AdminCompact,
         }
     }
 
@@ -1296,6 +1378,17 @@ impl AdminResp {
                     out.put_bool(status.is_leader);
                     out.put_varint(status.approximate_size);
                     out.put_varint(status.applied_index);
+                }
+            }
+            Self::Flushed { families } | Self::Compacted { families } => {
+                out.put_varint(families.len() as u64);
+                for family in families {
+                    out.put_str(&family.cf);
+                    out.put_varint(family.files.len() as u64);
+                    for (level, number) in &family.files {
+                        out.put_varint(u64::from(*level));
+                        out.put_varint(*number);
+                    }
                 }
             }
         }
@@ -1322,6 +1415,12 @@ impl AdminResp {
                 }
                 Self::Regions { regions }
             }
+            Method::AdminFlush => Self::Flushed {
+                families: decode_families(input)?,
+            },
+            Method::AdminCompact => Self::Compacted {
+                families: decode_families(input)?,
+            },
             other => {
                 return Err(DecodeError::invalid(
                     "method",
@@ -1592,9 +1691,11 @@ mod tests {
             let service = match method {
                 Method::Hello => SERVICE_SYSTEM,
                 Method::RaftBatch | Method::RaftSnapshot => crate::messages::SERVICE_RAFT,
-                Method::AdminSplit | Method::AdminTransferLeader | Method::AdminRegions => {
-                    SERVICE_ADMIN
-                }
+                Method::AdminSplit
+                | Method::AdminTransferLeader
+                | Method::AdminRegions
+                | Method::AdminFlush
+                | Method::AdminCompact => SERVICE_ADMIN,
                 Method::PdBootstrap
                 | Method::PdStoreHeartbeat
                 | Method::PdRegionHeartbeat
