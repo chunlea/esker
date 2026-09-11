@@ -137,7 +137,7 @@ impl LockInfo {
 /// once, and one refusal cannot describe many keys: reporting the first and making the client
 /// come back for the next costs a round trip per contended key, exactly when the client is
 /// already losing races. So a `Prewrite` answers **per key**, and a lock is one of the answers
-/// ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
+/// ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
 ///
 /// [`TxnStatus::Locked`] is therefore legal only in a `Prewrite` result. A `Commit` or a
 /// `Rollback` carrying one is a decoding error, the same way a `Rollback` in the `lock` column
@@ -463,7 +463,7 @@ pub enum TxnKvReq {
         keys: Vec<Bytes>,
     },
     /// Give **this** transaction's own locks on `keys` back, and leave it running
-    /// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+    /// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
     ///
     /// `ROLLBACK TO SAVEPOINT`, and the deadlock victim inside one: a real server releases a
     /// subtransaction's row locks when it aborts and keeps the transaction alive.
@@ -754,7 +754,7 @@ pub enum TxnKvResp {
     /// Per key rather than one verdict, because a batch can collide with several locks at once
     /// and reporting the first would cost a round trip per contended key — precisely when the
     /// client is already losing races
-    /// ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1). The client resolves
+    /// ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md) decision 1). The client resolves
     /// every reported lock and prewrites again; one round trip, however many keys collided.
     ///
     /// The whole batch is still one decision: if any key is refused, none is written. The list
@@ -1191,7 +1191,7 @@ mod tests {
 
     /// A `Prewrite` answers per key, so a batch that collides with several locks reports all
     /// of them — which is the whole reason this is a list
-    /// ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
+    /// ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
     #[test]
     fn a_prewrite_reports_every_lock_it_met() {
         let response = TxnKvResp::Prewrite {

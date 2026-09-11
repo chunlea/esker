@@ -1,6 +1,6 @@
 //! Columnar placement at the heartbeat: PD acts on what a SQL node reported, and on nothing else.
 //!
-//! [ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 5. PD **cannot read** the
+//! [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5. PD **cannot read** the
 //! catalog setting these come from — it links neither `esker-sql` nor a client, and every method
 //! on its service is inbound — so a SQL node reports key ranges and PD schedules from the report.
 //!

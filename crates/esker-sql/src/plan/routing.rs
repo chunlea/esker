@@ -1,6 +1,6 @@
 //! Which engine a query runs on, and why.
 //!
-//! [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 2, milestone 4;
+//! [ADR 0022](../../../../docs/adr/0022-columnar-learner-replica.md) Decision 2, milestone 4;
 //! `docs/plans/phase-10-routing.md` U2. Everything in this module is **pure**: it decides against a
 //! [`Shape`] and a [`Setting`] and touches no catalog, no network and no clock, so the rule can be
 //! tested as a table rather than against a cluster. Building the fragment, asking for it and

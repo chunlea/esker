@@ -1,6 +1,6 @@
 //! The real [`super::RowDecoder`]: a stored row into typed columns.
 //!
-//! [ADR 0030](../../../../docs/adr/0030-the-row-value-codec-moves-down.md) moved the row value
+//! [ADR 0030](../../../../docs/adr/0030-the-row-codec-moves-down.md) moved the row value
 //! codec down into `esker-keys`, which is what makes this possible at all: the store can decode a
 //! stored row without linking `esker-sql`, which sits *above* it. Until that landed this trait had
 //! only a test double (`docs/plans/phase-8-learner.md`, RULED-1).

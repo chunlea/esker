@@ -230,6 +230,12 @@ pub fn classify(error: &ProtoError) -> Verdict {
         }),
         ProtoError::RegionNotFound { .. } => Verdict::Retry(Redirect::Refresh),
         ProtoError::ServerIsBusy { .. } => Verdict::Retry(Redirect::Busy),
+        // **The store this attempt was routed to could not be reached**, and the request never
+        // left this process, so re-sending it is safe for a write as well as a read. Forgetting
+        // the leader is the repair: a store that is not answering is certainly not leading, and an
+        // unknown leader routes to a peer chosen by the attempt number — so the next try asks a
+        // different one rather than the same corpse (`Route::target_at`).
+        ProtoError::NotSent { .. } => Verdict::Retry(Redirect::Leader { hint: None }),
         // `KeyNotInRegion` lands here: this client's routing is wrong, and no amount of
         // waiting fixes that. The caller sees it; the cache entry that produced it is dropped
         // by the call site so the next attempt starts from the resolver rather than the same
@@ -425,7 +431,6 @@ mod tests {
             ProtoError::Locked {
                 lock_info: bytes::Bytes::from_static(b"lock"),
             },
-            ProtoError::not_sent("connection refused"),
             ProtoError::Closed {
                 detail: "reset".to_owned(),
             },
@@ -436,6 +441,35 @@ mod tests {
         for error in &others {
             assert_eq!(classify(error), Verdict::Surface, "{error:?} was retried");
         }
+    }
+
+    /// **`NotSent` is retried, and the repair is to stop believing in the leader.**
+    ///
+    /// It was in the list above until run 124 showed what that cost: a leader-store kill refused
+    /// 184 statements in 0.695 s, with a largest gap of 367 ms — no budget spent, because the set
+    /// had no entry for *"the store I was routed to is not reachable"*. Re-sending is safe for a
+    /// write as well as a read: the request never left the process.
+    #[test]
+    fn a_request_that_never_left_is_retried_somewhere_else() {
+        assert_eq!(
+            classify(&ProtoError::not_sent("connection refused")),
+            Verdict::Retry(Redirect::Leader { hint: None }),
+            "a store that is not answering is certainly not leading"
+        );
+    }
+
+    /// And the one it must **not** take with it. `Closed` says the request went out and the answer
+    /// was lost, so a write may have committed; a read in that position is re-asked by
+    /// `may_ask_again`, which needs the method and therefore cannot live in `classify`.
+    #[test]
+    fn a_lost_answer_is_still_not_retried_by_the_classifier() {
+        assert_eq!(
+            classify(&ProtoError::Closed {
+                detail: "reset".to_owned(),
+            }),
+            Verdict::Surface,
+            "an ambiguous outcome must not be re-sent on the strength of the error alone"
+        );
     }
 
     /// The protocol crate owns the retryable set; this module owns the repair for each one.

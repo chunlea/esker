@@ -73,7 +73,7 @@ pub const DEFAULT_SCAN_REGIONS: u32 = 128;
 pub const MAX_SCAN_REGIONS: u32 = 1024;
 
 /// How long a SQL node may serve **writes** from a cached schema before asking PD again
-/// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md), ADR 0020 as amended).
+/// ([ADR 0028](../../../../docs/adr/0028-the-schema-lease.md), ADR 0020 as amended).
 ///
 /// Writes only. A reader's snapshot already agrees with the rows it can see, so gating reads would
 /// add stalls and close no hole — and a node that cannot renew must **stop writing**, which is what
@@ -320,14 +320,14 @@ pub struct Pd {
     db: Arc<Db>,
     clock: Arc<dyn Clock>,
     /// The replicated state machine every durable write goes through
-    /// ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
+    /// ([ADR 0059](../../../../docs/adr/0059-pd-is-a-raft-group.md)).
     machine: Arc<Machine>,
     /// The Raft group underneath. Dropped last, which joins its thread.
     driver: PdDriver,
     /// The group this member believes it is in, and what that group is called.
     ///
     /// **It moves**, which is what dynamic membership means
-    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)):
+    /// ([ADR 0061](../../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)):
     /// a conf change appended to the log rewrites it, at append, before the messages of that same
     /// `Ready` go out. The lock is its own, taken briefly and never across a propose — the same
     /// rule the applied state follows and for the same reason ([`crate::driver`]).
@@ -424,7 +424,7 @@ impl Pd {
         // Two families, one WAL: the records in `default` and the Raft log in `raft`, so an apply
         // writes the record and the apply index in one atomic batch. A 4a directory has no `raft`
         // family and gains one here; nothing else about it changes
-        // ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
+        // ([ADR 0059](../../../../docs/adr/0059-pd-is-a-raft-group.md)).
         let db = Db::open_with(
             path,
             options.engine.clone(),
@@ -448,7 +448,7 @@ impl Pd {
         // **Who this member is with, and what the group is called.** The record wins over the
         // command line, which is `esker-raft`'s own rule for membership — after a membership change
         // `--peers` is exactly the stale thing that rule is about
-        // ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+        // ([ADR 0061](../../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
         let members = settle_membership(&mut log, &options.members, &db)?;
         let applied = log.applied_index();
 
@@ -585,12 +585,12 @@ impl Pd {
     /// **Not leader-only, and not cluster-checked.** Consensus is how a member becomes the
     /// leader, so refusing this on a follower would refuse the only traffic that can end an
     /// election; and the cluster id cannot guard it, because the group elects before `Bootstrap`
-    /// has minted one ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
+    /// has minted one ([ADR 0059](../../../../docs/adr/0059-pd-is-a-raft-group.md)).
     ///
     /// The **group id** is the guard instead, and it is the one this method exists to check. Two
     /// clusters' placement drivers pointed at each other by a stale flag would otherwise form one
     /// group and replicate one cluster's routing table over the other's, which is the mistake
-    /// [ADR 0011](../../../docs/adr/0011-pd-service-and-the-cluster-id.md) was written about with
+    /// [ADR 0011](../../../../docs/adr/0011-pd-service-and-the-cluster-id.md) was written about with
     /// a worse consequence.
     pub fn step_raft(&self, batch: &PdRaftBatch) -> Result<()> {
         let members = self.member_list();
@@ -696,7 +696,7 @@ impl Pd {
     /// configuration is in force from then, not from when it commits — and the entry that made the
     /// quorum three needs three to commit, while two are live and the new one has an empty log. A
     /// learner is not counted in a quorum, so it commits, catches up, and *then* counts
-    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
+    /// ([ADR 0061](../../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)
     /// §11.4).
     pub fn add_member(&self, id: NodeId, address: &str) -> Result<bool> {
         if id == 0 {
@@ -864,7 +864,7 @@ impl Pd {
             state.alloc.allocate(2, |end| reserve(driver, end))?
         };
         // Minted here rather than at apply, so that three members do not mint three
-        // ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)). Ignored by an apply that
+        // ([ADR 0059](../../../../docs/adr/0059-pd-is-a-raft-group.md)). Ignored by an apply that
         // finds a cluster already there.
         let cluster_id = mint_cluster_id(now_ms, store_id, address);
         drop(state);
@@ -926,7 +926,7 @@ impl Pd {
     ///
     /// Read out of applied state rather than out of `Pd`'s own, because the wishes are replicated:
     /// PD cannot re-derive them from any heartbeat, so they go through the log like every other
-    /// record ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
+    /// record ([ADR 0059](../../../../docs/adr/0059-pd-is-a-raft-group.md)).
     pub(crate) fn columnar_wanted_for(&self, start: &[u8], end: &[u8]) -> u8 {
         self.applied()
             .map_or(0, |applied| applied.columnar.wanted_for(start, end))
@@ -941,7 +941,7 @@ impl Pd {
     }
 
     /// The schema lease and the step arithmetic derived from it
-    /// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md)).
+    /// ([ADR 0028](../../../../docs/adr/0028-the-schema-lease.md)).
     ///
     /// Infallible and stateless today: three published numbers and one addition. It is a method on
     /// [`Pd`] rather than a free function because that is where it will read a *configured*
@@ -1073,7 +1073,7 @@ impl Pd {
         // proposed would be deciding against a state the log may have moved past by the time the
         // entry lands; letting the log's order settle which beat is newer is what the guard means,
         // and under Raft the log's order is the same on every member
-        // ([`crate::machine`], [ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
+        // ([`crate::machine`], [ADR 0059](../../../../docs/adr/0059-pd-is-a-raft-group.md)).
         let serving = self.leading()?;
         let record = RegionRecord {
             region: beat.region.clone(),
@@ -1137,7 +1137,7 @@ impl Pd {
     ///
     /// **The one thing `esker pd inspect` cannot show.** That command opens a *stopped* PD's
     /// database, and the in-flight set is deliberately not in it
-    /// ([ADR 0013](../../../docs/adr/0013-repair-operators-are-requests-not-commands.md)): a
+    /// ([ADR 0013](../../../../docs/adr/0013-repair-operators-are-requests-not-commands.md)): a
     /// restart forgets every operator and re-derives what is needed from the next round of
     /// heartbeats. So the only way to see one is to ask the running process, which is what
     /// `PdReq::Status` is for.
@@ -1213,7 +1213,7 @@ impl Pd {
     /// * **Rebuild on a new term.** A member that has just taken office reloads its allocator and
     ///   its oracle from what it has *applied* — `allocated_end + 1` and `max(clock, mark)` — which
     ///   is the same pair of constructors a restart uses, because a failover is a restart that
-    ///   kept its socket ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
+    ///   kept its socket ([ADR 0059](../../../../docs/adr/0059-pd-is-a-raft-group.md)).
     fn leading(&self) -> Result<std::sync::MutexGuard<'_, State>> {
         let office = self.driver.leadership();
         if !office.serving {
@@ -1314,7 +1314,7 @@ fn unreachable_stale(beat: &RegionBeat) -> RegionRecord {
 /// Commits the oracle's mark. Called *before* a timestamp at or above it is handed out.
 ///
 /// "Durable" now means "applied", and the difference is the whole of
-/// [ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md): this returns only once the entry has
+/// [ADR 0059](../../../../docs/adr/0059-pd-is-a-raft-group.md): this returns only once the entry has
 /// committed and this member has applied it, so a leader that has quietly lost office fails here
 /// rather than handing out a timestamp its successor will hand out again.
 fn commit_tso(driver: &PdDriver, high_water_ms: u64) -> Result<()> {

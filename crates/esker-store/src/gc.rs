@@ -1,5 +1,5 @@
 //! Garbage collection: which MVCC versions have outlived their usefulness
-//! (`docs/txn-spec.md` §7, [ADR 0021](../../docs/adr/0021-time-machine.md)).
+//! (`docs/txn-spec.md` §7, [ADR 0021](../../../docs/adr/0021-time-machine.md)).
 //!
 //! # The safepoint is a retention policy, not a number
 //!
@@ -47,7 +47,7 @@ use crate::error::engine_to_proto;
 /// A retention of `u64::MAX` means **keep everything, for ever**.
 ///
 /// A sentinel and not a duration: subtracting it from a safepoint underflows, and the rule it
-/// stands for is "collect nothing for this table" ([ADR 0021](../../docs/adr/0021-time-machine.md)).
+/// stands for is "collect nothing for this table" ([ADR 0021](../../../docs/adr/0021-time-machine.md)).
 pub const RETENTION_FOREVER: u64 = u64::MAX;
 
 /// The retention window a cluster has when nothing has set one, in milliseconds: ten minutes.
@@ -55,7 +55,7 @@ pub const RETENTION_FOREVER: u64 = u64::MAX;
 /// Long enough that an ordinary transaction and an ordinary reader are never inside it, short
 /// enough that a cluster nobody has configured does not keep every version it has ever written.
 /// A cluster that has set one takes that instead — an absent record is *unconfigured*, not zero
-/// ([ADR 0021](../../docs/adr/0021-time-machine.md)).
+/// ([ADR 0021](../../../docs/adr/0021-time-machine.md)).
 pub const DEFAULT_RETENTION_MS: u64 = 10 * 60 * 1_000;
 
 /// The catalog's format version for a retention record.
@@ -68,7 +68,7 @@ const TSO_LOGICAL_BITS: u32 = esker_txn::TSO_LOGICAL_BITS;
 /// How long each table keeps its old versions.
 ///
 /// Loaded from the catalog's own records, which `esker-sql` writes and this crate only reads
-/// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 4):
+/// ([ADR 0021](../../../docs/adr/0021-time-machine.md) decision 4):
 ///
 /// ```text
 /// 'm' ++ "sql" ++ 'd'                          the cluster default

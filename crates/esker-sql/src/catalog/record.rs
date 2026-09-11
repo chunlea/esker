@@ -78,7 +78,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// missing value, and the schema state on every column and index (ADR 0020,
 /// `docs/plans/phase-6e.md` §4). Version 4 added a column's **typmod** — the length of a
 /// `varchar(n)` or `character(n)` and the precision of a `timestamp(p)` — which
-/// [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md) named as the one version bump
+/// [ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md) named as the one version bump
 /// tier 1 owes. A version 3 column reads back `-1`, which is what a column declared without a
 /// number means, and is what every column a version 3 catalog could hold was.
 ///
@@ -216,7 +216,7 @@ const TAG_BOOL: u8 = 3;
 const TAG_BYTEA: u8 = 4;
 const TAG_TIMESTAMPTZ: u8 = 5;
 const TAG_DOUBLE: u8 = 6;
-/// Appended by [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), never
+/// Appended by [ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md), never
 /// renumbered: a record written before it has no tag above 6 and decodes unchanged.
 const TAG_INT4: u8 = 7;
 /// Appended by ADR 0033 with `varchar`; a record written before it has no tag above 7.
@@ -230,7 +230,7 @@ const TAG_REAL: u8 = 11;
 /// `character(n)`, whose internal name is `bpchar`. Version 4's type, and the reason version 4
 /// exists: it is the one type that cannot be declared without a typmod.
 const TAG_BPCHAR: u8 = 12;
-/// `json`, tier 2's first type ([ADR 0042](../../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)).
+/// `json`, tier 2's first type ([ADR 0042](../../../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)).
 const TAG_JSON: u8 = 13;
 /// `jsonb`, its canonicalising twin.
 const TAG_JSONB: u8 = 14;
@@ -317,7 +317,7 @@ const TAG_TSVECTOR: u8 = 84;
 const TAG_TSQUERY: u8 = 85;
 const TAG_TSVECTOR_ARRAY: u8 = 86;
 const TAG_TSQUERY_ARRAY: u8 = 87;
-/// `regtype` and its array ([ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
+/// `regtype` and its array ([ADR 0077](../../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
 ///
 /// **This file's own next free numbers**, which are one below `esker_keys::columnar`'s for the same
 /// two types — that offset is not new, it has held since `citext` (28 here, 29 there), and each
@@ -889,7 +889,7 @@ pub(super) fn layout_key() -> Vec<u8> {
 /// | version | what changed |
 /// |---|---|
 /// | 1 | everything before the marker existed: an index's name record was keyed on its bare name |
-/// | 2 | an index's name record is keyed by its schema ([ADR 0080](../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)) |
+/// | 2 | an index's name record is keyed by its schema ([ADR 0080](../../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)) |
 ///
 /// There is no upgrade path by decision: existing databases are disposable, so an older one is
 /// refused with a sentence naming the change rather than read into a catalog whose indexes are
@@ -2388,7 +2388,7 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     // Version 34. The **operator class** of each key part, seventeenth section and on the end for
     // the same reason: an index written before 34 reads back with none, which is what every index
     // a version 33 catalog could hold had — an operator class was parsed and thrown away until
-    // [ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md).
+    // [ADR 0070](../../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md).
     // An empty string is "the type's default", and the parser cannot produce an empty class name,
     // so the two cannot be confused — the rule the predicate and the expression sections follow.
     for index in &table.indexes {
@@ -2401,7 +2401,7 @@ pub(super) fn encode_table(table: &TableDef) -> Result<Vec<u8>> {
     // Version 35. Each column's **collation**, eighteenth section and on the end for the reason
     // every other one is: a column written before 35 reads back with none, which is what every
     // column a version 34 catalog could hold had — the word was refused
-    // ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)). An
+    // ([ADR 0076](../../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)). An
     // empty string is "the type's own", and no collation name is empty, so the two cannot be
     // confused.
     for column in &table.columns {

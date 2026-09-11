@@ -3,7 +3,7 @@
 //! The codec itself is [`esker_keys::row`]. It moved there so that a layer below `esker-sql` can
 //! read a stored row without inverting the dependency: `esker-store` has to turn a committed row
 //! into typed columns for a columnar learner, and `esker-sql` sits above it
-//! ([ADR 0029](../../docs/adr/0030-the-row-codec-moves-down.md)).
+//! ([ADR 0029](../../../docs/adr/0030-the-row-codec-moves-down.md)).
 //!
 //! What stays here is what a row *means* in SQL rather than what its bytes are: the error
 //! mapping, and the property tests that need PostgreSQL's ordering to state at all.

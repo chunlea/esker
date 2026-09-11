@@ -39,7 +39,7 @@
 //!   different answer from `42704` and means a different thing.
 //! * `esker.engine` is **this node's own** and is honoured in the strongest sense in this table: it
 //!   decides which engine a query runs on, and `EXPLAIN` names what it decided
-//!   ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 2). A real server
+//!   ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 2). A real server
 //!   accepts every value for it, because it validates no custom parameter at all; this one refuses
 //!   anything but `row`, `columnar` and `auto`, which is the same direction every other row here
 //!   takes.
@@ -214,7 +214,7 @@ pub const PARAMETERS: &[Parameter] = &[
     // `SET TRANSACTION ISOLATION LEVEL`, `BEGIN ISOLATION LEVEL …` and the session default are
     // four spellings of one value, and modelling it here gives all four the same machinery — the
     // block's save-and-restore included, so a level set inside a transaction ends with it, which
-    // is what a real server does ([ADR 0057](../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    // is what a real server does ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
     //
     // `read uncommitted` is accepted and served as `read committed`, which is what PostgreSQL
     // itself does — it has no weaker level.

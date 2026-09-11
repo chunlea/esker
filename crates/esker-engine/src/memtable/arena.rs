@@ -1,4 +1,4 @@
-//! The bump-allocated backing store for the skiplist ([ADR 0041](../../../docs/adr/0041-the-in-house-arena-skiplist.md)).
+//! The bump-allocated backing store for the skiplist ([ADR 0041](../../../../docs/adr/0041-the-in-house-arena-skiplist.md)).
 //!
 //! Everything a memtable holds — key bytes, value bytes, node headers and forward pointers —
 //! lives here, addressed by a `u32` offset rather than a pointer. Nothing is ever freed until

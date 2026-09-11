@@ -30,7 +30,7 @@ mod parity;
 /// What this node answers differently, and why. **All four are one root**: a relation's identity
 /// here is `esker-catalog`'s 64-bit id, and the catalog's own relations carry synthetic ids near
 /// `i64::MAX` rather than PostgreSQL's small fixed oids (1259 for `pg_class`, 1247 for `pg_type`).
-/// [ADR 0097](../../../docs/adr/0097-an-oid-is-a-type-and-a-relation-id-is-not-one.md) decided to
+/// [ADR 0097](../../../docs/adr/0097-an-oid-is-four-bytes-and-a-derived-one-is-not.md) decided to
 /// keep the width; these are what it costs, and every one of them is about a *catalog* relation.
 /// The same statements over a user relation agree, which is why they are in the corpus rather than
 /// only in this list.

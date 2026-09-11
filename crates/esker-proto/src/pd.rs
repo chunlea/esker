@@ -137,7 +137,7 @@ pub enum Operator {
 
     /// Add a replica of `region_id` on `store_id` that **stays** a learner.
     ///
-    /// [ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 1: a columnar replica
+    /// [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 1: a columnar replica
     /// is a Raft learner whose apply writes columns instead of rows, and it is never promoted.
     ///
     /// **This is not a new membership concept.** The peer it asks for is an ordinary
@@ -150,7 +150,7 @@ pub enum Operator {
     /// stopped at a learner is finished.
     ///
     /// A separate kind byte rather than a field on `AddPeer`, so no existing operator's bytes
-    /// move — the same additive shape [ADR 0028](../../docs/adr/0028-the-schema-lease.md) chose
+    /// move — the same additive shape [ADR 0028](../../../docs/adr/0028-the-schema-lease.md) chose
     /// for the schema lease, and for the same reason.
     AddLearner {
         /// The region to grow.
@@ -356,7 +356,7 @@ impl OperatorProgress {
 /// One operator PD has in flight right now.
 ///
 /// The in-flight set is **memory** and dies with the process
-/// ([ADR 0013](../../docs/adr/0013-repair-operators-are-requests-not-commands.md)), which is why
+/// ([ADR 0013](../../../docs/adr/0013-repair-operators-are-requests-not-commands.md)), which is why
 /// `esker pd inspect` — which opens a *stopped* PD's database — cannot show it and why this
 /// exists. The region id is not a field: it is [`Operator::region_id`], and duplicating it would
 /// make a disagreement between the two expressible.
@@ -437,7 +437,7 @@ pub enum PdRole {
     /// The state a member added at run time passes through, and the one an operator most wants to
     /// see: an `add` that has stalled looks exactly like a group of the right size until you can
     /// tell which of them is still a learner
-    /// ([ADR 0061](../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
     Learner = 2,
     /// Known by address, and in no configuration this member holds.
     ///
@@ -595,14 +595,14 @@ fn decode_membership(input: &mut Decoder<'_>) -> Result<PdMembership, DecodeErro
 /// A tick's worth of Raft messages between two **placement drivers**.
 ///
 /// The placement driver replicates itself with `esker-raft`
-/// ([ADR 0059](../../docs/adr/0059-pd-is-a-raft-group.md)), so it needs a transport of its own —
+/// ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)), so it needs a transport of its own —
 /// and it needs *less* than a store's. [`crate::RaftMessage`] wraps every message in a region id,
 /// an epoch and the store the sender is on, because a store holds many groups and a receiver has
 /// to know which. A placement driver holds exactly one group, and that group is not a region, so
 /// none of that routing exists to carry.
 ///
 /// What replaces it is the **group id**, and it is not decoration. The cluster id of
-/// [ADR 0011](../../docs/adr/0011-pd-service-and-the-cluster-id.md) cannot guard this traffic,
+/// [ADR 0011](../../../docs/adr/0011-pd-service-and-the-cluster-id.md) cannot guard this traffic,
 /// because the group has to elect a leader *before* `Bootstrap` — itself a log entry — has minted
 /// one. So the group is identified by the set of its members, and a member refuses a batch that
 /// does not carry its own: two clusters' placement drivers pointed at each other by a stale flag
@@ -747,7 +747,7 @@ pub enum PdReq {
     },
 
     /// How long a node may act on a cached schema before it must ask again
-    /// ([ADR 0028](../../docs/adr/0028-the-schema-lease.md)).
+    /// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md)).
     ///
     /// Asked by a SQL node, which is the first thing above the store that is neither a store nor a
     /// region and therefore has nothing else to say to PD. It carries no arguments: the answer is
@@ -756,7 +756,7 @@ pub enum PdReq {
 
     /// **The whole** set of key ranges that want columnar replicas, as one SQL node sees them.
     ///
-    /// [ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 5. PD acts on the
+    /// [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5. PD acts on the
     /// per-table columnar setting, and **cannot read it**: the setting lives in the catalog, in
     /// the cluster's own key space, and PD links neither `esker-sql` nor a client — every method
     /// on this service is inbound, so PD is told things and asks for nothing. So the SQL node
@@ -1464,7 +1464,7 @@ impl PdChannel {
     }
 
     /// How long this node may act on a cached schema before asking again, and the step arithmetic
-    /// that depends on it ([ADR 0028](../../docs/adr/0028-the-schema-lease.md)).
+    /// that depends on it ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md)).
     ///
     /// A SQL node calls this when its lease is running out. **Not being able to call it is the
     /// point**: a node that cannot reach PD holds no lease, and a node holding no lease refuses to
@@ -1519,7 +1519,7 @@ impl PdChannel {
     ///
     /// Answered by **any** member, which is what a client refreshing a stale endpoint list needs:
     /// it is asking precisely because the one it reached was not the leader
-    /// ([ADR 0061](../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
     pub async fn members(&self) -> Result<PdMembership, ProtoError> {
         match self.call(PdReq::Members).await? {
             PdResp::Members(membership) => Ok(membership),

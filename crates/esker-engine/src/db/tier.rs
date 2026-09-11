@@ -6,7 +6,7 @@
 //!
 //! # Why a thread of its own
 //!
-//! [ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) decision 1: an upload is
+//! [ADR 0024](../../../../docs/adr/0024-tiering-failure-semantics.md) decision 1: an upload is
 //! never awaited by a flush, a compaction, or a foreground write. It is not enough to run
 //! uploads *after* a flush's edit on the flush thread — the next memtable's flush would then
 //! wait behind them, L0 would climb, and a slow bucket would become a write stall by a longer

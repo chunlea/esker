@@ -136,7 +136,7 @@ pub enum CatalogView {
     ///
     /// A real server has six. These three are the ones this node's own `pg_class.relam` can point
     /// at — a `CREATE INDEX` may be declared `USING gin` or `USING gist` and is *recorded* as
-    /// such ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)),
+    /// such ([ADR 0070](../../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)),
     /// and an `EXCLUDE` constraint records `gist` — and a row for a method nothing can be built
     /// with would be a claim rather than a report. Declared: `hash`, `spgist` and `brin` are on a
     /// real server and not here, and `USING` one of them is still refused.
@@ -147,7 +147,7 @@ pub enum CatalogView {
     /// than a report. These four are the ones `crate::catalog::OPERATOR_CLASSES` accepts —
     /// `gin_trgm_ops`, `gist_trgm_ops`, `text_pattern_ops` and `varchar_pattern_ops` — and each
     /// is *recorded* on the index that names it while the index underneath stays the ordered one
-    /// ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
+    /// ([ADR 0070](../../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
     /// A real server has hundreds, and the `hash` halves of the two `_pattern_ops` are among the
     /// ones missing here because `USING hash` is refused.
     PgOpclass,
@@ -200,7 +200,7 @@ pub enum CatalogView {
     /// has gone away, and the whole view was `42P01` here until now. A real server's is
     /// cluster-wide — one row per backend, in every database — and this node has no registry of
     /// live sessions to build that from (the debt [ADR
-    /// 0052](../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md)
+    /// 0052](../../../../docs/adr/0052-a-database-is-a-tenant-and-the-directory-that-names-them.md)
     /// names for `DROP DATABASE` is the same missing thing), so it reports the backend that is
     /// asking. That row is **true**: it is `active`, because it is running the query that reads
     /// the view, and its `datname` is the database it is serving.
@@ -2564,7 +2564,7 @@ fn pg_cast_rows() -> Vec<Vec<Datum>> {
 ///
 /// All three are the **same ordering** — byte order, which is what a memcomparable key gives — and
 /// that is why they can be reported honestly
-/// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)). A real
+/// ([ADR 0076](../../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)). A real
 /// server numbers them 950, 951 and 100, and `ActiveRecord` reads the name off this view by
 /// joining `a.attcollation = c.oid`, so the oids have to be PostgreSQL's or the join finds nothing.
 ///
@@ -2675,7 +2675,7 @@ fn pg_sequence_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> 
             Datum::Int8(max),
             Datum::Int8(min),
             // `CACHE 1`: a block is reserved by the node and not by the sequence
-            // ([ADR 0072](../../../docs/adr/0072-a-sequence-block-belongs-to-the-node-not-to-the-connection.md)),
+            // ([ADR 0072](../../../../docs/adr/0072-a-sequence-block-belongs-to-the-node-not-to-the-connection.md)),
             // so nothing here caches and a client reading this is told so.
             Datum::Int8(1),
             Datum::Bool(false),
@@ -2799,7 +2799,7 @@ fn pg_type_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
                 // column that named no collation inherits this number, so
                 // `a.attcollation <> t.typcollation` is false for it and the join yields NULL,
                 // while a column that named `C` carries 950 and is reported
-                // ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+                // ([ADR 0076](../../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
                 //
                 // Leaving this at `0` while `attcollation` answered `100` made every plain `text`
                 // column report the collation `default`, which is the wrong half of the same
@@ -3723,7 +3723,7 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
 /// was missing: a `typelem` naming an absent row is what `array_delimiter.rs::no_typarray_dangles`
 /// forbids one column over, so the gap was the honest answer and stopped being one the day
 /// `"char"` arrived (ADR 0095). `name`'s own array (`_name`, 1003) was the same gap and closed
-/// first ([ADR 0086](../../../docs/adr/0086-a-folded-cast-keeps-the-type-it-named.md)).
+/// first ([ADR 0086](../../../../docs/adr/0086-a-folded-cast-keeps-the-type-it-named.md)).
 fn typelem(ty: ColumnType) -> i64 {
     if let Some(element) = ArrayValue::element_of(ty) {
         return i64::from(element.oid());

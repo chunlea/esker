@@ -1,5 +1,5 @@
 //! Differential and concurrency tests for the arena skiplist
-//! ([ADR 0041](../../../docs/adr/0041-the-in-house-arena-skiplist.md) test plan items 2 and 3).
+//! ([ADR 0041](../../../../docs/adr/0041-the-in-house-arena-skiplist.md) test plan items 2 and 3).
 //!
 //! # The model does not share the order it is checking
 //!

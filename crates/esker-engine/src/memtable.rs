@@ -1,7 +1,7 @@
 //! The in-memory half of the log-structured design: a sorted map of internal keys.
 //!
 //! Every write lands here after its bytes are in the log, and stays until the memtable is
-//! flushed to an SST. Since [ADR 0041](../../docs/adr/0041-the-in-house-arena-skiplist.md) it is
+//! flushed to an SST. Since [ADR 0041](../../../docs/adr/0041-the-in-house-arena-skiplist.md) it is
 //! an in-house arena skiplist — `skiplist::SkipList`. It was `crossbeam-skiplist`, the last
 //! piece of concurrent code the project bought rather than wrote; that dependency is gone, and
 //! with it three crates from the runtime budget.
@@ -80,7 +80,7 @@ pub enum Lookup {
         ///
         /// The caller needs it to ask whether a range tombstone from this source or a newer
         /// one hides it: a tombstone hides an entry only when it is strictly newer
-        /// ([ADR 0017](../../docs/adr/0017-range-tombstones.md)).
+        /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
         seqno: SeqNo,
     },
     /// The newest visible entry is a tombstone. The key does not exist at this snapshot.
@@ -92,7 +92,7 @@ pub enum Lookup {
 ///
 /// The tombstones sit *beside* the map rather than in it, because a range delete hides keys
 /// that are not in the map and keys that do not exist yet
-/// ([ADR 0017](../../docs/adr/0017-range-tombstones.md)). Behind a `Mutex` and not a skiplist
+/// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)). Behind a `Mutex` and not a skiplist
 /// because there are very few of them — a range delete is an administrative act, not something
 /// a write path emits per key — and because a reader takes a whole snapshot of them at once
 /// rather than seeking within them.
@@ -256,7 +256,7 @@ impl MemTable {
                 seqno,
             }),
             // `DeleteRange` never reaches the map — `add_range` puts it in the tombstone list
-            // instead ([ADR 0017](../../docs/adr/0017-range-tombstones.md)). A tag saying
+            // instead ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)). A tag saying
             // otherwise is memory corruption; reading it as a point delete is the safe way to
             // be wrong, because it hides a key rather than resurrecting one.
             Some((_, _, EntryKind::Delete | EntryKind::DeleteRange)) => Some(Lookup::Deleted),
@@ -281,7 +281,7 @@ impl MemTable {
     /// A table holding only `delete_range` entries has an empty map and is not empty: the
     /// flush path uses this to decide whether there is anything to write, and answering "yes,
     /// empty" would drop the deletes on the floor at the next memtable switch
-    /// ([ADR 0017](../../docs/adr/0017-range-tombstones.md)).
+    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
     pub fn is_empty(&self) -> bool {
         self.store().len() == 0 && !self.has_range_tombstones()
     }
@@ -312,7 +312,7 @@ impl MemTable {
 /// by the `MemTable` the `Arc` keeps alive, which is the whole lifetime argument: the borrow
 /// cannot outlive the bytes because it cannot outlive the table.
 ///
-/// That is what [ADR 0041](../../docs/adr/0041-the-in-house-arena-skiplist.md) was for.
+/// That is what [ADR 0041](../../../docs/adr/0041-the-in-house-arena-skiplist.md) was for.
 /// `crossbeam-skiplist` handed out entries that borrow the map, so a cursor built from one would
 /// have been self-referential; its position was a copy of the entry and every step re-found the
 /// key, which is `O(log n)` and an allocation.

@@ -198,7 +198,7 @@ proptest! {
 
     /// A table key decodes back to the ids that built it, whatever they are — and the decoder
     /// is what the garbage collector looks a retention window up by
-    /// ([ADR 0021](../../docs/adr/0021-time-machine.md)), so a wrong answer would apply one
+    /// ([ADR 0021](../../../docs/adr/0021-time-machine.md)), so a wrong answer would apply one
     /// table's retention to another's rows.
     #[test]
     fn table_keys_decode_back_to_their_ids(

@@ -1,6 +1,6 @@
 //! `FLASHBACK` — putting a table back, without unwriting anything.
 //!
-//! [ADR 0021](../../../docs/adr/0021-time-machine.md) Decision 3's fourth verb, deferred from phase
+//! [ADR 0021](../../../../docs/adr/0021-time-machine.md) Decision 3's fourth verb, deferred from phase
 //! 6d for exactly the batching-with-a-durable-cursor machinery
 //! [`crate::exec::job`] built (`docs/plans/phase-6e.md` unit 7).
 //!

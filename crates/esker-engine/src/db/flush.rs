@@ -46,7 +46,7 @@ use super::{ColumnFamily, Db, DbInner, MemState, lock, read_lock, write_lock};
 /// `Version::overlapping` and the read path's `covers` pick files by these bounds, so a
 /// tombstone reaching outside them would be invisible to the reads that need it — and the
 /// failure would be silent, the read taking a value from a lower level with nothing reporting
-/// an error ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 3).
+/// an error ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md) decision 3).
 ///
 /// The bounds are **internal** keys and a tombstone's are user keys, so each end is given the
 /// tag that makes it sort outside every real entry for the same user key: the largest possible
@@ -437,7 +437,7 @@ impl DbInner {
 
         // The ranges deleted while this table was active. They go with it: a flush is the
         // only way a tombstone reaches an SST, because a compaction discharges them rather
-        // than propagating them ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)
+        // than propagating them ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)
         // decision 6).
         let tombstones = table.range_tombstones();
 
@@ -469,7 +469,7 @@ impl DbInner {
         // The file's bounds are widened to span its tombstones, in internal-key space, because
         // `Version::overlapping` and the read path's `covers` pick files by these — and a
         // tombstone reaching outside them would be invisible to exactly the reads that need
-        // it, silently ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 3).
+        // it, silently ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md) decision 3).
         let (smallest, largest) = widen(&self.comparator, smallest, largest, &tombstones);
         Ok(Some(FileMeta {
             number,

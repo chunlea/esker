@@ -495,7 +495,7 @@ fn reclaim_interrupted_retirements(store: &Arc<Store>) -> Result<()> {
 /// because the two differ in the direction that matters: an unreadable catalog should make the
 /// collector keep *more* than it would have, never less. It is re-read on every safepoint, not
 /// cached, because a `retention` DDL writes a record and bumps no version — deliberately
-/// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 4) — so the collector's own next
+/// ([ADR 0021](../../../docs/adr/0021-time-machine.md) decision 4) — so the collector's own next
 /// pass is where a change is meant to be noticed.
 fn load_retention(db: &Db, collector: &MvccCollector) {
     match RetentionPolicy::load(db, DEFAULT_RETENTION_MS) {
@@ -3262,7 +3262,7 @@ impl Store {
     }
 
     /// Clears one chunk of a dropped database's key range, and says how far it got
-    /// ([ADR 0069](../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
+    /// ([ADR 0069](../../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
     ///
     /// # The record goes down before a byte comes out
     ///
@@ -3270,7 +3270,7 @@ impl Store {
     /// deleted, and the cursor advances after — so a crash re-clears a chunk that is already
     /// empty, which is a no-op. The other order would skip a chunk and leave its keys with nothing
     /// coming back for them, which is the leak
-    /// [ADR 0034](../../docs/adr/0034-a-removed-peer-is-swept-and-its-range-reclaimed.md) names.
+    /// [ADR 0034](../../../docs/adr/0034-a-removed-peer-is-swept-and-its-range-reclaimed.md) names.
     ///
     /// A repeat for a range this store has already finished finds no record and no hosted region
     /// overlapping it, and answers `finished` after one pass with no writes. That is the

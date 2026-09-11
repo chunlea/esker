@@ -104,7 +104,7 @@ fn cases() -> Vec<(&'static str, TableOptions, RangeTombstones)> {
             RangeTombstones::new(),
         ),
         // The same entries with range tombstones attached: the block
-        // [ADR 0017](../../docs/adr/0017-range-tombstones.md) adds, and the widened key
+        // [ADR 0017](../../../docs/adr/0017-range-tombstones.md) adds, and the widened key
         // bounds that make it findable. A separate file rather than a field on the two above,
         // because those two are frozen and adding a block to them would be a format change to
         // bytes that have not changed.
@@ -214,7 +214,7 @@ fn golden_files_read_back() {
         // to span a tombstone is the engine's job, in internal-key space, because the bounds a
         // reader picks files by are internal keys and building one here would mean
         // understanding a key — which `CLAUDE.md` invariant 7 forbids the SST layer
-        // ([ADR 0017](../../docs/adr/0017-range-tombstones.md)). `db/flush.rs::widen` does it,
+        // ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)). `db/flush.rs::widen` does it,
         // and `tests/range_del.rs` is where that is checked.
         assert_eq!(props.largest_key, entries[entries.len() - 1].0, "{name}");
         assert_eq!(props.smallest_seqno, 1, "{name}");

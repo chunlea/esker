@@ -61,7 +61,7 @@ pub const RECORD_VERSION: u8 = 3;
 fn tag_of(ty: ColumnType) -> u8 {
     match ty {
         // **Appended, not inserted**: 89 and 90 were the next two free, and every tag already
-        // written keeps the number it had ([ADR 0077](../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
+        // written keeps the number it had ([ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
         ColumnType::RegType => 89,
         ColumnType::RegProc => 105,
         ColumnType::RegClass => 91,
@@ -78,7 +78,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Double => 6,
         // Appended, never renumbered: an old file has no tag above 6 and reads unchanged, and a
         // reader that meets one it does not know answers corruption rather than guessing
-        // ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
+        // ([ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md)).
         ColumnType::Int4 => 7,
         ColumnType::Varchar => 8,
         // 94: the first free tag. Purely additive — every tag already written keeps its meaning.

@@ -29,7 +29,7 @@
 //! of those ranges, through this crate's `keyspace` module (`crates/esker-store/src/keyspace.rs`,
 //! private, so it is named rather than linked) — the same mapping a snapshot ships a region by.
 //!
-//! Until [ADR 0073](../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md) they read
+//! Until [ADR 0073](../../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md) they read
 //! `['r' ++ start, 's')` in `default` alone, so a region holding a SQL table reported `~0` bytes
 //! and offered no boundary: a SQL table occupied exactly one region whatever its size, at any
 //! threshold (`docs/plans/phase-16-mpp.md` §10). The `lock` family is still not read, and that is
@@ -44,7 +44,7 @@ use crate::error::engine_to_proto;
 use crate::keyspace::{PHYSICAL_NAMESPACES, physical_ranges};
 
 /// The column families whose bytes are a region's **data**, and so its size and the source of its
-/// split boundary ([ADR 0073](../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md)).
+/// split boundary ([ADR 0073](../../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md)).
 ///
 /// `lock` is absent on purpose: a lock is one in-flight transaction's claim on one key, deleted by
 /// both commit and rollback, so counting it would make a region's size a function of how many
@@ -353,7 +353,7 @@ fn midpoint(samples: &[Bytes], region: &Region) -> Option<Bytes> {
 /// `default` under both namespaces would not have fixed it: a value of
 /// `esker_txn::SHORT_VALUE_MAX_LEN` or under is inlined into its `write` record and costs no
 /// `default` entry at all, and ordinary SQL rows are short
-/// ([ADR 0073](../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md)).
+/// ([ADR 0073](../../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md)).
 pub fn approximate_size(db: &Db, region: &Region) -> Result<u64, ProtoError> {
     let mut total: u64 = 0;
     for name in DATA_CFS {
@@ -747,7 +747,7 @@ mod tests {
     /// **A lock is not a region's size.** It is one in-flight transaction's state, cleared at
     /// commit or rollback, so counting it would make a region's size a function of concurrency
     /// and let a burst of prewrites split data that has not been written
-    /// ([ADR 0073](../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md)).
+    /// ([ADR 0073](../../../docs/adr/0073-a-regions-size-is-the-data-families-it-spans.md)).
     ///
     /// It is the one test in this group that passes **before** the fix, and it passes for the
     /// wrong reason: everything reported zero. What makes it mean something is the four tests

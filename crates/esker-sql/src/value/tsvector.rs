@@ -1,6 +1,6 @@
 //! `tsvector` — a sorted, deduplicated set of lexemes, and the text it prints as.
 //!
-//! [ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md): the stored bytes are the
+//! [ADR 0066](../../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md): the stored bytes are the
 //! printed form, canonicalised on the way in, so equality, ordering, grouping and an index over the
 //! column are the text machinery's. The road `hstore` takes, and the whole of the risk is here —
 //! a node that stored the user's characters unchanged would round-trip `full_text_test.rb` and

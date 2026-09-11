@@ -1,5 +1,5 @@
 //! Reclaiming the key range of a database that has been dropped
-//! ([ADR 0069](../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
+//! ([ADR 0069](../../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
 //!
 //! `DROP DATABASE` deletes the catalog record — a small transaction, and the thing that makes the
 //! database *gone*. It does **not** delete the rows: nothing can route into a dropped tenant's key

@@ -699,7 +699,7 @@ async fn a_domain_and_a_range_bind_as_themselves_not_as_text() {
 ///
 /// Run 89's `invalid input syntax for type smallint: "ok"` — 3 tests across `enum_test.rb` and
 /// `invertible_migration_test.rb`. An enum's value is stored as its position
-/// ([ADR 0050](../../../docs/adr/0050-an-enum-is-its-ordinal.md)), so the `Datum` is an `int2`, and
+/// ([ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)), so the `Datum` is an `int2`, and
 /// the ordinal leaked across the boundary in **both** directions:
 ///
 /// * a **bound** parameter was read with the column's storage type, so `'ok'` was handed to the

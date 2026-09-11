@@ -121,7 +121,7 @@ enum Op {
     Delete(u8, u8),
     /// Deletes every key in `[lo, hi)`. `lo >= hi` is refused by the engine rather than
     /// treated as a no-op, so the model refuses it too
-    /// ([ADR 0017](../../docs/adr/0017-range-tombstones.md) decision 4) — which makes the
+    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 4) — which makes the
     /// refusal itself part of what this test checks.
     DeleteRange(u8, u8, u8),
     Get(u8, u8),

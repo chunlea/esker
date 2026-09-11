@@ -64,6 +64,16 @@ struct Link {
 #[derive(Debug)]
 pub struct TcpStores {
     links: Mutex<BTreeMap<u64, Link>>,
+    /// Addresses this client was given that have **never named a store**, and the instant each
+    /// may be dialled again.
+    ///
+    /// A book keyed by the store id a handshake reports has no key for an address that never
+    /// answered one, so before these were kept a store that was down at construction was missing
+    /// for ever — and `esker durability chaos` withheld twenty-six of twenty-eight rounds in
+    /// run 124 saying *"no address is known for store 4"*, on a cluster a SQL node was serving
+    /// from throughout. They are tried when something asks for a store the book cannot name, and
+    /// an address leaves this list the moment it says who it is.
+    unclaimed: Mutex<BTreeMap<SocketAddr, Instant>>,
     /// Kept so a redial is built the way the first dial was.
     config: TransportConfig,
     tls: RpcTls,
@@ -127,33 +137,57 @@ impl TcpStores {
     ///
     /// An address that cannot be reached is not fatal — a cluster with one node down is still a
     /// cluster — but every address failing is, because the book would be empty.
+    ///
+    /// **An address that did not answer is kept** rather than dropped. It cannot be keyed by a
+    /// store id, because it never reported one, so it goes on a shelf of its own and is dialled
+    /// again the first time something asks for a store this book cannot name.
+    ///
+    /// (Named in prose and not linked: the shelf is a private field, and a public item's
+    /// documentation may not link to one — `rustdoc::private_intra_doc_links`, which the gate
+    /// runs as an error and a package test run cannot see.) Before that, a store
+    /// that was down for the few milliseconds of construction was unreachable for the life of the
+    /// client, and the message it produced said so without saying why: *"no address is known for
+    /// store 4"*, twenty-six chaos rounds in a row (run 124).
     pub fn connect_all(addrs: &[SocketAddr], config: TransportConfig) -> Result<Self, ProtoError> {
         let mut links = BTreeMap::new();
+        let mut unclaimed = BTreeMap::new();
         let mut last_error = None;
+        let now = Instant::now();
         for addr in addrs {
             match BlockingTransport::connect_with(*addr, config) {
                 Ok(connection) => {
                     links.insert(connection.hello_ack().store_id, Link::to(*addr, connection));
                 }
-                // **A store that is down right now is missing from this book for ever**, because
-                // a book keyed by the store id its handshake reported has no key for an address
-                // that never answered. That is the same `TODO(debt-c6 #4)` — the store list PD
-                // hands out is what closes it — and it is a different hole from the one this file
-                // just closed, which was about a store that *was* here and came back.
-                Err(error) => last_error = Some(error),
+                // Kept, and dialled again on demand — see the note on `unclaimed`. What is still
+                // `TODO(debt-c6 #4)` is the *other* half: a store whose address this client was
+                // never given at all, for which PD's store list is the answer.
+                Err(error) => {
+                    unclaimed.insert(*addr, now);
+                    last_error = Some(error);
+                }
             }
         }
         if links.is_empty() {
             return Err(last_error
                 .unwrap_or_else(|| ProtoError::not_sent("no addresses were given to connect to")));
         }
-        Ok(Self::of(links, config, RpcTls::disabled()))
+        Ok(Self::of_with(links, unclaimed, config, RpcTls::disabled()))
     }
 
     /// The book, its dialling settings, and nothing else.
     fn of(links: BTreeMap<u64, Link>, config: TransportConfig, tls: RpcTls) -> Self {
+        Self::of_with(links, BTreeMap::new(), config, tls)
+    }
+
+    fn of_with(
+        links: BTreeMap<u64, Link>,
+        unclaimed: BTreeMap<SocketAddr, Instant>,
+        config: TransportConfig,
+        tls: RpcTls,
+    ) -> Self {
         Self {
             links: Mutex::new(links),
+            unclaimed: Mutex::new(unclaimed),
             config,
             tls,
         }
@@ -168,9 +202,10 @@ impl TcpStores {
         let address = {
             let mut links = self.lock();
             let Some(link) = links.get_mut(&store_id) else {
-                return Err(ProtoError::not_sent(format!(
-                    "no address is known for store {store_id}"
-                )));
+                // Nothing has ever named this store. Everything this client was given and could
+                // not reach is still on the shelf; one of them may be it by now.
+                drop(links);
+                return self.discover(store_id);
             };
             if !link.connection.is_closed() {
                 return Ok(Arc::clone(&link.connection));
@@ -218,9 +253,80 @@ impl TcpStores {
         Ok(fresh)
     }
 
+    /// Dials the addresses that have never named a store, and answers with the connection if one
+    /// of them turns out to be `store_id`.
+    ///
+    /// **Every address that answers is learned, not only the one asked for.** A client that
+    /// discovered store 4 and threw away the fact that the same round found store 5 would pay the
+    /// discovery again on the next miss, and a dial is the expensive part.
+    ///
+    /// The cadence is [`REDIAL_AFTER`], for the reason the redial path has one: a statement that
+    /// meets a missing store must not turn into a `connect(2)` per address per statement. run 120
+    /// measured what that costs at 31,700 attempts a second.
+    ///
+    /// **No `record_redial` here**, deliberately. A first dial is not a reconnection, and run 124
+    /// asked a question about the redial counter that conflating the two would make unanswerable
+    /// (`reconnected` stayed at 0 while `stores unreachable` moved 183).
+    ///
+    /// **And no log line**, which is worth saying because one belongs here. This crate takes no
+    /// `tracing` dependency: what it reports, it reports through [`crate::stmt_stats`], which is a
+    /// per-statement cost a caller reads rather than a stream a caller greps. A discovery deserves
+    /// a counter of its own there, and that is the same edit as emitting the per-store map the SQL
+    /// node currently sums away — one unit, not this one.
+    fn discover(&self, store_id: u64) -> Result<Arc<BlockingTransport>, ProtoError> {
+        let missing = || ProtoError::not_sent(format!("no address is known for store {store_id}"));
+        // Taken, and their next-try stamped, **inside** the lock; dialled outside it, so a slow
+        // `connect(2)` never holds up a call to a store this client can already reach.
+        let due: Vec<SocketAddr> = {
+            let mut unclaimed = self.unclaimed_lock();
+            let now = Instant::now();
+            let due: Vec<SocketAddr> = unclaimed
+                .iter()
+                .filter(|(_, next)| now >= **next)
+                .map(|(address, _)| *address)
+                .collect();
+            for address in &due {
+                unclaimed.insert(*address, now + REDIAL_AFTER);
+            }
+            due
+        };
+        if due.is_empty() {
+            crate::stmt_stats::record_not_sent(store_id);
+            return Err(missing());
+        }
+        let mut wanted = None;
+        for address in due {
+            let Ok(fresh) =
+                BlockingTransport::connect_with_tls(address, self.config, &self.tls, None)
+            else {
+                continue;
+            };
+            let answered = fresh.hello_ack().store_id;
+            let fresh = Arc::new(fresh);
+            self.unclaimed_lock().remove(&address);
+            self.lock()
+                .entry(answered)
+                .or_insert_with(|| Link::held(address, Arc::clone(&fresh)));
+            if answered == store_id {
+                wanted = Some(fresh);
+            }
+        }
+        wanted.ok_or_else(|| {
+            crate::stmt_stats::record_not_sent(store_id);
+            missing()
+        })
+    }
+
     /// The book, or the book a panicking thread left behind.
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Link>> {
         self.links.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The shelf of addresses that have never named a store, under the same rule.
+    fn unclaimed_lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<SocketAddr, Instant>> {
+        self.unclaimed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The store ids this book can reach.
@@ -248,6 +354,15 @@ impl TcpStores {
 }
 
 impl Link {
+    /// The same, from a connection somebody else already holds a handle to.
+    fn held(address: SocketAddr, connection: Arc<BlockingTransport>) -> Self {
+        Self {
+            address,
+            connection,
+            redial_after: Instant::now(),
+        }
+    }
+
     fn to(address: SocketAddr, connection: BlockingTransport) -> Self {
         Self {
             address,

@@ -1,6 +1,6 @@
 //! The staged schema change, driven: four states and a backfill, one step per transaction.
 //!
-//! [ADR 0020](../../../docs/adr/0020-online-schema-change.md), `docs/plans/phase-6e.md` units 4 and
+//! [ADR 0020](../../../../docs/adr/0020-online-schema-change.md), `docs/plans/phase-6e.md` units 4 and
 //! 5. `CREATE INDEX CONCURRENTLY` is what starts one; the states and what each is for live in
 //! [`crate::catalog::SchemaState`].
 //!

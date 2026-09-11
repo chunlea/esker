@@ -117,7 +117,7 @@ pub enum Statement {
     /// `DROP VIEW`.
     DropView(DropView),
     /// `CREATE MATERIALIZED VIEW` — a table that carries the `SELECT` its rows came from
-    /// ([ADR 0064](../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md)).
+    /// ([ADR 0064](../../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md)).
     CreateMaterializedView(CreateMaterializedView),
     /// `CREATE TABLE … AS <query>` — a table whose columns are typed from the query's plan.
     CreateTableAs(CreateTableAs),

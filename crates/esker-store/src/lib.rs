@@ -129,7 +129,7 @@ pub mod raft_cf {
 
     /// `'D' ++ start_key` → a key range this store is reclaiming for a dropped database, and how
     /// far it has got ([`crate::reclaim`],
-    /// [ADR 0069](../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
+    /// [ADR 0069](../../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
     ///
     /// The only prefix here whose key is **not** a region id: a dropped tenant's range is part of
     /// one region or spans several, so the record is keyed by the range's own start. Upper case

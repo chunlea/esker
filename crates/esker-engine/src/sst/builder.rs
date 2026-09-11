@@ -199,7 +199,7 @@ impl TableBuilder {
     /// which is what the block format stores, and this layer never interprets them — widening
     /// the *file's* bounds to span them is the engine's job, because the bounds are internal
     /// keys and building one would mean understanding a key, which invariant 7 forbids here
-    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+    /// ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)).
     ///
     /// Call before [`TableBuilder::finish`]; calling twice replaces the set.
     pub fn set_range_tombstones(&mut self, tombstones: RangeTombstones) {
@@ -298,7 +298,7 @@ impl TableBuilder {
 
         // The range-deletion block, uncompressed and before the filter. Its handle goes in the
         // properties rather than the footer, which is 48 bytes forever and has no room for a
-        // fourth ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+        // fourth ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)).
         if !self.range_tombstones.is_empty() {
             let payload = self.range_tombstones.encode();
             let handle = write_block(

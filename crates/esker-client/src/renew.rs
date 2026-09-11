@@ -1,5 +1,5 @@
 //! **Saying that a transaction is still alive**, which is the half of the lock lease nobody sent
-//! ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)).
+//! ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)).
 //!
 //! A Percolator lock carries a lease: `ttl_ms` from its `start_ts`, after which any transaction
 //! that wants the key may settle its owner and take it. That is what keeps a crashed client from
@@ -25,7 +25,7 @@
 //!
 //! # The cadence is derived, not configured
 //!
-//! A third of the lease, the rule [ADR 0028](../../docs/adr/0028-the-schema-lease.md) already
+//! A third of the lease, the rule [ADR 0028](../../../docs/adr/0028-the-schema-lease.md) already
 //! settled for the schema lease: a lost round trip still leaves two attempts before anything
 //! expires. Nothing here reads a wall clock — the lease is measured in the physical part of a
 //! timestamp from the oracle (`CLAUDE.md` invariant 6), and the thread's own sleep is only how

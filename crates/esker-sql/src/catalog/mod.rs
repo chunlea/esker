@@ -70,7 +70,7 @@ pub use record::RoleFlags;
 /// How long old MVCC versions are kept when nothing says otherwise: **one hour**.
 ///
 /// This number is two things at once and they pull in opposite directions
-/// ([ADR 0021](../../../docs/adr/0021-time-machine.md)). It is the depth of the *time machine* — a
+/// ([ADR 0021](../../../../docs/adr/0021-time-machine.md)). It is the depth of the *time machine* — a
 /// read `AS OF` an instant older than this has nothing left to read — and it is the depth of every
 /// version chain the storage engine has to walk past to answer an ordinary read. An hour is chosen
 /// to be long enough that "what did this look like before the last run" is answerable out of the
@@ -93,14 +93,14 @@ pub struct ColumnDef {
     /// The collation this column was declared with, or `None` for the type's own.
     ///
     /// `C` or `POSIX` and nothing else
-    /// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)): both
+    /// ([ADR 0076](../../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)): both
     /// name **byte order**, which is the ordering a memcomparable key already has, so recording
     /// one costs nothing and honours it exactly. `None` is what every column had before catalog
     /// version 35 and is what `pg_attribute.attcollation` reports as the type's default — which is
     /// why `ActiveRecord`'s read-back, `attcollation <> typcollation`, names only the columns that
     /// asked for one.
     pub collation: Option<String>,
-    /// One of the types this node stores ([ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md)).
+    /// One of the types this node stores ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md)).
     pub ty: ColumnType,
     /// PostgreSQL's `pg_attribute.atttypmod`, **verbatim**, or `-1` for a type given no number.
     ///
@@ -195,7 +195,7 @@ pub struct ColumnDef {
     /// (ADR 0049).
     pub comment: Option<String>,
     /// `ALTER TABLE ... DROP COLUMN` **tombstoned this column rather than removing it**
-    /// ([ADR 0051](../../../docs/adr/0051-a-dropped-column-keeps-its-slot.md)).
+    /// ([ADR 0051](../../../../docs/adr/0051-a-dropped-column-keeps-its-slot.md)).
     ///
     /// The column keeps its place in [`TableDef::columns`] for the life of the table, because a row
     /// is decoded by *position*: taking the entry out would shift every column after it and turn
@@ -212,7 +212,7 @@ pub struct ColumnDef {
     /// The oid of the **user-defined type** this column was declared as, or `None` for a column
     /// declared as one of this node's own types.
     ///
-    /// [ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s shape, and the field
+    /// [ADR 0050](../../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s shape, and the field
     /// exists because [`ColumnType`] must not learn one. `ty` stays what the value physically
     /// **is** — an enum label is stored as the `int2` of its position — and this is what it is
     /// *called*, which is the half that needs a catalog to answer. Putting the oid in
@@ -532,7 +532,7 @@ pub struct IndexKey {
     pub order: KeyOrder,
     /// The **operator class** written after the column, or `None` for the type's default.
     ///
-    /// Recorded and not acted on ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)):
+    /// Recorded and not acted on ([ADR 0070](../../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)):
     /// the key underneath is the ordered one every key here is, and this is what
     /// `pg_index.indclass` reports and `pg_get_indexdef` prints. `ActiveRecord`'s schema dumper
     /// reads it back, which is the whole reason it is stored.
@@ -685,7 +685,7 @@ pub struct IndexDef {
     pub keys: Vec<IndexKey>,
     /// The **access method** the index was declared with — `btree` unless `USING` said otherwise.
     ///
-    /// Recorded and not acted on ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)):
+    /// Recorded and not acted on ([ADR 0070](../../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)):
     /// what is built underneath is the ordered index every index here is, and this is what
     /// `pg_class.relam` and `pg_get_indexdef` report. **Nothing claims a trigram search is
     /// accelerated** — no plan mentions it and `EXPLAIN` never names a trigram scan.
@@ -822,7 +822,7 @@ pub const BTREE_ACCESS_METHOD: &str = "btree";
 pub const GIN_ACCESS_METHOD: &str = "gin";
 
 /// The access method a `USING gist` index records. Like `gin`, it is never read in key order, so
-/// the two admit the same keys — see [ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md)'s
+/// the two admit the same keys — see [ADR 0066](../../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md)'s
 /// amendment.
 pub const GIST_ACCESS_METHOD: &str = "gist";
 
@@ -836,7 +836,7 @@ pub const GIST_ACCESS_METHOD: &str = "gist";
 ///
 /// `text_pattern_ops` and `varchar_pattern_ops` exist for **both** `btree` and `hash` on a real
 /// server; only the btree halves are here, because `USING hash` is refused
-/// ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
+/// ([ADR 0070](../../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
 pub const OPERATOR_CLASSES: [(&str, &str, ColumnType); 4] = [
     ("gin_trgm_ops", "gin", ColumnType::Text),
     ("gist_trgm_ops", "gist", ColumnType::Text),
@@ -3410,7 +3410,7 @@ pub fn drop_flashback(txn: &mut dyn Txn, tenant: u64, table_id: u64) {
 
 /// How many columnar replicas a table wants, or `None` when nothing has been said about it.
 ///
-/// [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5. `None` and
+/// [ADR 0022](../../../../docs/adr/0022-columnar-learner-replica.md) Decision 5. `None` and
 /// `Some(0)` mean the same thing to a reader — no columnar copy — and are kept apart only so that
 /// a table somebody explicitly turned off is distinguishable from one nobody ever turned on.
 pub fn table_columnar_replicas(txn: &dyn Txn, tenant: u64, table_id: u64) -> Result<Option<u8>> {
@@ -3445,7 +3445,7 @@ pub fn table_published_schema(
 ///
 /// The type and its codec are [`esker_keys::columnar::Published`]: a store holding a columnar
 /// learner reads this record and cannot link `esker-sql`
-/// ([ADR 0030](../../../docs/adr/0030-the-row-codec-moves-down.md)). Re-exported rather than
+/// ([ADR 0030](../../../../docs/adr/0030-the-row-codec-moves-down.md)). Re-exported rather than
 /// wrapped, so there is one definition of what the bytes mean and not two.
 pub use esker_keys::columnar::Published as PublishedSchema;
 
@@ -3554,7 +3554,7 @@ pub fn default_retention(txn: &dyn Txn) -> Result<u64> {
 
 /// Names a timestamp: one record, and nothing else.
 ///
-/// A checkpoint is **free** ([ADR 0021](../../../docs/adr/0021-time-machine.md) Decision 3) — no
+/// A checkpoint is **free** ([ADR 0021](../../../../docs/adr/0021-time-machine.md) Decision 3) — no
 /// snapshot, no copy, no flush — because the data it refers to is kept by retention whether
 /// anybody named it or not. Re-using a name replaces it, which is what `pg_export_snapshot()`'s
 /// named variant should do: a name is a label a user moves, not a unique key they have to free.
@@ -4249,7 +4249,7 @@ pub fn qualify(schema: &str, name: &str) -> String {
 ///
 /// Before this, every index in a database shared one namespace: `my.schema.articles_pkey`
 /// collided with `public.articles_pkey`, which is what `SchemaWithDotsTest` met
-/// ([ADR 0080](../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)).
+/// ([ADR 0080](../../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)).
 #[must_use]
 pub(crate) fn owned_name(table: &TableDef, name: &str) -> String {
     // **A derived name arrives qualified already.** `plan::make_object_name` spends its 63-byte
@@ -4832,7 +4832,7 @@ pub fn allocate_id(txn: &mut dyn Txn, tenant: u64) -> Result<u64> {
 ///
 /// The sentence names the change and says what to do, because there is nothing else to be done:
 /// existing databases are disposable by the user's decision, and there is no upgrade path
-/// ([ADR 0080](../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)).
+/// ([ADR 0080](../../../../docs/adr/0080-an-index-name-record-is-scoped-to-its-schema.md)).
 fn refuse_an_older_layout(txn: &dyn Txn, version: u64) -> Result<()> {
     // The same rule as the counters beside it: this is read by every statement and written by
     // every DDL, so waiting here is waiting for somebody's uncommitted work (ADR 0105).
@@ -5363,12 +5363,12 @@ mod tests {
                 // operator class per key part. This table has one index of one key, so it is
                 // `btree` and an empty class — the type's default, which is every index a version
                 // 33 catalog could hold
-                // ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
+                // ([ADR 0070](../../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
                 "05627472656500",
                 // Version 35, and the eighteenth section: one collation per column, in column
                 // order. Two columns, neither of which named one, so two empty strings — which is
                 // every column a version 34 catalog could hold, because `COLLATE` was refused
-                // ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+                // ([ADR 0076](../../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
                 "0000",
             )
         );

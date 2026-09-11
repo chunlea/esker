@@ -128,7 +128,7 @@ pub enum Error {
         /// The winner's commit timestamp.
         commit_ts: u64,
         /// **Which key lost**, when the store said per key — which `Prewrite` does
-        /// ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
+        /// ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
         ///
         /// A caller above this one may need to know: a lost race on an ordinary row is a
         /// serialization failure and a lost race on a *unique index entry* is a duplicate key,
@@ -155,7 +155,7 @@ pub enum Error {
         /// The transaction holding it.
         start_ts: u64,
         /// **What this transaction was doing when it gave up**
-        /// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §4).
+        /// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §4).
         ///
         /// Three different calls reach this error and a client cannot tell them apart from the
         /// message: a read that holds nothing, a read set asserting a range did not move, and a
@@ -176,7 +176,7 @@ pub enum Error {
     },
 
     /// A historical read named a timestamp the collector has already passed
-    /// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1).
+    /// ([ADR 0021](../../../docs/adr/0021-time-machine.md) decision 1).
     ///
     /// A refusal rather than a clamp, and rather than an approximate answer: below the
     /// safepoint some versions are gone and some are not, so the database *can* answer and the
@@ -219,7 +219,7 @@ pub enum Error {
     },
 
     /// A named snapshot was read back and is not there
-    /// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 3).
+    /// ([ADR 0021](../../../docs/adr/0021-time-machine.md) decision 3).
     ///
     /// PostgreSQL's `42704 snapshot "..." does not exist`, and it means what it says: the name
     /// was never exported, or whatever holds the names has lost it. A checkpoint is a claim,
