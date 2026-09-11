@@ -123,7 +123,10 @@ fn frames(stream: &[u8]) -> Vec<(u8, &[u8])> {
             stream[at + 3],
             stream[at + 4],
         ]) as usize;
-        frames.push((stream[at], &stream[at + 5..(at + 1 + len).min(stream.len())]));
+        frames.push((
+            stream[at],
+            &stream[at + 5..(at + 1 + len).min(stream.len())],
+        ));
         at += 1 + len;
     }
     frames
@@ -240,7 +243,10 @@ fn a_with_query_keeps_the_columns_user_type() {
         "the label, not the ordinal it is stored as"
     );
     assert_eq!(
-        declared("WITH c AS (SELECT m AS v FROM t) SELECT v FROM c", &mut node),
+        declared(
+            "WITH c AS (SELECT m AS v FROM t) SELECT v FROM c",
+            &mut node
+        ),
         enum_oid(),
         "the RowDescription oid is the enum's own"
     );
