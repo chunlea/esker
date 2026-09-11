@@ -1,0 +1,21 @@
+crates/esker-cli/src/sst_dump.rs
+  s_ac192c209f55d3::t_37afe0072e0dd5 36,40,200-247,525,530
+crates/esker-cli/tests/admin_storage.rs
+  s_ac192c209f55d3::t_36539c41079150 217-301
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "42a0c40f6a736d3e70ed29af118d9adfb94ff7c7",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
