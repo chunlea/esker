@@ -52,7 +52,7 @@ const KEYS: u32 = 60;
 /// Every third key is deleted, so the compaction has tombstones to drop and values to keep, and
 /// the two are interleaved rather than in separate halves.
 fn is_deleted(key: u32) -> bool {
-    key % 3 == 0
+    key.is_multiple_of(3)
 }
 
 fn key_for(key: u32) -> Vec<u8> {
