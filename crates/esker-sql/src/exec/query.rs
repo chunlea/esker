@@ -380,7 +380,7 @@ impl<'a> Scope<'a> {
     ///
     /// A position is an index into the **concatenated** row, so this walks the tables the way
     /// [`Scope::offset`] builds it: the labels live on the table
-    /// (`crate::catalog::TableDef::enums`) and the oid on the column, so both halves have to be
+    /// (`crate::catalog::Hydrated::enums`) and the oid on the column, so both halves have to be
     /// found together (ADR 0050).
     ///
     /// Narrower than [`Scope::user_type_at`] on purpose: everything that rewrites a *value*

@@ -1181,7 +1181,7 @@ pub struct Hydrated {
     pub sequences: Vec<SequenceDef>,
     /// The user-defined types this table's columns were declared as, by oid.
     ///
-    /// **Not part of the table record either**, and for the same reason [`TableDef::sequences`] is
+    /// **Not part of the table record either**, and for the same reason [`Hydrated::sequences`] is
     /// not: the type is its own catalog record, keyed by name, and a column stores only its oid
     /// ([`ColumnDef::user_type`], ADR 0050). Hydrating it where the table is loaded is what makes
     /// every consumer able to answer without a catalog of its own — resolution has a `Scope`, and
@@ -1196,7 +1196,7 @@ pub struct Hydrated {
     pub enums: BTreeMap<u64, TypeDef>,
     /// How to read each child's rows **as this table's**, filled where the table is loaded.
     ///
-    /// Derived rather than stored, exactly as [`TableDef::sequences`] is: a scan of a parent
+    /// Derived rather than stored, exactly as [`Hydrated::sequences`] is: a scan of a parent
     /// returns its children's rows too, and the planner has no catalog in reach to work out how.
     /// A record decoded straight from bytes therefore has none.
     pub child_scans: Vec<ChildScan>,
@@ -2167,7 +2167,7 @@ impl TableDef {
     /// The derived half of a table **loaded through the catalog**, which always hydrates.
     ///
     /// For the readers that cannot carry on without it and have an error to return: a `TableDef`
-    /// from [`View::table_by_id`] or [`Catalog::require_table`] has been hydrated, so `None` here
+    /// from [`View::table_by_id`] or [`View::require_table`] has been hydrated, so `None` here
     /// means a record reached a reader that needed more than a record — a wiring mistake, loud
     /// rather than silent, and never a wrong answer to a user.
     pub fn derived(&self) -> Result<&Hydrated> {

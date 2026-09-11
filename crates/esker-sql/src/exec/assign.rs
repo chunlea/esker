@@ -180,7 +180,7 @@ fn coerce(
 /// [`user_type_of`] answers.
 ///
 /// The type is on the `TableDef` rather than on the column, because it is its own catalog record
-/// and the column stores only its oid — see `crate::catalog::TableDef::enums`, which is where the
+/// and the column stores only its oid — see `crate::catalog::Hydrated::enums`, which is where the
 /// read happens and where the "only when a column has one" guard lives.
 pub(super) fn rewriting_type_of<'a>(
     table: &'a crate::catalog::TableDef,

@@ -3023,7 +3023,7 @@ const INFORMATION_SCHEMA_DOMAINS: [InformationSchemaDomain; 5] = [
 /// The five as [`super::TypeDef`]s, by oid — what a column of one points at.
 ///
 /// **Built once and shared**, because they are constants wearing a runtime type: a `TypeDef` is
-/// what `TableDef::enums` holds and what `exec::assign::user_type_of` looks a column's
+/// what `Hydrated::enums` holds and what `exec::assign::user_type_of` looks a column's
 /// `user_type` up in, so a domain that reaches the wire has to be one of these.
 ///
 /// The name is the **stored** form — `information_schema` and the domain, separated by
