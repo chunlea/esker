@@ -179,6 +179,14 @@ pub(crate) struct DbInner {
     /// tables it did open. Together they say whether the filter is earning its bits.
     pub(crate) bloom_skips: AtomicU64,
     pub(crate) bloom_probes: AtomicU64,
+    /// Stored entries an iterator has examined, across every scan this database has served.
+    ///
+    /// **The work a scan does, as opposed to the answer it returns.** A scan over MVCC data
+    /// returns one row per key and walks one entry per *version*, so a set that dedupes the
+    /// answer hides the cost completely: the rows do not grow and the steps to produce them grow
+    /// with every commit in the range's history. That is #58, and a count is how it is asserted —
+    /// a timer on a shared machine measures the machine.
+    pub(crate) entries_stepped: Arc<AtomicU64>,
     pub(crate) shutdown: AtomicBool,
     /// Whether the uploader has work waiting, and the condvar it sleeps on.
     ///
@@ -549,6 +557,9 @@ impl Db {
             "esker.compactions" => Some(inner.compactions.load(Ordering::Relaxed).to_string()),
             "esker.bloom-skips" => Some(inner.bloom_skips.load(Ordering::Relaxed).to_string()),
             "esker.bloom-probes" => Some(inner.bloom_probes.load(Ordering::Relaxed).to_string()),
+            "esker.entries-stepped" => {
+                Some(inner.entries_stepped.load(Ordering::Relaxed).to_string())
+            }
             "esker.compactions-running" => Some(
                 inner
                     .compacting

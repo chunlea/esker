@@ -21,6 +21,7 @@
 
 use std::cmp::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::dbformat::{
     EntryKind, InternalKeyComparator, MAX_SEQNO, SeqNo, extract_user_key, internal_key, lookup_key,
@@ -110,6 +111,11 @@ pub struct DbIterator {
     status: Option<Error>,
     /// Pins every file the merger reads. Dropping it is what lets them be deleted.
     _version: Arc<Version>,
+    /// Every stored entry this iterator examines, counted into the database's own total.
+    ///
+    /// Shared rather than per-iterator because the question it answers is about a *workload* —
+    /// "did this scan get dearer" — and a scan opens an iterator, spends it and drops it.
+    stepped: Arc<AtomicU64>,
     /// Pins the sequence number, so a compaction cannot collect versions this iterator needs.
     _snapshot: Option<Snapshot>,
 }
@@ -210,6 +216,10 @@ impl DbIterator {
     fn find_next(&mut self, mut skipping: Option<Vec<u8>>) {
         let user_order = Arc::clone(self.comparator.user_comparator());
         while self.merger.valid() {
+            // Counted here, at the one place every forward step passes through, and counted per
+            // *stored entry* rather than per answer: the versions walked past are the whole of
+            // what #58 is about and they never reach the caller.
+            self.stepped.fetch_add(1, AtomicOrdering::Relaxed);
             let key = self.merger.key().to_vec();
             let Some((user, seqno, kind)) = split_internal_key(&key) else {
                 self.fail("an entry whose tag cannot be decoded");
@@ -251,6 +261,9 @@ impl DbIterator {
         let user_order = Arc::clone(self.comparator.user_comparator());
         let mut found: Option<(Vec<u8>, Vec<u8>)> = None;
         while self.merger.valid() {
+            // The backward mirror of `find_next`'s count, so a reverse scan is measured by the
+            // same number and a fix that only helped one direction would be visible.
+            self.stepped.fetch_add(1, AtomicOrdering::Relaxed);
             let key = self.merger.key().to_vec();
             let Some((user, seqno, kind)) = split_internal_key(&key) else {
                 self.fail("an entry whose tag cannot be decoded");
@@ -493,6 +506,7 @@ impl Db {
                 .then(|| cf.options().prefix_extractor.clone())
                 .flatten(),
             status: None,
+            stepped: Arc::clone(&self.inner.entries_stepped),
             _version: sources.version,
             _snapshot: options.snapshot.clone(),
         })

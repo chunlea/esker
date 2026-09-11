@@ -134,6 +134,7 @@ impl Db {
             compactions: AtomicU64::new(0),
             bloom_skips: AtomicU64::new(0),
             bloom_probes: AtomicU64::new(0),
+            entries_stepped: Arc::new(AtomicU64::new(0)),
             shutdown: AtomicBool::new(false),
             tier: Mutex::new(crate::db::TierSignal::default()),
             tier_wanted: Condvar::new(),
