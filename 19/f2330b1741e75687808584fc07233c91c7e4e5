@@ -1,0 +1,19 @@
+crates/esker-sql/tests/derived_user_type.rs
+  s_e59614afdddccb::t_51777be9d18a73 1-261
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "19f2330b1741e75687808584fc07233c91c7e4e5",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
