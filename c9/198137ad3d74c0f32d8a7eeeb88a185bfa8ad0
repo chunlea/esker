@@ -1,0 +1,19 @@
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_ac192c209f55d3::t_305f6ebb6d08cb 112-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c9198137ad3d74c0f32d8a7eeeb88a185bfa8ad0",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
