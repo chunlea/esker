@@ -7052,6 +7052,21 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             // one; folding a literal here is a convenience, and a *column* has nothing to fold.
             // Without this arm `typinput::oid` — a statement a real server answers — was
             // `0A000 the cast typinput::oid is not supported` (ADR 0098).
+            // **A `regproc`'s text is its name, so it is not folded here.** `'int4in'::regproc::oid`
+            // is `42` on 19beta1 and was `22P02 invalid input syntax for type oid: "int4in"`: the
+            // fold below reads the operand's characters with `oid`'s input function, and a
+            // `regproc` prints as `int4in`. The same cast over a **column** and over an array
+            // element both answered all along, because there the value is a `Datum::RegProc` and
+            // `value::convert_without_text` has the pair — so the node is kept and the conversion
+            // happens where the value can speak for itself. The `regtype` and `regclass` arms
+            // above never reach this one; `regproc` is the third of the family and had no arm.
+            if source_type(expr)? == Some(ColumnType::RegProc) {
+                return Ok(plan::Expr::Cast {
+                    operand: Box::new(lower_expr(expr)?),
+                    to: ColumnType::Oid,
+                    typmod: NO_TYPMOD,
+                });
+            }
             let Ok(text) = cast_operand(expr, data_type) else {
                 return Ok(plan::Expr::Cast {
                     operand: Box::new(lower_expr(expr)?),
