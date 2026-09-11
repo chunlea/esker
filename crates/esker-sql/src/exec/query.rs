@@ -5849,6 +5849,7 @@ fn counting_type(
         | ScalarFunc::CharLength
         | ScalarFunc::CharacterLength
         | ScalarFunc::OctetLength
+        | ScalarFunc::BitLength
         | ScalarFunc::Ascii => Some(ColumnType::Int4),
         _ => None,
     }
@@ -5867,6 +5868,10 @@ fn counting_type(
 /// tsvector        **lexemes**     -             -              -
 /// lseg / path     **float8**      -             -              -
 /// ```
+///
+/// **`bit_length` has no `(character)` row** where `octet_length` does, so a `character(5)` reaches
+/// it through the coercion to `text` and the trailing blanks go: `bit_length('ab'::character(5))`
+/// is 16 and `octet_length` of the same value is 5. Measured.
 ///
 /// `lower` and `upper` have a **range** overload beside the string one — they are the bounds — and
 /// that is the pair this crate already told apart by the operand. Everything else here is the same
@@ -5895,7 +5900,12 @@ fn scalar_accepts(func: crate::plan::ScalarFunc, ty: ColumnType) -> bool {
                         | ColumnType::Path
                 )
         }
-        ScalarFunc::OctetLength => {
+        // **The same set, measured and not assumed.** `bit_length`'s three `pg_proc` rows are
+        // `(bit)`, `(bytea)` and `(text)`, and asking `pg_typeof(bit_length(NULL::<t>))` for each
+        // of the probe list's 100 spellings on 19beta1 answers for exactly eight of them —
+        // `"char"`, `bit`, `bytea`, `character`, `character varying`, `citext`, `name`, `text` —
+        // plus `bit varying`, which that list does not carry. That is `octet_length`'s set.
+        ScalarFunc::OctetLength | ScalarFunc::BitLength => {
             stringy || matches!(ty, ColumnType::Bit | ColumnType::VarBit | ColumnType::Bytea)
         }
         // Untouched: the numeric one, whose operand the evaluator has always decided.

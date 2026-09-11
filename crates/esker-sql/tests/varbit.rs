@@ -29,8 +29,9 @@ mod parity;
 /// What this node answers differently, and why.
 ///
 /// **Two families, and neither is about the spelling.** The first is the bit-string *operators and
-/// functions* — `||`, the four bitwise ones, the shifts, `length`, `octet_length`, `bit_length`
-/// and `position` — which this crate has built for no element type and which `tests/bit_string.rs`
+/// functions* — `||`, the four bitwise ones, the shifts and `position`; `length`, `octet_length`
+/// and `bit_length` have since been built — which this crate has built for no element type and
+/// which `tests/bit_string.rs`
 /// has named as "their own unit" since the bit types arrived. They are here because the spelling
 /// made them reachable, not because they are new; every one is a refusal where a real server
 /// answers, which is the honest shape of a gap. The citations are this file's capture rather than
@@ -51,18 +52,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // the eight `pg_proc` rows over four counting names, and they do not agree with each other
         // (`tests/captures/pg19_length_overloads.txt`). The empty bit string was kept as the value
         // that would let a wrong implementation look right, and it is now asserted rather than
-        // declared. `bit_length` stays: this node has none of its three overloads and says so.
+        // declared. **`bit_length` is gone too**, closed the same way: its three `pg_proc` rows
+        // are `(bit)`, `(bytea)` and `(text)`, and over a bit string it is `length`'s answer while
+        // over a string it is eight times the octet count — which is the half that makes it a
+        // function rather than an alias.
         // **The four `||` entries that stood here are gone**, closed by wire v3 family F3b's
         // second unit: `bit`, `bytea` and `tsquery` each have a same-type `||` on a real server
         // and this crate now builds the value. The note they carried is worth keeping — `||` is
         // the one bit-string operator that keeps `bit varying`, where the four bitwise ones and
         // the shifts all answer a plain `bit` — and `varbit || bit(2)` is what says the answer is
         // `bit varying` rather than the wider of the two.
-        (
-            "SELECT bit_length('101'::varbit)",
-            "`bit_length` is not built for any type, so this is `0A000` where the others are `42883`. Over a bit string it is `length`'s answer; over a string it is eight times the octet count, which is the half that makes it a function rather than an alias.",
-            "pg19_varbit.txt:92",
-        ),
         (
             "SELECT '101'::varbit & '110'::varbit",
             "**The four bitwise operators over bit strings are not built.** They are built over the integers (`tests/bitwise.rs`) and share the spelling, which is what makes this a dispatch this crate does not have rather than an operator it has not heard of. Two measured rules ride on it: the result is a plain `bit` even over two `bit varying` operands, and operands of different lengths are `22026 cannot AND bit strings of different sizes` rather than a padded answer.",

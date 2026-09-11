@@ -2403,7 +2403,15 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             // (`tests/captures/pg19_length_overloads.txt`), and `char_length` has none of these.
             // `resolve` refuses the pairs that have no overload, so what arrives here is a pair
             // that does.
-            Datum::Bit { bits, .. } if matches!(func, crate::plan::ScalarFunc::Length) => {
+            // **`bit_length` over a `bit` is its bits, not its bytes times eight** — the one
+            // place the name and the answer part company, and the pair that says so is
+            // `bit_length('101010101'::varbit)` = 9 while `octet_length` of it is 2. Measured.
+            Datum::Bit { bits, .. }
+                if matches!(
+                    func,
+                    crate::plan::ScalarFunc::Length | crate::plan::ScalarFunc::BitLength
+                ) =>
+            {
                 Datum::Int4(i32::try_from(bits.chars().count()).unwrap_or(i32::MAX))
             }
             Datum::Bytea(bytes)
@@ -2413,6 +2421,9 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 ) =>
             {
                 Datum::Int4(i32::try_from(bytes.len()).unwrap_or(i32::MAX))
+            }
+            Datum::Bytea(bytes) if matches!(func, crate::plan::ScalarFunc::BitLength) => {
+                Datum::Int4(bits_in(bytes.len()))
             }
             // `octet_length` over a `bit` is its **bytes**, which is the pair that says the two
             // names are not one: `octet_length('1'::bit)` is 1 and `length('1'::bit)` is 1 too,
@@ -2467,6 +2478,10 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 crate::plan::ScalarFunc::OctetLength => {
                     Datum::Int4(i32::try_from(text.len()).unwrap_or(i32::MAX))
                 }
+                // **Bytes times eight, and the bytes are `octet_length`'s** — so a multi-byte
+                // string is not its character count times eight: `bit_length('éî')` is 32 and
+                // `length('éî')` is 2. Measured.
+                crate::plan::ScalarFunc::BitLength => Datum::Int4(bits_in(text.len())),
                 // Unreachable: the arm above catches `abs` before this one is tried.
                 crate::plan::ScalarFunc::Abs => Datum::Text(text),
             },
@@ -4688,6 +4703,16 @@ fn typmod_argument(arg: Option<&Datum>) -> Result<Option<i32>> {
 /// Measured on 19beta1, `tests/corpus/pg19_in.txt`. A scan rather than a rewrite to `= a OR = b`,
 /// so the left-hand side is evaluated once — which also keeps a `nextval` on the left from
 /// running per item.
+/// A byte count as a **bit** count, saturating.
+///
+/// `bit_length` is `octet_length` times eight over everything but a `bit` string, and eight times a
+/// `usize` does not fit an `int4` — which is the answer's type. Saturating rather than wrapping:
+/// this crate never panics on a value (`CLAUDE.md` invariant 9), and a string long enough to reach
+/// it is one no statement here can build.
+fn bits_in(bytes: usize) -> i32 {
+    i32::try_from(bytes).unwrap_or(i32::MAX).saturating_mul(8)
+}
+
 fn in_list(
     operand: &Expr,
     list: &[Expr],

@@ -58,9 +58,44 @@
 # A `path`'s bracket says whether it is open, and the closing edge is counted at two points as
 # well as at three.
 #
-# ## The one this does not close
+# ## `bit_length`, measured 2026-09-10 and now built
 #
-# `bit_length` has three overloads on 19beta1 — `bit_length('abc')` is 24, `bit_length('1'::bit)`
-# is 1, `bit_length('\x0102'::bytea)` is 16 — and this node has none of them. It answers
-# `0A000 the function bit_length is not supported`, which is a **named** refusal and not a wrong
-# value. Its own small item, pinned in `tests/length_overloads.rs`.
+# It was the one this file did not close: three overloads on 19beta1 and none on this node, which
+# answered the **named** refusal `0A000 the function bit_length is not supported`.
+#
+# ### Which spellings it accepts — asked, not assumed
+#
+# `SELECT pg_typeof(bit_length(NULL::<type>))` over the same 100 distinct spellings, one
+# `SAVEPOINT`/`ROLLBACK TO` per probe. **Eight answer**, every one of them `integer`:
+#
+#     "char"   bit   bytea   character   character varying   citext   name   text
+#
+# and `bit varying`, which the probe list does not carry (`pg19_varbit.txt:92` has it at 3 for
+# `'101'::varbit`). The other 92 are `42883 function bit_length(<type>) does not exist`.
+#
+# **That is `octet_length`'s set, not `length`'s** — no `tsvector`, no `lseg`, no `path`.
+#
+# ### What it counts
+#
+#     bit_length('abc'::text)              24     octet_length 3    length 3
+#     bit_length('éî'::text)               32     octet_length 4    length 2
+#     bit_length(''::text)                  0
+#     bit_length('abc'::varchar)           24
+#     bit_length('abc'::citext)            24
+#     bit_length('abc'::name)              24
+#     bit_length('x'::"char")               8
+#     bit_length('ab'::character(5))       16     octet_length 5    length 2
+#     bit_length('1'::bit)                  1     octet_length 1    length 1
+#     bit_length('101'::bit(3))             3     octet_length 1    length 3
+#     bit_length('101010101'::varbit)       9     octet_length 2    length 9
+#     bit_length('\x0102'::bytea)          16     octet_length 2    length 2
+#     bit_length(''::bytea)                 0
+#     bit_length(NULL::text)             NULL
+#
+# **`character(5)` is the row that matters.** `bit_length` has no `(character)` row in `pg_proc`
+# where `octet_length` does, so a `bpchar` reaches it through the coercion to `text` — and that
+# coercion **trims the trailing blanks**: 16, which is `'ab'` times eight, and not 40. It is the
+# same rule `tests/bpchar_padding.rs` lists as "a text function trims", and it is why this node
+# does *not* exempt `bit_length` from `read_as_text` the way it exempts `octet_length`.
+#
+# Built 2026-09-10; `tests/length_overloads.rs` holds both halves.
