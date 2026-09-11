@@ -174,7 +174,6 @@ fn why_this_join_stays_on_rows(scan: &Node) -> Option<&'static str> {
     let Node::NestedLoop {
         left_join,
         probe,
-        residual,
         inner_view,
         inner_plan,
         ..
@@ -195,9 +194,14 @@ fn why_this_join_stays_on_rows(scan: &Node) -> Option<&'static str> {
         // inner row per outer row" true, and only that makes a membership test preserve a count.
         return Some("a join on a non-unique inner column, where one outer row may match many");
     }
-    if residual.is_some() {
-        return Some("a join with a condition the probe did not express");
-    }
+    // **No rule about `residual` here**, and that is the point of the function taking only the
+    // node. A probe answers its equality exactly, so a residual is whatever else the condition
+    // said — over the *combined* row, which is the same coordinate space the `Filter` above the
+    // loop uses. So it is not a shape objection at all: [`split_by_side`] classifies it by which
+    // side it names, exactly as it classifies the `Filter`, and refuses the one case that is not
+    // a semi-join — a conjunct naming both sides. Refusing every residual here would refuse
+    // `WHERE d.bucket = 1` the moment the planner learned to put it on the join rather than above
+    // it, which is a *cheaper* plan expressing the identical condition.
     None
 }
 
@@ -353,15 +357,34 @@ fn ordinals_of(expr: &Expr) -> Vec<usize> {
 ///
 /// An outer-only conjunct goes into the fragment; an inner-only one filters the key set; one
 /// naming **both** is a condition over the *pair*, which is not a semi-join at all and refuses.
+///
+/// **`filter` and `residual` are one list, not two.** The first is the `Filter` above the loop and
+/// the second is what the planner put *on* the loop, and the planner moves a conjunct between them
+/// to make the row plan cheaper — a condition the join step can answer belongs on the join. Both
+/// read the combined row in the same coordinate space and both are conjuncts of the same
+/// condition, so which of the two a conjunct arrived in must not change whether this query can be
+/// answered on the columns. Reading them as one sequence is the only way to guarantee that.
+///
+/// **This holds because the join is an inner one, and only because of that.** On a `LEFT JOIN` the
+/// two positions are the difference between keeping an unmatched row and dropping it — the trap
+/// `tests/join.rs` opens with. [`why_this_join_stays_on_rows`] refuses a left join before this
+/// function is ever reached, which is what makes the equivalence above true rather than nearly
+/// true.
 fn split_by_side(
     filter: Option<&Expr>,
+    residual: Option<&Expr>,
     outer_filter: Option<&Expr>,
     outer_width: usize,
 ) -> Routed<(Vec<Expr>, Vec<Expr>)> {
     let plain = |reason: &'static str| Decision::rows(Reason::NotExpressible(reason));
     let mut outer_side: Vec<Expr> = outer_filter.into_iter().cloned().collect();
     let mut inner_side: Vec<Expr> = Vec::new();
-    for conjunct in filter.map(conjuncts).unwrap_or_default() {
+    let both = filter
+        .map(conjuncts)
+        .unwrap_or_default()
+        .into_iter()
+        .chain(residual.map(conjuncts).unwrap_or_default());
+    for conjunct in both {
         let ordinals = ordinals_of(conjunct);
         if ordinals.iter().all(|at| *at < outer_width) {
             outer_side.push(conjunct.clone());
@@ -409,6 +432,7 @@ fn absorb_join(
         inner_table_id,
         inner_columns,
         probe,
+        residual,
         ..
     } = scan
     else {
@@ -448,7 +472,7 @@ fn absorb_join(
         .ok_or_else(|| plain("a join whose inner key names no column"))?;
 
     let (fragment_conjuncts, key_conjuncts) =
-        split_by_side(filter, outer_filter, outer.columns.len())?;
+        split_by_side(filter, residual.as_ref(), outer_filter, outer.columns.len())?;
 
     let (Probe::PrimaryKey { outer: at } | Probe::UniqueIndex { outer: at, .. }) = probe else {
         return Err(plain(

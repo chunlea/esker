@@ -2521,19 +2521,23 @@ fn join_node(
     // than left to `probe_for`, so that a view can never be reached through a key. A **derived
     // table** is the same case for the same reason: its rows come from a plan.
     let inner_view = pg_catalog::view_of(inner);
-    let probe = on
+    let probed = on
         .filter(|_| !full && inner_view.is_none() && inner_plan.is_none())
-        .and_then(|on| probe_for(on, scope, inner))
-        .unwrap_or(crate::plan::Probe::Materialize);
-    // A probe answers the equality exactly, so the condition it came from is not re-checked. A
-    // materialised inner side has nothing to answer it, so the whole condition is the filter.
-    let residual = match (&probe, on) {
-        (crate::plan::Probe::Materialize, Some(on)) => {
-            let resolved = resolve(on, scope)?;
+        .and_then(|on| probe_for(on, scope, inner));
+    // A probe answers **its own** equality exactly, so that conjunct is not re-checked. What it
+    // did not express is, and a materialised inner side has nothing to answer any of the
+    // condition — so there the whole of it is the filter.
+    let (probe, unanswered) = match probed {
+        Some((probe, rest)) => (probe, (!rest.is_empty()).then(|| all_of(&rest))),
+        None => (crate::plan::Probe::Materialize, on.cloned()),
+    };
+    let residual = match unanswered {
+        Some(unanswered) => {
+            let resolved = resolve(&unanswered, scope)?;
             check_predicate(&resolved, "JOIN/ON", scope)?;
             Some(resolved)
         }
-        _ => None,
+        None => None,
     };
     Ok(Node::NestedLoop {
         outer: Box::new(outer),
@@ -2596,8 +2600,41 @@ fn using_condition(
     condition.ok_or_else(|| SqlError::Internal("an empty USING clause".to_owned()))
 }
 
-/// The probe an `ON` condition allows, or `None` for one that needs the inner table read whole.
-fn probe_for(on: &Expr, scope: &Scope<'_>, inner: &TableDef) -> Option<crate::plan::Probe> {
+/// The probe an `ON` condition allows and the conjuncts it leaves unanswered, or `None` for a
+/// condition that needs the inner table read whole.
+///
+/// **Read across the conjuncts, not at the condition as a whole.** `ON f.dk = d.k` and
+/// `ON f.dk = d.k AND d.bucket = 1` seek the same inner row; the second merely has something more
+/// to check once it is found. Matching only a bare equality answers the first with one key read
+/// and the second by materialising the whole inner table for every outer row — the worse plan for
+/// the *more* selective query, and the regression that appears the moment the planner starts
+/// moving a `WHERE` conjunct onto a join.
+///
+/// The first conjunct that is a key equality becomes the probe; everything else is returned for
+/// the caller to make the residual out of, which [`Cursor`](super::cursor) applies to the pair the
+/// probe built.
+fn probe_for<'a>(
+    on: &'a Expr,
+    scope: &Scope<'_>,
+    inner: &TableDef,
+) -> Option<(crate::plan::Probe, Vec<&'a Expr>)> {
+    let mut probe: Option<crate::plan::Probe> = None;
+    let mut rest: Vec<&Expr> = Vec::new();
+    for conjunct in conjuncts_of(on) {
+        if probe.is_none()
+            && let Some(found) = key_probe(conjunct, scope, inner)
+        {
+            probe = Some(found);
+        } else {
+            rest.push(conjunct);
+        }
+    }
+    Some((probe?, rest))
+}
+
+/// The key lookup one equality allows, or `None` when it is not an equality between the outer side
+/// and a unique key of the inner one.
+fn key_probe(on: &Expr, scope: &Scope<'_>, inner: &TableDef) -> Option<crate::plan::Probe> {
     let Expr::Binary {
         op: BinaryOp::Eq,
         left,

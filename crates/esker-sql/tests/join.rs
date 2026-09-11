@@ -200,3 +200,39 @@ fn a_left_join_drives_from_the_left_even_when_the_other_way_would_probe() {
         "and it does not drive from r: {left:?}"
     );
 }
+
+/// **An extra conjunct in the `ON` does not cost the probe.** `ON l.k = r.id` and
+/// `ON l.k = r.id AND r.flag` seek the same inner row; the second merely has something more to
+/// check once it is found. A planner matching only a bare equality answers the first with one key
+/// read and the *more* selective second by materialising the whole of `r` for every row of `l`.
+///
+/// Asserted through `EXPLAIN`, because this failure is invisible in every answer: both plans
+/// return the same rows and only the cost differs. It is what regressed when the planner learned
+/// to move a `WHERE` conjunct onto a join (#54) — the conjunct arrived, the probe left, and no
+/// answer-checking test could see it.
+#[test]
+fn an_extra_condition_in_the_on_does_not_cost_the_probe() {
+    let mut node = parity::Node::new(FIXTURE);
+    for sql in [
+        "EXPLAIN SELECT l.id FROM l JOIN r ON l.k = r.id AND r.flag",
+        // The same two conjuncts the other way round, because "the first one" is an
+        // implementation detail and which of them is the key must not be.
+        "EXPLAIN SELECT l.id FROM l JOIN r ON r.flag AND l.k = r.id",
+        "EXPLAIN SELECT l.id FROM l LEFT JOIN r ON l.k = r.id AND r.flag",
+        // A comma join has no `ON` to lose, and #54 synthesises one out of the `WHERE` — so this
+        // shape *gains* a probe it never had, which is the same rule read the other way round.
+        "EXPLAIN SELECT l.id FROM l, r WHERE l.k = r.id AND r.flag",
+    ] {
+        let plan = node.rows(sql);
+        assert!(
+            plan.iter().any(|line| line[0].contains("Point Get on r")),
+            "{sql} materialised r instead of probing it: {plan:?}"
+        );
+    }
+    // And the conjunct the probe did not express is still applied to the pair it built: `r`'s
+    // third row has `flag = false`, so the pair the key read found is refused.
+    assert_eq!(
+        node.rows("SELECT l.id, r.id FROM l JOIN r ON l.id = r.id AND r.flag ORDER BY l.id"),
+        [["1", "1"]]
+    );
+}

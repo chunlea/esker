@@ -823,16 +823,33 @@ impl<'a> Cursor<'a> {
                         }
                         let node = probe_node(probe, *inner_table_id, inner_columns, row);
                         let namer = relation_namer(env);
+                        let mut joined = None;
                         if let Some(inner) = point(self.txn, self.tenant, &node, Some(&namer))? {
-                            let mut joined = row.clone();
-                            joined.extend(inner);
-                            *current = None;
-                            return Ok(Some(joined));
+                            let mut pair = row.clone();
+                            pair.extend(inner);
+                            // The probe answered its own equality exactly; a conjunct of the `ON`
+                            // that it did not express is checked here, against the pair it built.
+                            // A pair this rejects leaves the outer row **unmatched** — the same
+                            // state a probe that found nothing leaves it in — which is what keeps
+                            // a LEFT JOIN's row, NULL-extended, rather than dropping it. NULL is
+                            // not true here either, by the same rule the materialised arm follows.
+                            let keep = match residual {
+                                None => true,
+                                Some(condition) => {
+                                    matches!(evaluate_in(condition, &pair, env)?, Datum::Bool(true))
+                                }
+                            };
+                            joined = keep.then_some(pair);
                         }
-                        let unmatched = left_extend(*left_join, row, inner_columns.len());
+                        // Kept, or the outer row unmatched — and `row` borrows `current`, so both
+                        // are decided before it is cleared.
+                        let answer = match joined {
+                            Some(pair) => Some(pair),
+                            None => left_extend(*left_join, row, inner_columns.len()),
+                        };
                         *current = None;
-                        if unmatched.is_some() {
-                            return Ok(unmatched);
+                        if answer.is_some() {
+                            return Ok(answer);
                         }
                     }
                     Probe::Materialize => {
