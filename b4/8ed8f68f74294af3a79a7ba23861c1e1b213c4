@@ -1,0 +1,33 @@
+crates/esker-cli/tests/cluster_pd_group.rs
+  s_e59614afdddccb::t_6cffb91d28f85a 160-176,182-183,190,192,195-196,198-202,204
+crates/esker-cli/tests/pgwire_pd_failover.rs
+  s_e59614afdddccb::t_3dbc16f8568021 130
+crates/esker-proto/src/lib.rs
+  s_e59614afdddccb::t_a1f1c78f9adafe 64
+crates/esker-proto/src/pd_leader.rs
+  s_e59614afdddccb::t_93e5372cada670 42-45,84,340,495,503,519
+crates/esker-sql/src/pd.rs
+  s_e59614afdddccb::t_52f0d729dc7dc0 230
+crates/esker-store/src/pd_remote.rs
+  s_e59614afdddccb::t_46174b733ae7a3 206
+crates/esker-store/tests/pd_leader_kill.rs
+  s_e59614afdddccb::t_2edfb4cb54e9af 37,114,134-135,187
+docs/plans/phase-15-pd-ha.md
+  s_e59614afdddccb::t_8a43047404c183 436-456,651-656,665-668
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b48ed8f68f74294af3a79a7ba23861c1e1b213c4",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
