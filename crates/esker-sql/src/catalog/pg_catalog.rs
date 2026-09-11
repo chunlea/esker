@@ -2514,6 +2514,29 @@ pub fn casts_to(from: ColumnType, to: ColumnType) -> bool {
     if let (Some(held), Some(wanted)) = (ArrayValue::element_of(from), ArrayValue::element_of(to)) {
         return casts_to(held, wanted);
     }
+    // **A vector casts to its array and not back**, and `pg_cast` shows neither direction —
+    // which is a third case beside "a row" and "out of a string type". Measured on 19beta1:
+    //
+    // ```text
+    // '1 2 3'::int2vector::int2[]   [0:2]={1,2,3}      pg_cast rows for the pair: 0
+    // '{1,2}'::int2[]::int2vector   42846              and none the other way either
+    // '1 2 3'::text::int2[]         22P02 malformed array literal
+    // ```
+    //
+    // The last line is what proves it is **not** the text: an `int2vector` prints `1 2 3`, which
+    // `array_in` refuses. PostgreSQL's vectors *are* arrays underneath, so the coercion is binary
+    // and a catalog a client reads has nothing to show for it. So this is a rule here and **not**
+    // a row in `CASTS`: that table is also what `pg_cast` reports, and a row there would be this
+    // node claiming a cast the oracle does not list
+    // ([ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
+    // step 2, the SQL-visible half).
+    if matches!(
+        (from, to),
+        (ColumnType::Int2Vector, ColumnType::Int2Array)
+            | (ColumnType::OidVector, ColumnType::OidArray)
+    ) {
+        return true;
+    }
     let (from, to) = (i64::from(from.oid()), i64::from(to.oid()));
     CASTS
         .iter()
@@ -3441,6 +3464,8 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::Ltree => "ltree",
         ColumnType::LtreeArray => "_ltree",
         ColumnType::LQueryArray => "_lquery",
+        ColumnType::Int2VectorArray => "_int2vector",
+        ColumnType::OidVectorArray => "_oidvector",
         ColumnType::LQuery => "lquery",
         ColumnType::Hstore => "hstore",
         ColumnType::TsVector => "tsvector",
@@ -3645,6 +3670,8 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         // PostgreSQL's array category despite not being array types.
         | ColumnType::Int2Vector
         | ColumnType::LQueryArray
+        | ColumnType::Int2VectorArray
+        | ColumnType::OidVectorArray
         | ColumnType::OidVector => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
         // **`G` for geometric**, which is neither the `U` an extension type gets nor the
@@ -3812,7 +3839,9 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::VarBitArray
         | ColumnType::XmlArray
         | ColumnType::LtreeArray
-        | ColumnType::LQueryArray => "array_in",
+        | ColumnType::LQueryArray
+        | ColumnType::Int2VectorArray
+        | ColumnType::OidVectorArray => "array_in",
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
         ColumnType::Int2 => "int2in",

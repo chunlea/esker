@@ -71,24 +71,30 @@ fn every_other_type_still_builds_an_array() {
 /// [ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
 /// is the decision — `lquery` in its step one, the two vectors in its step two.
 #[test]
-fn the_two_arrays_this_node_does_not_have() {
+fn every_array_this_node_did_not_have_it_has() {
     let mut node = parity::Node::new(&["CREATE EXTENSION IF NOT EXISTS ltree"]);
-    // **`lquery` has left this list**, which is what ADR 0107 said finishing its step 1 would
-    // look like: it is a type now, so its array is one.
-    assert_eq!(
-        node.rows("SELECT pg_typeof(ARRAY['a.*'::lquery])"),
-        vec![vec!["lquery[]"]],
-        "ADR 0107 step 1"
-    );
-    for (written, pg) in [
+    // **The list this test is named for is empty now.** It held three — `lquery`, `int2vector`,
+    // `oidvector` — each answering `text[]` where 19beta1 answers the element's own array, and
+    // each closed by the step of ADR 0107 that owned it: `lquery` by step 1, the two vectors by
+    // step 2's SQL-visible half. The assertions stay as the census rows they were, inverted.
+    for (written, array) in [
+        ("'a.*'::lquery", "lquery[]"),
         ("'1 2'::int2vector", "int2vector[]"),
         ("'1 2'::oidvector", "oidvector[]"),
     ] {
         assert_eq!(
             node.rows(&format!("SELECT pg_typeof(ARRAY[{written}])")),
-            vec![vec!["text[]"]],
-            "19beta1 answers {pg} here; ADR 0107 **step 2** owns it — a vector is a model and not \
-             a type, and refusing instead would be the worse direction"
+            vec![vec![array]],
+            "19beta1 answers {array} here and so does this node now"
         );
     }
+    // **`void` is still the one refusal**, which is what this file is actually about: the gate is
+    // the type `void` and not "an array this node does not have", and closing the three above is
+    // what makes that sentence testable rather than merely true.
+    assert!(
+        node.answer("SELECT pg_typeof(ARRAY[NULL::void])")
+            .to_string()
+            .starts_with("!42704"),
+        "42704 could not find array type for data type void, on both servers"
+    );
 }

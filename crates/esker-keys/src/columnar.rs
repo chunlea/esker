@@ -184,6 +184,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::LtreeArray => 83,
         ColumnType::LQuery => 84,
         ColumnType::LQueryArray => 108,
+        ColumnType::Int2VectorArray => 109,
+        ColumnType::OidVectorArray => 110,
     }
 }
 
@@ -301,6 +303,8 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         // this collided with `tsvector` on the first attempt — the compiler said so, as an
         // *unreachable pattern* rather than as an error.
         108 => ColumnType::LQueryArray,
+        109 => ColumnType::Int2VectorArray,
+        110 => ColumnType::OidVectorArray,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"

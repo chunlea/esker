@@ -180,6 +180,24 @@ impl Aggregation {
             AggregateFunc::ArrayAgg if arg == ColumnType::Void => {
                 Err(SqlError::NoArrayType(ColumnType::Void.name()))
             }
+            // **Accumulating a vector gives the vector back**, and the constructor does not —
+            // measured on 19beta1, and the pair is why this lives here and not in `array_over`:
+            //
+            // ```text
+            // pg_typeof(array_agg(x)) over an int2vector   int2vector
+            // pg_typeof(ARRAY['1 2'::int2vector])          int2vector[]
+            // ```
+            //
+            // A vector *is* an array to `array_agg(anyarray)`, which answers its argument's type
+            // the way `array_agg(bigint[])` answers `bigint[]`; it is **not** one to `ARRAY[…]`,
+            // which makes an array of it. ADR 0107 calls the vectors a model rather than a type
+            // for exactly this kind of split, and `ColumnType::element_of` must not learn it: a
+            // vector's oid is derived through that function and would come back as `_int2`'s.
+            AggregateFunc::ArrayAgg
+                if matches!(arg, ColumnType::Int2Vector | ColumnType::OidVector) =>
+            {
+                Ok(arg)
+            }
             AggregateFunc::ArrayAgg => {
                 Ok(esker_keys::array::ArrayValue::array_over(arg).unwrap_or(ColumnType::Text))
             }

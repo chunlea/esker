@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 37;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 38;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -369,6 +369,13 @@ const TAG_REGCLASS_ARRAY: u8 = 106;
 /// this number and [`CATALOG_FORMAT_VERSION`] are a shared resource between branches, whoever lands
 /// second renumbers, and it has collided twice.
 const TAG_LQUERY_ARRAY: u8 = 107;
+/// The two vectors' arrays, appended for ADR 0107 step 2 — **their own representation does not
+/// move**, only the array type they had been missing. 108/109 claimed out loud in
+/// `esker-coord/b4-claims-format-38.md` before they were written, for [`CATALOG_FORMAT_VERSION`]'s
+/// reason.
+const TAG_INT2VECTOR_ARRAY: u8 = 108;
+/// See [`TAG_INT2VECTOR_ARRAY`].
+const TAG_OIDVECTOR_ARRAY: u8 = 109;
 
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
@@ -488,6 +495,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Ltree => TAG_LTREE,
         ColumnType::LtreeArray => TAG_LTREE_ARRAY,
         ColumnType::LQueryArray => TAG_LQUERY_ARRAY,
+        ColumnType::Int2VectorArray => TAG_INT2VECTOR_ARRAY,
+        ColumnType::OidVectorArray => TAG_OIDVECTOR_ARRAY,
         ColumnType::LQuery => TAG_LQUERY,
         ColumnType::Bit => TAG_BIT,
         ColumnType::VarBit => TAG_VARBIT,
@@ -648,6 +657,8 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_LTREE => ColumnType::Ltree,
         TAG_LTREE_ARRAY => ColumnType::LtreeArray,
         TAG_LQUERY_ARRAY => ColumnType::LQueryArray,
+        TAG_INT2VECTOR_ARRAY => ColumnType::Int2VectorArray,
+        TAG_OIDVECTOR_ARRAY => ColumnType::OidVectorArray,
         TAG_LQUERY => ColumnType::LQuery,
         TAG_BIT => ColumnType::Bit,
         TAG_VARBIT => ColumnType::VarBit,

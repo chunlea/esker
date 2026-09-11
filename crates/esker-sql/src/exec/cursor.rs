@@ -2690,6 +2690,45 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             {
                 crate::value::json::cast_to_scalar(text, *to)?
             }
+            // **A vector to its array, and only the *plan* knows it is a vector.** An
+            // `int2vector` is a `Datum::Text` here — `1 2 3`, space separated, which is its output
+            // function's form and not an array literal — so the value cannot say which cast this
+            // is and the operand's declared type can. Measured on 19beta1:
+            //
+            // ```text
+            // '1 2 3'::int2vector::int2[]   [0:2]={1,2,3}     <- **lower bound zero**
+            // '1 2 3'::text::int2[]         22P02 malformed array literal
+            // '{1,2}'::int2[]::int2vector   42846             <- one direction only
+            // ```
+            //
+            // The second line is why this is an arm and not a text round trip, and the **zero** is
+            // the whole of what a vector is: an array subscripted from 0, which `array_lower`
+            // already answers here and `esker-keys`' row encoding has always been able to hold
+            // ([ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
+            // step 2, the SQL-visible half — no stored byte moves).
+            Datum::Text(ref text)
+                if matches!(*to, ColumnType::Int2Array | ColumnType::OidArray)
+                    && matches!(
+                        declared_type_of(operand),
+                        Some(ColumnType::Int2Vector | ColumnType::OidVector)
+                    ) =>
+            {
+                let element = if *to == ColumnType::Int2Array {
+                    ColumnType::Int2
+                } else {
+                    ColumnType::Oid
+                };
+                let mut values = Vec::new();
+                for word in text.split_whitespace() {
+                    values.push(Some(Datum::from_text(element, word)?));
+                }
+                Datum::Array(esker_keys::array::ArrayValue {
+                    element,
+                    lower: 0,
+                    dims: vec![i32::try_from(values.len()).unwrap_or(i32::MAX)],
+                    values,
+                })
+            }
             // **A `"char"` to an `int4` is the byte, and only the *plan* knows it is a `"char"`.**
             // A `"char"` and a `text` are the same `Datum::Text` here, and `text -> int4` really is
             // the I/O conversion it looks like — `'42'::text::int4` is 42 — so the value alone

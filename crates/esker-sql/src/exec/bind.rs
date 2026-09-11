@@ -1658,6 +1658,8 @@ fn placeholder(ty: ColumnType) -> Datum {
         | ColumnType::XmlArray
         | ColumnType::LtreeArray
         | ColumnType::LQueryArray
+        | ColumnType::Int2VectorArray
+        | ColumnType::OidVectorArray
         // **Five array types used to sit in an arm of their own with `money`'s element.** A
         // stand-in's whole job is to answer `column_type()` with the parameter's type, and
         // `ArrayValue::empty(Money)` answers `money[]` for all six — so `Describe` over
