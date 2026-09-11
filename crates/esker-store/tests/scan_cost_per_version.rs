@@ -143,24 +143,23 @@ fn get_cost(store: &Arc<Store>, state: &Arc<RegionState>, read_ts: u64) -> u64 {
 /// **The assertion #58 turns on.** The rows a scan returns do not depend on how many versions each
 /// key has; the entries it steps over must not either.
 ///
-/// # Still red, and exactly which half
+/// # It took two fixes, in two layers, and the second was the larger
 ///
-/// `user_keys_in`'s **`write` CF loop is fixed** — it seeks past each key's remaining versions and
-/// its cost is now flat in V. Measured between the two loops at V=16: the versions half spends
-/// about 40 entries for 20 keys at every depth, where it spent `3 × keys × V`.
+/// `user_keys_in`'s **`write` CF loop** stepped one MVCC version at a time; it now seeks past each
+/// key's remaining versions, using the prefix successor `key::version_range` already computes.
+/// That took V=256 from 15,380 entries to 10,280.
 ///
-/// What is left is the **`lock` CF loop**, and it is a different mechanism wearing the same
-/// symptom. A lock key has no timestamp suffix — one user key per row — so there is nothing to
-/// seek past. The entries under it are the engine's own superseded versions: every prewrite puts a
-/// lock and every commit deletes it, so a key committed V times carries `2V` obsolete entries,
-/// and `DbIterator::find_next` steps every one of them to decide the key is currently deleted.
-/// Measured at V=16: 640 entries for 20 keys, which is `keys × 2V` to the digit.
+/// The rest was **not** `txnkv`'s at all, and only the counter found it: the `lock` CF half. A lock
+/// key has no timestamp suffix, so there is nothing to seek past — the entries under it are the
+/// *engine's* own superseded versions, because every prewrite puts a lock and every commit deletes
+/// it. `DbIterator::find_next` stepped all `2V` of them to decide the key was currently absent. It
+/// now steps eight and then seeks past the key, which is what takes this flat.
 ///
-/// That one is an engine read-path question (skip to the next user key rather than stepping
-/// through a decided one), not a `txnkv` one, and it is the coordinator's to rule on — so this
-/// stays `#[ignore]`d and named rather than weakened into a bound it can already meet.
+///     V=1     80        V=16    220        V=256   220
+///
+/// Flat from 16 upward, and the 80 → 220 step is the threshold being paid once per key —
+/// 20 keys × 8 steps — rather than a term that grows.
 #[test]
-#[ignore = "#58: the write-CF half is fixed; the lock CF's superseded entries are the open half"]
 fn a_scan_costs_the_same_however_deep_the_history() {
     let mut measured = Vec::new();
     for versions in VERSIONS {
