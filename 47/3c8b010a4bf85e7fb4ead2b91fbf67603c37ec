@@ -1,0 +1,25 @@
+crates/esker-proto/src/pd_leader.rs
+  s_e59614afdddccb::t_cd9e1d2a67d980 128-140
+crates/esker-sql/src/bin/esker-sql.rs
+  s_e59614afdddccb::t_2def565aafa2df 56,61,81-85,101-102,143,198,205,210-216,228,255-257,259-270,300,304-308,350,383,394-398
+crates/esker-sql/src/pd.rs
+  s_e59614afdddccb::t_3c29b00e11f7e1 43-45,58-59,61-62,67-70,77-79,88-101,103,110,113-119,190-251,258,286-289,291,296-297,302-303,313-316
+crates/esker-sql/tests/pd_leader_kill.rs
+  s_e59614afdddccb::t_3289ed4948ba88 1-224
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "473c8b010a4bf85e7fb4ead2b91fbf67603c37ec",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
