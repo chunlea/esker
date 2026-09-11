@@ -582,3 +582,83 @@ fn described(node: &mut parity::Node, sql: &str) -> (u32, i32) {
         .unwrap_or_else(|| panic!("{sql} described no fields"));
     (fields[0].type_oid, fields[0].type_modifier)
 }
+
+/// **One statement, one resolution pass — and the arms were not in it.**
+///
+/// Everything `Executor::bound` does runs through `exec::bind`'s walkers, and none of them
+/// descended into `select.set_arms`. So a `UNION`'s second arm got none of it, and each pass said
+/// so from the row evaluator as an `XX000` — this crate reporting a state it does not handle, for
+/// statements whose **first** arm answers the same expression perfectly. Measured before the fix,
+/// five of them:
+///
+/// ```text
+/// SELECT 'pg_class'::regclass UNION SELECT 'pg_type'::regclass
+///     XX000 internal error: regclass() reached the row evaluator unresolved
+/// SELECT current_schema() UNION SELECT current_schema()      XX000 a current_schema …
+/// SELECT current_database() UNION SELECT current_database()  XX000 a current_schema …
+/// SELECT m FROM t UNION SELECT 'sad'::mood FROM t            XX000 a cast to a user-defined type …
+/// SELECT n FROM t UNION SELECT ('mood'::regtype)::int4       XX000 a regtype over a user-defined type …
+/// ```
+///
+/// The third walker with this hole and the same fix: a `FROM` function's arguments were the second
+/// (wire v3 family F10) and a `FROM`'s `VALUES` rows the first. `debts-v1.1.md` #57.
+#[test]
+fn a_set_arm_gets_the_same_resolution_the_first_one_does() {
+    let mut node = parity::Node::new(FIXTURE);
+    // Sorted here rather than by `ORDER BY 1`, which would sort by the **oid** a `regclass` is.
+    let mut relations =
+        node.rows("SELECT 'pg_class'::regclass AS r UNION SELECT 'pg_type'::regclass");
+    relations.sort();
+    assert_eq!(relations, vec![vec!["pg_class"], vec!["pg_type"]]);
+    assert_eq!(
+        node.rows("SELECT current_schema() AS s UNION SELECT current_schema()"),
+        vec![vec!["public"]]
+    );
+    assert_eq!(
+        node.rows("SELECT current_database() AS d UNION SELECT current_database()"),
+        vec![vec!["esker"]]
+    );
+    // **Only in the second arm**, which is the shape that needs the *read-only* walker as well:
+    // `resolve_current_database` and its siblings ask `bind::any` first and return early when the
+    // answer is no, so a construct the question could not see was never resolved even once the
+    // mutable walk could have reached it. Two walkers, written as a pair, exactly as
+    // `walk_table_ref_mut`'s own comment says of the `FROM` shapes.
+    assert_eq!(
+        node.rows("SELECT 'esker' AS d UNION SELECT current_database()"),
+        vec![vec!["esker"]]
+    );
+    assert_eq!(
+        node.rows("SELECT 'public' AS s UNION SELECT current_schema()"),
+        vec![vec!["public"]]
+    );
+    // A `regtype` over a **user** type, which is the same pass one function over.
+    node.run("CREATE TYPE mood AS ENUM ('sad', 'ok')").unwrap();
+    let oid = node.rows("SELECT ('mood'::regtype)::int4")[0][0].clone();
+    assert_eq!(
+        node.rows("SELECT 0 AS n UNION SELECT ('mood'::regtype)::int4 ORDER BY 1"),
+        vec![vec!["0".to_owned()], vec![oid]]
+    );
+}
+
+/// **A parameter in a non-first arm is typed by that arm's own columns**, which needs two more of
+/// the same walkers: the one that collects the statement's relations and the one that types.
+///
+/// `SELECT c FROM b UNION SELECT c FROM b WHERE c = $1` is one statement with one `$n` sequence.
+/// Before the walk reached the arms, `bind::infer` saw neither the predicate nor — for a relation
+/// only an arm names — the table to type it against, and the parameter fell back to `text`. It
+/// happens to be `text` here, so the shape that proves it is a column of another type.
+#[test]
+fn a_parameter_in_a_set_arm_is_typed_by_its_own_arm() {
+    let mut node = parity::Node::new(FIXTURE);
+    // `so.i` is an `int4`: a parameter compared against it is an `int4` (23) and not `text` (25).
+    let described = node
+        .describe("SELECT 0 AS i UNION SELECT i FROM so WHERE i = $1")
+        .unwrap();
+    assert_eq!(described.parameters, vec![23]);
+    // And the same statement runs, with the parameter filled — a `$n` the substitution never
+    // reached is an `XX000` from the row evaluator.
+    assert_eq!(
+        node.rows("SELECT 0 AS i UNION SELECT i FROM so WHERE i = 1 ORDER BY 1"),
+        vec![vec!["0"], vec!["1"]]
+    );
+}
