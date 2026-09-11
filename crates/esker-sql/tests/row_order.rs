@@ -148,6 +148,9 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 // **A pattern has no comparison at all**, which is `json`'s reason: `lquery`
                 // exists to be matched with `~` and never to be stored, ordered or indexed.
                 | ColumnType::LQuery
+                // Its array joins it for both of the reasons above at once — no comparison to
+                // reproduce, and `ltree[]`'s missing delimiter rule (ADR 0107 step 1).
+                | ColumnType::LQueryArray
                 // **A tsvector's order is not its printed form's.** Measured on 19beta1 over ten
                 // values: `'b'` sorts before `'ab'` and `'a':1A` before `'a':1`, where plain bytes
                 // give the reverse of both, and a two-lexeme vector lands between two one-lexeme

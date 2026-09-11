@@ -2706,37 +2706,36 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             {
                 Datum::Int4(crate::value::char_type::to_int4(text))
             }
-            value => {
-                // **Ask whether a real server would have rendered anything at all, first.**
-                // `pg_cast.castmethod` says: `i` is this arm's text round trip and `f` and `b` are
-                // conversions where the text is never written. Reading a `numeric`'s `2.5` with
-                // `int4in` was a `22P02` for a value a real server rounds to `2`; so were a
-                // float's `1.5`, a `bool`'s `t`, and a `bytea`'s hex — and `65::int4::bytea` did
-                // not refuse at all, it answered `\x3635`, the ASCII of the digits, where a real
-                // server gives the number's four bytes. `crate::value::convert_without_text` holds
-                // the pairs and `tests/cast_matrix.rs` holds the ones still missing from it.
-                if let Some(converted) = crate::value::convert_without_text(&value, *to) {
-                    return converted;
+            // **An array to another array is the element cast, done per element** — not the
+            // source array's *text* read back through the target's `array_in`, which is what the
+            // arm below would do and what every route into this one was doing.
+            //
+            // The scalar pair and the array pair disagreed, three ways, measured on 19beta1:
+            //
+            // ```text
+            // 1.5::float8::integer            2        '{1.5}'::float8[]::integer[]       22P02
+            // '2020-01-01'::date::character   2        '{…}'::date[]::character[]         22001
+            // ```
+            //
+            // and `{2}` is the answer to all six there. It was not the literal-array path either:
+            // a **column** of `float8[]` cast to `integer[]` reached the same `22P02`, so the
+            // defect is the cast itself and the three routes share it.
+            //
+            // **The typmod is the element's** — `lower_type`'s array arm says so and
+            // `character varying(255)[]` is why — so it goes to each element unchanged, which is
+            // what makes `'{2020-01-01}'::date[]::character[]` truncate to `{2}` the way its
+            // scalar does.
+            Datum::Array(mut values)
+                if let Some(element) = esker_keys::array::ArrayValue::element_of(*to)
+                    && values.element != element =>
+            {
+                for datum in values.values.iter_mut().flatten() {
+                    *datum = cast_one_value(datum, element, *typmod, env.settings.rendering)?;
                 }
-                // **The session's output function, not the boot one.** A cast between two types
-                // here is a text round trip, so the text it goes through has to be the text the
-                // session would see: under `SET TimeZone = 'Pacific/Auckland'`,
-                // `'2011-01-01 23:30:00+00'::timestamptz::date` is `2011-01-02` on a real server
-                // and was `2011-01-01` here, because the round trip rendered the instant in UTC
-                // and the date parser read the day off it. Measured
-                // (`tests/captures/pg19_time_zone.txt`), and the same reasoning `ToText` below
-                // already applied for an `interval`'s dialect.
-                // **The cast's text and not the output function's**, which differ for exactly
-                // one type: a `boolean` prints `t` and casts to `true`. This arm wrote `t` into a
-                // `varchar` and a `bpchar` while `ToText` beside it and `||` below both had the
-                // rule (`debts-v1.1.md` #44). `crate::value::cast_text_under` is the one reader
-                // now.
-                let text = crate::value::cast_text_under(&value, env.settings.rendering)
-                    .ok_or_else(|| SqlError::DatatypeMismatch("a value with no text".to_owned()))?;
-                // The modifier the cast wrote, applied the way a column's is: `$1::varchar(3)`
-                // bounds the string exactly as a `varchar(3)` column would.
-                crate::value::truncate_to_typmod(Datum::from_text(*to, &text)?, *to, *typmod)?
+                values.element = element;
+                Datum::Array(values)
             }
+            value => cast_one_value(&value, *to, *typmod, env.settings.rendering)?,
         },
         // **The operand's value, unchanged.** Both collations this node has are byte order
         // (ADR 0076), so the clause never moves a byte; what it does is make a collation
@@ -4638,6 +4637,60 @@ fn relation_namer(env: Env<'_>) -> impl Fn(i64) -> Box<str> + '_ {
         Ok(Datum::RegClass { name, .. }) => name,
         _ => oid.to_string().into_boxed_str(),
     }
+}
+
+/// **One value into one type**, where the pair has a cast and neither side needs the plan.
+///
+/// The tail of the `Expr::Cast` arm, in a function because an **array**'s cast is this applied per
+/// element — and a second copy of it is how the scalar pair and the array pair come to disagree,
+/// which is exactly what they were doing (`1.5::float8::integer` is `2` and
+/// `'{1.5}'::float8[]::integer[]` was `22P02`).
+///
+/// The arms it does **not** carry are the ones that need the operand's *declared* type — a `jsonb`
+/// and a `"char"` are both a `Datum::Text` here — and those stay above, where the plan is.
+fn cast_one_value(
+    value: &Datum,
+    to: ColumnType,
+    typmod: i32,
+    rendering: crate::value::Rendering,
+) -> Result<Datum> {
+    // **Ask whether a real server would have rendered anything at all, first.**
+    // `pg_cast.castmethod` says: `i` is the text round trip below and `f` and `b` are
+    // conversions where the text is never written. Reading a `numeric`'s `2.5` with `int4in` was
+    // a `22P02` for a value a real server rounds to `2`; so were a float's `1.5`, a `bool`'s `t`,
+    // and a `bytea`'s hex — and `65::int4::bytea` did not refuse at all, it answered `\x3635`,
+    // the ASCII of the digits, where a real server gives the number's four bytes.
+    // `crate::value::convert_without_text` holds the pairs and `tests/cast_matrix.rs` holds the
+    // ones still missing from it.
+    if let Some(converted) = crate::value::convert_without_text(value, to) {
+        return converted;
+    }
+    // **The fourteen geometric conversions are computed**, never read back through the text — the
+    // scalar arm above says why at length. It is repeated here rather than only there because an
+    // *element* never reaches that arm: `'{((0,0),(1,1))}'::box[]::polygon[]` is the four corners
+    // on 19beta1 and was `22P02` here, the text of a `box` handed to `polygon_in`.
+    if crate::value::is_geometric(to)
+        && matches!(value, Datum::Geometry { .. } | Datum::Point { .. })
+    {
+        return crate::value::geometric_cast(value, to);
+    }
+    // **The session's output function, not the boot one.** A cast between two types here is a
+    // text round trip, so the text it goes through has to be the text the session would see:
+    // under `SET TimeZone = 'Pacific/Auckland'`,
+    // `'2011-01-01 23:30:00+00'::timestamptz::date` is `2011-01-02` on a real server and was
+    // `2011-01-01` here, because the round trip rendered the instant in UTC and the date parser
+    // read the day off it. Measured (`tests/captures/pg19_time_zone.txt`), and the same reasoning
+    // `ToText` applies for an `interval`'s dialect.
+    // **The cast's text and not the output function's**, which differ for exactly one type: a
+    // `boolean` prints `t` and casts to `true`. This wrote `t` into a `varchar` and a `bpchar`
+    // while `ToText` beside it and `||` below both had the rule (`debts-v1.1.md` #44).
+    // `crate::value::cast_text_under` is the one reader now.
+    let text = crate::value::cast_text_under(value, rendering)
+        .ok_or_else(|| SqlError::DatatypeMismatch("a value with no text".to_owned()))?;
+    // The modifier the cast wrote, applied the way a column's is: `$1::varchar(3)` bounds the
+    // string exactly as a `varchar(3)` column would — and for an array it is the **element's**
+    // modifier, which is the one `lower_type` puts on the array cast.
+    crate::value::truncate_to_typmod(Datum::from_text(to, &text)?, to, typmod)
 }
 
 /// **`regclassin`'s own rule**: all digits are an oid, anything else is a relation name.

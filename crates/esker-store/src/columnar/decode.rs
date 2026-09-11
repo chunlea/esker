@@ -262,6 +262,9 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         | StoredType::Ltree
         | StoredType::LtreeArray
         | StoredType::LQuery
+        // `lquery[]` joins them the day it exists (ADR 0107 step 1), for both of their reasons at
+        // once: a pattern has no comparison and an array's is not its bytes'.
+        | StoredType::LQueryArray
         | StoredType::FloatRange
         | StoredType::VarcharRange
         | StoredType::TstzRangeArray

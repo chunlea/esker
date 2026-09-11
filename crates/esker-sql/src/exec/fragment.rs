@@ -1138,6 +1138,7 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         // columnar run could not sort or filter one without a vocabulary for that order.
         | Row::Ltree
         | Row::LtreeArray
+        | Row::LQueryArray
         | Row::LQuery
         | Row::BoolArray
         | Row::ByteaArray

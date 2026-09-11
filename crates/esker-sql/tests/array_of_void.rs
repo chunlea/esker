@@ -71,18 +71,24 @@ fn every_other_type_still_builds_an_array() {
 /// [ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
 /// is the decision — `lquery` in its step one, the two vectors in its step two.
 #[test]
-fn the_three_arrays_this_node_does_not_have() {
+fn the_two_arrays_this_node_does_not_have() {
     let mut node = parity::Node::new(&["CREATE EXTENSION IF NOT EXISTS ltree"]);
+    // **`lquery` has left this list**, which is what ADR 0107 said finishing its step 1 would
+    // look like: it is a type now, so its array is one.
+    assert_eq!(
+        node.rows("SELECT pg_typeof(ARRAY['a.*'::lquery])"),
+        vec![vec!["lquery[]"]],
+        "ADR 0107 step 1"
+    );
     for (written, pg) in [
-        ("'a.*'::lquery", "lquery[]"),
         ("'1 2'::int2vector", "int2vector[]"),
         ("'1 2'::oidvector", "oidvector[]"),
     ] {
         assert_eq!(
             node.rows(&format!("SELECT pg_typeof(ARRAY[{written}])")),
             vec![vec!["text[]"]],
-            "19beta1 answers {pg} here; F6 owns it, and refusing instead would be the worse \
-             direction"
+            "19beta1 answers {pg} here; ADR 0107 **step 2** owns it — a vector is a model and not \
+             a type, and refusing instead would be the worse direction"
         );
     }
 }

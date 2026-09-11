@@ -183,6 +183,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::Ltree => 82,
         ColumnType::LtreeArray => 83,
         ColumnType::LQuery => 84,
+        ColumnType::LQueryArray => 108,
     }
 }
 
@@ -293,6 +294,13 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         82 => ColumnType::Ltree,
         83 => ColumnType::LtreeArray,
         84 => ColumnType::LQuery,
+        // **The reverse mapping is the place the compiler does not point at**: it matches on a
+        // number, so a type added above and forgotten here is a `column type tag 108 is not one of
+        // ours` at read time and not a build error. The number is **108 and not 85**: the forward
+        // list is not in tag order past `lquery`, and reading the tag off the line above it is how
+        // this collided with `tsvector` on the first attempt — the compiler said so, as an
+        // *unreachable pattern* rather than as an error.
+        108 => ColumnType::LQueryArray,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"

@@ -183,6 +183,7 @@ mod tests {
             | ColumnType::VarBitArray
             | ColumnType::XmlArray
             | ColumnType::LtreeArray
+            | ColumnType::LQueryArray
             => {
                 let element = esker_keys::array::ArrayValue::element_of(ty)
                     .unwrap_or(ColumnType::Text);

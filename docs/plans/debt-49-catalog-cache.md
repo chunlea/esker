@@ -400,11 +400,17 @@ views** (`pg_class × pg_depend` on `oid = objid`: 1.55 ms → 24.6 ms for five 
 15.9x), which is a planner defect that no option in ADR 0106 touches.
 
 On the in-process node a KV read is a `BTreeMap` lookup; on the real topology it is **232 µs**.
-So the clock here cannot see this row's change at all. The test is left in place, `#[ignore]`d with
-that reason and those numbers, and
-[`a_repeated_statement_reads_only_the_version_keys`](../../crates/esker-sql/tests/catalog_read_slope.rs)
-is the acceptance test that does translate — red at 60 before, green at 4 now, asserted at two
-catalog sizes. `esker-coord/QUESTION-b4.md` is where the rewrite is asked for rather than taken.
+So the clock here cannot see this row's change at all — and it is the one place the in-process node
+measures *better* than the real cluster, because what it times is the planner and nothing else.
+
+**Ruled by the user 2026-09-10:** the test stays in place, `#[ignore]`d, with that reason and those
+numbers, and it becomes **`debts-v1.1.md` #54**'s red test — *computed catalog views join by cross
+product, so a statement over two of them scales with the square of the catalog*. Not fixed in this
+unit. **This plan's acceptance is the read count** —
+[`a_repeated_statement_reads_only_the_version_keys`](../../crates/esker-sql/tests/catalog_read_slope.rs),
+red at 60 before and green at 4 now, asserted at two catalog sizes — **plus r1's next real-topology
+pricing** of `pk_and_sequence_for`: 2.38 s at 35 round trips, expected well under 0.3 s at 4. The
+second half is r1's and is what closes the row.
 
 ### And a wrong answer the tests found on the way
 

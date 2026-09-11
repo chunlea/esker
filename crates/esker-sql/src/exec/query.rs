@@ -4423,7 +4423,7 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // **Its own family**: `ltree = text` is `42883` on a real server, and an ltree
             // compares with another ltree and with nothing else.
             ColumnType::Ltree => 78,
-            ColumnType::LtreeArray => 79,
+            ColumnType::LtreeArray | ColumnType::LQueryArray => 79,
             // A pattern compares with nothing, including another pattern.
             ColumnType::LQuery => 80,
         }
