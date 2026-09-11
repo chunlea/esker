@@ -1,0 +1,37 @@
+crates/esker-cli/src/admin.rs
+  s_ac192c209f55d3::t_47d4b3fdef480f 38-44,87-92,98-107,145-167
+crates/esker-cli/src/args.rs
+  s_ac192c209f55d3::t_ce5606dd6b24a4 208-213,837,852-858,879-886
+crates/esker-cli/tests/admin_storage.rs
+  s_ac192c209f55d3::t_40f7d6021d1470 302-393
+crates/esker-engine/src/db/mod.rs
+  s_ac192c209f55d3::t_db9dbec275112d 614-640
+crates/esker-proto/src/lib.rs
+  s_ac192c209f55d3::t_77153ddcece378 57-58
+crates/esker-proto/src/messages.rs
+  s_ac192c209f55d3::t_b1effc3f8dd189 129-132,223,264,321,375,1038-1049,1068,1090,1109-1111,1332-1344,1377-1390,1414,1435-1446,1488-1503,1778-1779
+crates/esker-proto/tests/golden/messages.hex
+  s_ac192c209f55d3::t_344470b1f6c8ad 136,162
+crates/esker-proto/tests/messages.rs
+  s_ac192c209f55d3::t_ecffaa1bafb85f 364-369,1115-1132
+crates/esker-store/src/server.rs
+  s_ac192c209f55d3::t_9df328e65517d0 2061-2078,3401-3412,3419,3473-3490
+crates/esker-store/tests/safepoint_collects.rs
+  s_ac192c209f55d3::t_63d059a32f136f 1-145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b200b88b359769002fbb91a77a601dd6a55e33e9",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
