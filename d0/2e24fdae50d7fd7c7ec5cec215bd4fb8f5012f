@@ -1,0 +1,25 @@
+crates/esker-sql/tests/catalog_read_slope.rs
+  s_e59614afdddccb::t_9b6776f0eb1344 24-26,46-48,179-182
+docs/adr/0106-what-a-statement-reads-below-the-sql.md
+  s_e59614afdddccb::t_efa6e91d910a86 524-531,535-540
+docs/plans/debt-49-catalog-cache.md
+  s_e59614afdddccb::t_7c055d2cea4682 403-413
+docs/plans/debts-v1.1.md
+  s_e59614afdddccb::t_2a7efd30f04e16 24,112,115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d02e24fdae50d7fd7c7ec5cec215bd4fb8f5012f",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
