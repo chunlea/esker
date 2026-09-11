@@ -1,6 +1,8 @@
 # 0110 — Who publishes the garbage-collection safepoint
 
-Status: **Proposed**, 2026-09-10. Decision material for #58; no code, and nothing here is built.
+Status: **Proposed**, 2026-09-10; **step 1 built 2026-09-11**. Decision material for #58.
+The hand-operated publisher below is built and measured — see *Step 1 is built*. **Step 2, who
+publishes automatically, is proposed and unbuilt**, and is the part that needs a ruling.
 
 ## Context — the collector exists, works, and has never been given a number
 
@@ -180,6 +182,56 @@ nobody tests and everybody eventually hits.
   and then reads must either answer from its snapshot or fail loudly — never answer differently.
   This is the test the window-only option cannot pass, and it is how to tell the two apart.
 * **A cluster on `CountingOracle` collects nothing**, rather than collecting everything.
+
+## Step 1 is built, and what it measured
+
+`esker admin gc --safepoint <ts> --store <addr>` — one more method on ADR 0109's admin service,
+`0x0506`, purely additive, two golden lines added and none changed. It raises the store's published
+safepoint (never lowering it), compacts every column family so the filter actually runs, and answers
+with the safepoint in force and **per-family SST and entry counts**. It does **not** publish
+anything automatically; that is step 2 and remains the user's to rule on.
+
+**The collector works exactly as ADR 0021 describes.** Eight keys, twelve committed versions each,
+written through prewrite and commit, flushed, then compacted at two safepoints on two fresh stores:
+
+```text
+                    safepoint 0        safepoint u64::MAX
+     write               96          →        8            one version per key
+      lock              192          →      192            unchanged
+   default                0                   0            values were short and inline
+      raft                1                   1
+```
+
+`write` falls to exactly one entry per key. That is the whole of what this ADR proposed to find out,
+and it is now a fact rather than an expectation.
+
+### Two things the measurement found that the proposal did not predict
+
+**The `lock` column family is not collected at all, and it is the bigger number.** 192 entries
+against the `write` family's 96, unchanged by any safepoint — because they are not MVCC versions.
+Every prewrite puts a lock and every commit deletes it, so V commits leave `2V` superseded *engine*
+entries per key, and the safepoint filter has no opinion about a column family it does not
+understand. Tonight's engine fix stopped a scan *stepping* through them; nothing removes them.
+
+So **collection alone will not flatten the space curve**, and the prediction handed to r1 should say
+so: expect the `write` family to shrink and the directory to fall by less than the version count
+suggests. Whether those lock entries survive a *bottom-level* compaction in a longer-lived store, or
+only this test's single compaction, is the next thing to measure and is not answered here.
+
+**A second compaction of an already-compacted family is a no-op**, so a store compacted at safepoint
+zero and then again at a higher one reports "collected nothing" whatever the collector does. The
+acceptance uses a fresh store per safepoint for that reason. Any future measurement that raises a
+safepoint on a live store has to force the compaction to have work to do, or it will measure its own
+no-op — which is the shape of mistake this whole investigation has been made of.
+
+### And the module doc overstates one thing
+
+`gc.rs` says *"Everything older goes, and so does its `default` entry."* Nothing in `gc.rs` touches
+the `default` family: its `cf::DEFAULT` references all read retention configuration. Where a value
+is too large to inline it lives there, keyed by `start_ts`, and this measurement could not see the
+case because its values were short. **Whether a large value's `default` entry is collected with its
+`write` record is unverified**, and it is the difference between reclaiming version records and
+reclaiming bytes. It is the first thing to check before anyone quotes a space saving.
 
 ## Consequences
 
