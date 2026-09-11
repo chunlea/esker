@@ -42,7 +42,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::{TcpListener, TcpStream};
+mod port_band;
+
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -140,7 +142,17 @@ fn a_fourth_driver_joins_three_real_processes_and_then_leaves() {
 
     // And back again, which is the half `remove` owns: a group that can only grow is not a group
     // an operator can repair.
-    let removed = members_command(&["remove", "4"], &founded[0]);
+    //
+    // **Retried, because the refusal it can meet here is the correct one.** A removal is checked
+    // against `recent_active`, which a leader clears at every election-timeout boundary and sets
+    // when a peer answers — so in the moments after an election, or after a fourth member has just
+    // joined, a healthy group still reports too few live to spare one. `pd/mod.rs` says as much
+    // where it refuses: *"the operator retries a second later"*. This test was that operator and
+    // did not retry, which made it fail about one run in three with
+    // `removing member 4 would leave 2 live of the 3 a quorum needs`.
+    let removed = retrying("`pd members remove`", REMOVE_SECONDS, || {
+        members_command(&["remove", "4"], &founded[0])
+    });
     assert!(
         removed.status.success(),
         "`pd members remove` failed: {}{}",
@@ -277,6 +289,34 @@ fn agree_on(addresses: &[String], expected: usize, what: &str) {
     );
 }
 
+/// How long a membership change may spend being refused for a reason that passes on its own.
+///
+/// Generous on purpose: what is being waited for is one election-timeout window, and the cost of
+/// waiting too long is nothing while the cost of waiting too little is a gate.
+const REMOVE_SECONDS: u64 = 30;
+
+/// Runs `attempt` until it succeeds or `seconds` pass, answering the last result either way.
+///
+/// The assertion stays at the call site — this only stops a *transient* refusal from being read as
+/// a failure, and a permanent one still arrives, with its own message, as the final result.
+fn retrying(
+    what: &str,
+    seconds: u64,
+    mut attempt: impl FnMut() -> std::process::Output,
+) -> std::process::Output {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut last = attempt();
+    while !last.status.success() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        eprintln!(
+            "  {what} was refused, retrying: {}",
+            String::from_utf8_lossy(&last.stderr).trim()
+        );
+        last = attempt();
+    }
+    last
+}
+
 fn members_command(words: &[&str], at: &str) -> std::process::Output {
     let mut command = Command::new(esker_cli());
     command.args(["pd", "members"]);
@@ -306,19 +346,13 @@ fn warm() {
         .status();
 }
 
-/// This file's own port band, for the reason `cluster_start.rs` gives: releasing a bound run and
-/// returning the base races whoever binds next, and only a private band makes that harmless
-/// between test binaries.
+/// A run of `span` consecutive free ports, from the one allocator every real-process test uses.
+///
+/// This file used to scan a fixed band of its own. See `tests/port_band/mod.rs` for why that
+/// deterministically collided with the other tests in this same binary, and what four gates it
+/// cost before anyone read the stderr.
 fn free_ports(span: u16) -> u16 {
-    for base in (34_100_u16..35_000).step_by(span as usize) {
-        let bound: Vec<TcpListener> = (0..span)
-            .filter_map(|at| TcpListener::bind(("127.0.0.1", base.checked_add(at)?)).ok())
-            .collect();
-        if bound.len() == span as usize {
-            return base;
-        }
-    }
-    panic!("no run of {span} consecutive free ports in 34,100–35,000, this file's own band");
+    port_band::reserve(span).into_base()
 }
 
 fn wait_for_port(
