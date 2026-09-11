@@ -676,6 +676,18 @@ pub enum ScalarFunc {
     /// `octet_length(text)`: **bytes**, which is a different number for anything non-ASCII — the
     /// pair is only interesting because the suite's generated columns use both.
     OctetLength,
+    /// `bit_length(x)`: **bits**, and its three `pg_proc` rows are `(bit)`, `(bytea)` and `(text)`.
+    ///
+    /// Over a string or a `bytea` it is `octet_length` times eight; over a `bit` or a `varbit` it
+    /// is the bits themselves, which is `length`'s answer and not `octet_length`'s. Measured on
+    /// 19beta1 (`tests/captures/pg19_length_overloads.txt`): `bit_length('abc')` is 24,
+    /// `bit_length('1'::bit)` is 1, `bit_length('\x0102'::bytea)` is 16.
+    ///
+    /// **It has no `(character)` row**, which is the detail that separates it from `octet_length`:
+    /// a `character(5)` reaches it through the coercion to `text`, and that coercion **trims the
+    /// trailing blanks** — `bit_length('ab'::character(5))` is 16 where `octet_length` of the same
+    /// value is 5. Measured, and it is why this one is not exempted from `read_as_text`.
+    BitLength,
 }
 
 impl ScalarFunc {
@@ -692,6 +704,7 @@ impl ScalarFunc {
             ScalarFunc::CharLength => "char_length",
             ScalarFunc::CharacterLength => "character_length",
             ScalarFunc::OctetLength => "octet_length",
+            ScalarFunc::BitLength => "bit_length",
         }
     }
 
@@ -708,6 +721,7 @@ impl ScalarFunc {
             "char_length" => Some(ScalarFunc::CharLength),
             "character_length" => Some(ScalarFunc::CharacterLength),
             "octet_length" => Some(ScalarFunc::OctetLength),
+            "bit_length" => Some(ScalarFunc::BitLength),
             _ => None,
         }
     }

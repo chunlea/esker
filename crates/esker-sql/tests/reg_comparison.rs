@@ -121,31 +121,28 @@ fn an_assignment_still_takes_the_name() {
     );
 }
 
-/// **A `reg*` **array** is a different mechanism and this step does not close it**, pinned with
-/// 19beta1's answers beside what this node gives.
+/// **A `reg*` array, both spellings, and the `0A000` this used to pin is gone.**
 ///
-/// Measured today:
+/// Measured, and the last row is what it cost:
 ///
 /// ```text
-/// '{t}'::regclass[]              regclass[]  {t}        here the same, value and type
-/// '{t}'::text::regclass[]        regclass[]  {t}        here 0A000 … without a catalog
+/// '{t}'::regclass[]              regclass[]  {t}
+/// '{t}'::text::regclass[]        regclass[]  {t}        <- was 0A000 … without a catalog
 /// '{nosuch}'::regclass[]         !42P01 relation "nosuch" does not exist
 /// '{int4,text}'::regtype[]       regtype[]   {integer,text}
 /// unnest(ARRAY['{t}'::regclass[]])           regclass   here text
 /// ```
 ///
-/// The **direct** spelling is right. What is not is the cast **at the use site**: the scalar's
-/// names are resolved in `Executor::bound`, before the plan, because a per-row catalog read is
-/// what that pass exists to avoid, and `'{…}'::text::regclass[]` is not a shape it walks — so the
-/// cast reaches the row evaluator, which has no catalog. It wants the same pass over an array's
-/// elements, and a `42P01` for a name that is not there — its own step, sized from these rows.
+/// The cast at the use site is `tests/regclass_array_from_text.rs`'s, which is where the rule it
+/// closed is written down: `text -> regclass[]` has **no** `pg_cast` row, so it is the target's
+/// input function and all-digits is an oid, while `text -> regclass` has one and is a name.
 ///
-/// The `unnest` row is wire v3 family **F10**'s last one, which is here because this is the
-/// mechanism that owns it.
+/// The `unnest` row is wire v3 family **F10**'s last one and is still open; it is here because
+/// this is the mechanism that owns it.
 #[test]
-fn a_reg_array_literal_is_still_text_here() {
+fn a_reg_array_literal_resolves_in_both_spellings() {
     let mut node = node();
-    // **The direct spelling is right, value and type**, which is what narrows the gap to the cast
+    // **The direct spelling is right, value and type**, which is what narrowed the gap to the cast
     // at the use site. An earlier reading of this said the type was `text`; the probe had wrapped
     // the expression in `::text` and was reporting its own cast.
     assert_eq!(
@@ -157,10 +154,12 @@ fn a_reg_array_literal_is_still_text_here() {
         vec![vec!["regclass[]"]]
     );
     assert_eq!(
-        node.answer("SELECT ('{ra}'::text::regclass[])::text")
-            .to_string(),
-        "!0A000 a relation name read as a regclass without a catalog is not supported",
-        "19beta1 answers the array; the cast reaches the row evaluator because nothing resolved the \
-         array's elements before the plan"
+        node.rows("SELECT ('{ra}'::text::regclass[])::text"),
+        vec![vec!["{ra}"]],
+        "the cast at the use site resolves its elements now"
+    );
+    assert_eq!(
+        node.rows("SELECT pg_typeof('{ra}'::text::regclass[])"),
+        vec![vec!["regclass[]"]]
     );
 }

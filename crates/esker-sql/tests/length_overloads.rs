@@ -147,16 +147,78 @@ fn octet_length_counts_bytes() {
     );
 }
 
-/// **`bit_length` is a fourth name with three overloads and this node has none of them** — pinned
-/// at the *named* refusal it gives, which is the honest state and not a wrong answer.
+/// **`bit_length` is the fourth name, and its three overloads are built** — it used to be a
+/// *named* `0A000`, which was the honest state and not a wrong answer.
 ///
-/// 19beta1: `bit_length('abc')` is 24, `bit_length('1'::bit)` is 1, `bit_length('\x0102'::bytea)`
-/// is 16. Its own small item.
+/// Its `pg_proc` rows are `(bit)`, `(bytea)` and `(text)`, and what each one counts is measured:
+/// over a string or a `bytea` it is `octet_length` times eight, over a `bit` or a `varbit` it is
+/// the **bits**, which is `length`'s answer rather than `octet_length`'s.
 #[test]
-fn bit_length_is_still_a_named_refusal() {
+fn bit_length_counts_the_bits_of_what_it_is_given() {
     let mut node = node();
+    for (written, answer) in [
+        ("'abc'::text", "24"),
+        // **Bytes times eight, so a multi-byte string is not its characters times eight**:
+        // `length('éî')` is 2 and `octet_length` is 4.
+        ("'éî'::text", "32"),
+        ("''::text", "0"),
+        ("'abc'::varchar", "24"),
+        ("'abc'::citext", "24"),
+        ("'abc'::name", "24"),
+        ("'x'::\"char\"", "8"),
+        // **The trailing blanks are gone**, because `bit_length` has no `(character)` row and the
+        // coercion to `text` trims: `octet_length('ab'::character(5))` is 5 and this is 16.
+        ("'ab'::character(5)", "16"),
+        // Bits, not bytes — the pair that says the two names are not one.
+        ("'1'::bit", "1"),
+        ("'101'::bit(3)", "3"),
+        ("'101010101'::varbit", "9"),
+        // Bytes times eight again.
+        ("'\\x0102'::bytea", "16"),
+        ("''::bytea", "0"),
+    ] {
+        assert_eq!(
+            node.rows(&format!("SELECT bit_length({written})::text")),
+            vec![vec![answer]],
+            "bit_length({written}) is {answer} on 19beta1"
+        );
+        assert_eq!(
+            node.rows(&format!("SELECT pg_typeof(bit_length({written}))::text")),
+            vec![vec!["integer"]],
+            "every one of the three overloads answers an integer"
+        );
+    }
     assert_eq!(
-        node.answer("SELECT bit_length('abc')").to_string(),
-        "!0A000 the function bit_length is not supported"
+        node.rows("SELECT bit_length(NULL::text) IS NULL"),
+        vec![vec!["t"]],
+        "and NULL in is NULL out"
     );
+}
+
+/// **The eight spellings it accepts, and the rest are `42883`** — asked of 19beta1 as
+/// `pg_typeof(bit_length(NULL::<type>))` over the wire v3 probe list's 100 spellings, which
+/// answers for exactly `"char"`, `bit`, `bytea`, `character`, `character varying`, `citext`,
+/// `name` and `text`, plus `bit varying`, which that list does not carry.
+///
+/// **That is `octet_length`'s set and not `length`'s**: no `tsvector`, no `lseg`, no `path`.
+#[test]
+fn bit_length_refuses_what_it_has_no_overload_for() {
+    let mut node = node();
+    for written in [
+        "'a b'::tsvector",
+        "'[(0,0),(3,4)]'::lseg",
+        "'[(0,0),(3,4)]'::path",
+        "1::integer",
+        "'2020-01-01'::date",
+        "'[1,2)'::int4range",
+    ] {
+        let answer = node
+            .answer(&format!("SELECT bit_length({written})"))
+            .to_string();
+        assert!(
+            answer.starts_with("!42883 function bit_length("),
+            "bit_length({written}) has no overload on 19beta1, so it is 42883 and not a value: \
+             {answer}"
+        );
+    }
 }

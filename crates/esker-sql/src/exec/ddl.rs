@@ -5721,7 +5721,7 @@ fn decided_literal_type(expr: &plan::Expr) -> Option<ColumnType> {
 
 /// Whether a scalar function takes `text`, and so shows a cast its argument needed.
 ///
-/// Eight of the nine do; `abs` is the numeric one. Measured rather than read off the names:
+/// Nine of the ten do; `abs` is the numeric one. Measured rather than read off the names:
 /// `length((v)::text)`, `upper((c)::text)`, `octet_length((v)::text)`, `abs(n)`.
 fn takes_text(func: plan::ScalarFunc) -> bool {
     use crate::plan::ScalarFunc;
@@ -5733,7 +5733,8 @@ fn takes_text(func: plan::ScalarFunc) -> bool {
         | ScalarFunc::Length
         | ScalarFunc::CharLength
         | ScalarFunc::CharacterLength
-        | ScalarFunc::OctetLength => true,
+        | ScalarFunc::OctetLength
+        | ScalarFunc::BitLength => true,
         ScalarFunc::Abs => false,
     }
 }

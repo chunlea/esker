@@ -2403,7 +2403,15 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             // (`tests/captures/pg19_length_overloads.txt`), and `char_length` has none of these.
             // `resolve` refuses the pairs that have no overload, so what arrives here is a pair
             // that does.
-            Datum::Bit { bits, .. } if matches!(func, crate::plan::ScalarFunc::Length) => {
+            // **`bit_length` over a `bit` is its bits, not its bytes times eight** — the one
+            // place the name and the answer part company, and the pair that says so is
+            // `bit_length('101010101'::varbit)` = 9 while `octet_length` of it is 2. Measured.
+            Datum::Bit { bits, .. }
+                if matches!(
+                    func,
+                    crate::plan::ScalarFunc::Length | crate::plan::ScalarFunc::BitLength
+                ) =>
+            {
                 Datum::Int4(i32::try_from(bits.chars().count()).unwrap_or(i32::MAX))
             }
             Datum::Bytea(bytes)
@@ -2413,6 +2421,9 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 ) =>
             {
                 Datum::Int4(i32::try_from(bytes.len()).unwrap_or(i32::MAX))
+            }
+            Datum::Bytea(bytes) if matches!(func, crate::plan::ScalarFunc::BitLength) => {
+                Datum::Int4(bits_in(bytes.len()))
             }
             // `octet_length` over a `bit` is its **bytes**, which is the pair that says the two
             // names are not one: `octet_length('1'::bit)` is 1 and `length('1'::bit)` is 1 too,
@@ -2467,6 +2478,10 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 crate::plan::ScalarFunc::OctetLength => {
                     Datum::Int4(i32::try_from(text.len()).unwrap_or(i32::MAX))
                 }
+                // **Bytes times eight, and the bytes are `octet_length`'s** — so a multi-byte
+                // string is not its character count times eight: `bit_length('éî')` is 32 and
+                // `length('éî')` is 2. Measured.
+                crate::plan::ScalarFunc::BitLength => Datum::Int4(bits_in(text.len())),
                 // Unreachable: the arm above catches `abs` before this one is tried.
                 crate::plan::ScalarFunc::Abs => Datum::Text(text),
             },
@@ -2567,6 +2582,31 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 };
                 regclass_of(env, names(&name)?)?
             }
+            // **A string to `regclass[]` is an I/O conversion, and that is not the scalar's
+            // rule.** `pg_cast` has a row for `text -> regclass` and **none** for
+            // `text -> regclass[]`, measured — so the scalar runs `text_regclass`, which resolves a
+            // *name*, and the array runs the target's input function, which is `array_in` with
+            // `regclassin` per element. `regclassin` reads **all digits** as an oid:
+            //
+            // ```text
+            // '1259'::text::regclass        42P01 relation "1259" does not exist
+            // '{1259}'::text::regclass[]    {pg_class}
+            // '{1259}'::text[]::regclass[]  42P01    <- one step more, and the row is back
+            // ```
+            //
+            // The braces, the quoting, the whitespace, the `NULL`s and the `[1:2]=` prefix stay
+            // `array_in`'s by reading the text as a `text[]` first: a second reader of one array
+            // grammar is how two spellings of one literal come to disagree (`debts-v1.1.md` #41,
+            // and `lower_regclass_array` reads the *literal* form the same way).
+            Datum::Text(text) if *to == ColumnType::RegClassArray => {
+                let mut values = crate::value::array::from_text(&text, ColumnType::Text)?;
+                for element in values.values.iter_mut().flatten() {
+                    let name = element.to_text().unwrap_or_default();
+                    *element = regclass_of(env, regclass_oid_of(env, &name)?)?;
+                }
+                values.element = ColumnType::RegClass;
+                Datum::Array(values)
+            }
             // **An array to `regclass[]` resolves every element**, because the type is a name per
             // element and the names come from the catalog. `array_in` cannot do it — the input
             // function of a `regclass` needs a relation lookup and `crate::value` has none — so it
@@ -2574,11 +2614,29 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             // `regclass_of` the scalar direction uses so the two cannot disagree about a name.
             Datum::Array(mut values) if *to == ColumnType::RegClassArray => {
                 for value in &mut values.values {
-                    if let Some(element) = value
-                        && let Some(oid) = oid_argument(Some(element))?
-                    {
-                        *element = regclass_of(env, oid)?;
-                    }
+                    let Some(element) = value else { continue };
+                    let resolved = match &*element {
+                        // **A `text` element is a name and only a name.** This is the arm an
+                        // `oid[]` reaches and a `text[]` reaches too, and the two differ: a
+                        // `text[] -> regclass[]` coerces element by element through the `pg_cast`
+                        // row for `text -> regclass`, which is `text_regclass` — so
+                        // `'{1259}'::text[]::regclass[]` is `42P01 relation "1259" does not exist`
+                        // where `'{1259}'::text::regclass[]` is `{pg_class}`. Measured, and it is
+                        // the counter-example that makes the I/O rule above a rule.
+                        Datum::Text(name) | Datum::Citext(name) => {
+                            let Some(names) = env.settings.names else {
+                                return Err(SqlError::unsupported(
+                                    "a relation name read as a regclass without a catalog",
+                                ));
+                            };
+                            regclass_of(env, names(name)?)?
+                        }
+                        other => match oid_argument(Some(other))? {
+                            Some(oid) => regclass_of(env, oid)?,
+                            None => continue,
+                        },
+                    };
+                    *element = resolved;
                 }
                 values.element = ColumnType::RegClass;
                 Datum::Array(values)
@@ -4582,6 +4640,30 @@ fn relation_namer(env: Env<'_>) -> impl Fn(i64) -> Box<str> + '_ {
     }
 }
 
+/// **`regclassin`'s own rule**: all digits are an oid, anything else is a relation name.
+///
+/// Measured on 19beta1, and the boundary is *digits*, not "looks numeric": `'{-1}'::text::regclass[]`
+/// is `42P01 relation "-1" does not exist`, because the sign makes it a name. An oid nothing names
+/// is not an error either — `'{999999}'::text::regclass[]` is `{999999}`, which is `regclassout`
+/// printing the number back.
+///
+/// The name half is the **executor's** rule, carried in through `Settings::names` rather than
+/// rewritten here, so `'x'::regclass` before the plan and a name resolved per row cannot disagree
+/// about the `search_path` or about a quoted spelling (`debts-v1.1.md` #41).
+fn regclass_oid_of(env: Env<'_>, name: &str) -> Result<i64> {
+    if !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()) {
+        return name
+            .parse::<i64>()
+            .map_err(|_| SqlError::DatatypeMismatch(format!("an oid that does not fit: {name}")));
+    }
+    let Some(names) = env.settings.names else {
+        return Err(SqlError::unsupported(
+            "a relation name read as a regclass without a catalog",
+        ));
+    };
+    names(name)
+}
+
 fn regclass_of(env: Env<'_>, oid: i64) -> Result<Datum> {
     let printed = match crate::catalog::pg_catalog::view_by_oid(oid) {
         Some(view) => view.name().to_owned(),
@@ -4688,6 +4770,16 @@ fn typmod_argument(arg: Option<&Datum>) -> Result<Option<i32>> {
 /// Measured on 19beta1, `tests/corpus/pg19_in.txt`. A scan rather than a rewrite to `= a OR = b`,
 /// so the left-hand side is evaluated once — which also keeps a `nextval` on the left from
 /// running per item.
+/// A byte count as a **bit** count, saturating.
+///
+/// `bit_length` is `octet_length` times eight over everything but a `bit` string, and eight times a
+/// `usize` does not fit an `int4` — which is the answer's type. Saturating rather than wrapping:
+/// this crate never panics on a value (`CLAUDE.md` invariant 9), and a string long enough to reach
+/// it is one no statement here can build.
+fn bits_in(bytes: usize) -> i32 {
+    i32::try_from(bytes).unwrap_or(i32::MAX).saturating_mul(8)
+}
+
 fn in_list(
     operand: &Expr,
     list: &[Expr],
