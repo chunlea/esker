@@ -111,10 +111,12 @@
 #
 # ## RE-SWEPT 2026-09-10 (evening) after the `42846 / ok` residue: 357 -> 31
 #
-# The node side re-taken over the divergence list below, in the same literal spelling the previous
-# re-take used (`'<value>'::<source>::<target>`, each source's own probe value from
-# `esker-coord/wire-v3-probes.txt`). Read over the **352** rows the list holds after the five bad
-# ones were corrected:
+# The node side re-asked over the divergence list below, **as literals** —
+# `SELECT ('<value>'::<source>::<target>) IS NOT NULL`, each source's own probe value from
+# `esker-coord/wire-v3-probes.txt`. The sweep this file records bound the value as a **parameter**
+# instead; the instrument is stated here because the two are different roads through this node (the
+# fold versus the evaluator) and this section's numbers are the literal one's. Read over the **352**
+# rows the list holds after the five bad ones were corrected:
 #
 #     now agree                      **326**
 #     node refuses, PG answers         **6**   <- was 54
@@ -156,6 +158,15 @@
 #
 # The `both refuse, different code` group is 20 and is the sqlstate family, not a cast defect:
 # seven are `22P02` where a real server says `22023`, six `22P02` where it says `42846`.
+#
+# **The node column of the list below is stale for about 270 rows**, and this is the note that says
+# so rather than a silent rewrite. Those rows record a node sqlstate from before the literal-array
+# guard, the element-wise array cast and the `casts_to` gate above `lower_cast`'s match — the list
+# says 292 rows refuse with a different code and asking again finds 20. **A re-take needs an
+# instrument decision first**, which is why it is not done here: the pg column was taken with the
+# value **bound**, and a node column taken with a **literal** is a different road through this node.
+# Whoever re-takes it should ask both ways, keep the value in the row, and say which column is
+# which — the difference between the two is itself one of this file's findings.
 #
 # ## RE-TAKEN 2026-09-10 (evening): the five rows the list's own value does not reproduce
 #
