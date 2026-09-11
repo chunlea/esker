@@ -151,6 +151,23 @@ pub mod raft_cf {
 /// A region is split once it grows past this many bytes (`docs/DESIGN.md` §14).
 pub const REGION_SPLIT_SIZE: u64 = 96 * 1024 * 1024;
 
+/// How long a store's **first** open waits for a placement-driver group to produce a leader.
+///
+/// A group has no leader for the first one to two seconds of its life — `esker_raft`'s
+/// `election_tick` of 10–20 at `TICK_MS` 100 — and a member with no leader answers
+/// [`esker_proto::ProtoError::PdNotLeader`] to everything
+/// ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
+/// Under load that first election takes longer, and a store may additionally be started before the
+/// members it has to ask.
+///
+/// **This is a startup budget, not a request budget**, and the two nest. `esker_proto`'s
+/// `REDIRECT_BUDGET` is spent *inside* each attempt below — it rotates the endpoint list looking
+/// for a leader that exists, and gives up in about three seconds because a client that chased
+/// hints for ever would never fail. That is the right bound for *finding* a leader and the wrong
+/// one for *waiting for the first one*, which is why this exists rather than the budget being
+/// raised: raising it would make every later redirect on every client slower to give up.
+pub const PD_LEADER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Interval between store heartbeats to the placement driver, in milliseconds.
 pub const STORE_HEARTBEAT_MS: u64 = 10_000;
 

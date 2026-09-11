@@ -65,22 +65,6 @@ const RECORD_CATCHUP_WAIT: std::time::Duration = std::time::Duration::from_milli
 /// nothing to subscribe to; two milliseconds is far below what it is waiting for.
 const RECORD_CATCHUP_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 
-/// How long a store's **first** open waits for a placement-driver group to produce a leader.
-///
-/// A group has no leader for the first one to two seconds of its life — `esker_raft`'s
-/// `election_tick` of 10–20 at `TICK_MS` 100 — and a member with no leader answers
-/// [`ProtoError::PdNotLeader`] to everything ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
-/// Under load that first election takes longer, and a store may additionally be started before the
-/// members it has to ask.
-///
-/// **This is a startup budget, not a request budget**, and the two nest. `esker_proto`'s
-/// `REDIRECT_BUDGET` is spent *inside* each attempt below — it rotates the endpoint list looking
-/// for a leader that exists, and gives up in about three seconds because a client that chased
-/// hints for ever would never fail. That is the right bound for *finding* a leader and the wrong
-/// one for *waiting for the first one*, which is why this exists rather than the budget being
-/// raised: raising it would make every later redirect on every client slower to give up.
-const PD_LEADER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// How long between attempts, once one has been refused.
 ///
 /// Short, because the expensive waiting already happened inside the attempt: a `RemotePd` spends
@@ -149,7 +133,8 @@ pub struct StoreOptions {
     pub region_heartbeat: std::time::Duration,
     /// How long the **first** open waits for a placement-driver group to produce a leader.
     ///
-    /// Defaults to [`PD_LEADER_WAIT`], and is a field for the reason `region_heartbeat` is one:
+    /// Defaults to [`crate::PD_LEADER_WAIT`], and is a field for the reason `region_heartbeat`
+    /// is one:
     /// a test that waited thirty seconds for the bound to expire would not be run.
     pub pd_leader_wait: std::time::Duration,
     /// How often each region's peer says what it believes, or `None` for never.
@@ -250,7 +235,7 @@ impl StoreOptions {
             heartbeat_tick: std::time::Duration::from_millis(esker_raft::TICK_MS),
             store_heartbeat: std::time::Duration::from_millis(crate::STORE_HEARTBEAT_MS),
             region_heartbeat: std::time::Duration::from_millis(crate::REGION_HEARTBEAT_MS),
-            pd_leader_wait: PD_LEADER_WAIT,
+            pd_leader_wait: crate::PD_LEADER_WAIT,
             region_census: None,
             split: SplitOptions::new(),
             engine: Options {
