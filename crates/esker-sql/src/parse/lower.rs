@@ -6847,8 +6847,8 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
     // target's input function. So `'25 1043'::text::oidvector` and `'pg_class'::regclass` are
     // untouched — the first because `text` is a string category and `casts_to` already says yes,
     // the second because there is nothing to cast *from* yet.
+    let to = target.column_type();
     if let Ok(Some(from)) = source_type(expr)
-        && let Some(to) = target.column_type()
         && !catalog::pg_catalog::casts_to(from, to)
     {
         return Err(SqlError::CannotCast {
@@ -7445,13 +7445,13 @@ impl CastTarget {
     /// The type this target **is**, for the one question these four arms did not ask: whether
     /// `pg_cast` has a row for the pair. Every other cast asks `casts_to`; a target with its own
     /// lowering arm returned before it.
-    fn column_type(self) -> Option<ColumnType> {
-        Some(match self {
+    fn column_type(self) -> ColumnType {
+        match self {
             CastTarget::RegClass => ColumnType::RegClass,
             CastTarget::RegType => ColumnType::RegType,
             CastTarget::Oid => ColumnType::Oid,
             CastTarget::OidVector => ColumnType::OidVector,
-        })
+        }
     }
 }
 
