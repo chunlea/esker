@@ -1,0 +1,19 @@
+crates/esker-sql/tests/catalog_read_slope.rs
+  s_e59614afdddccb::t_4b3bfa6e862f69 85-90,173-186,188-190,205-206,208-212,215-240,242-258,260-268,270-272,274-281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "36000ce3b8663992c137d89ea38e9ecb96f8fe25",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
