@@ -1,6 +1,6 @@
 # 0107 — A borrowed representation needs somewhere to carry its identity
 
-* Status: **Proposed**
+* Status: **Accepted** — both steps built, 2026-09-10 to 2026-09-11
 * Date: 2026-09-10
 * Deciders: b4 (types), the coordinator
 * Supersedes / relates: [0050](0050-a-user-defined-type-is-a-value.md),
@@ -173,6 +173,26 @@ representations apart, and therefore a migration or a second tag. Neither is a t
 
 ## What this ADR does not decide
 
-Whether `int2vector`'s **stored** form changes. Nothing in this node stores one today, so the
-question is open and cheap to answer later — and answering it now would be answering it without a
-measurement.
+Whether `int2vector`'s **stored** form changes — and this section said the wrong thing about why
+until the step-2 measurement above was taken. It read: *"Nothing in this node stores one today, so
+the question is open and cheap to answer later."* **It stores one.** A column can be declared
+`int2vector`, a value goes in, and it comes back out; `catalog::record`'s `TAG_INT2VECTOR` has had
+that meaning since it was written.
+
+So the question is still open and it is **not** cheap, and the difference is worth carrying: the
+tag already has data behind it, the format version lives in the *catalog record* rather than in the
+*row*, and therefore the two representations would be indistinguishable in a stored row. Deciding
+it later means a migration or a second tag, not a representation change. That is a storage
+question and this ADR is a type one — but the next reader should start from the cost, not from the
+sentence this section used to carry.
+
+## What is built, and what is left
+
+| | |
+|---|---|
+| **Step 1 — `lquery` is its own type** | built, `482428fa`. Its oid is looked up by name and not hardcoded, `lquery[]` is 16407, and `esker-keys::columnar` got the reverse tag it always needs. |
+| **Step 2 — the vectors, SQL-visible half** | built, `10b72dbc` + `e047755e` + `14a302fc`. `int2vector[]`/`oidvector[]` with PostgreSQL's own oids, `typarray` and category `A`, the cast to **every array the element casts to** (`[0:1]={1,2}`, the zero coming through), `= ANY` and `unnest` over a vector's elements. `pg_cast` gets **no** row for any of it: a vector's coercion is binary on a real server and a client reading that table sees nothing, so it is a rule in `casts_to` and not a row in `CASTS`. |
+| **Step 2 — the stored form** | **not built, deliberately, and not this ADR's to decide.** The cost of deciding it is the section above. Nothing in the wire census depends on it: every F6 row closed without moving a byte. |
+
+Family **F6** is closed on the wire (`esker-coord/b4-wire-v3-families.md`); what is left of this
+ADR is a storage decision with a written price and no caller waiting on it.
