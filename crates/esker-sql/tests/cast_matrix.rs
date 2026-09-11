@@ -23,6 +23,22 @@
 //! the element reader's `22P02` — "invalid input syntax" for a conversion that does not exist —
 //! where a real server says `42846` before reading anything. One guard moved 3,504 rows and
 //! regressed none.
+//!
+//! # Re-taken 2026-09-11 with a two-mode instrument, and the mode is the finding
+//!
+//! The numbers above are the old instrument's: one mode, and the value not written into the row.
+//! The capture now asks every pair **twice** — as a literal and as a bound parameter with no
+//! declared type, which is the shape a driver sends — and carries both the value and the mode in
+//! every row. 10,100 pairs, 20,200 probes per server.
+//!
+//! **A real server answers a literal and a bound parameter identically in all 10,100 pairs. This
+//! node does not, in 31.** Twenty-two of them are pairs a literal answers and a bind refuses —
+//! `oidvector -> T[]` is `22P02` and `regclass[] -> …` is `0A000` — and `ActiveRecord` binds by
+//! default, so that is the mode that matters and the one nothing had swept. Six run the other
+//! way: `line -> <geometry>` is a `22P02` about the value as a literal where the bind path and
+//! 19beta1 both say `42846` about the cast.
+//!
+//! Not fixed here; the capture holds the rows and the next unit starts from them.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

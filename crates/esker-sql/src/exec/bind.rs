@@ -578,6 +578,13 @@ fn walk_select(
             walk(&Statement::Select(derived.select.clone()), tables, seen);
         }
     }
+    // **And the other arms of a set operation**, whose columns type their own parameters:
+    // `SELECT … FROM a UNION SELECT … FROM b WHERE b.c = $1` is one statement with one `$n`
+    // sequence, and the arm's relations are in `tables` because `collect_table_names` now
+    // descends too.
+    for arm in &select.set_arms {
+        walk_select(&arm.select, tables, seen);
+    }
     // `LIMIT $1` is a count, whatever else is going on.
     for clause in [select.limit.as_ref(), select.offset.as_ref()]
         .into_iter()
@@ -880,6 +887,18 @@ fn walk_select_mut(select: &mut crate::plan::Select, visit: &mut impl FnMut(&mut
     for cte in &mut select.ctes {
         walk_table_ref_mut(cte, visit);
     }
+    // **The other arms of a set operation.** A `UNION`'s arms are one statement — one `$n`
+    // sequence, one catalog read, one resolution pass — and nothing in this file reached them, so
+    // *everything* `Executor::bound` does was blind to every arm but the first: `::regclass`,
+    // `current_schema()`, a cast to a user type, a `regtype` over one, a user function, and the
+    // parameter substitution itself. Each said so out loud as an `XX000` from the row evaluator,
+    // which is this crate reporting a state it does not handle — measured, five of them, for
+    // statements whose **first** arm answers the same expression perfectly
+    // (`debts-v1.1.md` #57). The third walker with this hole and the same fix: `FROM`'s function
+    // arguments were the second (wire v3 F10) and a `FROM`'s `VALUES` rows the first.
+    for arm in &mut select.set_arms {
+        walk_select_mut(&mut arm.select, visit);
+    }
 }
 
 /// A `FROM` entry: a derived table is a `SELECT`, walked as one.
@@ -946,6 +965,10 @@ fn for_each_in_select<'a>(select: &'a crate::plan::Select, each: &mut impl FnMut
     }
     for cte in &select.ctes {
         for_each_in_table_ref(cte, each);
+    }
+    // The arms, for the reason `walk_select_mut` gives at length: one statement, one pass.
+    for arm in &select.set_arms {
+        for_each_in_select(&arm.select, each);
     }
 }
 
@@ -1076,6 +1099,12 @@ fn collect_table_names<'a>(select: &'a crate::plan::Select, into: &mut Vec<&'a s
         if let Some(derived) = &table.derived {
             collect_table_names(&derived.select, into);
         }
+    }
+    // **An arm may name a relation the first one does not**, and the list is the whole
+    // statement's: without this, `SELECT … FROM a UNION SELECT … FROM b WHERE b.c = $1` typed
+    // `$1` against nothing.
+    for arm in &select.set_arms {
+        collect_table_names(&arm.select, into);
     }
     // **A subquery's relations are the statement's too**, because the inference is given one list
     // for the whole statement and a parameter under an `IN (SELECT … WHERE title = $1)` is typed
