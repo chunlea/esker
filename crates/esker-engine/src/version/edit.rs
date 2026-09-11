@@ -46,7 +46,7 @@ mod tag {
     /// so a database that never tiers writes the same bytes it wrote in phase 5 and every
     /// golden manifest still passes. An older binary reading a tiered manifest rejects it,
     /// which is the correct outcome: it cannot fetch those files
-    /// ([ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md)).
+    /// ([ADR 0024](../../../../docs/adr/0024-tiering-failure-semantics.md)).
     pub(super) const FILE_LOCATION: u32 = 9;
 }
 

@@ -44,7 +44,7 @@ pub struct Compaction {
     /// Empty for every ordinary compaction. Non-empty only for a **discharge**: a compaction
     /// whose inputs carry a range tombstone, which must take every file the tombstone covers
     /// so that the covered keys can be dropped and the tombstone itself dropped with them
-    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6). A range tombstone
+    /// ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md) decision 6). A range tombstone
     /// never reaches an SST below L0, and this is the mechanism that keeps that true.
     pub discharge: Vec<(usize, Arc<FileMeta>)>,
     /// The level the outputs go to: `level + 1` normally, and the deepest level a discharge
@@ -250,7 +250,7 @@ impl Picker {
 
     /// Grows a compaction into a **discharge** of the range tombstones its inputs carry.
     ///
-    /// Ruling (ii) of [ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6: a
+    /// Ruling (ii) of [ADR 0017](../../../../docs/adr/0017-range-tombstones.md) decision 6: a
     /// range tombstone is applied and dropped at L0 and never written below it. That is only
     /// sound if the compaction that applies it sees *every* version the tombstone covers —
     /// otherwise a key dropped from this output would be resurrected by an older version left
@@ -323,7 +323,7 @@ impl Picker {
     /// tombstone has nothing left to say to anyone: every live reader must already see the
     /// delete, which is `seqno <= floor`. A snapshot taken before the delete still needs to see
     /// what was deleted, and dropping the tombstone on its behalf would lose the deletion for
-    /// *everyone* ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6).
+    /// *everyone* ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md) decision 6).
     ///
     /// When this is false the compaction is simply not run. The tombstone stays in L0, reads
     /// keep honouring it out of there, and the next round tries again — which is what "the

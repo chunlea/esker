@@ -3,13 +3,13 @@
 //! This replaces a test that asserted the opposite. When `||` over text was built it shipped one
 //! wrong answer with it — two `jsonb` documents concatenated as strings — and that was guarded by
 //! refusing the call, which was the right trade under
-//! [ADR 0031](../../../docs/adr/0031-the-rails-suite-is-the-measure.md) (a gap beats a wrong
+//! [ADR 0031](../../../docs/adr/0031-rails-compatibility-is-measured.md) (a gap beats a wrong
 //! answer) and never the right answer.
 //!
 //! **The representation turned out not to be the obstacle.** `jsonb` is stored as a `Datum::Text`,
 //! and `docs/plans/jsonb-representation.md` argued from that it needed a `Datum` of its own before
 //! it could have a comparison — which is
-//! [ADR 0042](../../../docs/adr/0042-a-type-shares-a-representation-only-if-it-shares-a-comparison.md)'s
+//! [ADR 0042](../../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)'s
 //! rule. But the text it shares is **canonical**: `value::json::canonicalise` sorts keys by length
 //! then bytes, drops duplicate keys with the last winning, and normalises every separator, so two
 //! documents that are equal as `jsonb` are already the same string. Sharing a representation is

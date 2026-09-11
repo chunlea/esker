@@ -1604,7 +1604,7 @@ async fn how_the_leaderless_window_moves_with_the_drivers() {
 }
 
 /// **What the catalog read costs on a topology that has stores in it** —
-/// [ADR 0102](../../../../docs/adr/0102-the-catalogs-read-path.md)'s numbers, taken where run 111
+/// [ADR 0102](../../../docs/adr/0102-the-catalogs-read-path.md)'s numbers, taken where run 111
 /// could not take them.
 ///
 /// Run 111 counted 4,790,406 catalog views in one `ActiveRecord` pass at a mean of under half a
@@ -2415,7 +2415,7 @@ async fn a_bulk_load_into_a_splitting_table_is_not_told_it_does_not_know() {
 ///
 /// Run 113 timed three of these on the real topology at **0.5–0.8 s each** — `pg_index ⋈
 /// pg_attribute` 790 ms, `obj_description` 546 ms, `pg_inherits` 793 ms — and
-/// [ADR 0102](../../../../docs/adr/0102-the-catalogs-read-path.md)'s instrument, which was **on for
+/// [ADR 0102](../../../docs/adr/0102-the-catalogs-read-path.md)'s instrument, which was **on for
 /// the same run**, accounts for 2.2 ms of a 506 ms statement. So the half-second is not a slower
 /// version of a known cost, and the three numbers that could name it did not exist.
 ///

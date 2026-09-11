@@ -11,7 +11,7 @@
 //! A driver's line has id **zero**, which is not a store id anywhere in this codebase. With
 //! `--pd-nodes 3` there are three such lines, so zero means *a* driver rather than *the* driver and
 //! the address is what tells them apart
-//! ([ADR 0108](../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)).
+//! ([ADR 0108](../../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)).
 //! That was chosen against a self-describing format on purpose: `esker durability chaos` skips
 //! every `id == "0"` line rather than the first, and `esker-rails-harness/leader-kill.py` matches a
 //! census `store=N` against `id == N`, so both keep working without being edited.
@@ -72,7 +72,7 @@ pub(crate) enum ClusterOptions {
         ///
         /// One by default, which is every cluster this command has ever produced. Three is the
         /// number that survives losing one
-        /// ([ADR 0108](../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)):
+        /// ([ADR 0108](../../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)):
         /// they found one group between them, elect among themselves, and every store and the
         /// printed SQL command line are given all of their addresses.
         pd_nodes: u64,
@@ -116,7 +116,7 @@ struct Node {
 /// One child this command started and watches.
 ///
 /// **`id` is the id the state file carries**: a store's node id, or **zero** for a placement
-/// driver. A cluster may now have several drivers ([ADR 0108](../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)),
+/// driver. A cluster may now have several drivers ([ADR 0108](../../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)),
 /// so zero means *a* driver rather than *the* driver and the **address** is what tells two of them
 /// apart — which is also what `restart_command` needs, so it lives here rather than being derived
 /// from a single `Option<&str>` the way it was when there could only be one.
@@ -636,8 +636,8 @@ fn what(id: u64, address: &str) -> String {
 /// `BEGIN`.
 ///
 /// **What this buys is the availability of recovery, and not availability.** A single driver is
-/// still a single point: it is replicated in the algorithm ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md),
-/// [ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md))
+/// still a single point: it is replicated in the algorithm ([ADR 0059](../../../../docs/adr/0059-pd-is-a-raft-group.md),
+/// [ADR 0061](../../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md))
 /// and singular in every deployment this command can produce. Restarting it turns "down until an
 /// operator notices" into "down for one driver start"; it does not make the cluster survive
 /// losing it.

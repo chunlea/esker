@@ -57,7 +57,7 @@ pub enum TimeMachineVerb {
     /// CONCURRENTLY` sees the state advance, which is the only way to tell "slow" from "stuck".
     ListSchemaJobs,
     /// `SELECT * FROM esker_columnar_replicas()` — which tables want a columnar copy, and how
-    /// many ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5).
+    /// many ([ADR 0022](../../../../docs/adr/0022-columnar-learner-replica.md) Decision 5).
     ///
     /// A setting nobody can read back is a setting nobody can check, and this one is acted on by
     /// a different process entirely — so seeing what the catalog says is the only way to tell
@@ -66,7 +66,7 @@ pub enum TimeMachineVerb {
     /// `SELECT esker_schema_step('<index>')` — take the next step of one job, and say what it did.
     ///
     /// **The step clock made explicit.** PD publishes the interval a step must wait
-    /// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md)); this is the step itself, so that
+    /// ([ADR 0028](../../../../docs/adr/0028-the-schema-lease.md)); this is the step itself, so that
     /// what waits and what acts are separable — which is what makes the whole state machine
     /// testable without a timer, and what lets an operator drive a stuck job by hand.
     SchemaStep {

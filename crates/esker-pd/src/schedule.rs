@@ -163,7 +163,7 @@ pub enum Repair {
     ///
     /// Separate from [`Repair::AddPeer`] because it becomes a different operator with a different
     /// completion: `AddPeer` is done when the peer votes, and this is done when it exists
-    /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 1).
+    /// ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 1).
     ///
     /// **Only ever issued because the flag asked.** A region is never short of columnar replicas
     /// by default: the wanted count comes from what a SQL node reported, and zero — which is what

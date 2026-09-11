@@ -1,6 +1,6 @@
 //! The time machine's verbs, run.
 //!
-//! Named for what [ADR 0021](../../../docs/adr/0021-time-machine.md) Decision 3 calls them, and
+//! Named for what [ADR 0021](../../../../docs/adr/0021-time-machine.md) Decision 3 calls them, and
 //! not `time_machine`, so that the module this one leans on — `crate::time_machine`, which holds
 //! the value grammar, the token and the window — can be named here without qualification.
 //!
@@ -300,7 +300,7 @@ fn list_jobs(executor: &Executor, txn: &mut dyn Txn) -> Result<Outcome> {
 /// `SELECT esker_schema_step('<index>')` — one step of one job.
 ///
 /// **The step, separated from the wait.** PD publishes how long a step must wait
-/// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md)); this takes it. Separating them is what
+/// ([ADR 0028](../../../../docs/adr/0028-the-schema-lease.md)); this takes it. Separating them is what
 /// makes the state machine testable without a timer, and what lets an operator move a stuck job.
 ///
 /// The sequence is the ADR's: `absent → delete-only → write-only`, then the backfill a batch at a

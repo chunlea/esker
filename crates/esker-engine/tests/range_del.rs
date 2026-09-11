@@ -1,5 +1,5 @@
 //! `DeleteRange` end to end: reads, flush, compaction, recovery, and the invariant that keeps
-//! it sound ([ADR 0017](../../docs/adr/0017-range-tombstones.md)).
+//! it sound ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
 //!
 //! The three things this file exists to hold down, in the order the ruling on decision 6 put
 //! them:
@@ -145,7 +145,7 @@ fn a_snapshot_older_than_the_delete_still_sees_the_range() {
 }
 
 /// An empty or inverted range is a caller error, not a no-op
-/// ([ADR 0017](../../docs/adr/0017-range-tombstones.md) decision 4). A refused batch changes
+/// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 4). A refused batch changes
 /// nothing.
 #[test]
 fn an_empty_or_inverted_range_is_refused() {
@@ -256,7 +256,7 @@ fn tombstones_by_level(db: &Db, dir: &TempDir) -> Vec<(usize, bool)> {
 /// The standing invariant. A tombstone lives in a memtable and in L0 and nowhere else: a
 /// compaction discharges it rather than propagating it, which is what lets `search_levels`
 /// keep the binary search that assumes a level partitions the key space
-/// ([ADR 0017](../../docs/adr/0017-range-tombstones.md) decision 6).
+/// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6).
 #[test]
 fn no_sst_below_l0_ever_holds_a_range_tombstone() {
     let dir = TempDir::new().unwrap();

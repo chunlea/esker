@@ -14,7 +14,7 @@
 //!
 //! This server has no cost model, so every field PostgreSQL fills from one — `Startup Cost`,
 //! `Total Cost`, `Plan Rows`, `Plan Width`, the `Buffers` counters — is **absent** rather than
-//! zero. Under [ADR 0031](../../../docs/adr/0031-rails-compatibility-is-measured.md) an invented
+//! zero. Under [ADR 0031](../../../../docs/adr/0031-rails-compatibility-is-measured.md) an invented
 //! number would be the worse answer of the two: a client that reads `"Total Cost": 0.00` is being
 //! told something false, where one that finds no such key is being told the truth. The corpus
 //! records both sides (`tests/captures/pg19_explain_options.txt`, replayed by

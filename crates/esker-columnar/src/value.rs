@@ -59,7 +59,7 @@ pub enum ColumnType {
     /// 64-bit signed integer; PostgreSQL's `bigint`.
     Int8,
     /// 32-bit signed integer; PostgreSQL's `integer`. A **distinct type** and not an `Int8` that
-    /// happens to be small ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
+    /// happens to be small ([ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md)).
     Int4,
     /// 16-bit signed integer; PostgreSQL's `smallint`. Distinct for the same reason.
     Int2,

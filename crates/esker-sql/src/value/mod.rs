@@ -702,7 +702,7 @@ fn is_string_type(ty: ColumnType) -> bool {
 /// A value as the column's **typmod** requires it, or the error PostgreSQL raises instead.
 ///
 /// The three types that take a number each do something different with it, which is the whole of
-/// the unit ([ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md),
+/// the unit ([ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md),
 /// `tests/corpus/pg19_typmod.txt`):
 ///
 /// * **`varchar(n)` refuses.** Longer is `22001`, on `INSERT` and `UPDATE` alike. Trailing spaces
@@ -1502,7 +1502,7 @@ pub fn type_by_oid(oid: u32) -> Option<ColumnType> {
 /// **Not an error for an unknown oid**, which is measured and is the asymmetry worth remembering:
 /// `999999::regtype` is `999999` on a real server, where `'nosuchtype'::regtype` is `42704`. The
 /// name is the *output* function and an oid is always a legal input to it
-/// ([ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
+/// ([ADR 0077](../../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
 #[must_use]
 pub fn regclass_of_oid(oid: i64) -> Datum {
     // **The digits, because this layer has no catalog** (invariant 7) — and because the digits are

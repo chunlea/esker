@@ -117,7 +117,7 @@ pub struct CompactionJob<'a> {
     ///
     /// Empty for every ordinary compaction. When it is not, this compaction has taken every
     /// file at every level that the tombstones cover
-    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6), so an entry a
+    /// ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md) decision 6), so an entry a
     /// tombstone hides can be dropped outright rather than propagated: there is no older
     /// version left anywhere for it to resurrect.
     ///
@@ -427,7 +427,7 @@ mod tests {
 
     /// The discharge: an entry a tombstone covers is dropped outright, because this compaction
     /// holds every file the tombstone reaches and there is no older version left to resurrect
-    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6).
+    /// ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md) decision 6).
     #[test]
     fn a_discharge_drops_the_entries_its_tombstone_covers() {
         let mut tombstones = RangeTombstones::new();

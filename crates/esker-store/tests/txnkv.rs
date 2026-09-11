@@ -308,7 +308,7 @@ async fn a_refused_prewrite_leaves_no_lock_behind() {
 }
 
 /// A prewrite that meets another transaction's lock reports it **per key**, with everything a
-/// resolver needs ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
+/// resolver needs ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lock_conflict_comes_back_per_key_with_the_lock() {
     let running = start().await;
@@ -992,7 +992,7 @@ async fn a_version_above_the_safepoint_is_not_collected() {
 }
 
 /// A table with a longer retention keeps more, which is the whole of the time-machine hook
-/// ([ADR 0021](../../docs/adr/0021-time-machine.md)): the window a reader may travel back
+/// ([ADR 0021](../../../docs/adr/0021-time-machine.md)): the window a reader may travel back
 /// through *is* the distance the collector leaves alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_longer_retention_keeps_more_of_one_table() {
@@ -1030,7 +1030,7 @@ async fn a_longer_retention_keeps_more_of_one_table() {
 }
 
 /// **`LatestCommit` answers with the newest *commit*, not with whatever record is on top**
-/// ([ADR 0078](../../docs/adr/0078-a-marker-is-not-a-commit.md)).
+/// ([ADR 0078](../../../docs/adr/0078-a-marker-is-not-a-commit.md)).
 ///
 /// A rollback marker lives at `commit_ts == start_ts`, so a transaction that takes a key and dies
 /// leaves the newest record on it. This answer used to be computed by filtering that record out of

@@ -124,7 +124,7 @@ pub enum ProtoError {
     },
 
     /// This placement driver is not the leader of its own Raft group, so it answers nothing
-    /// ([ADR 0059](../../docs/adr/0059-pd-is-a-raft-group.md)).
+    /// ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
     ///
     /// A **separate code** from [`ProtoError::NotLeader`], and the separation is load-bearing.
     /// That one is region-scoped: it names a region, its hint is a *peer* id, and a client
@@ -179,7 +179,7 @@ pub enum ProtoError {
     /// A transactional lock is in the way (`docs/DESIGN.md` §8).
     ///
     /// The payload stays opaque **by decision**, not for want of a type:
-    /// [ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) declined to make it a typed
+    /// [ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md) declined to make it a typed
     /// `LockInfo` here, because that would rewrite an error frame whose golden has been frozen
     /// since phase 2 for no change in behaviour. The bytes are
     /// [`crate::txn::LockInfo::encode`], they have a golden line of their own, and

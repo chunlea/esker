@@ -17,7 +17,7 @@
 //!   the difference between "these bytes are fine" and "these bytes belong here".
 //!
 //! The offset is not stored; both sides know where the chunk is and compute the same seed from
-//! it. See [ADR 0027](../../../../docs/adr/0027-columnar-file-format.md).
+//! it. See [ADR 0027](../../../docs/adr/0027-columnar-file-format.md).
 //!
 //! An LZ4 payload is `raw_len:varint ++ lz4 block bytes`, so the decompressed size is known before
 //! a byte is decompressed and the buffer is allocated exactly once. A `raw_len` that the

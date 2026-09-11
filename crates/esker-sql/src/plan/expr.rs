@@ -33,7 +33,7 @@ use crate::value::{PgDatum, PgType};
 /// An expression, as far as phase 6a needs one.
 ///
 /// **Arithmetic was deliberately absent and is here now** ([ADR
-/// 0046](../../docs/adr/0046-arithmetic-is-its-own-node-and-postgresql-s-promotion-table.md)).
+/// 0046](../../../../docs/adr/0046-arithmetic-is-its-own-node-and-postgresql-s-promotion-table.md)).
 /// The reason it was left out still holds — every operator brings its own overflow, division and
 /// type-resolution rules, and each of them is a way to return a confidently wrong number — so it
 /// arrived the way the rest of this crate does: a capture of what a real server answers first,
@@ -1269,7 +1269,7 @@ pub enum CatalogFunc {
     /// exactly what `pg_proc.proargtypes` holds here. An `oidvector` is its own type on a real
     /// server and text here, which is the representation `proargtypes` already uses and the
     /// reason the comparison between them is order-sensitive and exact
-    /// ([ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
+    /// ([ADR 0077](../../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)).
     OidVector,
     /// `'happy'::mood` — a cast to a **user-defined type**, which is a name until the catalog is
     /// read.
@@ -1278,7 +1278,7 @@ pub enum CatalogFunc {
     /// [`CatalogFunc::RegClass`] it is replaced before the plan is built and never reaches the row
     /// evaluator — the catalog answer is the same for every row, and reading it per row is the
     /// cost trap `::regclass` already paid for once
-    /// ([ADR 0053](../../docs/adr/0053-a-cast-to-a-user-defined-type-is-resolved-once-per-statement.md)).
+    /// ([ADR 0053](../../../../docs/adr/0053-a-cast-to-a-user-defined-type-is-resolved-once-per-statement.md)).
     ///
     /// What it is replaced *with* depends on where it sits, and that is what an enum is rather
     /// than a special case: **the label** when it is a projection on its own, so
@@ -1918,7 +1918,7 @@ impl CatalogFunc {
             | CatalogFunc::TsHeadline => ColumnType::Text,
             // **`pg_typeof` answers a `regtype`**, which is its `prorettype` on a real server and
             // was `text` here while this node had no such type. It has had one since
-            // [ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md), and
+            // [ADR 0077](../../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md), and
             // the comment that stood here — "this node has no `regtype`" — outlived the decision
             // that made it false by fifteen ADRs.
             // **And `t::regtype` is one too**, not the name it prints as: it answered a `text`

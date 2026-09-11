@@ -6,7 +6,7 @@
 //! # `ALTER TABLE ADD COLUMN` rewrites nothing
 //!
 //! Appending a nullable column is a catalog write and nothing else. The rows already stored say
-//! how many columns they hold ([ADR 0019](../../../docs/adr/0019-a-row-says-how-many-columns-it-has.md)),
+//! how many columns they hold ([ADR 0019](../../../../docs/adr/0019-a-row-says-how-many-columns-it-has.md)),
 //! so a reader pads the new column to NULL, which is what PostgreSQL shows for it anyway. That is
 //! the whole feature. A **constant** `DEFAULT` is admitted on the same argument, one step further
 //! on: the value is stored on the column as its *missing value* and the decoder pads with that
@@ -412,7 +412,7 @@ fn type_by_oid(txn: &dyn Txn, executor: &Executor, oid: u64) -> Result<Option<ca
 
 /// A column's type, once the catalog has been asked about the name lowering could not resolve.
 ///
-/// [ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s first unit. Lowering
+/// [ADR 0050](../../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s first unit. Lowering
 /// hands over a bare type name it does not recognise (`crate::plan::Column::user_type_name`) and
 /// this is where it becomes a type or an error, because this is where the catalog is.
 ///
@@ -423,7 +423,7 @@ fn type_by_oid(txn: &dyn Txn, executor: &Executor, oid: u64) -> Result<Option<ca
 /// is invariant 7 kept rather than worked around.
 ///
 /// **A range's value is a range**
-/// ([ADR 0063](../../../docs/adr/0063-a-user-defined-range-is-a-representation-chosen-by-its-subtype.md)),
+/// ([ADR 0063](../../../../docs/adr/0063-a-user-defined-range-is-a-representation-chosen-by-its-subtype.md)),
 /// and the column type is chosen by its *subtype*: a
 /// `CREATE TYPE floatrange AS RANGE (subtype = float8)` column holds the same canonical text a
 /// `numrange` one does, read and written by the same `crate::value::range`. Which range type it
@@ -464,7 +464,7 @@ fn resolve_user_type(
             ))),
         },
         // **A domain's value is its base type's**, which is the whole of what a domain is
-        // ([ADR 0065](../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)):
+        // ([ADR 0065](../../../../docs/adr/0065-a-domain-is-a-name-and-a-constraint-over-a-base-type.md)):
         // nothing below this line can tell a `custom_money` column from the `numeric(8,2)` it
         // stands for, and the catalog is where the name comes back. Measured — a value too wide
         // for one reports `numeric field overflow` naming precision 8 scale 2, the **base type's**
@@ -567,7 +567,7 @@ fn refuse_unindexable_type(ty: ColumnType, method: &str) -> Result<bool> {
     // in key order, which is the whole of why they are safe here and `btree` is not: there the
     // order of the key *is* the index, and this node's order for a `tsvector` is its bytes' rather
     // than `tsvector_ops`'
-    // ([ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md), amended).
+    // ([ADR 0066](../../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md), amended).
     if ty == ColumnType::TsVector
         && matches!(
             method,
@@ -622,7 +622,7 @@ fn refuse_unindexable(table: &TableDef, column: &ColumnDef, method: &str) -> Res
     // in key order, which is the whole of why they are safe here and `btree` is not: there the
     // order of the key *is* the index, and this node's order for a `tsvector` is its bytes' rather
     // than `tsvector_ops`'
-    // ([ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md), amended).
+    // ([ADR 0066](../../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md), amended).
     //
     // An *expression* of this type was already accepted, because `index_expression` has no gate of
     // its own; admitting the column is what makes the two paths agree.
@@ -4955,7 +4955,7 @@ pub(super) fn drop_table(
 /// exactly the same removal the named table gets, and doing it by hand at the second call site is
 /// how one of the three steps gets forgotten.
 /// Every relation in one session's temporary schema, and then the schema
-/// ([ADR 0054](../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+/// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
 ///
 /// The same path `DROP SCHEMA … CASCADE` walks, so each table takes its own indexes, sequences and
 /// primary key with it and nothing is left half-dropped.
@@ -4978,7 +4978,7 @@ pub(super) fn drop_temp_schema(
 }
 
 /// `ON COMMIT` for every temporary table this session has, run at the end of **every** transaction
-/// ([ADR 0054](../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+/// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
 ///
 /// **"Every transaction" includes the implicit one**, which is the fact this exists to get right:
 /// a plain `INSERT` outside a transaction block into an `ON COMMIT DELETE ROWS` table leaves zero

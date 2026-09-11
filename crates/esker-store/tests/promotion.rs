@@ -742,7 +742,7 @@ async fn watch_until_every_learner_votes(
             // **What the driver says and what each core believes have to be the same thing.**
             //
             // A peer that has itself among the *voters* while the region record calls it a learner
-            // is the root of the stall [ADR 0085](../../docs/adr/0085-a-vote-is-not-granted-to-a-learner.md)
+            // is the root of the stall [ADR 0085](../../../docs/adr/0085-a-vote-is-not-granted-to-a-learner.md)
             // contains: `Raft::campaign` refuses a non-voter, so a learner that campaigns is a
             // learner whose own configuration disagrees, and one such peer kept a region leaderless
             // for as long as the load lasted. The ADR made that harmless; it did not make it untrue,

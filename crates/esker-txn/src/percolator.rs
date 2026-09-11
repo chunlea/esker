@@ -623,7 +623,7 @@ pub fn rollback(snapshot: &impl TxnSnapshot, user_key: &[u8], start_ts: u64) -> 
 // -- release -----------------------------------------------------------------------------
 
 /// Gives one key back **without ending the transaction that holds it**
-/// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+/// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
 ///
 /// `ROLLBACK TO SAVEPOINT`, and the deadlock victim inside one. PostgreSQL releases a
 /// subtransaction's row locks when it aborts and keeps the transaction alive; a

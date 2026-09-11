@@ -152,7 +152,7 @@ pub trait SstTier: Send + Sync + fmt::Debug {
     /// A new SST is complete and durable on local disk, and may be uploaded.
     ///
     /// Called **after** the manifest edit that names it, never before: an upload is not on the
-    /// write path ([ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) decision 1).
+    /// write path ([ADR 0024](../../../../docs/adr/0024-tiering-failure-semantics.md) decision 1).
     fn note_durable_sst(&self, number: u64);
 
     /// File numbers whose upload has completed since the last call, taken from the tier.

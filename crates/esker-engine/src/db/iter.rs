@@ -102,7 +102,7 @@ pub struct DbIterator {
     /// Every range tombstone any source of this scan declares, collected when the iterator was
     /// built. A tombstone hides keys that are nowhere in the merged run, so there is no entry
     /// to meet it at — the set has to be held and asked
-    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+    /// ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)).
     tombstones: RangeTombstones,
     /// Set by [`ReadOptions::prefix_same_as_start`]: iteration ends when the prefix changes.
     prefix: Option<Vec<u8>>,
@@ -415,7 +415,7 @@ impl DbInner {
     pub(crate) fn merge_sources(&self, cf: &Arc<ColumnFamily>) -> Result<MergeSources> {
         // The tombstone set for the whole scan, collected once up front rather than per key:
         // a range delete hides keys the merged run has never seen, so there is nothing to
-        // consult it *at* ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+        // consult it *at* ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)).
         let user_order = self.comparator.user_comparator();
         let mut tombstones = RangeTombstones::new();
 

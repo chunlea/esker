@@ -32,7 +32,7 @@
 //!
 //! The record's **bytes**, exactly as they are stored, and not a decoded schema. `esker-proto`
 //! does not depend on `esker-keys` and must not start: the record's format is
-//! [ADR 0022](../../docs/adr/0022-columnar-learner-replica.md)'s and belongs to the layer that
+//! [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md)'s and belongs to the layer that
 //! writes it, so a wire message that decoded it would give the format a second owner and a second
 //! place to drift. The asking store decodes it with the same `esker_keys::columnar::decode` it
 //! would have used on its own engine, so a record fetched over the wire and a record read locally

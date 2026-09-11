@@ -1113,7 +1113,7 @@ fn a_lock_inside_its_lease_is_waited_for_rather_than_settled() {
 /// and it bites only in the first 450 ms of a lease whose owner then dies.
 ///
 /// The bound is now a **deadline derived from the lease** rather than a count of tries — the
-/// shape [ADR 0057](../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)
+/// shape [ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)
 /// gave the SQL layer, and the same correction wave c3 made to the router's retry budget, which
 /// counted attempts against an epoch that kept moving.
 ///
@@ -1168,7 +1168,7 @@ fn a_reader_waits_out_the_lease_before_it_reports_a_lock_uncleared() {
 
 /// The reason a `Prewrite` answers per key: a batch that collides with **several** locks
 /// reports all of them, and the client clears them in one round rather than one round trip per
-/// contended key ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
+/// contended key ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
 #[test]
 fn a_prewrite_that_meets_several_locks_clears_them_in_one_round() {
     let transport = Arc::new(FakeTransport::new());

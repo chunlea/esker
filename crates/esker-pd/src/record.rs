@@ -212,7 +212,7 @@ impl AllocRecord {
 
 /// Every key range that wants columnar replicas, as the SQL layer last reported it.
 ///
-/// [ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 5. PD cannot read the
+/// [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5. PD cannot read the
 /// catalog setting this comes from — it links neither `esker-sql` nor a client, and every method
 /// on its service is inbound — so a SQL node reports it and re-reports on every lease refresh.
 ///
@@ -392,7 +392,7 @@ impl RegionRecord {
 /// What PD did about one operator, one line at a time (*fixed*, version 1).
 ///
 /// The in-flight set is memory — a restart forgets it, deliberately
-/// ([ADR 0013](../../docs/adr/0013-repair-operators-are-requests-not-commands.md)) — which
+/// ([ADR 0013](../../../docs/adr/0013-repair-operators-are-requests-not-commands.md)) — which
 /// leaves "what did PD do to my cluster, and why is it shaped like this" a question nothing
 /// could answer after the fact. This is that answer: a bounded ring of the last
 /// [`HISTORY_CAPACITY`] events, on disk, so `esker pd inspect` can show it for a PD that is not
@@ -427,7 +427,7 @@ pub enum EventKind {
     /// `TransferLeader`.
     TransferLeader = 3,
     /// `AddLearner` — a columnar replica, which is never promoted
-    /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 1).
+    /// ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 1).
     ///
     /// Its own kind in the history rather than an `AddPeer` that happened to stop, because the
     /// history is what an operator reads to tell a repair that stalled from a placement that

@@ -173,7 +173,7 @@ pub struct Executor {
     /// **The node's** reserved blocks, not this session's — one allocator for every session the
     /// process serves, joined by [`Executor::sharing_sequence_blocks`] the way the advisory-lock
     /// table is, and private to this executor when nobody hands one in
-    /// ([ADR 0072](../../../docs/adr/0072-a-sequence-block-belongs-to-the-node-not-to-the-connection.md)).
+    /// ([ADR 0072](../../../../docs/adr/0072-a-sequence-block-belongs-to-the-node-not-to-the-connection.md)).
     ///
     /// A block held per *connection* is invisible to a client with one and glaring to one that
     /// pools: five inserts on a five-connection pool answered `1, 33, 65, 97, 129` where
@@ -232,7 +232,7 @@ pub struct Executor {
     block_read_only: bool,
     /// Where columnar placement is reported, on a node that has a placement driver.
     /// The schema this session's **temporary** relations live in, once it has made one
-    /// ([ADR 0054](../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+    /// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
     ///
     /// `None` until the first `CREATE TEMP TABLE`, which is what keeps a session that makes none
     /// from writing a schema record — and what keeps `pg_namespace` from growing a row per
@@ -272,7 +272,7 @@ struct ReadAsOf {
 }
 
 /// **A session takes its temporary relations with it**, which is the third of the four rules a
-/// temporary table is ([ADR 0054](../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+/// temporary table is ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
 ///
 /// Best effort, deliberately: this runs where a failure cannot be reported to anybody, so a
 /// backend that will not answer leaves the schema behind rather than panicking in a destructor.
@@ -305,7 +305,7 @@ impl Drop for Executor {
 }
 
 /// Waits until no other transaction holds the row, or gives up the way a real server does
-/// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+/// ([ADR 0057](../../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
 ///
 /// **This is the whole of unit 1**, and it is short because the two hard parts are elsewhere: the
 /// lock itself is [`crate::backend::Txn::lock`] — taken at the *statement*, since a lock taken at
@@ -387,7 +387,7 @@ fn wait_for_the_lock(
         // 12, 11 and 10 failures of 12 rather than a clean split.
         cancel::check()?;
         // **The same reach the caller's first attempt asked for**
-        // ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)). This loop is shared by
+        // ([ADR 0088](../../../../docs/adr/0088-a-row-lock-across-nodes.md)). This loop is shared by
         // the write path, which needs the node's table, and by `SELECT … FOR UPDATE`, which needs
         // the store — and a retry that quietly asked for the cheaper one answered `Taken` at once
         // for a row another node was holding. That is not a slower lock, it is no lock: the
@@ -3266,7 +3266,7 @@ impl Executor {
     /// same for every row, and reading it per row is the cost trap `08ff6a2` paid for once. What
     /// it is replaced *with* depends on where it sits, which is not a special case but what an
     /// enum is — a number that prints as a label
-    /// ([ADR 0053](../../docs/adr/0053-a-cast-to-a-user-defined-type-is-resolved-once-per-statement.md)).
+    /// ([ADR 0053](../../../../docs/adr/0053-a-cast-to-a-user-defined-type-is-resolved-once-per-statement.md)).
     ///
     /// **The projection is walked first**, because the general walk below rewrites every cast it
     /// finds and would leave nothing to tell the two positions apart.
@@ -3887,7 +3887,7 @@ impl Executor {
     /// The version is a property of the transaction's snapshot, so it cannot move while the
     /// transaction lives: reading it again for the second and third view of one statement buys
     /// nothing and costs a round trip. Measured on the real topology
-    /// ([ADR 0102](../../../docs/adr/0102-the-catalogs-read-path.md), run 112's calibration): a
+    /// ([ADR 0102](../../../../docs/adr/0102-the-catalogs-read-path.md), run 112's calibration): a
     /// catalog read is **232 µs**, an ordinary statement took **two** of them, and **77%** of all
     /// reads returned the version the read before them had.
     ///
@@ -4321,7 +4321,7 @@ fn described(columns: &[query::OutputColumn]) -> Vec<FieldDescription> {
 /// What an advisory call that answers `void` folds to.
 ///
 /// **A `Cast` and not a bare literal**, for the reason a folded cast keeps one
-/// ([ADR 0086](../../../docs/adr/0086-a-folded-cast-keeps-the-type-it-named.md)): the value is a
+/// ([ADR 0086](../../../../docs/adr/0086-a-folded-cast-keeps-the-type-it-named.md)): the value is a
 /// `Datum::Text("")` and `text` is what a bare literal of it would be declared, so the node that
 /// carries the type is the only thing telling a client 2278. Without it the *executed* path said
 /// `text` while `Describe` said `void` — one expression with two answers, which is the shape three

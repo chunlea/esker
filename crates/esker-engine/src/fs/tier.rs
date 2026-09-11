@@ -3,7 +3,7 @@
 //! An SST never changes after `TableBuilder::finish` returns. That single fact is what makes
 //! tiering possible at all — a file that is immutable can be copied to a bucket once and read
 //! from there forever — and the only genuinely hard question is *when a local copy may be
-//! thrown away*. [ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) answers it and
+//! thrown away*. [ADR 0024](../../../../docs/adr/0024-tiering-failure-semantics.md) answers it and
 //! this module implements that answer.
 //!
 //! # What is tiered, and what is not
@@ -78,7 +78,7 @@ pub struct TierOptions {
 
     /// Whether the engine runs the uploader on a thread of its own.
     ///
-    /// `true` in production, where [ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md)
+    /// `true` in production, where [ADR 0024](../../../../docs/adr/0024-tiering-failure-semantics.md)
     /// decision 1 requires that no flush or compaction ever wait on an upload. `false` in
     /// tests, where a background thread turns "has it uploaded yet" into a race and the only
     /// way to answer it is a sleep — which is how a suite becomes flaky on a loaded machine.
@@ -91,7 +91,7 @@ pub struct TierOptions {
     /// the whole of the retry backoff: a file that fails goes to the back of the queue and is
     /// not tried again until the next pass. Passes happen on a new SST or on the uploader's
     /// idle tick, so a bucket that is down is retried at that cadence rather than in a hot
-    /// loop — which is what [ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md)
+    /// loop — which is what [ADR 0024](../../../../docs/adr/0024-tiering-failure-semantics.md)
     /// decision 2 asks for, without a clock the simulator would have to fake.
     pub batch: usize,
 

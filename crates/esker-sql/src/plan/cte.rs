@@ -13,7 +13,7 @@
 //! a read-only statement has nothing in it that can be run twice to different effect: this node
 //! refuses every volatile function inside a subquery, so there is no `nextval` and no `random()`
 //! to disagree with itself. What inlining changes is the **plan**, and [ADR
-//! 0031](../../../docs/adr/0031-rails-compatibility-is-measured.md) matches observable behaviour
+//! 0031](../../../../docs/adr/0031-rails-compatibility-is-measured.md) matches observable behaviour
 //! rather than plans.
 //!
 //! The cost is real and is recorded rather than hidden: a CTE referenced twice is **read twice**.

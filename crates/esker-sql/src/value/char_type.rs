@@ -22,7 +22,7 @@
 /// **It is idempotent, and that is PostgreSQL's own behaviour rather than a convenience**:
 /// `'\303'::"char"` is `\303` on a real server and not `\` — `charin` reads the escape form back
 /// — so `'é'::"char"::"char"` is `\303` too, measured. It matters here because a folded cast keeps
-/// its `Cast` node ([ADR 0086](../../../docs/adr/0086-a-folded-cast-keeps-the-type-it-named.md)),
+/// its `Cast` node ([ADR 0086](../../../../docs/adr/0086-a-folded-cast-keeps-the-type-it-named.md)),
 /// so the evaluator reads the already-rendered value a second time; without this that second pass
 /// took the backslash as the byte.
 #[must_use]

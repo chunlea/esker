@@ -1,5 +1,5 @@
 //! Range tombstones: `[begin, end)` deleted at one sequence number
-//! (`docs/DESIGN.md` §4.7, [ADR 0017](../../docs/adr/0017-range-tombstones.md)).
+//! (`docs/DESIGN.md` §4.7, [ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
 //!
 //! A point delete is an entry in the sorted run, and the read path finds it because it sits
 //! exactly where the key it hides sits. A range delete cannot work that way: it hides keys
@@ -164,7 +164,7 @@ impl RangeTombstones {
     ///
     /// A table's key bounds have to be widened to cover its tombstones, or a read for a key
     /// inside a deleted range would never open the file that says so
-    /// ([ADR 0017](../../docs/adr/0017-range-tombstones.md)).
+    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
     #[must_use]
     pub fn key_bounds(&self, comparator: &dyn Comparator) -> Option<(&[u8], &[u8])> {
         let mut bounds: Option<(&[u8], &[u8])> = None;

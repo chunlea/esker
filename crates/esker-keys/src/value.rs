@@ -100,7 +100,7 @@ pub enum ColumnType {
     /// 32-bit integer. PostgreSQL calls it `integer` in messages and `int4` in DDL.
     ///
     /// A **distinct type and not an alias for [`ColumnType::Int8`]** ([ADR
-    /// 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)): a client asking what a column is
+    /// 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md)): a client asking what a column is
     /// gets `int4`'s OID, and a value between 2^31 and 2^63 is `22003` here as it is on a real
     /// server rather than being quietly accepted.
     Int4,
@@ -110,7 +110,7 @@ pub enum ColumnType {
     /// different type**, which is PostgreSQL's own model: `text`, `varchar` and `bpchar` are one
     /// varlena told apart by OID, not by bytes. So a `varchar` column's rows are byte-identical to
     /// a `text` column's and this is not a format change even in principle
-    /// ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
+    /// ([ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md)).
     Varchar,
     /// PostgreSQL's `character(n)`, whose internal name is `bpchar` — "blank-padded char".
     ///
@@ -120,7 +120,7 @@ pub enum ColumnType {
     /// a plain byte comparison *is* PostgreSQL's blank-insensitive one. That is what lets an index
     /// key hold a `character(n)` without breaking "equal values encode identically", and it is why
     /// this type could not arrive before the typmod did — there is nowhere to pad to without an
-    /// `n` ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
+    /// `n` ([ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md)).
     Bpchar,
     /// PostgreSQL's `name`: the type its own catalog is written in, and the one string type that
     /// is **fixed width**.
@@ -133,12 +133,12 @@ pub enum ColumnType {
     /// Stored as its text, like [`ColumnType::Varchar`], and telling itself apart by OID — but
     /// unlike `varchar` its **collation is C**, so a column of it sorts in byte order and every
     /// capital precedes every lower-case letter. A memcomparable key is already in byte order
-    /// ([ADR 0076](../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)), so that
+    /// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)), so that
     /// ordering is the one this crate gives it for free.
     Name,
     /// PostgreSQL's `json`: a **validated string**, stored exactly as it was sent. Whitespace,
     /// key order and duplicate keys all survive, because that is all `json` is
-    /// ([ADR 0042](../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)).
+    /// ([ADR 0042](../../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)).
     Json,
     /// PostgreSQL's `jsonb`: a value, stored as the **canonical text** it prints as — keys
     /// reordered by length then bytes, duplicates dropped with the last winning, and a space after
@@ -167,7 +167,7 @@ pub enum ColumnType {
     Hstore,
     /// PostgreSQL's `tsvector`: a sorted, deduplicated set of lexemes, each optionally carrying a
     /// list of positions, stored as **the canonical text it prints as**
-    /// ([ADR 0066](../../docs/adr/0066-a-tsvector-is-its-canonical-text.md)).
+    /// ([ADR 0066](../../../docs/adr/0066-a-tsvector-is-its-canonical-text.md)).
     ///
     /// The road `hstore` takes and for the same reason: the canonical form is a function of the
     /// content, so two tsvectors are equal exactly when their texts are, and equality, ordering,
@@ -329,7 +329,7 @@ pub enum ColumnType {
     /// not become `'<a/>'` — once it is known to be well-formed XML *content*, which may be a bare
     /// text run and not only a document. Like `json` it has no equality operator at all, so it is
     /// not an index key, cannot be `DISTINCT`ed and cannot be ordered
-    /// ([ADR 0042](../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)).
+    /// ([ADR 0042](../../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)).
     Xml,
     /// `xml[]`. `xml_test.rb` declares no array; the type exists because a real server's `xml` has
     /// `typarray = 143`, and a base type whose `typarray` is `0` is what cost run 53 its 43 tests.
@@ -372,7 +372,7 @@ pub enum ColumnType {
     /// `{"'a' 'b'",'c'}` — so the element is quoted exactly when the array codec's own rules say
     /// so, which is what makes this a flat variant rather than a special case.
     TsVectorArray,
-    /// `tsquery[]`, for the symmetry [ADR 0047](../../docs/adr/0047-an-array-is-a-column-type-over-one-element-type.md)
+    /// `tsquery[]`, for the symmetry [ADR 0047](../../../docs/adr/0047-an-array-is-a-column-type-over-one-element-type.md)
     /// asks of every element type. Nothing in the suite builds one.
     TsQueryArray,
     /// Two-valued, with no third state but NULL.
@@ -384,7 +384,7 @@ pub enum ColumnType {
     /// PostgreSQL's `timestamp` **without** time zone: the same eight bytes as
     /// [`ColumnType::TimestampTz`] and a different type. It does no zone conversion, so what goes
     /// in is what comes out, and it prints with no offset
-    /// ([ADR 0033](../../docs/adr/0033-tier-1-of-the-type-surface.md)).
+    /// ([ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md)).
     Timestamp,
     /// IEEE-754 binary64.
     Double,
@@ -432,7 +432,7 @@ pub enum ColumnType {
     /// and the four here are the ones `ActiveRecord`'s schemas declare. A recursive
     /// `Array(Box<ColumnType>)` would say that better and would cost a `Box` at every one of the
     /// hundreds of places this `Copy` type is passed by value
-    /// ([ADR 0047](../../docs/adr/0047-an-array-is-a-column-type-over-one-element-type.md)).
+    /// ([ADR 0047](../../../docs/adr/0047-an-array-is-a-column-type-over-one-element-type.md)).
     Int8Array,
     /// `integer[]`.
     Int4Array,
@@ -514,7 +514,7 @@ pub enum ColumnType {
     /// The five that were left when `box` took its own: `tests/array_delimiter.rs` carried them as
     /// one named gap with one reason — no suite test declares an array of one — and r1's wire sweep
     /// made that reason false for three of them, so all five arrived together
-    /// ([ADR 0091](../../docs/adr/0091-the-five-geometric-shapes-get-their-arrays.md)).
+    /// ([ADR 0091](../../../docs/adr/0091-the-five-geometric-shapes-get-their-arrays.md)).
     LsegArray,
     /// See [`ColumnType::LsegArray`].
     PathArray,

@@ -80,7 +80,7 @@ impl ArrayValue {
     /// The four are the ones `ActiveRecord`'s schemas declare. Each is a `ColumnType` of its own
     /// rather than a constructor applied to another, because [`ColumnType`] is `Copy` and used by
     /// value everywhere — a recursive variant would be a `Box` in every one of those places
-    /// ([ADR 0047](../../docs/adr/0047-an-array-is-a-column-type-over-one-element-type.md)).
+    /// ([ADR 0047](../../../docs/adr/0047-an-array-is-a-column-type-over-one-element-type.md)).
     #[must_use]
     pub fn array_of(element: ColumnType) -> Option<ColumnType> {
         Some(match element {

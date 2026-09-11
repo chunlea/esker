@@ -1,6 +1,6 @@
 //! The fragment **result** format: what a columnar node answers with.
 //!
-//! [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 3,
+//! [ADR 0022](../../../../docs/adr/0022-columnar-learner-replica.md) Decision 3,
 //! `docs/plans/phase-8-learner.md` §wire. Milestone 2 built the fragment *request* as a
 //! versioned, fuzzed, golden-tested format and left the answer as Rust types —
 //! `FragmentResult { output, stats }` over `FragmentOutput::Rows`/`Groups` — with no way to put
@@ -113,7 +113,7 @@ pub enum ValueType {
     Oid,
     /// A 32-bit signed integer.
     ///
-    /// Appended by [ADR 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), never
+    /// Appended by [ADR 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md), never
     /// renumbered: a peer that has not learned it answers `unknown type tag` rather than reading
     /// four bytes as eight, which is the direction this vocabulary is built to fail in.
     Int4,

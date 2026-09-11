@@ -147,7 +147,7 @@ pub enum TablePart {
 /// The inverse of [`table_row_prefix`] and [`table_index_prefix`], and it lives here for the
 /// reason `CLAUDE.md` invariant 7 gives: key semantics belong in `esker-keys` and nowhere
 /// below it. The garbage collector needs it — a per-table retention window is looked up by the
-/// table a version's key names ([ADR 0021](../../docs/adr/0021-time-machine.md)) — and the
+/// table a version's key names ([ADR 0021](../../../docs/adr/0021-time-machine.md)) — and the
 /// collector sits in `esker-store`, which must not learn to parse a key layout that is
 /// described here.
 ///

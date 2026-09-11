@@ -109,7 +109,7 @@ pub struct Column {
     /// The collation the column was declared with, or `None` for the type's own.
     ///
     /// `C` or `POSIX` only
-    /// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)); every
+    /// ([ADR 0076](../../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)); every
     /// other name is refused in the lowerer, so what reaches here is always an ordering this node
     /// actually has.
     pub collation: Option<String>,
@@ -117,7 +117,7 @@ pub struct Column {
     /// which of the three it is.
     ///
     /// All three serial spellings are among them, since [ADR
-    /// 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md) gave this node the integers
+    /// 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md) gave this node the integers
     /// they stand for: `smallserial` is an `int2`, `serial` an `int4` and `bigserial` an `int8`,
     /// each plus a sequence. Before `int4` existed, `serial` was `0A000` rather than an `int8` in
     /// disguise, which would have accepted every value between 2^31 and 2^63 that a real server
@@ -669,7 +669,7 @@ pub struct CreateIndex {
     pub keys: Vec<IndexKeyPart>,
     /// The **access method** written after `USING`, folded — `btree` when none was.
     ///
-    /// Recorded and not acted on ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)):
+    /// Recorded and not acted on ([ADR 0070](../../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)):
     /// the index built underneath is the ordered one every index here is, and this is what
     /// `pg_class.relam` and `pg_get_indexdef` report.
     pub access_method: String,
@@ -995,7 +995,7 @@ fn name_addition(parts: impl Iterator<Item = impl AsRef<str>>) -> String {
 pub fn make_object_name(name1: &str, name2: Option<&str>, label: &str) -> String {
     // **The budget belongs to the identifier, never to the schema in front of it.** A stored name
     // is bare in `public` and `schema ++ NUL ++ name` anywhere else
-    // ([ADR 0071](../../../docs/adr/0071-a-relation-name-is-keyed-by-its-schema.md)), so handing
+    // ([ADR 0071](../../../../docs/adr/0071-a-relation-name-is-keyed-by-its-schema.md)), so handing
     // the qualified form in made the schema and its separator eat into the table's share: a
     // 60-character table in a one-character schema derived a **61**-byte index name where a real
     // server derives 63, and a long enough schema would have truncated the separator itself away
@@ -1248,10 +1248,10 @@ pub struct AlterTable {
 ///
 /// `ADD COLUMN` and `DROP COLUMN` are here. Every other action parses and comes back `0A000`
 /// naming itself (contract C2), a type change included: the row format carries a column *count*
-/// and not column identity ([ADR 0019](../../../docs/adr/0019-a-row-says-how-many-columns-it-has.md)),
+/// and not column identity ([ADR 0019](../../../../docs/adr/0019-a-row-says-how-many-columns-it-has.md)),
 /// so a column cannot change width under rows already written. `DROP COLUMN` used to be refused
 /// for that same reason and no longer is — it does not need identity, because the slot never moves
-/// ([ADR 0051](../../../docs/adr/0051-a-dropped-column-keeps-its-slot.md)).
+/// ([ADR 0051](../../../../docs/adr/0051-a-dropped-column-keeps-its-slot.md)).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterTableAction {
     /// `ADD [COLUMN] [IF NOT EXISTS] <column> <type>`, nullable and with no default — the only
@@ -1459,7 +1459,7 @@ pub enum AlterTableAction {
         retention_ms: Option<u64>,
     },
     /// `SET (columnar_replicas = <n>)` — how many columnar copies of this table the cluster
-    /// should keep ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5).
+    /// should keep ([ADR 0022](../../../../docs/adr/0022-columnar-learner-replica.md) Decision 5).
     ///
     /// The same storage-parameter shape as `retention` above and, like it, **not part of the
     /// table definition**: it changes nothing about how a row is written or read, so it does not
