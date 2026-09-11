@@ -176,6 +176,18 @@ fn golden_pd_raft_requests() -> Vec<(&'static str, Request)> {
 fn golden_pd_heartbeat_requests() -> Vec<(&'static str, Request)> {
     vec![
         (
+            // ADR 0110: one round that reports a reader's oldest `start_ts` and answers with the
+            // safepoint. A store sends `None`; this pins the client's shape, which carries one.
+            "pd-safepoint",
+            Request::Pd {
+                cluster_id: PD_CLUSTER,
+                request: PdReq::Safepoint {
+                    reporter_id: 7,
+                    oldest_read: Some(262_144_000),
+                },
+            },
+        ),
+        (
             "pd-store-heartbeat",
             Request::Pd {
                 cluster_id: PD_CLUSTER,
@@ -909,6 +921,12 @@ fn golden_pd_responses() -> Vec<(&'static str, Response)> {
             Response::Pd(PdResp::Bootstrap {
                 cluster_id: PD_CLUSTER,
                 region: None,
+            }),
+        ),
+        (
+            "pd-safepoint",
+            Response::Pd(PdResp::Safepoint {
+                safepoint: 262_144_999,
             }),
         ),
         ("pd-store-heartbeat", Response::Pd(PdResp::StoreHeartbeat)),

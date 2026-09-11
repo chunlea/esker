@@ -197,6 +197,14 @@ fn serve(pd: &Pd, cluster_id: u64, request: &PdReq) -> Result<PdResp, ProtoError
 /// match cannot skip a check it never sees.
 fn dispatch(pd: &Pd, request: &PdReq) -> Result<PdResp, ProtoError> {
     Ok(match request {
+        // **Both directions in one round** (ADR 0110): the reporter says what it is holding, and
+        // the answer is the safepoint that follows from every reporter together.
+        PdReq::Safepoint {
+            reporter_id,
+            oldest_read,
+        } => PdResp::Safepoint {
+            safepoint: pd.report_and_read_safepoint(*reporter_id, *oldest_read)?,
+        },
         PdReq::Bootstrap { store } => {
             let done = pd.bootstrap(store.store_id, &store.address)?;
             PdResp::Bootstrap {

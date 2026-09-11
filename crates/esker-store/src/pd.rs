@@ -132,6 +132,20 @@ pub trait PdClient: Send + Sync + fmt::Debug {
     /// Reports this store's capacity and load.
     fn store_heartbeat(&self, beat: &StoreHeartbeat) -> Result<(), ProtoError>;
 
+    /// Reports what this reporter is holding and answers with the safepoint in force.
+    ///
+    /// **A round of its own, not a field on the heartbeat** — `PdResp::StoreHeartbeat` encodes to
+    /// zero bytes and the golden file pins them, so the channel is added rather than widened
+    /// ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)).
+    /// A store holds no reads of its own, so it reports `None` and uses the answer.
+    ///
+    /// Defaulted to "PD published nothing", which is the safe answer: zero collects nothing, and
+    /// a `PdClient` that has not implemented this must not make a store collect more than it
+    /// would have.
+    fn safepoint(&self, _reporter_id: u64, _oldest_read: Option<u64>) -> Result<u64, ProtoError> {
+        Ok(0)
+    }
+
     /// Reports one region, from its leader.
     ///
     /// The answer may carry an [`Operator`]: the placement driver's whole way of asking a store to

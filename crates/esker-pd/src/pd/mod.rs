@@ -339,6 +339,13 @@ pub struct Pd {
     max_store_down_time_ms: u64,
     /// See [`PdOptions::lock_ttl_ms`]. Read only by [`Pd::schema_lease`].
     lock_ttl_ms: u64,
+    /// What the cluster's readers are holding, and the safepoint that follows (ADR 0110).
+    ///
+    /// Behind a lock rather than in the state machine: it is **derived**, not decided — a restart
+    /// forgets every report, and the first thing a restarted PD publishes is a safepoint with no
+    /// reader floor under it. That is why the window is the other half, and why a store holds
+    /// `0` until it is told: the direction of every unknown here is "collect less".
+    safepoints: Mutex<crate::safepoint::Safepoints>,
     /// See [`PdOptions::retention_ms`]. Read only by [`Pd::schema_lease`].
     retention_ms: u64,
     operator_timeout_ms: u64,
@@ -505,6 +512,12 @@ impl Pd {
             tso_save_interval_ms: options.tso_save_interval_ms,
             max_store_down_time_ms: options.max_store_down_time_ms,
             lock_ttl_ms: options.lock_ttl_ms,
+            safepoints: Mutex::new(crate::safepoint::Safepoints::new(
+                options.retention_ms,
+                // Two store-heartbeat rounds (10 s each, `crate::pd`'s cadence), so one lost
+                // report never moves the safepoint — a reporter has to be gone, not unlucky.
+                2 * 10_000,
+            )),
             retention_ms: options.retention_ms,
             operator_timeout_ms: options.operator_timeout_ms,
             target_replicas: options.target_replicas,
@@ -903,6 +916,27 @@ impl Pd {
         state
             .oracle
             .allocate(count, now_ms, |mark| commit_tso(driver, mark))
+    }
+
+    /// Records what a reporter is holding and answers with the safepoint that follows.
+    ///
+    /// **`now` comes from the oracle, not from the clock** — `CLAUDE.md` invariant 6, and ADR
+    /// 0110's arithmetic rule: the window is subtracted from a timestamp the same oracle issued,
+    /// so a cluster whose oracle counts rather than ticks answers zero and collects nothing.
+    /// Taking one timestamp per report is also what keeps the oracle's high-water mark honest
+    /// about a PD that is publishing safepoints.
+    pub fn report_and_read_safepoint(
+        &self,
+        reporter: u64,
+        oldest_read: Option<u64>,
+    ) -> Result<u64> {
+        let now = self.tso(1)?;
+        let mut safepoints = self
+            .safepoints
+            .lock()
+            .map_err(|_| PdError::internal("the safepoint registry is poisoned"))?;
+        safepoints.report(reporter, oldest_read, now);
+        Ok(safepoints.safepoint(now))
     }
 
     /// The oracle's high-water mark, for the inspector and the tests.

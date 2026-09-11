@@ -1414,9 +1414,9 @@ impl Store {
                 let report = store.report();
                 drop(store);
                 // The blocking pool refusing means the process is shutting down.
-                let Ok((next, operators)) = tokio::task::spawn_blocking(move || {
-                    let operators = beats.tick(&report);
-                    (beats, operators)
+                let Ok((next, tick)) = tokio::task::spawn_blocking(move || {
+                    let tick = beats.tick(&report);
+                    (beats, tick)
                 })
                 .await
                 else {
@@ -1426,7 +1426,14 @@ impl Store {
                 let Some(store) = weak.upgrade() else {
                     return;
                 };
-                for operator in operators {
+                // **Before the operators**, because it costs nothing and a store that is about to
+                // be told to move a region should already be collecting to the right depth
+                // (ADR 0110). `raise_safepoint` never moves it backwards, so a PD that has just
+                // restarted and publishes zero cannot make this store keep less.
+                if let Some(published) = tick.safepoint {
+                    store.raise_safepoint(published);
+                }
+                for operator in tick.operators {
                     store.run_operator(&operator).await;
                 }
                 // On the same schedule, because it is the second half of the same job: an
