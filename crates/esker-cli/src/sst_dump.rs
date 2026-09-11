@@ -33,11 +33,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::bytes::{escape, escape_capped};
-use esker_engine::dbformat::BytewiseComparator;
+use esker_engine::dbformat::{BytewiseComparator, Comparator, InternalKeyComparator};
 use esker_engine::fs::{FileSystem, LocalFileSystem, RandomAccessFile, read_exact_at};
 use esker_engine::options::{Compression, StripSuffix};
 use esker_engine::sst::footer::decode_block;
-use esker_engine::sst::{Block, BlockHandle, Footer, TableOptions, TableReader};
+use esker_engine::sst::{Block, BlockHandle, Footer, TableOptions, TableProperties, TableReader};
 
 /// What to dump, and how much of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +197,54 @@ fn open_file(
 }
 
 /// Reads and decodes the last 48 bytes.
+/// The comparator this table was built with, read from the table's own properties.
+///
+/// **Read and not assumed, and that is the whole of the fix.** Every SST a store writes is built
+/// with `esker.InternalKeyComparator` — a key's MVCC suffix is part of its order — while
+/// `TableOptions::default()` names the bytewise one. `TableReader::open` refuses the mismatch,
+/// correctly and loudly, so `esker sst-dump` could not open a single file this system had written:
+///
+/// ```text
+/// table was built with comparator "esker.InternalKeyComparator" but is being read with
+/// "esker.BytewiseComparator"; its keys would be searched in the wrong order
+/// ```
+///
+/// Hardcoding the internal one would only move the refusal: the golden tables this format is
+/// pinned by are bytewise, and dumping *those* is what the tool was first written for. The file
+/// says which it is, and the properties block is readable before the reader that needs the answer
+/// — which is why this reads it here rather than asking the `TableReader` that cannot be built yet.
+///
+/// `reconcile.rs` and `manifest_dump.rs` already wrap the internal comparator. This was the third
+/// reader of the same fact and the one that did not.
+fn comparator_of(
+    file: &dyn RandomAccessFile,
+    file_size: u64,
+    footer: &Footer,
+    path: &std::path::Path,
+) -> Result<Arc<dyn Comparator>, DumpError> {
+    let raw = read_raw(file, file_size, footer.properties, "properties", path)?;
+    let payload = decode_block(&raw, &path.display().to_string())?;
+    let props =
+        TableProperties::decode(Arc::from(payload.into_boxed_slice())).map_err(DumpError::Table)?;
+    let bytewise = Arc::new(BytewiseComparator);
+    if props.comparator_name == BytewiseComparator.name() {
+        return Ok(bytewise);
+    }
+    let internal = Arc::new(InternalKeyComparator::new(bytewise));
+    if props.comparator_name == internal.name() {
+        return Ok(internal);
+    }
+    // Named rather than guessed at: a table built by something else is a fact worth printing,
+    // and a tool that silently picked an order would search it wrongly.
+    Err(DumpError::Table(esker_engine::Error::InvalidArgument(
+        format!(
+            "{}: built with comparator {:?}, which this build does not have",
+            path.display(),
+            props.comparator_name
+        ),
+    )))
+}
+
 fn read_footer(
     file: &dyn RandomAccessFile,
     file_size: u64,
@@ -474,10 +522,12 @@ pub(crate) fn run(options: &DumpOptions, out: &mut dyn Write) -> Result<(), Dump
     let footer = read_footer(file.as_ref(), file_size, path)?;
     print_footer(out, &footer)?;
 
+    let comparator = comparator_of(file.as_ref(), file_size, &footer, path)?;
     let table_options = TableOptions {
         prefix_extractor: options
             .prefix_len
             .map(|len| Arc::new(StripSuffix::new(len)) as Arc<_>),
+        comparator: Arc::clone(&comparator),
         ..TableOptions::default()
     };
     let table = TableReader::open(open_file(fs, path)?, 0, table_options, None)?;

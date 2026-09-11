@@ -214,3 +214,88 @@ fn a_compaction_an_operator_asked_for_answers_with_what_is_left() {
         "`admin compact` said nothing about what is left:\n{said}"
     );
 }
+
+/// **`esker sst-dump` must open the SSTs this system writes.** Until this test it could not.
+///
+/// Every table a store writes is built with `esker.InternalKeyComparator` — the MVCC suffix is
+/// part of a key's order — and `sst-dump` opened files with `TableOptions::default()`, which names
+/// `esker.BytewiseComparator`. `TableReader::open` refuses the mismatch, correctly and loudly:
+///
+/// ```text
+/// table was built with comparator "esker.InternalKeyComparator" but is being read with
+/// "esker.BytewiseComparator"; its keys would be searched in the wrong order
+/// ```
+///
+/// So the one tool for counting dead versus live versions in a table could not open a single real
+/// one, which is the instrument gap #58's isolation ran into. `reconcile.rs` and
+/// `manifest_dump.rs` already wrap the internal comparator; this is the third reader of the same
+/// fact, and it was the one that did not.
+///
+/// It is an end-to-end test on purpose: the file it opens is one a store wrote, flushed by the
+/// verb above, rather than one the test built to its own taste.
+#[test]
+fn sst_dump_opens_a_table_a_store_wrote() {
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("node");
+    let log = dir.path().join("server.log");
+    let port = free_port();
+    let address = format!("127.0.0.1:{port}");
+
+    let mut server = start(&data, port, &log);
+    wait_until_listening(&mut server, &log);
+    for at in 0..ROWS {
+        let (ok, said) = cli(&[
+            "raw",
+            "put",
+            &format!("k{at:05}"),
+            "value",
+            "--addr",
+            &address,
+        ]);
+        assert!(ok, "`raw put` failed: {said}");
+    }
+    let (ok, said) = cli(&["admin", "flush", "--store", &address]);
+    assert!(ok, "`admin flush` failed: {said}");
+
+    let mut opened = 0;
+    let mut entries = 0;
+    for name in ssts_on_disk(&data) {
+        let mut stack = vec![data.clone()];
+        let mut found = None;
+        while let Some(at) = stack.pop() {
+            for entry in std::fs::read_dir(&at).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.file_name().is_some_and(|it| it == name.as_str()) {
+                    found = Some(path);
+                }
+            }
+        }
+        let path = found.expect("the sst that was just listed");
+        let (ok, report) = cli(&["sst-dump", path.to_str().unwrap()]);
+        assert!(
+            ok,
+            "sst-dump refused {}:
+{report}",
+            path.display()
+        );
+        assert!(
+            report.contains("comparator            esker.InternalKeyComparator"),
+            "a store's table is built with the internal comparator:
+{report}"
+        );
+        // The count is the point: an `entry_count` of zero would mean the tool opened the file
+        // and read nothing out of it, which is the same amount of use to r1 as refusing it.
+        let count: u64 = report
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("entry_count"))
+            .and_then(|rest| rest.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no entry_count in:\n{report}"));
+        assert!(count > 0, "the table dumped zero entries:\n{report}");
+        entries += count;
+        opened += 1;
+    }
+    assert!(opened > 0, "the flush wrote no sst to dump");
+    assert!(entries > 0, "{opened} tables held no entries between them");
+}
