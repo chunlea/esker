@@ -1,0 +1,21 @@
+docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md
+  s_ac192c209f55d3::t_801924381eecb2 288-318
+docs/plans/debts-v1.1.md
+  s_ac192c209f55d3::t_06bd56f962ced0 111,125-126
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d8194b3daf5bc81fff456738b9cc476de74b5d2c",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
