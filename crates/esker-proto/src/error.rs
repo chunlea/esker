@@ -395,6 +395,22 @@ impl ProtoError {
     /// changed. Everything else — a decode failure, an unsupported operation, a closed
     /// connection whose request may have been applied — is returned to the caller.
     ///
+    /// [`ProtoError::NotSent`] is in the set and is the safest member of it. The rule the set is
+    /// derived from is *a write may be re-sent only when the previous attempt provably did not
+    /// commit*, and this is the one variant that says exactly that about itself: the request
+    /// never reached the wire, so [`ProtoError::outcome`] has answered `NotApplied` for it all
+    /// along. Every other member is a refusal a store *chose to send*; this one never left the
+    /// client. It was missing, and what that cost is measurable: run 124's leader-store kill
+    /// refused **184 statements in 0.695 s** with a largest gap of 367 ms — not a budget being
+    /// spent on an election, but a client with no entry for *"the store I was routed to is not
+    /// reachable"* surfacing at once. Ninety-two Rails tests errored, on a cluster whose control
+    /// sample ran clean.
+    ///
+    /// [`ProtoError::Closed`] is **not** in the set and must not be: its outcome is `Unknown`, so
+    /// a write may have committed. A read in that position is re-asked by the one rule that needs
+    /// the method (`esker_client::retry::may_ask_again`); a write becomes `AmbiguousResult` and
+    /// the caller decides.
+    ///
     /// [`ProtoError::PdNotLeader`] is **deliberately excluded**, though it carries a hint. This
     /// set exists so that a *generic* loop can retry safely, and the only repair for a PD redirect
     /// is to send the request to a different placement driver — a loop that swallowed it without
@@ -409,6 +425,7 @@ impl ProtoError {
                 | Self::EpochNotMatch { .. }
                 | Self::ServerIsBusy { .. }
                 | Self::RegionNotFound { .. }
+                | Self::NotSent { .. }
         )
     }
 
@@ -809,8 +826,12 @@ mod tests {
 
     /// The retry set is a contract with the client: it decides which failures a retry loop is
     /// allowed to swallow, so it is pinned rather than left to a reader of the enum.
+    ///
+    /// `NotSent` joined it after run 124, and it belongs: the rule the set is derived from is *a
+    /// write may be re-sent only when the previous attempt provably did not commit*, and this is
+    /// the one variant whose own documentation says exactly that.
     #[test]
-    fn only_redirectable_errors_are_retryable() {
+    fn only_redirectable_errors_and_the_unsent_are_retryable() {
         for error in one_of_each() {
             let expected = matches!(
                 error,
@@ -818,8 +839,25 @@ mod tests {
                     | ProtoError::EpochNotMatch { .. }
                     | ProtoError::ServerIsBusy { .. }
                     | ProtoError::RegionNotFound { .. }
+                    | ProtoError::NotSent { .. }
             );
             assert_eq!(error.is_retryable(), expected, "{error:?}");
+        }
+    }
+
+    /// **The rule underneath the set, asserted as a rule.** Every retryable error must be one the
+    /// peer provably did not apply — that is what makes re-sending a *write* safe, and it is the
+    /// property a future addition to the set could break without any list noticing.
+    #[test]
+    fn every_retryable_error_provably_did_not_apply() {
+        for error in one_of_each() {
+            if error.is_retryable() {
+                assert_eq!(
+                    error.outcome(),
+                    RequestOutcome::NotApplied,
+                    "{error:?} may be retried but may also have been applied"
+                );
+            }
         }
     }
 

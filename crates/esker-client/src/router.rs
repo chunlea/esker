@@ -234,6 +234,14 @@ impl Router {
         // The epoch that attempt carried, so the repair that follows can be asked whether it
         // moved. `None` until one is routed, for the same reason `region_id` is zero.
         let mut sent_epoch: Option<Epoch> = None;
+        // The store the last attempt could not reach, and the peer list it was routed by.
+        //
+        // **A follower that has not yet noticed its leader died still names it.** Without this, a
+        // call spends its whole budget on a loop of two moves: fail to reach the dead leader,
+        // forget it, ask a follower, be told the dead leader leads, believe it. Six of nine
+        // attempts went that way in the test that found it.
+        let mut unreachable: Option<u64> = None;
+        let mut peers: Vec<esker_proto::Peer> = Vec::new();
         loop {
             if self.clock.now() >= deadline {
                 return Err(Error::DeadlineExceeded {
@@ -249,9 +257,13 @@ impl Router {
             let error = match self.route(body.routing_key(), Some(deadline)) {
                 Err(error) => error,
                 Ok(route) => {
-                    let target = route.target().ok_or_else(|| Error::NoRegion {
-                        key: Bytes::copy_from_slice(body.routing_key()),
-                    })?;
+                    // **By attempt**, so a call whose leader is unknown asks the peers in turn
+                    // rather than the same one every time — see `Route::target_at`.
+                    let target = route
+                        .target_at(attempts - 1)
+                        .ok_or_else(|| Error::NoRegion {
+                            key: Bytes::copy_from_slice(body.routing_key()),
+                        })?;
                     let header =
                         RequestHeader::new(route.region.id, route.region.epoch, target.peer_id);
                     let wire = body.clone().into_request(header);
@@ -272,6 +284,10 @@ impl Router {
                         Err(error) => {
                             region_id = route.region.id;
                             sent_epoch = Some(route.region.epoch);
+                            if esker_proto::is_unreachable(&error) {
+                                unreachable = Some(target.store_id);
+                                peers.clone_from(&route.region.peers);
+                            }
                             error
                         }
                     }
@@ -292,6 +308,7 @@ impl Router {
                 self.on_terminal(&error, region_id, body.routing_key());
                 return Err(terminal(error, method));
             };
+            let redirect = Self::without_the_corpse(redirect, unreachable, &peers);
             self.repair(&redirect, region_id);
             // **The budget counts failures, and a refusal that taught this client where the
             // region went is not one.** Reset rather than decremented: a call that keeps being
@@ -399,6 +416,36 @@ impl Router {
         })?;
         self.cache.insert(route.clone());
         Ok(route)
+    }
+
+    /// Drops a leader hint that names the store this call has just failed to reach.
+    ///
+    /// A `NotLeader` hint is a follower's opinion, and a follower that has not yet noticed its
+    /// leader is gone still names it. Believing it sends the next attempt straight back to the
+    /// store that did not answer — and the two moves alternate until the budget is gone, which is
+    /// how a client with two live replicas spends nine attempts reaching none of them.
+    ///
+    /// Only for the length of **this call**: the hint is not wrong in general, it is wrong now,
+    /// and the next call starts with no opinion at all. The hint is a peer id, so it is resolved
+    /// against the peer list the failing attempt was routed by — the same resolution
+    /// [`crate::RegionCache::set_leader`] does.
+    fn without_the_corpse(
+        redirect: Redirect,
+        unreachable: Option<u64>,
+        peers: &[esker_proto::Peer],
+    ) -> Redirect {
+        let (Redirect::Leader { hint: Some(hint) }, Some(store_id)) = (&redirect, unreachable)
+        else {
+            return redirect;
+        };
+        let names_the_corpse = peers
+            .iter()
+            .any(|peer| peer.peer_id == *hint && peer.store_id == store_id);
+        if names_the_corpse {
+            Redirect::Leader { hint: None }
+        } else {
+            redirect
+        }
     }
 
     /// Applies what a redirectable refusal said to fix.
