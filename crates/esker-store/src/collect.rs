@@ -1,6 +1,6 @@
 //! Going and collecting when the safepoint says there is more to collect.
 //!
-//! [ADR 0110](../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md) publishes the
+//! [ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md) publishes the
 //! number and #62 made a compaction drop what is below it. Neither of them makes a compaction
 //! *happen*, and `Store::raise_safepoint`'s own neighbour says why that matters: *a safepoint
 //! changes nothing until a compaction reads the entries it applies to.* This is the wire between

@@ -226,6 +226,14 @@ bounded thread pool (2 threads *default*) via a `CompactionJob` that is a pure f
 is unit-testable without the `Db`). `CompactionFilter` trait lets `esker-txn` drop MVCC versions below
 the safepoint.
 
+**Level scores are not the only trigger.** A score answers "is this level over its target", and a
+store whose write buffer never fills has no levels to score — run 127e watched twenty files over
+forty-six minutes and saw no compaction at all, while the versions it was keeping were collectable
+the whole time. So a **rising safepoint** also asks for one: `esker_store::collect::Sweeper` sweeps
+`default`, `lock` and `write` when the published number actually moves, debounced from the *end* of
+the last sweep (`COLLECT_DEBOUNCE`, one store heartbeat, since that is when a store learns the
+number at all). `raft` is left alone — it holds nothing a safepoint makes collectable.
+
 **Two compactions must not touch one file, nor write overlapping ranges into one level.** The pool
 is bounded but not serial, and `Db::compact_range` runs one inline on the caller's thread beside it,
 so both halves of that rule are load-bearing. A plan reserves its **input files** by number and the
@@ -825,8 +833,11 @@ excludes other sessions of the same node and **not** sessions of another node �
 crossed sequence that deadlocks one node both commit, measured. The accepted fix is (a'): the row
 lock becomes a Percolator lock, acquired by an ordinary prewrite of a `Check` mutation (tag 5) sent
 when the statement runs rather than at `COMMIT`, which is why it costs no new tag and no new
-method. GC: PD publishes a safepoint;
-a `CompactionFilter` drops versions below it (keeping the newest visible one).
+method. GC: PD publishes a safepoint
+([ADR 0110](adr/0110-who-publishes-the-garbage-collection-safepoint.md)); a rising one makes a store
+go and compact (§4.7); a `CompactionFilter` drops versions below it, keeping the newest visible one
+— **including when that newest one is a delete**, which is what
+[ADR 0111](adr/0111-a-deleted-keys-versions-are-dropped-as-one-segment.md) is about.
 
 ## 9. Wire API (`esker-proto`)
 
