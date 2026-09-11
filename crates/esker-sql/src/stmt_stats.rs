@@ -32,8 +32,9 @@
 //! guard's two ends is what this statement did.
 
 use std::cell::Cell;
-use std::sync::OnceLock;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Whether the instrument is on, read once from the environment.
@@ -111,13 +112,31 @@ static WORST_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Calls that never left this node because a store's connection was closed, and the connections
 /// rebuilt to stores that had gone away.
 ///
-/// **Totals and not a map**, here where the map would be the wrong shape: a node's report is a
-/// rate per statement, and *which* store went away is the census's question and the cluster log's.
-/// What this answers is the one a run cannot answer without it — whether any store was ever
-/// unreachable to this node, and whether it was found again. A green run of run 124 with both at
-/// zero is a run that never tested the thing it was built to test.
+/// Totals, because a node's report is a rate per statement and these two are the one pair where
+/// the total is the interesting number: whether any store was ever unreachable to this node, and
+/// whether it was found again. A green run with both at zero is a run that never tested the thing
+/// it was built to test.
 static NOT_SENT: AtomicU64 = AtomicU64::new(0);
 static REDIALS: AtomicU64 = AtomicU64::new(0);
+
+/// The same two numbers **by store**: `store -> (not sent, redialled)`.
+///
+/// This said "totals and not a map ... *which* store went away is the census's question", and
+/// run 124 is where that stopped being true. The census is a **store's** view of a region; which
+/// store *this node* could not reach is a different fact and only this node has it. The run asked
+/// for the attribution and the report had to answer *"asked for and cannot be given at this
+/// hash"* — `Cost` carries the map per statement exactly as designed, and it was summed away one
+/// line before it could be emitted.
+///
+/// **Beside the totals rather than instead of them.** The tap line is parsed by a running
+/// instrument (`run124-verdict.py`'s regex over `stores unreachable N, reconnected N`), and
+/// replacing what it reads mid-measurement buys tidiness with somebody else's run — the same
+/// reasoning that kept `cluster.state`'s shape in ADR 0108.
+///
+/// A `Mutex` on a path that is otherwise all atomics, and it costs nothing in the normal case: it
+/// is taken only by a statement that actually met an unreachable store, which is none of them
+/// until something breaks.
+static BY_STORE: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
 
 /// Records one point read at the store boundary.
 pub(crate) fn record_point(key: &[u8]) {
@@ -244,6 +263,7 @@ impl Drop for Guard {
         WAITED_MICROS.fetch_add(waited, Ordering::Relaxed);
         NOT_SENT.fetch_add(cost.not_sent.values().sum::<u64>(), Ordering::Relaxed);
         REDIALS.fetch_add(cost.redials.values().sum::<u64>(), Ordering::Relaxed);
+        record_by_store(&cost);
         MICROS.fetch_add(micros, Ordering::Relaxed);
         WORST_MICROS.fetch_max(micros, Ordering::Relaxed);
         if tracing_reads() {
@@ -376,7 +396,46 @@ pub fn summary() -> String {
         // number, and dividing it by the statements would round it to nothing.
         NOT_SENT.load(Ordering::Relaxed),
         REDIALS.load(Ordering::Relaxed),
-    )
+    ) + &by_store_suffix()
+}
+
+/// Folds one statement's per-store costs into [`BY_STORE`].
+///
+/// Nothing is locked unless the statement met a store it could not reach, which is what makes a
+/// mutex acceptable on a path that is otherwise all atomics.
+fn record_by_store(cost: &esker_client::stmt_stats::Cost) {
+    if cost.not_sent.is_empty() && cost.redials.is_empty() {
+        return;
+    }
+    let Ok(mut by_store) = BY_STORE.lock() else {
+        // A thread panicked holding it. Losing a counter is not worth poisoning a statement.
+        return;
+    };
+    for (store, count) in &cost.not_sent {
+        by_store.entry(*store).or_default().0 += count;
+    }
+    for (store, count) in &cost.redials {
+        by_store.entry(*store).or_default().1 += count;
+    }
+}
+
+/// The per-store attribution, as `store=unsent/redialled`, or an empty string when every store
+/// this node has talked to answered every time.
+///
+/// Appended to the tap line rather than woven into it: the totals stay where an instrument that is
+/// already running expects to find them.
+fn by_store_suffix() -> String {
+    let Ok(by_store) = BY_STORE.lock() else {
+        return String::new();
+    };
+    if by_store.is_empty() {
+        return String::new();
+    }
+    let named: Vec<String> = by_store
+        .iter()
+        .map(|(store, (unsent, redials))| format!("{store}={unsent}/{redials}"))
+        .collect();
+    format!("; by store (unsent/redialled): {}", named.join(" "))
 }
 
 /// **Names the key heads `esker-client` recorded**, which it deliberately cannot do itself.
@@ -391,13 +450,13 @@ pub fn summary() -> String {
 /// that prints it and a byte array in a report is a puzzle rather than an answer.
 #[must_use]
 pub fn name_heads(
-    heads: &std::collections::BTreeMap<[u8; esker_client::stmt_stats::HEAD], u64>,
+    heads: &BTreeMap<[u8; esker_client::stmt_stats::HEAD], u64>,
 ) -> Vec<(String, u64)> {
     // **Merged by name, because the head is wider than a kind.** The client keeps eight opaque
     // bytes; a kind is five, and the rest is the start of a tenant — so one kind read for two
     // tenants arrives as two entries. Merging here rather than narrowing the window keeps the
     // client's record free of any assumption about where a kind ends.
-    let mut merged: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut merged: BTreeMap<String, u64> = BTreeMap::new();
     for (head, count) in heads {
         *merged.entry(name_of_head(head)).or_default() += count;
     }
@@ -462,5 +521,42 @@ mod tests {
             "a disabled instrument counted a statement: {}",
             summary()
         );
+    }
+
+    /// **The attribution run 124 asked for and could not be given.** The per-store map reaches the
+    /// report instead of being summed into two globals one line before it is emitted.
+    ///
+    /// Driven through the folding function rather than a whole statement, because what was broken
+    /// was the fold: `Cost` carried the map exactly as designed at the hash the run measured.
+    #[test]
+    fn the_per_store_costs_reach_the_report() {
+        let mut cost = esker_client::stmt_stats::Cost::default();
+        cost.not_sent.insert(4, 171);
+        cost.not_sent.insert(1, 12);
+        cost.redials.insert(1, 1);
+        super::record_by_store(&cost);
+
+        let said = super::by_store_suffix();
+        assert!(
+            said.contains("4=171/0"),
+            "the store that went away is not named: {said}"
+        );
+        assert!(
+            said.contains("1=12/1"),
+            "a store that was unreachable and then found again is not named: {said}"
+        );
+    }
+
+    /// And it stays out of the way when nothing went wrong, so an ordinary run's tap line is the
+    /// line every instrument already parses.
+    #[test]
+    fn a_run_that_reached_every_store_says_nothing_extra() {
+        assert!(
+            super::by_store_suffix().is_empty()
+                || super::by_store_suffix().starts_with("; by store"),
+            "the suffix is either absent or the documented shape"
+        );
+        let cost = esker_client::stmt_stats::Cost::default();
+        super::record_by_store(&cost);
     }
 }
