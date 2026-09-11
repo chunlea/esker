@@ -82,6 +82,12 @@ const PK_AND_SEQUENCE_FOR: &str = "SELECT attr.attname, nsp.nspname, seq.relname
 /// numbers and the ratio still means what it says. The idiom `pk_and_sequence_cost.rs` established.
 const CONTROL: &str = "SELECT count(*) FROM pg_class";
 
+/// **The two computed catalog views #54 was about**, joined the way `pk_and_sequence_for` joins
+/// its five: a comma in the `FROM` and the equality in the `WHERE`. The shortest statement whose
+/// `EXPLAIN` says whether that equality became a join condition.
+const JOIN_OVER_TWO_VIEWS: &str =
+    "SELECT count(*) FROM pg_class seq, pg_depend dep WHERE seq.oid = dep.objid";
+
 fn grow_to(node: &mut parity::Node, target: usize, made: &mut usize) {
     while *made < target {
         node.run(&format!(
@@ -164,17 +170,24 @@ fn one_statement_reads_no_key_twice() {
 /// after it. Today both runs pay five whole-catalog loads, so the second is as linear as the
 /// first.
 ///
-/// **Red today at 6.2x for 5x the catalog** — 4.09 ms at twenty relations, 25.33 ms at a hundred,
-/// against a bound of 2x. Slightly *super*-linear, which the census explains: five whole-catalog
-/// loads each walking a catalog that is itself five times longer. The bound is loose on
-/// purpose — this is a clock on a shared box — and it is still far under a linear curve, which is
-/// the only thing it has to separate. `pk_and_sequence_cost.rs` asserts a *different and looser*
-/// property (`big < small * 4` for **twice** the catalog, which permits quadratic); it was written
-/// to catch a cross-product blow-up and it passes today. This one is about the slope that survived
-/// it.
+/// **It asserts read counts and a plan; the clock is printed.** It used to assert
+/// `big < small * 2 + 2ms` over the wall clock, and on 2026-09-11 that went red on a gate whose
+/// own diff did not touch this crate — 3.1x under a load of 8 to 11 (#59). A gate cannot carry a
+/// wall-clock assertion, so the two properties it was really about are asserted directly:
 ///
-/// **The control is a statement that must grow with the catalog**, so a slow container moves both
-/// numbers and the comparison still says what it says.
+/// * **the reads are four at either catalog size**, which is #49 (b)'s acceptance and is a count;
+/// * **the comma join's equality reaches the join**, which is #54's, and is a *plan*.
+///
+/// The second is the one that needed saying out loud. A cross product reads no more than a lookup
+/// does — a tenant-wide scan is one read whatever it walks — so the read count was flat *before*
+/// #54 was fixed, and a count alone is a test that cannot fail for the debt this is named after.
+/// The plan can: before the fix the equality sat in a `Filter` above the loop and every pair was
+/// built, and the bare product's plan (no condition at all) is asserted beside it so that the
+/// string being looked for is known to discriminate.
+///
+/// The clock stays in the output because it is what a reader wants when the counts look right and
+/// the statement still feels slow, and `tests/catalog_join_slope.rs` is the measurement at three
+/// sizes that keeps the numbers.
 ///
 /// # Green since 2026-09-11, and it spent two debts red
 ///
@@ -189,46 +202,83 @@ fn one_statement_reads_no_key_twice() {
 /// `tests/catalog_join_slope.rs` carries the measurement at three sizes.
 #[test]
 fn a_repeated_statement_stops_tracking_the_catalog() {
-    /// What five times the catalog may cost, once the statement has been asked before.
-    const BOUND: u32 = 2;
-    /// Absolute room for a noisy box, kept **small against the numbers this actually measures**
-    /// (4 ms and 25 ms). A 50 ms slack was the first attempt, copied from an older test written at
-    /// a different scale, and it made this pass on a 4.4x curve — an ignored test that would have
-    /// passed, which is worse than no test.
-    const SLACK: Duration = Duration::from_millis(2);
+    /// What the second run may read at either catalog size: two catalog views, two counters each.
+    const BOUND: usize = 4;
 
+    esker_sql::stmt_stats::trace_every_read();
+    assert!(
+        esker_sql::stmt_stats::tracing_reads(),
+        "this test reads the instrument's trace and could not turn it on"
+    );
     let mut node = parity::Node::new(&[]);
     let mut made = 0;
-    grow_to(&mut node, 20, &mut made);
-    assert_eq!(
-        node.rows(PK_AND_SEQUENCE_FOR),
-        [["id", "public", "pk0_id_seq"]]
-    );
-    let small_control = elapsed(&mut node, CONTROL);
-    // The **second** run, at a version nothing has moved: this is the one that has to be flat.
-    let small = elapsed(&mut node, PK_AND_SEQUENCE_FOR);
+    let mut measured = Vec::new();
+    for size in [20usize, 100] {
+        grow_to(&mut node, size, &mut made);
+        assert_eq!(
+            node.rows(PK_AND_SEQUENCE_FOR),
+            [["id", "public", "pk0_id_seq"]],
+            "the same one row over a catalog of {size}"
+        );
+        let control = elapsed(&mut node, CONTROL);
+        esker_sql::stmt_stats::clear_trace();
+        // The **second** run, at a version nothing has moved: this is the one that has to be flat.
+        let took = elapsed(&mut node, PK_AND_SEQUENCE_FOR);
+        let reads = esker_sql::stmt_stats::last_trace();
+        assert!(
+            !reads.is_empty(),
+            "the trace is empty over {size} relations, so the statement was never instrumented \
+             and the bound below would pass by not looking"
+        );
+        assert!(
+            reads.len() <= BOUND,
+            "over {size} relations the second run read {} keys, not {BOUND}:\n    {}",
+            reads.len(),
+            reads.join("\n    ")
+        );
+        measured.push((size, reads.len(), took, control));
+    }
 
-    grow_to(&mut node, 100, &mut made);
-    assert_eq!(
-        node.rows(PK_AND_SEQUENCE_FOR),
-        [["id", "public", "pk0_id_seq"]],
-        "the same one row over five times the catalog"
-    );
-    let big_control = elapsed(&mut node, CONTROL);
-    let big = elapsed(&mut node, PK_AND_SEQUENCE_FOR);
-
-    // **Printed whether it passes or fails.** A ratio assertion that only speaks when it breaks
-    // leaves the next reader guessing how much room there was.
-    println!(
-        "20 relations {small:?}, 100 relations {big:?}; control {small_control:?} -> {big_control:?}"
-    );
+    // **The plan is what pins #54, and the count above cannot.** A cross product reads no more
+    // than a lookup does — a tenant-wide scan is one read whatever it walks — so the read count
+    // was flat *before* the fix as well, and a count ratio alone would be a test that cannot fail
+    // for the debt it is named after. What the fix moved is where the equality goes: a comma
+    // join's `WHERE` becomes a **join condition** instead of a filter over the pairs, and
+    // `EXPLAIN` is where this node writes that down (`tests/catalog_join_slope.rs` has the three
+    // sizes and both plans).
+    let plan = node
+        .rows(&format!("EXPLAIN {JOIN_OVER_TWO_VIEWS}"))
+        .into_iter()
+        .map(|row| row.join(" "))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        big < small * BOUND + SLACK,
-        "five times the catalog took {big:?} where a fifth of it took {small:?}, on the second \
-         run at an unchanged version — the statement is still reading the whole catalog once per \
-         relation in its FROM list. The control over the same two catalogs went {small_control:?} \
-         -> {big_control:?}, so the machine is not what changed."
+        plan.contains("Join Filter: (oid = objid)"),
+        "the comma join's equality never reached the join, so the loop builds every pair and \
+         filters afterwards — which is #54, and it is quadratic in the catalog:\n{plan}"
     );
+    // **The control for the string**, so this cannot pass by looking for something every plan
+    // says: the same two views with **no** condition are an honest cross product, and that plan
+    // has no `Join Filter` in it at all.
+    let product = node
+        .rows("EXPLAIN SELECT count(*) FROM pg_class seq, pg_depend dep")
+        .into_iter()
+        .map(|row| row.join(" "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !product.contains("Join Filter"),
+        "a product with no condition named a join filter, so the assertion above proves \
+         nothing:\n{product}"
+    );
+
+    // **Printed, not asserted.** A wall clock on a shared box is not a gate: this assertion was
+    // `big < small * 2 + 2ms` and it went red on a gate whose own diff did not touch this crate,
+    // at 3.1x under a load of 8-11 (#59, 2026-09-11). The numbers stay because they are what a
+    // reader wants when the counts look right and the statement still feels slow.
+    for (size, reads, took, control) in &measured {
+        println!("{size:4} relations: {reads} reads, {took:?}; control {control:?}");
+    }
 }
 
 /// **A statement asked a second time at an unchanged version reads only the version counters** —

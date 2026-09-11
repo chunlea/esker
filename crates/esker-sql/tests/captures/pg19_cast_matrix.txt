@@ -32,29 +32,50 @@
 # ## What this node answers, per mode
 #
 #                                    literal     bind
-#     agree                          10,080   10,064
-#     node refuses, PG answers            4       26
+#     agree                          10,080   10,086
+#     node refuses, PG answers            4        4
 #     node answers, PG refuses            0        0
 #     both refuse, different code        16       10
 #
-# ## **The finding: 31 pairs where this node's own two modes disagree**
+# **Re-taken 2026-09-11 after the two bind families were fixed**: the bind column's "node refuses"
+# was **26** and is now **4**, and those four are the declared `regclass` divergence. What closed:
+# `oidvector -> T[]` (11), `regclass[] -> …` (11). What is left in that column is a ruling, not a
+# defect.
 #
-# The oracle's do not, anywhere. Three families, and the middle one is the one a client feels:
+# ## **The finding: the node's two modes disagree where the oracle's never do**
 #
-#     11  `oidvector -> T[]`      literal **ok**, bind `22P02`, PG ok
-#     11  `regclass[] -> …`       literal **ok**, bind `0A000`, PG ok
-#      6  `line -> <geometry>`    literal `22P02`, bind `42846`, PG `42846`   <- here **bind is right**
-#      3  `regclass -> oid` and `regclass[] -> integer[]|oid[]`: the declared divergence, refused
-#         by two different codes depending on how it is asked
+# When this file was first taken with both modes, **31** pairs answered differently as a literal
+# and as a bound parameter; on 19beta1 **none of the 10,100 does**. Twenty-two of the 31 were pairs
+# a literal answers and a bind refuses — and `ActiveRecord` binds by default, so that was the mode
+# that mattered and the one nothing had ever swept. Both families are now closed:
 #
-# **Twenty-two pairs that a literal answers are refused when the value is bound**, and
-# `ActiveRecord` binds by default — so the mode that matters is the one that was never swept. The
-# `line` family runs the other way: the *literal* path answers a `22P02` about the value where both
-# the bind path and a real server say `42846` about the cast.
+#     11  `oidvector -> T[]`    was literal ok / bind `22P02`   — `declared_type_of` did not read
+#                               `CatalogFunc::OidVector`, which is how `::oidvector` reaches the
+#                               planner (`sqlparser` has no `DataType` for the name), so the
+#                               evaluator's vector arm never fired and `1 2` met an array reader.
+#                               `int2vector` answered in both modes all along: it reaches
+#                               `lower_type` instead, and that was the whole difference.
+#     11  `regclass[] -> …`     was literal ok / bind `0A000`   — `bind::substitute` read the bound
+#                               text with `Datum::from_text`, and a `regclass`'s input function is
+#                               a **relation lookup** while `crate::value` has no catalog by
+#                               invariant 7. The value is handed to the cast now, and the lookup
+#                               happens where every other `regclass` name is resolved.
 #
-# Nothing here is fixed by this file; it is the measurement the next unit starts from.
+# **7 pairs still differ by mode**, and neither is a bind defect:
 #
-# ## The pairs this node gets wrong, whole (56 rows over both modes)
+#      6  `line -> <geometry>`  literal `22P02`, bind `42846`, PG `42846` — here the **bind path is
+#                               right**. `value::geometric::to_point` parses the source's
+#                               coordinates *before* the arm that says a `line` converts to
+#                               nothing, and a line's canonical `{A,B,C}` is not a coordinate
+#                               list, so the literal fold blames the value for a pair that has no
+#                               cast. A gate below a parse, which is this crate's recurring shape.
+#                               Recorded as wire v3 family **F12**; not fixed here.
+#      1  `regclass -> oid`     the declared divergence (`tests/user_decided_divergences.rs`),
+#                               which refuses in both modes and with two different sentences:
+#                               `22003` as a literal and `0A000` through a bind. One refusal, two
+#                               codes — worth one line of follow-up, not a new family.
+#
+# ## The pairs this node gets wrong, whole (34 rows over both modes)
 #
 citext	x	regclass	bind	!42804	!42P01
 citext	x	regclass	literal	!42804	!42P01
@@ -80,39 +101,16 @@ line	{1,-1,0}	lseg	literal	!22P02	!42846
 line	{1,-1,0}	path	literal	!22P02	!42846
 line	{1,-1,0}	point	literal	!22P02	!42846
 line	{1,-1,0}	polygon	literal	!22P02	!42846
-oidvector	1 2	bigint[]	bind	!22P02	ok
-oidvector	1 2	character varying[]	bind	!22P02	ok
-oidvector	1 2	character[]	bind	!22P02	ok
-oidvector	1 2	citext[]	bind	!22P02	ok
-oidvector	1 2	integer[]	bind	!22P02	ok
-oidvector	1 2	name[]	bind	!22P02	ok
-oidvector	1 2	oid[]	bind	!22P02	ok
-oidvector	1 2	regclass[]	bind	!22P02	ok
-oidvector	1 2	regproc[]	bind	!22P02	ok
-oidvector	1 2	regtype[]	bind	!22P02	ok
-oidvector	1 2	text[]	bind	!22P02	ok
 regclass	pg_class	integer	bind	!22003	ok
 regclass	pg_class	integer	literal	!22003	ok
 regclass	pg_class	oid	bind	!0A000	ok
 regclass	pg_class	oid	literal	!22003	ok
-regclass[]	{"pg_class"}	bigint[]	bind	!0A000	ok
-regclass[]	{"pg_class"}	character	bind	!0A000	ok
-regclass[]	{"pg_class"}	character varying	bind	!0A000	ok
-regclass[]	{"pg_class"}	character varying[]	bind	!0A000	ok
-regclass[]	{"pg_class"}	character[]	bind	!0A000	ok
-regclass[]	{"pg_class"}	citext	bind	!0A000	ok
-regclass[]	{"pg_class"}	citext[]	bind	!0A000	ok
-regclass[]	{"pg_class"}	integer[]	bind	!0A000	ok
+regclass[]	{"pg_class"}	integer[]	bind	!22003	ok
 regclass[]	{"pg_class"}	integer[]	literal	!22003	ok
-regclass[]	{"pg_class"}	name	bind	!0A000	ok
-regclass[]	{"pg_class"}	name[]	bind	!0A000	ok
-regclass[]	{"pg_class"}	oid[]	bind	!0A000	ok
+regclass[]	{"pg_class"}	oid[]	bind	!22003	ok
 regclass[]	{"pg_class"}	oid[]	literal	!22003	ok
-regclass[]	{"pg_class"}	text	bind	!0A000	ok
-regclass[]	{"pg_class"}	text[]	bind	!0A000	ok
 text[]	{"x"}	hstore	bind	!42846	!2202E
 text[]	{"x"}	hstore	literal	!42846	!2202E
-
 #
 # ## Earlier takes, kept because how the numbers moved is the useful half of a record
 #

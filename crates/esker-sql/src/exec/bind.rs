@@ -165,6 +165,27 @@ pub(super) fn substitute(
             return;
         };
         let ty = types.get(at).copied().unwrap_or(ColumnType::Text);
+        // **A `regclass`'s input function is a relation lookup, and `crate::value` has no
+        // catalog** (invariant 7) — so a bound value of one cannot be read here. It is read where
+        // every other `regclass` value is: the evaluator, which carries the session's name rule.
+        // `$1::regclass[]` was `0A000 a relation name read as a regclass without a catalog`, a
+        // sentence from the value layer, for a statement the same cast answers as a literal;
+        // eleven rows of the cast matrix's bind mode. The **scalar** `$1::regclass` answered all
+        // along because `cast_target` makes it a `CatalogFunc::RegClass` over a `text` parameter
+        // and the lookup happens one pass later, in `resolve_regclass` — this puts the array on
+        // the same footing by handing the text to the cast rather than to `from_text`.
+        if matches!(ty, ColumnType::RegClass | ColumnType::RegClassArray)
+            && let Some(Some(bytes)) = params.values.get(at)
+            && params.format(at) == 0
+            && let Ok(text) = std::str::from_utf8(bytes)
+        {
+            *expr = Expr::Cast {
+                operand: Box::new(Expr::Literal(Literal::String(text.to_owned()))),
+                to: ty,
+                typmod: crate::value::NO_TYPMOD,
+            };
+            return;
+        }
         let value = match slot {
             None => Ok(Datum::Null),
             Some(bytes) => match params.format(at) {

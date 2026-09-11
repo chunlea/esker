@@ -40,6 +40,44 @@ impl Client {
         }
     }
 
+    /// The bytes a message produced, for the two tests that read the **wire** rather than a
+    /// lossy rendering of it: a `RowDescription`'s type OID is four bytes in a frame and a
+    /// `contains("…")` over the whole stream cannot tell it from a value that happens to say the
+    /// same thing.
+    fn send_raw(&mut self, message: &Frontend) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.session
+            .handle(message, &mut self.node.executor, &mut out);
+        out
+    }
+
+    /// `Parse`/`Describe`/`Bind`/`Execute` with **no declared type**, answering the first column's
+    /// wire OID and its text — or the `SQLSTATE` of whichever step refused.
+    fn ask_row(&mut self, sql: &str, value: &str) -> Result<(u32, Option<String>), String> {
+        let mut stream = self.send_raw(&Frontend::Parse {
+            statement: "r".to_owned(),
+            sql: sql.to_owned(),
+            param_types: Vec::new(),
+        });
+        stream.extend(self.send_raw(&Frontend::Describe {
+            target: Target::Statement,
+            name: "r".to_owned(),
+        }));
+        stream.extend(self.send_raw(&Frontend::Bind {
+            portal: "q".to_owned(),
+            statement: "r".to_owned(),
+            param_formats: Vec::new(),
+            params: vec![Some(value.as_bytes().to_vec())],
+            result_formats: Vec::new(),
+        }));
+        stream.extend(self.send_raw(&Frontend::Execute {
+            portal: "q".to_owned(),
+            max_rows: 0,
+        }));
+        self.send(&Frontend::Sync);
+        first_row(&stream)
+    }
+
     fn send(&mut self, message: &Frontend) -> String {
         let mut out = Vec::new();
         self.session
@@ -376,5 +414,147 @@ fn a_declared_text_refuses_through_the_portal_shape() {
     assert!(
         answer.ends_with("ERROR operator does not exist: hstore = text"),
         "{answer}"
+    );
+}
+
+/// The first `RowDescription`'s first type OID and the first `DataRow`'s first column, read out of
+/// the backend stream — or the `SQLSTATE` of the first `ErrorResponse` in it.
+///
+/// A backend message is `tag(1) · length(4, big endian, counting itself) · body`, and the three
+/// bodies this reads are in `pgwire::message`'s own encoder one screen apart.
+fn first_row(stream: &[u8]) -> Result<(u32, Option<String>), String> {
+    let mut at = 0;
+    let mut oid = None;
+    while at + 5 <= stream.len() {
+        let tag = stream[at];
+        let len = u32::from_be_bytes([
+            stream[at + 1],
+            stream[at + 2],
+            stream[at + 3],
+            stream[at + 4],
+        ]) as usize;
+        let body = &stream[at + 5..(at + 1 + len).min(stream.len())];
+        at += 1 + len;
+        match tag {
+            // `E`: fields until a NUL, each `type · text · NUL`; `C` is the SQLSTATE.
+            b'E' => {
+                let mut field = body;
+                while let Some(end) = field.iter().position(|byte| *byte == 0) {
+                    if end == 0 {
+                        break;
+                    }
+                    let (kind, text) = (field[0], String::from_utf8_lossy(&field[1..end]));
+                    if kind == b'C' {
+                        return Err(text.into_owned());
+                    }
+                    field = &field[end + 1..];
+                }
+                return Err("an ErrorResponse with no code".to_owned());
+            }
+            // `T`: count, then per field `name · NUL · table · column · type oid · …`.
+            b'T' => {
+                let name_end = 2 + body[2..].iter().position(|byte| *byte == 0).unwrap_or(0);
+                let ty = name_end + 1 + 6;
+                oid = Some(u32::from_be_bytes([
+                    body[ty],
+                    body[ty + 1],
+                    body[ty + 2],
+                    body[ty + 3],
+                ]));
+            }
+            // `D`: count, then per column `length(4, -1 for NULL) · bytes`.
+            b'D' => {
+                let size = i32::from_be_bytes([body[2], body[3], body[4], body[5]]);
+                let value = usize::try_from(size)
+                    .ok()
+                    .map(|size| String::from_utf8_lossy(&body[6..6 + size]).into_owned());
+                return Ok((oid.unwrap_or(0), value));
+            }
+            _ => {}
+        }
+    }
+    Err("no DataRow and no ErrorResponse".to_owned())
+}
+
+/// **A vector cast to an array, through a bound parameter** — the eleven rows of the cast matrix
+/// where a literal answers and a bind refuses.
+///
+/// `$1::oidvector::integer[]` was `22P02 malformed array literal: "1 2"` while
+/// `'1 2'::oidvector::integer[]` answered, and `int2vector` answered in **both** spellings: the
+/// two vectors differ only in that `oidvector` reaches the planner as a `CatalogFunc::OidVector`
+/// (`sqlparser` has no `DataType` for it) where `int2vector` reaches `lower_type`. The evaluator's
+/// vector arm asks the *operand's declared type*, and `declared_type_of` did not read that call.
+///
+/// Measured on 19beta1, 2026-09-11, through `PREPARE`/`EXECUTE` so the parameter is bound:
+///
+/// ```text
+/// $1::oidvector::integer[]   [0:1]={1,2}      $1::oidvector::text[]      [0:1]={1,2}
+/// $1::int2vector::integer[]  [0:1]={1,2}      parameter type inferred    oidvector
+/// ```
+///
+/// The **zero** lower bound is what makes this a vector rather than an array, and it survives the
+/// bind exactly as it survives the literal.
+#[test]
+fn a_vector_cast_through_a_bound_parameter_is_the_element_cast() {
+    let mut client = Client::new();
+    for (sql, oid) in [
+        ("SELECT $1::oidvector::integer[]", 1007_u32),
+        ("SELECT $1::oidvector::text[]", 1009),
+        ("SELECT $1::oidvector::bigint[]", 1016),
+        ("SELECT $1::int2vector::integer[]", 1007),
+        ("SELECT $1::int2vector::text[]", 1009),
+    ] {
+        assert_eq!(
+            client.ask_row(sql, "1 2"),
+            Ok((oid, Some("[0:1]={1,2}".to_owned()))),
+            "{sql}"
+        );
+    }
+    // The vector itself, which was right in both modes and says the road only forks at the array.
+    assert_eq!(
+        client.ask_row("SELECT $1::oidvector", "1 2"),
+        Ok((30, Some("1 2".to_owned())))
+    );
+}
+
+/// **A `regclass[]` through a bound parameter** — the other eleven, and a different mechanism.
+///
+/// `$1::regclass[]` was `0A000 a relation name read as a regclass without a catalog`, a sentence
+/// from `crate::value`, which by invariant 7 has no catalog: `bind::substitute` reads the bound
+/// text with `Datum::from_text` and a `regclass`'s input function is a **relation lookup**. The
+/// scalar `$1::regclass` answers because its parameter is typed `text` and the lookup happens one
+/// pass later, in `resolve_regclass`, where the catalog is.
+///
+/// Measured on 19beta1 through `PREPARE`/`EXECUTE`: `$1::regclass[]` is `{pg_class}`, the
+/// parameter inferred as `regclass[]` — which this node infers too, so the inference was never the
+/// defect.
+#[test]
+fn a_regclass_array_through_a_bound_parameter_resolves_its_names() {
+    let mut client = Client::new();
+    assert_eq!(
+        client.ask_row("SELECT $1::regclass[]", "{\"pg_class\"}"),
+        Ok((2210, Some("{pg_class}".to_owned())))
+    );
+    for (sql, oid) in [
+        ("SELECT $1::regclass[]::text[]", 1009_u32),
+        ("SELECT $1::regclass[]::name[]", 1003),
+    ] {
+        assert_eq!(
+            client.ask_row(sql, "{\"pg_class\"}"),
+            Ok((oid, Some("{pg_class}".to_owned()))),
+            "{sql}"
+        );
+    }
+    // The scalar, which answered all along — the two now take the same road.
+    assert_eq!(
+        client.ask_row("SELECT $1::regclass", "pg_class"),
+        Ok((2205, Some("pg_class".to_owned())))
+    );
+    // **A name nothing answers to is still `42P01`**, which is the half the catalog road must
+    // keep: resolving through `value` could only ever have been a refusal, and resolving through
+    // the catalog has to be able to refuse too.
+    assert_eq!(
+        client.ask_row("SELECT $1::regclass[]", "{nosuchrelation}"),
+        Err("42P01".to_owned())
     );
 }
