@@ -475,8 +475,10 @@ pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
 /// The store pids to choose from: the state file when one was given, else `--pids`.
 ///
 /// `id address pid`, one node per line, written by `esker cluster start` and **rewritten when it
-/// restarts a store**. The driver is on line one with id 0 and is not a store, so it is skipped —
-/// killing the driver is a different experiment and `chaos` is not it.
+/// restarts a store**. A line with id 0 is a placement driver and not a store, so it is skipped —
+/// killing the driver is a different experiment and `chaos` is not it. *Every* such line, not the
+/// first: `--pd-nodes N` writes one per member (ADR 0108), and a filter that took "the driver" to
+/// mean line one would start killing drivers two and three as if they were stores.
 fn live_pids(options: &DurabilityOptions) -> Result<Vec<u32>, String> {
     let Some(path) = &options.state else {
         return Ok(options.pids.clone());

@@ -180,6 +180,11 @@ one, both of which `--pd-nodes 3` produces by construction.
 * **`esker durability chaos` still refuses to kill a driver** — it skips `id == "0"` and that is
   right: killing the driver is a different experiment, and now it is one that can be run on purpose
   with `leader-kill.py`'s shape rather than by accident.
+* **A driver's data directory is now `<data-dir>/pd-N`** rather than `<data-dir>/pd`, derived per
+  member for the reason `--sst-store` derives one per node: two members sharing a database would
+  each hold the other's Raft log, and the second to start would refuse to open at all. A dev
+  cluster restarted on a directory from before this change finds no driver state under the new
+  name and starts a fresh one; nothing outside this repository reads that path.
 * **Five members remain untested**, as `docs/plans/phase-15-pd-ha.md` §7 says. `--pd-nodes 5` will
   start five and nothing here claims anything about them.
 * **TLS between members is unchanged**, and `--pd-nodes` passes the same `RpcTlsFlags` every driver
