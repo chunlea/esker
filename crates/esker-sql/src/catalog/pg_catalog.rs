@@ -2198,7 +2198,7 @@ fn pg_depend_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
 ///
 /// `(castsource, casttarget, castcontext, castmethod)`. `castcontext` is `e` explicit, `a`
 /// assignment, `i` implicit; `castmethod` is `f` a function, `b` binary-coercible, `i` I/O.
-pub const CASTS: [(i64, i64, &str, &str); 157] = [
+pub const CASTS: [(i64, i64, &str, &str); 159] = [
     // **A bit string's eight rows, measured** rather than reasoned:
     //
     //     SELECT castsource::regtype, casttarget::regtype, castcontext, castmethod
@@ -2447,6 +2447,18 @@ pub const CASTS: [(i64, i64, &str, &str); 157] = [
     (25, 16402, "a", "b"),
     (1043, 16402, "a", "b"),
     (1042, 16402, "a", "b"),
+    // **`hstore` to the two JSON types**, which the extension's own `pg_cast` carries and which a
+    // sweep against a stock server cannot see either — measured on 19beta1 with `CREATE EXTENSION
+    // hstore` inside the transaction the probe rolls back:
+    //
+    //     hstore -> json    e  f        'b=>2, a=>1'::hstore::json   {"a": "1", "b": "2"}
+    //     hstore -> jsonb   e  f        'a=>NULL'::hstore::jsonb     {"a": null}
+    //
+    // Explicit and by function, not by I/O: the hstore's *text* is `"a"=>"1"`, which no JSON
+    // reader accepts, so the row is what makes the conversion happen rather than a round trip
+    // (`value::hstore::to_json`). The two rows back do not exist, in either direction.
+    (16400, 114, "e", "f"),
+    (16400, 3802, "e", "f"),
 ];
 
 /// The built-in functions this node has, as PostgreSQL numbers them.
@@ -2530,12 +2542,17 @@ pub fn casts_to(from: ColumnType, to: ColumnType) -> bool {
     // node claiming a cast the oracle does not list
     // ([ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
     // step 2, the SQL-visible half).
-    if matches!(
-        (from, to),
-        (ColumnType::Int2Vector, ColumnType::Int2Array)
-            | (ColumnType::OidVector, ColumnType::OidArray)
+    //
+    // **And it reaches every array its element reaches**, which is one rule where the pair
+    // `int2vector -> int2[]` was two tuples: measured off the oracle's own `ok` list, a
+    // `smallint` casts to fifteen types and an `int2vector` casts to the array of each of those
+    // fifteen and to nothing else (`oid` to ten, `oidvector` to their ten arrays). The identity
+    // pair falls out of it, because a type casts to itself.
+    if let (Some(held), Some(wanted)) = (
+        crate::value::vector_element(from),
+        ArrayValue::element_of(to),
     ) {
-        return true;
+        return casts_to(held, wanted);
     }
     let (from, to) = (i64::from(from.oid()), i64::from(to.oid()));
     CASTS

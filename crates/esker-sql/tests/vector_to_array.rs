@@ -251,3 +251,75 @@ fn a_quantifier_and_unnest_see_a_vectors_elements() {
         "and the values are the vector's, in order"
     );
 }
+
+/// **A vector casts to every array its element casts to**, which is what the residue of the cast
+/// matrix said and what one rule gives instead of two pairs.
+///
+/// `int2vector`'s targets on 19beta1 are exactly `{ T[] : smallint -> T }` and `oidvector`'s are
+/// `{ T[] : oid -> T }` — read off the capture's own `ok` list, where `smallint` reaches fifteen
+/// types and `int2vector` reaches the array of each of those fifteen and nothing else. The node
+/// had the two identity pairs (`int2vector -> smallint[]`, `oidvector -> oid[]`) written as a
+/// `matches!` of two tuples, and refused the other twenty-five with `42846`.
+///
+/// Measured on 19beta1, 2026-09-10 — the **zero** lower bound comes through every one of them,
+/// which is the half of a vector that is not its element:
+///
+/// ```text
+/// '1 2'::int2vector::integer[]    [0:1]={1,2}      '1 2'::int2vector::text[]     [0:1]={1,2}
+/// '1 2'::oidvector::bigint[]      [0:1]={1,2}      '1 2'::int2vector::numeric[]  [0:1]={1,2}
+/// ```
+#[test]
+fn a_vector_casts_to_every_array_its_element_does() {
+    let mut node = parity::Node::new(&[]);
+    for target in [
+        "smallint[]",
+        "integer[]",
+        "bigint[]",
+        "numeric[]",
+        "real[]",
+        "double precision[]",
+        "text[]",
+        "character varying[]",
+        "name[]",
+        "citext[]",
+        "oid[]",
+    ] {
+        assert_eq!(
+            node.rows(&format!("SELECT ('1 2'::int2vector::{target})::text")),
+            vec![vec!["[0:1]={1,2}"]],
+            "'1 2'::int2vector::{target}"
+        );
+    }
+    for target in [
+        "oid[]",
+        "integer[]",
+        "bigint[]",
+        "text[]",
+        "name[]",
+        "character varying[]",
+    ] {
+        assert_eq!(
+            node.rows(&format!("SELECT ('1 2'::oidvector::{target})::text")),
+            vec![vec!["[0:1]={1,2}"]],
+            "'1 2'::oidvector::{target}"
+        );
+    }
+    // **The element's own refusals are the vector's**, which is what makes this one rule rather
+    // than a longer list: `smallint` has no cast to `date` or to `interval`, and 19beta1 refuses
+    // both of these as `42846` too.
+    for written in [
+        "'1 2'::int2vector::date[]",
+        "'1 2'::int2vector::interval[]",
+        "'1 2'::oidvector::double precision[]",
+        // And a non-array target is still refused: a vector does not become a scalar.
+        "'1 2'::int2vector::integer",
+    ] {
+        assert!(
+            node.answer(&format!("SELECT {written}"))
+                .to_string()
+                .starts_with("!42846"),
+            "{written}: {}",
+            node.answer(&format!("SELECT {written}"))
+        );
+    }
+}

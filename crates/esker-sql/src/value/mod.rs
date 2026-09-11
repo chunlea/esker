@@ -258,6 +258,27 @@ pub fn range_subtype(ty: ColumnType) -> ColumnType {
 /// `tsrange[]`'s oid — PostgreSQL's own `_tsrange`, which is built in and therefore fixed.
 pub const TSRANGE_ARRAY_OID: u32 = 3909;
 
+/// **The element a vector holds**, which is the one thing `ArrayValue::element_of` must not learn.
+///
+/// An `int2vector` *is* an array of `int2` on a real server — 0-based, space separated on the way
+/// out — and three readers need to know it: `pg_catalog::casts_to`, so `int2vector::integer[]` is
+/// permitted exactly when `smallint::integer` is; the evaluator's cast arm, which builds the
+/// array; and `unnest`, whose element type is this and not `text`.
+///
+/// It is **not** in `element_of` because a vector's own oid is derived through that function —
+/// `ColumnType::oid` answers `array_oid(element_of(self))` for an array — so teaching it there
+/// would make `int2vector` report `_int2`'s number. That split is exactly what
+/// [ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
+/// calls a model rather than a type.
+#[must_use]
+pub fn vector_element(ty: ColumnType) -> Option<ColumnType> {
+    match ty {
+        ColumnType::Int2Vector => Some(ColumnType::Int2),
+        ColumnType::OidVector => Some(ColumnType::Oid),
+        _ => None,
+    }
+}
+
 /// The typmod a declared **length** makes, for `varchar(n)` and `character(n)`.
 ///
 /// The one place this arithmetic happens. `ColumnDef::typmod` holds PostgreSQL's number because
@@ -942,6 +963,20 @@ pub fn convert_without_text(value: &Datum, to: ColumnType) -> Option<Result<Datu
         (Datum::Double(_) | Datum::Real(_) | Datum::Numeric(_), _) if integer(to) => {
             Some(assignment_cast(value.clone(), to, Rendering::default()))
         }
+        // **An hstore to a JSON document**, which is two `pg_cast` rows the extension carries
+        // (`e`, by function) and never a round trip: an hstore's canonical text is `"a"=>"1"`,
+        // which no JSON reader accepts — the text road was `22P02 invalid input syntax for type
+        // json` for a pair a real server converts. Every value becomes a JSON **string** and a
+        // NULL becomes a JSON null, `hstore_to_json`'s rule rather than `hstore_to_json_loose`'s.
+        //
+        // Here rather than in the evaluator's cast arm because there are three callers and they
+        // must not disagree: the fold, a cast over a column, and an **element** of an
+        // `hstore[] -> json[]`, which reaches `cast_one_value` and nothing above it. Unlike the
+        // `"char"` this function cannot have, an hstore carries its own identity
+        // (`Datum::Hstore`), so the value alone says which cast this is.
+        (Datum::Hstore(text), ColumnType::Json | ColumnType::Jsonb) => {
+            Some(hstore::from_text(text).map(|map| Datum::Text(hstore::to_json(&map))))
+        }
         // **A `bool` and an `int4`, both ways.** `pg_cast` has the two rows and no others in the
         // family: `true::int4` is `1`, `0::int4::bool` is `false` and anything else is `true`.
         // Through the text this was `int4in` reading `t`.
@@ -1522,6 +1557,22 @@ pub const MAX_TYPE_LENGTH: u32 = 10_485_760;
 #[must_use]
 pub fn type_by_oid(oid: u32) -> Option<ColumnType> {
     ColumnType::ALL.into_iter().find(|ty| ty.oid() == oid)
+}
+
+/// **A `reg*` input function reads all digits as an oid**, and anything else as a name.
+///
+/// PostgreSQL's `regclassin` and `regtypein` share this rule and it is measured on both:
+/// `'1259'::regclass` is `pg_class` and `'23'::regtype` is `integer`, while `'-1'::regtype` is a
+/// *syntax* error — `invalid type name "-1"` — because the sign makes it a name. So the boundary
+/// is the characters and not "looks numeric", which is the half a reader guesses wrong.
+///
+/// `None` means "this is a name", and the caller resolves it where its catalog is.
+#[must_use]
+pub fn oid_spelled(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<u32>().ok()
 }
 
 /// The `regtype` an oid names, printing as the type's name or — for an oid that is no type — as
@@ -2600,11 +2651,18 @@ impl PgDatum for Datum {
                 }
             }
             ColumnType::RegType => {
-                let named =
-                    named_type(text)?.ok_or_else(|| SqlError::UndefinedType(text.to_owned()))?;
-                // Through the oid, so the printed form is the **canonical** name and not the
-                // spelling written: `'int4'::regtype` is `integer`, measured.
-                regtype_of_oid(named.oid())
+                // **All digits are an oid** (`oid_spelled`), which is `regtypein`'s own rule and
+                // what makes `'{23,25}'::text::regtype[]` the two type names rather than
+                // `42704 type "23" does not exist`. An oid no type names prints its digits back.
+                if let Some(oid) = oid_spelled(text) {
+                    regtype_of_oid(oid)
+                } else {
+                    let named = named_type(text)?
+                        .ok_or_else(|| SqlError::UndefinedType(text.to_owned()))?;
+                    // Through the oid, so the printed form is the **canonical** name and not the
+                    // spelling written: `'int4'::regtype` is `integer`, measured.
+                    regtype_of_oid(named.oid())
+                }
             }
             ColumnType::Point => {
                 let (x, y) = point::from_text(text)?;

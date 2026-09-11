@@ -6212,7 +6212,14 @@ fn lower_regclass_array(expr: &Expr) -> Result<plan::Expr> {
     // dimension up. Asking `cast_literal_text` instead read through the cast in
     // `'{1259}'::oid[]::regclass[]` and handed `1259` to the *name* lookup, which is
     // `42P01 relation "1259" does not exist` for a statement a real server answers `{pg_class}`.
-    let Some(text) = (if is_string_literal(expr) {
+    // **A vector is not a name list**, even though it is written as a quoted string: `1 2` has no
+    // braces and `array_in` answers `22P02 malformed array literal` for a cast 19beta1 performs
+    // (`'1 2'::int2vector::regclass[]` is `{1,2}` there, the digits being oids). `is_string_literal`
+    // looks through the cast — which is what `'{…}'::text::regclass[]` needs — so the source type
+    // is what tells the two apart, and the evaluator's vector arm takes it from here.
+    let Some(text) = (if is_string_literal(expr)
+        && source_type(expr)?.and_then(value::vector_element).is_none()
+    {
         cast_literal_text(expr)?
     } else {
         None
@@ -6382,6 +6389,34 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             Ok((ty, _)) => plan::Literal::TypedNull(ty),
             Err(_) => plan::Literal::Null,
         }));
+    }
+    // **A vector's cast to an array is the evaluator's, whichever array it is.** The words are
+    // not an array literal — `1 2`, no braces — so every path that reads the operand's text with
+    // `array_in` answers `22P02 malformed array literal` for a cast a real server performs, and
+    // two of them are reached before the general one: `lower_array_cast`'s literal arm (which
+    // defers only when the element has no typmod, so `character[]` slipped through) and
+    // `lower_regclass_array` (which reads the text itself, to resolve each name). Measured:
+    // `'1 2'::int2vector::character[]` and `::regclass[]` were the last two of the matrix's
+    // `42846 / ok` residue after the rest of the vectors' twenty-five closed.
+    //
+    // The permission is still `casts_to`'s and is asked here, because this returns before the
+    // general gate below: `'1 2'::int2vector::date[]` is `42846` on 19beta1 and stays one.
+    if let Some(from) = source_type(expr)?
+        && value::vector_element(from).is_some()
+        && let Ok((to, typmod)) = lower_type(data_type)
+        && esker_keys::array::ArrayValue::element_of(to).is_some()
+    {
+        if !catalog::pg_catalog::casts_to(from, to) {
+            return Err(SqlError::CannotCast {
+                from: from.name(),
+                to: to.name(),
+            });
+        }
+        return Ok(plan::Expr::Cast {
+            operand: Box::new(lower_expr(expr)?),
+            to,
+            typmod,
+        });
     }
     if let Some(array) = lower_array_cast(expr, data_type)? {
         return Ok(array);
@@ -6985,6 +7020,16 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
+            // **All digits are an oid, before the catalog is asked.** `'23'::regtype` is
+            // `integer` on a real server — `regtypein`'s own rule, the same one `regclassin` has
+            // — and it went to the user-type lookup here, which answered
+            // `42704 type "23" does not exist` for a spelling `ActiveRecord` writes when it reads
+            // `typelem` back. `value::oid_spelled` is the one reader of the rule.
+            if let Some(oid) = value::oid_spelled(&name) {
+                return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                    value::regtype_of_oid(oid),
+                ))));
+            }
             let Some(named) = value::named_type(&name)? else {
                 return Ok(user_regtype(&name, false));
             };
@@ -7161,18 +7206,19 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
             }));
         }
     }
-    // **A `time` casts to a string and to nothing else.** Measured one target at a time against
-    // 19beta1: `text`, `varchar` and `character(n)` are the whole of it, and every other type
-    // this node has — both integers and floats, `numeric`, `bool`, `bytea`, `json`, `jsonb`,
-    // `date` and both timestamps — is `42846 cannot cast type time without time zone to …`.
+    // **A cast to a string type is the source's output function, and "string type" is a
+    // category.** `pg_cast` has no row for any of these pairs; a real server admits them because
+    // `find_coercion_pathway` answers `COERCEVIAIO` when the *target*'s `typcategory` is `S`.
     // Without this the cast goes through the rendered text and blames the *value*, which is a
     // `22P02` about digits for a pair that has no cast at all.
-    let stringy = |ty: ColumnType| {
-        matches!(
-            ty,
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar
-        )
-    };
+    //
+    // **Written as three names — `text`, `varchar`, `character` — it refused eight pairs the
+    // oracle answers**, because `name` and `citext` are in that category too and this node's own
+    // `typcategory` already said so. Measured on 19beta1 with `citext` created inside the
+    // transaction: `'1 day'::interval::name`, `::citext`, and the same for `money`, `time` and
+    // `uuid`, are the value's own text. A hand-written list of a table that exists one module
+    // over is the shape this crate keeps finding; ask the table.
+    let stringy = |ty: ColumnType| catalog::pg_catalog::typcategory(ty) == "S";
     Ok(match (source, target) {
         // **A money casts to `numeric` and to a string, and takes `numeric` and the integers.**
         // Measured one target at a time, and the asymmetry is the point: `567.89::numeric::money`
@@ -7231,7 +7277,13 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
                 to: to.name(),
             })
         }
-        (Some(ColumnType::Time), Some(to)) if !stringy(to) && to != ColumnType::Time => {
+        // **And a `time` casts to an `interval`**, which is one `pg_cast` row (`e`, by function)
+        // and the half of the pair this list did not have: the arm below already says an interval
+        // casts to a time, found the same way and noted there as something "the time unit could
+        // not know when it wrote this list". `'12:34:56'::time::interval` is `12:34:56`.
+        (Some(ColumnType::Time), Some(to))
+            if !stringy(to) && !matches!(to, ColumnType::Time | ColumnType::Interval) =>
+        {
             Some(SqlError::CannotCast {
                 from: ColumnType::Time.name(),
                 to: to.name(),

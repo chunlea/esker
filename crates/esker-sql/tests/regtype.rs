@@ -115,13 +115,12 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             NO_SUCH_TYPE,
             "pg19_regtype.txt:82",
         ),
-        (
-            "SELECT '1'::regtype",
-            "PostgreSQL reads a bare number in a type name as an **OID**, so `'1'::regtype` is \
-             `1` rather than a lookup failure. The same reverse direction as `23::regtype`, \
-             reached through the forward spelling.",
-            "pg19_regtype.txt:123",
-        ),
+        // **`SELECT '1'::regtype` was here and is closed**, 2026-09-10: a bare number in a type
+        // name is an *oid*, which is `regtypein`'s own rule and now `value::oid_spelled`'s, one
+        // reader for the three roads a `regtype` arrives by (the literal, a `text` per row, and
+        // an array element). It came out of the cast matrix's residue, where the same defect was
+        // four rows of `<integer>[] -> regtype[]` — the scalar and the array being one rule, as
+        // this entry's own reason had said. `a_regtype_written_as_digits_is_an_oid` pins it.
     ],
 };
 
@@ -266,5 +265,68 @@ fn an_array_name_resolves_for_every_type_this_node_has() {
     assert_eq!(
         node.rows("SELECT '_int4'::regtype, 'numeric[]'::regtype"),
         vec![vec!["integer[]", "numeric[]"]]
+    );
+}
+
+/// **`regtypein` reads all digits as an oid**, which is the same rule `regclassin` has and the
+/// last of the cast matrix's `42846 / ok` residue.
+///
+/// `'23'::regtype` is `integer` on a real server and was `42704 type "23" does not exist` here:
+/// the name went to the catalog's user-type lookup, which is right for `'mood'` and wrong for a
+/// number. Measured on 19beta1, 2026-09-10, every row below being that server's answer:
+///
+/// ```text
+/// '23'::regtype                     integer      '999999'::regtype    999999
+/// '23'::text::regtype               integer      'integer'::regtype   integer
+/// '{23,25}'::text::regtype[]        {integer,text}
+/// '{23,25}'::integer[]::regtype[]   {integer,text}
+/// '23 25'::int2vector::regtype[]    [0:1]={integer,text}
+/// ```
+///
+/// **An oid no type names prints its own digits** rather than raising, exactly as a `regclass`
+/// does — the name is the *output* function and an oid is always a legal input to it (ADR 0077).
+/// The boundary is **digits**, and what is not digits is still a name: `'-1'::regtype` is a syntax
+/// error on 19beta1 (`invalid type name "-1"`), the sign making it a name rather than a number.
+#[test]
+fn a_regtype_written_as_digits_is_an_oid() {
+    let mut node = parity::Node::new(&[]);
+    for (written, answer) in [
+        ("'23'::regtype", "integer"),
+        ("'25'::regtype", "text"),
+        ("'1043'::regtype", "character varying"),
+        // An oid nothing names, which is not an error.
+        ("'999999'::regtype", "999999"),
+        // The name road, unchanged.
+        ("'integer'::regtype", "integer"),
+        ("'int4'::regtype", "integer"),
+        // Through a `text`, which is the I/O conversion rather than a `pg_cast` row.
+        ("'23'::text::regtype", "integer"),
+    ] {
+        assert_eq!(
+            node.rows(&format!("SELECT ({written})::text")),
+            vec![vec![answer]],
+            "{written}"
+        );
+    }
+    // The arrays, all three spellings, and the vector — which is what made this the residue's
+    // last two rows rather than four.
+    for (written, answer) in [
+        ("'{23,25}'::text::regtype[]", "{integer,text}"),
+        ("'{23,25}'::integer[]::regtype[]", "{integer,text}"),
+        ("'23 25'::int2vector::regtype[]", "[0:1]={integer,text}"),
+        ("'23 25'::oidvector::regtype[]", "[0:1]={integer,text}"),
+    ] {
+        assert_eq!(
+            node.rows(&format!("SELECT ({written})::text")),
+            vec![vec![answer]],
+            "{written}"
+        );
+    }
+    // And a name that is not a type is still `42704`, which is the half this rule must not take.
+    assert!(
+        node.answer("SELECT 'nosuchtype'::regtype")
+            .to_string()
+            .starts_with("!42704"),
+        "a name nothing names is still undefined"
     );
 }

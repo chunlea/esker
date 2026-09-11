@@ -234,3 +234,158 @@ fn a_cast_with_its_own_lowering_arm_still_asks_pg_cast() {
         "and 19beta1 answers this one too, which the capture's row did not say"
     );
 }
+
+/// **A cast to a string type is the source's output function, and "string type" is a category.**
+///
+/// The nine rows of the matrix's residue that are one list being three names long. `refused_cast`
+/// asks `stringy`, which was `text`, `varchar` and `character` — while `pg_cast` has **no row for
+/// any of these pairs** and a real server takes them through the I/O conversion its
+/// `TYPCATEGORY_STRING` test admits. `name` and `citext` are in that category
+/// (`pg_type.typcategory` says `S` for all five, and this node's `typcategory` already agreed),
+/// so the table refused eight pairs the oracle answers.
+///
+/// Measured on 19beta1, 2026-09-10, in one `BEGIN … ROLLBACK` with `citext` created inside it —
+/// the value on the right is that server's:
+///
+/// ```text
+/// '1 day'::interval::name      1 day        '1 day'::interval::citext    1 day
+/// '12.34'::money::name         $12.34       '12.34'::money::citext       $12.34
+/// '12:34:56'::time::name       12:34:56     '12:34:56'::time::citext     12:34:56
+/// '<uuid>'::uuid::name         <uuid>       '<uuid>'::uuid::citext       <uuid>
+/// '12:34:56'::time::interval   12:34:56     pg_cast rows for that pair:  1
+/// ```
+///
+/// The ninth is not a category at all: `time -> interval` is a real `pg_cast` row, and the arm
+/// that refused it says in its own comment that the *reverse* direction had already been found
+/// this way — "an interval casts to a time too, which the time unit could not know when it wrote
+/// this list".
+#[test]
+fn a_string_target_is_a_category_and_not_three_names() {
+    const UUID: &str = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+    let mut node = parity::Node::new(&[]);
+    for (source, value, answer) in [
+        ("interval", "1 day", "1 day"),
+        ("money", "12.34", "$12.34"),
+        ("time", "12:34:56", "12:34:56"),
+        ("uuid", UUID, UUID),
+    ] {
+        for target in ["name", "citext"] {
+            assert_eq!(
+                node.rows(&format!("SELECT ('{value}'::{source}::{target})::text")),
+                vec![vec![answer]],
+                "'{value}'::{source}::{target}"
+            );
+        }
+        // The three that were already right, so this says the list grew rather than moved.
+        for target in ["text", "character varying"] {
+            assert_eq!(
+                node.rows(&format!("SELECT ('{value}'::{source}::{target})::text")),
+                vec![vec![answer]],
+                "'{value}'::{source}::{target}"
+            );
+        }
+        // A `character(9)` truncates, and reading it back as `text` drops the blanks it padded
+        // with — `'1 day'::interval::character(9)` is `1 day` and the uuid keeps nine characters.
+        // Both measured on 19beta1 beside the rest.
+        assert_eq!(
+            node.rows(&format!("SELECT ('{value}'::{source}::character(9))::text")),
+            vec![vec![&answer[..answer.len().min(9)]]],
+            "'{value}'::{source}::character(9)"
+        );
+    }
+    // And the `pg_cast` row the same table was hiding.
+    assert_eq!(
+        node.rows("SELECT ('12:34:56'::time::interval)::text"),
+        vec![vec!["12:34:56"]]
+    );
+    // The refusals the table is *for* are unchanged: a pair with no cast and no string on either
+    // side is still `42846`, in both directions.
+    for written in [
+        "'1 day'::interval::integer",
+        "'12:34:56'::time::date",
+        "'12.34'::money::double precision",
+        "1::integer::date",
+    ] {
+        assert!(
+            node.answer(&format!("SELECT {written}"))
+                .to_string()
+                .starts_with("!42846"),
+            "{written} is still refused"
+        );
+    }
+}
+
+/// **`hstore` to the two JSON types**, the last four rows of the matrix's `!42846 / ok` residue
+/// and the only ones of the forty that are a genuinely missing `pg_cast` row.
+///
+/// Measured on 19beta1, 2026-09-10, with `CREATE EXTENSION hstore` inside the transaction the
+/// probe rolls back — which is also how the capture that found them was taken, and why a sweep
+/// against a stock server sees nothing here:
+///
+/// ```text
+/// 'b=>2, a=>1, cc=>3'::hstore::json     {"a": "1", "b": "2", "cc": "3"}
+/// 'a=>NULL, b=>1'::hstore::json         {"a": null, "b": "1"}
+/// ''::hstore::json                      {}
+/// '{"b=>2, a=>1"}'::hstore[]::json[]    {"{\"a\": \"1\", \"b\": \"2\"}"}
+/// pg_cast rows: hstore -> json  e f · hstore -> jsonb  e f · and none the other way
+/// ```
+///
+/// **The values stay strings.** `hstore_to_json` does not guess a number's JSON type — the
+/// function that does is `hstore_to_json_loose` and it is not what the cast calls — so `2` comes
+/// out `"2"`. The two orders coincide, which is why one rendering serves both targets: an
+/// hstore's canonical key order is length-then-bytes and so is `jsonb`'s.
+#[test]
+fn an_hstore_casts_to_a_json_document() {
+    let mut node = parity::Node::new(&[]);
+    for (written, answer) in [
+        (
+            "'b=>2, a=>1, cc=>3'::hstore::json",
+            "{\"a\": \"1\", \"b\": \"2\", \"cc\": \"3\"}",
+        ),
+        (
+            "'a=>NULL, b=>1'::hstore::json",
+            "{\"a\": null, \"b\": \"1\"}",
+        ),
+        ("''::hstore::json", "{}"),
+        (
+            "'b=>2, a=>1, cc=>3'::hstore::jsonb",
+            "{\"a\": \"1\", \"b\": \"2\", \"cc\": \"3\"}",
+        ),
+        (
+            "'a=>NULL, b=>1'::hstore::jsonb",
+            "{\"a\": null, \"b\": \"1\"}",
+        ),
+    ] {
+        assert_eq!(
+            node.rows(&format!("SELECT ({written})::text")),
+            vec![vec![answer]],
+            "{written}"
+        );
+    }
+    // The array, which is the element cast one dimension out and needs nothing of its own.
+    assert_eq!(
+        node.rows("SELECT ('{\"b=>2, a=>1\"}'::hstore[]::json[])::text"),
+        vec![vec!["{\"{\\\"a\\\": \\\"1\\\", \\\"b\\\": \\\"2\\\"}\"}"]]
+    );
+    // **And the row is in `pg_cast`**, because that view is this table and a client reads it.
+    assert_eq!(
+        node.rows(
+            "SELECT casttarget::regtype::text, castcontext, castmethod FROM pg_cast \
+             WHERE castsource = 'hstore'::regtype ORDER BY 1"
+        ),
+        vec![vec!["json", "e", "f"], vec!["jsonb", "e", "f"],]
+    );
+    // Neither direction back exists on a real server, and neither does here.
+    for written in [
+        "'{\"a\": \"1\"}'::json::hstore",
+        "'{\"a\": \"1\"}'::jsonb::hstore",
+    ] {
+        assert!(
+            node.answer(&format!("SELECT {written}"))
+                .to_string()
+                .starts_with("!42846"),
+            "{written}: {}",
+            node.answer(&format!("SELECT {written}"))
+        );
+    }
+}

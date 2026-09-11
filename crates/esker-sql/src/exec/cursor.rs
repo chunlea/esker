@@ -2582,6 +2582,53 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 };
                 regclass_of(env, names(&name)?)?
             }
+            // **A vector to its array, and only the *plan* knows it is a vector.** An
+            // `int2vector` is a `Datum::Text` here — `1 2 3`, space separated, which is its output
+            // function's form and not an array literal — so the value cannot say which cast this
+            // is and the operand's declared type can. Measured on 19beta1:
+            //
+            // ```text
+            // '1 2 3'::int2vector::int2[]   [0:2]={1,2,3}     <- **lower bound zero**
+            // '1 2 3'::text::int2[]         22P02 malformed array literal
+            // '{1,2}'::int2[]::int2vector   42846             <- one direction only
+            // ```
+            //
+            // The second line is why this is an arm and not a text round trip, and the **zero** is
+            // the whole of what a vector is: an array subscripted from 0, which `array_lower`
+            // already answers here and `esker-keys`' row encoding has always been able to hold
+            // ([ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
+            // step 2, the SQL-visible half — no stored byte moves).
+            // **And to every array its element casts to, not only its own**: `casts_to` permits
+            // `int2vector -> T[]` exactly when it permits `smallint -> T`, so the words are read
+            // as the vector's element and then handed to the element cast below — one conversion
+            // written once, and the **zero** lower bound survives it.
+            //
+            // **Above the `regclass[]` arm on purpose.** That one reads a `Datum::Text` as an
+            // array literal, which is right for `'{1259}'::text::regclass[]` and wrong for a
+            // vector — `1 2` has no braces, so it answered `22P02 malformed array literal` for a
+            // cast 19beta1 performs. This arm is the more specific of the two (it asks the
+            // operand's declared type) and a `match` takes the first that fits.
+            Datum::Text(ref text)
+                if let Some(held) =
+                    declared_type_of(operand).and_then(crate::value::vector_element)
+                    && let Some(element) = esker_keys::array::ArrayValue::element_of(*to) =>
+            {
+                let mut values = Vec::new();
+                for word in text.split_whitespace() {
+                    let datum = Datum::from_text(held, word)?;
+                    values.push(Some(if held == element {
+                        datum
+                    } else {
+                        cast_one_value(&datum, element, *typmod, env.settings.rendering)?
+                    }));
+                }
+                Datum::Array(esker_keys::array::ArrayValue {
+                    element,
+                    lower: 0,
+                    dims: vec![i32::try_from(values.len()).unwrap_or(i32::MAX)],
+                    values,
+                })
+            }
             // **A string to `regclass[]` is an I/O conversion, and that is not the scalar's
             // rule.** `pg_cast` has a row for `text -> regclass` and **none** for
             // `text -> regclass[]`, measured — so the scalar runs `text_regclass`, which resolves a
@@ -2689,45 +2736,6 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                     && declared_type_of(operand) == Some(ColumnType::Jsonb) =>
             {
                 crate::value::json::cast_to_scalar(text, *to)?
-            }
-            // **A vector to its array, and only the *plan* knows it is a vector.** An
-            // `int2vector` is a `Datum::Text` here — `1 2 3`, space separated, which is its output
-            // function's form and not an array literal — so the value cannot say which cast this
-            // is and the operand's declared type can. Measured on 19beta1:
-            //
-            // ```text
-            // '1 2 3'::int2vector::int2[]   [0:2]={1,2,3}     <- **lower bound zero**
-            // '1 2 3'::text::int2[]         22P02 malformed array literal
-            // '{1,2}'::int2[]::int2vector   42846             <- one direction only
-            // ```
-            //
-            // The second line is why this is an arm and not a text round trip, and the **zero** is
-            // the whole of what a vector is: an array subscripted from 0, which `array_lower`
-            // already answers here and `esker-keys`' row encoding has always been able to hold
-            // ([ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
-            // step 2, the SQL-visible half — no stored byte moves).
-            Datum::Text(ref text)
-                if matches!(*to, ColumnType::Int2Array | ColumnType::OidArray)
-                    && matches!(
-                        declared_type_of(operand),
-                        Some(ColumnType::Int2Vector | ColumnType::OidVector)
-                    ) =>
-            {
-                let element = if *to == ColumnType::Int2Array {
-                    ColumnType::Int2
-                } else {
-                    ColumnType::Oid
-                };
-                let mut values = Vec::new();
-                for word in text.split_whitespace() {
-                    values.push(Some(Datum::from_text(element, word)?));
-                }
-                Datum::Array(esker_keys::array::ArrayValue {
-                    element,
-                    lower: 0,
-                    dims: vec![i32::try_from(values.len()).unwrap_or(i32::MAX)],
-                    values,
-                })
             }
             // **A `"char"` to an `int4` is the byte, and only the *plan* knows it is a `"char"`.**
             // A `"char"` and a `text` are the same `Datum::Text` here, and `text -> int4` really is
@@ -4210,6 +4218,12 @@ fn catalog_function(
         // type, the shape only a `Describe` sees.
         CatalogFunc::RegTypeName => match args.first() {
             None | Some(Datum::Null) => Datum::Null,
+            // **All digits are an oid here too** (`value::oid_spelled`): `'23'::text::regtype` is
+            // `integer` on 19beta1, and this arm is the road a *text* takes — the literal one is
+            // `parse::lower`'s. Two readers of `regtypein`'s rule, asking the same function.
+            Some(Datum::Text(name)) if crate::value::oid_spelled(name).is_some() => {
+                crate::value::regtype_of_oid(crate::value::oid_spelled(name).unwrap_or(0))
+            }
             Some(Datum::Text(name)) => {
                 let named = crate::value::named_type(name)?
                     .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;

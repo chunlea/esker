@@ -105,6 +105,48 @@
 # wrong there is the *sqlstate*, which is what a client branches on. It is the largest group left
 # and the least urgent by ADR 0031.
 #
+# ## RE-SWEPT 2026-09-10 (evening) after the `42846 / ok` residue: 357 -> 31
+#
+# The node side re-taken over the **357 rows of the divergence list below**, in the same literal
+# spelling the previous re-take used (`'<value>'::<source>::<target>`, each source's own probe
+# value from `esker-coord/wire-v3-probes.txt`):
+#
+#     now agree                      **326**
+#     node refuses, PG answers        **10**   <- was 54
+#     node answers, PG refuses         **1**   <- was 11
+#     both refuse, different code     **20**   <- was 292
+#
+# **The `42846 / ok` forty are closed, and they were four mechanisms rather than one missing
+# table.** (1) `refused_cast`'s `stringy` was three names where PostgreSQL asks a *category*, so
+# `interval|money|time|uuid -> name|citext` were refused — eight rows, and `typcategory` already
+# said `S` for all five one module over. (2) `time -> interval` is a real `pg_cast` row the same
+# table hid, and the arm beside it already carried the finding in words. (3) `hstore -> json|jsonb`
+# are two rows the extension carries, added to `CASTS` with the conversion in
+# `value::convert_without_text` — one arm for the fold, the column and the array element. (4) The
+# twenty-five vector rows are **one rule**: a vector casts to every array its element casts to, so
+# `casts_to` asks `casts_to(int2, T)` where it had two tuples, and three readers of the operand's
+# text had to stop treating `1 2` as an array literal (`lower_array_cast`'s typmod'd elements,
+# `lower_regclass_array`, and the evaluator's `regclass[]` arm, which sat above the vector one).
+#
+# **The four `42704` rows went with them**: `regtypein` reads all digits as an oid — `'23'::regtype`
+# is `integer` — which is `regclassin`'s rule one type over, now `value::oid_spelled` for all three
+# roads a `regtype` arrives by. It closed `<integer>[] -> regtype[]`, the vectors' last two rows,
+# and a declared divergence in `tests/regtype.rs` whose reason had stated the rule.
+#
+# **What is left, and five of the eleven are this file's own bad rows.**
+#
+#     22003  4   `regclass -> integer|oid` and their arrays: ADR 0097's 64-bit ids against a
+#                four-byte oid. **A ruling, not a fix** — it is the id and not the cast.
+#     22P02  1   `"char"[] -> integer[]` is the byte, and an element never reaches the arm that
+#                knows, because that arm asks the *operand's* declared type — one parameter away.
+#     22P02  1   `regproc -> oid` over a literal.
+#     ----   5   `text -> money|hstore|int2vector|oidvector` and `text -> lquery`: the rows below
+#                whose value the list does not reproduce. Both servers agree on all five when
+#                asked with the list's own value (`x`). **Re-take them.**
+#
+# The `both refuse, different code` group is 20 and is the sqlstate family, not a cast defect:
+# seven are `22P02` where a real server says `22023`, six `22P02` where it says `42846`.
+#
 # ## Four rows of the `ok` list that the list's own value does not reproduce
 #
 # `text -> money`, `text -> hstore`, `text -> int2vector` and `text -> oidvector` are graded `ok`
