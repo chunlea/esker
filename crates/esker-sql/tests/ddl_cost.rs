@@ -237,3 +237,70 @@ fn what_each_ddl_statement_costs() {
 
     println!("\n  {}\n", esker_sql::stmt_stats::summary());
 }
+
+/// **#58 round 2 — does `DROP TABLE IF EXISTS` get dearer as history accumulates, and where?**
+///
+/// r1's shape diff put 87% of a Rails file's growth in this one statement: 277 reads apiece, 8.3×
+/// the file mean, and a per-read cost that grew 2.54× between file 1 and file 8 — *after* the
+/// engine-level read-path fixes made a scan's steps flat in the number of versions.
+///
+/// So the reads themselves are the suspect, and the question is which of them. This repeats the
+/// `CREATE` / `DROP` pair a Rails setup and teardown make, and prints the `DROP`'s reads **grouped
+/// by the catalog kind each addressed**, once per round. A kind whose count climbs with the round
+/// is the mechanism; counts that are all flat mean each read got dearer rather than more numerous,
+/// and the next place to look is under the client rather than in the catalog.
+///
+/// Ignored by default, like everything else in this file: it prints, and a test that failed when a
+/// DDL got cheaper would be worse than useless.
+#[test]
+#[ignore = "a measurement, not an assertion — see the module doc for how to run it"]
+fn what_a_drop_reads_as_the_history_grows() {
+    const ROUNDS: usize = 10;
+    // **A catalog the size the workload has.** The first run of this probe used an empty schema and
+    // measured 10 reads a `DROP`, against r1's 277 — so the 277 is a function of how many relations
+    // the catalog holds, not of the statement alone, and a probe without them measures a different
+    // statement. r1's file holds 294; this is the same order, kept small enough to build in a test.
+    const BACKGROUND: usize = 150;
+
+    assert!(
+        esker_sql::stmt_stats::enabled(),
+        "set ESKER_STMT_STATS=1, or every number here is zero"
+    );
+    let cluster = Cluster::start();
+    let mut s = cluster.session();
+    for at in 0..BACKGROUND {
+        s.run(&format!(
+            "CREATE TABLE bg{at} (id bigserial primary key, a bigint, b text)"
+        ))
+        .unwrap();
+    }
+
+    for round in 0..ROUNDS {
+        s.run("CREATE TABLE t (id bigserial primary key, a bigint, b text)")
+            .unwrap();
+        // The statement under test, priced and attributed. `IF EXISTS` because that is the form
+        // `ActiveRecord` sends, and the form r1 measured.
+        esker_client::stmt_stats::reset();
+        let began = std::time::Instant::now();
+        s.run("DROP TABLE IF EXISTS t").unwrap();
+        let took = began.elapsed();
+        let cost = esker_client::stmt_stats::taken();
+        let reads: u64 = cost.read_heads.values().sum();
+        let scans: u64 = cost.scan_heads.values().sum();
+        let by_kind =
+            |heads: &std::collections::BTreeMap<[u8; esker_client::stmt_stats::HEAD], u64>| {
+                esker_sql::stmt_stats::name_heads(heads)
+                    .iter()
+                    .map(|(name, n)| format!("{name} x{n}"))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            };
+        println!(
+            "  round {:>2}  {:>7.1} ms  reads {reads:>4}  scans {scans:>3}\n            reads: {}\n            scans: {}",
+            round + 1,
+            took.as_secs_f64() * 1_000.0,
+            by_kind(&cost.read_heads),
+            by_kind(&cost.scan_heads),
+        );
+    }
+}
