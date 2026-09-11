@@ -302,6 +302,24 @@ fn syntactic_type(expr: &Expr, tables: &dyn Tables) -> Option<ColumnType> {
         }
         Expr::Literal(Literal::Typed(value)) => value.column_type(),
         Expr::Cast { to, .. } => Some(*to),
+        // **An array of an array, read one level down.** `ARRAY['{t}'::regclass[]]` is the shape
+        // that needed it: a `regclass[]` literal is rewritten by `lower_regclass_array` into an
+        // `Expr::Array` of per-element resolutions, so it carries no cast and no folded value and
+        // this answered `text` for it (wire v3 family **F10**'s last row).
+        Expr::Array { element, elements } => {
+            let held = element.or_else(|| {
+                elements
+                    .iter()
+                    .find_map(|element| syntactic_type(element, tables))
+            })?;
+            esker_keys::array::ArrayValue::array_of(held)
+        }
+        // **A `reg*` resolution knows its own type**, which is the other half of the same row: the
+        // elements `lower_regclass_array` leaves behind are `CatalogFunc::RegClass` calls, and a
+        // catalog function's result type is a property of the function rather than of a scope.
+        Expr::CatalogFunc(call) if call.func == crate::plan::CatalogFunc::RegClass => {
+            Some(ColumnType::RegClass)
+        }
         _ => None,
     }
 }
