@@ -8,9 +8,13 @@
 #
 # ## What 19beta1 answers
 #
-#     ok        1,037      !42846    8,243      !22P02      522
+#     ok        1,034      !42846    8,243      !22P02      525
 #     !22007       40      !22023       14      !42601       11
 #     !42P01        9      !42883        9
+#
+# **Corrected 2026-09-10 (evening)** by the re-take five sections down: four `text ->` rows were
+# graded `ok` and one `!42601` with a value this file does not carry. `ok` was 1,037 and `!22P02`
+# was 522; the five rows moved and nothing else did.
 #
 # `42846` is by far the common answer: **most pairs of types have no cast at all**, and a node that
 # reads a value's text through the target's input function will answer where a real server refuses.
@@ -105,16 +109,86 @@
 # wrong there is the *sqlstate*, which is what a client branches on. It is the largest group left
 # and the least urgent by ADR 0031.
 #
-# ## Four rows of the `ok` list that the list's own value does not reproduce
+# ## RE-SWEPT 2026-09-10 (evening) after the `42846 / ok` residue: 357 -> 31
 #
-# `text -> money`, `text -> hstore`, `text -> int2vector` and `text -> oidvector` are graded `ok`
-# above, and with the probe list's value for `text` (`x`) **19beta1 refuses all four** —
-# `22P02 invalid input syntax for type money: "x"`, and the same for the two vectors. Measured
-# 2026-09-10, the same statement asked of both servers. So those four rows were taken with a
-# different value than the list carries, and they are not divergences: the node refuses them too,
-# with PostgreSQL's own code. **Re-take them with the value stated**, and the sweep this file
-# records should carry its values so the next reader does not have to go to a coordination file
-# for them.
+# The node side re-asked over the divergence list below, **as literals** —
+# `SELECT ('<value>'::<source>::<target>) IS NOT NULL`, each source's own probe value from
+# `esker-coord/wire-v3-probes.txt`. The sweep this file records bound the value as a **parameter**
+# instead; the instrument is stated here because the two are different roads through this node (the
+# fold versus the evaluator) and this section's numbers are the literal one's. Read over the **352**
+# rows the list holds after the five bad ones were corrected:
+#
+#     now agree                      **326**
+#     node refuses, PG answers         **6**   <- was 54
+#     node answers, PG refuses         **0**   <- was 11
+#     both refuse, different code     **20**   <- was 292
+#
+# **The `42846 / ok` forty are closed, and they were four mechanisms rather than one missing
+# table.** (1) `refused_cast`'s `stringy` was three names where PostgreSQL asks a *category*, so
+# `interval|money|time|uuid -> name|citext` were refused — eight rows, and `typcategory` already
+# said `S` for all five one module over. (2) `time -> interval` is a real `pg_cast` row the same
+# table hid, and the arm beside it already carried the finding in words. (3) `hstore -> json|jsonb`
+# are two rows the extension carries, added to `CASTS` with the conversion in
+# `value::convert_without_text` — one arm for the fold, the column and the array element. (4) The
+# twenty-five vector rows are **one rule**: a vector casts to every array its element casts to, so
+# `casts_to` asks `casts_to(int2, T)` where it had two tuples, and three readers of the operand's
+# text had to stop treating `1 2` as an array literal (`lower_array_cast`'s typmod'd elements,
+# `lower_regclass_array`, and the evaluator's `regclass[]` arm, which sat above the vector one).
+#
+# **The four `42704` rows went with them**: `regtypein` reads all digits as an oid — `'23'::regtype`
+# is `integer` — which is `regclassin`'s rule one type over, now `value::oid_spelled` for all three
+# roads a `regtype` arrives by. It closed `<integer>[] -> regtype[]`, the vectors' last two rows,
+# and a declared divergence in `tests/regtype.rs` whose reason had stated the rule.
+#
+# **What is left is four rows in one item, and it is a ruling rather than a fix** — the five bad
+# rows are corrected rather than counted, in the section above, and the two defects are closed.
+#
+#     22003  4   `regclass -> integer|oid` and their arrays: ADR 0097's 64-bit ids against a
+#                four-byte oid. **A ruling, not a fix** — it is the id and not the cast.
+#
+# `"char"[] -> integer[]` **was** the "one parameter away" row and is closed: `cast_one_value`
+# takes the operand's declared type now, so an element's cast knows what the element was, and the
+# scalar arm that used to hold the rule is that call. `'{x,r}'::"char"[]::integer[]` is
+# `{120,114}`, the literal, the constructor and the column all agreeing.
+#
+# `regproc -> oid` was the fold: the lowering's `oid` arm reads the operand's *characters* with
+# `oid`'s input function and a `regproc` prints as `int4in`. The node is kept for that source now,
+# and the conversion happens where the value is a `Datum::RegProc` and can say so — which is why
+# the same cast over a column and over an array element answered all along.
+#
+# The `both refuse, different code` group is 20 and is the sqlstate family, not a cast defect:
+# seven are `22P02` where a real server says `22023`, six `22P02` where it says `42846`.
+#
+# **The node column of the list below is stale for about 270 rows**, and this is the note that says
+# so rather than a silent rewrite. Those rows record a node sqlstate from before the literal-array
+# guard, the element-wise array cast and the `casts_to` gate above `lower_cast`'s match — the list
+# says 292 rows refuse with a different code and asking again finds 20. **A re-take needs an
+# instrument decision first**, which is why it is not done here: the pg column was taken with the
+# value **bound**, and a node column taken with a **literal** is a different road through this node.
+# Whoever re-takes it should ask both ways, keep the value in the row, and say which column is
+# which — the difference between the two is itself one of this file's findings.
+#
+# ## RE-TAKEN 2026-09-10 (evening): the five rows the list's own value does not reproduce
+#
+# `text -> money`, `text -> hstore`, `text -> int2vector`, `text -> oidvector` were graded `ok` and
+# `text -> lquery` was graded `!42601`. Asked again with the value the probe list actually carries
+# for `text` (`x`), one `BEGIN … ROLLBACK` with `hstore` created inside it, 19beta1 answers:
+#
+#     'x'::text::money        !22P02 invalid input syntax for type money: "x"
+#     'x'::text::hstore       !42601 syntax error in hstore: unexpected end of string
+#     'x'::text::int2vector   !22P02 invalid input syntax for type smallint: "x"
+#     'x'::text::oidvector    !22P02 invalid input syntax for type oid: "x"
+#     'x'::text::lquery       x
+#
+# **This node answers each of the five identically**, message included, so all five were agreements
+# recorded as divergences: they had been taken with a value this file does not carry. The `ok` list
+# below and the divergence list at the end are corrected; the tally at the head moves with them —
+# `ok` 1,037 -> **1,034**, `!22P02` 522 -> **525**, `!42601` 11 -> 11 (hstore in, lquery out) — and
+# the divergence list is **352 rows**, not 357.
+#
+# **The sweep should carry its values.** This is the third time these rows have been read as
+# divergences, and each time the cost was a probe run to find out they are not. A row here is
+# `(source, target, node, pg)` and it should be `(source, value, target, node, pg)`.
 #
 # ## Which casts exist — the 1,037 `ok` rows, one line per source
 #
@@ -201,7 +275,7 @@ regtype	bigint character character varying citext integer name oid text
 regtype[]	bigint[] character character varying character varying[] character[] citext citext[] integer[] name name[] oid[] text text[]
 smallint	bigint bytea character character varying citext double precision integer name numeric oid real regclass regproc regtype text
 smallint[]	bigint[] bytea[] character character varying character varying[] character[] citext citext[] double precision[] integer[] name name[] numeric[] oid[] real[] regclass[] regproc[] regtype[] text text[]
-text	"char" bit bytea character character varying citext hstore int2vector ltree money name oidvector tsquery tsvector void xml
+text	"char" bit bytea character character varying citext lquery ltree name tsquery tsvector void xml
 text[]	"char"[] bit[] bytea[] character character varying character varying[] character[] citext citext[] ltree[] name name[] text tsquery[] tsvector[] xml[]
 time	character character varying citext interval name text
 timestamp	character character varying citext date name text time timestamp with time zone
@@ -517,11 +591,6 @@ smallint[]	oid	!22P02	!42846
 smallint[]	regclass	!42804	!42846
 smallint[]	regtype	!42804	!42846
 smallint[]	regtype[]	!42704	ok
-text	hstore	!42601	ok
-text	int2vector	!22P02	ok
-text	lquery	ok	!42601
-text	money	!22P02	ok
-text	oidvector	!22P02	ok
 text	regclass	!42P01	!42602
 text	regproc	!42883	!42602
 text	regtype	!42704	!42601

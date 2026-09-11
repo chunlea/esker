@@ -119,6 +119,41 @@ pub fn to_text(map: &Hstore) -> String {
         .join(", ")
 }
 
+/// The `json` an hstore casts to: **every value a JSON string, and a NULL a JSON null.**
+///
+/// One function for both targets, because the two orders coincide: an hstore's canonical order is
+/// length-then-bytes ([`Key`]) and that is `jsonb`'s object order as well, so the text this builds
+/// is canonical for a `jsonb` and is the hstore's own order for a `json`. Measured on 19beta1 with
+/// the extension created inside the transaction, 2026-09-10:
+///
+/// ```text
+/// 'b=>2, a=>1, cc=>3'::hstore::json    {"a": "1", "b": "2", "cc": "3"}
+/// 'a=>NULL, b=>1'::hstore::json        {"a": null, "b": "1"}
+/// ''::hstore::json                     {}
+/// '"a b"=>"x \"y\"", c=>"1.5"'::hstore::json   {"c": "1.5", "a b": "x \"y\""}
+/// ```
+///
+/// **The numbers stay strings**: `hstore_to_json` does not guess a value's JSON type — that is
+/// `hstore_to_json_loose`, a different function with a different name — so `2` comes out `"2"`.
+/// The space after the colon is `json`'s own rendering and is what both servers print.
+#[must_use]
+pub fn to_json(map: &Hstore) -> String {
+    let mut out = String::from("{");
+    for (at, (key, value)) in map.iter().enumerate() {
+        if at > 0 {
+            out.push_str(", ");
+        }
+        super::json::write_string(&key.0, &mut out);
+        out.push_str(": ");
+        match value {
+            None => out.push_str("null"),
+            Some(value) => super::json::write_string(value, &mut out),
+        }
+    }
+    out.push('}');
+    out
+}
+
 /// One key or value, quoted the way `hstore_out` quotes it: always, with `\` before a `"` or a `\`.
 fn quote(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);

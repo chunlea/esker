@@ -504,6 +504,17 @@ pub enum ColumnType {
     Int2Vector,
     /// `oidvector`, `int2vector`'s sibling — see it for the shape they share.
     OidVector,
+    /// `int2vector[]`, which exists because **a `typarray` naming a row that is not there is worse
+    /// than a zero** — the sentence the sixteen array types below are introduced by, applied to the
+    /// two types it had skipped.
+    ///
+    /// [ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
+    /// step 2, **the SQL-visible half**: the vectors' own stored representation does not change
+    /// here and the cost of changing it later is written into that ADR. This is only their array,
+    /// and it is purely additive.
+    Int2VectorArray,
+    /// `oidvector[]`, beside [`ColumnType::Int2VectorArray`] and for its reason.
+    OidVectorArray,
     /// `boolean[]`. **The sixteen below are not sixteen features.** Every base type on a real
     /// server has an array type, and `pg_type.typarray` points at it; a `typarray` naming a row
     /// that is not there is worse than a zero, because a client walks the link in both directions
@@ -613,7 +624,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 105] = [
+    pub const ALL: [ColumnType; 107] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -650,6 +661,8 @@ impl ColumnType {
         ColumnType::RegProc,
         ColumnType::RegClass,
         ColumnType::Int2Vector,
+        ColumnType::Int2VectorArray,
+        ColumnType::OidVectorArray,
         ColumnType::OidVector,
         ColumnType::Int8Array,
         ColumnType::Int4Array,

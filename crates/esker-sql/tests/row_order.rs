@@ -151,6 +151,10 @@ fn encoded_keys_sort_the_way_postgresql_sorts_the_values() {
                 // Its array joins it for both of the reasons above at once — no comparison to
                 // reproduce, and `ltree[]`'s missing delimiter rule (ADR 0107 step 1).
                 | ColumnType::LQueryArray
+                // And the vectors' arrays with step 2: a vector holds a space-separated text whose
+                // comparison is not its bytes', so an array of them has none either.
+                | ColumnType::Int2VectorArray
+                | ColumnType::OidVectorArray
                 // **A tsvector's order is not its printed form's.** Measured on 19beta1 over ten
                 // values: `'b'` sorts before `'ab'` and `'a':1A` before `'a':1`, where plain bytes
                 // give the reverse of both, and a two-lexeme vector lands between two one-lexeme

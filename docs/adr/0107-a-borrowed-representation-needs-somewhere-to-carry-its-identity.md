@@ -134,6 +134,43 @@ enum by one variant per type that borrows — which is the shape this ADR exists
   that meets them, and a test that says so. That is what the four units above did, and it is
   affordable; what is not affordable is doing it silently.
 
+### Step 2, decided 2026-09-10 after measuring: the SQL-visible half, and **no byte moves**
+
+Step 1 landed (`lquery`). Step 2 was written as *"give the vectors a real array value"* and its
+opening instruction was to **start by asking what a stored `int2vector` column round-trips as
+today**. Asked, on this node:
+
+```text
+CREATE TABLE vv (id bigint primary key, iv int2vector)   accepted
+INSERT INTO vv VALUES (1, '1 2 3')                       accepted
+SELECT iv::text FROM vv                                  1 2 3      it round-trips
+SELECT array_length(iv, 1) FROM vv                       3
+SELECT (iv)[0] FROM vv                                   1          already zero-based
+SELECT array_lower('1 2 3'::int2vector, 1)               0          already zero
+SELECT (iv::int2[])::text FROM vv                        42846      19beta1: [0:2]={1,2,3}
+```
+
+**Two of this ADR's own sentences were refuted by that, and both in the cheap direction.**
+
+*"This node does not store an `int2vector` today, so the storage form is an open, cheap question"*
+— **it stores one.** `catalog::record` has `TAG_INT2VECTOR = 91`, so a column can be declared, and
+the value goes into the row as `Datum::Text`'s bytes. Giving the type an array value would change
+what those bytes mean **under the same tag**, and the format version lives in the *catalog record*,
+not in the *row* — so old bytes and new bytes would be indistinguishable. That is a migration, not
+a representation change, and this ADR was explicit that it does not decide storage.
+
+*"The zero-based lower bound … is the risk"* — **it is already right**: `array_lower` answers 0 and
+`(iv)[0]` is the first element, both from the computed path, and `esker-keys`' row encoding has
+persisted an array's lower bound since it was written (`row.rs`, "the lower bound is part of the
+value"). So one of the two named risks does not exist and the other is larger than stated.
+
+**Decided by the user 2026-09-10: step 2 is the SQL-visible half and moves no stored byte.**
+`int2vector -> int2[]` (which 19beta1 answers `[0:2]={1,2,3}`), `typarray` and category `A`,
+and the `= ANY`/`unnest` shapes listed above. **The storage form stays undecided**, which is what
+this ADR said it would do — and now with the cost of deciding it later written down rather than
+assumed: a tag that already has data behind it, a version number that cannot tell the two
+representations apart, and therefore a migration or a second tag. Neither is a type question.
+
 ## What this ADR does not decide
 
 Whether `int2vector`'s **stored** form changes. Nothing in this node stores one today, so the

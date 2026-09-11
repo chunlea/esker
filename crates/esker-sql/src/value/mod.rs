@@ -258,6 +258,27 @@ pub fn range_subtype(ty: ColumnType) -> ColumnType {
 /// `tsrange[]`'s oid — PostgreSQL's own `_tsrange`, which is built in and therefore fixed.
 pub const TSRANGE_ARRAY_OID: u32 = 3909;
 
+/// **The element a vector holds**, which is the one thing `ArrayValue::element_of` must not learn.
+///
+/// An `int2vector` *is* an array of `int2` on a real server — 0-based, space separated on the way
+/// out — and three readers need to know it: `pg_catalog::casts_to`, so `int2vector::integer[]` is
+/// permitted exactly when `smallint::integer` is; the evaluator's cast arm, which builds the
+/// array; and `unnest`, whose element type is this and not `text`.
+///
+/// It is **not** in `element_of` because a vector's own oid is derived through that function —
+/// `ColumnType::oid` answers `array_oid(element_of(self))` for an array — so teaching it there
+/// would make `int2vector` report `_int2`'s number. That split is exactly what
+/// [ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
+/// calls a model rather than a type.
+#[must_use]
+pub fn vector_element(ty: ColumnType) -> Option<ColumnType> {
+    match ty {
+        ColumnType::Int2Vector => Some(ColumnType::Int2),
+        ColumnType::OidVector => Some(ColumnType::Oid),
+        _ => None,
+    }
+}
+
 /// The typmod a declared **length** makes, for `varchar(n)` and `character(n)`.
 ///
 /// The one place this arithmetic happens. `ColumnDef::typmod` holds PostgreSQL's number because
@@ -942,6 +963,20 @@ pub fn convert_without_text(value: &Datum, to: ColumnType) -> Option<Result<Datu
         (Datum::Double(_) | Datum::Real(_) | Datum::Numeric(_), _) if integer(to) => {
             Some(assignment_cast(value.clone(), to, Rendering::default()))
         }
+        // **An hstore to a JSON document**, which is two `pg_cast` rows the extension carries
+        // (`e`, by function) and never a round trip: an hstore's canonical text is `"a"=>"1"`,
+        // which no JSON reader accepts — the text road was `22P02 invalid input syntax for type
+        // json` for a pair a real server converts. Every value becomes a JSON **string** and a
+        // NULL becomes a JSON null, `hstore_to_json`'s rule rather than `hstore_to_json_loose`'s.
+        //
+        // Here rather than in the evaluator's cast arm because there are three callers and they
+        // must not disagree: the fold, a cast over a column, and an **element** of an
+        // `hstore[] -> json[]`, which reaches `cast_one_value` and nothing above it. Unlike the
+        // `"char"` this function cannot have, an hstore carries its own identity
+        // (`Datum::Hstore`), so the value alone says which cast this is.
+        (Datum::Hstore(text), ColumnType::Json | ColumnType::Jsonb) => {
+            Some(hstore::from_text(text).map(|map| Datum::Text(hstore::to_json(&map))))
+        }
         // **A `bool` and an `int4`, both ways.** `pg_cast` has the two rows and no others in the
         // family: `true::int4` is `1`, `0::int4::bool` is `false` and anything else is `true`.
         // Through the text this was `int4in` reading `t`.
@@ -1524,6 +1559,22 @@ pub fn type_by_oid(oid: u32) -> Option<ColumnType> {
     ColumnType::ALL.into_iter().find(|ty| ty.oid() == oid)
 }
 
+/// **A `reg*` input function reads all digits as an oid**, and anything else as a name.
+///
+/// PostgreSQL's `regclassin` and `regtypein` share this rule and it is measured on both:
+/// `'1259'::regclass` is `pg_class` and `'23'::regtype` is `integer`, while `'-1'::regtype` is a
+/// *syntax* error — `invalid type name "-1"` — because the sign makes it a name. So the boundary
+/// is the characters and not "looks numeric", which is the half a reader guesses wrong.
+///
+/// `None` means "this is a name", and the caller resolves it where its catalog is.
+#[must_use]
+pub fn oid_spelled(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<u32>().ok()
+}
+
 /// The `regtype` an oid names, printing as the type's name or — for an oid that is no type — as
 /// its own digits.
 ///
@@ -1663,11 +1714,13 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         ColumnType::RegClass => 2210,
         // There is no array of an array: an array type is a constructor over a *scalar* here, so
         // asking for one has no answer and `0` is `InvalidOid`, which is what a real server's
-        // `typarray` holds for a type that has no array. Neither vector has one on a real server.
+        // `typarray` holds for a type that has no array.
         // **`typarray` is 0 for a pseudo-type**, measured: there is no `_void`.
+        //
+        // **The sentence "neither vector has one on a real server" stood here and was wrong** —
+        // 19beta1 has `_int2vector` (1006) and `_oidvector` (1013), measured — which is why the two
+        // are now in the arm above rather than in this list (ADR 0107 step 2).
         ColumnType::Void
-        | ColumnType::Int2Vector
-        | ColumnType::OidVector
         | ColumnType::Int8Array
         | ColumnType::Int4Array
         | ColumnType::Int2Array
@@ -1714,9 +1767,12 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::FloatRange
         | ColumnType::VarcharRange
         | ColumnType::XmlArray
-        // `lquery` left this list with ADR 0107 step 1; an array still has no array.
+        // `lquery` left this list with ADR 0107 step 1 and the two vectors with its step 2; an
+        // array still has no array.
         | ColumnType::LtreeArray
-        | ColumnType::LQueryArray => 0,
+        | ColumnType::LQueryArray
+        | ColumnType::Int2VectorArray
+        | ColumnType::OidVectorArray => 0,
         // **Every range type has its array now**, which is what run 58 was: `range_test.rb`
         // declares two range arrays and an array type is built per element type, so three of the
         // four left its 46 tests exactly where they were. The oids are PostgreSQL's own and each
@@ -1779,6 +1835,10 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         ColumnType::Citext => CITEXT_ARRAY_OID,
         ColumnType::Ltree => LTREE_ARRAY_OID,
         ColumnType::LQuery => LQUERY_ARRAY_OID,
+        // **PostgreSQL's own numbers**, unlike the extension block above: `_int2vector` is 1006
+        // and `_oidvector` 1013, both built in.
+        ColumnType::Int2Vector => 1006,
+        ColumnType::OidVector => 1013,
 
         ColumnType::TsRange => TSRANGE_ARRAY_OID,
         ColumnType::Jsonb => 3807,
@@ -1891,6 +1951,8 @@ fn takes_typmod(ty: ColumnType) -> bool {
         // Listed although the early return above already answers for it: an array's typmod is its
         // element's, and this match is exhaustive over the vocabulary.
         | ColumnType::LQueryArray
+        | ColumnType::Int2VectorArray
+        | ColumnType::OidVectorArray
         | ColumnType::Money
         | ColumnType::Inet
         | ColumnType::Cidr
@@ -2074,6 +2136,11 @@ impl PgType for ColumnType {
             ColumnType::Ltree => LTREE_OID,
             ColumnType::LQuery => LQUERY_OID,
             ColumnType::LQueryArray => LQUERY_ARRAY_OID,
+            // **Required for exhaustiveness and unreachable in practice**: the early return above
+            // answers for every array type. They defer to the same function rather than repeating
+            // 1006 and 1013, so the two directions cannot drift apart.
+            ColumnType::Int2VectorArray => array_oid(ColumnType::Int2Vector),
+            ColumnType::OidVectorArray => array_oid(ColumnType::OidVector),
             // PostgreSQL's own, and fixed: unlike an extension's, a range type is built in.
             ColumnType::TsRange => 3908,
             ColumnType::TstzRange => 3910,
@@ -2265,6 +2332,8 @@ impl PgType for ColumnType {
             ColumnType::Ltree => "ltree",
             ColumnType::LtreeArray => "ltree[]",
             ColumnType::LQueryArray => "lquery[]",
+            ColumnType::Int2VectorArray => "int2vector[]",
+            ColumnType::OidVectorArray => "oidvector[]",
             ColumnType::LQuery => "lquery",
             ColumnType::HstoreArray => "hstore[]",
             ColumnType::TsVectorArray => "tsvector[]",
@@ -2367,6 +2436,8 @@ impl PgType for ColumnType {
             | ColumnType::Ltree
             | ColumnType::LQuery
             | ColumnType::LQueryArray
+            | ColumnType::Int2VectorArray
+            | ColumnType::OidVectorArray
             | ColumnType::Numeric
             | ColumnType::Bytea
             // However many elements it has, which is the definition of a varlena.
@@ -2580,11 +2651,18 @@ impl PgDatum for Datum {
                 }
             }
             ColumnType::RegType => {
-                let named =
-                    named_type(text)?.ok_or_else(|| SqlError::UndefinedType(text.to_owned()))?;
-                // Through the oid, so the printed form is the **canonical** name and not the
-                // spelling written: `'int4'::regtype` is `integer`, measured.
-                regtype_of_oid(named.oid())
+                // **All digits are an oid** (`oid_spelled`), which is `regtypein`'s own rule and
+                // what makes `'{23,25}'::text::regtype[]` the two type names rather than
+                // `42704 type "23" does not exist`. An oid no type names prints its digits back.
+                if let Some(oid) = oid_spelled(text) {
+                    regtype_of_oid(oid)
+                } else {
+                    let named = named_type(text)?
+                        .ok_or_else(|| SqlError::UndefinedType(text.to_owned()))?;
+                    // Through the oid, so the printed form is the **canonical** name and not the
+                    // spelling written: `'int4'::regtype` is `integer`, measured.
+                    regtype_of_oid(named.oid())
+                }
             }
             ColumnType::Point => {
                 let (x, y) = point::from_text(text)?;
@@ -2671,7 +2749,9 @@ impl PgDatum for Datum {
             | ColumnType::CitextArray
             | ColumnType::XmlArray
             | ColumnType::LtreeArray
-            | ColumnType::LQueryArray => {
+            | ColumnType::LQueryArray
+            | ColumnType::Int2VectorArray
+            | ColumnType::OidVectorArray => {
                 let element =
                     esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
                 Datum::Array(array::from_text(text, element)?)
@@ -2961,7 +3041,9 @@ impl PgDatum for Datum {
             | ColumnType::CitextArray
             | ColumnType::XmlArray
             | ColumnType::LtreeArray
-            | ColumnType::LQueryArray => {
+            | ColumnType::LQueryArray
+            | ColumnType::Int2VectorArray
+            | ColumnType::OidVectorArray => {
                 return Err(SqlError::unsupported(format!(
                     "a binary-format {}",
                     ty.name()
@@ -3814,6 +3896,8 @@ mod tests {
                         | ColumnType::XmlArray
                         | ColumnType::LtreeArray
                         | ColumnType::LQueryArray
+                        | ColumnType::Int2VectorArray
+                        | ColumnType::OidVectorArray
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value
                         // carries are the value, and `numeric(10,2)` bounds them in the typmod,
