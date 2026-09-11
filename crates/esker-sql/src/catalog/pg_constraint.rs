@@ -189,11 +189,9 @@ const NO_FOREIGN_ACTION: &str = " ";
 
 /// Every `pg_constraint` row this tenant has.
 pub fn rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    Ok(rows_from(
-        &Relations::read(txn, tenant)?,
-        &super::schemas(txn, tenant)?,
-    ))
+    let relations = view.relations()?;
+    let schemas = view.schemas()?;
+    Ok(rows_from(&relations, &schemas))
 }
 
 /// The same, over a snapshot somebody else has already read — which is how

@@ -1,8 +1,8 @@
 # #49, option (b): give the catalog cache the readers it does not have
 
-Status: **proposed, 2026-09-10 — waiting on the user.** Nothing here is built. Its target was
-re-priced by run 117 the same day and the plan survived it; the last section is where that is
-recorded.
+Status: **built, 2026-09-10** (lane b4; chosen by the user 16:00, ADR 0106 accepted with it).
+*"What it turned out to be"* at the end of this file is what changed against the plan and what was
+measured; everything before it is the plan as written, kept because the difference is the record.
 
 [ADR 0106](../adr/0106-what-a-statement-reads-below-the-sql.md) is the decision document and this is
 the plan for its option (b), written so that a lane can start on the day it is chosen.
@@ -357,3 +357,76 @@ are catalog"* is indeed a true fact about a cheap statement, **and the plan is s
 It is the **version** read — the one ADR 0102 instrumented — and `pk_and_sequence_for` makes 60 KV
 reads of which two are it. The other 58 are what this plan removes. Anyone picking this up will meet
 that 2.3% and should meet the explanation with it.
+
+---
+
+## What it turned out to be
+
+Built the same day it was chosen. **The shape held** — routing, not construction — and three things
+were not as written.
+
+### 1. The bundle had to be cached, not only its parts
+
+The Scope above gives `Cache` four new maps and has `Relations::read` take a `&View` so its
+per-table load goes through `View::table_by_id`. That removes the point reads and the hydration
+bundles; it leaves **the scan of the name records**, once per `Relations::read`, five times in a
+statement that names five catalog relations. And the scan is the term that grows with the catalog.
+
+So `Cache` holds `relations: BTreeMap<u64, Arc<Relations>>` as well — the whole bundle, at a
+version. It is a pure function of the records at that version, which is the same argument that
+makes `tables` safe. **The acceptance test is what forced it**: with the parts cached and the
+bundle not, `one_statement_reads_no_key_twice` is red at five `scan name(t1)…`.
+
+Six maps landed rather than four: `schemas`, `schema_lists`, `views`, `types`, `sequences`,
+`relations`.
+
+### 2. Two readers the census did not name, and both were cheap
+
+* **The layout marker is memoised on the `Catalog`, not per process.** The plan says "once per
+  process"; a `Catalog` is one per node and one node is one store, which is the assumption its
+  version cache already rests on. Per process would have leaked one store's answer into another's,
+  which is a real shape in this crate's own tests — many `MemoryBackend`s in one process.
+* **A transaction that has written the catalog now builds its views reading nothing at all**
+  (`Catalog::view_written`). Such a view never consults the cache, so the version it would read is
+  a number nobody compares. Without this, routing `schema_exists` through a view would have *added*
+  two reads per call inside a DDL statement — the opposite of the point.
+
+### 3. The clock acceptance test measures a different mechanism, and it is still red
+
+`a_repeated_statement_stops_tracking_the_catalog` was the plan's headline test. After option (b),
+the second run of `pk_and_sequence_for` reads **4 keys at 20 relations and 4 at 100** — flat — and
+takes **1.96 ms and 14.38 ms**. What it times is a **cross product between two computed catalog
+views** (`pg_class × pg_depend` on `oid = objid`: 1.55 ms → 24.6 ms for five times the catalog,
+15.9x), which is a planner defect that no option in ADR 0106 touches.
+
+On the in-process node a KV read is a `BTreeMap` lookup; on the real topology it is **232 µs**.
+So the clock here cannot see this row's change at all. The test is left in place, `#[ignore]`d with
+that reason and those numbers, and
+[`a_repeated_statement_reads_only_the_version_keys`](../../crates/esker-sql/tests/catalog_read_slope.rs)
+is the acceptance test that does translate — red at 60 before, green at 4 now, asserted at two
+catalog sizes. `esker-coord/QUESTION-b4.md` is where the rewrite is asked for rather than taken.
+
+### And a wrong answer the tests found on the way
+
+`CREATE TYPE`, `DROP TYPE` and a standalone `DROP SEQUENCE` never bumped the catalog version. With
+those records read from the store every statement it could not be seen; with them cached, a type
+session B declares is missing from session A's next statement. Fixed in the writers, where every
+other catalog write already does it, and
+`crates/esker-sql/tests/catalog_cache_invalidation.rs` is the test that was red on it — nine cases,
+one per map, with the counterfactual recorded in its header (and the *first* counterfactual written
+for it, which passed because it switched the cache off instead of making it stale).
+
+### The numbers
+
+| statement | before | after | after, cache warm |
+|---|---|---|---|
+| `pk_and_sequence_for` | **60** | 12 | **4** |
+| `SELECT a FROM pk0 WHERE id = 1` | 9 | 5 | 5 |
+| `INSERT … RETURNING id` | 8 | 5 | 5 |
+| `CREATE TABLE` | 17 | 16 | 16 |
+| `ALTER TABLE … DISABLE TRIGGER ALL` | 17 | **10** | 10 |
+| `DROP TABLE` | 29 | **22** | 22 |
+
+`CREATE TABLE` moves least, exactly as the DDL census predicted: what is left there is `next-id`,
+the version counters and its own name writes. **r1's number on the real cluster is what closes this
+row**; the counts are this lane's.

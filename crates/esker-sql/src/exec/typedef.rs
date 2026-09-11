@@ -42,7 +42,7 @@ pub(super) fn create(
     // A schema that is not there is `3F000` before anything else is looked at — the same class and
     // the same sentence `CREATE TABLE nosuchschema.t` gives, rather than a type that quietly lands
     // in `public`.
-    if !catalog::schema_exists(&*txn, executor.tenant, &schema)? {
+    if !executor.catalog_view(&*txn)?.schema_exists(&schema)? {
         return Err(SqlError::UndefinedSchema(schema));
     }
     let stored = catalog::qualify(&schema, &bare);
@@ -99,7 +99,7 @@ pub(super) fn create(
             oid,
             kind: create.kind.clone(),
         },
-    );
+    )?;
     Ok(Outcome::done("CREATE TYPE"))
 }
 
@@ -160,7 +160,7 @@ fn rename_type(executor: &Executor, txn: &mut dyn Txn, def: &TypeDef, to: &str) 
     if catalog::type_by_name(&*txn, executor.tenant, &stored)?.is_some() {
         return Err(SqlError::DuplicateType(to.to_owned()));
     }
-    catalog::drop_type(txn, executor.tenant, &def.name);
+    catalog::drop_type(txn, executor.tenant, &def.name)?;
     catalog::put_type(
         txn,
         executor.tenant,
@@ -169,7 +169,7 @@ fn rename_type(executor: &Executor, txn: &mut dyn Txn, def: &TypeDef, to: &str) 
             oid: def.oid,
             kind: def.kind.clone(),
         },
-    );
+    )?;
     Ok(())
 }
 
@@ -198,8 +198,7 @@ fn rename_enum_value(
         return Err(SqlError::DuplicateEnumLabel(to.to_owned()));
     }
     to.clone_into(&mut labels[at]);
-    put_labels(executor, txn, def, labels);
-    Ok(())
+    put_labels(executor, txn, def, labels)
 }
 
 /// `ADD VALUE [IF NOT EXISTS] 'label' [BEFORE | AFTER 'other']`.
@@ -244,12 +243,16 @@ fn add_enum_value(
         shift_enum_ordinals(executor, txn, def, at)?;
     }
     labels.insert(at, label.to_owned());
-    put_labels(executor, txn, def, labels);
-    Ok(())
+    put_labels(executor, txn, def, labels)
 }
 
 /// Writes a type's labels back, keeping its oid.
-fn put_labels(executor: &Executor, txn: &mut dyn Txn, def: &TypeDef, labels: Vec<String>) {
+fn put_labels(
+    executor: &Executor,
+    txn: &mut dyn Txn,
+    def: &TypeDef,
+    labels: Vec<String>,
+) -> Result<()> {
     catalog::put_type(
         txn,
         executor.tenant,
@@ -258,7 +261,7 @@ fn put_labels(executor: &Executor, txn: &mut dyn Txn, def: &TypeDef, labels: Vec
             oid: def.oid,
             kind: catalog::TypeKind::Enum { labels },
         },
-    );
+    )
 }
 
 /// Adds one to every stored ordinal at or after `at`, in every column declared as this enum.
@@ -270,7 +273,7 @@ fn shift_enum_ordinals(
     def: &TypeDef,
     at: usize,
 ) -> Result<()> {
-    let relations = catalog::pg_relations::Relations::read(&*txn, executor.tenant)?;
+    let relations = executor.catalog_view(&*txn)?.relations()?;
     let mut wanted: Vec<(u64, Vec<usize>)> = Vec::new();
     for table in relations.tables() {
         let columns: Vec<usize> = table
@@ -330,7 +333,7 @@ fn refuse_if_a_column_depends(executor: &Executor, txn: &dyn Txn, name: &str) ->
     let Some(def) = catalog::type_by_name(txn, executor.tenant, name)? else {
         return Ok(());
     };
-    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    let relations = executor.catalog_view(txn)?.relations()?;
     for table in relations.tables() {
         for column in &table.columns {
             if column.user_type == Some(def.oid) {
@@ -357,7 +360,7 @@ fn drop_columns_of_type(executor: &mut Executor, txn: &mut dyn Txn, name: &str) 
     let Some(def) = catalog::type_by_name(txn, executor.tenant, name)? else {
         return Ok(());
     };
-    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    let relations = executor.catalog_view(txn)?.relations()?;
     let mut wanted: Vec<(u64, Vec<String>)> = Vec::new();
     for table in relations.tables() {
         let columns: Vec<String> = table
@@ -402,7 +405,7 @@ pub(super) fn drop(executor: &mut Executor, txn: &mut dyn Txn, drop: &DropType) 
         } else {
             refuse_if_a_column_depends(executor, txn, &stored)?;
         }
-        catalog::drop_type(txn, executor.tenant, &stored);
+        catalog::drop_type(txn, executor.tenant, &stored)?;
     }
     Ok(Outcome::done("DROP TYPE"))
 }

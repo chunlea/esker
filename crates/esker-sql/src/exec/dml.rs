@@ -242,11 +242,14 @@ pub(super) fn column_default_value(
     // `value::split_type_name` was for.
     let mut types = None;
     let mut failure = None;
+    // **No session, so no cache**: a stored default is re-read per row in whatever transaction is
+    // running, and there is no pinned catalog version to answer it from.
+    let view = crate::catalog::Snapshot::detached().view(txn, tenant);
     let _ = super::subquery::walk_mut(&mut parsed, &mut |expr| {
         // **No path here, and it is not an omission.** A stored default's cast is written as the
         // statement wrote it and re-read per row; a bare user type in one meant `public` when it
         // was stored, and this path has no session to ask.
-        match Executor::user_cast(tenant, &mut types, txn, expr, false, &[]) {
+        match Executor::user_cast(&view, &mut types, expr, false, &[]) {
             Ok(Some(resolved)) => *expr = resolved,
             Ok(None) => {}
             Err(error) => failure = Some(error),

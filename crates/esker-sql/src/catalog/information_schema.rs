@@ -33,7 +33,7 @@
 //!   keys, so there is nothing referential to constrain.
 
 use super::NO_LENGTH;
-use crate::catalog::pg_relations::{RelKind, Relations};
+use crate::catalog::pg_relations::RelKind;
 use crate::catalog::{ColumnDef, Identity};
 use crate::error::Result;
 use crate::value::{self, ColumnType, Datum, Rendering};
@@ -45,8 +45,7 @@ const NO: &str = "NO";
 
 /// Every `information_schema.tables` row: one per **table**, and nothing else.
 pub fn tables(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     // **A view is here and a materialized view is not**, measured: `information_schema.tables` has
     // a `VIEW` row for the first and no row at all for the second — the standard has no table type
     // for something PostgreSQL invented, so a real server leaves it out rather than calling it a
@@ -97,9 +96,8 @@ pub const DOMAINS_COLUMNS: &[(&str, ColumnType, i32)] = &[
 /// `custom_money` over `numeric(8,2)` reports `numeric`, with the precision and scale beside it.
 /// The domain's own name is `domain_name`, which is the column that tells them apart (ADR 0065).
 pub fn domains(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
     let mut rows = Vec::new();
-    for def in super::user_types(txn, tenant)? {
+    for def in view.user_types()?.iter() {
         let super::TypeKind::Domain { base, typmod, .. } = def.kind else {
             continue;
         };
@@ -185,9 +183,9 @@ fn is_automatically_updatable(definition: &str) -> bool {
 
 /// Every `information_schema.views` row: one per view, with PostgreSQL's updatability rule.
 pub fn views(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    Ok(crate::catalog::views(txn, tenant)?
-        .into_iter()
+    Ok(view
+        .views()?
+        .iter()
         .map(|view| {
             let (schema, name) = crate::catalog::split_qualified(&view.name);
             // **`YES`/`NO` text, not a boolean** — the standard spells these as
@@ -214,12 +212,12 @@ pub fn views(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
 
 /// Every `information_schema.columns` row: one per column of a table, in declaration order.
 pub fn columns(view: &crate::catalog::View<'_>, rendering: Rendering) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     // One read for the whole view rather than a lookup per column, the trade `Relations` already
     // makes for user types: a schema dump asks this of every column of every table.
-    let domains: std::collections::BTreeMap<u64, String> = super::user_types(txn, tenant)?
-        .into_iter()
+    let domains: std::collections::BTreeMap<u64, String> = view
+        .user_types()?
+        .iter()
         .filter(|def| matches!(def.kind, super::TypeKind::Domain { .. }))
         .map(|def| {
             let (_, bare) = super::split_qualified(&def.name);
@@ -401,11 +399,10 @@ fn collation_name(column: &ColumnDef) -> Datum {
 
 /// Every `information_schema.table_constraints` row, out of `pg_constraint`.
 pub fn table_constraints(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
     // One snapshot for the constraint rows *and* for the table each names, rather than one read
     // per row: this is a view over a view, and the catalog underneath is read once.
-    let relations = Relations::read(txn, tenant)?;
-    let schemas = super::schemas(txn, tenant)?;
+    let relations = view.relations()?;
+    let schemas = view.schemas()?;
     let mut rows = Vec::new();
     for row in super::pg_constraint::rows_from(&relations, &schemas) {
         let (Some(Datum::Text(name)), Some(Datum::Text(contype))) = (row.get(1), row.get(3)) else {
@@ -464,8 +461,7 @@ fn yes_no(value: Option<&Datum>) -> &'static str {
 /// a primary key and a unique constraint alike — it is the position in the *referenced* key of a
 /// foreign key, and there are none.
 pub fn key_column_usage(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     let mut rows = Vec::new();
     for relation in relations.of_kind(RelKind::Table) {
         let Some(table) = relations.table(relation) else {

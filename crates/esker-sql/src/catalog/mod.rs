@@ -2437,9 +2437,18 @@ pub fn fold_identifier(name: &str, quoted: bool) -> (String, bool) {
 }
 
 /// The per-node cache of definitions. One per SQL node, shared by every session.
+///
+/// **One `Catalog` is one store.** Everything below is keyed on a catalog version, which is a
+/// number read out of *that* store's keys; two stores behind one of these would answer each
+/// other's records at each other's versions. Nothing enforces it and nothing has to — a node has
+/// one backend — but `Catalog::accept_layout` leans on it as well, so it is written down here.
 #[derive(Debug, Default)]
 pub struct Catalog {
     cached: Mutex<Cache>,
+    /// Whether this store's catalog layout has been read and accepted — see
+    /// [`Catalog::accept_layout`]. It is a **constant of the store**, so unlike everything in
+    /// [`Cache`] it survives a version bump.
+    layout: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -2450,6 +2459,26 @@ struct Cache {
     names: BTreeMap<(u64, String), Option<Relation>>,
     /// `(tenant, table_id)` to the definition.
     tables: BTreeMap<(u64, u64), Arc<TableDef>>,
+    /// `(tenant, name)` to whether that schema exists. `false` is "known not to exist", which is
+    /// what a `search_path` entry naming nothing asks about once per name resolution — sixteen
+    /// times in one `pk_and_sequence_for` before this map existed.
+    schemas: BTreeMap<(u64, String), bool>,
+    /// One tenant's created schemas, whole: every reader of them wants all of them.
+    schema_lists: BTreeMap<u64, Arc<Vec<(String, u64)>>>,
+    /// One tenant's views, whole.
+    views: BTreeMap<u64, Arc<Vec<ViewDef>>>,
+    /// One tenant's user-defined types, whole.
+    types: BTreeMap<u64, Arc<Vec<TypeDef>>>,
+    /// `(tenant, table_id)` to that table's sequences.
+    sequences: BTreeMap<(u64, u64), Arc<Vec<SequenceDef>>>,
+    /// One tenant's whole catalog as the `pg_catalog` and `information_schema` views read it.
+    ///
+    /// **The bundle, and not only its parts.** Reading it is one scan of the name records plus a
+    /// point read per relation, and a statement that names five catalog relations built it five
+    /// times: caching the parts leaves the scan, and the scan is the term that grows with the
+    /// catalog (`docs/plans/debt-49-catalog-cache.md`). It is a pure function of the records at
+    /// this version, which is the same reason `tables` is safe to hold.
+    relations: BTreeMap<u64, Arc<pg_relations::Relations>>,
 }
 
 impl Catalog {
@@ -2532,13 +2561,53 @@ impl Catalog {
         // **Once per transaction, beside the counter it already reads.** Every catalog view comes
         // through here, so this is where a database whose keys this build cannot read is turned
         // away — before a single name is looked up in the wrong place.
-        refuse_an_older_layout(txn, version)?;
+        self.accept_layout(txn, version)?;
         Ok(View {
             catalog: cached.then_some(self),
             txn,
             tenant,
             version,
         })
+    }
+
+    /// The view a transaction that has **written** the catalog gets, at no read at all.
+    ///
+    /// Such a view answers from the store and never from the cache, so the version it would carry
+    /// is never compared to anything: reading the two counters for it buys a number nobody looks
+    /// at. The measurement is what made this worth a function — a DDL statement resolves names
+    /// through a view several times, and this used to be two counter reads and a layout read each.
+    ///
+    /// The layout marker still gets its check, because a store this process has never checked one
+    /// for has to be turned away here as anywhere; when it has been checked, that costs nothing
+    /// and this reads nothing.
+    pub fn view_written<'a>(&'a self, txn: &'a dyn Txn, tenant: u64) -> Result<View<'a>> {
+        if !self.layout.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.view_at(txn, tenant, false);
+        }
+        Ok(View {
+            catalog: None,
+            txn,
+            tenant,
+            // Never read: `catalog` is `None`, so no cache entry is ever compared against it.
+            version: 0,
+        })
+    }
+
+    /// Refuses a store whose catalog keys this build cannot read — **once per node**.
+    ///
+    /// The marker is a constant of the store ([`refuse_an_older_layout`] says why), and every
+    /// catalog view was reading it: two of `pk_and_sequence_for`'s sixty reads and four of every
+    /// DDL statement's. A store that has answered once cannot start answering differently — the
+    /// key is written once, by the first `bump_version` a store ever runs, with this build's own
+    /// number.
+    fn accept_layout(&self, txn: &dyn Txn, version: u64) -> Result<()> {
+        if self.layout.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        refuse_an_older_layout(txn, version)?;
+        self.layout
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// A poisoned lock means a thread panicked holding it; the maps behind it are still sound and
@@ -2703,7 +2772,7 @@ impl<'a> View<'a> {
         // What the record does not hold is a second read, and [`hydrate`] is where all of it
         // happens: a `TableDef` in anybody's hands has it, so nothing above the catalog has to
         // remember to ask.
-        hydrate(self.txn, self.tenant, &mut table)?;
+        hydrate(self, &mut table)?;
         let table = Arc::new(table);
         if let Some(cache) = cache {
             cache.lock().tables.insert(key, Arc::clone(&table));
@@ -2716,6 +2785,122 @@ impl<'a> View<'a> {
     fn cache(&self) -> Option<&Catalog> {
         self.catalog
             .filter(|catalog| catalog.usable_at(self.version))
+    }
+
+    /// The one place a cached catalog answer is read and filled.
+    ///
+    /// **The fill never runs while the lock is held.** A fill reads the store and can ask this
+    /// again — [`View::relations`] hydrates every table and a hydration asks for that table's
+    /// sequences — and a `Mutex` is not reentrant, so the guard is dropped before `fill` runs. A
+    /// second filler racing the first is harmless: both read the same version's records, so they
+    /// compute the same answer and the later `insert` replaces an equal one.
+    fn memoise<K: Ord, V: Clone>(
+        &self,
+        key: K,
+        map: fn(&mut Cache) -> &mut BTreeMap<K, V>,
+        fill: impl FnOnce() -> Result<V>,
+    ) -> Result<V> {
+        let cache = self.cache();
+        if let Some(cache) = cache
+            && let Some(hit) = map(&mut cache.lock()).get(&key)
+        {
+            return Ok(hit.clone());
+        }
+        let made = fill()?;
+        if let Some(cache) = cache {
+            map(&mut cache.lock()).insert(key, made.clone());
+        }
+        Ok(made)
+    }
+
+    /// Whether a schema exists, `public` and the two the catalog lives in included.
+    ///
+    /// **Asked once per `search_path` entry per name resolved**, which is why it is here: sixteen
+    /// identical reads of `schema(t1,"esker")` in one statement was the largest single line of
+    /// `docs/bench/statement-reads.md`.
+    pub fn schema_exists(&self, name: &str) -> Result<bool> {
+        // Before the map, not through it: these three are a property of the build and a tenant
+        // that has created nothing still has them, so there is nothing to remember.
+        if name == PUBLIC_SCHEMA || is_reserved_schema(name) {
+            return Ok(true);
+        }
+        self.memoise(
+            (self.tenant, name.to_owned()),
+            |cache| &mut cache.schemas,
+            || schema_exists(self.txn, self.tenant, name),
+        )
+    }
+
+    /// Every schema this tenant has **created**, in name order — [`schemas`] behind the cache.
+    pub fn schemas(&self) -> Result<Arc<Vec<(String, u64)>>> {
+        self.memoise(
+            self.tenant,
+            |cache| &mut cache.schema_lists,
+            || Ok(Arc::new(schemas(self.txn, self.tenant)?)),
+        )
+    }
+
+    /// Every schema a name can resolve in, `public` first — [`schema_names`] behind the cache.
+    pub fn schema_names(&self) -> Result<Vec<(String, u64)>> {
+        let mut out = vec![(PUBLIC_SCHEMA.to_owned(), PUBLIC_SCHEMA_ID)];
+        out.extend(
+            RESERVED_SCHEMAS
+                .iter()
+                .map(|(name, id)| ((*name).to_owned(), *id)),
+        );
+        out.extend(self.schemas()?.iter().cloned());
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// Every view of this tenant, by stored name — [`views`] behind the cache.
+    pub fn views(&self) -> Result<Arc<Vec<ViewDef>>> {
+        self.memoise(
+            self.tenant,
+            |cache| &mut cache.views,
+            || Ok(Arc::new(views(self.txn, self.tenant)?)),
+        )
+    }
+
+    /// One view by stored name, or `None`.
+    ///
+    /// **Answered from the whole list**, which is one scan of the same prefix the point read would
+    /// have looked in — so a statement that asks about one name and a statement that asks about
+    /// every one of them share an answer instead of reading the same records twice.
+    pub fn view(&self, name: &str) -> Result<Option<ViewDef>> {
+        Ok(self.views()?.iter().find(|def| def.name == name).cloned())
+    }
+
+    /// Every user-defined type of this tenant, in name order — [`user_types`] behind the cache.
+    pub fn user_types(&self) -> Result<Arc<Vec<TypeDef>>> {
+        self.memoise(
+            self.tenant,
+            |cache| &mut cache.types,
+            || Ok(Arc::new(user_types(self.txn, self.tenant)?)),
+        )
+    }
+
+    /// One table's sequences — [`table_sequences`] behind the cache.
+    pub fn table_sequences(&self, table_id: u64) -> Result<Arc<Vec<SequenceDef>>> {
+        self.memoise(
+            (self.tenant, table_id),
+            |cache| &mut cache.sequences,
+            || Ok(Arc::new(table_sequences(self.txn, self.tenant, table_id)?)),
+        )
+    }
+
+    /// This tenant's whole catalog as the catalog views read it —
+    /// `pg_relations::Relations::read` behind the cache.
+    ///
+    /// **This is the read #49 is about.** A statement naming five catalog relations asked for it
+    /// five times, each one a scan of the name records and a point read per relation, at one
+    /// snapshot where the answer cannot have changed.
+    pub fn relations(&self) -> Result<Arc<pg_relations::Relations>> {
+        self.memoise(
+            self.tenant,
+            |cache| &mut cache.relations,
+            || Ok(Arc::new(pg_relations::Relations::read(self)?)),
+        )
     }
 
     /// A table by name, or `42P01` — the shape almost every statement wants.
@@ -2778,11 +2963,18 @@ pub fn uninstall_extension(txn: &mut dyn Txn, tenant: u64, name: &str) {
 }
 
 /// Writes a user-defined type. The caller has already checked that the name is free.
-pub fn put_type(txn: &mut dyn Txn, tenant: u64, def: &TypeDef) {
+///
+/// **And bumps the version, like every other catalog write.** It did not, and that was invisible
+/// while `catalog::user_types` was read from the store on every statement: `debts-v1.1.md` #49
+/// put the tenant's types in the node's cache, and the first test written for that cache — B
+/// declares a type, A's next statement must see it — went red on this. A catalog write that does
+/// not move the version is a wrong answer waiting for somebody to hold a copy.
+pub fn put_type(txn: &mut dyn Txn, tenant: u64, def: &TypeDef) -> Result<()> {
     txn.put(
         &record::type_key(tenant, &def.name),
         &record::encode_type(def),
     );
+    bump_version(txn, tenant)
 }
 
 /// One user-defined type by name, or `None`.
@@ -2802,13 +2994,16 @@ pub fn type_by_name(txn: &dyn Txn, tenant: u64, name: &str) -> Result<Option<Typ
 /// already by the time this was written: `enums` was attached in the first and not the second, so
 /// `information_schema.columns` reported a column's storage where every other reader reported its
 /// type. **A field added to a `TableDef` outside its record belongs here and nowhere else.**
-pub(crate) fn hydrate(txn: &dyn Txn, tenant: u64, table: &mut TableDef) -> Result<()> {
-    table.sequences = table_sequences(txn, tenant, table.id)?;
+pub(crate) fn hydrate(view: &View<'_>, table: &mut TableDef) -> Result<()> {
+    let (txn, tenant) = (view.txn, view.tenant);
+    table
+        .sequences
+        .clone_from(view.table_sequences(table.id)?.as_ref());
     // And the parents' — see `inherited_sequences` for why the record stays theirs.
-    let inherited = inherited_sequences(txn, tenant, table, &table.parents.clone())?;
+    let inherited = inherited_sequences(view, table, &table.parents.clone())?;
     table.sequences.extend(inherited);
     table.child_scans = child_scans(txn, tenant, table)?;
-    table.enums = column_user_types(txn, tenant, table)?;
+    table.enums = column_user_types(view, table)?;
     Ok(())
 }
 
@@ -2821,11 +3016,7 @@ pub(crate) fn hydrate(txn: &dyn Txn, tenant: u64, table: &mut TableDef) -> Resul
 /// A type is keyed by **name** and a column stores its **oid**, so this is a scan and not a point
 /// read — which is also what makes a `RENAME TYPE` free, since the oid a column holds does not
 /// move when the record does.
-fn column_user_types(
-    txn: &dyn Txn,
-    tenant: u64,
-    table: &TableDef,
-) -> Result<BTreeMap<u64, TypeDef>> {
+fn column_user_types(view: &View<'_>, table: &TableDef) -> Result<BTreeMap<u64, TypeDef>> {
     if table
         .columns
         .iter()
@@ -2838,10 +3029,11 @@ fn column_user_types(
         .iter()
         .filter_map(|column| column.user_type)
         .collect();
-    Ok(user_types(txn, tenant)?
-        .into_iter()
+    Ok(view
+        .user_types()?
+        .iter()
         .filter(|def| wanted.contains(&def.oid))
-        .map(|def| (def.oid, def))
+        .map(|def| (def.oid, def.clone()))
         .collect())
 }
 
@@ -2859,8 +3051,11 @@ pub fn user_types(txn: &dyn Txn, tenant: u64) -> Result<Vec<TypeDef>> {
 }
 
 /// Removes one. The caller has already checked that nothing depends on it.
-pub fn drop_type(txn: &mut dyn Txn, tenant: u64, name: &str) {
+///
+/// Bumps the version for the reason [`put_type`] does.
+pub fn drop_type(txn: &mut dyn Txn, tenant: u64, name: &str) -> Result<()> {
     txn.delete(&record::type_key(tenant, name));
+    bump_version(txn, tenant)
 }
 
 /// Every extension this tenant has installed, in name order, as `(name, version, schema)`.
@@ -4410,18 +4605,17 @@ pub(super) fn child_scans(txn: &dyn Txn, tenant: u64, table: &TableDef) -> Resul
 /// the in-memory list a `TableDef` carries gains an entry, which is what the writer reads to fill
 /// a column and what `pg_attrdef` reads to print the default.
 pub(super) fn inherited_sequences(
-    txn: &dyn Txn,
-    tenant: u64,
+    view: &View<'_>,
     table: &TableDef,
     parents: &[u64],
 ) -> Result<Vec<SequenceDef>> {
     let mut inherited = Vec::new();
     for &parent_id in parents {
-        let Some(bytes) = txn.get(&record::table_key(tenant, parent_id))? else {
+        let Some(bytes) = view.txn.get(&record::table_key(view.tenant, parent_id))? else {
             continue;
         };
         let parent = record::decode_table(&bytes)?;
-        for sequence in table_sequences(txn, tenant, parent_id)? {
+        for sequence in view.table_sequences(parent_id)?.iter().cloned() {
             let Some(at) = sequence.column else {
                 continue;
             };
@@ -4468,10 +4662,20 @@ pub fn table_sequences(txn: &dyn Txn, tenant: u64, table_id: u64) -> Result<Vec<
 /// does not, so deleting the record removes both facts at once. Measured: after
 /// `DROP SEQUENCE … CASCADE` a real server has no `pg_attrdef` row for the table and the column is
 /// still there.
-pub fn drop_sequence(txn: &mut dyn Txn, tenant: u64, table_id: u64, sequence: &SequenceDef) {
+pub fn drop_sequence(
+    txn: &mut dyn Txn,
+    tenant: u64,
+    table_id: u64,
+    sequence: &SequenceDef,
+) -> Result<()> {
     txn.delete(&record::sequence_key(tenant, table_id, sequence.id));
     txn.delete(&record::name_key(tenant, &sequence.name));
     txn.delete(&record::sequence_value_key(tenant, sequence.id));
+    // **A name record was just deleted**, so every reader holding this tenant's relations is
+    // holding one that has it. A sequence a column owns is followed by `replace_table`, which
+    // bumps; a **standalone** one was followed by nothing, and its name stayed resolvable in the
+    // node's cache until something else moved the version.
+    bump_version(txn, tenant)
 }
 
 /// Sets one sequence back to its start, keeping the sequence itself.

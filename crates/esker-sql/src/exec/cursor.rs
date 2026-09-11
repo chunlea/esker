@@ -16,6 +16,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::backend::Txn;
 use crate::error::{Result, SqlError};
@@ -125,7 +126,7 @@ pub(super) struct Cursor<'a> {
     /// dump quadratic in the number of relations, so the snapshot is taken once, here, by whichever
     /// cursor node first needs it. A cursor whose plan calls none of these functions never builds
     /// one.
-    catalog: std::cell::OnceCell<crate::catalog::pg_relations::Relations>,
+    catalog: std::cell::OnceCell<Arc<crate::catalog::pg_relations::Relations>>,
     kind: Kind<'a>,
 }
 
@@ -1357,7 +1358,7 @@ pub(super) struct Env<'a> {
     tenant: u64,
     /// Where the cursor keeps its catalog snapshot, or `None` for an evaluator that has no cursor
     /// behind it — `RETURNING` and `UPDATE ... SET`, neither of which can hold a catalog function.
-    catalog: Option<&'a std::cell::OnceCell<crate::catalog::pg_relations::Relations>>,
+    catalog: Option<&'a std::cell::OnceCell<Arc<crate::catalog::pg_relations::Relations>>>,
     /// What the session decides: the resolved `search_path` a catalog function prints a name
     /// against, and the `IntervalStyle` a value is rendered in.
     settings: Settings<'a>,
@@ -1398,10 +1399,10 @@ impl Env<'_> {
             // `OnceCell::get_or_init` cannot fail, and reading the catalog can, so the read
             // happens outside it. A racing `set` is impossible — a cursor is not shared — and
             // would be harmless anyway: both snapshots are of the same transaction.
-            let read = crate::catalog::pg_relations::Relations::read(txn, self.tenant)?;
+            let read = self.settings.catalog.view(txn, self.tenant).relations()?;
             let _ = cell.set(read);
         }
-        cell.get().ok_or_else(|| {
+        cell.get().map(AsRef::as_ref).ok_or_else(|| {
             SqlError::Internal("a catalog snapshot that was just read is gone".to_owned())
         })
     }

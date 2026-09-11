@@ -1,10 +1,12 @@
 # ADR 0106 — What a statement reads below the SQL
 
-Status: **proposed** (2026-09-10) · Debt `debts-v1.1.md` #49 is this row · Numbered 0106 by the
-coordinator.
+Status: **accepted — option (b)** (2026-09-10; proposed the same day) · Debt `debts-v1.1.md` #49
+is this row · Numbered 0106 by the coordinator.
 
-**No decision is made here.** This records what a statement actually reads, what each of three
-shapes would save, and what each costs — so the milestone is the user's to set. Nothing is built.
+**The decision, taken by the user 2026-09-10 16:00:** option **(b)**, the cache. It is built;
+`docs/plans/debt-49-catalog-cache.md` is the plan and the last section here is what it measured.
+Everything between this line and *"What option (b) measured"* is the census the decision was made
+on, unchanged.
 
 ## Context — the number that sizes the problem is not the one the row was opened on
 
@@ -465,3 +467,72 @@ between a report and its summary is worth one question to whoever holds the tap.
 all, and whether run 117's per-statement prices change the ranking. If the 907 statements turn out
 to be dominated by something this census cannot see — the TSO, the commit, the wire — then none of
 the three options is the answer and the row moves.
+
+## What option (b) measured
+
+Built 2026-09-10 (`docs/plans/debt-49-catalog-cache.md`, lane b4). The census above, re-taken the
+same way on the same fixture — `crates/esker-sql/tests/statement_reads.rs`, and the whole trace is
+in [`docs/bench/statement-reads.md`](../bench/statement-reads.md):
+
+| statement | before | after | after, cache warm |
+|---|---|---|---|
+| `pk_and_sequence_for` | **60** | 12 | **4** |
+| `SELECT a FROM pk0 WHERE id = 1` | 9 | 5 | **5** |
+| `INSERT … RETURNING id` | 8 | 5 | 5 |
+| `CREATE TABLE` | 17 | 16 | 16 |
+| `ALTER TABLE … DISABLE TRIGGER ALL` | 17 | **10** | 10 |
+| `DROP TABLE` | 29 | **22** | 22 |
+
+**Four is the floor this ADR left standing**: two catalog views, two version counters each. It is
+[ADR 0105](0105-a-catalog-read-never-waits.md)'s key and #50's row, exactly as the exclusion above
+says — one view instead of two would make it two.
+
+**What actually removed the reads**, in the order they mattered:
+
+1. **The bundle, not only its parts.** `pg_relations::Relations` is now held per tenant at a
+   version. Caching the *parts* — names, tables, types, views — leaves the scan of the name records
+   in place, and the scan is the term that grows with the catalog; a statement naming five catalog
+   relations built the bundle five times. This is the one thing the plan's file list did not say
+   outright, and the acceptance test is what forced it.
+2. **`schema_exists` behind the cache** — sixteen identical reads in one statement, one per
+   `search_path` entry per name resolved.
+3. **The layout marker once per node.** It is a store-wide constant and every catalog view read it:
+   two of `pk_and_sequence_for`'s sixty and four of every DDL's.
+4. **A transaction that has written the catalog builds its views without reading anything.** Such a
+   view never consults the cache, so the version it would read is a number nobody compares — worth
+   two reads per view, and a DDL statement opens several.
+
+### The measurement that changes what "done" means for this row
+
+**On the in-process node the clock cannot see any of this**, and the acceptance test written from
+the plan — *"a repeated statement's time stops tracking the catalog's size"* — is still red because
+of it. After option (b), the second run of `pk_and_sequence_for` reads **4 keys at 20 relations and
+4 at 100**, and takes **1.96 ms and 14.38 ms**. The read count is flat and the clock is not.
+
+Where the milliseconds are, per statement, 20 → 100 relations:
+
+```text
+SELECT count(*) FROM pg_class                       164 us ->   639 us   3.9x
+SELECT count(*) FROM pg_attribute                   316 us ->   737 us   2.3x
+SELECT count(*) FROM pg_class, pg_namespace         371 us ->  1355 us   3.7x
+SELECT count(*) FROM pg_class seq, pg_depend dep
+               WHERE seq.oid = dep.objid           1552 us -> 24646 us  15.9x
+```
+
+**A join between two computed catalog views is a cross product**, and five times the catalog is
+twenty-five times the pairs. That is a planner defect and it is in none of this ADR's three options;
+no amount of caching reads touches it. It is recorded here because this is where it was found, and
+it is asked for a debt number in `esker-coord/QUESTION-b4.md` rather than taken.
+
+So what closes this row is the **count**, which is what the real topology bills at 232 µs a read
+([ADR 0102](0102-the-catalogs-read-path.md)) — 35 round trips per `pk_and_sequence_for` on r1's
+measurement, and four keys here. **r1's number on the real cluster is what confirms it**, and it is
+not this lane's to take.
+
+### A bug the cache found, fixed with it
+
+`CREATE TYPE`, `DROP TYPE` and a standalone `DROP SEQUENCE` **never bumped the catalog version**.
+That was invisible while `catalog::user_types` was read from the store on every statement; the
+moment those records are cached it is a wrong answer — a type session B declares is missing from
+session A's next statement. The three writers now bump, like every other catalog write, and
+`crates/esker-sql/tests/catalog_cache_invalidation.rs` is the test that was red on it.

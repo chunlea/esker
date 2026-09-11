@@ -1141,7 +1141,8 @@ impl CatalogView {
                     ]
                 })
                 .collect()),
-            CatalogView::PgNamespace => Ok(super::schema_names(txn, tenant)?
+            CatalogView::PgNamespace => Ok(view
+                .schema_names()?
                 .into_iter()
                 .map(|(name, id)| {
                     vec![
@@ -1162,7 +1163,7 @@ impl CatalogView {
             // the schema when it equals `current_schema`, so the constant made every extension
             // list bare.
             CatalogView::PgExtension => {
-                let schemas = super::schema_names(txn, tenant)?;
+                let schemas = view.schema_names()?;
                 Ok(installed(txn, tenant)?
                     .into_iter()
                     .map(|(name, version, schema)| {
@@ -1624,7 +1625,7 @@ fn proc_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum
 /// One row per registered trigger.
 fn trigger_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
     let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     let functions = super::functions(txn, tenant)?;
     let mut rows = Vec::new();
     for table in relations.tables() {
@@ -2019,8 +2020,7 @@ fn stat_activity_row(
 /// table record — which is also why `pg_views`, whose source is the view records, excludes them
 /// without being told to (ADR 0064).
 fn matviews_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     let mut rows = Vec::new();
     for relation in relations.of_kind(super::pg_relations::RelKind::MaterializedView) {
         let Some(table) = relations.table(relation) else {
@@ -2045,24 +2045,23 @@ fn matviews_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
 }
 
 fn views_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    Ok(super::views(txn, tenant)?
-        .into_iter()
-        .map(|view| {
-            let (schema, name) = super::split_qualified(&view.name);
+    Ok(view
+        .views()?
+        .iter()
+        .map(|def| {
+            let (schema, name) = super::split_qualified(&def.name);
             vec![
                 Datum::Text(schema.to_owned()),
                 Datum::Text(name.to_owned()),
                 Datum::Text(String::new()),
-                Datum::Text(view.definition),
+                Datum::Text(def.definition.clone()),
             ]
         })
         .collect())
 }
 
 fn indexes_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     let mut rows = Vec::new();
     for relation in relations.rows() {
         if !matches!(
@@ -2094,8 +2093,7 @@ fn indexes_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
 
 /// One row per partitioned table, the way `pg_partitioned_table` holds them.
 fn partitioned_table_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     let mut rows = Vec::new();
     for table in relations.tables() {
         let Some(key) = &table.partition_by else {
@@ -2126,8 +2124,7 @@ fn partitioned_table_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Dat
 /// child's parents from 1 in the order its `INHERITS` clause wrote them, and the parent's own list
 /// has no such order to offer.
 fn inherits_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     let mut rows = Vec::new();
     for table in relations.tables() {
         for (at, &parent) in table.parents.iter().enumerate() {
@@ -2149,9 +2146,8 @@ fn inherits_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
 /// `attnum` is the column's **one-based** position, which is what `pg_attribute` reports and what
 /// `cons.conkey[1]` is compared against.
 fn pg_depend_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
     let class_oid = i64::try_from(CatalogView::PgClass.table_def().id).unwrap_or(i64::MAX);
-    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     let mut rows = Vec::new();
     for table in relations.tables() {
         for sequence in &table.sequences {
@@ -2590,7 +2586,7 @@ fn pg_am_rows() -> Vec<Vec<Datum>> {
 
 fn pg_sequence_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
     let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     // **A sequence no column owns is filed under `STANDALONE_SEQUENCE_OWNER`, which has no
     // `TableDef`**, so walking the tables finds every `bigserial`'s sequence and none of the ones
     // `CREATE SEQUENCE` made. `pg_class` lists them — it reads the name records — and this view
@@ -2674,9 +2670,8 @@ fn pg_sequence_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> 
 /// without an `ORDER BY` would find least surprising — and `ActiveRecord`'s own `enum_types` query
 /// sorts inside `array_agg` anyway, so it does not depend on this.
 fn pg_enum_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
     let mut rows = Vec::new();
-    for def in super::user_types(txn, tenant)? {
+    for def in view.user_types()?.iter() {
         let super::TypeKind::Enum { labels } = &def.kind else {
             continue;
         };
@@ -2711,7 +2706,6 @@ fn pg_enum_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
 /// `rngcanonical` and `rngsubdiff` are not columns of this view — nothing reads them — for the
 /// reason `oid` is not one either (see the module note).
 fn pg_range_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
     let builtin = [
         (ColumnType::TsRange, ColumnType::Timestamp),
         (ColumnType::TstzRange, ColumnType::TimestampTz),
@@ -2729,7 +2723,7 @@ fn pg_range_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
             ]
         })
         .collect();
-    for def in super::user_types(txn, tenant)? {
+    for def in view.user_types()?.iter() {
         if let super::TypeKind::Range { subtype, .. } = def.kind {
             rows.push(vec![
                 Datum::Int8(super::pg_relations::as_oid(def.oid)),
@@ -3101,10 +3095,9 @@ fn information_schema_domain_rows() -> Vec<Vec<Datum>> {
 /// is `floatrange[]`, measured — so it is derived here rather than stored: its oid is the type's
 /// plus one, taken from the same sequence at creation.
 fn user_type_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    let schemas = super::schemas(txn, tenant)?;
+    let schemas = view.schemas()?;
     let mut rows = Vec::new();
-    for def in super::user_types(txn, tenant)? {
+    for def in view.user_types()?.iter() {
         let oid = super::pg_relations::as_oid(def.oid);
         // **The bare name**, the way a relation's `relname` is bare: the schema is `typnamespace`
         // and repeating it here would make `typname = 'text'` fail to find a domain called `text`.
@@ -3180,8 +3173,7 @@ fn user_type_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
 }
 
 fn pg_class_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = super::pg_relations::Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     // **`relhastriggers` is `t` for either side of a foreign key**, because a foreign key *is* two
     // internal triggers — one on the child and one on the parent. Measured: a table with no
     // constraint at all is `f`, the child is `t` and the parent is `t`. So the referenced side has
@@ -3203,7 +3195,7 @@ fn pg_class_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
     // filter `relkind IN ('r', 'p')`, so these rows are invisible to them exactly as they should
     // be. The name is the unqualified one, which is what `relname` holds — the schema is a
     // separate column there and `information_schema.tables` is `tables` in `pg_class`.
-    let schemas = super::schema_names(txn, tenant)?;
+    let schemas = view.schema_names()?;
     let views = CatalogView::ALL.into_iter().map(|view| {
         vec![
             Datum::Int8(i64::try_from(view.id()).unwrap_or(i64::MAX)),

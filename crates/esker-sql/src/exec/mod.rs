@@ -644,7 +644,7 @@ impl Executor {
     /// registers here as it registers in `crate::exec::deferred`: one more place to look, in the
     /// same order.
     fn constraint_deferrable(&self, txn: &dyn Txn, name: &str) -> Result<bool> {
-        let relations = crate::catalog::pg_relations::Relations::read(txn, self.tenant)?;
+        let relations = self.catalog_view(txn)?.relations()?;
         for table in relations.rows().filter_map(|row| relations.table(row)) {
             for index in &table.indexes {
                 if index.name == name {
@@ -1526,7 +1526,7 @@ impl Executor {
     fn name_rule<'a>(
         &'a self,
         txn: &'a dyn Txn,
-        relations: &'a std::cell::RefCell<Option<crate::catalog::pg_relations::Relations>>,
+        relations: &'a std::cell::RefCell<Option<Arc<crate::catalog::pg_relations::Relations>>>,
     ) -> impl Fn(&str) -> Result<i64> + 'a {
         move |name| self.relation_oid(&mut relations.borrow_mut(), txn, name)
     }
@@ -2926,6 +2926,7 @@ impl Executor {
     /// `{public}` on a server that has no schema named for the role.
     pub(crate) fn resolved_search_path(&self, txn: &dyn Txn) -> Result<Vec<String>> {
         let written = self.parameter(crate::parameter::search_path());
+        let view = self.catalog_view(txn)?;
         let mut out: Vec<String> = Vec::new();
         for entry in written.split(',') {
             let entry = entry.trim().trim_matches('"');
@@ -2948,7 +2949,7 @@ impl Executor {
             if entry.is_empty() || out.iter().any(|held| held == entry) {
                 continue;
             }
-            if crate::catalog::schema_exists(txn, self.tenant, entry)? {
+            if view.schema_exists(entry)? {
                 out.push(entry.to_owned());
             }
         }
@@ -2983,7 +2984,7 @@ impl Executor {
     /// be a record no statement wrote.
     pub(crate) fn ensure_temp_schema(&mut self, txn: &mut dyn Txn) -> Result<String> {
         if let Some(temp) = &self.temp_schema
-            && crate::catalog::schema_exists(&*txn, self.tenant, temp)?
+            && self.catalog_view(&*txn)?.schema_exists(temp)?
         {
             return Ok(temp.clone());
         }
@@ -3277,6 +3278,7 @@ impl Executor {
         // it: an unqualified type name resolves the way an unqualified relation name does.
         let mut types = None;
         let path = self.resolution_path(txn)?;
+        let view = self.catalog_view(txn)?;
         if let Statement::Select(select) = statement {
             for item in &mut select.projection {
                 let crate::plan::SelectItem::Expr {
@@ -3289,8 +3291,8 @@ impl Executor {
                 // the label (ADR 0050) and the type it is told is the enum's, which is the pair
                 // `OID::Enum` is built from; taken here because this is the last place the type's
                 // name is still in the tree.
-                let named = Self::cast_target(self.tenant, &mut types, txn, expr, &path);
-                match Self::user_cast(self.tenant, &mut types, txn, expr, true, &path) {
+                let named = Self::cast_target(&view, &mut types, expr, &path);
+                match Self::user_cast(&view, &mut types, expr, true, &path) {
                     Ok(Some(resolved)) => {
                         *expr = resolved;
                         *user_type = named;
@@ -3302,20 +3304,14 @@ impl Executor {
                 }
             }
         }
-        let mut resolve = |expr: &mut Expr| match Self::user_cast(
-            self.tenant,
-            &mut types,
-            txn,
-            expr,
-            false,
-            &path,
-        ) {
-            Ok(Some(resolved)) => *expr = resolved,
-            Ok(None) => {}
-            Err(error) => {
-                failure.get_or_insert(error);
-            }
-        };
+        let mut resolve =
+            |expr: &mut Expr| match Self::user_cast(&view, &mut types, expr, false, &path) {
+                Ok(Some(resolved)) => *expr = resolved,
+                Ok(None) => {}
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            };
         bind::walk_mut(statement, &mut resolve);
         match failure {
             Some(error) => Err(error),
@@ -3367,10 +3363,10 @@ impl Executor {
     /// `'nosuchschema.mood'::regtype` against `'public.nosuchtype'::regtype` — and this is the only
     /// place that can tell them apart, because it is the only one with the catalog. The
     /// qualification stays inside the quotes of the `42704`, which is also measured.
-    fn no_such_type(txn: &dyn Txn, tenant: u64, spelled: &str) -> Result<SqlError> {
+    fn no_such_type(view: &crate::catalog::View<'_>, spelled: &str) -> Result<SqlError> {
         let (schema, bare) = crate::value::split_type_name(spelled);
         if let Some(schema) = &schema
-            && !crate::catalog::schema_exists(txn, tenant, schema)?
+            && !view.schema_exists(schema)?
         {
             return Ok(SqlError::UndefinedSchema(schema.clone()));
         }
@@ -3388,9 +3384,8 @@ impl Executor {
     /// answer here; what they have in common is that the stored value's type is not the declared
     /// one.
     fn cast_target(
-        tenant: u64,
-        types: &mut Option<Vec<crate::catalog::TypeDef>>,
-        txn: &dyn Txn,
+        view: &crate::catalog::View<'_>,
+        types: &mut Option<Arc<Vec<crate::catalog::TypeDef>>>,
         expr: &crate::plan::Expr,
         path: &[String],
     ) -> Option<crate::catalog::TypeDef> {
@@ -3408,7 +3403,7 @@ impl Executor {
         };
         let known = match types {
             Some(known) => known,
-            None => types.insert(crate::catalog::user_types(txn, tenant).ok()?),
+            None => types.insert(view.user_types().ok()?),
         };
         Self::qualified_user_type(known, name, path).cloned()
     }
@@ -3426,9 +3421,8 @@ impl Executor {
     /// unresolved — the same shape, one function over, that the `UserFunc` inlining beside it
     /// already had to answer. Everything it wants from a session is the tenant.
     pub(super) fn user_cast(
-        tenant: u64,
-        types: &mut Option<Vec<crate::catalog::TypeDef>>,
-        txn: &dyn Txn,
+        view: &crate::catalog::View<'_>,
+        types: &mut Option<Arc<Vec<crate::catalog::TypeDef>>>,
         expr: &crate::plan::Expr,
         printed: bool,
         path: &[String],
@@ -3443,7 +3437,7 @@ impl Executor {
             && matches!(&**operand, Expr::CatalogFunc(inner)
                 if inner.func == crate::plan::CatalogFunc::UserCast)
         {
-            return Self::user_cast(tenant, types, txn, operand, true, path);
+            return Self::user_cast(view, types, operand, true, path);
         }
         let Expr::CatalogFunc(call) = expr else {
             return Ok(None);
@@ -3462,7 +3456,7 @@ impl Executor {
             let Some(Expr::Literal(Literal::String(name))) = inner.args.first().cloned() else {
                 return Ok(None);
             };
-            Self::user_cast(tenant, types, txn, &call.args[0].clone(), true, path)?;
+            Self::user_cast(view, types, &call.args[0].clone(), true, path)?;
             return Ok(Some(Expr::Literal(Literal::String(name))));
         }
         // **`'<name>'::regtype` over a type the catalog made**, resolved in this pass because it
@@ -3479,11 +3473,11 @@ impl Executor {
             };
             let known = match types {
                 Some(known) => known,
-                None => types.insert(crate::catalog::user_types(txn, tenant)?),
+                None => types.insert(view.user_types()?),
             };
             // **One grammar, one parser — and now one lookup behind it.**
             let Some(def) = Self::qualified_user_type(known, name, path) else {
-                return Err(Self::no_such_type(txn, tenant, name)?);
+                return Err(Self::no_such_type(view, name)?);
             };
             // **The name unless the `::oid` was written**, which is the half `ActiveRecord`
             // asks for and the half this node can answer without a `regtype` type of its own.
@@ -3523,7 +3517,7 @@ impl Executor {
         };
         let known = match types {
             Some(known) => known,
-            None => types.insert(crate::catalog::user_types(txn, tenant)?),
+            None => types.insert(view.user_types()?),
         };
         // The third of the three lookups, and the same one: a cast to `schema_1.text` resolves
         // where a column of it already did.
@@ -3732,7 +3726,7 @@ impl Executor {
     /// name.
     fn relation_named(
         &self,
-        relations: &mut Option<crate::catalog::pg_relations::Relations>,
+        relations: &mut Option<Arc<crate::catalog::pg_relations::Relations>>,
         txn: &dyn Txn,
         name: &str,
     ) -> Result<Option<String>> {
@@ -3748,10 +3742,7 @@ impl Executor {
         }
         let relations = match relations {
             Some(relations) => relations,
-            slot => slot.insert(crate::catalog::pg_relations::Relations::read(
-                txn,
-                self.tenant,
-            )?),
+            slot => slot.insert(self.catalog_view(txn)?.relations()?),
         };
         Ok(relations
             .by_name(&stored)
@@ -3765,7 +3756,7 @@ impl Executor {
     /// this node's `pg_class` really does hold `pg_class`'s columns.
     fn relation_oid(
         &self,
-        relations: &mut Option<crate::catalog::pg_relations::Relations>,
+        relations: &mut Option<Arc<crate::catalog::pg_relations::Relations>>,
         txn: &dyn Txn,
         name: &str,
     ) -> Result<i64> {
@@ -3794,10 +3785,7 @@ impl Executor {
         // the statement has not written anything at this point because nothing has run yet.
         let relations = match relations {
             Some(relations) => relations,
-            slot => slot.insert(crate::catalog::pg_relations::Relations::read(
-                txn,
-                self.tenant,
-            )?),
+            slot => slot.insert(self.catalog_view(txn)?.relations()?),
         };
         relations
             .by_name(&stored)
@@ -3884,7 +3872,7 @@ impl Executor {
             // exist: bigint = text` for a plain read of a view — a disagreement
             // `describe_resolves_like_execute` exists to catch and could not, because it prepared
             // no statement naming a view. It does now.
-            } else if let Some(def) = crate::catalog::view(txn, self.tenant, &name)?
+            } else if let Some(def) = view.view(&name)?
                 && let Some(table) = def.as_table()
             {
                 found.push(Arc::new(table));
@@ -3907,9 +3895,12 @@ impl Executor {
     /// the catalog reads its own uncommitted DDL, so it takes an uncached view every time; and the
     /// pin is dropped wherever `catalog_written` is set or cleared, which is every place a
     /// transaction begins, ends or turns into a DDL one.
-    fn catalog_view<'a>(&'a self, txn: &'a dyn Txn) -> Result<crate::catalog::View<'a>> {
+    pub(crate) fn catalog_view<'a>(&'a self, txn: &'a dyn Txn) -> Result<crate::catalog::View<'a>> {
         if self.catalog_written {
-            return self.catalog.view_uncached(txn, self.tenant);
+            // **And it reads nothing to be built**: a view that answers from the store never
+            // consults the cache, so the version it would read is a number nobody compares. A DDL
+            // statement opens several of these ([`crate::catalog::Catalog::view_written`]).
+            return self.catalog.view_written(txn, self.tenant);
         }
         // **The generation is what makes the pin safe against a statement that writes the catalog
         // in the middle of itself.** `SELECT esker_schema_step(…)` is not a DDL statement and does
@@ -4728,12 +4719,13 @@ impl Executor {
         if name.is_empty() {
             return Ok(None);
         }
+        let catalog = self.catalog_view(txn)?;
         if name.contains(crate::catalog::SCHEMA_SEPARATOR) {
-            return crate::catalog::view(txn, self.tenant, name);
+            return catalog.view(name);
         }
         for schema in self.resolved_search_path(txn)? {
             let candidate = crate::catalog::qualify(&schema, name);
-            if let Some(view) = crate::catalog::view(txn, self.tenant, &candidate)? {
+            if let Some(view) = catalog.view(&candidate)? {
                 return Ok(Some(view));
             }
         }

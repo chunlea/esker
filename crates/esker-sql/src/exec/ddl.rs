@@ -402,9 +402,12 @@ fn domain_of(
 
 /// One user-defined type by oid, for the places that hold an oid rather than a name.
 fn type_by_oid(txn: &dyn Txn, executor: &Executor, oid: u64) -> Result<Option<catalog::TypeDef>> {
-    Ok(catalog::user_types(txn, executor.tenant)?
-        .into_iter()
-        .find(|def| def.oid == oid))
+    Ok(executor
+        .catalog_view(txn)?
+        .user_types()?
+        .iter()
+        .find(|def| def.oid == oid)
+        .cloned())
 }
 
 /// A column's type, once the catalog has been asked about the name lowering could not resolve.
@@ -1039,7 +1042,7 @@ pub(super) fn create_extension(
     // **does not move it**, so the schema is never looked at on that path.
     let schema = match &create.schema {
         Some(name) => {
-            if !catalog::schema_exists(&*txn, executor.tenant, name)? {
+            if !executor.catalog_view(&*txn)?.schema_exists(name)? {
                 return Err(SqlError::UndefinedSchema(name.clone()));
             }
             name.clone()
@@ -1096,7 +1099,7 @@ fn drop_extension_columns(
     if types.is_empty() {
         return Ok(());
     }
-    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    let relations = executor.catalog_view(txn)?.relations()?;
     let tables: Vec<TableDef> = relations
         .rows()
         .filter_map(|row| relations.table(row))
@@ -2072,7 +2075,7 @@ fn trigger_naming(
     txn: &dyn Txn,
     function: &str,
 ) -> Result<Option<(String, String)>> {
-    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    let relations = executor.catalog_view(txn)?.relations()?;
     for table in relations.tables() {
         if let Some(trigger) = table
             .triggers
@@ -2265,7 +2268,7 @@ fn default_naming(
     txn: &dyn Txn,
     function: &str,
 ) -> Result<Option<(String, String)>> {
-    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    let relations = executor.catalog_view(txn)?.relations()?;
     for table in relations.tables() {
         for column in table.user_columns().map(|(_, column)| column) {
             let Some(text) = &column.default_expr else {
@@ -2546,7 +2549,7 @@ pub(super) fn drop_sequence(
     }
 
     for (_, table_id, sequence) in targets {
-        catalog::drop_sequence(txn, executor.tenant, table_id, &sequence);
+        catalog::drop_sequence(txn, executor.tenant, table_id, &sequence)?;
         // A sequence no column owns has no table record to rewrite, and nothing caches it.
         if table_id == catalog::STANDALONE_SEQUENCE_OWNER {
             continue;
@@ -3551,7 +3554,7 @@ fn refuse_missing_schema(txn: &dyn Txn, executor: &Executor, stored: &str) -> Re
     if catalog::is_reserved_schema(schema) {
         return Err(SqlError::CreateInSystemSchema(format!("{schema}.{name}")));
     }
-    if catalog::schema_exists(txn, executor.tenant, schema)? {
+    if executor.catalog_view(txn)?.schema_exists(schema)? {
         return Ok(());
     }
     Err(SqlError::UndefinedSchema(schema.to_owned()))
@@ -3584,7 +3587,7 @@ pub(super) fn create_schema(
     {
         return Err(SqlError::UndefinedRole(owner.clone()));
     }
-    if catalog::schema_exists(&*txn, executor.tenant, &create.name)? {
+    if executor.catalog_view(&*txn)?.schema_exists(&create.name)? {
         // **`IF NOT EXISTS` is a notice and a success**, which is what a real server answers; the
         // notice itself is on stderr in `psql` and is not a row.
         if create.if_not_exists {
@@ -3723,7 +3726,7 @@ pub(super) fn create_view(
     // A view stored before record version 30 publishes no columns at all, and there is nothing to
     // compare it against; such a replacement is allowed rather than refused on missing evidence.
     if create.or_replace
-        && let Some(previous) = catalog::view(txn, executor.tenant, &name)?
+        && let Some(previous) = executor.catalog_view(txn)?.view(&name)?
         && !previous.columns.is_empty()
     {
         if shape.len() < previous.columns.len() {
@@ -4285,7 +4288,7 @@ pub(super) fn drop_schema(
         if catalog::is_reserved_schema(name) {
             return Err(SqlError::RequiredSchema(name.clone()));
         }
-        if !catalog::schema_exists(&*txn, executor.tenant, name)? {
+        if !executor.catalog_view(&*txn)?.schema_exists(name)? {
             if drop.if_exists {
                 executor.notice(SqlError::DoesNotExistSkipping {
                     kind: "schema",
@@ -4305,9 +4308,11 @@ pub(super) fn drop_schema(
         // schema that was gone — visible in `pg_type` under `public`, not resolvable by name, and
         // not droppable. Measured on PostgreSQL: `2BP01 … DETAIL: type ds_s.ds depends on schema
         // ds_s`, with the type named the way a table is.
-        let types: Vec<String> = catalog::user_types(&*txn, executor.tenant)?
-            .into_iter()
-            .map(|def| def.name)
+        let types: Vec<String> = executor
+            .catalog_view(&*txn)?
+            .user_types()?
+            .iter()
+            .map(|def| def.name.clone())
             .filter(|stored| catalog::split_qualified(stored).0 == name)
             .collect();
         if !drop.cascade
@@ -4362,14 +4367,14 @@ pub(super) fn drop_schema(
             if let Some(sequence) =
                 catalog::sequence_by_id(txn, executor.tenant, table_id, sequence_id)?
             {
-                catalog::drop_sequence(txn, executor.tenant, table_id, &sequence);
+                catalog::drop_sequence(txn, executor.tenant, table_id, &sequence)?;
                 forgotten.push(sequence_id);
             }
         }
         // The types go too, and after the tables: a column declared as one of them has already
         // gone with its table, so nothing is left pointing at a type this removes.
         for stored in &types {
-            catalog::drop_type(txn, executor.tenant, stored);
+            catalog::drop_type(txn, executor.tenant, stored)?;
         }
         catalog::drop_schema(txn, executor.tenant, name)?;
         for sequence_id in std::mem::take(&mut forgotten) {
@@ -4385,10 +4390,10 @@ pub(super) fn alter_schema_rename(
     txn: &mut dyn Txn,
     rename: &plan::AlterSchemaRename,
 ) -> Result<Outcome> {
-    if !catalog::schema_exists(&*txn, executor.tenant, &rename.name)? {
+    if !executor.catalog_view(&*txn)?.schema_exists(&rename.name)? {
         return Err(SqlError::UndefinedSchema(rename.name.clone()));
     }
-    if catalog::schema_exists(&*txn, executor.tenant, &rename.to)? {
+    if executor.catalog_view(&*txn)?.schema_exists(&rename.to)? {
         return Err(SqlError::DuplicateSchema(rename.to.clone()));
     }
     // `public` is a property of the build rather than a record, so there is nothing to rename and
@@ -4396,10 +4401,12 @@ pub(super) fn alter_schema_rename(
     if rename.name == catalog::PUBLIC_SCHEMA {
         return Err(SqlError::unsupported("ALTER SCHEMA public RENAME TO"));
     }
-    let id = catalog::schemas(&*txn, executor.tenant)?
-        .into_iter()
+    let id = executor
+        .catalog_view(&*txn)?
+        .schemas()?
+        .iter()
         .find(|(name, _)| *name == rename.name)
-        .map_or(0, |(_, id)| id);
+        .map_or(0, |(_, id)| *id);
     catalog::drop_schema(txn, executor.tenant, &rename.name)?;
     catalog::create_schema(txn, executor.tenant, &rename.to, id)?;
     Ok(Outcome::done("ALTER SCHEMA"))
@@ -4687,7 +4694,7 @@ fn drop_views_cascading(
         let outer = dependent_views(executor, txn, &view)?;
         drop_views_cascading(executor, txn, outer)?;
         // Already gone with an earlier branch: two views over one table can share a dependent.
-        if catalog::view(txn, executor.tenant, &view)?.is_none() {
+        if executor.catalog_view(txn)?.view(&view)?.is_none() {
             continue;
         }
         executor.notice(SqlError::CascadeDropsView(catalog::display_name(&view)));
@@ -4713,7 +4720,7 @@ fn views_depending_on_column(
 ) -> Result<Vec<String>> {
     let mut found = Vec::new();
     for view in dependent_views(executor, txn, relation)? {
-        let Some(def) = catalog::view(txn, executor.tenant, &view)? else {
+        let Some(def) = executor.catalog_view(txn)?.view(&view)? else {
             continue;
         };
         let Ok(parsed) = crate::parse::parse_statements(&def.definition) else {
@@ -4769,12 +4776,12 @@ fn dependent_relations(
         };
         super::bind::table_names(&lowered).contains(&relation)
     };
-    for view in catalog::views(txn, executor.tenant)? {
+    for view in executor.catalog_view(txn)?.views()?.iter() {
         if names_it(&view.definition) {
             found.push((view.id, view.name.clone(), "view"));
         }
     }
-    let relations = catalog::pg_relations::Relations::read(txn, executor.tenant)?;
+    let relations = executor.catalog_view(txn)?.relations()?;
     for row in relations.of_kind(catalog::pg_relations::RelKind::MaterializedView) {
         let Some(table) = relations.table(row) else {
             continue;

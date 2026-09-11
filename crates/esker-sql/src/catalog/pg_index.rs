@@ -48,8 +48,7 @@ use crate::value::{ColumnType, Datum};
 
 /// Every `pg_index` row this tenant has: one per index, and one per primary key.
 pub fn rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     let mut rows = Vec::new();
     for relation in relations.rows() {
         let Some(table) = relations.table(relation) else {

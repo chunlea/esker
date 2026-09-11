@@ -41,8 +41,8 @@
 //! already follow. A catalog scan is a scan.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use crate::backend::Txn;
 use crate::catalog::{Relation, SequenceDef, TableDef};
 use crate::error::{Result, SqlError};
 
@@ -95,7 +95,7 @@ pub enum RelKind {
     /// The index behind an `EXCLUDE` constraint: `relkind` `i`, and `pg_am` says `gist`.
     ///
     /// **Synthesised, not stored.** Every other relation here comes from a name record; this one
-    /// is derived in [`Relations::read`] from the table's own `excludes`, because a real server
+    /// is derived in `Relations::read` from the table's own `excludes`, because a real server
     /// makes an index relation for each exclusion constraint and a client names it — the capture
     /// reads `pg_get_indexdef('…_date_overlap'::regclass)`. No record format changes for it, and
     /// the constraint's oid is the index's, the arrangement a primary key already has.
@@ -149,7 +149,7 @@ pub struct Relations {
     /// In name order, which is the order the name scan returns them in.
     rows: Vec<RelationRow>,
     /// Every table, by id, so a view can reach its columns without a second read.
-    tables: BTreeMap<u64, TableDef>,
+    tables: BTreeMap<u64, Arc<TableDef>>,
     /// The tenant's user-defined types, by oid.
     ///
     /// One more scan in the read that was happening anyway, so a catalog function can name a type
@@ -171,7 +171,13 @@ pub struct Relations {
 
 impl Relations {
     /// Reads the tenant's whole catalog: one scan, then one point read per table and per sequence.
-    pub fn read(txn: &dyn Txn, tenant: u64) -> Result<Relations> {
+    ///
+    /// **The fill path of [`super::View::relations`], and its one caller.** Every table it needs
+    /// comes from the view, so a table hydrated once in a statement is hydrated once — and the
+    /// bundle it returns is itself held at the view's version, which is what stops five catalog
+    /// relations in one `FROM` list from being five of these.
+    pub(super) fn read(view: &super::View<'_>) -> Result<Relations> {
+        let (txn, tenant) = (view.txn(), view.tenant());
         let (start, end) = super::record::name_range(tenant);
         let mut rows = Vec::new();
         let mut tables = BTreeMap::new();
@@ -183,7 +189,7 @@ impl Relations {
             }
             let stored = super::record::name_of(tenant, &key)?;
             let relation = super::record::decode_relation(&value)?;
-            rows.push(row_of(txn, tenant, &stored, relation, &mut tables)?);
+            rows.push(row_of(view, &stored, relation, &mut tables)?);
         }
         // The `EXCLUDE` constraints' indexes, which have no name record of their own — see
         // [`RelKind::Exclusion`]. Appended after the scan and then re-sorted, so the whole list
@@ -204,15 +210,16 @@ impl Relations {
             }
         }
         rows.sort_by(|a, b| a.name.cmp(&b.name));
-        let user_types = super::user_types(txn, tenant)?
-            .into_iter()
-            .map(|def| (def.oid, def))
+        let user_types = view
+            .user_types()?
+            .iter()
+            .map(|def| (def.oid, def.clone()))
             .collect();
         let mut view_definitions = BTreeMap::new();
         let mut view_columns = BTreeMap::new();
-        for view in super::views(txn, tenant)? {
-            view_definitions.insert(view.id, view.definition);
-            view_columns.insert(view.id, view.columns);
+        for def in view.views()?.iter() {
+            view_definitions.insert(def.id, def.definition.clone());
+            view_columns.insert(def.id, def.columns.clone());
         }
         Ok(Relations {
             rows,
@@ -298,21 +305,21 @@ impl Relations {
     /// of a foreign key, and the referenced side is not written down on the table that is
     /// referenced.
     pub fn tables(&self) -> impl Iterator<Item = &TableDef> {
-        self.tables.values()
+        self.tables.values().map(AsRef::as_ref)
     }
 
     /// The table a row belongs to. `None` only for a record that names a table with no definition,
-    /// which [`Relations::read`] already refused to build.
+    /// which `Relations::read` already refused to build.
     #[must_use]
     pub fn table(&self, row: &RelationRow) -> Option<&TableDef> {
-        self.tables.get(&row.table_id)
+        self.tables.get(&row.table_id).map(AsRef::as_ref)
     }
 
     /// A table by its id, for the edges a `TableDef` records as ids rather than as rows — a
     /// partition's parent, whose name its inherited constraints are reported under.
     #[must_use]
     pub fn table_by_id(&self, table_id: u64) -> Option<&TableDef> {
-        self.tables.get(&table_id)
+        self.tables.get(&table_id).map(AsRef::as_ref)
     }
 
     /// The relation an oid names, if this tenant has one.
@@ -381,11 +388,10 @@ impl Relations {
 
 /// One name record, turned into a row — reading whatever second record its oid lives in.
 fn row_of(
-    txn: &dyn Txn,
-    tenant: u64,
+    view: &super::View<'_>,
     stored: &str,
     relation: Relation,
-    tables: &mut BTreeMap<u64, TableDef>,
+    tables: &mut BTreeMap<u64, Arc<TableDef>>,
 ) -> Result<RelationRow> {
     // **The stored name carries the schema and every view wants them apart**: `pg_class.relname`
     // is the bare one and `relnamespace` is the other half. A relation in `public` has no
@@ -396,7 +402,7 @@ fn row_of(
         Relation::Table { table_id } => {
             // **A materialized view is a table record**, and this is where the two part company:
             // the letter, and everything downstream that branches on it (ADR 0064).
-            let table = load_table(txn, tenant, table_id, tables)?;
+            let table = load_table(view, table_id, tables)?;
             let kind = if table.matview.is_some() {
                 RelKind::MaterializedView
             } else {
@@ -427,7 +433,7 @@ fn row_of(
             column: None,
         },
         Relation::Index { table_id, index_id } => {
-            let table = load_table(txn, tenant, table_id, tables)?;
+            let table = load_table(view, table_id, tables)?;
             let index_at = table.indexes.iter().position(|index| index.id == index_id);
             RelationRow {
                 oid: as_oid(index_id),
@@ -441,7 +447,7 @@ fn row_of(
             }
         }
         Relation::PrimaryKey { table_id } => {
-            load_table(txn, tenant, table_id, tables)?;
+            load_table(view, table_id, tables)?;
             RelationRow {
                 // Derived: a primary key has no record of its own to carry one. See the module
                 // note — it was the table's own id until this module, which made two rows of
@@ -462,7 +468,7 @@ fn row_of(
         } => {
             // A sequence no column owns has no table to load, and `pg_class` still lists it.
             if table_id != crate::catalog::STANDALONE_SEQUENCE_OWNER {
-                load_table(txn, tenant, table_id, tables)?;
+                load_table(view, table_id, tables)?;
             }
             // **The sequence's own id, which the name record now carries.** It used to live only
             // in the sequence record, so `pg_class` reported the table's id instead and every
@@ -484,14 +490,18 @@ fn row_of(
 }
 
 /// The table record, read once per snapshot however many relations point at it.
+///
+/// **Through [`super::View::table_by_id`]**, which is the same map every ordinary statement fills:
+/// a table hydrated for `pg_class` is the table `SELECT` already had, and a second decode of one
+/// record is a second place for the two to drift (`crate::catalog::hydrate` is the note about the
+/// last time they did).
 fn load_table<'a>(
-    txn: &dyn Txn,
-    tenant: u64,
+    view: &super::View<'_>,
     table_id: u64,
-    tables: &'a mut BTreeMap<u64, TableDef>,
+    tables: &'a mut BTreeMap<u64, Arc<TableDef>>,
 ) -> Result<&'a TableDef> {
     if let std::collections::btree_map::Entry::Vacant(slot) = tables.entry(table_id) {
-        let Some(bytes) = txn.get(&super::record::table_key(tenant, table_id))? else {
+        let Some(table) = view.table_by_id(table_id)? else {
             // A name points at a table whose record is not there. The two keys are written by one
             // transaction, so this is corruption rather than a missing table — the same reading
             // `Executor::table_by_id` takes.
@@ -499,15 +509,11 @@ fn load_table<'a>(
                 "a name points at table {table_id}, which is not there"
             )));
         };
-        let mut table = super::record::decode_table(&bytes)?;
-        // The **same** hydration `View::table_by_id` does, through the same function. Spelled out
-        // here twice before, which is how `enums` came to be attached on one path and not the
-        // other — see [`crate::catalog::hydrate`].
-        crate::catalog::hydrate(txn, tenant, &mut table)?;
         slot.insert(table);
     }
     tables
         .get(&table_id)
+        .map(AsRef::as_ref)
         .ok_or_else(|| SqlError::Internal("a table record that was just inserted is gone".into()))
 }
 

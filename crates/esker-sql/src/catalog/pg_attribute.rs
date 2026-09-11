@@ -46,7 +46,7 @@
 use super::NO_LENGTH;
 use std::borrow::Cow;
 
-use crate::catalog::pg_relations::{RelKind, RelationRow, Relations};
+use crate::catalog::pg_relations::{RelKind, RelationRow};
 use crate::catalog::{ColumnDef, Identity, KeyPart, TableDef};
 use crate::error::Result;
 use crate::value::{ColumnType, Datum, PgType};
@@ -86,8 +86,7 @@ const DEFAULT_COLLATION: i64 = 100;
 
 /// Every `pg_attribute` row this tenant has.
 pub fn rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     let mut rows = catalog_rows();
     for relation in relations.rows() {
         // **A view answers here too, out of the shape it published when it was created.** It has
@@ -199,8 +198,7 @@ pub fn default_rows(
     view: &crate::catalog::View<'_>,
     rendering: crate::value::Rendering,
 ) -> Result<Vec<Vec<Datum>>> {
-    let (txn, tenant) = (view.txn(), view.tenant());
-    let relations = Relations::read(txn, tenant)?;
+    let relations = view.relations()?;
     let mut rows = Vec::new();
     for relation in relations.of_kind(RelKind::Table) {
         let Some(table) = relations.table(relation) else {
