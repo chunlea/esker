@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/subquery.rs
+  s_e59614afdddccb::t_5f6d626d38abdb 305-322
+crates/esker-sql/tests/set_func_column_type.rs
+  s_e59614afdddccb::t_f66fd87467d020 167-168,170-174,176,180-187
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a74fd8690895282ead863222d80fcfddd996606f",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
