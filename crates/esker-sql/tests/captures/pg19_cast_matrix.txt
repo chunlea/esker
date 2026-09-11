@@ -34,15 +34,87 @@
 # element reader's `22P02` — "invalid input syntax" for a conversion that does not exist — where a
 # real server says `42846` before reading anything.
 #
-# ## What is left, and it is not one thing
+# ## What was left after the literal-array guard, and it was not one thing
 #
 #     95   node answers, PG refuses    — mostly `text ->` something the reader accepts too freely
-#     121  node refuses, PG answers    — pairs whose `pg_cast` row this node's table does not carry
+#     121  node refuses, PG answers    — **not** 121 missing `pg_cast` rows; see the breakdown below
 #     293  both refuse, different code
 #
-# The 121 overlap family F9's forty `pg_cast` rows: a stock-server capture could not see the
-# extension casts, and some `reg*` pairs were left out of a set that is otherwise complete. Sized
-# from this sweep rather than from a name.
+# ## RE-SWEPT 2026-09-10 after the element-wise array cast: 509 -> 353
+#
+# The node side was re-taken over the same 1,425 pairs the grading above names (the 509 divergent
+# and the 916 that agreed), with each source's own probe value from `esker-coord/wire-v3-probes.txt`:
+#
+#                                     before   now agrees   still
+#     node refuses, PG answers          121        **71**      50
+#     node answers, PG refuses           95        **79**      16     <- ADR 0031's worst class
+#     both refuse, different code       293          6        287
+#                                      ----       -----     -----
+#                                       509        156        353
+#
+# **One mechanism, and the "121 missing `pg_cast` rows" reading was wrong.** Grouped by the
+# sqlstate the node gave, the 121 were: `22001` 34 (`<T>[] -> character[]`), `22P02` 34 (pairs
+# whose scalar cast **exists**), `42846` 40 (the genuinely missing rows — F9's forty), `22026` 5,
+# `42704` 4 (`<integer>[] -> regtype[]`), `22003` 4 (`regclass -> integer`, whose ids are 64-bit
+# here). Only the 40 were about a missing row.
+#
+# The other families were **one defect**: an array's cast read each element's *text* through the
+# target element's input function instead of applying the **element cast**. The scalar pair and
+# the array pair disagreed, and all three routes in — a literal, an `ARRAY[…]` constructor and a
+# **column** — shared it:
+#
+#     1.5::float8::integer            2       '{1.5,2.5}'::float8[]::integer[]      22P02
+#     '2020-01-01'::date::character   2       '{2020-01-01}'::date[]::character[]   22001
+#
+# **It was not the literal-array arm**, which is where the previous unit's note pointed: a column
+# of `float8[]` reached the same `22P02`. Three changes, each symmetric with something that
+# already existed — `exec::cursor` casts element by element through the same function the scalar
+# fallback uses, `parse::lower` stops folding an array cast that **has** a source type (no source
+# type is the input function, a source type is a cast — `pg_cast`'s own boundary), and
+# `value::truncate_to_typmod` gains the container arm `fit_to_typmod` already had.
+#
+# **Why the second class moved at all**: 79 of the 95 rows where this node *answered* and 19beta1
+# refuses were the same mechanism seen from the other side — a pair with no element cast used to
+# be read by `array_in`, which accepts what the element reader accepts.
+#
+# ## What the 357 are now, and they are four separate items plus one family
+#
+# **54 node refuses, PG answers** — by the sqlstate this node gives:
+#
+#     42846  40   `hstore -> json|jsonb` and `int2vector`/`oidvector` -> the arrays.
+#                 **The genuinely missing `pg_cast` rows**, which is family F9's forty. A unit.
+#     42704   4   `<integer>[] -> regtype[]`. `pg_cast` has **no** `text -> regtype` row either, so
+#                 both spellings are I/O conversions and `regtypein` reads all digits as an oid —
+#                 `'23'::regtype` is `integer` there and `42704 type "23" does not exist` here.
+#                 The scalar has it too; four rows here and two spellings. A unit.
+#     22003   4   `regclass -> integer|oid` and their arrays. This node's relation ids are 64-bit
+#                 (ADR 0097) and a real server's oids are four bytes, so the overflow is a
+#                 consequence of the id and not a cast defect. **Probably a declared divergence**
+#                 rather than a fix, and it should be decided rather than carried.
+#     22P02   5   `"char"[] -> integer[]` is the byte (`'1'::"char"::integer` is 49) and an element
+#                 never reaches the arm that knows, because that arm asks the *operand's* declared
+#                 type and an element's is the array's — one parameter away. The other four are
+#                 `regproc -> oid` and three of the unreproducible rows below.
+#     42601   1   `text -> hstore`, the fourth unreproducible row.
+#
+# **11 node answers, PG refuses** — the other direction of one small table: seven are
+# `<something> -> oidvector`, where `casts_to` says yes and `pg_cast` has no row, and the rest are
+# `regclass <-> regtype` and `bit -> oid`. A `casts_to` unit, and the smallest of the four.
+#
+# **292 both refuse with different codes** is a family of its own and not a cast defect: what is
+# wrong there is the *sqlstate*, which is what a client branches on. It is the largest group left
+# and the least urgent by ADR 0031.
+#
+# ## Four rows of the `ok` list that the list's own value does not reproduce
+#
+# `text -> money`, `text -> hstore`, `text -> int2vector` and `text -> oidvector` are graded `ok`
+# above, and with the probe list's value for `text` (`x`) **19beta1 refuses all four** —
+# `22P02 invalid input syntax for type money: "x"`, and the same for the two vectors. Measured
+# 2026-09-10, the same statement asked of both servers. So those four rows were taken with a
+# different value than the list carries, and they are not divergences: the node refuses them too,
+# with PostgreSQL's own code. **Re-take them with the value stated**, and the sweep this file
+# records should carry its values so the next reader does not have to go to a coordination file
+# for them.
 #
 # ## Which casts exist — the 1,037 `ok` rows, one line per source
 #
@@ -149,9 +221,13 @@ void	character character varying citext name text
 xml	character character varying citext name text
 xml[]	character character varying character varying[] character[] citext citext[] name name[] text text[]
 
-# ## The pairs this node still gets wrong, whole
+# ## The pairs this node still gets wrong, whole — **re-taken 2026-09-10** after the
+# ## element-wise array cast (357 rows; it was 509, and four of these are the `ok`-list
+# ## rows above that the list's own value does not reproduce on either server)
 #
 #     <source> <TAB> <target> <TAB> node <TAB> pg
+#
+#     54  node refuses, PG answers    ·  11  node answers, PG refuses  ·  292  both, different code
 #
 "char"	oid	!22P02	!42846
 "char"	oidvector	!22P02	!42846
@@ -175,98 +251,69 @@ bit[]	regtype	!42804	!42846
 boolean	oid	!22P02	!42846
 boolean	regclass	!42804	!42846
 boolean	regtype	!42804	!42846
-boolean[]	integer[]	!22P02	ok
 boolean[]	oid	!22P02	!42846
 boolean[]	regclass	!42804	!42846
 boolean[]	regtype	!42804	!42846
 box	oid	!22P02	!42846
 box	regclass	!42804	!42846
 box	regtype	!42804	!42846
-box[]	character[]	!22001	ok
-box[]	circle[]	!22P02	ok
-box[]	lseg[]	!22P02	ok
 box[]	oid	!22P02	!42846
-box[]	point[]	!22P02	ok
-box[]	polygon[]	!22P02	ok
 box[]	regclass	!42804	!42846
 box[]	regtype	!42804	!42846
 bytea	oid	!22P02	!42846
 bytea	regclass	!42804	!42846
 bytea	regtype	!42804	!42846
-bytea[]	bigint[]	!22P02	ok
-bytea[]	character[]	!22001	ok
-bytea[]	integer[]	!22P02	ok
 bytea[]	oid	!22P02	!42846
 bytea[]	regclass	!42804	!42846
 bytea[]	regtype	!42804	!42846
-bytea[]	smallint[]	!22P02	ok
-bytea[]	uuid[]	!22P02	!22P03
-character varying[]	bit[]	!22026	ok
 character varying[]	oid	!22P02	!42846
 character varying[]	regclass	!42804	!42846
-character varying[]	regclass[]	!42804	!42P01
 character varying[]	regtype	!42804	!42846
-character[]	bit[]	!22026	ok
 character[]	oid	!22P02	!42846
 character[]	regclass	!42804	!42846
-character[]	regclass[]	!42804	!42P01
 character[]	regtype	!42804	!42846
 cidr	oid	!22P02	!42846
 cidr	regclass	!42804	!42846
 cidr	regtype	!42804	!42846
-cidr[]	character[]	!22001	ok
 cidr[]	oid	!22P02	!42846
 cidr[]	regclass	!42804	!42846
 cidr[]	regtype	!42804	!42846
 circle	oid	!22P02	!42846
 circle	regclass	!42804	!42846
 circle	regtype	!42804	!42846
-circle[]	box[]	!22P02	ok
-circle[]	character[]	!22001	ok
 circle[]	oid	!22P02	!42846
-circle[]	point[]	!22P02	ok
-circle[]	polygon[]	!22P02	ok
 circle[]	regclass	!42804	!42846
 circle[]	regtype	!42804	!42846
 citext	money	!42846	!22P02
 citext	regclass	!42804	!42P01
 citext	regtype	!42804	!42704
 citext	time	!42846	!22007
-citext[]	bit[]	!22026	ok
 citext[]	oid	!22P02	!42846
 citext[]	regclass	!42804	!42846
-citext[]	regclass[]	!42804	!42P01
 citext[]	regtype	!42804	!42846
 date	oid	!22P02	!42846
 date	regclass	!42804	!42846
 date	regtype	!42804	!42846
-date[]	character[]	!22001	ok
 date[]	oid	!22P02	!42846
 date[]	regclass	!42804	!42846
 date[]	regtype	!42804	!42846
 daterange	oid	!22P02	!42846
 daterange	regclass	!42804	!42846
 daterange	regtype	!42804	!42846
-daterange[]	character[]	!22001	ok
 daterange[]	oid	!22P02	!42846
 daterange[]	regclass	!42804	!42846
 daterange[]	regtype	!42804	!42846
 double precision	oid	!22P02	!42846
 double precision	regclass	!42804	!42846
 double precision	regtype	!42804	!42846
-double precision[]	bigint[]	!22P02	ok
-double precision[]	character[]	!22001	ok
-double precision[]	integer[]	!22P02	ok
 double precision[]	oid	!22P02	!42846
 double precision[]	regclass	!42804	!42846
 double precision[]	regtype	!42804	!42846
-double precision[]	smallint[]	!22P02	ok
 hstore	json	!42846	ok
 hstore	jsonb	!42846	ok
 hstore	oid	!22P02	!42846
 hstore	regclass	!42804	!42846
 hstore	regtype	!42804	!42846
-hstore[]	character[]	!22001	ok
 hstore[]	json[]	!42846	ok
 hstore[]	jsonb[]	!42846	ok
 hstore[]	oid	!22P02	!42846
@@ -275,7 +322,6 @@ hstore[]	regtype	!42804	!42846
 inet	oid	!22P02	!42846
 inet	regclass	!42804	!42846
 inet	regtype	!42804	!42846
-inet[]	character[]	!22001	ok
 inet[]	oid	!22P02	!42846
 inet[]	regclass	!42804	!42846
 inet[]	regtype	!42804	!42846
@@ -302,14 +348,12 @@ int2vector	text[]	!42846	ok
 int4range	oid	!22P02	!42846
 int4range	regclass	!42804	!42846
 int4range	regtype	!42804	!42846
-int4range[]	character[]	!22001	ok
 int4range[]	oid	!22P02	!42846
 int4range[]	regclass	!42804	!42846
 int4range[]	regtype	!42804	!42846
 int8range	oid	!22P02	!42846
 int8range	regclass	!42804	!42846
 int8range	regtype	!42804	!42846
-int8range[]	character[]	!22001	ok
 int8range[]	oid	!22P02	!42846
 int8range[]	regclass	!42804	!42846
 int8range[]	regtype	!42804	!42846
@@ -323,7 +367,6 @@ interval	name	!42846	ok
 interval	oid	!22P02	!42846
 interval	regclass	!42804	!42846
 interval	regtype	!42804	!42846
-interval[]	character[]	!22001	ok
 interval[]	oid	!22P02	!42846
 interval[]	regclass	!42804	!42846
 interval[]	regtype	!42804	!42846
@@ -331,7 +374,6 @@ json	oid	!22P02	!42846
 json	oidvector	!22P02	!42846
 json	regclass	!42P01	!42846
 json	regtype	!42704	!42846
-json[]	character[]	!22001	ok
 json[]	oid	!22P02	!42846
 json[]	regclass	!42804	!42846
 json[]	regtype	!42804	!42846
@@ -341,7 +383,6 @@ jsonb	regclass	!42P01	!42846
 jsonb	regtype	!42704	!42846
 jsonb[]	bigint[]	!22P02	!22023
 jsonb[]	boolean[]	!22P02	!22023
-jsonb[]	character[]	!22001	ok
 jsonb[]	double precision[]	!22P02	!22023
 jsonb[]	integer[]	!22P02	!22023
 jsonb[]	numeric[]	!22P02	!22023
@@ -359,7 +400,6 @@ line	point	!22P02	!42846
 line	polygon	!22P02	!42846
 line	regclass	!42804	!42846
 line	regtype	!42804	!42846
-line[]	character[]	!22001	ok
 line[]	oid	!22P02	!42846
 line[]	regclass	!42804	!42846
 line[]	regtype	!42804	!42846
@@ -370,22 +410,18 @@ lquery	regtype	!42704	!42846
 lseg	oid	!22P02	!42846
 lseg	regclass	!42804	!42846
 lseg	regtype	!42804	!42846
-lseg[]	character[]	!22001	ok
 lseg[]	oid	!22P02	!42846
-lseg[]	point[]	!22P02	ok
 lseg[]	regclass	!42804	!42846
 lseg[]	regtype	!42804	!42846
 ltree	oid	!22P02	!42846
 ltree	regclass	!42804	!42846
 ltree	regtype	!42804	!42846
-ltree[]	character[]	!22001	ok
 ltree[]	oid	!22P02	!42846
 ltree[]	regclass	!42804	!42846
 ltree[]	regtype	!42804	!42846
 macaddr	oid	!22P02	!42846
 macaddr	regclass	!42804	!42846
 macaddr	regtype	!42804	!42846
-macaddr[]	character[]	!22001	ok
 macaddr[]	oid	!22P02	!42846
 macaddr[]	regclass	!42804	!42846
 macaddr[]	regtype	!42804	!42846
@@ -394,32 +430,23 @@ money	name	!42846	ok
 money	oid	!22P02	!42846
 money	regclass	!42804	!42846
 money	regtype	!42804	!42846
-money[]	character[]	!22001	ok
-money[]	numeric[]	!22P02	ok
 money[]	oid	!22P02	!42846
 money[]	regclass	!42804	!42846
 money[]	regtype	!42804	!42846
 name	money	!42846	!22P02
 name	time	!42846	!22007
-name[]	bit[]	!22026	ok
 name[]	oid	!22P02	!42846
 name[]	regclass	!42804	!42846
-name[]	regclass[]	!42804	!42P01
 name[]	regtype	!42804	!42846
 numeric	oid	!22P02	!42846
 numeric	regclass	!42804	!42846
 numeric	regtype	!42804	!42846
-numeric[]	bigint[]	!22P02	ok
-numeric[]	character[]	!22001	ok
-numeric[]	integer[]	!22P02	ok
 numeric[]	oid	!22P02	!42846
 numeric[]	regclass	!42804	!42846
 numeric[]	regtype	!42804	!42846
-numeric[]	smallint[]	!22P02	ok
 numrange	oid	!22P02	!42846
 numrange	regclass	!42804	!42846
 numrange	regtype	!42804	!42846
-numrange[]	character[]	!22001	ok
 numrange[]	oid	!22P02	!42846
 numrange[]	regclass	!42804	!42846
 numrange[]	regtype	!42804	!42846
@@ -445,38 +472,27 @@ oidvector	text[]	!42846	ok
 path	oid	!22P02	!42846
 path	regclass	!42804	!42846
 path	regtype	!42804	!42846
-path[]	character[]	!22001	ok
 path[]	oid	!22P02	!42846
 path[]	regclass	!42804	!42846
 path[]	regtype	!42804	!42846
 point	oid	!22P02	!42846
 point	regclass	!42804	!42846
 point	regtype	!42804	!42846
-point[]	box[]	!22P02	ok
-point[]	character[]	!22001	ok
 point[]	oid	!22P02	!42846
 point[]	regclass	!42804	!42846
 point[]	regtype	!42804	!42846
 polygon	oid	!22P02	!42846
 polygon	regclass	!42804	!42846
 polygon	regtype	!42804	!42846
-polygon[]	box[]	!22P02	ok
-polygon[]	character[]	!22001	ok
-polygon[]	circle[]	!22P02	ok
 polygon[]	oid	!22P02	!42846
-polygon[]	point[]	!22P02	ok
 polygon[]	regclass	!42804	!42846
 polygon[]	regtype	!42804	!42846
 real	oid	!22P02	!42846
 real	regclass	!42804	!42846
 real	regtype	!42804	!42846
-real[]	bigint[]	!22P02	ok
-real[]	character[]	!22001	ok
-real[]	integer[]	!22P02	ok
 real[]	oid	!22P02	!42846
 real[]	regclass	!42804	!42846
 real[]	regtype	!42804	!42846
-real[]	smallint[]	!22P02	ok
 regclass	integer	!22003	ok
 regclass	oid	!22003	ok
 regclass	regtype	ok	!42846
@@ -488,19 +504,11 @@ regclass[]	regtype	!42804	!42846
 regproc	oid	!22P02	ok
 regproc	regclass	!42804	!42846
 regproc	regtype	!42804	!42846
-regproc[]	bigint[]	!22P02	ok
-regproc[]	character[]	!22001	ok
-regproc[]	integer[]	!22P02	ok
 regproc[]	oid	!22P02	!42846
-regproc[]	oid[]	!22P02	ok
 regproc[]	regclass	!42804	!42846
 regproc[]	regtype	!42804	!42846
 regtype	regclass	ok	!42846
-regtype[]	bigint[]	!22P02	ok
-regtype[]	character[]	!22001	ok
-regtype[]	integer[]	!22P02	ok
 regtype[]	oid	!22P02	!42846
-regtype[]	oid[]	!22P02	ok
 regtype[]	oidvector	ok	!42846
 regtype[]	regclass	!42804	!42846
 regtype[]	regtype	!42804	!42846
@@ -509,94 +517,17 @@ smallint[]	oid	!22P02	!42846
 smallint[]	regclass	!42804	!42846
 smallint[]	regtype	!42804	!42846
 smallint[]	regtype[]	!42704	ok
-text	"char"[]	ok	!22P02
-text	bigint	ok	!22P02
-text	bigint[]	ok	!22P02
-text	bit[]	ok	!22P02
-text	boolean	ok	!22P02
-text	boolean[]	ok	!22P02
-text	box	ok	!22P02
-text	box[]	ok	!22P02
-text	bytea[]	ok	!22P02
-text	character varying[]	ok	!22P02
-text	character[]	ok	!22P02
-text	cidr	ok	!22P02
-text	cidr[]	ok	!22P02
-text	circle	ok	!22P02
-text	circle[]	ok	!22P02
-text	citext[]	ok	!22P02
-text	date	ok	!22007
-text	date[]	ok	!22P02
-text	daterange	ok	!22P02
-text	daterange[]	ok	!22P02
-text	double precision	ok	!22P02
-text	double precision[]	ok	!22P02
-text	hstore[]	ok	!22P02
-text	inet	ok	!22P02
-text	inet[]	ok	!22P02
-text	int4range	ok	!22P02
-text	int4range[]	ok	!22P02
-text	int8range	ok	!22P02
-text	int8range[]	ok	!22P02
-text	integer	ok	!22P02
-text	integer[]	ok	!22P02
-text	interval	ok	!22007
-text	interval[]	ok	!22P02
-text	json	ok	!22P02
-text	json[]	ok	!22P02
-text	jsonb	ok	!22P02
-text	jsonb[]	ok	!22P02
-text	line	ok	!22P02
-text	line[]	ok	!22P02
+text	hstore	!42601	ok
+text	int2vector	!22P02	ok
 text	lquery	ok	!42601
-text	lseg	ok	!22P02
-text	lseg[]	ok	!22P02
-text	ltree[]	ok	!22P02
-text	macaddr	ok	!22P02
-text	macaddr[]	ok	!22P02
-text	money[]	ok	!22P02
-text	name[]	ok	!22P02
-text	numeric	ok	!22P02
-text	numeric[]	ok	!22P02
-text	numrange	ok	!22P02
-text	numrange[]	ok	!22P02
-text	oid	ok	!22P02
-text	oid[]	ok	!22P02
-text	path	ok	!22P02
-text	path[]	ok	!22P02
-text	point	ok	!22P02
-text	point[]	ok	!22P02
-text	polygon	ok	!22P02
-text	polygon[]	ok	!22P02
-text	real	ok	!22P02
-text	real[]	ok	!22P02
-text	regclass	ok	!42602
-text	regclass[]	ok	!22P02
-text	regproc	ok	!42602
-text	regproc[]	ok	!22P02
-text	regtype	ok	!42601
-text	regtype[]	ok	!22P02
-text	smallint	ok	!22P02
-text	smallint[]	ok	!22P02
-text	text[]	ok	!22P02
-text	time	ok	!22007
-text	timestamp	ok	!22007
-text	timestamp with time zone	ok	!22007
-text	timestamp with time zone[]	ok	!22P02
-text	tsquery[]	ok	!22P02
-text	tsrange	ok	!22P02
-text	tsrange[]	ok	!22P02
-text	tstzrange	ok	!22P02
-text	tstzrange[]	ok	!22P02
-text	tsvector[]	ok	!22P02
-text	uuid	ok	!22P02
-text	uuid[]	ok	!22P02
-text	xml[]	ok	!22P02
-text[]	bit[]	!22026	ok
+text	money	!22P02	ok
+text	oidvector	!22P02	ok
+text	regclass	!42P01	!42602
+text	regproc	!42883	!42602
+text	regtype	!42704	!42601
 text[]	hstore	!42846	!2202E
 text[]	oid	!22P02	!42846
 text[]	regclass	!42804	!42846
-text[]	regclass[]	!42804	!42P01
 text[]	regtype	!42804	!42846
 time	citext	!42846	ok
 time	interval	!42846	ok
@@ -610,35 +541,30 @@ timestamp	regtype	!42804	!42846
 timestamp with time zone	oid	!22P02	!42846
 timestamp with time zone	regclass	!42804	!42846
 timestamp with time zone	regtype	!42804	!42846
-timestamp with time zone[]	character[]	!22001	ok
 timestamp with time zone[]	oid	!22P02	!42846
 timestamp with time zone[]	regclass	!42804	!42846
 timestamp with time zone[]	regtype	!42804	!42846
 tsquery	oid	!22P02	!42846
 tsquery	regclass	!42804	!42846
 tsquery	regtype	!42804	!42846
-tsquery[]	character[]	!22001	ok
 tsquery[]	oid	!22P02	!42846
 tsquery[]	regclass	!42804	!42846
 tsquery[]	regtype	!42804	!42846
 tsrange	oid	!22P02	!42846
 tsrange	regclass	!42804	!42846
 tsrange	regtype	!42804	!42846
-tsrange[]	character[]	!22001	ok
 tsrange[]	oid	!22P02	!42846
 tsrange[]	regclass	!42804	!42846
 tsrange[]	regtype	!42804	!42846
 tstzrange	oid	!22P02	!42846
 tstzrange	regclass	!42804	!42846
 tstzrange	regtype	!42804	!42846
-tstzrange[]	character[]	!22001	ok
 tstzrange[]	oid	!22P02	!42846
 tstzrange[]	regclass	!42804	!42846
 tstzrange[]	regtype	!42804	!42846
 tsvector	oid	!22P02	!42846
 tsvector	regclass	!42804	!42846
 tsvector	regtype	!42804	!42846
-tsvector[]	character[]	!22001	ok
 tsvector[]	oid	!22P02	!42846
 tsvector[]	regclass	!42804	!42846
 tsvector[]	regtype	!42804	!42846
@@ -647,18 +573,16 @@ uuid	name	!42846	ok
 uuid	oid	!22P02	!42846
 uuid	regclass	!42804	!42846
 uuid	regtype	!42804	!42846
-uuid[]	character[]	!22001	ok
 uuid[]	oid	!22P02	!42846
 uuid[]	regclass	!42804	!42846
 uuid[]	regtype	!42804	!42846
 void	oidvector	ok	!42846
-void	regclass	ok	!42846
-void	regtype	ok	!42846
+void	regclass	!42P01	!42846
+void	regtype	!42601	!42846
 xml	oid	!22P02	!42846
 xml	oidvector	!22P02	!42846
 xml	regclass	!42P01	!42846
 xml	regtype	!42704	!42846
-xml[]	character[]	!22001	ok
 xml[]	oid	!22P02	!42846
 xml[]	regclass	!42804	!42846
 xml[]	regtype	!42804	!42846

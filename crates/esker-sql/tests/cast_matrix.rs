@@ -102,3 +102,82 @@ fn the_array_casts_that_exist_still_work() {
         vec![vec!["bigint[]"]]
     );
 }
+
+/// **An array's cast is the element's cast, and it was the source array's *text* read back.**
+///
+/// The scalar pair and the array pair disagreed, and the scalar was right. Measured on 19beta1
+/// (`127.0.0.1:55432`, 2026-09-10) — every answer below is that server's:
+///
+/// ```text
+/// 1.5::float8::integer            2       '{1.5,2.5}'::float8[]::integer[]      was 22P02
+/// '2020-01-01'::date::character   2       '{2020-01-01}'::date[]::character[]   was 22001
+/// ```
+///
+/// **Two roundings, because `pg_cast` has two functions**: a float is half to **even** (`1.5` and
+/// `2.5` are both `2`) and a `numeric` is half **away from zero** (`2.5` is `3`, `-1.5` is `-2`).
+/// An array that went through `array_in` had neither — it had `int4in`, which refuses a decimal
+/// point.
+#[test]
+fn an_array_cast_is_its_element_cast() {
+    let mut node = parity::Node::new(&[]);
+    for (written, answer) in [
+        // The two roundings, one array each.
+        ("'{1.5,2.5}'::float8[]::integer[]", "{2,2}"),
+        ("'{2.5,-1.5}'::numeric[]::integer[]", "{3,-2}"),
+        // **The element's modifier is the array cast's**, which is what makes this truncate:
+        // a bare `character` is `character(1)` and an explicit cast truncates in silence.
+        ("'{2020-01-01}'::date[]::character[]", "{2}"),
+        // `pg_cast`'s two `bool`/`int4` rows, both ways.
+        ("'{t,f}'::boolean[]::integer[]", "{1,0}"),
+        ("'{0,1}'::integer[]::boolean[]", "{f,t}"),
+        // **The geometric conversions are computed, and an element never reached the arm that
+        // computes them**: a `box`'s text handed to `circle_in` is `22P02`.
+        (
+            "'{\"((0,0),(1,1))\"}'::box[]::circle[]",
+            "{\"<(0.5,0.5),0.7071067811865476>\"}",
+        ),
+        (
+            "'{\"((0,0),(1,1))\"}'::box[]::polygon[]",
+            "{\"((0,0),(0,1),(1,1),(1,0))\"}",
+        ),
+        ("'{\"((0,0),(1,1))\"}'::box[]::point[]", "{\"(0.5,0.5)\"}"),
+        // **The control**: a pair whose element cast and whose `array_in` reading agree, so it
+        // answered before this change and has to answer after it.
+        ("'{1}'::text[]::bit[]", "{1}"),
+    ] {
+        assert_eq!(
+            node.rows(&format!("SELECT ({written})::text")),
+            vec![vec![answer]],
+            "{written} is {answer} on 19beta1"
+        );
+    }
+}
+
+/// **All three routes into the cast, because the literal was blamed and the column does it too.**
+///
+/// `d4be1a60` closed the pairs with **no** cast and its note says the same pair through a column
+/// was refused correctly — true there, and not true for a pair that *has* a cast: the literal, the
+/// constructor and the column all reached the same text round trip.
+#[test]
+fn every_route_into_an_array_cast_is_the_same_cast() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE t (f float8[])",
+        "INSERT INTO t VALUES ('{1.5}')",
+    ]);
+    for written in [
+        "'{1.5}'::float8[]::integer[]",
+        "ARRAY[1.5::float8]::integer[]",
+        "(SELECT f FROM t)::integer[]",
+    ] {
+        assert_eq!(
+            node.rows(&format!("SELECT ({written})::text")),
+            vec![vec!["{2}"]],
+            "{written} is {{2}} on 19beta1"
+        );
+    }
+    assert_eq!(
+        node.rows("SELECT (f::integer[])::text FROM t"),
+        vec![vec!["{2}"]],
+        "and through the column, which is the route the note said was already right"
+    );
+}

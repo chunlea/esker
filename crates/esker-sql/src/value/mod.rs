@@ -345,6 +345,23 @@ pub fn truncate_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<D
     if typmod == NO_TYPMOD {
         return Ok(value);
     }
+    // **An array's typmod is its element's, applied element by element** — the arm
+    // [`fit_to_typmod`] already carries, and the one this function did not. Without it an array
+    // fell through to that function, which is the *assignment*'s rule, so
+    // `'{2020-01-01}'::date[]::character[]` was `22001 value too long for type character(1)` where
+    // the scalar `'2020-01-01'::date::character` truncates to `2` — the two halves of one measured
+    // split (19beta1 answers `{2}`), disagreeing because only one of them had the container arm.
+    if let Datum::Array(array) = &value
+        && let Some(element_type) = esker_keys::array::ArrayValue::element_of(ty)
+    {
+        let mut fitted = array.clone();
+        for element in &mut fitted.values {
+            if let Some(datum) = element.take() {
+                *element = Some(truncate_to_typmod(datum, element_type, typmod)?);
+            }
+        }
+        return Ok(Datum::Array(fitted));
+    }
     // **A bit string's cast pads on the right and truncates in silence**, which is the answer
     // `fit_to_typmod` used to hold for *both* callers: `'10101'::bit(3)` is `101` and `'1'::bit(3)`
     // is `100`, measured. It is here now, on the cast's side of the seam, so that the write's side

@@ -6129,6 +6129,27 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
                 to: array.name(),
             });
         }
+        // **A source type means a cast, and no source type means the input function.** That is
+        // `pg_cast`'s own boundary and this arm had only one side of it: reading the source's text
+        // with the target's `array_in` is exactly right for `'{1}'::int8[]`, where the literal is
+        // `unknown` and there is nothing to convert *from* — and it is the wrong function for
+        // `'{1.5}'::float8[]::integer[]`, which is `{2}` on 19beta1 and was
+        // `22P02 invalid input syntax for type integer: "1.5"` here, because `int4in` was handed a
+        // decimal point that `float8 -> int4` rounds away.
+        //
+        // So a typed source keeps its `Cast` node and the **element** conversion happens in
+        // `exec::cursor`, where the scalar pair's is (`cast_one_value`). The three routes into it —
+        // this literal, an `ARRAY[…]` constructor and a column — then cannot answer differently,
+        // which they were doing.
+        if let Ok(Some(from)) = source_type(expr)
+            && from != array
+        {
+            return Ok(Some(plan::Expr::Cast {
+                operand: Box::new(lower_expr(expr)?),
+                to: array,
+                typmod: NO_TYPMOD,
+            }));
+        }
         let text = match cast_literal_text(expr)? {
             Some(text) => Some(text),
             None => match lower_expr(expr) {
