@@ -76,8 +76,10 @@ impl RegionResolver for PdRegions {
 /// The store list comes from PD's own answer about the first key rather than from a flag: a
 /// benchmark that had to be told the addresses could be told a set the cluster does not have.
 pub(crate) fn routed(pd: &str) -> Result<(Arc<TcpStores>, Arc<PdRegions>), String> {
-    let address: SocketAddr = resolve(pd)?;
-    let conn = PdConn::connect(address)?;
+    // The whole group: only its leader answers, and a run that kills the leader must not take the
+    // routing with it (ADR 0108).
+    let addresses = crate::raw::resolve_all(pd)?;
+    let conn = PdConn::connect_to(&addresses, TransportConfig::new())?;
     let PdResp::GetRegion { stores, .. } = conn
         .call(&PdReq::GetRegion {
             key: bytes::Bytes::new(),

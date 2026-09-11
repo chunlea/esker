@@ -43,6 +43,7 @@ pub mod fragment;
 pub mod frame;
 pub mod messages;
 pub mod pd;
+pub mod pd_leader;
 pub mod raft;
 pub mod region;
 pub mod schema;
@@ -60,6 +61,7 @@ pub use pd::{
     MemberChange, Operator, OperatorProgress, OperatorStatus, PdChannel, PdMemberInfo,
     PdMembership, PdRaftBatch, PdReq, PdResp, PdRole, ScannedRegion, StoreInfo,
 };
+pub use pd_leader::{LeaderBook, Redirects, is_unreachable};
 pub use raft::{RaftBatch, RaftMessage};
 pub use region::{Epoch, Peer, PeerRole, Region};
 pub use transport::{

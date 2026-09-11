@@ -433,14 +433,27 @@ would add coverage the current tests do not.
 
 ## 10. What another lane must add
 
-- **`esker-sql`: `crates/esker-sql/src/pd.rs`.** `PdConn` holds one `SocketAddr` and implements
-  `RegionResolver`, so a SQL node whose placement driver has changed leader stops resolving until
-  it is restarted. It needs the same three rules `esker_store::pd_remote` now has, and they are
-  small: hold the endpoint list rather than one address; on `ProtoError::PdNotLeader` with a
-  non-empty `leader_address` that is **in the list**, move to it and retry, bounded by a budget;
-  on an empty hint, back off and try the next endpoint. A hint naming an address outside the list
-  is a misconfiguration and must not be followed. The `--pd` flag that feeds it should take a
-  comma-separated list, as `esker server`'s now does.
+- ~~**`esker-sql`: `crates/esker-sql/src/pd.rs`.**~~ **Done, 2026-09-10, and it turned out to be
+  five rules rather than three** ([ADR 0108](../adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)).
+  `PdConn` held one `SocketAddr` and is the node's `RegionResolver`, `TimestampOracle`, schema
+  lease and columnar report all at once, so a node whose driver had changed leader ran *nothing* —
+  every statement starts by asking it for a timestamp. It now holds an `esker_proto::LeaderBook`,
+  which is where the rules live so that this crate and `esker_store::pd_remote` cannot answer one
+  question differently, and `--pd` takes a comma-separated list.
+
+  Two corrections to what this bullet said, and both were found by building it:
+
+  * *"A hint naming an address outside the list is a misconfiguration and must not be followed"* is
+    **superseded by ADR 0061** and `pd_remote` already no longer does it: a driver's membership
+    moves, so an unknown address may be a member added since the client started. The rule is
+    refresh from `Pd::Members` and adopt only on a matching group id — which is what keeps
+    ADR 0059's protection.
+  * The three rules are all about a member that **answers**. A member that was *killed* answers
+    nothing, so nothing in them moves a client off it; it re-dials the corpse on its own cadence
+    for ever. The fifth rule is that a member which provably could not be reached
+    (`ProtoError::NotSent`, and only that) is advanced past too. `crates/esker-cli/tests/pgwire_pd_failover.rs`
+    is what that buys: a statement returns **2.0 s** after the leading driver is `kill -9`ed, and
+    with one driver it never returns.
 - **Nothing is asked of `esker-raft`.** PD drives the same pure `RawNode` under the same `Ready`
   contract, and this lane found no gap in it.
 
@@ -635,9 +648,12 @@ way below a quorum and cannot undo it, because undoing needs the quorum it just 
 
 ### 11.10 Owed
 
-- **A three-process membership change**, as opposed to three members in one process. Same gap
-  §9.3 records for failover, and the same answer: the largest of these and the one with the most
-  to find.
+- ~~**A three-process membership change**, as opposed to three members in one process.~~ **Three
+  processes, 2026-09-10**: `esker cluster start --pd-nodes 3` founds a group of three real
+  processes over real sockets, and `crates/esker-cli/tests/cluster_pd_group.rs` asserts they agree
+  on one group id and one leader (counterfactual: drop `--peers`, and each founds a group of one).
+  What is still owed is a *change* — an `add` or a `remove` — run against three processes rather
+  than the founding itself.
 - **Roles in `esker pd members`.** The listing shows who leads but not who is a *learner*, so an
   add that has stalled half-way is diagnosed from `pd members add` not returning rather than from
   the listing. Adding `role` to `PdMemberInfo` would change a golden — one written in this same
@@ -646,6 +662,8 @@ way below a quorum and cannot undo it, because undoing needs the quorum it just 
 - ~~`PdTcpTransport::reconfigure`~~ — landed with the `tls` lane's RPC unit; `wiring.rs` is gone.
   What it left is in §11.7, and it was a live regression rather than a tidy-up.
 - **A membership change over a real socket.** The gap §11.7 names: every test of the rewiring path
-  either drives the inherent method directly or uses an in-process transport. Nothing has yet added
-  a member to a group of three real processes and watched a message reach it.
+  either drives the inherent method directly or uses an in-process transport. `--pd-nodes 3` now
+  gives the *founding* path three real processes and a real transport between them, so what is left
+  is narrower than it was: nothing has yet **added** a member to a group of three real processes and
+  watched a message reach it.
 

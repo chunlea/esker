@@ -33,37 +33,24 @@
 //!
 //! # Three endpoints, and following the hint
 //!
-//! A placement driver is a Raft group of up to three members and only its leader answers
-//! ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)). So a store is given the whole list,
-//! believes one of them, and moves when it is told to:
+//! A placement driver is a Raft group and only its leader answers
+//! ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)), so a store is given the whole list,
+//! believes one of them, and moves when it is told to. **Which one it believes is not decided
+//! here**: the four rules live in [`esker_proto::LeaderBook`], because a SQL node's
+//! placement-driver client obeys the same ones and two copies of a rule are one copy too many
+//! ([ADR 0108](../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)).
 //!
-//! * a [`ProtoError::PdNotLeader`] that **names** a member moves this client to that endpoint and
-//!   retries, up to [`REDIRECT_BUDGET`] times — a bound, because a group mid-election can hand out
-//!   hints that chase each other and a client that followed them for ever would never fail;
-//! * a refusal that names **nobody** is an election in progress, and there is nothing to chase.
-//!   The client backs off, moves to the next endpoint in the list, and tries again — *never*
-//!   spins, because the member's answer will not change until the election ends;
-//! * a hint naming an address **outside** the list is no longer a misconfiguration, because a
-//!   placement driver's membership moves
-//!   ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)):
-//!   it may simply be a member added since this store started. So it triggers a **refresh** —
-//!   `Pd::Members` at the endpoint that gave the hint, which any member answers — and the list is
-//!   adopted only if its **group id** matches the one this client first learned. That check is
-//!   what keeps ADR 0059's protection: one cluster's placement driver still cannot route a store
-//!   into another's, because the two have different group ids and always will.
-//!
-//! The believed endpoint is sticky: the next call starts where the last one succeeded, so a
-//! cluster pays for a leader change once rather than on every heartbeat.
+//! What is decided here is everything with a socket in it: the dispatcher holds a connection to
+//! whichever member the book believes and rebuilds it when the book moves, and the refresh the
+//! book asks for is a `Pd::Members` call this file makes.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use esker_proto::{
-    BoxFuture, PdChannel, ProtoError, StoreInfo as WireStoreInfo, TcpTransport, Transport,
-    TransportConfig,
+    BoxFuture, LeaderBook, PdChannel, ProtoError, Redirects, StoreInfo as WireStoreInfo,
+    TcpTransport, Transport, TransportConfig,
 };
 
 use crate::pd::{Bootstrapped, PdClient, RegionHeartbeat, RegionRoute, StoreHeartbeat, StoreInfo};
@@ -78,41 +65,19 @@ use crate::pd::{Bootstrapped, PdClient, RegionHeartbeat, RegionRoute, StoreHeart
 /// as the connect error itself rather than as "the client stopped".
 type Job = Box<dyn FnOnce(Result<Arc<PdChannel>, ProtoError>) -> BoxFuture<'static, ()> + Send>;
 
-/// Redirects one call will follow before it gives up.
-///
-/// Twice round a group of three. A bound rather than a timeout because the failure it guards
-/// against is a *loop* — two members each naming the other while an election settles — and a loop
-/// is bounded by counting, not by waiting.
-pub const REDIRECT_BUDGET: usize = 6;
-
-/// How long a client waits when no member will say who leads.
-///
-/// An election takes one to two seconds at the project's tick (`esker_raft::TICK_MS`), so this is
-/// short enough to catch the end of one and long enough that a store is not spinning through
-/// three endpoints while it runs. It doubles up to [`NO_LEADER_BACKOFF_MAX_MS`], which is the
-/// difference between waiting and hammering.
-pub const NO_LEADER_BACKOFF_MS: u64 = 100;
-
-/// The cap on that backoff.
-pub const NO_LEADER_BACKOFF_MAX_MS: u64 = 800;
+/// The rules this client follows when a member says it does not lead, and the numbers that bound
+/// them. Re-exported so a reader of the store's placement-driver client finds them where they
+/// expect, and defined once, beside the book that applies them.
+pub use esker_proto::pd_leader::{NO_LEADER_BACKOFF_MAX_MS, NO_LEADER_BACKOFF_MS, REDIRECT_BUDGET};
 
 /// A [`PdClient`] talking to a real placement driver.
 #[derive(Debug)]
 pub struct RemotePd {
-    /// Every member this client knows of, in the order it was given them.
+    /// Who is in the group, and which member this client believes leads it.
     ///
-    /// **It grows and shrinks**, because a placement driver's group does. The configured list is
-    /// where it starts; a refresh replaces it with what the group says, once the group has proved
-    /// it is the same group.
-    endpoints: Arc<RwLock<Vec<SocketAddr>>>,
-    /// The group this client first learned, or zero before it has learned one.
-    ///
-    /// Latched, and never overwritten: it is what a refreshed member list is checked against, and
-    /// a client that adopted a new id along with a new list would have checked nothing.
-    group_id: AtomicU64,
-    /// Which of them this client believes leads. Shared with the dispatcher, which reconnects
-    /// when it moves.
-    at: Arc<AtomicUsize>,
+    /// Shared with the dispatcher, which reads it to decide which socket to hold and rebuilds the
+    /// connection when it moves.
+    book: Arc<LeaderBook>,
     /// `None` only while dropping: the dispatcher's loop ends when the last sender goes, so the
     /// sender has to be released before the thread can be joined.
     jobs: Option<Sender<Job>>,
@@ -144,20 +109,13 @@ impl RemotePd {
         endpoints: &[SocketAddr],
         config: TransportConfig,
     ) -> Result<Self, ProtoError> {
-        if endpoints.is_empty() {
-            return Err(ProtoError::invalid(
-                "a placement-driver client needs at least one endpoint",
-            ));
-        }
-        let endpoints = Arc::new(RwLock::new(endpoints.to_vec()));
-        let at = Arc::new(AtomicUsize::new(0));
+        let book = Arc::new(LeaderBook::new(endpoints)?);
         let (jobs, inbox) = channel();
         let thread = {
-            let endpoints = Arc::clone(&endpoints);
-            let at = Arc::clone(&at);
+            let book = Arc::clone(&book);
             std::thread::Builder::new()
                 .name("pd-client".to_owned())
-                .spawn(move || dispatch(&endpoints, &at, config, &inbox))
+                .spawn(move || dispatch(&book, config, &inbox))
                 .map_err(|error| {
                     ProtoError::internal(format!(
                         "could not start the placement-driver thread: {error}"
@@ -165,9 +123,7 @@ impl RemotePd {
                 })?
         };
         Ok(Self {
-            endpoints,
-            group_id: AtomicU64::new(0),
-            at,
+            book,
             jobs: Some(jobs),
             thread: std::sync::Mutex::new(Some(thread)),
         })
@@ -176,131 +132,33 @@ impl RemotePd {
     /// The endpoint this client currently believes leads.
     #[must_use]
     pub fn address(&self) -> SocketAddr {
-        let endpoints = self.endpoint_list();
-        endpoints[self.at.load(Ordering::Acquire).min(endpoints.len() - 1)]
+        self.book.believed()
     }
 
     /// Every member this client knows of, as it currently believes the group to be.
     #[must_use]
     pub fn endpoints(&self) -> Vec<SocketAddr> {
-        self.endpoint_list()
+        self.book.endpoints()
     }
 
     /// The group this client has latched, or zero before it has asked.
     #[must_use]
     pub fn group_id(&self) -> u64 {
-        self.group_id.load(Ordering::Acquire)
+        self.book.group_id()
     }
 
-    /// The endpoints, or — if the lock is poisoned, which means a thread panicked holding it —
-    /// what was there. Answering something beats panicking (`CLAUDE.md` invariant 9).
-    fn endpoint_list(&self) -> Vec<SocketAddr> {
-        self.endpoints.read().map_or_else(
-            |poisoned| poisoned.into_inner().clone(),
-            |held| held.clone(),
-        )
-    }
-
-    /// Points this client at `address` if it is one of the configured endpoints.
+    /// Points this client at the member `hint` names, and says whether it moved.
     ///
-    /// Returns whether it moved. A hint naming an address outside the list is refused: it is a
-    /// misconfiguration, and following it would let one cluster's placement driver route a store
-    /// into another's.
-    fn follow(&self, address: &str) -> bool {
-        let Ok(hinted) = address.parse::<SocketAddr>() else {
-            return false;
-        };
-        if let Some(at) = self.endpoint_list().iter().position(|end| *end == hinted) {
-            return self.at.swap(at, Ordering::AcqRel) != at;
-        }
-        // Not one of ours — which, since a placement driver's membership moves, is as likely to
-        // mean "added since this client started" as "misconfigured". Ask the member that gave the
-        // hint; it is one of ours, and any member answers.
-        if !self.refresh() {
-            return false;
-        }
-        let Some(at) = self.endpoint_list().iter().position(|end| *end == hinted) else {
-            tracing::warn!(
-                %hinted,
-                "the placement driver named a leader its own group does not contain"
-            );
-            return false;
-        };
-        self.at.swap(at, Ordering::AcqRel) != at
-    }
-
-    /// Asks the current endpoint who is in its group, and adopts the answer.
-    ///
-    /// **The group id is the guard**, and it is the whole of what makes this safe. Before ADR 0061
-    /// a hint outside the configured list was refused outright, because following one would let
-    /// another cluster's placement driver route this store. That refusal cannot stand once
-    /// membership moves — the address may be a member added an hour ago — so the check moves with
-    /// it: a list is adopted only from a group whose id is the one this client first learned.
-    ///
-    /// The first answer latches the id. There is nothing to compare it against, and nothing to
-    /// gain from refusing it: this client was pointed at that address by its own configuration.
-    fn refresh(&self) -> bool {
-        let membership = match self.attempt(|channel| async move { channel.members().await }) {
-            Ok(Ok(membership)) => membership,
-            Ok(Err(error)) | Err(error) => {
-                tracing::debug!(%error, "could not refresh the placement-driver group");
-                return false;
+    /// The decision is [`LeaderBook::follow`]'s; what this adds is the one call it may need — a
+    /// `Pd::Members` at the member that gave the hint, which is one of ours and which any member
+    /// answers. The book checks that answer's group id before it adopts anything.
+    fn follow(&self, hint: &str) -> bool {
+        self.book.follow(hint, || {
+            match self.attempt(|channel| async move { channel.members().await }) {
+                Ok(Ok(membership)) => Ok(membership),
+                Ok(Err(error)) | Err(error) => Err(error),
             }
-        };
-        let known = self.group_id.load(Ordering::Acquire);
-        if known != 0 && membership.group_id != known {
-            tracing::error!(
-                expected = format_args!("{known:#018x}"),
-                actual = format_args!("{:#018x}", membership.group_id),
-                "a placement driver answered for a different group; its members were not adopted"
-            );
-            return false;
-        }
-        let mut fresh = Vec::with_capacity(membership.members.len());
-        for member in &membership.members {
-            match member.address.parse::<SocketAddr>() {
-                Ok(address) => fresh.push(address),
-                // A member with an address this build cannot parse is one it cannot reach, and
-                // dropping it is better than refusing the whole list: the others are still good.
-                Err(error) => tracing::warn!(
-                    id = member.id,
-                    address = %member.address,
-                    %error,
-                    "a placement driver's address will not parse; skipping it"
-                ),
-            }
-        }
-        if fresh.is_empty() {
-            return false;
-        }
-        self.group_id.store(membership.group_id, Ordering::Release);
-        let moved = {
-            let Ok(mut held) = self.endpoints.write() else {
-                return false;
-            };
-            let moved = *held != fresh;
-            *held = fresh;
-            moved
-        };
-        if moved {
-            // The index may now point past the end, or at a different member. Start again from
-            // the top: the next refusal will say where to go, and one extra round trip after a
-            // membership change is not worth remembering a position through it.
-            self.at.store(0, Ordering::Release);
-            tracing::info!(
-                group_id = format_args!("{:#018x}", membership.group_id),
-                members = membership.members.len(),
-                "the placement-driver group has changed; adopting its members"
-            );
-        }
-        moved
-    }
-
-    /// Moves to the next endpoint, for when nobody will say who leads.
-    fn advance(&self) {
-        let count = self.endpoint_list().len().max(1);
-        let next = (self.at.load(Ordering::Acquire) + 1) % count;
-        self.at.store(next, Ordering::Release);
+        })
     }
 
     /// Runs one asynchronous call on the dispatcher thread and waits for its answer, following a
@@ -318,8 +176,7 @@ impl RemotePd {
         F: Fn(Arc<PdChannel>) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Result<T, ProtoError>> + Send + 'static,
     {
-        let mut budget = REDIRECT_BUDGET;
-        let mut backoff = NO_LEADER_BACKOFF_MS;
+        let mut redirects = Redirects::new();
         loop {
             match self.attempt(work.clone())? {
                 Ok(answer) => return Ok(answer),
@@ -327,22 +184,28 @@ impl RemotePd {
                     leader_id,
                     leader_address,
                 }) => {
-                    if budget == 0 {
+                    if !redirects.take() {
                         return Err(ProtoError::PdNotLeader {
                             leader_id,
                             leader_address,
                         });
                     }
-                    budget -= 1;
                     if !leader_address.is_empty() && self.follow(&leader_address) {
                         continue;
                     }
                     // Nobody will say who leads, or the hint was one this store cannot use. There
                     // is nothing to chase: the member's answer will not change until the election
                     // ends, so wait before asking the next one.
-                    self.advance();
-                    std::thread::sleep(Duration::from_millis(backoff));
-                    backoff = (backoff * 2).min(NO_LEADER_BACKOFF_MAX_MS);
+                    self.book.advance();
+                    std::thread::sleep(redirects.backoff());
+                }
+                // **A member that was killed says nothing at all**, so nothing above moves this
+                // client off it. `NotSent` is a request that provably never left this process —
+                // a connection that could not be built — so asking another member is not asking
+                // twice. Everything ambiguous is the caller's, and its own cadence is the retry.
+                Err(other) if esker_proto::is_unreachable(&other) && redirects.take() => {
+                    self.book.advance();
+                    std::thread::sleep(redirects.backoff());
                 }
                 Err(other) => return Err(other),
             }
@@ -472,12 +335,7 @@ impl PdClient for RemotePd {
 /// One at a time is deliberate. PD calls from a store are a bootstrap and a heartbeat every ten
 /// seconds; concurrency here would buy nothing and would make "the connection failed, rebuild it"
 /// a decision taken while other calls were in flight on the connection being replaced.
-fn dispatch(
-    endpoints: &RwLock<Vec<SocketAddr>>,
-    at: &AtomicUsize,
-    config: TransportConfig,
-    inbox: &Receiver<Job>,
-) {
+fn dispatch(book: &LeaderBook, config: TransportConfig, inbox: &Receiver<Job>) {
     // One worker thread, so the reader, the writer and the keepalive keep running between calls.
     // On a current-thread runtime they would only advance while a job was being awaited, and a
     // connection that only lives during a call cannot notice a dead peer.
@@ -500,18 +358,11 @@ fn dispatch(
     let mut connected_to: Option<SocketAddr> = None;
     let mut cluster_id = 0_u64;
     while let Ok(job) = inbox.recv() {
-        // The caller moves this when it is redirected, so a change here is "go and talk to a
-        // different member" and the old socket is of no use for it.
-        let listed: Vec<SocketAddr> = endpoints.read().map_or_else(
-            |poisoned| poisoned.into_inner().clone(),
-            |held| held.clone(),
-        );
-        if listed.is_empty() {
-            continue;
-        }
-        // The **address**, not the index, is what identifies a connection: a refresh can reorder
-        // the list, and an index that meant one member a moment ago can mean another now.
-        let want = listed[at.load(Ordering::Acquire).min(listed.len() - 1)];
+        // The caller moves the book when it is redirected, so a change here is "go and talk to a
+        // different member" and the old socket is of no use for it. The **address**, not an index,
+        // is what identifies a connection: a refresh can reorder the list, and an index that meant
+        // one member a moment ago can mean another now.
+        let want = book.believed();
         if Some(want) != connected_to {
             open = None;
         }

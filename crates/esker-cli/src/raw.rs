@@ -189,6 +189,26 @@ pub(crate) fn run(options: &RawOptions, out: &mut impl Write) -> Result<Outcome,
 }
 
 /// Turns `host:port` into an address, preferring IPv4 when a name resolves to both.
+/// Every address in a comma-separated list, each resolved as [`resolve`] resolves one.
+///
+/// What `--pd` takes wherever it names a placement-driver **group**: only the group's leader
+/// answers and leadership moves, so a tool given one member stops working when that member is the
+/// one that dies (ADR 0108). One address is a list of one and keeps working exactly as it did.
+pub(crate) fn resolve_all(listed: &str) -> Result<Vec<SocketAddr>, String> {
+    let mut addresses = Vec::new();
+    for part in listed
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        addresses.push(resolve(part)?);
+    }
+    if addresses.is_empty() {
+        return Err(format!("`{listed}` names no address"));
+    }
+    Ok(addresses)
+}
+
 pub(crate) fn resolve(addr: &str) -> Result<SocketAddr, String> {
     let mut resolved = addr
         .to_socket_addrs()

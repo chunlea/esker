@@ -28,13 +28,14 @@
 //!
 //! `0` it worked · `2` the arguments were wrong · `3` the cluster refused, or could not be reached.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use esker_proto::{
-    AdminReq, AdminResp, BlockingTransport, PdReq, PdResp, ProtoError, Region, Request,
-    TransportConfig,
+    AdminReq, AdminResp, BlockingTransport, LeaderBook, PdReq, PdResp, ProtoError, Redirects,
+    Region, Request, TransportConfig,
 };
 
 use crate::bytes::escape;
@@ -131,7 +132,13 @@ pub(crate) fn run(options: &RegionOptions) -> Result<(), String> {
 /// adopts that id and retries, and every call afterwards carries it. One extra round trip per
 /// invocation, on a tool a person runs by hand.
 pub(crate) struct PdConn {
-    transport: BlockingTransport,
+    /// Who is in the group, and which member this tool believes leads it.
+    book: LeaderBook,
+    config: TransportConfig,
+    /// The live connection and the member it is to, or `None` before the first call and after a
+    /// failed one. The **address** is what identifies it: a redirect leaves a healthy connection
+    /// to the member that has just said it is the wrong one.
+    transport: RefCell<Option<(SocketAddr, Arc<BlockingTransport>)>>,
     /// The cluster PD said it serves, or `0` before it has said.
     cluster_id: Cell<u64>,
 }
@@ -141,45 +148,149 @@ impl PdConn {
         Self::connect_with(address, TransportConfig::new())
     }
 
-    /// The same, with an explicit transport configuration.
+    /// One member, **connected now**, with an explicit transport configuration.
     ///
     /// `request_timeout` bounds the wire handshake as well as every call on the connection, so a
     /// caller that must not wait the default thirty seconds for a socket which accepts and then
     /// says nothing sets it here. The one such caller is `cluster start`'s readiness probe
-    /// ([`crate::cluster`]), which asks a driver that may not be up yet.
+    /// ([`crate::cluster`]), which asks a driver that may not be up yet — and which is also why
+    /// this one connects before it returns: *"is this driver up"* is the question, and a lazy
+    /// connection would answer it one line later and in another sentence.
     pub(crate) fn connect_with(
         address: SocketAddr,
         config: TransportConfig,
     ) -> Result<Self, String> {
-        let transport = BlockingTransport::connect_with(address, config)
+        let held = BlockingTransport::connect_with(address, config)
             .map_err(|error| format!("connecting to the placement driver at {address}: {error}"))?;
         Ok(Self {
-            transport,
+            book: LeaderBook::lone(address),
+            config,
+            transport: RefCell::new(Some((address, Arc::new(held)))),
             cluster_id: Cell::new(0),
         })
     }
 
-    /// One PD call, addressed to the cluster this connection has learned about.
+    /// A placement-driver **group**, given every member's address.
+    ///
+    /// Only the leader answers, so this follows the group's own hints — and, when a member is
+    /// killed rather than deposed, moves past the one it cannot reach
+    /// ([`esker_proto::LeaderBook`],
+    /// [ADR 0108](../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)).
+    ///
+    /// **Connected lazily**, unlike [`Self::connect_with`]: the first member of a list is not
+    /// necessarily the one that will answer, so refusing to build the client because that one is
+    /// down would be refusing on the strength of the wrong member.
+    pub(crate) fn connect_to(
+        endpoints: &[SocketAddr],
+        config: TransportConfig,
+    ) -> Result<Self, String> {
+        let book =
+            LeaderBook::new(endpoints).map_err(|error| format!("the placement driver: {error}"))?;
+        Ok(Self {
+            book,
+            config,
+            transport: RefCell::new(None),
+            cluster_id: Cell::new(0),
+        })
+    }
+
+    /// The member this tool currently believes leads.
+    pub(crate) fn address(&self) -> SocketAddr {
+        self.book.believed()
+    }
+
+    /// One PD call, to whichever member of the group this tool believes leads it.
+    ///
+    /// The rules are [`esker_proto::LeaderBook`]'s, and every method this file and
+    /// [`crate::durability`] send through here is safe to send again: `Tso` hands out fresh
+    /// timestamps and never reuses one, and the rest are reads.
+    pub(crate) fn call(&self, request: &PdReq) -> Result<PdResp, ProtoError> {
+        let mut redirects = Redirects::new();
+        loop {
+            match self.attempt(request) {
+                Ok(response) => return Ok(response),
+                Err(ProtoError::PdNotLeader {
+                    leader_id,
+                    leader_address,
+                }) => {
+                    if !redirects.take() {
+                        return Err(ProtoError::PdNotLeader {
+                            leader_id,
+                            leader_address,
+                        });
+                    }
+                    if !leader_address.is_empty() && self.follow(&leader_address) {
+                        continue;
+                    }
+                    self.book.advance();
+                    std::thread::sleep(redirects.backoff());
+                }
+                // A member that was killed answers nothing at all, so nothing above moves this
+                // client off it. `NotSent` is a request that provably never left this process.
+                Err(other) if esker_proto::is_unreachable(&other) && redirects.take() => {
+                    self.book.advance();
+                    std::thread::sleep(redirects.backoff());
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    }
+
+    /// Points this client at the member `hint` names, and says whether it moved.
+    fn follow(&self, hint: &str) -> bool {
+        self.book
+            .follow(hint, || match self.attempt(&PdReq::Members)? {
+                PdResp::Members(membership) => Ok(membership),
+                other => Err(ProtoError::invalid(format!(
+                    "asked the placement driver who is in its group and it answered {}",
+                    other.method().name()
+                ))),
+            })
+    }
+
+    /// One attempt, addressed to the cluster this connection has learned about.
     ///
     /// Retried **once** and only on a mismatch that names a different cluster, so a PD that
     /// somehow refused the id it had just given would be reported rather than looped on.
-    pub(crate) fn call(&self, request: &PdReq) -> Result<PdResp, ProtoError> {
+    fn attempt(&self, request: &PdReq) -> Result<PdResp, ProtoError> {
+        let transport = self.connection()?;
         let deadline = || std::time::Instant::now() + CALL_TIMEOUT;
         let known = self.cluster_id.get();
-        let response = match self
-            .transport
-            .call(esker_proto::pd::encode(known, request.clone()), deadline())
-        {
-            Err(ProtoError::ClusterMismatch { expected, .. }) if expected != known => {
-                self.cluster_id.set(expected);
-                self.transport.call(
-                    esker_proto::pd::encode(expected, request.clone()),
-                    deadline(),
-                )?
+        let answer =
+            match transport.call(esker_proto::pd::encode(known, request.clone()), deadline()) {
+                Err(ProtoError::ClusterMismatch { expected, .. }) if expected != known => {
+                    self.cluster_id.set(expected);
+                    transport.call(
+                        esker_proto::pd::encode(expected, request.clone()),
+                        deadline(),
+                    )
+                }
+                other => other,
+            };
+        match answer {
+            Ok(response) => esker_proto::pd::decode(response),
+            Err(error) => {
+                // The connection is suspect after any failure, and the next call builds a fresh
+                // one — to whichever member the book believes by then.
+                *self.transport.borrow_mut() = None;
+                Err(error)
             }
-            other => other?,
-        };
-        esker_proto::pd::decode(response)
+        }
+    }
+
+    /// The live connection to the member this client believes leads, or a new one.
+    fn connection(&self) -> Result<Arc<BlockingTransport>, ProtoError> {
+        let want = self.book.believed();
+        let mut slot = self.transport.borrow_mut();
+        if let Some((held, existing)) = slot.as_ref()
+            && *held == want
+            && !existing.is_closed()
+        {
+            return Ok(Arc::clone(existing));
+        }
+        let fresh = Arc::new(BlockingTransport::connect_with(want, self.config)?);
+        *slot = Some((want, Arc::clone(&fresh)));
+        Ok(fresh)
     }
 }
 
