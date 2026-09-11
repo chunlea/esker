@@ -125,6 +125,19 @@ impl LeaderBook {
         })
     }
 
+    /// A book over a single member — the group of one that a development cluster still is.
+    ///
+    /// Infallible, which is the point: there is no empty list to refuse, so a caller with one
+    /// address does not have to carry a `Result` it can never see.
+    #[must_use]
+    pub fn lone(address: SocketAddr) -> Self {
+        Self {
+            endpoints: RwLock::new(vec![address]),
+            group_id: AtomicU64::new(0),
+            at: AtomicUsize::new(0),
+        }
+    }
+
     /// The member this client believes leads, and therefore the one to talk to.
     #[must_use]
     pub fn believed(&self) -> SocketAddr {

@@ -40,7 +40,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use esker_client::region_cache::{RegionResolver, Route};
 use esker_proto::pd::ColumnarWish;
-use esker_proto::{BlockingTransport, PdReq, PdResp, ProtoError, TransportConfig};
+use esker_proto::{
+    BlockingTransport, LeaderBook, PdReq, PdResp, ProtoError, Redirects, TransportConfig,
+};
 
 use crate::backend::{Backend, SchemaLease, StepInterval};
 use crate::exec::for_each_page;
@@ -53,20 +55,28 @@ use crate::exec::for_each_page;
 /// startup failure rather than a node that serves without a lease.
 #[derive(Debug)]
 pub struct PdConn {
-    address: SocketAddr,
+    /// Who is in the group, and which member this node believes leads it.
+    book: LeaderBook,
     config: TransportConfig,
-    /// The live connection, or `None` before the first call and after a failed one.
+    /// The live connection and the member it is to, or `None` before the first call and after a
+    /// failed one.
     ///
     /// An `Arc` so a call can leave the lock before it blocks: the refresher and a session's
     /// `ALTER` share this connection, and holding the mutex across a call would let a slow PD
     /// stall a statement for a whole request timeout.
-    transport: Mutex<Option<Arc<BlockingTransport>>>,
+    ///
+    /// **The address travels with it** because the believed member moves: a connection to the
+    /// member this node has just stopped believing is of no use for the call that redirected it.
+    transport: Mutex<Option<(SocketAddr, Arc<BlockingTransport>)>>,
     /// The cluster PD said it serves, or `0` before it has said.
     cluster_id: AtomicU64,
 }
 
 impl PdConn {
     /// A connection to the placement driver at `address`, with the project's transport defaults.
+    ///
+    /// One address is a group of one, which is what a cluster with a single driver is and what
+    /// every caller had before there could be more than one.
     #[must_use]
     pub fn new(address: SocketAddr) -> Self {
         Self::with_config(address, TransportConfig::new())
@@ -75,18 +85,38 @@ impl PdConn {
     /// The same, configured explicitly.
     #[must_use]
     pub fn with_config(address: SocketAddr, config: TransportConfig) -> Self {
+        Self::over(LeaderBook::lone(address), config)
+    }
+
+    /// A connection to a placement-driver **group**, given every member's address.
+    ///
+    /// Only the leader answers, so a node is given the whole list and moves between them as it is
+    /// told to — or as it finds a member it cannot reach
+    /// ([`esker_proto::LeaderBook`],
+    /// [ADR 0108](../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)).
+    pub fn to_group(endpoints: &[SocketAddr], config: TransportConfig) -> Result<Self, ProtoError> {
+        Ok(Self::over(LeaderBook::new(endpoints)?, config))
+    }
+
+    fn over(book: LeaderBook, config: TransportConfig) -> Self {
         Self {
-            address,
+            book,
             config,
             transport: Mutex::new(None),
             cluster_id: AtomicU64::new(0),
         }
     }
 
-    /// Where the placement driver is.
+    /// The member of the group this node currently believes leads.
     #[must_use]
     pub fn address(&self) -> SocketAddr {
-        self.address
+        self.book.believed()
+    }
+
+    /// Every member this node knows of.
+    #[must_use]
+    pub fn endpoints(&self) -> Vec<SocketAddr> {
+        self.book.endpoints()
     }
 
     /// This node's lease, as PD's three numbers.
@@ -157,14 +187,75 @@ impl PdConn {
         }
     }
 
-    /// One call, addressed to the cluster this connection has learned about.
+    /// One call, to whichever member of the group this node believes leads it.
+    ///
+    /// The rules are [`esker_proto::LeaderBook`]'s and the store's placement-driver client obeys
+    /// the same ones: follow a hint that names a member, wait rather than spin when nobody will say
+    /// who leads, and — the one that matters when a driver is **killed** rather than deposed —
+    /// move past a member this node provably could not reach.
+    ///
+    /// **Sleeping here is right**, unusually. `PdConn`'s two callers are a refresher thread and a
+    /// statement on `tokio`'s blocking pool; both are already blocking on purpose, which is the
+    /// whole argument of this file's header.
+    ///
+    /// Every method a SQL node sends through here is safe to send again: `Tso` hands out fresh
+    /// timestamps and never reuses one, `GetRegion` and `SchemaLease` are reads, and
+    /// `ReportColumnar` is a full assertion whose last writer is right.
+    fn call(&self, request: &PdReq) -> Result<PdResp, ProtoError> {
+        let mut redirects = Redirects::new();
+        loop {
+            match self.attempt(request) {
+                Ok(response) => return Ok(response),
+                Err(ProtoError::PdNotLeader {
+                    leader_id,
+                    leader_address,
+                }) => {
+                    if !redirects.take() {
+                        return Err(ProtoError::PdNotLeader {
+                            leader_id,
+                            leader_address,
+                        });
+                    }
+                    if !leader_address.is_empty() && self.follow(&leader_address) {
+                        continue;
+                    }
+                    // An election is in progress, or the hint is one this node cannot use. The
+                    // member's answer will not change until the election ends, so ask another one
+                    // — after a wait, because asking immediately is asking the same question.
+                    self.book.advance();
+                    std::thread::sleep(redirects.backoff());
+                }
+                // A member that was killed answers nothing at all, so nothing above moves this
+                // node off it. `NotSent` is a request that provably never left this process.
+                Err(other) if esker_proto::unreachable(&other) && redirects.take() => {
+                    self.book.advance();
+                    std::thread::sleep(redirects.backoff());
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    }
+
+    /// Points this node at the member `hint` names, and says whether it moved.
+    ///
+    /// The decision is [`LeaderBook::follow`]'s; what this adds is the `Pd::Members` call it may
+    /// need, which every member answers.
+    fn follow(&self, hint: &str) -> bool {
+        self.book
+            .follow(hint, || match self.attempt(&PdReq::Members)? {
+                PdResp::Members(membership) => Ok(membership),
+                other => Err(mismatch("Members", &other)),
+            })
+    }
+
+    /// One attempt, addressed to the cluster this connection has learned about.
     ///
     /// A SQL node never bootstraps, so it learns the cluster id the only other way PD offers: the
     /// refusal names the cluster PD serves, so the first call adopts that id and retries, and
     /// every call afterwards carries it. Retried **once**, and only on a mismatch naming a
     /// different cluster, so a PD that refused the id it had just given is reported rather than
     /// looped on (the same rule `esker-cli`'s `region` commands follow).
-    fn call(&self, request: &PdReq) -> Result<PdResp, ProtoError> {
+    fn attempt(&self, request: &PdReq) -> Result<PdResp, ProtoError> {
         let connection = self.connection()?;
         let deadline = || Instant::now() + self.config.request_timeout;
         let known = self.cluster_id.load(Ordering::Relaxed);
@@ -192,19 +283,24 @@ impl PdConn {
         }
     }
 
-    /// The live connection, or a new one.
+    /// The live connection to the member this node believes leads, or a new one.
+    ///
+    /// The **address** is what identifies it, not the slot being occupied: a redirect leaves a
+    /// perfectly healthy connection to a member that has just told this node it is the wrong one.
     fn connection(&self) -> Result<Arc<BlockingTransport>, ProtoError> {
+        let want = self.book.believed();
         let mut slot = self
             .transport
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(existing) = slot.as_ref()
+        if let Some((held, existing)) = slot.as_ref()
+            && *held == want
             && !existing.is_closed()
         {
             return Ok(Arc::clone(existing));
         }
-        let fresh = Arc::new(BlockingTransport::connect_with(self.address, self.config)?);
-        *slot = Some(Arc::clone(&fresh));
+        let fresh = Arc::new(BlockingTransport::connect_with(want, self.config)?);
+        *slot = Some((want, Arc::clone(&fresh)));
         Ok(fresh)
     }
 
@@ -214,7 +310,10 @@ impl PdConn {
             .transport
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if slot.as_ref().is_some_and(|live| Arc::ptr_eq(live, used)) {
+        if slot
+            .as_ref()
+            .is_some_and(|(_, live)| Arc::ptr_eq(live, used))
+        {
             *slot = None;
         }
     }
