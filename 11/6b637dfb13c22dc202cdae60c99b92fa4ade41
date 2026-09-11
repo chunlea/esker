@@ -1,0 +1,64 @@
+crates/esker-keys/src/array.rs
+  h_44076b318daf9c 128,257
+crates/esker-keys/src/columnar.rs
+  h_44076b318daf9c 186,297-303
+crates/esker-keys/src/row.rs
+  h_44076b318daf9c 563-564,1269-1270,1272,1524,2282
+crates/esker-keys/src/value.rs
+  h_44076b318daf9c 354-362,616,721
+crates/esker-sql/src/catalog/mod.rs
+  h_44076b318daf9c 5075,5168,5259,6744
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 1509-1514,3443,3647,3814-3815
+crates/esker-sql/src/catalog/record.rs
+  h_44076b318daf9c 106,367-371,490,650
+crates/esker-sql/src/exec/bind.rs
+  h_44076b318daf9c 1660
+crates/esker-sql/src/exec/cursor.rs
+  h_44076b318daf9c 2709-2733,2735-2736,2738,4642-4695
+crates/esker-sql/src/exec/fragment.rs
+  h_44076b318daf9c 1141
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 4426
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 6132-6152
+crates/esker-sql/src/plan/expr.rs
+  h_44076b318daf9c 2665,2755,2927
+crates/esker-sql/src/row.rs
+  h_44076b318daf9c 186
+crates/esker-sql/src/value/mod.rs
+  h_44076b318daf9c 235-245,247-248,359-375,1637-1643,1712-1713,1717,1719,1781-1782,1891-1893,2076,2267,2369,2673-2674,2963-2964,3774-3783,3816
+crates/esker-sql/tests/array_delimiter.rs
+  h_44076b318daf9c 169-174
+crates/esker-sql/tests/array_of_void.rs
+  h_44076b318daf9c 74,76-82,90-91
+crates/esker-sql/tests/captures/pg19_cast_matrix.txt
+  h_44076b318daf9c 37,40,43-117,224-226,230-231,520-521,523-527,580-581
+crates/esker-sql/tests/cast_matrix.rs
+  h_44076b318daf9c 105-183
+crates/esker-sql/tests/catalog_read_slope.rs
+  h_44076b318daf9c 24-26,46-48,178-189
+crates/esker-sql/tests/lquery_array.rs
+  h_44076b318daf9c 1-138
+crates/esker-sql/tests/row_order.rs
+  h_44076b318daf9c 151-153
+crates/esker-store/src/columnar/decode.rs
+  h_44076b318daf9c 265-267
+docs/adr/0106-what-a-statement-reads-below-the-sql.md
+  h_44076b318daf9c 524-531,535-540
+docs/plans/debt-49-catalog-cache.md
+  h_44076b318daf9c 403-413
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,112,115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "116b637dfb13c22dc202cdae60c99b92fa4ade41",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
