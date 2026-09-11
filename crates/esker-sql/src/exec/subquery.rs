@@ -310,7 +310,7 @@ fn syntactic_type(expr: &Expr, tables: &dyn Tables) -> Option<ColumnType> {
             let at = def.column(name)?;
             Some(def.columns.get(at)?.ty)
         }
-        Expr::Literal(Literal::Typed(value)) => value.column_type(),
+        Expr::Literal(Literal::Typed { value, .. }) => value.column_type(),
         Expr::Cast { to, .. } => Some(*to),
         // **An array of an array, read one level down.** `ARRAY['{t}'::regclass[]]` is the shape
         // that needed it: a `regclass[]` literal is rewritten by `lower_regclass_array` into an
@@ -698,7 +698,7 @@ fn fold_counts(select: &mut Select, txn: &dyn Txn, tenant: u64) -> Result<()> {
         *slot = Expr::Literal(match value(sub, &[])? {
             Datum::Null => Literal::Null,
             Datum::Int8(count) => Literal::Integer(count),
-            other => Literal::Typed(Box::new(other)),
+            other => Literal::typed(Box::new(other)),
         });
     }
     Ok(())
@@ -902,7 +902,7 @@ fn substitute_in_expr(expr: &mut Expr, outer: &[Datum], depth: usize) {
             *expr = Expr::Literal(match outer.get(*at) {
                 // A NULL has no type to carry and needs none: every comparison with one is NULL.
                 Some(Datum::Null) | None => Literal::Null,
-                Some(value) => Literal::Typed(Box::new(value.clone())),
+                Some(value) => Literal::typed(Box::new(value.clone())),
             });
         }
         Expr::Like {

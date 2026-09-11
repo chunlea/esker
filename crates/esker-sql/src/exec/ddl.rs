@@ -500,8 +500,13 @@ fn fold_user_default(
         return Ok(None);
     };
     Ok(Some(match (&def.kind, value) {
+        // **`None`: a stored `DEFAULT` is a value and not an expression by the time it is here.**
+        // `DEFAULT 'sad'` is the label and maps; `DEFAULT 'sad'::mood` folded to the ordinal
+        // before the catalog record was written and has no claim left to check, so it is the
+        // `42804` it was — one shape of `debts-v1.1.md` #57 this unit does not reach, pinned in
+        // `tests/enum_cast_identity.rs`.
         (catalog::TypeKind::Enum { .. }, _) => {
-            super::assign::into_enum(value.clone(), column, def)?
+            super::assign::into_enum(value.clone(), column, def, None)?
         }
         // A composite `DEFAULT` is canonicalised like any other value of one, so the column's
         // default and a row written by hand are the same string.
@@ -5572,7 +5577,7 @@ fn folded_into_its_cast(expr: &plan::Expr) -> bool {
         // instead. A `TypedNull` is *not* here: the user named a type, and `(NULL::integer)::text`
         // is a cast a real server keeps.
         plan::Expr::Literal(plan::Literal::String(_) | plan::Literal::Null) => true,
-        plan::Expr::Literal(plan::Literal::Typed(value)) => {
+        plan::Expr::Literal(plan::Literal::Typed { value, .. }) => {
             matches!(value.as_ref(), Datum::Text(_))
         }
         _ => false,
@@ -5582,7 +5587,7 @@ fn folded_into_its_cast(expr: &plan::Expr) -> bool {
 /// That constant, printed with the type the cast named rather than the type it is held as.
 fn deparse_literal_of(expr: &plan::Expr, to: ColumnType) -> String {
     match expr {
-        plan::Expr::Literal(plan::Literal::Typed(value)) => match value.as_ref() {
+        plan::Expr::Literal(plan::Literal::Typed { value, .. }) => match value.as_ref() {
             Datum::Text(text) => format!("'{}'::{}", text.replace('\'', "''"), to.name()),
             _ => deparse_literal(&plan::Literal::Null, to),
         },
@@ -6123,7 +6128,7 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
         Expr::Literal(literal) => matches!(
             literal,
             plan::Literal::Integer(_) | plan::Literal::Decimal(_)
-        ) || matches!(literal, plan::Literal::Typed(value)
+        ) || matches!(literal, plan::Literal::Typed { value, .. }
                 if matches!(**value, Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)
                     | Datum::Numeric(_) | Datum::Real(_) | Datum::Double(_))),
         Expr::CatalogFunc(call) => {
@@ -6746,7 +6751,7 @@ fn deparse_literal(literal: &plan::Literal, ty: ColumnType) -> String {
         // column, `(t > 'a'::text)` for a text one and `(d > '2020-01-01'::date)` for a date. The
         // label is what tells the reader — and the re-parse — which type a quoted constant is.
         // Which numbers are bare is [`numeric_constant`]'s subject.
-        Literal::Typed(value) => match value.as_ref() {
+        Literal::Typed { value, .. } => match value.as_ref() {
             Datum::Bool(flag) => flag.to_string(),
             number @ (Datum::Int8(_)
             | Datum::Int4(_)

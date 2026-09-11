@@ -3366,7 +3366,7 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                         func: CatalogFunc::JsonbCompare,
                         args: vec![left, right],
                     }))),
-                    right: Box::new(Expr::Literal(Literal::Typed(Box::new(Datum::Int4(0))))),
+                    right: Box::new(Expr::Literal(Literal::typed(Box::new(Datum::Int4(0))))),
                 });
             }
             // **And a scalar whose `=` does not exist at all**, which is a different list from
@@ -3753,7 +3753,7 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                         func: CatalogFunc::PgTypeof,
                         args: vec![
                             args.swap_remove(0),
-                            Expr::Literal(Literal::Typed(Box::new(named))),
+                            Expr::Literal(Literal::typed(Box::new(named))),
                         ],
                     }))
                 }
@@ -4561,10 +4561,23 @@ fn reconcile_enum(
     let coerced = match other {
         // Still nothing, whatever the type it was written with.
         Expr::Literal(Literal::Null | Literal::TypedNull(_)) => return Ok(None),
+        // **A cast to this same enum is already the ordinal, and now says so.** `'sad'::mood`
+        // folds to the label's ordinal and carries the type it was cast to
+        // (`plan::Literal::Typed::user`), so both sides are `int2` values of one enum and the
+        // ordinary path compares them — which is what a real server does, measured.
+        //
+        // **Only this enum.** A different enum's ordinal keeps falling through to the refusal
+        // below, because two enums have no operator between them there either; what its sentence
+        // says is `mood = smallint` where a real server says `mood = other_mood`, which is a
+        // message this node cannot write until an expression's user type is readable from
+        // anywhere but here (recorded, not fixed).
+        Expr::Literal(Literal::Typed {
+            user: Some(oid), ..
+        }) if *oid == def.oid => return Ok(None),
         // The `unknown` literal, and the only spelling that is coerced.
         Expr::Literal(Literal::String(text)) => {
             match crate::catalog::enum_ordinal(enum_labels(def)?, text) {
-                Some(ordinal) => Expr::Literal(Literal::Typed(Box::new(Datum::Int2(ordinal)))),
+                Some(ordinal) => Expr::Literal(Literal::typed(Box::new(Datum::Int2(ordinal)))),
                 None => {
                     return Err(SqlError::InvalidEnumValue {
                         ty: def.name.clone(),
@@ -4966,7 +4979,7 @@ pub(super) fn literal_type(literal: &Literal) -> Option<ColumnType> {
         // the literal's own type moved.
         Literal::Decimal(_) => Some(ColumnType::Numeric),
         Literal::Bool(_) => Some(ColumnType::Bool),
-        Literal::Typed(value) => value.column_type(),
+        Literal::Typed { value, .. } => value.column_type(),
     }
 }
 
@@ -5068,7 +5081,7 @@ fn blank_pad(literal: Literal, ty: ColumnType, typmod: i32) -> Literal {
     // spellings reach here and both are the same value.
     let text = match &literal {
         Literal::String(text) => text.as_str(),
-        Literal::Typed(datum) => match datum.as_ref() {
+        Literal::Typed { value: datum, .. } => match datum.as_ref() {
             Datum::Text(text) => text.as_str(),
             _ => return literal,
         },
@@ -5104,7 +5117,7 @@ fn retype(
     // Narrowing is what an assignment does, and an assignment of this literal is `22003 bigint out
     // of range`, which is the right answer to `INSERT` and the wrong one to `WHERE`. The
     // comparison itself is exact: `Datum`'s ordering has a `numeric`-against-`int8` arm.
-    if matches!(literal, Literal::Typed(value) if matches!(**value, Datum::Numeric(_)))
+    if matches!(literal, Literal::Typed { value, .. } if matches!(**value, Datum::Numeric(_)))
         && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
     {
         return Ok(literal.clone());
@@ -5132,7 +5145,7 @@ fn retype(
     // `tests/corpus/pg19_negative_constant.txt`: `(i2 > (1)::smallint)`,
     // `(i2 > ('-1'::integer)::smallint)`, `(nm > ('-1'::integer)::numeric)`.
     let carries_an_integer_type = matches!(literal, Literal::Integer(_))
-        || matches!(literal, Literal::Typed(value)
+        || matches!(literal, Literal::Typed { value, .. }
             if matches!(**value, Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)));
     if carries_an_integer_type
         && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
@@ -5156,7 +5169,7 @@ fn retype(
     // Measured across all 2,756 column-against-literal pairs
     // (`tests/captures/pg19_comparison_matrix_column.txt`): eleven of them were this `42804`, and
     // they became visible only once `comparable_with` stopped refusing them one gate earlier.
-    if let Literal::Typed(value) = literal
+    if let Literal::Typed { value, .. } = literal
         && let Some(held) = value.column_type()
         && held != ty
     {
@@ -5188,7 +5201,7 @@ fn retype(
         && let Literal::String(text) = literal
     {
         let oid = crate::value::oid::from_text(text)?;
-        return Ok(Literal::Typed(Box::new(Datum::RegProc {
+        return Ok(Literal::typed(Box::new(Datum::RegProc {
             oid,
             name: crate::value::reg_proc::to_text(oid).into_boxed_str(),
         })));
@@ -5209,7 +5222,7 @@ fn retype(
         && let Literal::String(text) = literal
     {
         let oid = crate::value::oid::from_text(text)?;
-        return Ok(Literal::Typed(Box::new(crate::value::regclass_of_oid(
+        return Ok(Literal::typed(Box::new(crate::value::regclass_of_oid(
             i64::from(oid),
         ))));
     }
@@ -5224,7 +5237,7 @@ fn retype(
         && let Literal::String(text) = literal
     {
         let oid = crate::value::oid::from_text(text)?;
-        return Ok(Literal::Typed(Box::new(crate::value::regtype_of_oid(oid))));
+        return Ok(Literal::typed(Box::new(crate::value::regtype_of_oid(oid))));
     }
     match literal.assign(ty, "?column?") {
         // Reduced to a value of the column's own type, so the comparison is between two of them.
@@ -5232,7 +5245,7 @@ fn retype(
             Datum::Int8(value) => Literal::Integer(value),
             Datum::Bool(value) => Literal::Bool(value),
             Datum::Text(value) => Literal::String(value),
-            other => Literal::Typed(Box::new(other)),
+            other => Literal::typed(Box::new(other)),
         }),
         // A literal of the right *category* that still will not read -- `WHERE ts = 'not a date'`
         // -- keeps the error its input function raised, which says what is actually wrong.
@@ -5247,7 +5260,7 @@ fn retype(
 fn integer_literal_value(literal: &Literal) -> Option<i64> {
     match literal {
         Literal::Integer(value) => Some(*value),
-        Literal::Typed(value) => match value.as_ref() {
+        Literal::Typed { value, .. } => match value.as_ref() {
             Datum::Int2(value) => Some(i64::from(*value)),
             Datum::Int4(value) => Some(i64::from(*value)),
             Datum::Int8(value) => Some(*value),
@@ -5292,7 +5305,7 @@ fn integer_span(ty: ColumnType) -> Option<(i64, i64)> {
 fn is_already_of_type(expr: &Expr, ty: ColumnType) -> bool {
     matches!(
         expr,
-        Expr::Literal(Literal::Typed(value))
+        Expr::Literal(Literal::Typed { value, .. })
             if matches!(**value, Datum::Range { .. }) && value.fits(ty)
     )
 }
@@ -5461,7 +5474,9 @@ fn figure_column_name(expr: &Expr) -> String {
         // because the value itself says which type it is: nothing but that cast produces a
         // `regclass` datum. Measured — a real server names an unaliased cast after its target
         // type (`tests/captures/pg19_regclass.txt`), and an alias still wins.
-        Expr::Literal(Literal::Typed(datum)) if matches!(**datum, Datum::RegClass { .. }) => {
+        Expr::Literal(Literal::Typed { value: datum, .. })
+            if matches!(**datum, Datum::RegClass { .. }) =>
+        {
             "regclass".to_owned()
         }
         _ => "?column?".to_owned(),
@@ -6685,7 +6700,9 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
         Expr::ToText { .. }
         | Expr::CurrentSetting { .. }
         | Expr::Literal(Literal::String(_) | Literal::Null) => ColumnType::Text,
-        Expr::Literal(Literal::Typed(value)) => value.column_type().unwrap_or(ColumnType::Text),
+        Expr::Literal(Literal::Typed { value, .. }) => {
+            value.column_type().unwrap_or(ColumnType::Text)
+        }
         Expr::Literal(Literal::Bool(_))
         | Expr::Like { .. }
         | Expr::RegexMatch { .. }

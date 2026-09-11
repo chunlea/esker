@@ -287,7 +287,7 @@ fn lower_row_constructor(args: &[FunctionArg]) -> Result<plan::Expr> {
             plan::Expr::Literal(plan::Literal::Bool(value)) => {
                 Some(if value { "t" } else { "f" }.to_owned())
             }
-            plan::Expr::Literal(plan::Literal::Typed(value)) => value.to_text(),
+            plan::Expr::Literal(plan::Literal::Typed { value, .. }) => value.to_text(),
             _ => return Err(SqlError::unsupported("ROW over anything but constants")),
         });
     }
@@ -355,7 +355,7 @@ fn literal_type(literal: &plan::Literal) -> Option<ColumnType> {
         plan::Literal::Decimal(_) => Some(ColumnType::Numeric),
         plan::Literal::Bool(_) => Some(ColumnType::Bool),
         plan::Literal::TypedNull(ty) => Some(*ty),
-        plan::Literal::Typed(value) => value.column_type(),
+        plan::Literal::Typed { value, .. } => value.column_type(),
         plan::Literal::Null | plan::Literal::String(_) => None,
     }
 }
@@ -4246,7 +4246,7 @@ fn lower_expr_inner(expr: &Expr) -> Result<plan::Expr> {
             right,
         } if date_plus_time(left, right)?.is_some() => {
             let micros = date_plus_time(left, right)?.unwrap_or_default();
-            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 Datum::Timestamp(micros),
             ))))
         }
@@ -4493,7 +4493,7 @@ fn lower_expr_inner(expr: &Expr) -> Result<plan::Expr> {
                 None => text.clone(),
             };
             let value = value::interval::from_text(&spelled)?;
-            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 Datum::Interval {
                     months: value.months,
                     days: value.days,
@@ -5525,7 +5525,7 @@ fn stack_folded_arrays(
         .collect();
     let stacked = esker_keys::array::ArrayValue::stacked(&parts, fallback)
         .ok_or(SqlError::ArrayExpressionDimensions)?;
-    Ok(Some(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+    Ok(Some(plan::Expr::Literal(plan::Literal::typed(Box::new(
         Datum::Array(stacked),
     )))))
 }
@@ -5717,7 +5717,7 @@ fn lower_array_constructor(elements: &[Expr]) -> Result<plan::Expr> {
             .map(|value| {
                 plan::Expr::Literal(match value {
                     None => plan::Literal::Null,
-                    Some(value) => plan::Literal::Typed(Box::new(value)),
+                    Some(value) => plan::Literal::typed(Box::new(value)),
                 })
             })
             .collect(),
@@ -5762,14 +5762,14 @@ fn lower_array_constructor_elements(expr: &Expr) -> Result<Option<Vec<plan::Expr
     // caller lowers each element itself.
     Ok(match lower_array_constructor(&array.elem)? {
         plan::Expr::Array { elements, .. } => Some(elements),
-        plan::Expr::Literal(plan::Literal::Typed(value)) => match *value {
+        plan::Expr::Literal(plan::Literal::Typed { value, .. }) => match *value {
             Datum::Array(array) => Some(
                 array
                     .values
                     .into_iter()
                     .map(|element| {
                         plan::Expr::Literal(match element {
-                            Some(value) => plan::Literal::Typed(Box::new(value)),
+                            Some(value) => plan::Literal::typed(Box::new(value)),
                             None => plan::Literal::Null,
                         })
                     })
@@ -6120,7 +6120,7 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
         // is what supplies one. So it is answered here rather than by lowering the constructor,
         // which would raise `42P18` before the type arrived.
         if matches!(strip_nesting(expr), Expr::Array(array) if array.elem.is_empty()) {
-            return Ok(Some(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            return Ok(Some(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 Datum::Array(esker_keys::array::ArrayValue::empty(element)),
             )))));
         }
@@ -6171,12 +6171,12 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
         let text = match cast_literal_text(expr)? {
             Some(text) => Some(text),
             None => match lower_expr(expr) {
-                Ok(plan::Expr::Literal(plan::Literal::Typed(value))) => value.to_text(),
+                Ok(plan::Expr::Literal(plan::Literal::Typed { value, .. })) => value.to_text(),
                 _ => None,
             },
         };
         if let Some(text) = text {
-            return Ok(Some(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            return Ok(Some(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 Datum::from_text(array, &text)?,
             )))));
         }
@@ -6204,7 +6204,7 @@ fn lower_regclass_array(expr: &Expr) -> Result<plan::Expr> {
     // `ARRAY[]::regclass[]` is the empty array, as it is at every other element type: the
     // constructor has no element to take a type from and the cast is what supplies one.
     if matches!(strip_nesting(expr), Expr::Array(array) if array.elem.is_empty()) {
-        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+        return Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
             Datum::Array(esker_keys::array::ArrayValue::empty(ColumnType::RegClass)),
         ))));
     }
@@ -6302,7 +6302,7 @@ fn lower_condition(expr: &Expr, boolean: bool) -> Result<plan::Expr> {
         && let Expr::Value(value) = expr
         && let Value::SingleQuotedString(text) = &value.value
     {
-        return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+        return Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
             <Datum as PgDatum>::from_text(ColumnType::Bool, text)?,
         ))));
     }
@@ -6479,7 +6479,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             && let Some(text) = cast_literal_text(expr)?
         {
             let bytes = value::uuid::from_text(&text)?;
-            return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            return Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 Datum::Bytea(bytes.to_vec()),
             ))));
         }
@@ -6507,7 +6507,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                     } else {
                         address
                     };
-                    return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                    return Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                         Datum::Inet {
                             family: address.family,
                             bits: address.bits,
@@ -6531,7 +6531,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             // **Signed**, which one measurement is enough to see and reasoning is not:
             // `chr(200)::"char"::int4` is `-61` on 19beta1, not `195`. A `"char"` is one *byte*
             // and PostgreSQL's `chartoi4` reads it as `int8`, the C type, which is signed.
-            return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            return Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 Datum::Int4(value::char_type::to_int4(&text)),
             ))));
         }
@@ -6565,7 +6565,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             // `text` here, which is ADR 0086's rule with a third type in it — the value cannot
             // carry the type it was given, so the cast that gave it stays to say so.
             return Ok(plan::Expr::Cast {
-                operand: Box::new(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                operand: Box::new(plan::Expr::Literal(plan::Literal::typed(Box::new(
                     converted,
                 )))),
                 to: ColumnType::Char,
@@ -6582,7 +6582,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             && value::json::casts_to_scalar(to)
             && let Some(text) = cast_literal_text(expr)?
         {
-            return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            return Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 value::json::cast_to_scalar(&text, to)?,
             ))));
         }
@@ -6596,7 +6596,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             && let Some(text) = cast_literal_text(expr)?
         {
             let cents = value::money::from_text(&text)?;
-            return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            return Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 Datum::from_text(ColumnType::Numeric, &value::money::to_numeric_text(cents))?,
             ))));
         }
@@ -6619,7 +6619,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             && value::is_geometric(to)
             && let Some(text) = cast_literal_text(expr)?
         {
-            return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            return Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 value::geometric_cast(&Datum::from_text(from, &text)?, to)?,
             ))));
         }
@@ -6847,10 +6847,10 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                     });
                 }
                 if value.column_type() == Some(ty) && typmod == NO_TYPMOD {
-                    return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(value))));
+                    return Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(value))));
                 }
                 Ok(plan::Expr::Cast {
-                    operand: Box::new(plan::Expr::Literal(plan::Literal::Typed(Box::new(value)))),
+                    operand: Box::new(plan::Expr::Literal(plan::Literal::typed(Box::new(value)))),
                     to: ty,
                     typmod,
                 })
@@ -6942,7 +6942,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             // **An `oid`, not a `bigint`.** `'23'::oid` has been a real `ColumnType::Oid` since
             // that type's own unit and this spelling had not caught up, so
             // `pg_typeof('int4'::regtype::oid)` answered `bigint` where a real server says `oid`.
-            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 Datum::Oid(named.oid()),
             ))))
         }
@@ -7022,7 +7022,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 // `pg_typeof` where a real server says `oidvector` — the sentence ADR 0086 is,
                 // reached by a path that does not go through the fold that carries it.
                 return Ok(plan::Expr::Cast {
-                    operand: Box::new(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                    operand: Box::new(plan::Expr::Literal(plan::Literal::typed(Box::new(
                         Datum::from_text(ColumnType::OidVector, &text)?,
                     )))),
                     to: ColumnType::OidVector,
@@ -7043,7 +7043,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             // `42704 type "23" does not exist` for a spelling `ActiveRecord` writes when it reads
             // `typelem` back. `value::oid_spelled` is the one reader of the rule.
             if let Some(oid) = value::oid_spelled(&name) {
-                return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                return Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                     value::regtype_of_oid(oid),
                 ))));
             }
@@ -7054,7 +7054,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             // — so every answer that only reads the value is unchanged; what moves is
             // `pg_typeof`, which now says `regtype` as a real server does, and the comparison,
             // which is the oid's and so meets `castsource` and `proargtypes` where they are.
-            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 value::regtype_of_oid(named.oid()),
             ))))
         }
@@ -7091,7 +7091,7 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                     typmod: NO_TYPMOD,
                 });
             };
-            Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+            Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 Datum::Oid(value::oid::from_text(&text)?),
             ))))
         }
@@ -7471,14 +7471,14 @@ fn cast_literal_text(expr: &Expr) -> Result<Option<String>> {
             // instead, which is how `'r'::"char"::int4` became
             // `22P02 invalid input syntax for type integer: "r"`.
             plan::Expr::Cast { operand, .. } => Ok(match operand.as_ref() {
-                plan::Expr::Literal(plan::Literal::Typed(value)) => match value.as_ref() {
+                plan::Expr::Literal(plan::Literal::Typed { value, .. }) => match value.as_ref() {
                     Datum::Text(text) => Some(text.clone()),
                     other => other.to_text(),
                 },
                 plan::Expr::Literal(plan::Literal::String(text)) => Some(text.clone()),
                 _ => None,
             }),
-            plan::Expr::Literal(plan::Literal::Typed(value)) => Ok(match value.as_ref() {
+            plan::Expr::Literal(plan::Literal::Typed { value, .. }) => Ok(match value.as_ref() {
                 Datum::Text(text) => Some(text.clone()),
                 other => other.to_text(),
             }),
@@ -7611,7 +7611,7 @@ fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {
                     // `double precision` where PostgreSQL says `numeric`, trading one wrong type
                     // for another. A typed literal carries the value itself and types as what it
                     // is.
-                    Err(_) => plan::Literal::Typed(Box::new(Datum::Numeric(
+                    Err(_) => plan::Literal::typed(Box::new(Datum::Numeric(
                         value::numeric::from_text(&text)?,
                     ))),
                 }
@@ -7632,14 +7632,14 @@ fn lower_value(value: &Value, negated: bool) -> Result<plan::Expr> {
         // `"B" is not a valid binary digit` is that envelope arriving at the value parser.
         Value::SingleQuotedByteStringLiteral(bits) => {
             refuse_if(negated, "a negated bit-string literal")?;
-            plan::Literal::Typed(Box::new(Datum::Bit {
+            plan::Literal::typed(Box::new(Datum::Bit {
                 varying: false,
                 bits: value::bit::from_text(bits)?,
             }))
         }
         Value::HexStringLiteral(digits) => {
             refuse_if(negated, "a negated bit-string literal")?;
-            plan::Literal::Typed(Box::new(Datum::Bit {
+            plan::Literal::typed(Box::new(Datum::Bit {
                 varying: false,
                 bits: value::bit::from_hex(digits)?,
             }))

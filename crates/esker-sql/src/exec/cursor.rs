@@ -2195,7 +2195,7 @@ fn expand(exprs: &[Expr], row: &[Datum], env: Env<'_>) -> Result<Vec<Vec<Datum>>
                         .and_then(|row| row.first())
                         .cloned()
                         .unwrap_or(Datum::Null);
-                    *expr = Expr::Literal(crate::plan::Literal::Typed(Box::new(value)));
+                    *expr = Expr::Literal(crate::plan::Literal::typed(Box::new(value)));
                     next += 1;
                 }
             });
@@ -2235,7 +2235,7 @@ fn declared_type_of(expr: &Expr) -> Option<ColumnType> {
     match expr {
         Expr::Ordinal { ty, .. } => Some(*ty),
         Expr::Cast { to, .. } => Some(*to),
-        Expr::Literal(crate::plan::Literal::Typed(value)) => value.column_type(),
+        Expr::Literal(crate::plan::Literal::Typed { value, .. }) => value.column_type(),
         // **`::oidvector` is a call and not a cast**, because the parser has no type for the name
         // (`parse::lower::cast_target` is the list) and `parse::lower` answers it with a
         // `CatalogFunc::OidVector`. Every arm here
@@ -2993,7 +2993,7 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
         // could ask.
         Expr::Literal(Literal::Decimal(digits)) => Datum::from_text(ColumnType::Numeric, digits)?,
         Expr::Literal(Literal::String(text)) => Datum::Text(text.clone()),
-        Expr::Literal(Literal::Typed(value)) => (**value).clone(),
+        Expr::Literal(Literal::Typed { value, .. }) => (**value).clone(),
         Expr::Column { name, .. } => {
             return Err(SqlError::Internal(format!(
                 "column \"{name}\" reached the executor unresolved"

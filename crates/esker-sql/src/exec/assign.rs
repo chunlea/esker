@@ -39,6 +39,7 @@ pub(super) fn into_column(
     value: Datum,
     column: &ColumnDef,
     user_type: Option<&crate::catalog::TypeDef>,
+    from: Option<u64>,
     rendering: crate::value::Rendering,
 ) -> Result<Datum> {
     // **An enum first, and by its own rule.** The column is an `int2` in the row, so every test
@@ -46,7 +47,7 @@ pub(super) fn into_column(
     // smallint` where a real server names the enum and the label it did not have.
     if let Some(def) = user_type {
         match &def.kind {
-            crate::catalog::TypeKind::Enum { .. } => return into_enum(value, column, def),
+            crate::catalog::TypeKind::Enum { .. } => return into_enum(value, column, def, from),
             // **A composite arrives as text and is stored canonically**, so what a client wrote
             // and what a real server would have printed are the same string by the time it is a
             // row: `'(Paris,Rue Basse)'` becomes `(Paris,"Rue Basse")`, which is
@@ -218,21 +219,25 @@ pub(super) fn user_type_of<'a>(
 /// `"1"` and answer `22P02` where a real server says
 /// `column "current_mood" is of type mood but expression is of type integer`, which is a different
 /// error about a different mistake.
-pub(super) fn enum_literal(literal: &crate::plan::Literal) -> Datum {
+pub(super) fn enum_literal(literal: &crate::plan::Literal) -> (Datum, Option<u64>) {
     use crate::plan::Literal;
     match literal {
-        Literal::Null | Literal::TypedNull(_) => Datum::Null,
-        Literal::String(text) => Datum::Text(text.clone()),
-        Literal::Typed(value) => (**value).clone(),
+        Literal::Null | Literal::TypedNull(_) => (Datum::Null, None),
+        Literal::String(text) => (Datum::Text(text.clone()), None),
+        // **The type it was cast to travels with it.** `'sad'::mood` is already this enum's
+        // ordinal and says which enum (`plan::Literal::Typed::user`, `debts-v1.1.md` #57); every
+        // other literal says nothing, which is what keeps `VALUES (1)` a `42804`.
+        Literal::Typed { value, user } => ((**value).clone(), *user),
         // A bare integer constant's datum is an `i64` whatever width it is *declared* — the
         // ladder narrows types and not values (ADR 0087) — and either way it is not a label.
-        Literal::Integer(value) => Datum::Int8(*value),
+        Literal::Integer(value) => (Datum::Int8(*value), None),
         // A bare decimal is a `numeric`, scale and all, so its datum is one too.
-        Literal::Decimal(digits) => {
+        Literal::Decimal(digits) => (
             <Datum as crate::value::PgDatum>::from_text(ColumnType::Numeric, digits)
-                .unwrap_or(Datum::Null)
-        }
-        Literal::Bool(flag) => Datum::Bool(*flag),
+                .unwrap_or(Datum::Null),
+            None,
+        ),
+        Literal::Bool(flag) => (Datum::Bool(*flag), None),
     }
 }
 
@@ -255,6 +260,7 @@ pub(super) fn into_enum(
     value: Datum,
     column: &ColumnDef,
     def: &crate::catalog::TypeDef,
+    from: Option<u64>,
 ) -> Result<Datum> {
     let crate::catalog::TypeKind::Enum { labels } = &def.kind else {
         return Err(SqlError::Internal(
@@ -273,6 +279,12 @@ pub(super) fn into_enum(
                 value: text,
             }),
         },
+        // **An ordinal that already says it is this enum.** `'sad'::mood` resolved to the label's
+        // ordinal and carries the type it was cast to, so a write takes the value it is — where
+        // before this was the `42804` below, for a statement a real server answers
+        // (`debts-v1.1.md` #57). **A bare `1` still cannot**: it carries no identity to match,
+        // which is the measured rule this arm sits above.
+        Datum::Int2(ordinal) if from == Some(def.oid) => Ok(Datum::Int2(ordinal)),
         other => Err(SqlError::DatatypeMismatchInColumn {
             column: column.name.clone(),
             column_type: def.name.clone(),

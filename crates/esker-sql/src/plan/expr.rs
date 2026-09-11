@@ -2412,10 +2412,33 @@ pub enum Literal {
     /// A value the planner already resolved against a column's type — a `timestamptz` read out of
     /// a quoted literal, say. It carries no ambiguity left to resolve, which is the point: the
     /// executor evaluates it and nothing re-reads the text.
-    Typed(Box<Datum>),
+    ///
+    /// **`user` is the type it was *declared* as, when a `ColumnType` cannot say.** An enum is
+    /// stored as its label's ordinal, so `'sad'::mood` resolves to a `Datum::Int2` and the name
+    /// `mood` has nowhere to live: `ColumnType` is a closed enum of storage types and
+    /// `plan::SelectItem::user_type` is a slot only the **projection** has. Without it a
+    /// comparison against an enum column was `42883 operator does not exist: mood = smallint`, a
+    /// write was `42804`, and a `UNION` answered ordinals under `smallint` — three readers, one
+    /// missing fact (`debts-v1.1.md` #57, ADR 0050's unfinished half).
+    ///
+    /// `None` is every other literal, which is most of them: the field says *which user-defined
+    /// type this value is a value of*, and a `bigint` is not one.
+    Typed {
+        /// The resolved value — an enum's ordinal, a date's day count, a range's canonical text.
+        value: Box<Datum>,
+        /// `catalog::TypeDef::oid`, when the value's type is one this vocabulary cannot spell.
+        user: Option<u64>,
+    },
 }
 
 impl Literal {
+    /// A resolved value with no user-defined type over it — the ordinary case, and the only one
+    /// there was before [`Literal::Typed::user`] existed.
+    #[must_use]
+    pub fn typed(value: Box<Datum>) -> Self {
+        Literal::Typed { value, user: None }
+    }
+
     /// The type name PostgreSQL uses for this literal when it complains about it.
     #[must_use]
     pub fn type_name(&self) -> &'static str {
@@ -2429,7 +2452,7 @@ impl Literal {
             Literal::Integer(value) if i32::try_from(*value).is_ok() => "integer",
             Literal::Integer(_) => "bigint",
             Literal::Decimal(_) => "numeric",
-            Literal::Typed(value) => value.column_type().map_or("unknown", ColumnType::name),
+            Literal::Typed { value, .. } => value.column_type().map_or("unknown", ColumnType::name),
             Literal::Bool(_) => "boolean",
         }
     }
@@ -2522,7 +2545,7 @@ impl Literal {
             // two-literal arm already ask, and it is measured twice over — 2,704 pairs as two
             // columns and 2,704 as two literals. Three readers of one question, and this was the
             // last one still answering it its own way (`debts-v1.1.md` #43).
-            Literal::Typed(value) => value
+            Literal::Typed { value, .. } => value
                 .column_type()
                 .is_none_or(|held| crate::exec::query::same_family(held, ty)),
         }
@@ -2762,7 +2785,7 @@ impl Literal {
             // **A `regclass` or `regtype` into an integer or `oid` column is the number it is**,
             // taken before `fits` can hand the name-carrying datum through: the same rule as
             // `into_column`'s, because this is the other write path (`crate::value::stored_shape`).
-            Literal::Typed(value)
+            Literal::Typed { value, .. }
                 if matches!(**value, Datum::RegClass { .. } | Datum::RegType { .. })
                     && matches!(
                         ty,
@@ -2775,7 +2798,7 @@ impl Literal {
                     crate::value::Rendering::default(),
                 )
             }
-            Literal::Typed(value) if value.fits(ty) => Ok((**value).clone()),
+            Literal::Typed { value, .. } if value.fits(ty) => Ok((**value).clone()),
             // **A whole `numeric` into an integer column is an assignment that can overflow,
             // and the overflow is the answer.** An integer literal past `int8` is a `numeric`
             // (see `lower_value`), so `INSERT INTO t (a_bigint) VALUES (9223372036854775808)` is
@@ -2792,7 +2815,7 @@ impl Literal {
             // Whole numbers only. A fractional `numeric` in an integer column is a rounding
             // assignment cast on a real server and neither this nor the `42804` below is that
             // answer; it is left where it was rather than given a second wrong one.
-            Literal::Typed(value)
+            Literal::Typed { value, .. }
                 if matches!(**value, Datum::Numeric(_))
                     && matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
                     && value
@@ -2822,7 +2845,7 @@ impl Literal {
             // measured, `UPDATE t SET int4arr = int8arr` is accepted, because an array's cast is
             // its element's and `bigint → integer` is an assignment cast. `exec::assign::coerce`
             // does it now, element by element, and so does the arm below this one.
-            Literal::Typed(value)
+            Literal::Typed { value, .. }
                 if matches!(**value, Datum::Array(_))
                     && esker_keys::array::ArrayValue::element_of(ty).is_some() =>
             {
@@ -2837,7 +2860,7 @@ impl Literal {
             // *column's* everywhere in this crate — a value whose flag disagrees does not `fit` —
             // so the literal is re-read as the column's type, the road the array arm above takes.
             // The length rule then applies as it does to any assignment, `22026` and all.
-            Literal::Typed(value)
+            Literal::Typed { value, .. }
                 if matches!(**value, Datum::Bit { .. })
                     && matches!(ty, ColumnType::Bit | ColumnType::VarBit) =>
             {
@@ -2855,7 +2878,9 @@ impl Literal {
             //
             // After the two arms above, not before: an array and a `B'…'` literal have their own
             // measured rules and this must not take them.
-            Literal::Typed(value) if crate::value::has_assignment_cast(value.column_type(), ty) => {
+            Literal::Typed { value, .. }
+                if crate::value::has_assignment_cast(value.column_type(), ty) =>
+            {
                 // **The boot rendering, because lowering has no session.** A cast folded here cannot ask
                 // which zone the client is in, which is the gap `tests/assignment_cast_date.rs`
                 // declares for `'…'::timestamptz::date` written as a literal.
@@ -2865,7 +2890,7 @@ impl Literal {
                     crate::value::Rendering::default(),
                 )
             }
-            Literal::Typed(_) => mismatch(),
+            Literal::Typed { .. } => mismatch(),
 
             Literal::Bool(value) => match ty {
                 ColumnType::Bool => Ok(Datum::Bool(*value)),

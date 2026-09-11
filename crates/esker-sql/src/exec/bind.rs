@@ -226,7 +226,7 @@ pub(super) fn substitute(
                     None => true,
                     Some(actual) => actual == ty || crate::exec::query::same_family(actual, ty),
                 };
-                let literal = Expr::Literal(Literal::Typed(Box::new(value)));
+                let literal = Expr::Literal(Literal::typed(Box::new(value)));
                 *expr = if carries_its_type {
                     literal
                 } else {
@@ -1576,7 +1576,7 @@ pub(super) fn substitute_placeholders(statement: &mut Statement, types: &[Column
         if let Expr::Parameter(number) = expr {
             let at = (*number as usize).saturating_sub(1);
             let ty = types.get(at).copied().unwrap_or(ColumnType::Text);
-            let stand_in = Expr::Literal(Literal::Typed(Box::new(placeholder(ty))));
+            let stand_in = Expr::Literal(Literal::typed(Box::new(placeholder(ty))));
             // **A placeholder carries a representation; a parameter has a *type*.** For most types
             // those are the same thing and the datum answers for both. For the ones that share
             // `text`'s storage — `hstore`, `xml`, `void`, the two vectors — the stand-in *is* a

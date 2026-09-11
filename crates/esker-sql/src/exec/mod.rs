@@ -2033,7 +2033,7 @@ impl Executor {
             bind::walk_expr_mut(expr, &mut |expr: &mut Expr| {
                 if matches!(expr, Expr::Sequence(_)) {
                     if let Some(value) = values.get(at) {
-                        *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Int8(*value))));
+                        *expr = Expr::Literal(Literal::typed(Box::new(Datum::Int8(*value))));
                     }
                     at += 1;
                 }
@@ -2668,7 +2668,7 @@ impl Executor {
         }
         let mut resolve = |expr: &mut Expr| {
             if matches!(expr, Expr::CurrentDatabase) {
-                *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Text(self.database.clone()))));
+                *expr = Expr::Literal(Literal::typed(Box::new(Datum::Text(self.database.clone()))));
             }
         };
         bind::walk_mut(statement, &mut resolve);
@@ -2690,7 +2690,7 @@ impl Executor {
             .unwrap_or_else(|| self.user.clone());
         let mut resolve = |expr: &mut Expr| {
             if matches!(expr, Expr::CurrentUser) {
-                *expr = Expr::Literal(Literal::Typed(Box::new(Datum::Text(who.clone()))));
+                *expr = Expr::Literal(Literal::typed(Box::new(Datum::Text(who.clone()))));
             }
         };
         bind::walk_mut(statement, &mut resolve);
@@ -3120,7 +3120,7 @@ impl Executor {
                     // under the wrong declared type.
                     None => Expr::Literal(Literal::TypedNull(ColumnType::Name)),
                     Some(first) => Expr::Cast {
-                        operand: Box::new(Expr::Literal(Literal::Typed(Box::new(Datum::Text(
+                        operand: Box::new(Expr::Literal(Literal::typed(Box::new(Datum::Text(
                             first.clone(),
                         ))))),
                         to: ColumnType::Name,
@@ -3143,7 +3143,7 @@ impl Executor {
                     // is compared against in every catalog query `ActiveRecord` sends. It was the
                     // *text* of an array while this node had no array of `name`, so the column was
                     // declared `text` and a client decoding by OID got a string.
-                    Expr::Literal(Literal::Typed(Box::new(Datum::Array(
+                    Expr::Literal(Literal::typed(Box::new(Datum::Array(
                         esker_keys::array::ArrayValue::one_dimensional(
                             ColumnType::Name,
                             1,
@@ -3280,26 +3280,47 @@ impl Executor {
         let path = self.resolution_path(txn)?;
         let view = self.catalog_view(txn)?;
         if let Statement::Select(select) = statement {
-            for item in &mut select.projection {
-                let crate::plan::SelectItem::Expr {
-                    expr, user_type, ..
-                } = item
-                else {
-                    continue;
-                };
-                // **What the cast named, before it is folded away.** The value a client gets is
-                // the label (ADR 0050) and the type it is told is the enum's, which is the pair
-                // `OID::Enum` is built from; taken here because this is the last place the type's
-                // name is still in the tree.
-                let named = Self::cast_target(&view, &mut types, expr, &path);
-                match Self::user_cast(&view, &mut types, expr, true, &path) {
-                    Ok(Some(resolved)) => {
-                        *expr = resolved;
-                        *user_type = named;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        failure.get_or_insert(error);
+            // **Every arm's projection, not the head's.** A set operation is one statement and its
+            // columns are unified across the arms (`query::append`), so a `user_type` slot filled
+            // on one side and left empty on the other unifies to *nothing*: `SELECT m FROM t UNION
+            // SELECT 'sad'::mood` was declared `smallint` and sent the ordinals, where a real
+            // server answers `mood` and the labels. The same hole the walkers in `exec::bind` had
+            // (`debts-v1.1.md` #57 (a)), in the one loop that is not a walker.
+            // **A set operation's columns are values, not renderings.** The projection rule is
+            // that a cast to an enum *prints* as its label (ADR 0050) — right for a column a
+            // client reads, and wrong for an arm, whose value has to unify with the other arm's
+            // **ordinal**: printing it made `SELECT m FROM t UNION SELECT 'sad'::mood` into
+            // `42804 UNION types smallint and text cannot be matched`. So when there are arms,
+            // every arm's projection — the head's included, it is one of them — resolves to the
+            // ordinal and carries the type beside it, and the *set's* column renders the label
+            // out of the `user_type` `query::append` unified.
+            let printed = select.set_arms.is_empty();
+            let mut projections = vec![&mut select.projection];
+            for arm in &mut select.set_arms {
+                projections.push(&mut arm.select.projection);
+            }
+            for projection in projections {
+                for item in projection {
+                    let crate::plan::SelectItem::Expr {
+                        expr, user_type, ..
+                    } = item
+                    else {
+                        continue;
+                    };
+                    // **What the cast named, before it is folded away.** The value a client gets
+                    // is the label (ADR 0050) and the type it is told is the enum's, which is the
+                    // pair `OID::Enum` is built from; taken here because this is the last place
+                    // the type's name is still in the tree.
+                    let named = Self::cast_target(&view, &mut types, expr, &path);
+                    match Self::user_cast(&view, &mut types, expr, printed, &path) {
+                        Ok(Some(resolved)) => {
+                            *expr = resolved;
+                            *user_type = named;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            failure.get_or_insert(error);
+                        }
                     }
                 }
             }
@@ -3494,7 +3515,7 @@ impl Executor {
             // function's own declared reason for the `want_oid` flag, and it is why the flag can
             // stay: `::oid` still asks for an `oid` and gets one.
             let oid = u32::try_from(def.oid).unwrap_or(u32::MAX);
-            return Ok(Some(Expr::Literal(Literal::Typed(Box::new(
+            return Ok(Some(Expr::Literal(Literal::typed(Box::new(
                 if *want_oid {
                     Datum::Oid(oid)
                 } else {
@@ -3535,7 +3556,7 @@ impl Executor {
         if let crate::catalog::TypeKind::Composite { fields } = &def.kind {
             let text = match operand {
                 Expr::Literal(Literal::String(text)) => text.clone(),
-                Expr::Literal(Literal::Typed(value)) => match &**value {
+                Expr::Literal(Literal::Typed { value, .. }) => match &**value {
                     Datum::Text(text) => text.clone(),
                     _ => return Err(SqlError::unsupported(format!("the type {name}"))),
                 },
@@ -3543,7 +3564,7 @@ impl Executor {
                 Expr::Literal(Literal::Null) => return Ok(Some(Expr::Literal(Literal::Null))),
                 _ => return Err(SqlError::unsupported(format!("a cast to {name} per row"))),
             };
-            return Ok(Some(Expr::Literal(Literal::Typed(Box::new(Datum::Text(
+            return Ok(Some(Expr::Literal(Literal::typed(Box::new(Datum::Text(
                 crate::value::composite::canonicalise(&text, fields.len())?,
             ))))));
         }
@@ -3552,7 +3573,7 @@ impl Executor {
         // the type is the honest answer rather than a value read some other way.
         let text = match operand {
             Expr::Literal(Literal::String(text)) => text.clone(),
-            Expr::Literal(Literal::Typed(value)) => match &**value {
+            Expr::Literal(Literal::Typed { value, .. }) => match &**value {
                 Datum::Text(text) => text.clone(),
                 _ => return Err(SqlError::unsupported(format!("the type {name}"))),
             },
@@ -3580,7 +3601,7 @@ impl Executor {
                     PgDatum::to_text(&value).unwrap_or_default(),
                 ))
             } else {
-                Expr::Literal(Literal::Typed(Box::new(value)))
+                Expr::Literal(Literal::typed(Box::new(value)))
             }));
         }
         // **A range's value is the range**, where an enum's is an ordinal — the two halves of
@@ -3602,7 +3623,7 @@ impl Executor {
                     PgDatum::to_text(&value).unwrap_or_default(),
                 ))
             } else {
-                Expr::Literal(Literal::Typed(Box::new(value)))
+                Expr::Literal(Literal::typed(Box::new(value)))
             }));
         }
         let crate::catalog::TypeKind::Enum { labels } = &def.kind else {
@@ -3621,7 +3642,16 @@ impl Executor {
             // is, now that the ordinal above has proved the type has it.
             Expr::Literal(Literal::String(text))
         } else {
-            Expr::Literal(Literal::Typed(Box::new(Datum::Int2(ordinal))))
+            // **The ordinal, and which enum it is the ordinal of.** An enum is stored as an
+            // `int2`, so folding to the value alone threw the type's name away and left a
+            // comparison, a write and a `UNION` each with an `int2` where a `mood` was written —
+            // `42883 operator does not exist: mood = smallint` for a statement a real server
+            // answers (`debts-v1.1.md` #57, ADR 0050's unfinished half). `ColumnType` cannot
+            // spell `mood`; the oid can, and the catalog has the labels behind it.
+            Expr::Literal(Literal::Typed {
+                value: Box::new(Datum::Int2(ordinal)),
+                user: Some(def.oid),
+            })
         }))
     }
 
@@ -3669,7 +3699,7 @@ impl Executor {
                     }
                     Ok(Some(printed)) => match self.relation_oid(&mut relations, txn, name) {
                         Ok(oid) => {
-                            *expr = Expr::Literal(Literal::Typed(Box::new(Datum::RegClass {
+                            *expr = Expr::Literal(Literal::typed(Box::new(Datum::RegClass {
                                 oid,
                                 name: printed.into(),
                             })));
@@ -3697,7 +3727,7 @@ impl Executor {
                         .ok()
                         .flatten()
                         .unwrap_or_else(|| oid.to_string());
-                    *expr = Expr::Literal(Literal::Typed(Box::new(Datum::RegClass {
+                    *expr = Expr::Literal(Literal::typed(Box::new(Datum::RegClass {
                         oid,
                         name: printed.into(),
                     })));
@@ -3960,7 +3990,7 @@ fn advisory_key(
     let integer = |expr: &Expr| -> Option<i64> {
         match expr {
             Expr::Literal(Literal::Integer(value)) => Some(*value),
-            Expr::Literal(Literal::Typed(datum)) => match **datum {
+            Expr::Literal(Literal::Typed { value: datum, .. }) => match **datum {
                 Datum::Int8(value) => Some(value),
                 Datum::Int4(value) => Some(i64::from(value)),
                 _ => None,
@@ -4329,7 +4359,7 @@ fn described(columns: &[query::OutputColumn]) -> Vec<FieldDescription> {
 fn void_value() -> crate::plan::Expr {
     use crate::plan::{Expr, Literal};
     Expr::Cast {
-        operand: Box::new(Expr::Literal(Literal::Typed(Box::new(Datum::Text(
+        operand: Box::new(Expr::Literal(Literal::typed(Box::new(Datum::Text(
             String::new(),
         ))))),
         to: ColumnType::Void,

@@ -1512,7 +1512,7 @@ fn render_literal(literal: &Literal) -> String {
         Literal::String(text) => quoted(text),
         // Already resolved against a column's type, so it prints the way that type prints — the
         // same text a client would see the value as in a result.
-        Literal::Typed(value) => match value.as_ref() {
+        Literal::Typed { value, .. } => match value.as_ref() {
             Datum::Null => "NULL".to_owned(),
             Datum::Text(text) => quoted(text),
             other => other.to_text().unwrap_or_else(|| "NULL".to_owned()),

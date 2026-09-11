@@ -977,7 +977,7 @@ fn literal_value(literal: &crate::plan::Literal) -> Routed<esker_columnar::Value
         Literal::Bool(flag) => Value::Bool(*flag),
         Literal::Integer(int) => Value::Int8(*int),
         Literal::String(text) => Value::Text(text.clone()),
-        Literal::Typed(datum) => datum_to_value(datum),
+        Literal::Typed { value: datum, .. } => datum_to_value(datum),
         Literal::Decimal(digits) => {
             let Ok(Datum::Double(double)) =
                 Datum::from_text(crate::value::ColumnType::Double, digits)
