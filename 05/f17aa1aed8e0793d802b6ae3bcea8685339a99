@@ -1,0 +1,19 @@
+crates/esker-sql/tests/cluster/mod.rs
+  s_ac192c209f55d3::t_44c7a6c33dfc8f 212-222
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "05f17aa1aed8e0793d802b6ae3bcea8685339a99",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
