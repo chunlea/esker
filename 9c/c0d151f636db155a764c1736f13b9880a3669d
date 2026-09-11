@@ -1,0 +1,53 @@
+crates/esker-sql/src/catalog/information_schema.rs
+  s_ac192c209f55d3::t_40ea8547f6ab70 36,48,100,186-188,215,218-220,404-405,464
+crates/esker-sql/src/catalog/mod.rs
+  s_ac192c209f55d3::t_6c855478914895 2440-2444,2448-2451,2462-2481,2564,2573-2612,2775,2790-2905,2966-2972,2977,2997-3001,3003,3006,3019,3032-3034,3036,3054-3056,3058,4608,4614,4618,4665-4670,4674-4678
+crates/esker-sql/src/catalog/pg_attribute.rs
+  s_ac192c209f55d3::t_1df1c3b1e37ffa 49,89,201
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_ac192c209f55d3::t_323ef7408a3be1 1144-1145,1166,1628,2023,2048-2052,2057,2064,2096,2127,2150,2589,2674,2726,3098,3100,3176,3198
+crates/esker-sql/src/catalog/pg_constraint.rs
+  s_ac192c209f55d3::t_1ac8d87b3cc48c 192-194
+crates/esker-sql/src/catalog/pg_index.rs
+  s_ac192c209f55d3::t_75dc7f4d0ba40b 51
+crates/esker-sql/src/catalog/pg_relations.rs
+  s_ac192c209f55d3::t_e4f87c94c426c5 44,98,152,174-180,192,213-216,220-222,308,312,315,322,391,394,405,436,450,471,493-497,499,501,504,516
+crates/esker-sql/src/exec/cursor.rs
+  s_ac192c209f55d3::t_9e9f7cf62d62ac 19,129,1361,1402,1405
+crates/esker-sql/src/exec/ddl.rs
+  s_ac192c209f55d3::t_fdb9ccde856a5d 405-410,1045,1102,2078,2271,2552,3557,3590,3729,4291,4311-4315,4370,4377,4393,4396,4404-4407,4409,4697,4723,4779,4784
+crates/esker-sql/src/exec/dml.rs
+  s_ac192c209f55d3::t_ad2a7f90e2a99a 245-247,252
+crates/esker-sql/src/exec/mod.rs
+  s_ac192c209f55d3::t_aaabeabc694ba3 647,1529,2929,2952,2987,3281,3294-3295,3307-3314,3366,3369,3387-3388,3406,3424-3425,3440,3459,3476,3480,3520,3729,3745,3759,3788,3875,3898,3900-3903,4722,4724,4728
+crates/esker-sql/src/exec/typedef.rs
+  s_ac192c209f55d3::t_1da649ac211dd8 45,102,163,172,201,246,250-255,264,276,336,363,408
+crates/esker-sql/src/stmt_stats.rs
+  s_ac192c209f55d3::t_23bb319725323a 39-56,60-61,102-103
+crates/esker-sql/tests/catalog_cache_invalidation.rs
+  s_ac192c209f55d3::t_af03ff8ac49f92 1-272
+crates/esker-sql/tests/catalog_read_slope.rs
+  s_ac192c209f55d3::t_0c9c8260329229 1-2,5-7,19-27,29-39,41-45,47,49-58,108-109,115-117,120,176-179,222-282
+docs/adr/0106-what-a-statement-reads-below-the-sql.md
+  s_ac192c209f55d3::t_04f25b0be3bed7 3-4,6-9,470-538
+docs/bench/statement-reads.md
+  s_ac192c209f55d3::t_fff7b9f14147f9 12-15,17-19,21-232,234-237
+docs/plans/debt-49-catalog-cache.md
+  s_ac192c209f55d3::t_a2a454c02dba35 3-5,360-432
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9cc0d151f636db155a764c1736f13b9880a3669d",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
