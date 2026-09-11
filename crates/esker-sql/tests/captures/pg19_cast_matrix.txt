@@ -119,7 +119,7 @@
 # rows the list holds after the five bad ones were corrected:
 #
 #     now agree                      **326**
-#     node refuses, PG answers         **6**   <- was 54
+#     node refuses, PG answers         **6**   <- was 54; then 2 were fixed and 4 declared, so **0**
 #     node answers, PG refuses         **0**   <- was 11
 #     both refuse, different code     **20**   <- was 292
 #
@@ -140,11 +140,17 @@
 # roads a `regtype` arrives by. It closed `<integer>[] -> regtype[]`, the vectors' last two rows,
 # and a declared divergence in `tests/regtype.rs` whose reason had stated the rule.
 #
-# **What is left is four rows in one item, and it is a ruling rather than a fix** — the five bad
-# rows are corrected rather than counted, in the section above, and the two defects are closed.
+# **Nothing is left in this column.** The five bad rows are corrected rather than counted, in the
+# section above; the two defects are closed; and the last four are **a declared divergence**,
+# ruled by the user on 2026-09-11 on [ADR 0097]'s own text:
 #
-#     22003  4   `regclass -> integer|oid` and their arrays: ADR 0097's 64-bit ids against a
-#                four-byte oid. **A ruling, not a fix** — it is the id and not the cast.
+#     22003  4   `regclass -> integer|oid` and their arrays. Relation ids here are `u64` and an
+#                `oid` is four bytes, which that ADR decided and wrote into its consequences in
+#                the same words this node answers in — "answering a truncated oid would be a wrong
+#                value under a right type". Pinned in `tests/user_decided_divergences.rs`, with
+#                the two spellings that are **not** a narrowing (`::bigint`, `::text`) beside them.
+#
+# [ADR 0097]: ../../../../docs/adr/0097-an-oid-is-four-bytes-and-a-derived-one-is-not.md
 #
 # `"char"[] -> integer[]` **was** the "one parameter away" row and is closed: `cast_one_value`
 # takes the operand's declared type now, so an element's cast knows what the element was, and the
