@@ -73,6 +73,20 @@ impl Route {
     /// what that looks like from outside — losing one store refused 184 statements in 0.695 s.
     #[must_use]
     pub fn target_at(&self, attempt: u32) -> Option<&Peer> {
+        self.target_at_skipping(attempt, &[])
+    }
+
+    /// The same choice, with the stores this call has already found unreachable left out.
+    ///
+    /// **A corpse answers no faster the fourth time.** With the leader unknown the rotation is by
+    /// attempt number, so a dead store comes round again every `peers.len()` attempts — each one
+    /// a connection refused and a backoff, spent on a peer this call has already watched fail.
+    /// Skipping them is what turns "wait for the election" into "ask the ones that can answer",
+    /// and it is why a read that has to wait now waits on the *cluster* rather than on a rota.
+    ///
+    /// All of them dead is not an error here: the rota is used unchanged, the attempt fails like
+    /// any other, and the call's deadline is what ends it.
+    pub fn target_at_skipping(&self, attempt: u32, corpses: &[u64]) -> Option<&Peer> {
         if let Some(leader) = self.leader.as_ref() {
             return Some(leader);
         }
@@ -80,7 +94,14 @@ impl Route {
         if peers.is_empty() {
             return None;
         }
-        peers.get(attempt as usize % peers.len())
+        let live: Vec<&Peer> = peers
+            .iter()
+            .filter(|peer| !corpses.contains(&peer.store_id))
+            .collect();
+        if live.is_empty() {
+            return peers.get(attempt as usize % peers.len());
+        }
+        live.get(attempt as usize % live.len()).copied()
     }
 }
 
