@@ -434,9 +434,30 @@ impl DbInner {
         // the inputs guarantees it would not be: the whole point of taking it is to apply it
         // and drop it. Moving the file instead would carry the tombstone to L1 and break the
         // invariant that nothing below L0 holds one.
+        //
+        // **And it is only trivial where the rewrite would have dropped nothing** (#62). The two
+        // clauses above name the two reasons the bytes would change that this code already knew
+        // about; the third is the ordinary one and was missing. A file arriving at the bottom
+        // level is a file whose point tombstones have just become droppable — nothing below can
+        // still be hiding an older value from them — and a move carries them down unread instead,
+        // where nothing will ever compact with them again because there is nothing below to
+        // compact with. That is how a column family with no filter kept every put and every
+        // delete it had ever written: 3,546 entries, unchanged by a full compaction, walked by
+        // every scan that crossed them. Rewriting on arrival is the standard cost of reaching the
+        // bottom, and it is what buys the space back.
+        //
+        // **The last level, not merely "nothing overlaps below".** Either would fix the bug, and
+        // this one is both cheaper and the standard rule: a file on its way down is moved for
+        // free through every level above the bottom and rewritten once when it arrives. Taking
+        // the overlap test instead would rewrite at *every* level of an otherwise empty family,
+        // paying the merge six times over to drop the same entries once.
+        let arriving_at_the_bottom = version
+            .cf(compaction.cf)
+            .is_some_and(|cf_version| compaction.output_level() + 1 >= cf_version.num_levels());
         let trivial = compaction.is_trivial_move()
             && cf.options().compaction_filter.is_none()
-            && tombstones.is_empty();
+            && tombstones.is_empty()
+            && !arriving_at_the_bottom;
         // Kept past the branch: once the edit naming them is durable, these are the numbers
         // the register has no further reason to hold.
         let mut outputs: Vec<FileMeta> = Vec::new();
