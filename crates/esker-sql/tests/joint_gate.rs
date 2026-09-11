@@ -950,20 +950,39 @@ fn compare(gate: &Gate, what: &Comparison) {
         }
     }
 
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target")
-        .join(format!("joint-gate-disagreement-{}.txt", what.ts));
-    let written = std::fs::write(&path, &dump);
+    let landed = write_dump(&dump, what.ts);
     panic!(
-        "the columnar copy and the row store disagree at ts {}; dump {} at {}\n{dump}",
-        what.ts,
-        if written.is_ok() {
-            "written"
-        } else {
-            "NOT written"
-        },
-        path.display(),
+        "the columnar copy and the row store disagree at ts {}; dump {}\n{dump}",
+        what.ts, landed,
     );
+}
+
+/// Writes the dump somewhere that exists, and says where.
+///
+/// **The first place this tried did not exist in the container the gate runs in.** It was
+/// `CARGO_MANIFEST_DIR/../../target`, which is `/work/target` there — while cargo's target
+/// directory is a volume mounted at `/target`, named by `CARGO_TARGET_DIR`. So the one time this
+/// fired on the gate it reported `dump NOT written`, and the only reason the failure was
+/// diagnosable at all is that the panic message carries the dump inline as well.
+///
+/// Three places, first that works: `CARGO_TARGET_DIR` when the build sets one, then the
+/// manifest-relative `target` a plain `cargo test` on a host has, then the temporary directory,
+/// which exists everywhere. Returning where it landed rather than whether it landed, because
+/// "written" without a path is what sent somebody looking in the wrong container.
+fn write_dump(dump: &str, ts: u64) -> String {
+    let name = format!("joint-gate-disagreement-{ts}.txt");
+    let candidates = [
+        std::env::var_os("CARGO_TARGET_DIR").map(std::path::PathBuf::from),
+        Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")),
+        Some(std::env::temp_dir()),
+    ];
+    for directory in candidates.into_iter().flatten() {
+        let path = directory.join(&name);
+        if std::fs::write(&path, dump).is_ok() {
+            return format!("written at {}", path.display());
+        }
+    }
+    "NOT written anywhere: the dump is inline above".to_owned()
 }
 
 /// Everything one comparison is made of, so the dump can say all of it.
