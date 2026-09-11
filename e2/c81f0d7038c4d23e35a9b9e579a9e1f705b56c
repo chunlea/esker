@@ -1,0 +1,49 @@
+crates/esker-cli/tests/admin_storage.rs
+  s_ac192c209f55d3::t_92e7d4bbdeb02b 24-25,41-44,46
+crates/esker-cli/tests/client_reconnect.rs
+  s_ac192c209f55d3::t_3c4e76b9f69276 27-29,54-57,59
+crates/esker-cli/tests/cluster_chaos.rs
+  s_ac192c209f55d3::t_f000eddf78cb9d 26-27,74,76-79,81
+crates/esker-cli/tests/cluster_harness/mod.rs
+  s_ac192c209f55d3::t_39f1bd2fc96116 15-17,20,642-644,646
+crates/esker-cli/tests/cluster_pd_group.rs
+  s_ac192c209f55d3::t_21c84af20ca41b 25-26,45-48,50
+crates/esker-cli/tests/cluster_start.rs
+  s_ac192c209f55d3::t_5ab0bc66298155 19-20,90,92-93,95
+crates/esker-cli/tests/columnar_cluster.rs
+  s_ac192c209f55d3::t_007df610387728 34-35,213-216,218
+crates/esker-cli/tests/data_dir_lock.rs
+  s_ac192c209f55d3::t_69a919c71ce67f 15-16,30-33,35
+crates/esker-cli/tests/durability_pd_failover.rs
+  s_ac192c209f55d3::t_075f375646d16e 27-29,218-222,224
+crates/esker-cli/tests/pgwire_cluster.rs
+  s_ac192c209f55d3::t_894b64e55df127 38-39,41,242-246,248
+crates/esker-cli/tests/pgwire_pd_failover.rs
+  s_ac192c209f55d3::t_61625ee7dc1bb8 31-32,34,326-330,332
+crates/esker-cli/tests/port_band/mod.rs
+  s_ac192c209f55d3::t_776ac592b54d82 1-126
+crates/esker-cli/tests/ports.rs
+  s_ac192c209f55d3::t_1c5e21ad753ab1 1-69
+crates/esker-cli/tests/region_census.rs
+  s_ac192c209f55d3::t_87e3e08c2dd779 14-15,38-41,43
+crates/esker-cli/tests/store_starts_before_its_driver.rs
+  s_ac192c209f55d3::t_46d1e3e61168d2 35-36,60-63,65
+crates/esker-cli/tests/tier_acceptance.rs
+  s_ac192c209f55d3::t_68fb2c6b65b86f 43-44,98,100-103,105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e2c81f0d7038c4d23e35a9b9e579a9e1f705b56c",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
