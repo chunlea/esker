@@ -465,3 +465,67 @@ fn an_element_cast_knows_what_the_element_was() {
         vec![vec!["42", "{42}"]]
     );
 }
+
+/// **A `line` converts to nothing, and the refusal has to come before the parse** — wire v3 family
+/// F12, and the six rows the two-mode sweep found.
+///
+/// `'{1,-1,0}'::line::box` was `22P02 invalid input syntax for type line: "{1,-1,0}"` — a
+/// complaint about the **value**, for a pair that has no cast and whose value is the type's own
+/// canonical text. `value::geometric::to_point` and `convert` both open by reading the source's
+/// coordinates and only then reach the arm that says a `line` has no conversion; a line's
+/// `{A,B,C}` is three coefficients, not a coordinate list, so the parse failed first and answered
+/// about the wrong thing. A gate below a parse, which is this crate's recurring shape.
+///
+/// Measured on 19beta1, 2026-09-11, all six and in both spellings — `42846 cannot cast type line
+/// to <target>`, and the prepared form refuses at `PREPARE`, which is where this node refuses it
+/// too (`bind_infers_over_the_wire.rs::a_line_is_refused_by_the_pair_through_a_bound_parameter`
+/// is that half).
+///
+/// **The bind path was right all along**, which is the only reason this was visible: a bound
+/// parameter's cast is not folded at lowering, so it reaches `exec::cursor` where `casts_to`
+/// refuses the pair before any geometry is read. One-mode sweeps of either kind would have shown a
+/// clean column or a wrong one with no way to tell which.
+#[test]
+fn a_line_is_refused_by_the_pair_and_not_by_its_own_text() {
+    let mut node = parity::Node::new(&["CREATE TABLE ln (id bigint primary key, l line)"]);
+    for target in ["box", "circle", "lseg", "path", "point", "polygon"] {
+        assert_eq!(
+            node.answer(&format!("SELECT '{{1,-1,0}}'::line::{target}"))
+                .to_string(),
+            format!("!42846 cannot cast type line to {target}"),
+            "'{{1,-1,0}}'::line::{target}"
+        );
+        // The same pair through a **column**, which took the other road and was right: one answer
+        // per pair, whichever way it is written.
+        assert_eq!(
+            node.answer(&format!("SELECT l::{target} FROM ln"))
+                .to_string(),
+            format!("!42846 cannot cast type line to {target}"),
+            "a column of line to {target}"
+        );
+    }
+    // **A line still reads and prints**, which is what says the refusal is about the pair: the
+    // text the cast was blaming is the type's own canonical form, and the bracket spelling folds
+    // to it.
+    assert_eq!(
+        node.rows("SELECT ('{1,-1,0}'::line)::text, ('[(0,0),(1,1)]'::line)::text"),
+        vec![vec!["{1,-1,0}", "{1,-1,0}"]]
+    );
+    // **And the fourteen conversions that do exist are untouched**, including the two that read
+    // their coordinates the same way — the guard goes above the parse, not instead of it.
+    assert_eq!(
+        node.rows("SELECT ('((0,0),(1,1))'::box::circle)::text"),
+        vec![vec!["<(0.5,0.5),0.7071067811865476>"]]
+    );
+    assert_eq!(
+        node.rows("SELECT ('((0,0),(1,1))'::box::point)::text"),
+        vec![vec!["(0.5,0.5)"]]
+    );
+    // An **open** path still refuses with its own sentence, which is a value-shaped refusal that
+    // has to survive: `22023` about the path, not `42846` about the pair.
+    assert_eq!(
+        node.answer("SELECT '[(0,0),(1,1)]'::path::polygon")
+            .to_string(),
+        "!22023 open path cannot be converted to polygon"
+    );
+}

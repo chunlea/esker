@@ -160,6 +160,37 @@ fn a_relations_regclass_does_not_narrow_to_an_oid() {
     ] {
         assert_eq!(node.answer(sql).to_string(), refusal, "{sql}");
     }
+    // **The same four through a bound parameter, and the same sentence.** A declared divergence
+    // that refuses with one code as a literal and another through a bind is two boundaries
+    // wearing one ruling: `$1::regclass::oid` was `0A000 the cast $1::oid is not supported` —
+    // a refusal *by name*, from the lowering, which says nothing about the id at all. Measured and
+    // fixed 2026-09-11 on the coordinator's ruling: one boundary, one sentence, and the sentence
+    // is the ADR's.
+    for (sql, refusal) in [
+        (
+            "SELECT $1::regclass::integer",
+            "!22003 integer out of range",
+        ),
+        (
+            "SELECT $1::regclass::oid",
+            "!22003 value \"9223372036854774786\" is out of range for type oid",
+        ),
+    ] {
+        assert_eq!(bound(sql, "pg_class"), refusal, "{sql}");
+    }
+    for (sql, refusal) in [
+        (
+            "SELECT $1::regclass[]::integer[]",
+            "!22003 integer out of range",
+        ),
+        (
+            "SELECT $1::regclass[]::oid[]",
+            "!22003 value \"9223372036854774786\" is out of range for type oid",
+        ),
+    ] {
+        assert_eq!(bound(sql, "{\"pg_class\"}"), refusal, "{sql}");
+    }
+
     // **And the two spellings that are not a narrowing still answer**, which is what keeps this a
     // boundary rather than a hole: the id is a `bigint` and the name is what a `regclass` prints.
     assert_eq!(
@@ -170,4 +201,66 @@ fn a_relations_regclass_does_not_narrow_to_an_oid() {
         node.rows("SELECT ('pg_class'::regclass)::text"),
         vec![vec!["pg_class"]]
     );
+}
+
+/// One statement through `Parse`/`Describe`/`Bind`/`Execute` with **no declared type** — the shape
+/// a driver sends — answering `ok` or the `!SQLSTATE message` of whichever step refused.
+///
+/// Here rather than in the harness because two tests in this repository drive the extended
+/// protocol and they want different things out of it: this one wants the sentence, and
+/// `bind_infers_over_the_wire.rs` wants the wire's type OID.
+fn bound(sql: &str, value: &str) -> String {
+    use esker_sql::pgwire::message::{Frontend, Target};
+
+    let mut node = parity::Node::new(&[]);
+    let mut session = esker_sql::pgwire::session::Session::new();
+    let mut send = |message: &Frontend, node: &mut parity::Node| {
+        let mut out = Vec::new();
+        session.handle(message, &mut node.executor, &mut out);
+        let text = String::from_utf8_lossy(&out).to_string();
+        let parts: Vec<&str> = text.split('\u{0}').collect();
+        if parts
+            .iter()
+            .any(|part| *part == "SERROR" || *part == "VERROR")
+        {
+            let code = parts
+                .iter()
+                .find(|part| part.starts_with('C') && part.len() == 6)
+                .map_or("?????", |part| &part[1..]);
+            let message = parts
+                .iter()
+                .find(|part| part.starts_with('M'))
+                .map_or("", |part| &part[1..]);
+            return format!("!{code} {message}");
+        }
+        "ok".to_owned()
+    };
+    for message in [
+        Frontend::Parse {
+            statement: "d".to_owned(),
+            sql: sql.to_owned(),
+            param_types: Vec::new(),
+        },
+        Frontend::Describe {
+            target: Target::Statement,
+            name: "d".to_owned(),
+        },
+        Frontend::Bind {
+            portal: "e".to_owned(),
+            statement: "d".to_owned(),
+            param_formats: Vec::new(),
+            params: vec![Some(value.as_bytes().to_vec())],
+            result_formats: Vec::new(),
+        },
+        Frontend::Execute {
+            portal: "e".to_owned(),
+            max_rows: 0,
+        },
+    ] {
+        let answer = send(&message, &mut node);
+        if answer.starts_with('!') {
+            return answer;
+        }
+    }
+    "ok".to_owned()
 }
