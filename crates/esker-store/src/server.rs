@@ -2048,6 +2048,36 @@ impl Store {
             AdminReq::Regions => Ok(AdminResp::Regions {
                 regions: self.region_statuses(),
             }),
+            // ADR 0109. Both answer only when the work is done: `Db::flush_all` blocks on the
+            // flush job and `compact_range` on the compaction it schedules, so neither adds a
+            // cadence of its own — and an operator's flush that returned early would be useless
+            // to the measurement it exists for.
+            AdminReq::Flush => {
+                self.flush()?;
+                Ok(AdminResp::Flushed {
+                    families: self.sst_files()?,
+                })
+            }
+            AdminReq::Compact { cf } => {
+                if cf.is_empty() {
+                    for name in self.cf_names() {
+                        self.compact_cf(&name)?;
+                    }
+                } else {
+                    // Named and absent is an operator's typo, and it is worth saying which names
+                    // there are rather than handing back the engine's "no such column family".
+                    if !self.cf_names().contains(&cf) {
+                        return Err(ProtoError::invalid(format!(
+                            "no column family named `{cf}`; this store holds {}",
+                            self.cf_names().join(", ")
+                        )));
+                    }
+                    self.compact_cf(&cf)?;
+                }
+                Ok(AdminResp::Compacted {
+                    families: self.sst_files()?,
+                })
+            }
             AdminReq::TransferLeader {
                 region_id,
                 to_peer_id,
@@ -3377,8 +3407,42 @@ impl Store {
     /// For an operator forcing a collection, and for the tests that check one happened: a
     /// safepoint changes nothing until a compaction reads the entries it applies to.
     pub fn compact_write_cf(&self) -> Result<()> {
-        self.db.compact_range(cf::WRITE, None, None)?;
+        self.compact_cf(cf::WRITE)
+    }
+
+    /// Compacts one column family, end to end, and returns when it has finished
+    /// ([ADR 0109](../../../docs/adr/0109-an-operator-can-ask-a-store-to-flush-and-to-compact.md)).
+    ///
+    /// The general form of [`Store::compact_write_cf`], which is the one `esker bench --compact`
+    /// has always meant: `write` is where MVCC versions are.
+    pub fn compact_cf(&self, cf: &str) -> Result<()> {
+        self.db.compact_range(cf, None, None)?;
         Ok(())
+    }
+
+    /// Every column family this store holds, with the SSTs in each (ADR 0109).
+    ///
+    /// The **level** is carried and not only a count, because that is the distinction the
+    /// measurement this exists for turns on: one file in L0 and one in L1 are the difference
+    /// between versions that are all still there and versions that were merged away.
+    pub fn sst_files(&self) -> Result<Vec<esker_proto::CfFiles>> {
+        let mut families = Vec::new();
+        for cf in self.db.cf_names() {
+            let mut files = Vec::new();
+            for (level, number) in self.db.files_by_level(&cf)? {
+                let level = u32::try_from(level).map_err(|_| {
+                    StoreError::Bootstrap(format!("{cf} reports a level of {level}"))
+                })?;
+                files.push((level, number));
+            }
+            families.push(esker_proto::CfFiles { cf, files });
+        }
+        Ok(families)
+    }
+
+    /// The column families this store holds, for a request that names one.
+    pub fn cf_names(&self) -> Vec<String> {
+        self.db.cf_names()
     }
 
     /// How many `write` records this store holds for one user key.
