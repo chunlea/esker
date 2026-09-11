@@ -1,0 +1,37 @@
+crates/esker-cli/src/admin.rs
+  s_ac192c209f55d3::t_10795239041ea6 1-128
+crates/esker-cli/src/args.rs
+  s_ac192c209f55d3::t_4a9bb320129040 31,72-74,208-210,498,819-872
+crates/esker-cli/src/main.rs
+  s_ac192c209f55d3::t_351a24dbdd4f9d 10,100-109,180
+crates/esker-cli/tests/admin_storage.rs
+  s_ac192c209f55d3::t_86af7eebc40cd7 1-216
+crates/esker-proto/src/lib.rs
+  s_ac192c209f55d3::t_1fb07c1241c879 57-58
+crates/esker-proto/src/messages.rs
+  s_ac192c209f55d3::t_493bc56760d7a3 124-128,219,258-259,314-315,367-368,1024-1036,1047-1048,1068-1069,1084-1087,1302-1350,1361-1362,1383-1393,1418-1423,1694-1698
+crates/esker-proto/tests/golden/messages.hex
+  s_ac192c209f55d3::t_271cb9a6183115 133-135,159-160
+crates/esker-proto/tests/messages.rs
+  s_ac192c209f55d3::t_9be41b40b796b0 351-363,1102-1135,1567-1570,1604-1605
+crates/esker-store/src/server.rs
+  s_ac192c209f55d3::t_1c9ffc884f2fba 2051-2080,3410-3419,3423-3447
+docs/adr/0109-an-operator-can-ask-a-store-to-flush-and-to-compact.md
+  s_ac192c209f55d3::t_65e7910659c83a 1-125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2803d3e95cf4ba9e78ecae9a4a0276f769e67ada",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
