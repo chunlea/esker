@@ -3,7 +3,7 @@
 //! OID 24, `typlen` 4, `typcategory` `N`, `typinput` `regprocin`, `typarray` 1008. It is
 //! `pg_type.typinput`'s type, and the only column of it this node has — a real server declares it
 //! on forty, all in catalogs this node does not serve
-//! ([ADR 0098](../../../docs/adr/0098-regproc-is-an-oid-that-prints-as-a-function.md)).
+//! ([ADR 0098](../../../../docs/adr/0098-regproc-is-an-oid-that-prints-as-a-function.md)).
 //!
 //! # An oid no function has prints as the number
 //!

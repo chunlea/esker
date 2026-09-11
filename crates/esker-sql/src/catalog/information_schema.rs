@@ -387,7 +387,7 @@ fn collation_schema(column: &ColumnDef) -> Datum {
 }
 
 /// The collation the column was declared with — `C` or `POSIX`
-/// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+/// ([ADR 0076](../../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
 ///
 /// See [`collation_catalog`] for the measurement all three share.
 fn collation_name(column: &ColumnDef) -> Datum {
@@ -655,7 +655,7 @@ pub const COLUMNS_COLUMNS: &[(&str, ColumnType, i32)] = &[
     // collation — the same condition `pg_attribute.attcollation <> typcollation` names, which is
     // what `ActiveRecord` already reads and what `catalog::ColumnDef::collation` records.
     // `collation_schema` is `pg_catalog` because that is where `C` and `POSIX` live
-    // ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)), and
+    // ([ADR 0076](../../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)), and
     // `collation_catalog` is the database name — `crate::parse::DATABASE_NAME`, the same string
     // `pg_database.datname` carries, so the two agree whatever a client connected as.
     ("collation_catalog", ColumnType::Name, NO_LENGTH),

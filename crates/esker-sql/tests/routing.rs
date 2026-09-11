@@ -4,7 +4,7 @@
 //!
 //! * **`esker.engine`'s surface**, replayed against `tests/corpus/pg19_routing_engine.txt` — what a
 //!   real PostgreSQL 19 answered for every statement in it — with every divergence listed and its
-//!   reason, checked in both directions as [ADR 0031](../../docs/adr/0031-rails-compatibility-is-measured.md)
+//!   reason, checked in both directions as [ADR 0031](../../../docs/adr/0031-rails-compatibility-is-measured.md)
 //!   requires. A gap cannot be absorbed silently and neither can closing one.
 //! * **the rule itself**, against a fragment source that answers from a script. The decision is a
 //!   pure function tested as a table in `plan::routing`'s own unit tests; what is tested here is

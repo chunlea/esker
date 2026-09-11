@@ -187,7 +187,7 @@ fn encodings_match_the_golden_file() {
 /// would still pass. This reads the ids back out of the bytes the golden file holds, which is
 /// the only version of the check that a matched pair of mistakes cannot satisfy — and it
 /// matters because the garbage collector looks a retention window up by what this returns
-/// ([ADR 0021](../../docs/adr/0021-time-machine.md)).
+/// ([ADR 0021](../../../docs/adr/0021-time-machine.md)).
 #[test]
 fn the_frozen_table_keys_decode_to_the_ids_they_name() {
     let row = golden_bytes("table_row_prefix", "tenant=1,table=7");

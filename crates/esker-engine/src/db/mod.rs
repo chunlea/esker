@@ -212,7 +212,7 @@ pub(crate) struct CompactState {
 ///
 /// No `error` field, unlike its neighbours: an upload that fails is not an error anybody is
 /// waiting on. The file stays local and readable and the tier retries
-/// ([ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) decision 2), so there is
+/// ([ADR 0024](../../../../docs/adr/0024-tiering-failure-semantics.md) decision 2), so there is
 /// nothing to report to a foreground caller and nothing to hold onto.
 #[derive(Debug, Default)]
 pub(crate) struct TierSignal {
@@ -603,7 +603,7 @@ impl Db {
     /// Every SST this database currently holds for `cf`, as `(level, file number)`.
     ///
     /// Exists for the invariant that keeps range tombstones sound — *no SST below L0 holds
-    /// one* ([ADR 0017](../../docs/adr/0017-range-tombstones.md) decision 6) — which cannot be
+    /// one* ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md) decision 6) — which cannot be
     /// checked without knowing which level a file is at. `esker-cli sst-dump` reports the
     /// tombstone count for one file; this is how a test sweeps all of them.
     pub fn files_by_level(&self, cf: &str) -> Result<Vec<(usize, u64)>> {

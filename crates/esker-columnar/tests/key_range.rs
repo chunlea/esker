@@ -8,7 +8,7 @@
 //! # What it is for
 //!
 //! A run can hold rows the region no longer owns — a parent's runs after a split, which nothing
-//! prunes ([ADR 0040](../../docs/adr/0040-the-engine-a-query-runs-on.md)). Scoping the *build*
+//! prunes ([ADR 0040](../../../docs/adr/0040-the-engine-a-query-runs-on.md)). Scoping the *build*
 //! stops a copy being written with another region's rows; this makes the answer right whatever a
 //! run already contains, and `docs/plans/phase-8-learner.md` §store unit 4 records why neither
 //! covers the other. The defect both halves close is the `mpp` lane's: a bare `count(*)` answering

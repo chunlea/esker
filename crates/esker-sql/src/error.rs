@@ -122,7 +122,7 @@ pub enum SqlError {
     ///
     /// This node accepted it, which is a wrong answer rather than a missing feature: a replacement
     /// that silently renames a column breaks every query written against the old name, and
-    /// [ADR 0031](../../docs/adr/0031-a-refusal-outranks-a-wrong-answer.md) ranks that below a
+    /// [ADR 0031](../../../docs/adr/0031-rails-compatibility-is-measured.md) ranks that below a
     /// refusal.
     #[error("cannot change name of view column \"{from}\" to \"{to}\"")]
     CannotRenameViewColumn {
@@ -528,7 +528,7 @@ pub enum SqlError {
     /// to 11 while this statement waited is **111** on a real server, and applying the value this
     /// statement already computed would answer 110 — a lost update wearing a successful commit.
     /// So the statement is undone to its implicit savepoint and re-run at a fresh read timestamp
-    /// ([ADR 0057](../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
     ///
     /// It reaches a client only if something forgot to catch it, which is why it says so.
     #[error("a statement that waited for a row lock was not restarted")]
@@ -2954,7 +2954,7 @@ pub enum SqlError {
     ReadOnlyTransaction(&'static str),
 
     /// This node's schema lease has run out and it could not renew it, so it will not write
-    /// ([ADR 0028](../../docs/adr/0028-the-schema-lease.md)).
+    /// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md)).
     ///
     /// **Fail closed**, and the message says which half is refused, because the other half still
     /// works: reads are never gated by the lease. `40003 statement_completion_unknown` would be
@@ -3979,7 +3979,7 @@ impl SqlError {
 /// bug above this layer produces one; and invalid UTF-8 keeps PostgreSQL's own `22021`, with the
 /// offending byte, because that one is a condition a *user* can cause and a client reads the
 /// message. Collapsing them here would lose two sqlstates
-/// ([ADR 0029](../../docs/adr/0030-the-row-codec-moves-down.md)).
+/// ([ADR 0029](../../../docs/adr/0030-the-row-codec-moves-down.md)).
 impl From<esker_keys::row::RowError> for SqlError {
     fn from(error: esker_keys::row::RowError) -> Self {
         use esker_keys::row::RowError;

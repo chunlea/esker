@@ -1,5 +1,5 @@
 //! A single-writer, multi-reader, append-only skiplist over the arena beside it
-//! ([ADR 0041](../../../docs/adr/0041-the-in-house-arena-skiplist.md)).
+//! ([ADR 0041](../../../../docs/adr/0041-the-in-house-arena-skiplist.md)).
 //!
 //! This is `LevelDB`'s structure, which is the right one because the engine's memtable has
 //! `LevelDB`'s concurrency and not a general lock-free map's: one thread inserts at a time,

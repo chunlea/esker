@@ -80,7 +80,7 @@ pub enum PeerRole {
     /// exactly that reason.
     Learner = 2,
     /// A columnar replica: receives the log, never votes, and is **never promoted**
-    /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 1).
+    /// ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 1).
     ///
     /// # Why this is a role and not a flag somewhere else
     ///
@@ -157,7 +157,7 @@ impl Peer {
     ///
     /// Two things are learners and the wire does not tell them apart, on purpose: a replica
     /// being caught up before it is promoted to a voter, and a columnar replica that is never
-    /// promoted at all ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md) Decision 1).
+    /// promoted at all ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 1).
     /// Raft treats them identically because there is nothing to treat differently; what differs
     /// is only which operator asked for one, which is PD's business and not this type's.
     #[must_use]

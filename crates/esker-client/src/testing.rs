@@ -156,7 +156,7 @@ pub enum Outcome {
     /// Answer a `Prewrite` with "every key locked", sized from the request.
     ///
     /// A `Prewrite` answers one status per mutation
-    /// ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1), and a client that
+    /// ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md) decision 1), and a client that
     /// checks the length — this one does — would refuse a fixed-size answer to a batch of a
     /// different size. Counting the request's mutations is what a store does, so the fake does
     /// it too rather than making every test spell the number out.
@@ -170,7 +170,7 @@ pub enum Outcome {
 impl Outcome {
     /// Answer a locked key the way a store does: an `Error` frame carrying the lock, so the
     /// client's resolution path is driven through the same channel a real store uses
-    /// ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md)).
+    /// ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md)).
     #[must_use]
     pub fn locked(lock: &LockInfo) -> Self {
         Self::Fail(lock.into_error())

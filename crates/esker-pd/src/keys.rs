@@ -58,7 +58,7 @@ pub const STORE: u8 = b's';
 pub const TSO: u8 = b't';
 /// Second byte of the columnar-placement record's key.
 ///
-/// `'l'` for the **learner** [ADR 0022](../../docs/adr/0022-columnar-learner-replica.md)
+/// `'l'` for the **learner** [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md)
 /// Decision 1 calls a columnar replica — deliberately the same letter `esker-sql` uses for the
 /// catalog record this is reported from, so the two read as one thing in two places.
 pub const COLUMNAR: u8 = b'l';

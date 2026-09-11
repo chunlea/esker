@@ -67,7 +67,7 @@ use crate::value::{PgDatum, PgType};
 /// Every parameter's type, indexed from zero for `$1`.
 /// The type a **bound parameter** for this column takes, which is not always the column's own.
 ///
-/// An enum is stored as its ordinal ([ADR 0050](../../../docs/adr/0050-an-enum-is-its-ordinal.md)),
+/// An enum is stored as its ordinal ([ADR 0050](../../../../docs/adr/0050-a-user-defined-type-is-a-value.md)),
 /// so `ColumnDef::ty` is an `int2` — and reading a bound `'ok'` with that gives
 /// `22P02 invalid input syntax for type smallint: "ok"`, which is what run 89 saw from every
 /// `ActiveRecord` write to an enum column, because `ActiveRecord` prepares. A **label** is what a

@@ -143,7 +143,7 @@ pub struct TableProperties {
     /// the table has none, which is nearly all of them.
     ///
     /// The handle is here rather than in the footer because the footer is 48 bytes forever and
-    /// a fourth handle does not fit ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+    /// a fourth handle does not fit ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)).
     /// An older table simply has no such property and keeps the zero default, which is what
     /// makes this an extension rather than a format change.
     pub range_del_offset: u64,
@@ -201,7 +201,7 @@ impl TableProperties {
                 .as_bytes(),
         )?;
         // Written only when the table has range tombstones. A table with none is byte-identical
-        // to one written before [ADR 0017](../../../docs/adr/0017-range-tombstones.md) existed,
+        // to one written before [ADR 0017](../../../../docs/adr/0017-range-tombstones.md) existed,
         // which is exactly what "a missing name keeps its default" is for — and it is what keeps
         // this an extension rather than a format change to every table ever written.
         if self.range_del_count > 0 {

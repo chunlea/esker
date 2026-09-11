@@ -300,7 +300,7 @@ fn lower_row_constructor(args: &[FunctionArg]) -> Result<plan::Expr> {
 ///
 /// `C` and `POSIX` are the same ordering under two names — byte order, which a memcomparable key
 /// already gives — and they are the only two
-/// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)). Anything
+/// ([ADR 0076](../../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)). Anything
 /// else is `42704` with PostgreSQL's own sentence, because accepting the name and sorting by bytes
 /// anyway would answer a question the client did not ask.
 fn collation_name(name: &ObjectName) -> Result<String> {
@@ -1764,7 +1764,7 @@ fn set_feature_name(set: &sqlparser::ast::Set) -> String {
 /// A real server validates nothing here — not the parameter, not even its namespace (measured; the
 /// matching `SET` refuses both) — so this maps names to actions and refuses none of them. Only one
 /// name has anywhere to be forgotten from, and `columnar_replicas` is Esker's own
-/// ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decision 5).
+/// ([ADR 0022](../../../../docs/adr/0022-columnar-learner-replica.md) Decision 5).
 ///
 /// **`ONLY` is refused with the sentence it gets on every other `ALTER TABLE`.** A real server
 /// takes it; this node does not implement inheritance and says so by name rather than letting the
@@ -2770,7 +2770,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                 // **`COLLATE "C"` and `COLLATE "POSIX"` name the ordering this node has** —
                 // byte order, which is what a memcomparable key already gives, so honouring one
                 // costs nothing and ignoring it would cost the client the order it asked for
-                // ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+                // ([ADR 0076](../../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
                 // Every other name is `42704`, the sqlstate a real server gives for a collation it
                 // does not have, because this node genuinely does not have that ordering.
                 ColumnOption::Collation(name) => {
@@ -3531,7 +3531,7 @@ fn lower_create_index(create: &sqlparser::ast::CreateIndex) -> Result<plan::Crea
         "CREATE INDEX with table options",
     )?;
     // **`gin` and `gist` are recorded; `hash` and `brin` are still refused**
-    // ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
+    // ([ADR 0070](../../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md)).
     // The two that are recorded are the two the suite writes, and what is built underneath is the
     // ordered index every index here is — the catalog says what was asked for and nothing claims a
     // trigram search is accelerated. The two that are refused have no operator class this node
@@ -4397,7 +4397,7 @@ fn lower_expr_inner(expr: &Expr) -> Result<plan::Expr> {
                     // `Datum::Text`, so `'{"a":1}'::jsonb || '{"b":2}'::jsonb` would concatenate
                     // two documents into a string that is not a document. A **wrong answer**
                     // where a refusal is a gap, which
-                    // [ADR 0031](../../../docs/adr/0031-the-rails-suite-is-the-measure.md) ranks
+                    // [ADR 0031](../../../../docs/adr/0031-rails-compatibility-is-measured.md) ranks
                     // the other way round, so it is refused here with the `0A000` the operator
                     // gave before `||` over text existed. A jsonb *column* is caught in
                     // `exec::cursor`, where an `Expr::Ordinal` still carries its type.
@@ -8897,7 +8897,7 @@ fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
 /// A serial is its integer plus a sequence: `bigserial` lowers to [`ColumnType::Int8`] and
 /// `serial` to [`ColumnType::Int4`], with the caller reading [`serial_identity`] to find out that
 /// a sequence goes with it. `serial` was `0A000` until [ADR
-/// 0033](../../../docs/adr/0033-tier-1-of-the-type-surface.md), and only because `int4` was
+/// 0033](../../../../docs/adr/0033-tier-1-of-the-type-surface.md), and only because `int4` was
 /// missing — accepting it as an `int8` would have taken every value between 2^31 and 2^63 that a
 /// real server answers `22003` for. With `int4` there is nothing left of that argument.
 ///
@@ -8924,7 +8924,7 @@ fn lower_delete(delete: &sqlparser::ast::Delete) -> Result<plan::Delete> {
 ///
 /// **A modifier or a qualifier disqualifies it.** `mood(3)` is not a user type — no user type
 /// takes a typmod here — and `test_schema.mood` is a type in a schema, which is
-/// [ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s explicit non-goal and
+/// [ADR 0050](../../../../docs/adr/0050-a-user-defined-type-is-a-value.md)'s explicit non-goal and
 /// the namespace lane's. Both keep the refusal `lower_type` gives them.
 /// The type a `USING` casts this column to, or `None` if it is anything but such a cast.
 ///
@@ -9521,7 +9521,7 @@ fn index_columns(columns: &[IndexColumn]) -> Result<Vec<String>> {
 /// The options a key part may not carry, whichever kind of key it is in.
 ///
 /// **An operator class is no longer one of them in a `CREATE INDEX`** — it is recorded there
-/// ([ADR 0070](../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md))
+/// ([ADR 0070](../../../../docs/adr/0070-an-operator-class-is-recorded-and-the-index-underneath-is-ordered.md))
 /// — and it is still refused in a *constraint*, where a real server's grammar has no place for
 /// one: `UNIQUE (a text_pattern_ops)` is a syntax error there.
 fn index_key_options(column: &IndexColumn) -> Result<()> {

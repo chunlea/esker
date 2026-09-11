@@ -1425,7 +1425,7 @@ impl Env<'_> {
 /// `jsonb` has no `Datum` of its own — it is a `Datum::Text`, where `hstore`, `ltree`, `citext`
 /// and `tsvector` each have a variant — so by the time this operator has two values in hand a
 /// document and a string are the same thing. Concatenating them is a **wrong answer** where
-/// refusing is a gap, and [ADR 0031](../../../docs/adr/0031-the-rails-suite-is-the-measure.md)
+/// refusing is a gap, and [ADR 0031](../../../../docs/adr/0031-rails-compatibility-is-measured.md)
 /// ranks a wrong answer worse, so the declared type is read from the plan instead and the operator
 /// gives back the `0A000` it gave before `||` over text existed.
 ///

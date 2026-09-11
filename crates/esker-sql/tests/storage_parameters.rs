@@ -182,7 +182,7 @@ fn reset_carries_the_rest_of_the_alter_table_grammar() {
 /// real server answered, and the ones that differ are named here with their reason.
 ///
 /// The file is read rather than restated, so a row that changes on either side changes this test.
-/// And a divergence that starts *agreeing* fails it — [ADR 0031](../../../docs/adr/0031-declared-divergences.md)
+/// And a divergence that starts *agreeing* fails it — [ADR 0031](../../../docs/adr/0031-rails-compatibility-is-measured.md)
 /// rule 2 is that a declared divergence which has stopped diverging is deleted, not left standing.
 ///
 /// The rows are asserted here instead of through `parity::replay` because this file predates the

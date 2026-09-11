@@ -78,7 +78,7 @@ const MAX_TRANSFER: u64 = 50;
 const TTL_MS: u64 = 400;
 
 /// How far behind the present the audit reads
-/// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1).
+/// ([ADR 0021](../../../docs/adr/0021-time-machine.md) decision 1).
 ///
 /// **Derived from the lease, not chosen.** A read at `T` is blocked only by locks with
 /// `start_ts ≤ T` that are still unsettled, so an audit at `now` collides with every transfer
@@ -565,7 +565,7 @@ enum NoAudit {
 /// transfer moves money between two accounts inside one transaction, and that is as true of a
 /// snapshot from a second ago as of one from now. What it buys is that the snapshot is behind
 /// the transactions still in flight, so the audit is not queueing behind them
-/// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1 — this is the feature's first
+/// ([ADR 0021](../../../docs/adr/0021-time-machine.md) decision 1 — this is the feature's first
 /// customer, and `docs/bench/phase-5.md` records what it did to the completion rate).
 fn audit(client: &TxnClient, lag: Duration) -> Result<u64, NoAudit> {
     let txn = if lag.is_zero() {

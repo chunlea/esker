@@ -7,7 +7,7 @@
 //! # A declared divergence, not a parity gap
 //!
 //! PostgreSQL's plan text has no equivalent to any of this, because PostgreSQL has no second
-//! engine to choose between. Under [ADR 0031](../../../docs/adr/0031-rails-compatibility-is-measured.md)
+//! engine to choose between. Under [ADR 0031](../../../../docs/adr/0031-rails-compatibility-is-measured.md)
 //! that makes it a **declared** divergence: the corpus records what a real server prints for the
 //! same statements, the divergence list carries both sides, and nothing here pretends to be
 //! parity. What is borrowed is the *shape* — a node per line, indented by depth, with the node's

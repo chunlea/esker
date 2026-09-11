@@ -268,7 +268,7 @@ impl DbInner {
                     let mem = read_lock(&cf.mem)?;
                     if entry.kind == EntryKind::DeleteRange {
                         // Beside the map, never in it: a range delete hides keys the map has
-                        // never seen ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+                        // never seen ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)).
                         // The entry's `value` is the range's exclusive end
                         // ([`crate::batch::WriteBatch::delete_range`]).
                         mem.active.add_range(entry.seqno, entry.key, entry.value);
@@ -310,7 +310,7 @@ impl DbInner {
     /// * a [`EntryKind::DeleteRange`] whose `end` is not strictly above its `begin`. `RocksDB`
     ///   treats that as a no-op; this engine refuses it, because "nothing happened" and
     ///   "everything from `begin` was deleted" are far enough apart that guessing between them
-    ///   is worse than saying so ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)
+    ///   is worse than saying so ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)
     ///   decision 4). There is no convention that an empty `end` means the end of the key
     ///   space: the engine is byte-opaque and an empty `end` sorts *below* everything, so a
     ///   caller wanting a whole namespace passes that namespace's successor.
@@ -320,7 +320,7 @@ impl DbInner {
     ///
     /// The refusal of `DeleteRange` itself is gone: `docs/DESIGN.md` §4.7's limitation was
     /// that no read path honoured one, and they now do
-    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+    /// ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)).
     fn check_batch(&self, batch: &WriteBatch) -> Result<()> {
         let cfs = read_lock(&self.cfs)?;
         for entry in batch {

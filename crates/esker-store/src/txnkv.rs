@@ -305,7 +305,7 @@ pub fn get(db: &Db, user_key: &[u8], ts: u64) -> Result<TxnKvResp, ProtoError> {
         ReadOutcome::NotFound => Ok(TxnKvResp::Get { value: None }),
         // A lock is a refusal to serve one key, and one key is all this asks about — so it goes
         // out through the error channel, where the client's retry machinery already lives
-        // ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
+        // ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
         ReadOutcome::Locked(lock) => Err(lock_info(user_key, &lock).into_error()),
     }
 }
@@ -421,7 +421,7 @@ fn namespace_end() -> Vec<u8> {
 ///
 /// Answers one status per mutation, positionally, because a batch can collide with several
 /// locks and one refusal cannot describe many keys
-/// ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1). The batch is still one
+/// ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md) decision 1). The batch is still one
 /// decision: **if any key is refused, nothing is staged**.
 pub fn prewrite(
     db: &Db,
@@ -455,7 +455,7 @@ pub fn prewrite(
                         commit_ts: version.commit_ts,
                     });
                 }
-                // **A commit is a verdict; a lock is a question** ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §1).
+                // **A commit is a verdict; a lock is a question** ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §1).
                 // Asked in this order because a commit inside the range is decided — this
                 // transaction has lost, whatever anyone else is holding — and the lock below is
                 // not: its owner may still roll back, in which case nothing was ever in the range
@@ -618,7 +618,7 @@ pub fn rollback(
 }
 
 /// Gives **this** transaction's own locks on `keys` back, leaving it running
-/// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+/// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
 ///
 /// `ROLLBACK TO SAVEPOINT`, and the deadlock victim inside one: a real server releases a
 /// subtransaction's row locks when it aborts and keeps the transaction alive. Until this existed
@@ -761,7 +761,7 @@ fn lock_info(user_key: &[u8], lock: &LockRecord) -> LockInfo {
 
 /// The response status a protocol refusal from `esker-txn` belongs in.
 ///
-/// One-to-one by construction ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1),
+/// One-to-one by construction ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md) decision 1),
 /// which is what makes this a `match` and not a translation with judgement in it.
 ///
 /// The four that map are the transaction's *fate*. Corruption, a missing value and caller

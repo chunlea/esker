@@ -66,7 +66,7 @@ pub trait Backend: fmt::Debug + Send + Sync {
     /// How long this node may still serve **writes** from a cached schema, or `None` when it has
     /// no lease at all.
     ///
-    /// [ADR 0028](../../../docs/adr/0028-the-schema-lease.md). `None` is **fail closed**: a node
+    /// [ADR 0028](../../../../docs/adr/0028-the-schema-lease.md). `None` is **fail closed**: a node
     /// that cannot reach PD holds no lease and refuses to write, which is what lets PD's step
     /// clock advance on a timer rather than on a poll of nodes it may not be able to reach.
     ///
@@ -130,7 +130,7 @@ pub struct StepInterval {
     pub removal_extra_ms: u64,
 }
 
-/// **How far a lock has to reach** ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)).
+/// **How far a lock has to reach** ([ADR 0088](../../../../docs/adr/0088-a-row-lock-across-nodes.md)).
 ///
 /// The two are not a preference, they are two different jobs:
 ///
@@ -208,7 +208,7 @@ pub trait Txn: fmt::Debug + Send {
     fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>>;
 
     /// Takes a **row lock** for this transaction, or reports who holds it
-    /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    /// ([ADR 0057](../../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
     ///
     /// **The thing a READ COMMITTED writer waits on**, and the reason it cannot live in
     /// [`Txn::put`]: that one returns nothing and so can neither wait nor report. Without a lock
@@ -244,7 +244,7 @@ pub trait Txn: fmt::Debug + Send {
     fn locks(&self) -> LockView;
 
     /// **The catalog's read, which never waits for a lock**
-    /// ([ADR 0105](../../../docs/adr/0105-a-catalog-read-never-waits.md)).
+    /// ([ADR 0105](../../../../docs/adr/0105-a-catalog-read-never-waits.md)).
     ///
     /// Every statement that resolves a relation reads the catalog's version counter, and every DDL
     /// writes it — so an ordinary `SELECT` on an unrelated table met a DDL's commit there, spent
@@ -263,7 +263,7 @@ pub trait Txn: fmt::Debug + Send {
     fn get_without_waiting(&self, key: &[u8]) -> Result<Option<Bytes>>;
 
     /// Records what this transaction reads, so that its commit can be validated
-    /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md)).
+    /// ([ADR 0062](../../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md)).
     ///
     /// **Only SERIALIZABLE asks for this**, and the cost is why: a read set is memory per
     /// transaction and a check per key at commit. The other two levels are snapshot isolation and
@@ -288,7 +288,7 @@ pub trait Txn: fmt::Debug + Send {
     fn changed_since_statement(&self, key: &[u8]) -> Result<bool>;
 
     /// Takes a fresh read timestamp for the statement that is about to be re-run
-    /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    /// ([ADR 0057](../../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
     ///
     /// **Two things move and one does not.** Reads made by the re-run see the newer snapshot, and
     /// writes it produces carry that snapshot as their `read_ts` — so a prewrite validates them

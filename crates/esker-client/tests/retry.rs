@@ -220,6 +220,12 @@ fn not_leader_sends_the_next_attempt_to_the_hinted_peer() {
 /// A hint naming a peer the cached region does not have means the cache is stale. Routing to
 /// it would send the request to an address nobody knows, so the leader is forgotten instead
 /// and the next attempt asks a peer that does exist.
+///
+/// **Which** peer changed with `debt-c6 #3`: with no believed leader the target rotates by attempt
+/// number, so the second try asks peer 20 rather than peer 10 again. The property this test is
+/// named for is untouched — peer 999 is never routed to — and the rotation is the repair for the
+/// case that motivated it: when the peer this would otherwise always pick is the store that just
+/// died, asking it again is the whole retry budget spent on a corpse.
 #[test]
 fn a_hint_for_an_unknown_peer_is_dropped_rather_than_followed() {
     let harness = harness();
@@ -235,7 +241,15 @@ fn a_hint_for_an_unknown_peer_is_dropped_rather_than_followed() {
         .script(always(Outcome::Reply(RawKvResp::Get { value: None })));
 
     assert_eq!(harness.client.get(b"k").expect("recovered"), None);
-    assert_eq!(harness.transport.peers(), vec![10, 10]);
+    assert_eq!(
+        harness.transport.peers(),
+        vec![10, 20],
+        "the bogus hint was not followed, and the retry asked a different peer that does exist"
+    );
+    assert!(
+        !harness.transport.peers().contains(&999),
+        "the hint named a peer the region does not have and it was routed to anyway"
+    );
 }
 
 /// `EpochNotMatch` carries the regions that now cover the range, so one round trip repairs the
@@ -440,6 +454,11 @@ fn a_key_outside_the_region_surfaces_and_still_clears_the_cache() {
 /// An error whose outcome is `Unknown` is a different thing and is not in this list — no answer
 /// came back at all, which for a read is worth asking again and for a write is not. The two
 /// tests below that rule are what cover those.
+///
+/// **`NotSent` was in this list and is not any more**, which is the change run 124 forced: a
+/// refusal a *store* chose to send is one the client cannot improve on by asking again, but a
+/// request that never left the client can be sent somewhere else, and refusing instead cost 184
+/// statements in 0.695 s. `a_request_that_never_left_is_sent_somewhere_else` below is its test.
 #[test]
 fn a_non_retryable_error_surfaces_on_the_first_attempt() {
     for error in [
@@ -447,7 +466,6 @@ fn a_non_retryable_error_surfaces_on_the_first_attempt() {
         ProtoError::Locked {
             lock_info: Bytes::from_static(b"lock"),
         },
-        ProtoError::not_sent("connection refused"),
     ] {
         assert_eq!(
             error.outcome(),
@@ -464,6 +482,37 @@ fn a_non_retryable_error_surfaces_on_the_first_attempt() {
         assert_eq!(harness.transport.call_count(), 1, "{error:?} was retried");
         assert!(harness.clock.sleeps().is_empty(), "{error:?} backed off");
     }
+}
+
+/// **A request that never left is sent somewhere else**, which is the other half of the list
+/// above and the one run 124 was missing.
+///
+/// The store this call is routed to has gone; the transport says `NotSent`, which is the one error
+/// that provably did not apply. The client must not hand that to the caller — Rails does not retry
+/// `08006` in fixture setup, and 92 tests errored on a cluster whose control sample was clean.
+#[test]
+fn a_request_that_never_left_is_sent_somewhere_else() {
+    let harness = harness();
+    harness
+        .transport
+        .script(Rule::new(
+            Matcher::Any,
+            Outcome::Fail(ProtoError::not_sent("connection refused")),
+        ))
+        .script(always(Outcome::Reply(RawKvResp::Get { value: None })));
+
+    assert_eq!(
+        harness
+            .client
+            .get(b"k")
+            .expect("the second attempt answers"),
+        None
+    );
+    assert_eq!(
+        harness.transport.call_count(),
+        2,
+        "a request that never left was surfaced instead of being sent again"
+    );
 }
 
 /// The rule the phase-5 transaction layer depends on. A write that went out and was never

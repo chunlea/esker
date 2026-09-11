@@ -93,7 +93,7 @@ pub fn physical_ms(ts: u64) -> u64 {
 /// The first timestamp of the millisecond `physical_ms`, with the logical counter at zero.
 ///
 /// The inverse of [`physical_ms`], and the whole of "wall clock in, timestamp out"
-/// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1): a timestamp's high 46 bits
+/// ([ADR 0021](../../../docs/adr/0021-time-machine.md) decision 1): a timestamp's high 46 bits
 /// *are* milliseconds since the Unix epoch, so this is a shift and never a lookup.
 ///
 /// The rounding is deliberate and worth stating, because both readings are defensible until you
@@ -175,7 +175,7 @@ pub struct TxnClient {
     router: Arc<Router>,
     oracle: Arc<dyn TimestampOracle>,
     /// The transactions this client is telling the store are still alive
-    /// ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)).
+    /// ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)).
     renewals: Arc<crate::renew::Renewals>,
     lock_ttl_ms: u64,
     max_lock_resolutions: u32,
@@ -267,7 +267,7 @@ impl TxnClient {
     }
 
     /// A **read-only** transaction at a timestamp of the caller's choosing: the time machine
-    /// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1).
+    /// ([ADR 0021](../../../docs/adr/0021-time-machine.md) decision 1).
     ///
     /// `begin()` is the special case of this with the timestamp taken from the oracle, and that
     /// is the whole of the feature on this side: a transaction's `start_ts` is its snapshot, so
@@ -351,7 +351,7 @@ impl TxnClient {
     }
 
     /// Names the present, so a later transaction can read it back — `pg_export_snapshot()`
-    /// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 3).
+    /// ([ADR 0021](../../../docs/adr/0021-time-machine.md) decision 3).
     ///
     /// **It is free, and that is the design.** A checkpoint is a *number*: this takes a
     /// timestamp and writes one nine-byte record. No snapshot, no copy, no flush — the data it
@@ -459,7 +459,7 @@ pub struct Transaction {
     router: Arc<Router>,
     oracle: Arc<dyn TimestampOracle>,
     /// Shared with the client: what keeps this transaction's lock alive while it is doing nothing
-    /// ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)).
+    /// ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)).
     renewals: Arc<crate::renew::Renewals>,
     start_ts: u64,
     lock_ttl_ms: u64,
@@ -495,7 +495,7 @@ pub struct Transaction {
     /// exist when the scan ran is in no read set, and only the range can name it.
     check_ranges: BTreeMap<Bytes, Bytes>,
     /// Keys this transaction has **already prewritten a lock on**, before its commit
-    /// ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)).
+    /// ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)).
     ///
     /// A `SELECT … FOR UPDATE` row, and the difference from `checks` is *when*: a check is staged
     /// and sent at commit, and one of these is on the store from the moment the statement asked for
@@ -515,7 +515,7 @@ pub struct Transaction {
     /// statements never waited, which is every transaction that never blocks.
     statement_undo: BTreeMap<Bytes, Option<Write>>,
     /// Whether this transaction reads a past snapshot and so may not write
-    /// ([ADR 0021](../../docs/adr/0021-time-machine.md) decision 1).
+    /// ([ADR 0021](../../../docs/adr/0021-time-machine.md) decision 1).
     read_only: bool,
     /// The first key a write was attempted on, when this transaction is read-only.
     ///
@@ -677,7 +677,7 @@ impl Transaction {
     }
 
     /// **Takes a lock on `key` now, that every node can see**
-    /// ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)).
+    /// ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)).
     ///
     /// This is `SELECT … FOR UPDATE`'s lock. It prewrites a `Check` mutation — the lock-only
     /// mutation ADR 0067 added as tag 5 — so the store holds a lock record on the key from this
@@ -725,7 +725,7 @@ impl Transaction {
     }
 
     /// **Gives back locks this transaction placed, and stays running**
-    /// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+    /// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
     ///
     /// `ROLLBACK TO SAVEPOINT`, and the deadlock victim inside one. A real server releases a
     /// subtransaction's row locks when it aborts; before this, the SQL layer released its
@@ -1100,7 +1100,7 @@ impl Transaction {
     }
 
     /// **The same read, except that it never waits for a lock**
-    /// ([ADR 0105](../../docs/adr/0105-a-catalog-read-never-waits.md)).
+    /// ([ADR 0105](../../../docs/adr/0105-a-catalog-read-never-waits.md)).
     ///
     /// A lock in the way is not resolved and not waited out: this re-reads at
     /// `lock.start_ts - 1`, which is the newest committed state **strictly before** the
@@ -1365,7 +1365,7 @@ impl Transaction {
         let commit_ts = self.oracle.timestamp()?;
         if let Err(error) = self.commit_keys(commit_ts, std::slice::from_ref(&primary)) {
             // **A transaction that did not commit takes its locks with it**
-            // ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)). Percolator's answer is
+            // ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)). Percolator's answer is
             // that a later reader resolves them, and that answer is one whole TTL long for every
             // session that wants one of those rows — bearable when reaching here was rare, and it
             // stopped being rare when a transaction could be *wounded*: the loser of a cross-node
@@ -1444,7 +1444,7 @@ impl Transaction {
     /// Prewrites one region's worth of keys, resolving whatever locks come back.
     ///
     /// A `Prewrite` answers **per key**, so a batch that collides with several locks reports
-    /// all of them at once ([ADR 0016](../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
+    /// all of them at once ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md) decision 1).
     /// This resolves every one of them **in parallel** and prewrites again — one resolution
     /// round however many keys collided, rather than a round trip per contended key, which is
     /// the shape that matters exactly when the client is already losing races.
@@ -1653,7 +1653,7 @@ impl Transaction {
                 }],
             };
             // **A lock inside the range is resolved here, and never wounded**
-            // ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
+            // ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
             // §1). Without this loop the `Locked` the store now answers falls through to
             // `check`, whose `Locked` arm reports `LockNotCleared` on sight — a `40001` for a
             // holder that may be about to roll back, which is a phantom that never existed.
@@ -1896,7 +1896,7 @@ impl Transaction {
     /// settled first**, and everything else follows the fact it leaves behind.
     /// `may_wound` is whether the caller is **acquiring**: only a transaction that holds locks
     /// and wants another can be half of a cycle, and only it may kill a live holder
-    /// ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)).
+    /// ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)).
     fn resolve(
         &self,
         lock: &LockInfo,
@@ -1931,7 +1931,7 @@ impl Transaction {
                 return Ok(());
             }
             // **The holder is alive and younger than us, so it loses**
-            // ([ADR 0088](../../docs/adr/0088-a-row-lock-across-nodes.md)). Waiting it out is what
+            // ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)). Waiting it out is what
             // this did before eager locks existed, and it was right then: no transaction here held
             // a lock while waiting for another, so a wait always ended. It can now — a
             // `SELECT … FOR UPDATE` puts a lock on the store and the transaction goes on asking for
@@ -2146,7 +2146,7 @@ const SNAPSHOT_RECORD_VERSION: u8 = 1;
 /// `version:u8 ++ start_ts:u64` little-endian — nine bytes.
 ///
 /// Deliberately the same shape as the retention records of
-/// [ADR 0021](../../docs/adr/0021-time-machine.md) decision 4: a version byte and a `u64`, so
+/// [ADR 0021](../../../docs/adr/0021-time-machine.md) decision 4: a version byte and a `u64`, so
 /// the two records of one feature read alike and neither needs its own explanation.
 fn encode_snapshot(at: u64) -> [u8; 9] {
     let mut out = [0u8; 9];

@@ -1,5 +1,5 @@
 //! The surface the memtable's storage answers to
-//! ([ADR 0041](../../../docs/adr/0041-the-in-house-arena-skiplist.md)).
+//! ([ADR 0041](../../../../docs/adr/0041-the-in-house-arena-skiplist.md)).
 //!
 //! One implementation now — the in-house arena [`skiplist`](super::skiplist) — and two while the
 //! benchmark in `docs/bench/skiplist.md` was being taken. This trait is what let the same

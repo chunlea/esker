@@ -1,7 +1,7 @@
 //! No schema job is ever orphaned.
 //!
 //! `docs/plans/debt-c2.md`, and the sentence it retires from
-//! [ADR 0020](../../docs/adr/0020-online-schema-change.md): *"Automatic re-drive ... is future
+//! [ADR 0020](../../../docs/adr/0020-online-schema-change.md): *"Automatic re-drive ... is future
 //! work"*. Until now a `CREATE INDEX CONCURRENTLY` whose node died sat at whatever state it had
 //! reached until a human called `esker_schema_step`. Nothing was lost and nothing was unsafe —
 //! the record and its cursor are durable and the index is not readable until `public` — but the

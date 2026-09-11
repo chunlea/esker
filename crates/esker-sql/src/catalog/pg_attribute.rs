@@ -440,7 +440,7 @@ fn attribute(
 /// that named none, and `0` for a column of a type that has no collation at all — measured. The
 /// gap between the first two and the third is the whole of `ActiveRecord`'s read-back:
 /// `a.attcollation <> t.typcollation` names only the columns that asked
-/// ([ADR 0076](../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
+/// ([ADR 0076](../../../../docs/adr/0076-c-and-posix-are-the-collations-this-node-has.md)).
 fn attcollation(column: &ColumnDef) -> i64 {
     match column.collation.as_deref() {
         Some(name) if name.eq_ignore_ascii_case("C") => C_COLLATION,

@@ -1718,7 +1718,7 @@ fn reads_are_correct_without_a_bloom_filter() {
 }
 
 /// A `DeleteRange` deletes its whole range — the thing `docs/DESIGN.md` §4.7 refused to do
-/// until [ADR 0017](../../docs/adr/0017-range-tombstones.md) made it real.
+/// until [ADR 0017](../../../docs/adr/0017-range-tombstones.md) made it real.
 ///
 /// This test used to assert the refusal. It asserts the opposite now, and the two halves it
 /// keeps from that version are the ones that mattered: that the range really is a *range*

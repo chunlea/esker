@@ -1,6 +1,6 @@
 //! Reading the database as it was: `begin_at`, and the three refusals around it.
 //!
-//! [ADR 0021](../../docs/adr/0021-time-machine.md) decision 1 — *a historical read is a read
+//! [ADR 0021](../../../docs/adr/0021-time-machine.md) decision 1 — *a historical read is a read
 //! timestamp, and nothing else*. The storage layer has always been a time machine: every
 //! version is filed under `commit_ts` and a read at `T` is "the newest write with
 //! `commit_ts ≤ T`", which is what `TxnKv` already does with whatever `start_ts` it was given.

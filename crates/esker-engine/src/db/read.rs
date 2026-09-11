@@ -21,14 +21,14 @@
 //!
 //! A range tombstone does not sit where the key it hides sits, so finding the newest entry is
 //! no longer the whole answer: the read must also ask whether a tombstone covers it
-//! ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)). This walk collects the tombstones
+//! ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)). This walk collects the tombstones
 //! of each source *as it passes it*, newest first, and when a source finally yields an entry it
 //! asks the collected set whether anything strictly newer than that entry covers the key. That
 //! ordering is what makes one pass enough: every source that could hold a covering tombstone
 //! has already been visited by the time the entry is found.
 //!
 //! Below L0 there is nothing to collect. Range tombstones are **discharged at L0** and never
-//! propagated ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6): a compaction
+//! propagated ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md) decision 6): a compaction
 //! that consumes one takes every lower-level file overlapping it, drops the covered keys, and
 //! writes no tombstone into its output. So `search_levels` below L0 is exactly what it was, and
 //! the binary search that assumes a level partitions the key space keeps its assumption.
@@ -326,7 +326,7 @@ impl DbInner {
 ///
 /// The two travel together because they must agree: **collect** at L0, where a table may hold
 /// tombstones, and only **apply** below it, where the invariant says none can
-/// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6). Passing them
+/// ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md) decision 6). Passing them
 /// separately is how the pair would come apart.
 struct TombstoneScan<'a> {
     tombstones: &'a mut RangeTombstones,

@@ -4,7 +4,7 @@
 //! 0x0601 Evaluate   run a fragment against this node's columnar copy of a region
 //! ```
 //!
-//! [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md) Decisions 3 and 4,
+//! [ADR 0022](../../../../docs/adr/0022-columnar-learner-replica.md) Decisions 3 and 4,
 //! `docs/plans/phase-8-learner.md` §wire.
 //!
 //! # A service of its own
@@ -20,7 +20,7 @@
 //! [`FragmentReq::fragment`] is `esker_columnar`'s format — version byte, little-endian body,
 //! CRC32C, its own goldens, and 402 million cases through its decoder. This crate carries it as a
 //! length-prefixed byte string and has no opinion about its contents, exactly as it carries a
-//! transaction's lock payload ([ADR 0016](../../../docs/adr/0016-txnkv-on-the-wire.md)).
+//! transaction's lock payload ([ADR 0016](../../../../docs/adr/0016-txnkv-on-the-wire.md)).
 //!
 //! **One definition of fragment bytes, and it is theirs.** A second decoder here would be a
 //! second definition of what a filter means, and two nodes disagreeing about that is a wrong

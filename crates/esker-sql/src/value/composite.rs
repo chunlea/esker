@@ -10,7 +10,7 @@
 //!   two apart is the whole reason this text form is lossless.
 //!
 //! The value a column stores is this canonical text, the way `jsonb` stores its own
-//! ([ADR 0042](../../../docs/adr/0042-a-type-shares-a-representation-only-if-it-shares-a-comparison.md)):
+//! ([ADR 0042](../../../../docs/adr/0042-json-and-jsonb-are-two-types-and-one-of-them-is-not-a-key.md)):
 //! composite equality is field by field, and two field-equal composites render identically, so the
 //! comparison comes with the representation.
 

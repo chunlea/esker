@@ -1,6 +1,6 @@
 //! The re-driver: a job whose driver died is finished by whichever node notices.
 //!
-//! [ADR 0020](../../../docs/adr/0020-online-schema-change.md) as amended, and
+//! [ADR 0020](../../../../docs/adr/0020-online-schema-change.md) as amended, and
 //! `docs/plans/debt-c2.md`. A `CREATE INDEX CONCURRENTLY` is a job in the catalog that some node
 //! steps; `esker_schema_step` is the verb. Until now, if the node that started one died, nothing
 //! picked it up: the job sat at whatever state it had reached until a human called the verb. The

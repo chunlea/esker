@@ -55,10 +55,32 @@ impl Route {
     /// this region's peer list by [`RegionCache::set_leader`].
     #[must_use]
     pub fn target(&self) -> Option<&Peer> {
-        // `TODO(debt-c6 #3)`: prefer a peer that has not just failed rather than always the
-        // first one, so a down store is not asked twice in one retry budget
-        // (`docs/plans/debt-c6.md` §4).
-        self.leader.as_ref().or_else(|| self.region.peers.first())
+        self.target_at(0)
+    }
+
+    /// The same, for attempt number `attempt` — **rotating when the leader is unknown**.
+    ///
+    /// This is `debt-c6 #3`, which stood here as a `TODO` in exactly these words: *prefer a peer
+    /// that has not just failed rather than always the first one, so a down store is not asked
+    /// twice in one retry budget* (`docs/plans/debt-c6.md` §4).
+    ///
+    /// With a believed leader there is one right answer and it is returned. Without one, every
+    /// peer is an equally good place to ask and each can hand back the hint that ends the search,
+    /// so asking the *same* one on every retry is strictly worse than asking them in turn. It is
+    /// also the difference between recovering and not: when the peer this would otherwise always
+    /// pick is the store that has just died, every attempt in the budget goes to the corpse, and a
+    /// client with two perfectly good replicas spends eight tries learning nothing. run 124 is
+    /// what that looks like from outside — losing one store refused 184 statements in 0.695 s.
+    #[must_use]
+    pub fn target_at(&self, attempt: u32) -> Option<&Peer> {
+        if let Some(leader) = self.leader.as_ref() {
+            return Some(leader);
+        }
+        let peers = &self.region.peers;
+        if peers.is_empty() {
+            return None;
+        }
+        peers.get(attempt as usize % peers.len())
     }
 }
 

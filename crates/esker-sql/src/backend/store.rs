@@ -37,7 +37,7 @@ pub struct StoreBackend {
     /// Where this node's schema lease comes from, or `None` for a node with no placement driver.
     lease: Option<Arc<dyn SchemaLease>>,
     /// The row locks **this node** holds
-    /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    /// ([ADR 0057](../../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
     ///
     /// The same table `MemoryBackend` uses, and deliberately not a second implementation of a
     /// wait-for graph. What differs is its *scope*, and the difference is declared rather than
@@ -52,7 +52,7 @@ pub struct StoreBackend {
 }
 
 /// Where a node's schema lease comes from
-/// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md)).
+/// ([ADR 0028](../../../../docs/adr/0028-the-schema-lease.md)).
 ///
 /// A trait rather than a `PdClient` field for one reason that matters: **the test that proves fail
 /// closed has to be able to stop answering.** A lease source that could only be a live PD would
@@ -308,7 +308,7 @@ impl Txn for StoreTxn {
     }
 
     /// Takes this node's row lock, or names the holder
-    /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
+    /// ([ADR 0057](../../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)).
     ///
     /// **Node-local, and that is a declared scope rather than an approximation.** Two sessions of
     /// one `esker-sql` process block on each other exactly as they do on the in-process backend;
@@ -344,7 +344,7 @@ impl Txn for StoreTxn {
             self.held.push(key.to_vec());
         }
         // **And now the half a second node can see**
-        // ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)). The table above is one
+        // ([ADR 0088](../../../../docs/adr/0088-a-row-lock-across-nodes.md)). The table above is one
         // process's, so it excludes the sessions of this node and no others; measured, two nodes
         // given the crossed sequence that costs one node a `40P01` both committed. The lock that
         // excludes the other node is a lock on the key, in the store, and it is the same
@@ -509,7 +509,7 @@ impl Txn for StoreTxn {
             locks.give_back(self.id, &[key.to_vec()]);
         }
         // **And the half a second node can see**
-        // ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
+        // ([ADR 0104](../../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
         // §2). A `SELECT … FOR UPDATE` leaves a Percolator lock on the store (ADR 0088), and
         // until this call existed nothing gave it back short of ending the transaction: a
         // savepoint's rollback freed the row for the sessions of *this* node and left every other
@@ -617,7 +617,7 @@ fn translate(error: ClientError) -> SqlError {
         // line: an operator could not tell a wait on the catalog's version counter from a wait on
         // any row. `TxnConflict` above has always carried its key; this now does too.
         // **And what this transaction was doing when it gave up**
-        // ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
+        // ([ADR 0104](../../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md)
         // §4). Three different calls raise this — a read, a `SERIALIZABLE` read set, and a
         // transaction acquiring a key it means to write — and they are not the same condition:
         // the first is a reader stuck behind somebody's uncommitted write, the last is two
@@ -634,7 +634,7 @@ fn translate(error: ClientError) -> SqlError {
             key: Some(key.to_vec()),
         },
         // **The victim of a wound, told the way PostgreSQL tells one**
-        // ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)). A transaction settled
+        // ([ADR 0088](../../../../docs/adr/0088-a-row-lock-across-nodes.md)). A transaction settled
         // by somebody else is one whose lock another transaction rolled back to make progress —
         // the younger of two that wanted each other's rows, or one whose lease ran out under a
         // waiter. From the client's seat those are the same event and it is the one `40P01`

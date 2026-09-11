@@ -273,7 +273,7 @@ impl DbInner {
             };
             // A tombstone in the inputs turns this into a discharge: it takes every file the
             // tombstone covers, at every level, applies it and drops it
-            // ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6). This is
+            // ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md) decision 6). This is
             // what the *scheduler* does with a `delete_range`; the write that produced the
             // tombstone acknowledged long ago, and reads have been honouring it out of the
             // memtable and L0 ever since (invariant 1 is untouched).
@@ -301,7 +301,7 @@ impl DbInner {
     /// The range tombstones a compaction's inputs carry.
     ///
     /// Only L0 files can hold any, because a discharge drops them rather than propagating them
-    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md) decision 6) — so this is a
+    /// ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md) decision 6) — so this is a
     /// no-op for every compaction below L0, and the `debug_assert` is what keeps the claim
     /// honest rather than assumed.
     fn tombstones_of(
@@ -542,7 +542,7 @@ impl DbInner {
                 .iter()
                 .any(|(level, file)| !holds(*level, file.number));
         // **And the output level must not have gained a file this plan never saw**, which is the
-        // half [ADR 0079](../../../docs/adr/0079-compaction-concurrency-reserves-the-output-range.md)'s
+        // half [ADR 0079](../../../../docs/adr/0079-compaction-concurrency-reserves-the-output-range.md)'s
         // reservation cannot reach.
         //
         // The reservation stops two plans *running* over one range. It cannot stop a plan that was

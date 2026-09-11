@@ -249,7 +249,7 @@ impl TableReader {
 
         // The range-deletion block, when there is one. Its handle is in the properties rather
         // than the footer, which has no room for a fourth
-        // ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)). Read at open and held for
+        // ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)). Read at open and held for
         // the life of the reader, like the index and the filter: every read of this table has
         // to consult it, and nearly every table has none at all.
         let range_tombstones = if props.range_del_count == 0 {
@@ -294,7 +294,7 @@ impl TableReader {
     }
 
     /// The range tombstones this table carries; empty for nearly every table
-    /// ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)).
+    /// ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)).
     ///
     /// A read that finds an entry in this table — or in any *lower* one — has to ask these
     /// whether it is covered, which is the second question a range delete forces on every read

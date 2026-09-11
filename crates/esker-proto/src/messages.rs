@@ -73,10 +73,10 @@ pub enum Method {
     /// `Pd::Tso`.
     PdTso = 0x0306,
     /// `Pd::SchemaLease` — how long a node may act on a cached schema before it must ask again
-    /// ([ADR 0028](../../docs/adr/0028-the-schema-lease.md)).
+    /// ([ADR 0028](../../../docs/adr/0028-the-schema-lease.md)).
     PdSchemaLease = 0x0307,
     /// `Pd::ReportColumnar` — a SQL node telling PD which key ranges want columnar replicas
-    /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md), [`crate::pd`]).
+    /// ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md), [`crate::pd`]).
     PdReportColumnar = 0x0308,
     /// `Pd::Status` — what a **running** placement driver is doing right now: the operators it
     /// has in flight, which are memory and are therefore invisible to `esker pd inspect`
@@ -86,7 +86,7 @@ pub enum Method {
     /// every region does not ask `GetRegion` once per region ([`crate::pd`]).
     PdScanRegions = 0x030a,
     /// `Pd::Raft` — a tick's worth of Raft messages between two placement drivers
-    /// ([ADR 0059](../../docs/adr/0059-pd-is-a-raft-group.md), [`crate::pd::PdRaftBatch`]).
+    /// ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md), [`crate::pd::PdRaftBatch`]).
     ///
     /// On the `Pd` service rather than on `RaftTransport`, because the two are addressed
     /// differently and a store must not be able to receive one: `RaftTransport` carries a
@@ -95,7 +95,7 @@ pub enum Method {
     /// consensus traffic from its placement driver's without decoding a body.
     PdRaft = 0x030b,
     /// `Pd::Members` — who is in this placement driver's group and which member leads
-    /// ([ADR 0059](../../docs/adr/0059-pd-is-a-raft-group.md)).
+    /// ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
     ///
     /// Answered by **any** member, leader or not, which is the whole point: an operator reaches
     /// for it exactly when the leader is the thing that is missing. Its own method rather than a
@@ -103,7 +103,7 @@ pub enum Method {
     /// is an addition rather than a change to what is already on the wire.
     PdMembers = 0x030c,
     /// `Pd::MemberChange` — add or remove a placement driver, one step at a time
-    /// ([ADR 0061](../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
+    /// ([ADR 0061](../../../docs/adr/0061-a-placement-driver-joins-a-group-it-is-told-the-name-of.md)).
     ///
     /// **One step**, and the caller loops. Adding a member is three things — propose a learner,
     /// wait for it to catch up, promote it — and a single call that did all three would hold a
@@ -113,7 +113,7 @@ pub enum Method {
     PdMemberChange = 0x030d,
 
     /// `RaftTransport::Batch` — a tick's worth of Raft messages between two stores
-    /// (`docs/DESIGN.md` §6, [ADR 0009](../../docs/adr/0009-the-wire-carries-the-raft-message.md)).
+    /// (`docs/DESIGN.md` §6, [ADR 0009](../../../docs/adr/0009-the-wire-carries-the-raft-message.md)).
     RaftBatch = 0x0401,
     /// `Admin::Split` — split a region at a chosen key (`esker-cli region split`).
     AdminSplit = 0x0501,
@@ -147,14 +147,14 @@ pub enum Method {
     /// `TxnKv::GcSafepoint`.
     TxnGcSafepoint = 0x0208,
     /// `TxnKv::LatestCommit` — the newest `commit_ts` for one key, and nothing else
-    /// ([ADR 0067](../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
+    /// ([ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
     ///
     /// **A question, not an acquisition.** It takes no lock, writes no log entry and has no
     /// `TxnWrite` variant: it answers what the store already computes for its own prewrite check,
     /// so that a waiter can tell a stale value from a fresh one instead of guessing.
     TxnLatestCommit = 0x0209,
     /// `TxnKv::ReclaimRange` — clear the storage under a key range whose owner has been dropped
-    /// ([ADR 0069](../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
+    /// ([ADR 0069](../../../docs/adr/0069-a-dropped-database-is-reclaimed-by-range-not-key-by-key.md)).
     ///
     /// **Not a delete.** Nothing routes into a dropped database's key space, so this resolves no
     /// versions and takes no locks: it clears the range physically, which is sound only below the
@@ -163,16 +163,16 @@ pub enum Method {
     /// the caller's timing.
     TxnReclaimRange = 0x020A,
     /// `TxnKv::ReleaseLock` — give one transaction's own locks back without ending it
-    /// ([ADR 0104](../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
+    /// ([ADR 0104](../../../docs/adr/0104-where-a-conflict-becomes-40001-and-where-40p01.md) §2).
     TxnReleaseLock = 0x020B,
 
     /// `Fragment::Evaluate` — run a plan fragment against a node's columnar copy of a region
-    /// ([ADR 0022](../../docs/adr/0022-columnar-learner-replica.md), [`crate::fragment`]).
+    /// ([ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md), [`crate::fragment`]).
     FragmentEvaluate = 0x0601,
 
     /// `Schema::Fetch` — ask a store for a table's columnar record, because the asker does not
     /// host the region that holds it ([`crate::schema`],
-    /// [ADR 0037](../../docs/adr/0037-a-columnar-learner-fetches-the-schema-it-cannot-read.md)).
+    /// [ADR 0037](../../../docs/adr/0037-a-columnar-learner-fetches-the-schema-it-cannot-read.md)).
     SchemaFetch = 0x0701,
 }
 
@@ -961,7 +961,7 @@ pub enum Request {
         request: crate::pd::PdReq,
     },
     /// A plan fragment for a columnar replica, with the region it is addressed to
-    /// ([`crate::fragment`], [ADR 0022](../../docs/adr/0022-columnar-learner-replica.md)).
+    /// ([`crate::fragment`], [ADR 0022](../../../docs/adr/0022-columnar-learner-replica.md)).
     Fragment {
         /// Which region, at which epoch, on which peer. Invariant 5 applies here as to a row
         /// read, which is why the fragment body carries no epoch of its own.

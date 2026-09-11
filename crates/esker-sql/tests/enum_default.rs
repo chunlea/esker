@@ -5,7 +5,7 @@
 //! `test_migrate_revert_rename_enum_value`. Both come from one line of a migration:
 //! `t.enum :best_color, enum_type: "color", default: "blue", null: false`.
 //!
-//! An enum's stored value is its ordinal ([ADR 0050](../../../docs/adr/0050-an-enum-is-its-ordinal.md)),
+//! An enum's stored value is its ordinal ([ADR 0050](../../../docs/adr/0050-a-user-defined-type-is-a-value.md)),
 //! so a column's `ty` at lowering is an `int2` placeholder until the catalog has been read —
 //! folding `'blue'` against it hands a label to the `int2` input function. `ALTER TABLE … ADD
 //! COLUMN` had the guard for this and `CREATE TABLE` did not, which is the whole of the bug: two

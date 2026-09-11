@@ -428,7 +428,7 @@ impl VersionSet {
     /// The same set [`obsolete_files`](Self::obsolete_files) computes, exposed because object
     /// deletion cannot be driven from a directory listing: a file the tier has evicted is
     /// absent from the listing, so its object would never be reclaimed
-    /// ([ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) decision 5).
+    /// ([ADR 0024](../../../../docs/adr/0024-tiering-failure-semantics.md) decision 5).
     pub fn live_file_numbers(&mut self) -> BTreeSet<u64> {
         self.live.retain(|version| Arc::strong_count(version) > 1);
         let mut live_files: BTreeSet<u64> = self.current.live_files();

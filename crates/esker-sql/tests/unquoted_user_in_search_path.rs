@@ -3,7 +3,7 @@
 //! `schema_test.rb`'s `test_raise_on_unquoted_schema_name` asserts the difference directly — it
 //! sets `search_path` to `"$user,public"` and requires a raise — and this node used to accept it,
 //! quietly setting a path whose first entry is a schema nobody has. A wrong answer dressed as a
-//! success, which [ADR 0031](../../docs/adr/0031-a-refusal-outranks-a-wrong-answer.md) ranks below
+//! success, which [ADR 0031](../../../docs/adr/0031-rails-compatibility-is-measured.md) ranks below
 //! a refusal.
 //!
 //! Measured on PostgreSQL 19beta1, both spellings, in one rolled-back session:

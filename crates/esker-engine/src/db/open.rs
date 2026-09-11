@@ -595,7 +595,7 @@ fn apply_to_memtables(
                 })?;
                 // A range delete replays into the tombstone list beside the map, exactly as
                 // it was applied when it was written
-                // ([ADR 0017](../../../docs/adr/0017-range-tombstones.md)). Replaying it into
+                // ([ADR 0017](../../../../docs/adr/0017-range-tombstones.md)). Replaying it into
                 // the map instead would make a recovered database disagree with the one that
                 // crashed, which is the one thing recovery may never do.
                 if entry.kind == crate::dbformat::EntryKind::DeleteRange {

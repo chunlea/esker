@@ -20,7 +20,7 @@
 //!
 //! # The on-disk (in-bucket) format
 //!
-//! Thirty-seven fixed bytes, little-endian, [ADR 0029](../../../docs/adr/0029-the-sst-store-claim.md):
+//! Thirty-seven fixed bytes, little-endian, [ADR 0029](../../../../docs/adr/0029-the-sst-store-claim.md):
 //!
 //! ```text
 //! 0   8  magic "ESKERCLM"
@@ -267,7 +267,7 @@ pub enum ClaimError {
 /// `AlreadyThere` into an answer — the marker names its owner, and a retry of our own claim
 /// recognises itself instead of refusing — and it is the whole of the safety story on an endpoint
 /// that ignores `If-None-Match`, where a conditional put degrades to an unconditional one and the
-/// window is the narrowed one [ADR 0029](../../../docs/adr/0029-the-sst-store-claim.md)
+/// window is the narrowed one [ADR 0029](../../../../docs/adr/0029-the-sst-store-claim.md)
 /// originally shipped. Never wider, never silent.
 pub fn settle(
     store: &dyn ObjectStore,
@@ -373,7 +373,7 @@ const CLAIM_ID_FILE_LEN: usize = 12;
 /// be wrong: the alternative is a database that adopts a prefix on the strength of a file
 /// anybody could have deleted. The way back is deliberate and takes two steps — delete the
 /// marker object, then re-open with `--adopt-sst-store`, which is the hatch for a prefix that
-/// holds objects and no marker ([ADR 0029](../../../docs/adr/0029-the-sst-store-claim.md)).
+/// holds objects and no marker ([ADR 0029](../../../../docs/adr/0029-the-sst-store-claim.md)).
 pub fn id_for_directory(fs: &dyn super::FileSystem, dir: &Path) -> io::Result<ClaimId> {
     let path = dir.join(CLAIM_ID_FILE);
     if fs.exists(&path)? {
