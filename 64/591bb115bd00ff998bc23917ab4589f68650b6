@@ -1,0 +1,19 @@
+crates/esker-cli/tests/pgwire_pd_failover.rs
+  s_e59614afdddccb::t_4b65f8e98394c0 1-355
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "64591bb115bd00ff998bc23917ab4589f68650b6",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
