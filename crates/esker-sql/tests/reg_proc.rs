@@ -191,3 +191,40 @@ fn every_user_types_typinput_resolves_too() {
         "these types name an input function `value::reg_proc` does not know: {digits:?}"
     );
 }
+
+/// **A `regproc` literal's cast to `oid` is not a text round trip**, which is the last row of the
+/// cast matrix's residue that was a defect.
+///
+/// `'int4in'::regproc::oid` is `42` on 19beta1 and was `22P02 invalid input syntax for type oid:
+/// "int4in"` here: the lowering's `oid` arm folds the operand's *characters* with `oid`'s input
+/// function, and a `regproc` prints as a name. The same cast over a **column** and over an array
+/// element answered all along, because there the value is a `Datum::RegProc` and
+/// `value::convert_without_text` has the pair — the fold was the only route that could not say
+/// what it was casting from.
+///
+/// Measured on 19beta1, 2026-09-10: `'int4in'::regproc::oid`, `::integer` and
+/// `'{int4in}'::regproc[]::oid[]` are `42`, `42` and `{42}`.
+#[test]
+fn a_regproc_literal_casts_to_its_oid() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE rp (id bigint primary key, r regproc)",
+        "INSERT INTO rp VALUES (1, 'int4in')",
+    ]);
+    // The literal, which is the one that was wrong, beside the two that were right.
+    assert_eq!(
+        node.rows("SELECT ('int4in'::regproc::oid)::text"),
+        vec![vec!["42"]]
+    );
+    assert_eq!(
+        node.rows("SELECT ('int4in'::regproc::integer)::text"),
+        vec![vec!["42"]]
+    );
+    assert_eq!(node.rows("SELECT (r::oid)::text FROM rp"), vec![vec!["42"]]);
+    assert_eq!(
+        node.rows("SELECT ('{int4in}'::regproc[]::oid[])::text"),
+        vec![vec!["{42}"]]
+    );
+    // And an `oid` literal is still read as digits, which is the pair this must not take:
+    // `'23'::oid` is 23 and not a name lookup.
+    assert_eq!(node.rows("SELECT ('23'::oid)::text"), vec![vec!["23"]]);
+}

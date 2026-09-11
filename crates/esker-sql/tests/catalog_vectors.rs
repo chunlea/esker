@@ -22,17 +22,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `attnum_vector_element`. The two agreed wherever resolution had already run, so only a
     // `Describe` could see the difference.
     types: &[],
-    answers: &[(
-        "SELECT 'r', oid, typname, typlen, typtype, typcategory, typdelim, typinput, typelem, \
-         typarray FROM pg_type WHERE typname IN ('int2vector','oidvector') ORDER BY oid",
-        "**`typarray` is 1006 and 1013 there and 0 here, and that is a decision.** Both vectors \
-         are on `array_delimiter.rs::every_base_type_has_an_array_or_is_listed`'s named-gap list: \
-         they are catalog types a client reads and never stores an array of, so `_int2vector` and \
-         `_oidvector` would be two types nothing writes and nothing reads. Every other column of \
-         both rows agrees — including `typcategory` **A** and the `typelem` that says a vector is \
-         made of its element, which is the fact this unit's input functions are built on.",
-        "pg19_catalog_vectors.txt:44",
-    )],
+    // **The `typarray` row is gone from this list** — it said *"1006 and 1013 there and 0 here,
+    // and that is a decision"*, and the decision was reversed by ADR 0107 step 2 once the reason
+    // was measured rather than reasoned. The reason had been *"two types nothing writes and
+    // nothing reads"*; what the measurement said is that a `typarray` of 0 makes `ARRAY[vec]` a
+    // `text[]`, which a client decodes by oid and gets wrong. `_int2vector` (1006) and
+    // `_oidvector` (1013) are types now, and the whole row agrees.
+    answers: &[],
 };
 
 #[test]

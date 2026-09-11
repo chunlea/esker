@@ -1163,6 +1163,8 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         | Row::Ltree
         | Row::LtreeArray
         | Row::LQueryArray
+        | Row::Int2VectorArray
+        | Row::OidVectorArray
         | Row::LQuery
         | Row::BoolArray
         | Row::ByteaArray

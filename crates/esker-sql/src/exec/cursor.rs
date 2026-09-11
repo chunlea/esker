@@ -2236,6 +2236,17 @@ fn declared_type_of(expr: &Expr) -> Option<ColumnType> {
         Expr::Ordinal { ty, .. } => Some(*ty),
         Expr::Cast { to, .. } => Some(*to),
         Expr::Literal(crate::plan::Literal::Typed(value)) => value.column_type(),
+        // **`::oidvector` is a call and not a cast**, because the parser has no type for the name
+        // (`parse::lower::cast_target` is the list) and `parse::lower` answers it with a
+        // `CatalogFunc::OidVector`. Every arm here
+        // that asks what a value *is* was blind to that: `$1::oidvector::integer[]` reached the
+        // array reader as the text `1 2` and was `22P02 malformed array literal` where the same
+        // cast over `int2vector` — which does reach `lower_type` — answered. Eleven rows of the
+        // cast matrix's bind mode, and the difference between the two vectors was never anything
+        // but which door the spelling comes through.
+        Expr::CatalogFunc(call) if call.func == crate::plan::CatalogFunc::OidVector => {
+            Some(ColumnType::OidVector)
+        }
         _ => None,
     }
 }
@@ -2599,6 +2610,59 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 };
                 regclass_of(env, names(&name)?)?
             }
+            // **A vector to its array, and only the *plan* knows it is a vector.** An
+            // `int2vector` is a `Datum::Text` here — `1 2 3`, space separated, which is its output
+            // function's form and not an array literal — so the value cannot say which cast this
+            // is and the operand's declared type can. Measured on 19beta1:
+            //
+            // ```text
+            // '1 2 3'::int2vector::int2[]   [0:2]={1,2,3}     <- **lower bound zero**
+            // '1 2 3'::text::int2[]         22P02 malformed array literal
+            // '{1,2}'::int2[]::int2vector   42846             <- one direction only
+            // ```
+            //
+            // The second line is why this is an arm and not a text round trip, and the **zero** is
+            // the whole of what a vector is: an array subscripted from 0, which `array_lower`
+            // already answers here and `esker-keys`' row encoding has always been able to hold
+            // ([ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
+            // step 2, the SQL-visible half — no stored byte moves).
+            // **And to every array its element casts to, not only its own**: `casts_to` permits
+            // `int2vector -> T[]` exactly when it permits `smallint -> T`, so the words are read
+            // as the vector's element and then handed to the element cast below — one conversion
+            // written once, and the **zero** lower bound survives it.
+            //
+            // **Above the `regclass[]` arm on purpose.** That one reads a `Datum::Text` as an
+            // array literal, which is right for `'{1259}'::text::regclass[]` and wrong for a
+            // vector — `1 2` has no braces, so it answered `22P02 malformed array literal` for a
+            // cast 19beta1 performs. This arm is the more specific of the two (it asks the
+            // operand's declared type) and a `match` takes the first that fits.
+            Datum::Text(ref text)
+                if let Some(held) =
+                    declared_type_of(operand).and_then(crate::value::vector_element)
+                    && let Some(element) = esker_keys::array::ArrayValue::element_of(*to) =>
+            {
+                let mut values = Vec::new();
+                for word in text.split_whitespace() {
+                    let datum = Datum::from_text(held, word)?;
+                    values.push(Some(if held == element {
+                        datum
+                    } else {
+                        cast_one_value(
+                            &datum,
+                            Some(held),
+                            element,
+                            *typmod,
+                            env.settings.rendering,
+                        )?
+                    }));
+                }
+                Datum::Array(esker_keys::array::ArrayValue {
+                    element,
+                    lower: 0,
+                    dims: vec![i32::try_from(values.len()).unwrap_or(i32::MAX)],
+                    values,
+                })
+            }
             // **A string to `regclass[]` is an I/O conversion, and that is not the scalar's
             // rule.** `pg_cast` has a row for `text -> regclass` and **none** for
             // `text -> regclass[]`, measured — so the scalar runs `text_regclass`, which resolves a
@@ -2707,22 +2771,12 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             {
                 crate::value::json::cast_to_scalar(text, *to)?
             }
-            // **A `"char"` to an `int4` is the byte, and only the *plan* knows it is a `"char"`.**
-            // A `"char"` and a `text` are the same `Datum::Text` here, and `text -> int4` really is
-            // the I/O conversion it looks like — `'42'::text::int4` is 42 — so the value alone
-            // cannot say which cast this is. The operand can: a column reference carries the
-            // column's type (`Expr::Ordinal`), a cast carries the type it named, and a folded
-            // literal carries its own. `parse::lower` had this pair right for a literal from the
-            // day `"char"` arrived and the evaluator answered
-            // `22P02 invalid input syntax for type integer: "r"` per row, for two years of
-            // corpora, because nothing asked the plan. `debts-v1.1.md` #43, the last row of its
-            // first mechanism.
-            Datum::Text(ref text)
-                if *to == ColumnType::Int4
-                    && declared_type_of(operand) == Some(ColumnType::Char) =>
-            {
-                Datum::Int4(crate::value::char_type::to_int4(text))
-            }
+            // The `"char" -> int4` arm that stood here is `cast_one_value`'s now, because an
+            // **element** needs the same rule and reaches only that function. `parse::lower` had
+            // the pair right for a literal from the day `"char"` arrived, and the evaluator
+            // answered `22P02 invalid input syntax for type integer: "r"` per row for two years
+            // of corpora because nothing asked the plan (`debts-v1.1.md` #43, the last row of its
+            // first mechanism); the arrays were the same defect one dimension out.
             // **An array to another array is the element cast, done per element** — not the
             // source array's *text* read back through the target's `array_in`, which is what the
             // arm below would do and what every route into this one was doing.
@@ -2746,13 +2800,26 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 if let Some(element) = esker_keys::array::ArrayValue::element_of(*to)
                     && values.element != element =>
             {
+                let held = values.element;
                 for datum in values.values.iter_mut().flatten() {
-                    *datum = cast_one_value(datum, element, *typmod, env.settings.rendering)?;
+                    *datum = cast_one_value(
+                        datum,
+                        Some(held),
+                        element,
+                        *typmod,
+                        env.settings.rendering,
+                    )?;
                 }
                 values.element = element;
                 Datum::Array(values)
             }
-            value => cast_one_value(&value, *to, *typmod, env.settings.rendering)?,
+            value => cast_one_value(
+                &value,
+                declared_type_of(operand),
+                *to,
+                *typmod,
+                env.settings.rendering,
+            )?,
         },
         // **The operand's value, unchanged.** Both collations this node has are byte order
         // (ADR 0076), so the clause never moves a byte; what it does is make a collation
@@ -4188,6 +4255,12 @@ fn catalog_function(
         // type, the shape only a `Describe` sees.
         CatalogFunc::RegTypeName => match args.first() {
             None | Some(Datum::Null) => Datum::Null,
+            // **All digits are an oid here too** (`value::oid_spelled`): `'23'::text::regtype` is
+            // `integer` on 19beta1, and this arm is the road a *text* takes — the literal one is
+            // `parse::lower`'s. Two readers of `regtypein`'s rule, asking the same function.
+            Some(Datum::Text(name)) if crate::value::oid_spelled(name).is_some() => {
+                crate::value::regtype_of_oid(crate::value::oid_spelled(name).unwrap_or(0))
+            }
             Some(Datum::Text(name)) => {
                 let named = crate::value::named_type(name)?
                     .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
@@ -4667,10 +4740,26 @@ fn relation_namer(env: Env<'_>) -> impl Fn(i64) -> Box<str> + '_ {
 /// and a `"char"` are both a `Datum::Text` here — and those stay above, where the plan is.
 fn cast_one_value(
     value: &Datum,
+    from: Option<ColumnType>,
     to: ColumnType,
     typmod: i32,
     rendering: crate::value::Rendering,
 ) -> Result<Datum> {
+    // **A `"char"` to an `int4` is the byte, and the value cannot say it is a `"char"`.** It is a
+    // `Datum::Text` exactly as a `text` is, and `text -> int4` really is the I/O conversion it
+    // looks like — `'42'::text::int4` is 42 — so the *declared* type is what separates them. That
+    // is why this function takes one: the scalar arm above could ask the operand's, and an
+    // **element**'s operand is the array, so `'{x,r}'::"char"[]::integer[]` was
+    // `22P02 invalid input syntax for type integer: "x"` where 19beta1 answers `{120,114}` — the
+    // last row of the cast matrix's residue that is a defect rather than a ruling, and the "one
+    // parameter away" the capture named. The other direction never needed it: a `Datum::Int4`
+    // says what it is (`convert_without_text`).
+    if from == Some(ColumnType::Char)
+        && to == ColumnType::Int4
+        && let Datum::Text(text) = value
+    {
+        return Ok(Datum::Int4(crate::value::char_type::to_int4(text)));
+    }
     // **Ask whether a real server would have rendered anything at all, first.**
     // `pg_cast.castmethod` says: `i` is the text round trip below and `f` and `b` are
     // conversions where the text is never written. Reading a `numeric`'s `2.5` with `int4in` was

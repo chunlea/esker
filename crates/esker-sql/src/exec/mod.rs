@@ -4902,6 +4902,31 @@ impl Executor {
             //
             // So it resolves the way `Executor::plan_select` does, off the statement's own `FROM`
             // and joins, which is also the only reading that a derived table cannot shift.
+            // **A set operation is dispatched here the way `plan_select` dispatches it**, and it
+            // is the whole of wire v3's F11. `Executor::plan_select` opens with
+            // `if !select.set_arms.is_empty() { plan_set_operation }`, which is where
+            // `query::append` unifies the arms; this path called `query::plan` directly, planned
+            // the **head arm** and answered its columns — so a `Describe` of
+            // `SELECT 1::int2 UNION SELECT 1::int4` said `int2` where the simple protocol and
+            // `pg_typeof` both said `integer`, and a client that prepares decodes by this one.
+            // r1's wire-types gate measured seventeen such pairs on run 127 and every one was the
+            // **left** arm's oid.
+            //
+            // Only the top level was wrong: a set operation inside a derived table or a `WITH`
+            // body is planned by `subquery::plan_subqueries`, which calls `append` itself.
+            //
+            // **Three things move together**, which is why the dispatch is the fix rather than a
+            // type rule: the oid, the **typmod** (`varchar(3) UNION varchar(5)` has none, and the
+            // head arm's 7 was going out), and the **refusal** — `set_arm_supported` is what makes
+            // `INTERSECT`/`EXCEPT` a `0A000` at `Describe` instead of a shape this node then
+            // refuses at `Execute`.
+            Statement::Select(select) if !select.set_arms.is_empty() => Some(
+                self.plan_set_operation(txn, select)?
+                    .columns
+                    .iter()
+                    .map(field_of)
+                    .collect(),
+            ),
             Statement::Select(select) => {
                 let catalogued = Catalogued { exec: self, txn };
                 let from = match &select.from {

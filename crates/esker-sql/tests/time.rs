@@ -4,11 +4,12 @@
 //! one session and replayed against a real server for idempotence before it was imported: 62
 //! statements, of which the ones below are the answers this node does not reproduce.
 //!
-//! **Almost every divergence here is one of two absent types.** `interval` is what a `time`
-//! answers with whenever it is subtracted, multiplied or aggregated, and `timetz` is a separate
-//! type with its own OID. Neither exists yet, so each of those statements is `0A000` naming the
-//! type rather than a wrong value — ADR 0031's rule, applied to the two halves of this type's
-//! arithmetic that cannot be reached from here.
+//! **The divergences here began as two absent types and are down to one.** `interval` is what a
+//! `time` answers with whenever it is subtracted, multiplied or aggregated; it arrived, its
+//! arithmetic came off this list one row at a time, and the last of it — the two casts between
+//! the two types — closed with the cast matrix's residue. What is left is `timetz`, a separate
+//! type with its own OID and a zone this node has nowhere to put, refused by name: ADR 0031's
+//! rule, applied to the half of this type's surface that cannot be reached from here.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -17,19 +18,6 @@ mod parity;
 
 /// Nothing: the corpus builds its own table.
 const CORPUS_FIXTURE: &[&str] = &[];
-
-/// One of `DIVERGENCES`' reasons: the result type does not exist here.
-const INTERVAL: &str = "**The two casts between `time` and `interval` are what is left.** This \
-     entry used to say that `interval` was not a type this node had, and covered every arithmetic \
-     a `time` takes part in — `time - time`, `time * 2`, `time + interval`, `sum` and `avg`. The \
-     type arrived, and those came off this list one at a time; `sum(time)` and `avg(time)` were \
-     the last, when they began answering the `interval` a real server answers. \
-     `'12:34:56'::time::interval` is the one row that still disagrees, and what it wants is a \
-     conversion between the two types rather than the types themselves. It was two: `'1 day \
-     02:00:00'::interval::time` closed when `value::convert_without_text` was given that pair \
-     (`debts-v1.1.md` #43), and the asymmetry it leaves is worth naming: the same conversion over a \
-     **column** had been right all along, so this row is the *fold's* half of one cast and the \
-     matrix never saw it.";
 
 /// The other absent type.
 const TIMETZ: &str = "**`timetz` is a different type** — OID 1266, twelve bytes, a `time` plus a \
@@ -62,7 +50,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // too, and the column is missing for all sixteen types.
         "SELECT oid, typname, typlen, typinput, typcategory FROM pg_type WHERE typname IN \
          ('time','timetz') ORDER BY oid",
-        "SELECT '12:34:56'::time::interval, '24:00:00'::time::interval",
         "SELECT '12:34:56'::time::timetz",
         "SELECT '12:34:56'::timetz::time",
         "SELECT extract(hour FROM '12:34:56'::time), extract(epoch FROM '12:34:56'::time)",
@@ -92,13 +79,14 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
         // here and is closed: `debts-v1.1.md` #36 gave the cast and the row write their own
         // sides of one seam (`tests/typmod_seam.rs`). It had nothing to do with this type,
         // which is what every copy of it said — five entries across four files, one cause.
-        (
-            "SELECT '12:34:56'::time::interval, '24:00:00'::time::interval",
-            INTERVAL,
-            "pg19_time.txt:87",
-        ),
-        // `'1 day 02:00:00'::interval::time` was here under the same reason and is **closed** —
-        // see `INTERVAL` above for the asymmetry it left behind.
+        // **Both casts between `time` and `interval` are closed and neither is listed here any
+        // more.** `'1 day 02:00:00'::interval::time` went first, when `value::convert_without_text`
+        // was given the pair (`debts-v1.1.md` #43); `'12:34:56'::time::interval` went with the cast
+        // matrix's residue, and it was never a missing conversion — `refused_cast`'s table said the
+        // pair had no cast at all, while `pg_cast` on a real server has one row for it. The arm
+        // beside it already carried the finding in words ("an interval casts to a time too, which
+        // the time unit could not know when it wrote this list") and the other direction was left
+        // standing for a day.
         (
             "SELECT '12:34:56'::time::timetz",
             TIMETZ,

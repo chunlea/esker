@@ -453,3 +453,212 @@ fn greatest_takes_the_common_type_and_not_the_wider_one() {
         vec![vec!["2", "1"]]
     );
 }
+
+/// **The `Describe` of a set operation answers the first arm's type, not the set's.**
+///
+/// Found by r1's wire-types gate on run 127 (`esker-coord/r1-127-wire-caveat.txt` §4): seventeen
+/// `UNION` pairs where the `RowDescription` this node sends is the **left** arm's oid and 19beta1
+/// sends the promotion. Diagnosed here rather than assumed, by asking the two paths the same
+/// seventeen questions:
+///
+/// ```text
+///   pair                    simple  describe   pg_typeof   pg19
+///   int2  UNION int4            23        21   integer       23
+///   int8  UNION float4         700        20   real          700
+///   numeric UNION float8       701      1700   double …      701
+///   varchar UNION name          19      1043   name           19
+/// ```
+///
+/// **The simple path is right in every one of the seventeen, and so is the value** —
+/// `exec::query::common_of` is `select_common_type`, it *does* reach `UNION`, and it answers
+/// exactly what 19beta1 answers. What the extended protocol sends is the head arm's, because
+/// `Executor::described_in` calls `query::plan` directly where `plan_select` would have
+/// dispatched on `set_arms` to `plan_set_operation` — the one place the unification lives. A set
+/// operation **nested** anywhere is right, measured: inside a derived table and inside a `WITH`
+/// body both answer 23, because those are planned by `subquery::plan_subqueries`, which calls
+/// `append`. It is the top level and only the top level.
+///
+/// Two shapes beyond the gate's seventeen, because the gate records the type oid and nothing else:
+///
+/// * the **typmod** is the first arm's too — `varchar(3) UNION varchar(5)` describes as
+///   `1043/7` where the simple path says `1043/-1`, which is what a real server says;
+/// * `INTERSECT` and `EXCEPT` are `0A000` on the simple path and **answer a shape** here, so a
+///   client that prepares one is told its columns and refused at `Execute` instead of at
+///   `Describe`.
+///
+/// **Fixed** by dispatching on `set_arms` where `described_in` called `query::plan` — one call,
+/// after the parameters are typed and the views expanded, which is the order that function
+/// documents at length.
+#[test]
+fn a_prepared_set_operation_describes_the_common_type() {
+    let mut node = parity::Node::new(FIXTURE);
+    // Every pair r1's gate measured, with 19beta1's answer beside it.
+    for (left, right, expected) in [
+        ("int2", "int4", 23_u32),
+        ("int2", "int8", 20),
+        ("int2", "numeric", 1700),
+        ("int2", "float4", 700),
+        ("int2", "float8", 701),
+        ("int4", "int8", 20),
+        ("int4", "numeric", 1700),
+        ("int4", "float4", 700),
+        ("int4", "float8", 701),
+        ("int8", "numeric", 1700),
+        ("int8", "float4", 700),
+        ("int8", "float8", 701),
+        ("numeric", "float4", 700),
+        ("numeric", "float8", 701),
+        ("float4", "float8", 701),
+        ("varchar", "name", 19),
+        ("bpchar", "name", 19),
+    ] {
+        let sql = format!("SELECT '1'::{left} AS v UNION SELECT '1'::{right}");
+        assert_eq!(described(&mut node, &sql).0, expected, "Describe of {sql}");
+    }
+}
+
+/// **The typmod is the set's too, and the wire gate cannot see it** — it records the
+/// `RowDescription`'s type oid and nothing else, so this shape had to be asked for rather than
+/// found.
+///
+/// A `varchar(3)` beside a `varchar(5)` is a `varchar` with no length on a real server; the
+/// `Describe` path was answering the head arm's `7` (3 + `VARHDRSZ`). Same dispatch, because
+/// `query::append` is where a typmod survives only when both arms agree on it.
+#[test]
+fn a_prepared_set_operation_describes_the_common_typmod() {
+    let mut node = parity::Node::new(FIXTURE);
+    let widths = "SELECT '1'::varchar(3) AS v UNION SELECT '1'::varchar(5)";
+    assert_eq!(
+        described(&mut node, widths),
+        (1043, -1),
+        "a varchar(3) beside a varchar(5) is a varchar with no length"
+    );
+    // **Both arms agreeing keeps it**, which is what says the rule is agreement and not "drop it".
+    assert_eq!(
+        described(
+            &mut node,
+            "SELECT '1'::varchar(3) AS v UNION SELECT '2'::varchar(3)"
+        ),
+        (1043, 7)
+    );
+    // And the simple path, which was right all along — the two answers now match.
+    let esker_sql::pgwire::session::Outcome::Rows { fields, .. } = node.run(widths).unwrap() else {
+        panic!("{widths} returned no rows")
+    };
+    assert_eq!((fields[0].type_oid, fields[0].type_modifier), (1043, -1));
+}
+
+/// **A set operation this node does not have is refused at `Describe`, not after it.**
+///
+/// `INTERSECT` and `EXCEPT` are `0A000` here (`set_arm_supported`), and the `Describe` path never
+/// reached that check: it planned the head arm and answered a shape, so a client that prepares one
+/// was told its columns and then refused at `Execute`. The protocol's own order is that a
+/// statement which cannot run does not describe.
+#[test]
+fn a_prepared_intersect_is_refused_before_it_is_described() {
+    let mut node = parity::Node::new(FIXTURE);
+    for sql in [
+        "SELECT i FROM so INTERSECT SELECT i FROM so",
+        "SELECT i FROM so EXCEPT SELECT i FROM so",
+    ] {
+        let described = node.describe(sql).expect_err("describe answered a shape");
+        assert_eq!(
+            described.sqlstate(),
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{sql}"
+        );
+        // The same refusal the simple path gives, which is the point: one answer per statement.
+        let executed = node.run(sql).expect_err("execute answered rows");
+        assert_eq!(described.to_string(), executed.to_string(), "{sql}");
+    }
+}
+
+/// The `Describe`'s first field, as `(type_oid, type_modifier)`.
+fn described(node: &mut parity::Node, sql: &str) -> (u32, i32) {
+    let fields = node
+        .describe(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error}"))
+        .fields
+        .unwrap_or_else(|| panic!("{sql} described no fields"));
+    (fields[0].type_oid, fields[0].type_modifier)
+}
+
+/// **One statement, one resolution pass — and the arms were not in it.**
+///
+/// Everything `Executor::bound` does runs through `exec::bind`'s walkers, and none of them
+/// descended into `select.set_arms`. So a `UNION`'s second arm got none of it, and each pass said
+/// so from the row evaluator as an `XX000` — this crate reporting a state it does not handle, for
+/// statements whose **first** arm answers the same expression perfectly. Measured before the fix,
+/// five of them:
+///
+/// ```text
+/// SELECT 'pg_class'::regclass UNION SELECT 'pg_type'::regclass
+///     XX000 internal error: regclass() reached the row evaluator unresolved
+/// SELECT current_schema() UNION SELECT current_schema()      XX000 a current_schema …
+/// SELECT current_database() UNION SELECT current_database()  XX000 a current_schema …
+/// SELECT m FROM t UNION SELECT 'sad'::mood FROM t            XX000 a cast to a user-defined type …
+/// SELECT n FROM t UNION SELECT ('mood'::regtype)::int4       XX000 a regtype over a user-defined type …
+/// ```
+///
+/// The third walker with this hole and the same fix: a `FROM` function's arguments were the second
+/// (wire v3 family F10) and a `FROM`'s `VALUES` rows the first. `debts-v1.1.md` #57.
+#[test]
+fn a_set_arm_gets_the_same_resolution_the_first_one_does() {
+    let mut node = parity::Node::new(FIXTURE);
+    // Sorted here rather than by `ORDER BY 1`, which would sort by the **oid** a `regclass` is.
+    let mut relations =
+        node.rows("SELECT 'pg_class'::regclass AS r UNION SELECT 'pg_type'::regclass");
+    relations.sort();
+    assert_eq!(relations, vec![vec!["pg_class"], vec!["pg_type"]]);
+    assert_eq!(
+        node.rows("SELECT current_schema() AS s UNION SELECT current_schema()"),
+        vec![vec!["public"]]
+    );
+    assert_eq!(
+        node.rows("SELECT current_database() AS d UNION SELECT current_database()"),
+        vec![vec!["esker"]]
+    );
+    // **Only in the second arm**, which is the shape that needs the *read-only* walker as well:
+    // `resolve_current_database` and its siblings ask `bind::any` first and return early when the
+    // answer is no, so a construct the question could not see was never resolved even once the
+    // mutable walk could have reached it. Two walkers, written as a pair, exactly as
+    // `walk_table_ref_mut`'s own comment says of the `FROM` shapes.
+    assert_eq!(
+        node.rows("SELECT 'esker' AS d UNION SELECT current_database()"),
+        vec![vec!["esker"]]
+    );
+    assert_eq!(
+        node.rows("SELECT 'public' AS s UNION SELECT current_schema()"),
+        vec![vec!["public"]]
+    );
+    // A `regtype` over a **user** type, which is the same pass one function over.
+    node.run("CREATE TYPE mood AS ENUM ('sad', 'ok')").unwrap();
+    let oid = node.rows("SELECT ('mood'::regtype)::int4")[0][0].clone();
+    assert_eq!(
+        node.rows("SELECT 0 AS n UNION SELECT ('mood'::regtype)::int4 ORDER BY 1"),
+        vec![vec!["0".to_owned()], vec![oid]]
+    );
+}
+
+/// **A parameter in a non-first arm is typed by that arm's own columns**, which needs two more of
+/// the same walkers: the one that collects the statement's relations and the one that types.
+///
+/// `SELECT c FROM b UNION SELECT c FROM b WHERE c = $1` is one statement with one `$n` sequence.
+/// Before the walk reached the arms, `bind::infer` saw neither the predicate nor — for a relation
+/// only an arm names — the table to type it against, and the parameter fell back to `text`. It
+/// happens to be `text` here, so the shape that proves it is a column of another type.
+#[test]
+fn a_parameter_in_a_set_arm_is_typed_by_its_own_arm() {
+    let mut node = parity::Node::new(FIXTURE);
+    // `so.i` is an `int4`: a parameter compared against it is an `int4` (23) and not `text` (25).
+    let described = node
+        .describe("SELECT 0 AS i UNION SELECT i FROM so WHERE i = $1")
+        .unwrap();
+    assert_eq!(described.parameters, vec![23]);
+    // And the same statement runs, with the parameter filled — a `$n` the substitution never
+    // reached is an `XX000` from the row evaluator.
+    assert_eq!(
+        node.rows("SELECT 0 AS i UNION SELECT i FROM so WHERE i = 1 ORDER BY 1"),
+        vec![vec!["0"], vec!["1"]]
+    );
+}

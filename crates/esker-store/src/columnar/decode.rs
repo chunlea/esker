@@ -265,6 +265,10 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         // `lquery[]` joins them the day it exists (ADR 0107 step 1), for both of their reasons at
         // once: a pattern has no comparison and an array's is not its bytes'.
         | StoredType::LQueryArray
+        // The two vectors' arrays join them the day they exist (ADR 0107 step 2): what a vector
+        // holds is a space-separated text whose comparison is not its bytes'.
+        | StoredType::Int2VectorArray
+        | StoredType::OidVectorArray
         | StoredType::FloatRange
         | StoredType::VarcharRange
         | StoredType::TstzRangeArray

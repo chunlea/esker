@@ -5818,6 +5818,24 @@ fn lower_array(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {
         {
             return Ok(None);
         }
+        // **A vector is not written with braces**, and this function is the one reader of the
+        // array grammar that did not know it: `int2vectorout` is space separated, so
+        // `2 = ANY('1 2 3'::int2vector)` reached `parse_array_literal`, found no `{`, and was
+        // `22P02 invalid input syntax for type array` — while **the same comparison through a
+        // column answered `true`**, because that path reads the value with `value::vector::Array`,
+        // which knows both forms. Measured, both halves, and 19beta1 answers `true` to each.
+        //
+        // `None` keeps it an expression, exactly as the `regclass[]` arm above does and for a
+        // sibling reason: the shortcut is only for a list this function can *see*, and a vector's
+        // elements are not written where it is looking.
+        Expr::Cast { data_type, .. }
+            if matches!(
+                lower_type(data_type),
+                Ok((ColumnType::Int2Vector | ColumnType::OidVector, _))
+            ) || cast_target(data_type) == Some(CastTarget::OidVector) =>
+        {
+            return Ok(None);
+        }
         // `'{a,b}'::text[]` and a bare `'{a,b}'`: the cast is a no-op here, because what the array
         // holds is decided by what it is compared against, exactly as an `IN` list's elements are.
         Expr::Cast { expr, .. } => return lower_array(expr),
@@ -6194,7 +6212,14 @@ fn lower_regclass_array(expr: &Expr) -> Result<plan::Expr> {
     // dimension up. Asking `cast_literal_text` instead read through the cast in
     // `'{1259}'::oid[]::regclass[]` and handed `1259` to the *name* lookup, which is
     // `42P01 relation "1259" does not exist` for a statement a real server answers `{pg_class}`.
-    let Some(text) = (if is_string_literal(expr) {
+    // **A vector is not a name list**, even though it is written as a quoted string: `1 2` has no
+    // braces and `array_in` answers `22P02 malformed array literal` for a cast 19beta1 performs
+    // (`'1 2'::int2vector::regclass[]` is `{1,2}` there, the digits being oids). `is_string_literal`
+    // looks through the cast — which is what `'{…}'::text::regclass[]` needs — so the source type
+    // is what tells the two apart, and the evaluator's vector arm takes it from here.
+    let Some(text) = (if is_string_literal(expr)
+        && source_type(expr)?.and_then(value::vector_element).is_none()
+    {
         cast_literal_text(expr)?
     } else {
         None
@@ -6364,6 +6389,34 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             Ok((ty, _)) => plan::Literal::TypedNull(ty),
             Err(_) => plan::Literal::Null,
         }));
+    }
+    // **A vector's cast to an array is the evaluator's, whichever array it is.** The words are
+    // not an array literal — `1 2`, no braces — so every path that reads the operand's text with
+    // `array_in` answers `22P02 malformed array literal` for a cast a real server performs, and
+    // two of them are reached before the general one: `lower_array_cast`'s literal arm (which
+    // defers only when the element has no typmod, so `character[]` slipped through) and
+    // `lower_regclass_array` (which reads the text itself, to resolve each name). Measured:
+    // `'1 2'::int2vector::character[]` and `::regclass[]` were the last two of the matrix's
+    // `42846 / ok` residue after the rest of the vectors' twenty-five closed.
+    //
+    // The permission is still `casts_to`'s and is asked here, because this returns before the
+    // general gate below: `'1 2'::int2vector::date[]` is `42846` on 19beta1 and stays one.
+    if let Some(from) = source_type(expr)?
+        && value::vector_element(from).is_some()
+        && let Ok((to, typmod)) = lower_type(data_type)
+        && esker_keys::array::ArrayValue::element_of(to).is_some()
+    {
+        if !catalog::pg_catalog::casts_to(from, to) {
+            return Err(SqlError::CannotCast {
+                from: from.name(),
+                to: to.name(),
+            });
+        }
+        return Ok(plan::Expr::Cast {
+            operand: Box::new(lower_expr(expr)?),
+            to,
+            typmod,
+        });
     }
     if let Some(array) = lower_array_cast(expr, data_type)? {
         return Ok(array);
@@ -6835,6 +6888,27 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             },
         };
     };
+    // **Permission is `pg_cast`'s here too**, which is the one thing these four targets were not
+    // asking. Every other cast goes through `casts_to` — the general arm above says so in its own
+    // comment — and a target with its own lowering arm returned before it, so
+    // `'1'::bit::oid`, `'pg_class'::regclass::regtype` and five `… -> oidvector` pairs answered
+    // values where 19beta1 says `42846 cannot cast type X to Y`. Measured, all seven; it is the
+    // same shape the literal-array arm had before `d4be1a60`, and the third time in this family.
+    //
+    // **A source with no type of its own is not refused**: an unquoted literal is `unknown` and
+    // `source_type` answers `None`, which is exactly the case PostgreSQL resolves through the
+    // target's input function. So `'25 1043'::text::oidvector` and `'pg_class'::regclass` are
+    // untouched — the first because `text` is a string category and `casts_to` already says yes,
+    // the second because there is nothing to cast *from* yet.
+    let to = target.column_type();
+    if let Ok(Some(from)) = source_type(expr)
+        && !catalog::pg_catalog::casts_to(from, to)
+    {
+        return Err(SqlError::CannotCast {
+            from: from.name(),
+            to: to.name(),
+        });
+    }
     match (target, expr) {
         // `'integer'::regtype::oid` — the inner cast is matched here rather than lowered first.
         (
@@ -6946,6 +7020,16 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
         // `'integer'::regtype` on its own, which answers the name PostgreSQL prints it by.
         (CastTarget::RegType, _) => {
             let name = cast_operand(expr, data_type)?;
+            // **All digits are an oid, before the catalog is asked.** `'23'::regtype` is
+            // `integer` on a real server — `regtypein`'s own rule, the same one `regclassin` has
+            // — and it went to the user-type lookup here, which answered
+            // `42704 type "23" does not exist` for a spelling `ActiveRecord` writes when it reads
+            // `typelem` back. `value::oid_spelled` is the one reader of the rule.
+            if let Some(oid) = value::oid_spelled(&name) {
+                return Ok(plan::Expr::Literal(plan::Literal::Typed(Box::new(
+                    value::regtype_of_oid(oid),
+                ))));
+            }
             let Some(named) = value::named_type(&name)? else {
                 return Ok(user_regtype(&name, false));
             };
@@ -6968,6 +7052,21 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             // one; folding a literal here is a convenience, and a *column* has nothing to fold.
             // Without this arm `typinput::oid` — a statement a real server answers — was
             // `0A000 the cast typinput::oid is not supported` (ADR 0098).
+            // **A `regproc`'s text is its name, so it is not folded here.** `'int4in'::regproc::oid`
+            // is `42` on 19beta1 and was `22P02 invalid input syntax for type oid: "int4in"`: the
+            // fold below reads the operand's characters with `oid`'s input function, and a
+            // `regproc` prints as `int4in`. The same cast over a **column** and over an array
+            // element both answered all along, because there the value is a `Datum::RegProc` and
+            // `value::convert_without_text` has the pair — so the node is kept and the conversion
+            // happens where the value can speak for itself. The `regtype` and `regclass` arms
+            // above never reach this one; `regproc` is the third of the family and had no arm.
+            if source_type(expr)? == Some(ColumnType::RegProc) {
+                return Ok(plan::Expr::Cast {
+                    operand: Box::new(lower_expr(expr)?),
+                    to: ColumnType::Oid,
+                    typmod: NO_TYPMOD,
+                });
+            }
             let Ok(text) = cast_operand(expr, data_type) else {
                 return Ok(plan::Expr::Cast {
                     operand: Box::new(lower_expr(expr)?),
@@ -7122,18 +7221,19 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
             }));
         }
     }
-    // **A `time` casts to a string and to nothing else.** Measured one target at a time against
-    // 19beta1: `text`, `varchar` and `character(n)` are the whole of it, and every other type
-    // this node has — both integers and floats, `numeric`, `bool`, `bytea`, `json`, `jsonb`,
-    // `date` and both timestamps — is `42846 cannot cast type time without time zone to …`.
+    // **A cast to a string type is the source's output function, and "string type" is a
+    // category.** `pg_cast` has no row for any of these pairs; a real server admits them because
+    // `find_coercion_pathway` answers `COERCEVIAIO` when the *target*'s `typcategory` is `S`.
     // Without this the cast goes through the rendered text and blames the *value*, which is a
     // `22P02` about digits for a pair that has no cast at all.
-    let stringy = |ty: ColumnType| {
-        matches!(
-            ty,
-            ColumnType::Text | ColumnType::Varchar | ColumnType::Bpchar
-        )
-    };
+    //
+    // **Written as three names — `text`, `varchar`, `character` — it refused eight pairs the
+    // oracle answers**, because `name` and `citext` are in that category too and this node's own
+    // `typcategory` already said so. Measured on 19beta1 with `citext` created inside the
+    // transaction: `'1 day'::interval::name`, `::citext`, and the same for `money`, `time` and
+    // `uuid`, are the value's own text. A hand-written list of a table that exists one module
+    // over is the shape this crate keeps finding; ask the table.
+    let stringy = |ty: ColumnType| catalog::pg_catalog::typcategory(ty) == "S";
     Ok(match (source, target) {
         // **A money casts to `numeric` and to a string, and takes `numeric` and the integers.**
         // Measured one target at a time, and the asymmetry is the point: `567.89::numeric::money`
@@ -7192,7 +7292,13 @@ fn refused_cast(expr: &Expr, data_type: &DataType) -> Result<Option<SqlError>> {
                 to: to.name(),
             })
         }
-        (Some(ColumnType::Time), Some(to)) if !stringy(to) && to != ColumnType::Time => {
+        // **And a `time` casts to an `interval`**, which is one `pg_cast` row (`e`, by function)
+        // and the half of the pair this list did not have: the arm below already says an interval
+        // casts to a time, found the same way and noted there as something "the time unit could
+        // not know when it wrote this list". `'12:34:56'::time::interval` is `12:34:56`.
+        (Some(ColumnType::Time), Some(to))
+            if !stringy(to) && !matches!(to, ColumnType::Time | ColumnType::Interval) =>
+        {
             Some(SqlError::CannotCast {
                 from: ColumnType::Time.name(),
                 to: to.name(),
@@ -7418,6 +7524,20 @@ enum CastTarget {
     Oid,
     /// PostgreSQL's `oidvector`: a list of oids, printed space separated.
     OidVector,
+}
+
+impl CastTarget {
+    /// The type this target **is**, for the one question these four arms did not ask: whether
+    /// `pg_cast` has a row for the pair. Every other cast asks `casts_to`; a target with its own
+    /// lowering arm returned before it.
+    fn column_type(self) -> ColumnType {
+        match self {
+            CastTarget::RegClass => ColumnType::RegClass,
+            CastTarget::RegType => ColumnType::RegType,
+            CastTarget::Oid => ColumnType::Oid,
+            CastTarget::OidVector => ColumnType::OidVector,
+        }
+    }
 }
 
 /// `sqlparser` files both as custom type names, since neither is in its `DataType`.
