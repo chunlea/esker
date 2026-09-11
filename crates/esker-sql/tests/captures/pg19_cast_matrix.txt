@@ -138,14 +138,17 @@
 # roads a `regtype` arrives by. It closed `<integer>[] -> regtype[]`, the vectors' last two rows,
 # and a declared divergence in `tests/regtype.rs` whose reason had stated the rule.
 #
-# **What is left is six rows in three items** — the five bad rows are corrected rather than
-# counted, in the section above.
+# **What is left is five rows in two items** — the five bad rows are corrected rather than counted,
+# in the section above, and `"char"[] -> integer[]` is closed.
 #
 #     22003  4   `regclass -> integer|oid` and their arrays: ADR 0097's 64-bit ids against a
 #                four-byte oid. **A ruling, not a fix** — it is the id and not the cast.
-#     22P02  1   `"char"[] -> integer[]` is the byte, and an element never reaches the arm that
-#                knows, because that arm asks the *operand's* declared type — one parameter away.
 #     22P02  1   `regproc -> oid` over a literal.
+#
+# `"char"[] -> integer[]` **was** the "one parameter away" row and is closed: `cast_one_value`
+# takes the operand's declared type now, so an element's cast knows what the element was, and the
+# scalar arm that used to hold the rule is that call. `'{x,r}'::"char"[]::integer[]` is
+# `{120,114}`, the literal, the constructor and the column all agreeing.
 #
 # The `both refuse, different code` group is 20 and is the sqlstate family, not a cast defect:
 # seven are `22P02` where a real server says `22023`, six `22P02` where it says `42846`.

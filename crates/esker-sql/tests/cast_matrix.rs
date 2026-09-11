@@ -389,3 +389,63 @@ fn an_hstore_casts_to_a_json_document() {
         );
     }
 }
+
+/// **An element's cast needs the element's declared type**, which is the last row of the matrix
+/// that is a defect rather than a ruling.
+///
+/// `'x'::"char"::integer` is `120` — the byte — and `'{x,r}'::"char"[]::integer[]` was
+/// `22P02 invalid input syntax for type integer: "x"`, because the arm that knows asks the
+/// **operand's** declared type and an element's operand is the array. The other direction was
+/// right all along (`'{120,114}'::integer[]::"char"[]` is `{x,r}`), because there the value is a
+/// `Datum::Int4` and says so itself; a `"char"` is a `Datum::Text` exactly as a `text` is, where
+/// `text -> integer` really is the I/O conversion it looks like.
+///
+/// Measured on 19beta1, 2026-09-10, both directions and both routes:
+///
+/// ```text
+/// 'x'::"char"::integer              120       '{x,r}'::"char"[]::integer[]      {120,114}
+/// '{120,114}'::integer[]::"char"[]  {x,r}
+/// ```
+#[test]
+fn an_element_cast_knows_what_the_element_was() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE ch (id bigint primary key, a \"char\"[], b integer[])",
+        "INSERT INTO ch VALUES (1, '{x,r}', '{120,114}')",
+    ]);
+    // The literal, the constructor and the column: three routes into one cast, which is the shape
+    // this family keeps having.
+    for written in [
+        "'{x,r}'::\"char\"[]::integer[]",
+        "ARRAY['x'::\"char\", 'r'::\"char\"]::integer[]",
+    ] {
+        assert_eq!(
+            node.rows(&format!("SELECT ({written})::text")),
+            vec![vec!["{120,114}"]],
+            "{written}"
+        );
+    }
+    assert_eq!(
+        node.rows("SELECT (a::integer[])::text FROM ch"),
+        vec![vec!["{120,114}"]],
+        "a column of \"char\"[]"
+    );
+    // The scalar, and the direction that was already right, so this says the rule moved rather
+    // than that it was rewritten.
+    assert_eq!(
+        node.rows("SELECT ('x'::\"char\"::integer)::text"),
+        vec![vec!["120"]]
+    );
+    assert_eq!(
+        node.rows(
+            "SELECT ('{120,114}'::integer[]::\"char\"[])::text, (b::\"char\"[])::text FROM ch"
+        ),
+        vec![vec!["{x,r}", "{x,r}"]]
+    );
+    // **A `text` is still the I/O conversion**, which is the pair this rule must not swallow:
+    // `'42'::text::integer` is 42 and `'{42}'::text[]::integer[]` is `{42}`, digits read as
+    // digits, where the same characters as a `"char"` would be the byte.
+    assert_eq!(
+        node.rows("SELECT ('42'::text::integer)::text, ('{42}'::text[]::integer[])::text"),
+        vec![vec!["42", "{42}"]]
+    );
+}
