@@ -184,7 +184,7 @@ impl TxnSnapshot for EngineSnapshot<'_> {
             if iter.key() >= &upper[..] {
                 break;
             }
-            let (_, commit_ts) = key::split(iter.key())?;
+            let (user_key, commit_ts) = key::split(iter.key())?;
             if commit_ts > ts {
                 let record = WriteRecord::decode(iter.value())?;
                 // A rollback marker is not a commit, so it is not a phantom either (ADR 0078):
@@ -194,8 +194,17 @@ impl TxnSnapshot for EngineSnapshot<'_> {
                 if record.kind != esker_txn::Kind::Rollback {
                     return Ok(Some(Version::new(commit_ts, record)));
                 }
+                // A marker was stepped past, and an **older** version of this same key can still
+                // be above `ts`. So this one key is walked version by version, which is the case
+                // the seek below may not take.
+                iter.next();
+            } else {
+                // Versions sort newest-first under a key's prefix, so this key's newest is at or
+                // below `ts` and every older one is too. Nothing under this prefix can be a
+                // phantom: past the whole key (#58, the same rule as `scan`'s).
+                let (_, past_this_key) = key::version_range(&user_key);
+                iter.seek(&past_this_key);
             }
-            iter.next();
         }
         iter.status().map_err(|error| storage(&error))?;
         Ok(None)
@@ -389,8 +398,14 @@ fn user_keys_in(
     versions.seek(&low);
     while versions.valid() && versions.key() < high.as_slice() && keys.len() < ceiling {
         let (user_key, _) = key::split(versions.key()).map_err(txn_to_proto)?;
+        // **Past the whole key, not on to its next version** (#58). Every remaining entry under
+        // this prefix is an older version of a key already taken, and the answer is a *set of
+        // keys* — so stepping them cost `O(keys × versions)` and produced nothing. The set
+        // deduped the answer and hid the work: the rows never grew and the steps grew with every
+        // commit in the range's history.
+        let (_, past_this_key) = key::version_range(&user_key);
         keys.insert(user_key);
-        versions.next();
+        versions.seek(&past_this_key);
     }
     versions.status().map_err(|error| engine_to_proto(&error))?;
 
