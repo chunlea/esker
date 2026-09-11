@@ -157,11 +157,9 @@ pub struct StoreOptions {
     /// moves and nothing goes to act on it — and it is kept reachable because the acceptance
     /// needs a control arm that cannot collect.
     ///
-    /// **The default is conservative and provisional.** Five minutes is a number chosen to be
-    /// obviously safe rather than measured: a store hears a safepoint every ten seconds, so this
-    /// is thirty heartbeats' worth of quiet between whole-family rewrites. r1's run 127i is
-    /// timing what one sweep costs on a real cluster, and that measurement is what this should
-    /// finally be set from.
+    /// The default is [`crate::COLLECT_DEBOUNCE`] — one heartbeat, which is as short as this can
+    /// usefully be: a store learns the safepoint by asking PD on its heartbeat and at no other
+    /// time.
     pub collect_debounce: Option<std::time::Duration>,
 }
 

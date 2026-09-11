@@ -174,11 +174,22 @@ pub const STORE_HEARTBEAT_MS: u64 = 10_000;
 
 /// The default shortest gap between two collections ([`collect`]).
 ///
-/// **Conservative and provisional.** A store hears a safepoint every [`STORE_HEARTBEAT_MS`], so
-/// five minutes is thirty heartbeats' worth of quiet between whole-family rewrites — chosen to be
-/// obviously safe rather than measured, because what one sweep costs on a real cluster is what
-/// r1's run 127i is timing. That measurement is what this should finally be set from.
-pub const COLLECT_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(300);
+/// **Measured, and bounded below by the heartbeat.** Run 127i timed a whole-column-family sweep on
+/// a real cluster at a **400 ms median per store** (361–529 ms, over 200–680 K entries and
+/// 75–100 MB), so a sweep is not the expensive thing a five-minute gap was guarding against.
+///
+/// Ten seconds because that is [`STORE_HEARTBEAT_MS`]: a store learns the safepoint by asking PD
+/// on its heartbeat and at no other time, so a gap shorter than one heartbeat **cannot let
+/// anything through that a ten-second gap would not**. It would only cost a lock acquisition per
+/// rise. The ceiling this puts on the work is one 400 ms sweep per ten seconds — about four per
+/// cent of one store — and that is the worst case, reached only while the safepoint moves on every
+/// single heartbeat.
+///
+/// Configurable at [`crate::StoreOptions::collect_debounce`], where `None` is "never collect by
+/// itself" — the behaviour every store had before #70, kept so that a measurement can have a
+/// control arm.
+pub const COLLECT_DEBOUNCE: std::time::Duration =
+    std::time::Duration::from_millis(STORE_HEARTBEAT_MS);
 
 /// Interval between region heartbeats from a leader, in milliseconds.
 pub const REGION_HEARTBEAT_MS: u64 = 60_000;

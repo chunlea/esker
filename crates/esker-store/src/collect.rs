@@ -296,7 +296,10 @@ mod tests {
         let (_dir, db) = db();
         let sweeper = Sweeper::start(db, Duration::ZERO);
         sweeper.wanted(10);
-        assert!(sweeper.wait_for_sweeps(1, PATIENCE), "the first rise sweeps");
+        assert!(
+            sweeper.wait_for_sweeps(1, PATIENCE),
+            "the first rise sweeps"
+        );
         for _ in 0..5 {
             sweeper.wanted(10);
         }
@@ -317,7 +320,10 @@ mod tests {
         let gap = Duration::from_millis(400);
         let sweeper = Sweeper::start(db, gap);
         sweeper.wanted(10);
-        assert!(sweeper.wait_for_sweeps(1, PATIENCE), "the first rise sweeps");
+        assert!(
+            sweeper.wait_for_sweeps(1, PATIENCE),
+            "the first rise sweeps"
+        );
 
         sweeper.wanted(20);
         assert!(
