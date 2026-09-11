@@ -175,11 +175,19 @@ fn one_statement_reads_no_key_twice() {
 ///
 /// **The control is a statement that must grow with the catalog**, so a slow container moves both
 /// numbers and the comparison still says what it says.
+///
+/// # Green since 2026-09-11, and it spent two debts red
+///
+/// It was `#[ignore]`d twice over: first as #49's, then retargeted at **#54** by the user's ruling
+/// of 2026-09-10 — *kept red rather than rewritten*, which is the ruling that made it the thing
+/// #54 had to satisfy instead of a number #54 could be fitted to.
+///
+/// What closed it was not what its own `#[ignore]` predicted. The residue really was a cross
+/// product, and the fix was not a hash on the key: a comma join's `WHERE` never became a join
+/// condition, so `outer x inner` joined rows were built and then filtered. Measured at
+/// **1.19 ms -> 2.74 ms** for five times the catalog, where it had been 4.09 -> 25.33.
+/// `tests/catalog_join_slope.rs` carries the measurement at three sizes.
 #[test]
-#[ignore = "this is debts-v1.1.md #54's red test, not #49's: after option (b) the second run reads \
-            4 keys at every catalog size and the residue is a cross product between two computed \
-            catalog views (1.55 ms -> 24.6 ms for 5x the catalog). Kept red by the user's ruling of \
-            2026-09-10 rather than rewritten. See this file's header"]
 fn a_repeated_statement_stops_tracking_the_catalog() {
     /// What five times the catalog may cost, once the statement has been asked before.
     const BOUND: u32 = 2;

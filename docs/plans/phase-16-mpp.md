@@ -763,8 +763,14 @@ A semi-join is not a join. Replacing one with the other is exact only under cond
    inner rows and `count(*)` must count it many times — so it is **refused**.
 3. **No inner column is referenced above the join** — not in the aggregates, the grouping keys, the
    `HAVING` or the projection. A filter yields no `dim` values to project.
-4. **`residual` is `None`, or reads only outer columns.** A probe answers its equality exactly, so
-   a residual here is the part the probe did not express.
+4. **`residual` names one side, not both.** A probe answers its own equality exactly, so a
+   residual here is the rest of the `ON` — and it reads the *combined* row, in the same coordinate
+   space as the `Filter` above the loop. So it is split by the same rule that splits the `WHERE`
+   (`exec::fragment::split_by_side`): outer-only conjuncts join the fragment's filter, inner-only
+   ones narrow the key set, and one naming **both** is a condition over the pair, which is not a
+   semi-join and refuses. Which of the two a conjunct arrived in must not decide whether the query
+   can be answered on the columns, because the planner moves conjuncts between them for cost:
+   `WHERE d.bucket = 1` and `ON … AND d.bucket = 1` are the same query.
 5. **The key set is bounded** (§J5). Above the bound the estimate refuses and says so.
 
 Any of these failing is a refusal with a reason, never a partial honouring — ADR 0022 Decision 3's

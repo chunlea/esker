@@ -86,6 +86,15 @@ const JOIN_QUERIES_THAT_MUST_ROUTE: &[&str] = &[
     "SELECT f.region, count(*) FROM f JOIN d ON f.dk = d.k WHERE d.bucket = 1 \
      GROUP BY f.region ORDER BY f.region",
     "SELECT count(*), min(amount), max(amount) FROM f JOIN d ON f.dk = d.k",
+    // **The same condition where the user wrote it, not where the planner moved it.** Every query
+    // above puts `d.bucket = 1` in the `WHERE`, and the fragment reads it out of the `Filter`
+    // standing above the loop. Written in the `ON` there is no such `Filter`: the probe answers
+    // `f.dk = d.k` and the rest becomes the join's **residual**, which is the only path by which
+    // this condition can reach the key set. A build that dropped it answers **8** where these
+    // answer 4 — a wrong count, not a slow one — and the three tests above do not notice,
+    // because their copy in the `WHERE` narrows the key set whatever the residual does.
+    "SELECT count(*) FROM f JOIN d ON f.dk = d.k AND d.bucket = 1",
+    "SELECT count(*), sum(amount) FROM f JOIN d ON f.dk = d.k AND d.bucket = 1 WHERE f.amount > 20",
 ];
 
 /// Joins that must **not** reach it, each failing a different one of §J3's conditions.
