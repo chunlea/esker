@@ -1,0 +1,21 @@
+crates/esker-engine/src/db/compact.rs
+  s_b249f065cef854::t_65751413250379 437-456,459-460
+crates/esker-engine/tests/compaction_drops_the_dead.rs
+  s_b249f065cef854::t_1641ad227d4366 1-202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ff1fd2eb2675ae6be7181cbc69fa6708fd3400a3",
+  "prompts": {},
+  "sessions": {
+    "s_b249f065cef854": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7c1a94ab-56c5-4769-8981-7863defc92e8",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
