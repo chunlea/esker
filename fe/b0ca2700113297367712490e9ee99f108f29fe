@@ -1,0 +1,45 @@
+crates/esker-sql/src/exec/assign.rs
+  s_ac192c209f55d3::t_83fd58f3d11f7a 42,50,222,225-230,233,235,237-240,263,282-287
+crates/esker-sql/src/exec/bind.rs
+  s_ac192c209f55d3::t_a736a3d9ec702e 229,1579
+crates/esker-sql/src/exec/cursor.rs
+  s_ac192c209f55d3::t_4a14d9cf12c63f 2198,2238,2996
+crates/esker-sql/src/exec/ddl.rs
+  s_ac192c209f55d3::t_a8d1514edcff27 503-507,509,5580,5590,6131,6754
+crates/esker-sql/src/exec/dml.rs
+  s_ac192c209f55d3::t_d6a15215651476 814-817,821,826,848,903-906,916,925,939-940,948-950,959,1272,1275,1748-1751,1756
+crates/esker-sql/src/exec/fragment.rs
+  s_ac192c209f55d3::t_f2f3ad47907e14 980
+crates/esker-sql/src/exec/mod.rs
+  s_ac192c209f55d3::t_acc2bcd37e1c37 2036,2671,2693,3123,3146,3283-3323,3518,3559,3567,3576,3604,3626,3645-3654,3702,3730,3993,4362
+crates/esker-sql/src/exec/query.rs
+  s_ac192c209f55d3::t_f09d71dd0c397d 3369,3756,4564-4576,4580,4982,5084,5120,5148,5172,5204,5225,5240,5248,5263,5308,5477-5479,6703-6705
+crates/esker-sql/src/exec/subquery.rs
+  s_ac192c209f55d3::t_133da04b7d8aaf 313,701,905
+crates/esker-sql/src/parse/lower.rs
+  s_ac192c209f55d3::t_622dc2fedfcfd5 290,358,4249,4496,5528,5720,5765,5772,6123,6174,6179,6207,6305,6482,6510,6534,6568,6585,6599,6622,6850,6853,6945,7025,7046,7057,7094,7474,7481,7614,7635,7642
+crates/esker-sql/src/plan/expr.rs
+  s_ac192c209f55d3::t_1d76fb0521408d 2415-2431,2435-2441,2455,2548,2788,2801,2818,2848,2863,2881-2883,2893
+crates/esker-sql/src/plan/query.rs
+  s_ac192c209f55d3::t_96f2c18b1692bf 1515
+crates/esker-sql/tests/enum_cast_identity.rs
+  s_ac192c209f55d3::t_94b94145d47bd0 1-288
+docs/plans/debts-v1.1.md
+  s_ac192c209f55d3::t_c88766c92d5c2e 118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "feb0ca2700113297367712490e9ee99f108f29fe",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
