@@ -1,0 +1,53 @@
+crates/esker-keys/src/array.rs
+  s_e59614afdddccb::t_d4f8ee30f11b32 128,257
+crates/esker-keys/src/columnar.rs
+  s_e59614afdddccb::t_99d05e4487dd22 186,297-303
+crates/esker-keys/src/row.rs
+  s_e59614afdddccb::t_afdb553b359f8f 563-564,1269-1270,1272,1524,2282
+crates/esker-keys/src/value.rs
+  s_e59614afdddccb::t_ad987cb6da6ec0 354-362,616,721
+crates/esker-sql/src/catalog/mod.rs
+  s_e59614afdddccb::t_37aa74f2269547 5075,5168,5259,6744
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_e59614afdddccb::t_fd009d6a090c9d 1509-1514,3443,3647,3814-3815
+crates/esker-sql/src/catalog/record.rs
+  s_e59614afdddccb::t_819243c7916425 106,367-371,490,650
+crates/esker-sql/src/exec/bind.rs
+  s_e59614afdddccb::t_da8d758138b8d7 1660
+crates/esker-sql/src/exec/fragment.rs
+  s_e59614afdddccb::t_0905209a56a690 1141
+crates/esker-sql/src/exec/query.rs
+  s_e59614afdddccb::t_9b07defaef86eb 4268
+crates/esker-sql/src/plan/expr.rs
+  s_e59614afdddccb::t_95a78bb534d3ef 2665,2755,2927
+crates/esker-sql/src/row.rs
+  s_e59614afdddccb::t_c169e613f3fc65 186
+crates/esker-sql/src/value/mod.rs
+  s_e59614afdddccb::t_c90ea99598108c 235-245,247-248,1637-1643,1712-1713,1717,1719,1781-1782,1891-1893,2076,2267,2369,2673-2674,2963-2964,3774-3783,3816
+crates/esker-sql/tests/array_delimiter.rs
+  s_e59614afdddccb::t_04c33497b50c86 169-174
+crates/esker-sql/tests/array_of_void.rs
+  s_e59614afdddccb::t_b19864f3a4a40c 74,76-82,90-91
+crates/esker-sql/tests/lquery_array.rs
+  s_e59614afdddccb::t_9a1b02e5f8e11e 1-138
+crates/esker-sql/tests/row_order.rs
+  s_e59614afdddccb::t_bfe6e3b6d6f90b 151-153
+crates/esker-store/src/columnar/decode.rs
+  s_e59614afdddccb::t_ac56ea0aa9b19f 265-267
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "216b7a7fb34c889cf83d879108a07ed509e7891d",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
