@@ -931,6 +931,22 @@ pub(super) fn table_key(tenant: u64, table_id: u64) -> Vec<u8> {
     prefix::meta_key(&suffix)
 }
 
+/// Every table record of one tenant: the range [`table_key`] writes into.
+///
+/// **Read-side only, and it names keys that already exist** — nothing about the format moves.
+/// It exists so that a question about *all* tables can be one scan instead of one point read per
+/// table: `pg_relations::Relations` loads every `TableDef` by id, which is right for a view of
+/// every relation and wrong for a caller that wants one field out of each (#61).
+#[must_use]
+pub(super) fn table_range(tenant: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut suffix = [SQL, &[KIND_TABLE]].concat();
+    codec::encode_u64(tenant, &mut suffix);
+    let start = prefix::meta_key(&suffix);
+    let mut end = start.clone();
+    end.push(0xff);
+    (start, end)
+}
+
 /// `'m' ++ "sql" ++ 'n' ++ tenant ++ name`. The name is the whole rest of the key, so nothing has
 /// to be prefix-free about it and a name cannot be confused with a longer one.
 #[must_use]

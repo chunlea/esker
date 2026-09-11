@@ -304,3 +304,79 @@ fn what_a_drop_reads_as_the_history_grows() {
         );
     }
 }
+
+/// **#61 — dropping one table must not read the whole catalog.**
+///
+/// Measured before the fix, 150 background relations: `reads 160 = catalog 't' x152, …` and
+/// `scans 158 = catalog 'q' x152, …`. One `KIND_TABLE` read and one `KIND_SEQUENCE` scan per
+/// relation in the database, because `DROP` materialises the whole relations view
+/// (`Catalog::relations` → `pg_relations::Relations::read`). At r1's 294 relations that is the 277
+/// reads a statement the run-127c shape diff attributed **73% of a Rails file's time** to.
+///
+/// What a `DROP` actually needs is *who references this table* — foreign keys, owned sequences,
+/// indexes, and the view and trigger dependencies — which is a question about one relation, not a
+/// listing of all of them.
+///
+/// # The bound, and why it is a bound and not a ratio
+///
+/// Under twenty reads at **three hundred** relations. A ratio against the catalog size would pass
+/// on a constant factor of two; a fixed ceiling at a catalog size twice the one that produced the
+/// original number says the cost stopped depending on it at all. It is deliberately loose — this
+/// asserts the shape, not a count somebody has to update whenever a `DROP` reads one more record.
+///
+/// **Not `#[ignore]`d**, unlike the rest of this file: it is an assertion about a complexity class,
+/// and one that would have caught #61 the day it was written.
+#[test]
+fn dropping_one_table_does_not_read_every_relation() {
+    const BACKGROUND: usize = 300;
+    const CEILING: u64 = 20;
+
+    // Turned on here rather than by the environment, for the reason both modules' docs give: a
+    // test that runs only when somebody remembers a variable is one the gate never runs, and this
+    // one is an assertion rather than a measurement.
+    //
+    // **Both switches.** The counters read below are the *client's*, and its `force_on` is a
+    // separate flag from `esker-sql`'s — turning on only the one whose name came to mind first
+    // left every counter at zero, and a bound of "fewer than twenty" is met very comfortably by
+    // nothing at all. That is what the denominator assertion underneath is for.
+    esker_sql::stmt_stats::trace_every_read();
+    esker_client::stmt_stats::force_on();
+    let cluster = Cluster::start();
+    let mut s = cluster.session();
+    for at in 0..BACKGROUND {
+        s.run(&format!(
+            "CREATE TABLE bg{at} (id bigserial primary key, a bigint, b text)"
+        ))
+        .unwrap();
+    }
+    s.run("CREATE TABLE doomed (id bigserial primary key, a bigint)")
+        .unwrap();
+
+    esker_client::stmt_stats::reset();
+    s.run("DROP TABLE IF EXISTS doomed").unwrap();
+    let cost = esker_client::stmt_stats::taken();
+    let reads: u64 = cost.read_heads.values().sum();
+    let scans: u64 = cost.scan_heads.values().sum();
+    let breakdown =
+        |heads: &std::collections::BTreeMap<[u8; esker_client::stmt_stats::HEAD], u64>| {
+            esker_sql::stmt_stats::name_heads(heads)
+                .iter()
+                .map(|(name, n)| format!("{name} x{n}"))
+                .collect::<Vec<String>>()
+                .join(", ")
+        };
+    // **The denominator.** A counter that is off reports zero, and zero passes every ceiling. This
+    // is the assertion that makes the one below mean something.
+    assert!(
+        reads + scans > 0,
+        "the read counters are off, so the bound below would pass against any implementation"
+    );
+    assert!(
+        reads + scans < CEILING,
+        "dropping one table read {reads} and scanned {scans} with {BACKGROUND} relations in the \
+         catalog, which is the whole catalog rather than this table's dependants.\n  \
+         reads: {}\n  scans: {}",
+        breakdown(&cost.read_heads),
+        breakdown(&cost.scan_heads),
+    );
+}

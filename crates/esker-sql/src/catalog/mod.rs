@@ -2467,6 +2467,12 @@ struct Cache {
     schema_lists: BTreeMap<u64, Arc<Vec<(String, u64)>>>,
     /// One tenant's views, whole.
     views: BTreeMap<u64, Arc<Vec<ViewDef>>>,
+    /// One tenant's materialized views, whole.
+    ///
+    /// Separate from `relations` and far cheaper: one scan of the table records rather than a
+    /// point read and a sequence scan per relation, which is what asking `relations` this question
+    /// cost (#61).
+    matviews: BTreeMap<u64, Arc<Vec<MatviewRef>>>,
     /// One tenant's user-defined types, whole.
     types: BTreeMap<u64, Arc<Vec<TypeDef>>>,
     /// `(tenant, table_id)` to that table's sequences.
@@ -2859,6 +2865,47 @@ impl<'a> View<'a> {
             self.tenant,
             |cache| &mut cache.views,
             || Ok(Arc::new(views(self.txn, self.tenant)?)),
+        )
+    }
+
+    /// Every **materialized view** of this tenant, in id order.
+    ///
+    /// # Why this exists instead of walking `relations()`
+    ///
+    /// A materialized view is stored as a *table* record ([ADR 0064](../../../docs/adr/0064-a-materialized-view-is-a-table-whose-rows-are-recomputed.md)),
+    /// so the only way to know a table is one is to look at its record. `pg_relations::Relations`
+    /// does that by loading every `TableDef` **by id** — a point read each, plus the sequence scan
+    /// `hydrate` does for each — which is right for a view of every relation and is what `DROP
+    /// TABLE` was paying to answer a question about one table (#61): 152 reads and 152 scans with
+    /// 150 relations in the catalog, and r1 measured that shape as 73% of a Rails file's time.
+    ///
+    /// This reads the same records as **one scan** of the range they already live in, decodes each
+    /// without hydrating it — a matview's definition is in the record, and nothing here needs a
+    /// table's sequences, children or user types — and keeps the ones that are matviews. Same
+    /// answer, same order, no format change: `table_range` names keys `table_key` has always
+    /// written.
+    pub fn matviews(&self) -> Result<Arc<Vec<MatviewRef>>> {
+        self.memoise(
+            self.tenant,
+            |cache| &mut cache.matviews,
+            || {
+                let (start, end) = record::table_range(self.tenant);
+                let mut found = Vec::new();
+                for (_, value) in self.txn.scan(&start, &end, 0)? {
+                    let table = record::decode_table(&value)?;
+                    if let Some(matview) = table.matview {
+                        found.push(MatviewRef {
+                            id: table.id,
+                            name: table.name,
+                            definition: matview.definition,
+                        });
+                    }
+                }
+                // By id, because the caller reports the *first* dependent and a real server finds
+                // them by oid — the same ordering `dependent_relations` sorts into.
+                found.sort_by_key(|found| found.id);
+                Ok(Arc::new(found))
+            },
         )
     }
 
@@ -4043,6 +4090,21 @@ pub struct ViewColumn {
     pub ty: ColumnType,
     /// `pg_attribute.atttypmod`, in PostgreSQL's own encoding — see [`ColumnDef::typmod`].
     pub typmod: i32,
+}
+
+/// A materialized view, as the one question `DROP` asks about them needs it (#61).
+///
+/// Three fields rather than a `TableDef`, and that is the point: finding which matview names a
+/// relation needs its definition and its name, not its columns, sequences or children — and
+/// loading those is what made `DROP TABLE` read the whole catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatviewRef {
+    /// The table id the matview is stored under, which is also its `pg_class.oid`.
+    pub id: u64,
+    /// Its stored name, schema-qualified the way every catalog name is.
+    pub name: String,
+    /// The `SELECT` text, as [`MatviewDef::definition`] holds it.
+    pub definition: String,
 }
 
 /// What makes a table a **materialized view**: the `SELECT` its rows were computed from, and

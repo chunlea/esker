@@ -4781,16 +4781,14 @@ fn dependent_relations(
             found.push((view.id, view.name.clone(), "view"));
         }
     }
-    let relations = executor.catalog_view(txn)?.relations()?;
-    for row in relations.of_kind(catalog::pg_relations::RelKind::MaterializedView) {
-        let Some(table) = relations.table(row) else {
-            continue;
-        };
-        let Some(matview) = table.matview.as_ref() else {
-            continue;
-        };
+    // **Not `relations()`** (#61). That view loads every `TableDef` by id — a point read each,
+    // plus the sequence scan `hydrate` does for each — to answer a question about one relation:
+    // 152 reads and 152 scans with 150 relations in the catalog, which r1 measured as 73% of a
+    // Rails file's statement time and 87% of its growth. `matviews()` reads the same records as
+    // one scan and decodes only the field this needs.
+    for matview in executor.catalog_view(txn)?.matviews()?.iter() {
         if names_it(&matview.definition) {
-            found.push((table.id, table.name.clone(), "materialized view"));
+            found.push((matview.id, matview.name.clone(), "materialized view"));
         }
     }
     // **In creation order, because the `DETAIL` names the first dependent found and a real server
