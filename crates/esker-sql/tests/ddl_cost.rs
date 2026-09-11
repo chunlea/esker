@@ -380,3 +380,105 @@ fn dropping_one_table_does_not_read_every_relation() {
         breakdown(&cost.scan_heads),
     );
 }
+
+/// **#58 round 3 — a thousand rounds, catalog pinned, history growing.**
+///
+/// Rounds 1 and 2 both came back flat, and both were too short to be evidence: ten rounds of
+/// `CREATE` / `DROP` at a fixed catalog size moved nothing, which says only that ten rounds is not
+/// history. r1 measures the climb across eight *files* — tens of thousands of statements — so this
+/// is the same shape run long enough to have a chance of showing it, in process, where a checkpoint
+/// costs nothing.
+///
+/// # What grows and what is held still
+///
+/// Each round creates a table, writes rows into it, and drops it. The **catalog size is pinned** —
+/// the create and the drop cancel — while the **stored history grows without bound**, because
+/// nothing is ever collected: no safepoint is ever published, so every version and every tombstone
+/// of every round is still on disk (ADR 0110). That is r1's arm A in miniature: identical work per
+/// round against an ever-deeper store.
+///
+/// # What is recorded, and why steps and seeks rather than time
+///
+/// Every hundredth round, around the `DROP` alone: the reads and scans the statement issued
+/// **grouped by catalog kind**, the **entries the engine stepped**, the **seeks it made**, and the
+/// milliseconds. The first three are deterministic; the last is the one a loaded machine ruins, and
+/// r1 has already lost two arms to it.
+///
+/// The three answer different questions. Steps rising means each read walks further — data. Seeks
+/// rising with steps flat means the tree got deeper or more fragmented — structure. Both flat with
+/// the milliseconds rising means neither, and the cost is per-operation: allocation, cache
+/// residency, arena growth.
+///
+/// Ignored by default: it is a measurement, and a long one. `ROUNDS`, `BACKGROUND`, `ROWS` and
+/// `CHECKPOINT` override the defaults, which is how the slope was bisected against the rows.
+#[test]
+#[ignore = "a measurement, not an assertion — see the module doc for how to run it"]
+fn a_thousand_rounds_of_history() {
+    // Env-driven so the slope can be bisected against the one input that plausibly drives it —
+    // rows written per round — without a rebuild between arms.
+    let rounds: usize = env_or("ROUNDS", 1_000);
+    let background: usize = env_or("BACKGROUND", 40);
+    let rows_per_round: usize = env_or("ROWS", 20);
+    let checkpoint_every: usize = env_or("CHECKPOINT", 100);
+    // Zero, the default, never fires: `round` counts from one.
+    let collect_at: usize = env_or("COLLECT_AT", 0);
+
+    esker_sql::stmt_stats::trace_every_read();
+    esker_client::stmt_stats::force_on();
+    let cluster = Cluster::start();
+    let mut s = cluster.session();
+    for at in 0..background {
+        s.run(&format!(
+            "CREATE TABLE bg{at} (id bigserial primary key, a bigint, b text)"
+        ))
+        .unwrap();
+    }
+
+    println!("  rounds={rounds} background={background} rows={rows_per_round}");
+    println!("  round      ms  reads scans   steps  seeks  steps/read");
+    for round in 1..=rounds {
+        s.run("CREATE TABLE t (id bigserial primary key, a bigint, b text)")
+            .unwrap();
+        for row in 0..rows_per_round {
+            s.run(&format!("INSERT INTO t (a, b) VALUES ({row}, 'r{round}')"))
+                .unwrap();
+        }
+
+        // **The decisive arm**: collect at a chosen round and see whether the slope resets. If it
+        // does, what grows is reclaimable history rather than anything the read path can fix.
+        if round == collect_at {
+            cluster.collect_everything();
+        }
+        let checkpoint = round % checkpoint_every == 0 || round == 1;
+        let (steps_before, seeks_before) = (
+            cluster.engine_counter("esker.entries-stepped"),
+            cluster.engine_counter("esker.seeks"),
+        );
+        esker_client::stmt_stats::reset();
+        let began = std::time::Instant::now();
+        s.run("DROP TABLE IF EXISTS t").unwrap();
+        let took = began.elapsed();
+        if !checkpoint {
+            continue;
+        }
+        let cost = esker_client::stmt_stats::taken();
+        let reads: u64 = cost.read_heads.values().sum();
+        let scans: u64 = cost.scan_heads.values().sum();
+        let steps = cluster.engine_counter("esker.entries-stepped") - steps_before;
+        let seeks = cluster.engine_counter("esker.seeks") - seeks_before;
+        let per_read = steps.checked_div(reads + scans).unwrap_or(0);
+        println!(
+            "  {round:>5}  {:>6.1}  {reads:>5} {scans:>5}  {steps:>6} {seeks:>6}  {per_read:>10}",
+            took.as_secs_f64() * 1_000.0,
+        );
+    }
+}
+
+/// One `usize` from the environment, or `fallback`. For the probe above, whose arms differ only in
+/// their inputs — a rebuild between them would measure the compiler as well.
+fn env_or(name: &str, fallback: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|it| it.parse().ok())
+        .unwrap_or(fallback)
+}

@@ -67,6 +67,9 @@ pub struct Cluster {
     pub oracle: Arc<dyn TimestampOracle>,
     /// Where the three stores listen, so a test can build a second client of its own.
     pub addresses: Vec<std::net::SocketAddr>,
+    /// The stores themselves, kept so a probe can read the engine's own counters — a
+    /// `ServerHandle` alone cannot answer `esker.entries-stepped` (#58 round 3).
+    stores: Vec<Arc<Store>>,
     _handles: Vec<ServerHandle>,
     _dirs: Vec<tempfile::TempDir>,
     /// The runtime the stores were started on, when this cluster owns one. `None` when the caller
@@ -75,7 +78,7 @@ pub struct Cluster {
     runtime: Option<tokio::runtime::Runtime>,
 }
 
-async fn start_store(id: u64) -> (ServerHandle, tempfile::TempDir) {
+async fn start_store(id: u64) -> (ServerHandle, tempfile::TempDir, Arc<Store>) {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let store = Store::open(
         dir.path(),
@@ -89,14 +92,14 @@ async fn start_store(id: u64) -> (ServerHandle, tempfile::TempDir) {
     .expect("the store opens");
     let handle = esker_proto::transport::Server::bind(
         "127.0.0.1:0",
-        StoreService::new(store),
+        StoreService::new(Arc::clone(&store)),
         TransportConfig::new(),
     )
     .await
     .expect("the server binds")
     .spawn()
     .expect("the server starts");
-    (handle, dir)
+    (handle, dir, store)
 }
 
 fn route(id: u64, start: &[u8], end: &[u8]) -> Route {
@@ -134,7 +137,7 @@ impl Cluster {
         }
         let addresses: Vec<_> = started
             .iter()
-            .map(|(handle, _)| handle.local_addr())
+            .map(|(handle, _, _)| handle.local_addr())
             .collect();
         // `connect_all` is synchronous and blocks, so it cannot run on a runtime thread -- which
         // is where this function is. `spawn_blocking` is the seam for exactly that, and it is the
@@ -165,7 +168,14 @@ impl Cluster {
         let oracle: Arc<dyn TimestampOracle> = Arc::new(CountingOracle::starting_at(1_000));
         let client = Arc::new(TxnClient::on_router(Arc::new(router), Arc::clone(&oracle)));
 
-        let (handles, dirs): (Vec<_>, Vec<_>) = started.into_iter().unzip();
+        let mut handles = Vec::new();
+        let mut dirs = Vec::new();
+        let mut kept = Vec::new();
+        for (handle, dir, store) in started {
+            handles.push(handle);
+            dirs.push(dir);
+            kept.push(store);
+        }
         let addresses = handles.iter().map(ServerHandle::local_addr).collect();
         Cluster {
             backend: Arc::new(StoreBackend::new(Arc::clone(&client), Arc::clone(&oracle))),
@@ -174,9 +184,35 @@ impl Cluster {
             client,
             oracle,
             addresses,
+            stores: kept,
             _handles: handles,
             _dirs: dirs,
             runtime: None,
+        }
+    }
+
+    /// One engine counter, summed over the three stores.
+    ///
+    /// The cluster is three processes' worth of state in one, so a workload's cost is the total —
+    /// and `esker.entries-stepped` is per database. Exists for #58's round-3 probe: the statement
+    /// tap counts a read as one read however many stored entries it walked, and this is the half it
+    /// cannot see.
+    pub fn engine_counter(&self, name: &str) -> u64 {
+        self.stores
+            .iter()
+            .filter_map(|store| store.property(name))
+            .filter_map(|value| value.parse::<u64>().ok())
+            .sum()
+    }
+
+    /// Raises every store's collection safepoint and compacts, so a probe can ask what the cost
+    /// would be if the history were reclaimed (ADR 0110 step 1, by hand).
+    pub fn collect_everything(&self) {
+        for store in &self.stores {
+            store.raise_safepoint(u64::MAX);
+            for cf in store.cf_names() {
+                store.compact_cf(&cf).expect("a compaction runs");
+            }
         }
     }
 

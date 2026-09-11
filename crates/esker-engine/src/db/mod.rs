@@ -187,6 +187,13 @@ pub(crate) struct DbInner {
     /// with every commit in the range's history. That is #58, and a count is how it is asserted —
     /// a timer on a shared machine measures the machine.
     pub(crate) entries_stepped: Arc<AtomicU64>,
+    /// Seeks an iterator has made, across every scan this database has served.
+    ///
+    /// The companion to [`entries_stepped`](Self::entries_stepped) and the other half of what a
+    /// read costs: stepping is linear in what it walks past and seeking is `O(log n)` per source,
+    /// so a read that got dearer without stepping more is a read whose seeks got dearer — which
+    /// points at the tree rather than at the data in it (#58).
+    pub(crate) seeks: Arc<AtomicU64>,
     pub(crate) shutdown: AtomicBool,
     /// Whether the uploader has work waiting, and the condvar it sleeps on.
     ///
@@ -560,6 +567,7 @@ impl Db {
             "esker.entries-stepped" => {
                 Some(inner.entries_stepped.load(Ordering::Relaxed).to_string())
             }
+            "esker.seeks" => Some(inner.seeks.load(Ordering::Relaxed).to_string()),
             "esker.compactions-running" => Some(
                 inner
                     .compacting

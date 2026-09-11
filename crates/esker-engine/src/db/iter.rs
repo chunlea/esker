@@ -135,6 +135,8 @@ pub struct DbIterator {
     /// Shared rather than per-iterator because the question it answers is about a *workload* —
     /// "did this scan get dearer" — and a scan opens an iterator, spends it and drops it.
     stepped: Arc<AtomicU64>,
+    /// Seeks this iterator has made, counted into the database's own total.
+    seeks: Arc<AtomicU64>,
     /// Pins the sequence number, so a compaction cannot collect versions this iterator needs.
     _snapshot: Option<Snapshot>,
 }
@@ -187,6 +189,7 @@ impl DbIterator {
 
     /// Positions on the first key at or after `target`.
     pub fn seek(&mut self, target: &[u8]) {
+        self.seeks.fetch_add(1, AtomicOrdering::Relaxed);
         self.set_prefix(target);
         // The largest tag for the user key, which sorts before every stored version of it.
         self.merger.seek(&lookup_key(target, MAX_SEQNO));
@@ -196,6 +199,7 @@ impl DbIterator {
 
     /// Positions on the last key at or before `target`.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
+        self.seeks.fetch_add(1, AtomicOrdering::Relaxed);
         self.set_prefix(target);
         // Tag zero sorts after every stored version of the user key, so this lands on the
         // oldest one; the backward scan then walks up to the newest.
@@ -550,6 +554,7 @@ impl Db {
                 .flatten(),
             status: None,
             stepped: Arc::clone(&self.inner.entries_stepped),
+            seeks: Arc::clone(&self.inner.seeks),
             _version: sources.version,
             _snapshot: options.snapshot.clone(),
         })
