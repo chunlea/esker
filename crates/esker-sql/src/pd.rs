@@ -227,7 +227,7 @@ impl PdConn {
                 }
                 // A member that was killed answers nothing at all, so nothing above moves this
                 // node off it. `NotSent` is a request that provably never left this process.
-                Err(other) if esker_proto::unreachable(&other) && redirects.take() => {
+                Err(other) if esker_proto::is_unreachable(&other) && redirects.take() => {
                     self.book.advance();
                     std::thread::sleep(redirects.backoff());
                 }

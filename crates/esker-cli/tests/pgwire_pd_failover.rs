@@ -126,9 +126,8 @@ fn a_statement_returns_after_the_leading_driver_is_killed() {
     kill9(pid);
 
     let began = Instant::now();
-    let mut last = String::new();
     loop {
-        last = one_query(sql_port, "SELECT 1");
+        let last = one_query(sql_port, "SELECT 1");
         if last.contains('D') && last.contains('C') {
             break;
         }

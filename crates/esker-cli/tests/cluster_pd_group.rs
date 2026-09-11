@@ -157,38 +157,51 @@ fn three_drivers_found_one_group_and_one_of_them_leads() {
         std::thread::sleep(Duration::from_millis(100));
     };
 
-    // **The shape `durability chaos` and `leader-kill.py` read.** Three driver lines, all id zero,
-    // all on different addresses; the store keeps its own id.
-    let drivers: Vec<&(u64, String)> = rows.iter().filter(|(id, _)| *id == 0).collect();
+    let drivers = the_state_file_names_three_drivers(&rows);
+    they_are_one_group(&drivers);
+
+    // Stopped here rather than only by `Drop`, so a failure above still leaves the ports free for
+    // the next run of this binary.
+    let _ = supervisor.0.kill();
+    let _ = supervisor.0.wait();
+}
+
+/// **The shape `durability chaos` and `leader-kill.py` read.** Three driver lines, all id zero, all
+/// on different addresses; the store keeps its own id.
+fn the_state_file_names_three_drivers(rows: &[(u64, String)]) -> Vec<String> {
+    let drivers: Vec<String> = rows
+        .iter()
+        .filter(|(id, _)| *id == 0)
+        .map(|(_, address)| address.clone())
+        .collect();
     assert_eq!(
         drivers.len() as u64,
         DRIVERS,
         "the state file does not name {DRIVERS} placement drivers: {rows:?}"
     );
-    let mut addresses: Vec<&str> = drivers.iter().map(|(_, a)| a.as_str()).collect();
-    addresses.sort_unstable();
+    let mut addresses = drivers.clone();
+    addresses.sort();
     addresses.dedup();
     assert_eq!(
         addresses.len() as u64,
         DRIVERS,
         "two drivers were written on one address, so nothing can tell them apart: {rows:?}"
     );
-    let stores: Vec<&(u64, String)> = rows.iter().filter(|(id, _)| *id != 0).collect();
+    let stores = rows.iter().filter(|(id, _)| *id != 0).count();
     assert_eq!(
-        stores.len() as u64,
-        NODES,
+        stores as u64, NODES,
         "the store lines are not what a chaos arm would find: {rows:?}"
     );
+    drivers
+}
 
-    // **One group, not three.** Every member is asked, and each has to name the same group id, the
-    // same leader, and all three members — which is exactly what three drivers that each founded a
-    // group of one would fail.
-    let answers: Vec<String> = drivers
-        .iter()
-        .map(|(_, address)| members(address))
-        .collect();
+/// **One group, not three.** Every member is asked, and each has to name the same group id, the
+/// same members, and one leader — which is exactly what three drivers that each founded a group of
+/// one would fail.
+fn they_are_one_group(drivers: &[String]) {
+    let answers: Vec<String> = drivers.iter().map(|address| members(address)).collect();
     for (at, answer) in answers.iter().enumerate() {
-        for (_, address) in &drivers {
+        for address in drivers {
             assert!(
                 answer.contains(address.as_str()),
                 "driver {} does not name {address} as a member, so this is not one group:\n{answer}",
@@ -221,9 +234,4 @@ fn three_drivers_found_one_group_and_one_of_them_leads() {
         "no member says who leads:\n{}",
         answers.join("\n---\n")
     );
-
-    // Stopped here rather than only by `Drop`, so a failure above still leaves the ports free for
-    // the next run of this binary.
-    let _ = supervisor.0.kill();
-    let _ = supervisor.0.wait();
 }

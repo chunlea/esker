@@ -203,7 +203,7 @@ impl RemotePd {
                 // client off it. `NotSent` is a request that provably never left this process —
                 // a connection that could not be built — so asking another member is not asking
                 // twice. Everything ambiguous is the caller's, and its own cadence is the retry.
-                Err(other) if esker_proto::unreachable(&other) && redirects.take() => {
+                Err(other) if esker_proto::is_unreachable(&other) && redirects.take() => {
                     self.book.advance();
                     std::thread::sleep(redirects.backoff());
                 }

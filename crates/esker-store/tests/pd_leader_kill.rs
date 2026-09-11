@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use esker_proto::{
     BoxFuture, PdMemberInfo, PdMembership, PdReq, PdResp, PdRole, ProtoError, Reply, Request,
-    Response, Server, ServerHandle, Service,
+    Response, Server, ServerHandle, Service, TransportConfig,
 };
 use esker_store::RemotePd;
 use esker_store::pd::PdClient;
@@ -111,7 +111,7 @@ async fn serve(id: u64) -> (ServerHandle, std::net::SocketAddr) {
             id,
             members: Vec::new(),
         }) as Arc<dyn Service>,
-        esker_proto::TransportConfig::new(),
+        TransportConfig::new(),
     )
     .await
     .unwrap();
@@ -131,7 +131,8 @@ async fn a_client_whose_member_was_killed_is_answered_by_another() {
 
     let client = tokio::task::spawn_blocking(move || {
         let client =
-            RemotePd::connect_to(&[first_address, second_address], Default::default()).unwrap();
+            RemotePd::connect_to(&[first_address, second_address], TransportConfig::default())
+                .unwrap();
         assert_eq!(
             client.alloc_id(1).unwrap(),
             1,
@@ -183,7 +184,7 @@ async fn a_client_that_can_reach_nobody_fails_rather_than_spinning() {
     let (first, first_address) = serve(1).await;
     let (second, second_address) = serve(2).await;
     let client = tokio::task::spawn_blocking(move || {
-        RemotePd::connect_to(&[first_address, second_address], Default::default()).unwrap()
+        RemotePd::connect_to(&[first_address, second_address], TransportConfig::default()).unwrap()
     })
     .await
     .unwrap();

@@ -39,10 +39,10 @@
 //! back cost 111 seconds of unavailability.
 //!
 //! So a member this client **could not reach** is advanced past too, under the same budget:
-//! [`unreachable`] says which failures those are, and it is deliberately the narrowest possible
-//! set. Only `ProtoError::NotSent` — a request that provably never left this process, which is
-//! what a connection that could not be built is. A call that went out and lost its answer is
-//! `Closed` or `Timeout`, and those are returned to the caller as they are: sending such a request
+//! [`is_unreachable`] says which failures those are, and it is deliberately the narrowest
+//! possible set. Only `ProtoError::NotSent` — a request that provably never left this process,
+//! which is what a connection that could not be built is. A call that went out and lost its answer
+//! is `Closed` or `Timeout`, and those are returned to the caller as they are: sending such a request
 //! to a different member would be sending, a second time, a request that may already have applied.
 //! The cost of that narrowness is one call — the one in flight when the socket died; the next call
 //! has to build a connection, and that is the failure that moves the book.
@@ -81,7 +81,7 @@ pub const NO_LEADER_BACKOFF_MAX_MS: u64 = 800;
 /// request that timed out — is the caller's to report, because a client that re-sent those would
 /// be repeating requests whose outcome it does not know.
 #[must_use]
-pub fn unreachable(error: &ProtoError) -> bool {
+pub fn is_unreachable(error: &ProtoError) -> bool {
     matches!(error, ProtoError::NotSent { .. })
 }
 
@@ -337,6 +337,7 @@ mod tests {
     use crate::ProtoError;
     use crate::pd::{PdMemberInfo, PdMembership, PdRole};
     use std::net::SocketAddr;
+    use std::time::Duration;
 
     const GROUP: u64 = 0x0102_0304_0506_0708;
 
@@ -491,7 +492,7 @@ mod tests {
             assert!(next >= last);
             last = next;
         }
-        assert_eq!(last.as_millis() as u64, NO_LEADER_BACKOFF_MAX_MS);
+        assert_eq!(last, Duration::from_millis(NO_LEADER_BACKOFF_MAX_MS));
     }
 
     /// **Rule five, and the line it draws.** A connection that could not be built provably sent
@@ -499,7 +500,7 @@ mod tests {
     /// so it may not — which is the whole reason this is a predicate and not "any error".
     #[test]
     fn only_a_request_that_never_left_moves_the_client() {
-        assert!(super::unreachable(&ProtoError::not_sent(
+        assert!(super::is_unreachable(&ProtoError::not_sent(
             "connecting to 127.0.0.1:2379: Connection refused"
         )));
         for ambiguous in [
@@ -515,7 +516,7 @@ mod tests {
             ProtoError::internal("something else"),
         ] {
             assert!(
-                !super::unreachable(&ambiguous),
+                !super::is_unreachable(&ambiguous),
                 "{ambiguous} may have been applied; asking elsewhere would ask twice"
             );
         }
