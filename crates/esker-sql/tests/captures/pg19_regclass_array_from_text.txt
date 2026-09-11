@@ -1,0 +1,54 @@
+# **`text` to `regclass[]` is an I/O conversion, and `text[]` to `regclass[]` is not** —
+# PostgreSQL 19beta1, 2026-09-10, `127.0.0.1:55432`, one `BEGIN … ROLLBACK` with a
+# `SAVEPOINT`/`ROLLBACK TO` per probe.
+#
+# The last row of wire v3 family **F7**: `tests/cast_to_vector.rs` swept every
+# `'<value>'::text::<T>` over the probe list's 100 spellings and found this node refusing two.
+# `oidvector` was closed there; this is the other, `0A000 a relation name read as a regclass
+# without a catalog`.
+#
+# ## The rule, from `pg_cast`
+#
+#     SELECT count(*) FROM pg_cast WHERE castsource = 'text'::regtype
+#                                    AND casttarget = 'regclass'::regtype     ->  1
+#     SELECT count(*) FROM pg_cast WHERE castsource = 'text'::regtype
+#                                    AND casttarget = 'regclass[]'::regtype   ->  0
+#
+# A cast **with** a row runs that row's function — `text_regclass`, which resolves a relation
+# **name**. A cast **without** one is the target's **input function** over the source's text —
+# `array_in` with `regclassin` per element — and `regclassin` reads **all digits** as an oid.
+#
+# ## The pair that makes it a rule and not a coincidence
+#
+#     '1259'::text::regclass          ERROR  relation "1259" does not exist      <- text_regclass
+#     '{1259}'::text::regclass[]      {pg_class}                                 <- regclassin
+#     '{1259}'::text[]::regclass[]    ERROR  relation "1259" does not exist      <- text_regclass
+#     '{1259}'::regclass[]            {pg_class}                                 <- unknown -> I/O
+#     ARRAY['1259']::regclass[]       {pg_class}                                 <- unknown
+#     ARRAY['1259'::text]::regclass[] ERROR  relation "1259" does not exist      <- text_regclass
+#     '{1259}'::text::oid[]::regclass[]  {pg_class}                              <- oids all along
+#
+# **One step more through a real `text[]` and the digits are a name again**, because that step has
+# a `pg_cast` row and the first one does not.
+#
+# ## Everything else, over a table `ra`
+#
+#     '{ra}'::text::regclass[]              regclass[]   {ra}
+#     '{ra,pg_class}'::text::regclass[]     regclass[]   {ra,pg_class}
+#     '{"ra"}'::text::regclass[]                         {ra}          quoted
+#     '{ ra }'::text::regclass[]                         {ra}          array_in trims unquoted
+#     '{ra,NULL}'::text::regclass[]                      {ra,NULL}
+#     '{}'::text::regclass[]                             {}
+#     '[1:2]={ra,pg_class}'::text::regclass[]            {ra,pg_class} the bound prefix
+#     '{public.ra}'::text::regclass[]                    {ra}          the path is not printed
+#     '{{ra},{pg_class}}'::text::regclass[]              {{ra},{pg_class}}  two dimensions
+#     t::regclass[] over a text column                   {ra}
+#     '{999999}'::text::regclass[]                       {999999}      an oid nothing names
+#     '{-1}'::text::regclass[]              ERROR  relation "-1" does not exist
+#     '{nosuch}'::text::regclass[]          ERROR  relation "nosuch" does not exist
+#
+# **`-1` is the boundary** and it is worth the line: the rule is *all digits*, not "looks
+# numeric" — a sign makes it a name, and `999999` is an oid whose `regclassout` prints the number
+# back rather than raising.
+#
+# Built 2026-09-10; `tests/regclass_array_from_text.rs` holds all of it.

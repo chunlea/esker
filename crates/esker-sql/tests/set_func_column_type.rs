@@ -164,18 +164,26 @@ fn an_array_constructor_holding_a_parameter_is_still_a_named_refusal() {
     );
 }
 
-/// **One spelling this unit does not close**, pinned with 19beta1's answer beside it.
+/// **The spelling that unit did not close, closed with F8's `reg*` step** — the hundredth of a
+/// hundred.
 ///
-/// `unnest(ARRAY['{t}'::regclass[]])` is a `regclass` there and `text` here: the `regclass[]`
-/// literal does not carry its type syntactically — the reg\* resolution rewrites it — so
-/// `syntactic_type` cannot read it without a scope. It belongs with **F8**'s `reg*` step, which
-/// owns that resolution.
+/// `unnest(ARRAY['{t}'::regclass[]])` is a `regclass` on 19beta1 and was `text` here: a
+/// `regclass[]` literal carries no cast and no folded value, because `lower_regclass_array`
+/// rewrites it into an `Expr::Array` of per-element resolutions — so `syntactic_type` had nothing
+/// to read. It reads two more shapes now, an array's own element type and a
+/// `CatalogFunc::RegClass`, which is what that rewrite leaves behind.
 #[test]
-fn a_regclass_array_literal_is_still_text_here() {
+fn a_regclass_array_literal_unnests_as_a_regclass() {
     let mut node = parity::Node::new(&["CREATE TABLE t (id bigint)"]);
     assert_eq!(
         node.rows("SELECT pg_typeof(u) FROM unnest(ARRAY['{t}'::regclass[]]) u LIMIT 1"),
-        vec![vec!["text"]],
-        "19beta1 answers regclass; F8's reg* step owns it"
+        vec![vec!["regclass"]],
+        "19beta1 answers regclass, and the first field of a RowDescription is what a client \
+         decodes by"
+    );
+    assert_eq!(
+        node.rows("SELECT u::text FROM unnest(ARRAY['{t}'::regclass[]]) u LIMIT 1"),
+        vec![vec!["t"]],
+        "and the value was already right, which is what made the type the whole of the row"
     );
 }

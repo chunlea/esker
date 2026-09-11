@@ -2453,7 +2453,7 @@ pub const CASTS: [(i64, i64, &str, &str); 157] = [
 /// this node already uses PostgreSQL's type oids, so `text` really is 25 on both sides.
 ///
 /// `(oid, name, proargtypes, prorettype, provolatile)`.
-pub const BUILTIN_FUNCTIONS: [(i64, &str, &str, i64, &str); 15] = [
+pub const BUILTIN_FUNCTIONS: [(i64, &str, &str, i64, &str); 18] = [
     (1705, "abs", "1700", 1700, "i"),
     (1396, "abs", "20", 20, "i"),
     (1398, "abs", "21", 21, "i"),
@@ -2461,6 +2461,12 @@ pub const BUILTIN_FUNCTIONS: [(i64, &str, &str, i64, &str); 15] = [
     (1394, "abs", "700", 700, "i"),
     (1395, "abs", "701", 701, "i"),
     (1620, "ascii", "25", 23, "i"),
+    // **All three rows**, because all three overloads are built: `bytea`, `text` and `bit` —
+    // `bit varying` and the other string types reach the `text` one through a coercion, which is
+    // exactly how a real server resolves them. Oids read off 19beta1's own `pg_proc`.
+    (1810, "bit_length", "17", 23, "i"),
+    (1811, "bit_length", "25", 23, "i"),
+    (1812, "bit_length", "1560", 23, "i"),
     (2010, "length", "17", 23, "i"),
     (1317, "length", "25", 23, "i"),
     (870, "lower", "25", 25, "i"),
