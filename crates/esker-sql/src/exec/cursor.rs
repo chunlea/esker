@@ -375,16 +375,22 @@ fn inner_side(
     settings: Settings<'_>,
     inner_table_id: u64,
     inner_view: Option<&crate::plan::CatalogView>,
+    inner_only: Option<i64>,
     inner_plan: Option<&Node>,
     inner_columns: &RowSchema,
     probe: &Probe,
 ) -> Result<Vec<Vec<Datum>>> {
     if let Some(view) = inner_view {
+        // **The relation the planner carried across the `ON`, when there was one.** This side has
+        // no constant of its own — `ON a.attrelid = d.adrelid` ties it to a column of the outer
+        // row — so `exec::query::pinned_across_join` is what turns the statement's `WHERE` into
+        // one here (`debts-v1.1.md` #63 (c)).
         return view.rows_of(
             &settings.catalog.view(txn, tenant),
             settings.rendering,
             settings.prepared,
             settings.advisory,
+            inner_only,
         );
     }
     if !matches!(probe, Probe::Materialize) {
@@ -443,12 +449,13 @@ impl<'a> Cursor<'a> {
             Node::OneRow => Kind::One(false),
             // Computed here, once, rather than page by page: `pg_type` is six rows and `pg_range`
             // is none. If a catalog view ever is not small, this is the line that changes.
-            Node::CatalogView { view, .. } => Kind::Rows(
+            Node::CatalogView { view, only, .. } => Kind::Rows(
                 view.rows_of(
                     &settings.catalog.view(txn, tenant),
                     settings.rendering,
                     settings.prepared,
                     settings.advisory,
+                    *only,
                 )?
                 .into_iter(),
             ),
@@ -525,6 +532,7 @@ impl<'a> Cursor<'a> {
                 outer_columns,
                 inner_table_id,
                 inner_view,
+                inner_only,
                 inner_plan,
                 inner_columns,
                 probe,
@@ -537,6 +545,7 @@ impl<'a> Cursor<'a> {
                     settings,
                     *inner_table_id,
                     inner_view.as_ref(),
+                    *inner_only,
                     inner_plan.as_deref(),
                     inner_columns,
                     probe,

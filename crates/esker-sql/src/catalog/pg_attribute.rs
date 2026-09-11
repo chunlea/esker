@@ -84,11 +84,39 @@ const POSIX_COLLATION: i64 = 951;
 /// What a collatable type carries when nothing overrides it.
 const DEFAULT_COLLATION: i64 = 100;
 
-/// Every `pg_attribute` row this tenant has.
-pub fn rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
+/// The relations a view's rows are built from: **one** when the predicate pinned it, all of them
+/// otherwise.
+///
+/// An oid that names nothing yields none, which is the same answer the unpinned loop gives — it
+/// walks every relation and matches no row — so a pin can only make the work smaller and never the
+/// answer different.
+fn pinned<'a>(
+    relations: &'a super::pg_relations::Relations,
+    only: Option<i64>,
+) -> Box<dyn Iterator<Item = &'a RelationRow> + 'a> {
+    match only {
+        Some(oid) => Box::new(relations.by_oid(oid).into_iter()),
+        None => Box::new(relations.rows()),
+    }
+}
+
+/// Every `pg_attribute` row this tenant has — or, when `only` names a relation, the rows of that
+/// one relation beside the catalog's own.
+///
+/// **The narrowing is about what is *built*, not about what is returned.** The `Filter` above this
+/// still carries the same equality, so the answer is identical either way; what changes is that a
+/// statement asking for one table's columns stops hydrating every relation of the tenant to throw
+/// all but one away. `ActiveRecord` sends exactly that statement before it can describe any table
+/// (`debts-v1.1.md` #63 (c), `tests/column_introspection_slope.rs`).
+///
+/// [`catalog_rows`] is built whatever the pin is, and that is deliberate: it reads nothing, and it
+/// is the half that answers `WHERE attrelid = 'pg_class'::regclass` — a relation
+/// [`super::pg_relations::Relations`] has no row for, so a pinned lookup finds nothing and the
+/// catalog's own rows are the whole answer.
+pub fn rows(view: &crate::catalog::View<'_>, only: Option<i64>) -> Result<Vec<Vec<Datum>>> {
     let relations = view.relations()?;
     let mut rows = catalog_rows();
-    for relation in relations.rows() {
+    for relation in pinned(&relations, only) {
         // **A view answers here too, out of the shape it published when it was created.** It has
         // no `TableDef` to describe, and until the shape was stored there was nothing to say — so
         // `pg_attribute` was empty for a view, which is the one answer a client cannot tell from
@@ -201,10 +229,11 @@ fn catalog_rows() -> Vec<Vec<Datum>> {
 pub fn default_rows(
     view: &crate::catalog::View<'_>,
     rendering: crate::value::Rendering,
+    only: Option<i64>,
 ) -> Result<Vec<Vec<Datum>>> {
     let relations = view.relations()?;
     let mut rows = Vec::new();
-    for relation in relations.of_kind(RelKind::Table) {
+    for relation in pinned(&relations, only).filter(|row| row.kind == RelKind::Table) {
         // **Hydrated, not the listing's record.** This view reports a column's default, and a
         // `bigserial`'s default *is* its sequence — which a record does not carry (#63). Reading
         // it off the listing answers "no default", which is a wrong answer rather than a loud one.
