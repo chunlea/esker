@@ -365,9 +365,12 @@ pub struct PeerCore {
     /// has moved that one and not this one, and writing the wrong one is the mistake `86d9824`
     /// and `91de89a` were both about.
     ///
-    /// Moved by applying a `ConfChange` entry, in `apply_conf_change` and nowhere else, which is
-    /// the one place that can know an index has been applied. Before the first one it is the
-    /// configuration the peer started with, which is the membership as of every index it has.
+    /// Moved by applying a `ConfChange` entry, in `stage_conf_change` and nowhere else, which is
+    /// the one place that can know an index has been applied. **Seeded at open from the region
+    /// record** — [`crate::region::membership`] — because that record is written by the very
+    /// batch that carries the apply index, and so is the only thing on disk that answers *this*
+    /// question. The Raft state record's `conf_state` answers a different one, and seeding from
+    /// it dropped every change applied since the last truncation (debt #53).
     applied_conf: ConfState,
     /// This region as the **log** has made it: narrowed by every split this peer has applied.
     ///
@@ -1416,6 +1419,19 @@ impl RaftPeer {
         pool: Arc<crate::driver::DriverPool>,
     ) -> Result<Reservation> {
         let region_id = options.region.id;
+        // **The membership as of the apply index, read from the record that carries it.**
+        // `applied_conf` and `self.region` are two views of one fact: a conf change moves both,
+        // from one batch, and they must therefore be *read back* from one record too.
+        //
+        // The Raft state record cannot answer this and never could. Its `conf_state` is the
+        // membership as of the **truncated index** — a different index, which the core replays
+        // the log's conf-change entries on top of — so a peer that rebuilt `applied_conf` from it
+        // silently forgot every change applied since the last truncation. That value is what a
+        // compaction writes back as the log's new anchor and what a snapshot names, so one
+        // restart was enough to put a wrong configuration on disk and ship it to whoever was
+        // being caught up: run 123's store 3 came back calling itself a learner and never
+        // campaigned again (debt #53, `tests/membership_across_restart.rs`).
+        let applied_conf = crate::region::membership(&options.region);
         let mut config = RaftConfig::new(options.peer_id, options.voters, options.seed);
         config.learners = options.learners;
         config.applied = storage.applied_index();
@@ -1428,7 +1444,6 @@ impl RaftPeer {
         let leader = Arc::new(AtomicU64::new(0));
         let published = Arc::new(Published::default());
         published.applied.store(applied_index, Ordering::Release);
-        let applied_conf = node.storage().state().conf_state.clone();
         let core = PeerCore {
             node,
             transport,

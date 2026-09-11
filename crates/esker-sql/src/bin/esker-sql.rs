@@ -53,12 +53,12 @@ async fn main() -> std::io::Result<()> {
     // The lease this node holds, or nothing at all. **Absent `--pd` changes nothing**: no lease
     // source, so `Backend::schema_lease_remaining` answers "unbounded" and every write is
     // unrestricted, exactly as it was before this flag existed.
-    let lease = pd.as_ref().map(|_| Arc::new(PdLease::new()));
+    let lease = (!pd.is_empty()).then(|| Arc::new(PdLease::new()));
     // The router the client was built on, kept so the fragment path can share it: one region cache
     // for both, so an entry a row read warmed is warm for a fragment.
     let mut router: Option<Arc<esker_client::Router>> = None;
     let backend: Arc<dyn Backend> = if stores.is_empty() {
-        if pd.is_some() {
+        if !pd.is_empty() {
             // The fake keeps nothing and is in this process; a lease from a real placement driver
             // over it would be a safety property with nothing behind it, and a columnar report
             // would name ranges no store holds. Refused rather than half-wired.
@@ -78,9 +78,11 @@ async fn main() -> std::io::Result<()> {
         // "Cannot start a runtime from within a runtime" — on the first line of every node
         // started against real stores, which is the one path no test took until this phase
         // started one from a shell.
-        let (client, oracle, built) = tokio::task::spawn_blocking(move || connect(&stores, pd))
-            .await
-            .map_err(std::io::Error::other)??;
+        let members = pd.clone();
+        let (client, oracle, built) =
+            tokio::task::spawn_blocking(move || connect(&stores, &members))
+                .await
+                .map_err(std::io::Error::other)??;
         router = Some(built);
         let backend = StoreBackend::new(Arc::new(client), oracle);
         match &lease {
@@ -96,8 +98,8 @@ async fn main() -> std::io::Result<()> {
     // (`docs/plans/phase-8-learner.md` §wiring). `zip` because the two are built together: a lease
     // with no address to renew it at, or an address with no lease to fill in, would both be this
     // function having gone wrong.
-    let columnar: Option<Arc<dyn ColumnarReport>> = if let Some((address, lease)) = pd.zip(lease) {
-        Some(attach_pd(address, lease, &backend).await?)
+    let columnar: Option<Arc<dyn ColumnarReport>> = if let Some(lease) = lease {
+        Some(attach_pd(&pd, lease, &backend).await?)
     } else {
         tracing::info!(
             "no placement driver given: writes are unrestricted, no schema lease is held, and \
@@ -138,7 +140,7 @@ async fn main() -> std::io::Result<()> {
     // has no cluster to send it to. Either way the planner still decides and `EXPLAIN` still says
     // what it decided — on rows, naming the reason.
     let fragments: Option<Arc<dyn FragmentSource>> = router
-        .filter(|_| pd.is_some())
+        .filter(|_| !pd.is_empty())
         .map(|router| Arc::new(ClientFragments::new(router)) as Arc<dyn FragmentSource>);
     if fragments.is_some() {
         tracing::info!("columnar routing is available: fragments go to the learners PD placed");
@@ -193,19 +195,25 @@ fn configure_tls(
 /// What this node was told on its command line.
 ///
 /// Hand-parsed, like every other argument list in this project. The positional form is unchanged —
-/// `esker-sql [listen] [store...]` — and `--pd` may appear anywhere among them.
+/// `esker-sql [listen] [store...]` — and `--pd a[,b,c]` may appear anywhere among them.
 #[derive(Debug)]
 struct Args {
     /// Where to listen for clients.
     address: String,
     /// The stores to connect to; empty runs the in-process fake.
     stores: Vec<String>,
-    /// The placement driver, or `None`.
+    /// Every member of the placement-driver group, or empty for a node with no driver.
     ///
     /// **No default and no discovery.** A node started without `--pd` behaves exactly as it did
     /// before the flag existed, which is what makes the flag additive rather than a change of
     /// behaviour with an opt-out.
-    pd: Option<std::net::SocketAddr>,
+    ///
+    /// A **list**, comma-separated, because only the group's leader answers and leadership moves —
+    /// and because a member can be killed, which is the case a node holding one address cannot
+    /// survive
+    /// ([ADR 0108](../../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)).
+    /// One address is still valid and is a group of one, so no invocation had to change.
+    pd: Vec<std::net::SocketAddr>,
     /// PEM certificate chain for the client port, or `None` to terminate no TLS.
     tls_cert: Option<std::path::PathBuf>,
     /// PEM private key for [`Args::tls_cert`]. Both or neither.
@@ -217,7 +225,7 @@ impl Args {
         let invalid =
             |message: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
         let mut positional = Vec::new();
-        let mut pd = None;
+        let mut pd: Vec<std::net::SocketAddr> = Vec::new();
         let mut tls_cert = None;
         let mut tls_key = None;
         let mut arguments = arguments.peekable();
@@ -244,10 +252,22 @@ impl Args {
                 });
             match taken {
                 Some(("--pd", value)) => {
+                    // Comma-separated, as `esker server --pd` already reads it: one flag naming a
+                    // group, rather than a flag that has to be repeated and a reader that has to
+                    // know it may be.
                     let raw = value?;
-                    pd = Some(raw.parse().map_err(|error| {
-                        invalid(format!("{raw} is not a placement-driver address: {error}"))
-                    })?);
+                    for part in raw
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|part| !part.is_empty())
+                    {
+                        pd.push(part.parse().map_err(|error| {
+                            invalid(format!("{part} is not a placement-driver address: {error}"))
+                        })?);
+                    }
+                    if pd.is_empty() {
+                        return Err(invalid(format!("`--pd {raw}` names no placement driver")));
+                    }
                 }
                 Some(("--tls-cert", value)) => tls_cert = Some(std::path::PathBuf::from(value?)),
                 Some(("--tls-key", value)) => tls_key = Some(std::path::PathBuf::from(value?)),
@@ -277,11 +297,15 @@ impl Args {
 /// driver that restarted while this node was up: the assertion is the whole set, so a node
 /// starting is a node saying everything it knows.
 async fn attach_pd(
-    address: std::net::SocketAddr,
+    members: &[std::net::SocketAddr],
     lease: Arc<PdLease>,
     backend: &Arc<dyn Backend>,
 ) -> std::io::Result<Arc<dyn ColumnarReport>> {
-    let conn = Arc::new(PdConn::new(address));
+    let conn = Arc::new(
+        PdConn::to_group(members, esker_proto::TransportConfig::new())
+            .map_err(std::io::Error::other)?,
+    );
+    let address = conn.address();
     let refresher = LeaseRefresher::new(Arc::clone(&conn), lease)
         .asserting_columnar_for(Arc::clone(backend), TENANT);
     // Onto a blocking thread and back, because this function is inside `#[tokio::main]`'s
@@ -323,7 +347,7 @@ async fn attach_pd(
 /// (`CLAUDE.md` invariant 6).
 fn connect(
     stores: &[String],
-    pd: Option<std::net::SocketAddr>,
+    pd: &[std::net::SocketAddr],
 ) -> std::io::Result<(
     esker_client::TxnClient,
     Arc<dyn esker_client::TimestampOracle>,
@@ -356,10 +380,7 @@ fn connect(
     let (resolver, oracle): (
         Arc<dyn esker_client::RegionResolver>,
         Arc<dyn esker_client::TimestampOracle>,
-    ) = if let Some(address) = pd {
-        let conn = Arc::new(PdConn::new(address));
-        (Arc::clone(&conn) as Arc<_>, conn as Arc<_>)
-    } else {
+    ) = if pd.is_empty() {
         // **A local counter is a correct oracle for exactly one node**, and without `--pd` there is
         // no driver to ask. It is *not* correct for two: two processes counting from one hand the
         // same `start_ts` to different transactions, which is `CLAUDE.md` invariant 6 gone and
@@ -370,6 +391,11 @@ fn connect(
             Arc::new(esker_client::StaticRegion::replicated(1, &store_ids)) as Arc<_>,
             Arc::new(esker_client::CountingOracle::starting_at(1)) as Arc<_>,
         )
+    } else {
+        let conn = Arc::new(
+            PdConn::to_group(pd, TransportConfig::default()).map_err(std::io::Error::other)?,
+        );
+        (Arc::clone(&conn) as Arc<_>, conn as Arc<_>)
     };
     let router = Arc::new(esker_client::Router::new(Arc::new(transport), resolver));
     Ok((

@@ -193,8 +193,9 @@ Commands:
                         `start` restarts a store that exits unless --no-respawn
                         (--nodes, --data-dir, --base-port, --seed, --sst-store,
                         --write-buffer-size, --region-census-ms; each node gets
-                        its own prefix under the one given). --pd also starts a placement driver on
-                        the port above the nodes and points every node at it,
+                        its own prefix under the one given). --pd also starts placement
+                        drivers on the ports above the nodes -- one, or --pd-nodes N
+                        founding one group -- and points every node at all of them,
                         which is what a SQL node needs to be given with --pd
   pd serve|inspect|status
                         Run the placement driver, print what a stopped one has
@@ -1450,6 +1451,7 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
     let mut sst_store: Option<String> = None;
     let mut write_buffer_size: Option<usize> = None;
     let mut pd = false;
+    let mut pd_nodes = 1_u64;
     let mut no_respawn = false;
     let mut region_census_ms: Option<u64> = None;
     let mut index = 0;
@@ -1507,6 +1509,13 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
             // cannot collide with the nodes', and it is printed. A cluster this command starts is
             // one it also has to be able to stop.
             "--pd" => pd = true,
+            // **How many**, and one by default, so every invocation that existed before this flag
+            // produces exactly the cluster it always did. Three is the number that survives losing
+            // one (ADR 0108).
+            "--pd-nodes" => {
+                let raw = take_value(rest, &mut index, inline, "--pd-nodes")?;
+                pd_nodes = positive_u64(&raw, "--pd-nodes")?;
+            }
             "--no-respawn" => no_respawn = true,
             "--region-census-ms" => {
                 let raw = take_value(rest, &mut index, inline, "--region-census-ms")?;
@@ -1528,6 +1537,7 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
             sst_store,
             write_buffer_size,
             pd,
+            pd_nodes,
             no_respawn,
             region_census_ms,
         })),
@@ -2399,6 +2409,7 @@ mod tests {
             sst_store,
             write_buffer_size,
             pd,
+            pd_nodes: _,
             no_respawn,
             region_census_ms,
         }) = parse_ok(&[

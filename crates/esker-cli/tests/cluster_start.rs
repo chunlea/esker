@@ -267,7 +267,7 @@ fn a_four_node_cluster_with_a_driver_registers_four_stores() {
         if count >= NODES {
             // **And now PD's own count**, once, from the live driver — which is where every later
             // operator decision is made from, and which reading a store's stdout only implies.
-            let inspected = inspect(&data_dir.path().join("pd"));
+            let inspected = inspect(&data_dir.path().join("pd-1"));
             assert!(
                 inspected.contains(&format!("stores ({NODES})")),
                 "every store said it registered, and the driver's own records say otherwise:\n\

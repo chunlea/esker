@@ -2,9 +2,19 @@
 //!
 //! This is a development and testing command, not an operator tool. Without `--pd` the membership
 //! is fixed at start and every store is told the whole peer list on its command line; with it,
-//! this also starts a placement driver, points every store at it, and prints the address a SQL
-//! node should be given — which is what makes the phase-8 story runnable in one command
-//! (`docs/bench/columnar-learner.md`).
+//! this also starts a placement driver — or `--pd-nodes N` of them, founding one group — points
+//! every store at all of them, and prints the addresses a SQL node should be given, which is what
+//! makes the phase-8 story runnable in one command (`docs/bench/columnar-learner.md`).
+//!
+//! # The state file's id column, and why it did not change
+//!
+//! A driver's line has id **zero**, which is not a store id anywhere in this codebase. With
+//! `--pd-nodes 3` there are three such lines, so zero means *a* driver rather than *the* driver and
+//! the address is what tells them apart
+//! ([ADR 0108](../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)).
+//! That was chosen against a self-describing format on purpose: `esker durability chaos` skips
+//! every `id == "0"` line rather than the first, and `esker-rails-harness/leader-kill.py` matches a
+//! census `store=N` against `id == N`, so both keep working without being edited.
 //!
 //! # Why child processes
 //!
@@ -56,12 +66,20 @@ pub(crate) enum ClusterOptions {
         sst_store: Option<String>,
         /// Memtable bytes before a flush, for every node. `None` is the engine's default.
         write_buffer_size: Option<usize>,
+        /// How many placement drivers to start, when `--pd` asks for any.
+        ///
+        /// One by default, which is every cluster this command has ever produced. Three is the
+        /// number that survives losing one
+        /// ([ADR 0108](../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)):
+        /// they found one group between them, elect among themselves, and every store and the
+        /// printed SQL command line are given all of their addresses.
+        pd_nodes: u64,
         /// Also start a placement driver, and point every node at it.
         ///
-        /// A switch rather than an address: it listens on the port **above** the nodes', so it
-        /// cannot collide with one, and `start` prints where it is. A cluster this command starts
-        /// is one it also has to be able to stop, and an address it was handed might belong to
-        /// somebody else's driver.
+        /// A switch rather than an address: they listen on the ports **above** the nodes', so they
+        /// cannot collide with one, and `start` prints where they are. A cluster this command
+        /// starts is one it also has to be able to stop, and an address it was handed might belong
+        /// to somebody else's driver.
         pd: bool,
         /// **Do not restart a store that exits.**
         ///
@@ -93,6 +111,23 @@ struct Node {
     pid: u32,
 }
 
+/// One child this command started and watches.
+///
+/// **`id` is the id the state file carries**: a store's node id, or **zero** for a placement
+/// driver. A cluster may now have several drivers ([ADR 0108](../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)),
+/// so zero means *a* driver rather than *the* driver and the **address** is what tells two of them
+/// apart — which is also what `restart_command` needs, so it lives here rather than being derived
+/// from a single `Option<&str>` the way it was when there could only be one.
+///
+/// Every reader of the state file keeps working because of that choice: `esker durability chaos`
+/// skips every `id == "0"` line rather than the first, and `esker-rails-harness/leader-kill.py`
+/// matches a census `store=N` against `id == N` and so never sees a driver at all.
+struct Supervised {
+    id: u64,
+    address: String,
+    child: Child,
+}
+
 /// Runs the command.
 pub(crate) fn run(options: &ClusterOptions) -> Result<(), String> {
     match options {
@@ -104,6 +139,7 @@ pub(crate) fn run(options: &ClusterOptions) -> Result<(), String> {
             sst_store,
             write_buffer_size,
             pd,
+            pd_nodes,
             no_respawn,
             region_census_ms,
         } => start(
@@ -118,6 +154,7 @@ pub(crate) fn run(options: &ClusterOptions) -> Result<(), String> {
             },
             Supervision {
                 pd: *pd,
+                pd_nodes: *pd_nodes,
                 respawn: !*no_respawn,
             },
         ),
@@ -140,20 +177,31 @@ fn dir_of(data_dir: &Path, id: u64) -> PathBuf {
 /// The SQL node's command line is printed rather than left to be worked out: it needs both the
 /// store addresses and the driver's, and the whole point of `--pd` is that this is the command
 /// that follows.
-fn announce(nodes: u64, base_port: u16, launched: &[Node], pd: Option<&str>) {
+fn announce(nodes: u64, base_port: u16, launched: &[Node], pd: &[String]) {
     println!("esker cluster: {nodes} nodes started");
+    let mut member = 0;
     for node in launched {
         match node.id {
-            0 => println!("  placement driver on {} (pid {})", node.address, node.pid),
+            0 => {
+                member += 1;
+                println!(
+                    "  placement driver {member} on {} (pid {})",
+                    node.address, node.pid
+                );
+            }
             id => println!("  node {id} on {} (pid {})", node.address, node.pid),
         }
     }
-    if let Some(address) = pd {
+    if !pd.is_empty() {
         let stores: Vec<String> = (1..=nodes).map(|id| address_of(base_port, id)).collect();
+        // **The whole group on the SQL node's command line**, because a node given one member
+        // stops serving when that member is the one that dies — which is the thing several
+        // drivers exist to prevent.
         println!(
             "esker cluster: a SQL node over this cluster is\n  \
-             esker-sql 127.0.0.1:5432 {} --pd {address}",
-            stores.join(" ")
+             esker-sql 127.0.0.1:5432 {} --pd {}",
+            stores.join(" "),
+            pd.join(",")
         );
     }
 }
@@ -163,10 +211,50 @@ fn announce(nodes: u64, base_port: u16, launched: &[Node], pd: Option<&str>) {
 /// Id **zero**, which is not a store id anywhere in this codebase and is therefore an honest way
 /// to say "this line is not a store" in a format that has one shape. `stop` kills it like any
 /// other line.
-fn start_pd(binary: &Path, data_dir: &Path, address: &str) -> Result<(Node, Child), String> {
-    let child = pd_command(binary, data_dir, address)
+/// Starts every placement driver and waits for each to answer, or stops what it started.
+///
+/// **Every member, and each waited for.** A group of three elects among itself, so the second and
+/// third are not optional extras: a store pointed at a list whose members are not all listening can
+/// be redirected to one that is not, and spend its redirect budget on it.
+fn start_drivers(
+    binary: &Path,
+    data_dir: &Path,
+    group: &[String],
+    children: &mut Vec<Supervised>,
+    launched: &mut Vec<Node>,
+) -> Result<(), String> {
+    for (at, address) in group.iter().enumerate() {
+        let member = at as u64 + 1;
+        let (node, mut child) = start_pd(binary, data_dir, address, member, group)?;
+        if let Err(error) = wait_until_the_driver_answers(address, &mut child, PD_START_TIMEOUT) {
+            let _ = child.kill();
+            // The members already up are stopped too: a half-formed group is one that cannot
+            // elect, and leaving it running would look like a cluster.
+            for one in children.iter_mut() {
+                let _ = one.child.kill();
+            }
+            return Err(error);
+        }
+        launched.push(node);
+        children.push(Supervised {
+            id: 0,
+            address: address.clone(),
+            child,
+        });
+    }
+    Ok(())
+}
+
+fn start_pd(
+    binary: &Path,
+    data_dir: &Path,
+    address: &str,
+    member: u64,
+    group: &[String],
+) -> Result<(Node, Child), String> {
+    let child = pd_command(binary, data_dir, address, member, group)
         .spawn()
-        .map_err(|error| format!("starting the placement driver: {error}"))?;
+        .map_err(|error| format!("starting placement driver {member}: {error}"))?;
     Ok((
         Node {
             id: 0,
@@ -183,21 +271,49 @@ fn start_pd(binary: &Path, data_dir: &Path, address: &str) -> Result<(Node, Chil
 /// also restarted, and a supervisor that rebuilt this in a second place would eventually restart
 /// a driver pointed at a different directory than the one it replaced — with the cluster looking
 /// healthy while its timestamps came from an empty database.
-fn pd_command(binary: &Path, data_dir: &Path, address: &str) -> Process {
+fn pd_command(
+    binary: &Path,
+    data_dir: &Path,
+    address: &str,
+    member: u64,
+    group: &[String],
+) -> Process {
     let mut process = Process::new(binary);
     process
         .arg("pd")
         .arg("serve")
         .arg("--data-dir")
-        .arg(data_dir.join("pd"))
+        // **One directory per member**, derived rather than configured, for the reason
+        // `--sst-store` derives one per node: two members sharing a database would each hold the
+        // other's Raft log, and the second to start would refuse to open at all.
+        .arg(data_dir.join(format!("pd-{member}")))
         .arg("--listen")
-        .arg(address);
+        .arg(address)
+        .arg("--id")
+        .arg(member.to_string());
+    if group.len() > 1 {
+        // **Founding, not joining.** Every member is handed the same list, so the group id is
+        // derived from it once and written down (ADR 0061); `--join` is for adding a member to a
+        // group that is already up, which is `esker pd members add`'s business and not this
+        // command's. A group of one is left without the flag, which is exactly the command line
+        // every existing invocation produced.
+        let peers: Vec<String> = group
+            .iter()
+            .enumerate()
+            .map(|(at, listed)| format!("{}@{listed}", at + 1))
+            .collect();
+        process.arg("--peers").arg(peers.join(","));
+    }
     process
 }
 
-/// Where the placement driver listens when `--pd` is given: one above the last node.
-fn pd_address_of(base_port: u16, nodes: u64) -> String {
-    format!("127.0.0.1:{}", u64::from(base_port) + nodes)
+/// Where placement driver `member` listens when `--pd` is given: the ports above the nodes'.
+///
+/// One above the last store for the first member, one above that for the second, and so on —
+/// extending the rule `--pd` already followed rather than opening a second band an operator would
+/// have to know about.
+fn pd_address_of(base_port: u16, nodes: u64, member: u64) -> String {
+    format!("127.0.0.1:{}", u64::from(base_port) + nodes + member - 1)
 }
 
 /// Everything one store's command line is derived from, so that spawning them is one argument
@@ -211,8 +327,9 @@ struct Layout<'a> {
     write_buffer_size: Option<usize>,
     /// How often each region's peer logs what it believes. `None` is off.
     region_census_ms: Option<u64>,
-    /// The driver's address, once it is known to be listening.
-    pd: Option<&'a str>,
+    /// Every placement driver's address, once they are known to be listening. Empty without
+    /// `--pd`.
+    pd: &'a [String],
     /// `id@address` for every node, which every node is told in full.
     peers: &'a [String],
 }
@@ -250,8 +367,10 @@ fn store_command(binary: &Path, layout: &Layout<'_>, id: u64) -> Result<Process,
     if let Some(every) = layout.region_census_ms {
         process.arg("--region-census-ms").arg(every.to_string());
     }
-    if let Some(address) = layout.pd {
-        process.arg("--pd").arg(address);
+    if !layout.pd.is_empty() {
+        // The whole group, comma-separated: only its leader answers, and a store given one
+        // address cannot outlive that member (`esker_proto::LeaderBook`).
+        process.arg("--pd").arg(layout.pd.join(","));
     }
     for peer in layout.peers {
         process.arg("--peer").arg(peer);
@@ -266,19 +385,20 @@ fn store_command(binary: &Path, layout: &Layout<'_>, id: u64) -> Result<Process,
 fn spawn_stores(
     binary: &Path,
     layout: &Layout<'_>,
-    children: &mut Vec<(u64, Child)>,
+    children: &mut Vec<Supervised>,
     launched: &mut Vec<Node>,
 ) -> Result<(), String> {
     for id in 1..=layout.nodes {
         let child = store_command(binary, layout, id)?
             .spawn()
             .map_err(|error| format!("starting node {id}: {error}"))?;
+        let address = address_of(layout.base_port, id);
         launched.push(Node {
             id,
-            address: address_of(layout.base_port, id),
+            address: address.clone(),
             pid: child.id(),
         });
-        children.push((id, child));
+        children.push(Supervised { id, address, child });
     }
     Ok(())
 }
@@ -305,6 +425,19 @@ fn start(
     if nodes == 0 {
         return Err("`--nodes` must be at least 1".to_owned());
     }
+    if supervision.pd && supervision.pd_nodes == 0 {
+        return Err("`--pd-nodes` must be at least 1".to_owned());
+    }
+    // The same argument as for the stores, and it is the placement driver's own Raft group: two
+    // members tolerate no failure at all, because a quorum of two is two.
+    if supervision.pd && supervision.pd_nodes.is_multiple_of(2) {
+        eprintln!(
+            "esker cluster: {} is an even number of placement drivers; it tolerates no more \
+             failures than {} and can split evenly",
+            supervision.pd_nodes,
+            supervision.pd_nodes - 1
+        );
+    }
     // An even group has no advantage over the odd one below it — four nodes tolerate one
     // failure, exactly as three do — and it makes a split-brain-looking two-two partition
     // possible. Worth saying rather than silently allowing.
@@ -325,7 +458,7 @@ fn start(
     let binary =
         std::env::current_exe().map_err(|error| format!("finding this executable: {error}"))?;
 
-    let mut children: Vec<(u64, Child)> = Vec::new();
+    let mut children: Vec<Supervised> = Vec::new();
     let mut launched: Vec<Node> = Vec::new();
 
     // The driver first, because every store below is about to ask it whether to bootstrap. A
@@ -339,16 +472,13 @@ fn start(
     // (`docs/bench/columnar-learner.md`, "One more thing the real binaries said"). So this waits
     // until the driver answers a driver's question, and fails loudly if it never does —
     // *answers*, not *accepts*: `wait_until_the_driver_answers` says what a bare connect cost.
-    let pd = supervision.pd.then(|| pd_address_of(base_port, nodes));
-    if let Some(address) = &pd {
-        let (node, mut child) = start_pd(&binary, data_dir, address)?;
-        if let Err(error) = wait_until_the_driver_answers(address, &mut child, PD_START_TIMEOUT) {
-            let _ = child.kill();
-            return Err(error);
-        }
-        launched.push(node);
-        children.push((0, child));
-    }
+    let pd: Vec<String> = supervision
+        .pd
+        .then(|| (1..=supervision.pd_nodes).map(|m| pd_address_of(base_port, nodes, m)))
+        .into_iter()
+        .flatten()
+        .collect();
+    start_drivers(&binary, data_dir, &pd, &mut children, &mut launched)?;
 
     // Named once and used twice: `spawn_stores` starts them and the supervisor restarts them, and
     // a store is whatever this says it is.
@@ -360,14 +490,14 @@ fn start(
         sst_store: tuning.sst_store,
         write_buffer_size: tuning.write_buffer_size,
         region_census_ms: tuning.region_census_ms,
-        pd: pd.as_deref(),
+        pd: &pd,
         peers: &peers,
     };
     if let Err(error) = spawn_stores(&binary, &layout, &mut children, &mut launched) {
         // A node that will not start leaves the cluster short of a quorum, so the ones already
         // running are stopped rather than left half-formed.
-        for (_, mut child) in children {
-            let _ = child.kill();
+        for mut one in children {
+            let _ = one.child.kill();
         }
         return Err(error);
     }
@@ -379,14 +509,14 @@ fn start(
     // started — and "no child has died yet" was not enough to know that it is not.
     if let Err(error) = wait_until_the_stores_answer(&mut children, &launched, STORE_START_TIMEOUT)
     {
-        for (_, mut child) in children {
-            let _ = child.kill();
+        for mut one in children {
+            let _ = one.child.kill();
         }
         return Err(error);
     }
 
     write_state(data_dir, &launched)?;
-    announce(nodes, base_port, &launched, pd.as_deref());
+    announce(nodes, base_port, &launched, &pd);
     println!(
         "esker cluster: ctrl-C to stop, or `esker cluster stop --data-dir {}`",
         data_dir.display()
@@ -404,10 +534,10 @@ fn start(
         supervision.respawn,
     );
     println!("esker cluster: stopping");
-    for (id, child) in &mut children {
-        signal(child.id(), "TERM");
-        let what = what(*id);
-        match child.wait() {
+    for one in &mut children {
+        signal(one.child.id(), "TERM");
+        let what = what(one.id, &one.address);
+        match one.child.wait() {
             Ok(status) => println!("  {what} exited with {status}"),
             Err(error) => eprintln!("  {what}: {error}"),
         }
@@ -425,13 +555,11 @@ fn stop(data_dir: &Path) -> Result<(), String> {
         ));
     }
     for node in &nodes {
-        match node.id {
-            0 => println!(
-                "esker cluster: stopping the placement driver (pid {})",
-                node.pid
-            ),
-            id => println!("esker cluster: stopping node {id} (pid {})", node.pid),
-        }
+        println!(
+            "esker cluster: stopping {} (pid {})",
+            what(node.id, &node.address),
+            node.pid
+        );
         signal(node.pid, "TERM");
     }
     std::fs::remove_file(data_dir.join(STATE_FILE))
@@ -503,6 +631,8 @@ const STORE_START_TIMEOUT: Duration = Duration::from_secs(60);
 struct Supervision {
     /// Start a placement driver beside the stores and point every node at it.
     pd: bool,
+    /// How many of them, when `pd` is set. One is a single point of failure and the default.
+    pd_nodes: u64,
     /// Restart a store that exits.
     respawn: bool,
 }
@@ -626,7 +756,7 @@ fn ask_the_driver(address: &str) -> Result<(), String> {
 /// which limit it hit and how many stores had answered by then, because "did not answer within
 /// 60s" was the same sentence for a store that never opened and for a machine that was busy.
 fn wait_until_the_stores_answer(
-    children: &mut [(u64, Child)],
+    children: &mut [Supervised],
     launched: &[Node],
     within: Duration,
 ) -> Result<(), String> {
@@ -660,7 +790,7 @@ fn wait_until_the_stores_answer(
             let (id, address) = &waiting[0];
             return Err(format!(
                 "{} did not answer on {address}: {spent} ({} of {stores} answered)",
-                what(*id),
+                what(*id, address),
                 stores - waiting.len(),
             ));
         }
@@ -696,19 +826,25 @@ fn ask_a_store(address: &str) -> Result<(), String> {
 }
 
 /// The first child that has already exited, described the way an operator needs it.
-fn first_child_that_died(children: &mut [(u64, Child)]) -> Option<String> {
+fn first_child_that_died(children: &mut [Supervised]) -> Option<String> {
     children
         .iter_mut()
-        .find_map(|(id, child)| match child.try_wait() {
-            Ok(Some(status)) => Some(format!("{} exited with {status}", what(*id))),
+        .find_map(|one| match one.child.try_wait() {
+            Ok(Some(status)) => Some(format!(
+                "{} exited with {status}",
+                what(one.id, &one.address)
+            )),
             _ => None,
         })
 }
 
-/// `node N` or `the placement driver`, for a message an operator reads.
-fn what(id: u64) -> String {
+/// `node N` or `the placement driver on ADDR`, for a message an operator reads.
+///
+/// The driver's address is in the sentence because a cluster may have several, and "the placement
+/// driver exited" in a log with three of them is a line that names nothing.
+fn what(id: u64, address: &str) -> String {
     if id == 0 {
-        "the placement driver".to_owned()
+        format!("the placement driver on {address}")
     } else {
         format!("node {id}")
     }
@@ -740,14 +876,30 @@ fn what(id: u64) -> String {
 /// old one held. `try_wait` returned a status, so that process is reaped and the kernel has
 /// released the claim `Db::open` takes on its data directory (#116) — without which this restart
 /// would race the corpse for the database that holds the mark.
-fn restart_command(binary: &Path, layout: &Layout<'_>, id: u64) -> Result<Process, String> {
+fn restart_command(
+    binary: &Path,
+    layout: &Layout<'_>,
+    id: u64,
+    address: &str,
+) -> Result<Process, String> {
     if id != 0 {
         return store_command(binary, layout, id);
     }
-    let address = layout
+    // **Its own address, not the group's first.** With several drivers, deriving one from the
+    // layout would restart every casualty as member one — two processes on one port, one of them
+    // opening a database another already holds.
+    let member = layout
         .pd
-        .ok_or_else(|| "the placement driver has no address to restart on".to_owned())?;
-    Ok(pd_command(binary, layout.data_dir, address))
+        .iter()
+        .position(|listed| listed == address)
+        .ok_or_else(|| format!("{address} is not a placement driver this cluster started"))?;
+    Ok(pd_command(
+        binary,
+        layout.data_dir,
+        address,
+        member as u64 + 1,
+        layout.pd,
+    ))
 }
 
 /// Blocks until ctrl-C, naming any child that exits along the way.
@@ -767,7 +919,7 @@ fn restart_command(binary: &Path, layout: &Layout<'_>, id: u64) -> Result<Proces
 /// [`first_child_that_died`] runs before anything is announced, where a dead child means the
 /// cluster never formed rather than that somebody is testing it.
 fn wait_for_interrupt(
-    children: &mut [(u64, Child)],
+    children: &mut [Supervised],
     binary: &Path,
     layout: &Layout<'_>,
     nodes: &mut [Node],
@@ -784,11 +936,17 @@ fn wait_for_interrupt(
     // `try_wait` with its status for ever, and a supervisor that said so every tick would bury the
     // log it exists to write. With `respawn` the entry is replaced instead, so the next exit is a
     // new fact and is reported again.
-    let mut reported: Vec<u64> = Vec::new();
-    // How long before this id is started again, doubling on each consecutive failure. A store that
-    // cannot open its data directory would otherwise be restarted as fast as this loop ticks.
-    let mut backoff: std::collections::BTreeMap<u64, Duration> = std::collections::BTreeMap::new();
-    let mut due: std::collections::BTreeMap<u64, Instant> = std::collections::BTreeMap::new();
+    //
+    // **Keyed by position, not by id**, because a cluster may have several placement drivers and
+    // every one of them is id zero in the state file. Three children sharing one key would share
+    // one backoff and one "already reported" entry between them, so the second driver to die
+    // would be silently taken for the first and never restarted.
+    let mut reported: Vec<usize> = Vec::new();
+    // How long before this child is started again, doubling on each consecutive failure. A store
+    // that cannot open its data directory would otherwise be restarted as fast as this loop ticks.
+    let mut backoff: std::collections::BTreeMap<usize, Duration> =
+        std::collections::BTreeMap::new();
+    let mut due: std::collections::BTreeMap<usize, Instant> = std::collections::BTreeMap::new();
 
     runtime.block_on(async {
         let interrupt = tokio::signal::ctrl_c();
@@ -802,54 +960,63 @@ fn wait_for_interrupt(
                     return;
                 }
                 () = tokio::time::sleep(SUPERVISE_TICK) => {
-                    let mut exited: Vec<u64> = Vec::new();
-                    for (id, child) in children.iter_mut() {
-                        if reported.contains(id) {
+                    let mut exited: Vec<usize> = Vec::new();
+                    for (at, one) in children.iter_mut().enumerate() {
+                        if reported.contains(&at) {
                             continue;
                         }
-                        if let Ok(Some(status)) = child.try_wait() {
-                            reported.push(*id);
-                            eprintln!("esker cluster: {} exited with {status}", what(*id));
+                        if let Ok(Some(status)) = one.child.try_wait() {
+                            reported.push(at);
+                            eprintln!(
+                                "esker cluster: {} exited with {status}",
+                                what(one.id, &one.address)
+                            );
                             if respawn {
-                                exited.push(*id);
+                                exited.push(at);
                             }
                         }
                     }
-                    for id in exited {
+                    for at in exited {
                         let wait = backoff
-                            .get(&id)
+                            .get(&at)
                             .copied()
                             .unwrap_or(RESPAWN_BACKOFF)
                             .min(RESPAWN_BACKOFF_MAX);
-                        due.insert(id, Instant::now() + wait);
-                        backoff.insert(id, wait.saturating_mul(2).min(RESPAWN_BACKOFF_MAX));
+                        due.insert(at, Instant::now() + wait);
+                        backoff.insert(at, wait.saturating_mul(2).min(RESPAWN_BACKOFF_MAX));
                     }
-                    let ready: Vec<u64> = due
+                    let ready: Vec<usize> = due
                         .iter()
                         .filter(|(_, at)| Instant::now() >= **at)
-                        .map(|(id, _)| *id)
+                        .map(|(at, _)| *at)
                         .collect();
-                    for id in ready {
-                        due.remove(&id);
-                        match restart_command(binary, layout, id).and_then(|mut command| {
-                            command
-                                .spawn()
-                                .map_err(|error| format!("restarting {}: {error}", what(id)))
-                        }) {
+                    for at in ready {
+                        due.remove(&at);
+                        let (id, address) = (children[at].id, children[at].address.clone());
+                        let name = what(id, &address);
+                        match restart_command(binary, layout, id, &address).and_then(
+                            |mut command| {
+                                command
+                                    .spawn()
+                                    .map_err(|error| format!("restarting {name}: {error}"))
+                            },
+                        ) {
                             Ok(child) => {
                                 let pid = child.id();
-                                eprintln!("esker cluster: {} restarted as pid {pid}", what(id));
-                                reported.retain(|seen| *seen != id);
-                                if let Some(slot) =
-                                    children.iter_mut().find(|(seen, _)| *seen == id)
-                                {
-                                    slot.1 = child;
-                                }
+                                eprintln!("esker cluster: {name} restarted as pid {pid}");
+                                reported.retain(|seen| *seen != at);
+                                children[at].child = child;
                                 // **The state file is what a chaos arm reads to find a pid**, and a
                                 // restarted store has a new one. A file that still named the dead
                                 // pid would send every later kill to a corpse, which is exactly the
                                 // shape run 118 spent fourteen shots on.
-                                if let Some(node) = nodes.iter_mut().find(|node| node.id == id) {
+                                //
+                                // Found by **address** rather than by id: every driver's id is
+                                // zero, so an id lookup would rewrite the first driver's pid
+                                // whichever one came back.
+                                if let Some(node) =
+                                    nodes.iter_mut().find(|node| node.address == address)
+                                {
                                     node.pid = pid;
                                 }
                                 if let Err(error) = write_state(layout.data_dir, nodes) {
@@ -858,7 +1025,7 @@ fn wait_for_interrupt(
                             }
                             Err(error) => {
                                 eprintln!("esker cluster: {error}");
-                                due.insert(id, Instant::now() + RESPAWN_BACKOFF_MAX);
+                                due.insert(at, Instant::now() + RESPAWN_BACKOFF_MAX);
                             }
                         }
                     }
@@ -926,9 +1093,27 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        DEFAULT_BASE_PORT, Node, address_of, dir_of, first_child_that_died, read_state,
+        DEFAULT_BASE_PORT, Node, Supervised, address_of, dir_of, first_child_that_died, read_state,
         wait_until_the_driver_answers, wait_until_the_stores_answer, write_state,
     };
+
+    /// One supervised store, at the address `cluster start` would have given it.
+    fn supervised(id: u64, child: std::process::Child) -> Supervised {
+        Supervised {
+            address: address_of(DEFAULT_BASE_PORT, id),
+            id,
+            child,
+        }
+    }
+
+    /// One supervised placement driver: id zero, and its address is what names it.
+    fn driver(child: std::process::Child) -> Supervised {
+        Supervised {
+            id: 0,
+            address: "127.0.0.1:1".to_owned(),
+            child,
+        }
+    }
     use crate::testserver::{TestPd, TestServer};
 
     /// A child that outlives the check, so the wait is timing out on the port rather
@@ -1079,7 +1264,7 @@ mod tests {
         let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = free.local_addr().unwrap().to_string();
         drop(free);
-        let mut children = vec![(1, sleeper())];
+        let mut children = vec![supervised(1, sleeper())];
         let launched = vec![Node {
             id: 1,
             address: address.clone(),
@@ -1093,8 +1278,8 @@ mod tests {
         let error =
             wait_until_the_stores_answer(&mut children, &launched, Duration::from_millis(300))
                 .expect_err("a node that never answered was reported as started");
-        for (_, mut child) in children {
-            let _ = child.kill();
+        for mut one in children {
+            let _ = one.child.kill();
         }
         assert!(error.contains("node 1"), "{error}");
         assert!(error.contains("did not answer"), "{error}");
@@ -1105,15 +1290,15 @@ mod tests {
     #[test]
     fn the_wait_ends_when_every_store_answers() {
         let store = TestServer::start();
-        let mut children = vec![(1, sleeper())];
+        let mut children = vec![supervised(1, sleeper())];
         let launched = vec![Node {
             id: 1,
             address: store.addr(),
             pid: 0,
         }];
         let answer = wait_until_the_stores_answer(&mut children, &launched, Duration::from_secs(5));
-        for (_, mut child) in children {
-            let _ = child.kill();
+        for mut one in children {
+            let _ = one.child.kill();
         }
         assert!(answer.is_ok(), "{answer:?}");
     }
@@ -1127,7 +1312,7 @@ mod tests {
         drop(free);
         let mut dead = Process::new("false").spawn().unwrap();
         dead.wait().unwrap();
-        let mut children = vec![(1, dead)];
+        let mut children = vec![supervised(1, dead)];
         let launched = vec![Node {
             id: 1,
             address,
@@ -1147,20 +1332,22 @@ mod tests {
         // its own, so "it has exited" has to be a fact here and not a hope. `wait` caches the
         // status, which is what the `try_wait` inside then reads.
         dead.wait().unwrap();
-        let mut children = vec![(0, dead), (1, sleeper())];
+        let mut children = vec![driver(dead), supervised(1, sleeper())];
         let gone = first_child_that_died(&mut children).expect("the exited child was not noticed");
+        // **Which driver**, not just "a driver": a cluster may have three of them and a line
+        // that named none would send an operator to the wrong process.
         assert!(
-            gone.starts_with("the placement driver exited with"),
+            gone.starts_with("the placement driver on 127.0.0.1:1 exited with"),
             "{gone}"
         );
-        for (_, mut child) in children {
-            let _ = child.kill();
+        for mut one in children {
+            let _ = one.child.kill();
         }
 
-        let mut alive = vec![(1, sleeper()), (2, sleeper())];
+        let mut alive = vec![supervised(1, sleeper()), supervised(2, sleeper())];
         assert!(first_child_that_died(&mut alive).is_none());
-        for (_, mut child) in alive {
-            let _ = child.kill();
+        for mut one in alive {
+            let _ = one.child.kill();
         }
     }
 

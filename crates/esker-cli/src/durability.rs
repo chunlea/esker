@@ -47,12 +47,15 @@ struct PdOracle {
     pd: std::sync::Mutex<crate::region::PdConn>,
 }
 
-// `PdConn` holds a socket and does not derive `Debug`, which the trait asks for. The address would
-// be the useful thing to print and the connection does not expose it, so this says what the value
-// is rather than inventing a field.
+// `PdConn` holds a socket and does not derive `Debug`, which the trait asks for. The useful thing
+// to print is **which member it is talking to**, and since ADR 0108 the connection can say: a run
+// that has moved between members is a run whose log should show it moved.
 impl std::fmt::Debug for PdOracle {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        out.write_str("PdOracle")
+        match self.pd.lock() {
+            Ok(pd) => write!(out, "PdOracle({})", pd.address()),
+            Err(_) => out.write_str("PdOracle(poisoned)"),
+        }
     }
 }
 
@@ -70,11 +73,18 @@ impl esker_client::TimestampOracle for PdOracle {
     }
 }
 
-/// Connects an oracle to the placement driver named by `pd`.
+/// Connects an oracle to the placement-driver **group** named by `pd`.
+///
+/// A list, because a run that kills the driver that was leading is the run this tool exists for:
+/// an oracle holding one member stops handing out timestamps when that member is the one that
+/// dies, and every writer stops with it (ADR 0108). One address is a group of one.
 fn oracle(pd: &str) -> Result<Arc<dyn esker_client::TimestampOracle>, String> {
-    let address = crate::raw::resolve(pd)?;
+    let addresses = crate::raw::resolve_all(pd)?;
     Ok(Arc::new(PdOracle {
-        pd: std::sync::Mutex::new(crate::region::PdConn::connect(address)?),
+        pd: std::sync::Mutex::new(crate::region::PdConn::connect_to(
+            &addresses,
+            esker_proto::TransportConfig::new(),
+        )?),
     }))
 }
 
@@ -475,8 +485,10 @@ pub(crate) fn chaos(options: &DurabilityOptions) -> Result<String, String> {
 /// The store pids to choose from: the state file when one was given, else `--pids`.
 ///
 /// `id address pid`, one node per line, written by `esker cluster start` and **rewritten when it
-/// restarts a store**. The driver is on line one with id 0 and is not a store, so it is skipped —
-/// killing the driver is a different experiment and `chaos` is not it.
+/// restarts a store**. A line with id 0 is a placement driver and not a store, so it is skipped —
+/// killing the driver is a different experiment and `chaos` is not it. *Every* such line, not the
+/// first: `--pd-nodes N` writes one per member (ADR 0108), and a filter that took "the driver" to
+/// mean line one would start killing drivers two and three as if they were stores.
 fn live_pids(options: &DurabilityOptions) -> Result<Vec<u32>, String> {
     let Some(path) = &options.state else {
         return Ok(options.pids.clone());

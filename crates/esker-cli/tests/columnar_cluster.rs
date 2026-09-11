@@ -76,7 +76,7 @@ fn psql_asks_a_question_a_columnar_learner_answers() {
     // Registration is the store's first act after opening, so this is seconds. Asserted from the
     // **driver's** side, because a store that is alive and has not registered is the same failure
     // to anyone using the cluster (`cluster_start.rs`).
-    let pd_dir = data_dir.path().join("pd");
+    let pd_dir = data_dir.path().join("pd-1");
     wait_for("the driver to see four stores", 60, || {
         inspect(&pd_dir).contains(&format!("stores ({NODES})"))
     });
