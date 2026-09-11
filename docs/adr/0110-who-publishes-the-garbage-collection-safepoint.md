@@ -285,6 +285,37 @@ Not an assertion about a number, because the number depends on the level layout,
 The last one is the one that matters. A rule that collected a live lock would let two transactions
 prewrite the same key, which is the failure the lock family exists to prevent.
 
+## What round 2 and #61 said about the space half's urgency
+
+Written after the read-path work landed, because it changes the argument above rather than
+decorating it.
+
+**The growth is not more reads.** Round 2 repeated `CREATE` / `DROP` at a pinned catalog size and
+the counts did not move — reads and scans fixed to the unit across ten rounds. So the per-statement
+work is constant and the *per-read* cost is what r1 measures rising, which is what the µs-per-read
+framing already implied and is now measured rather than inferred.
+
+**And the largest single cost was not #58 at all.** `DROP TABLE IF EXISTS` — 73% of a Rails file's
+statement time and 87% of its growth — was reading **one record per relation in the catalog** to ask
+which materialized views exist. At 150 relations: 160 reads and 158 scans for one dropped table.
+That is #61, fixed in `21654f97` (reads 160 → 9, 81 ms → 12 ms), and it was a **constant factor of
+about 150×**, not a term that grows.
+
+Two things follow for this ADR.
+
+* **The safepoint's urgency is unchanged and its justification is narrower.** Collecting was never
+  going to fix a per-relation read amplification, and #61 was never going to fix an unbounded
+  history. They are independent, and conflating them — "DROP is slow, therefore GC" — is the
+  reasoning to avoid. What collection is for is **space**, which nothing else reaches.
+* **The measurement that would decide step 2 should be taken after #61.** r1's four passes were
+  dominated by a statement that has since become seven times cheaper, so the curve this ADR wants to
+  see flatten is about to be measured against a different baseline. Taking the operator verb to a
+  run *now* would price the safepoint against a workload that no longer exists.
+
+**And #60 caps what collecting can return.** A spilled value stays after the `write` record naming
+it is collected — `write` 96 → 8 while `default` stayed at 96 — so today's collection reclaims
+version records rather than bytes. Anyone quoting a space saving from step 1 is quoting the records.
+
 ## Consequences
 
 * **#58 stops being a floor.** Tonight's fixes stopped the scan walking the history; this stops the
