@@ -3142,18 +3142,18 @@ pub(super) fn decode_table(bytes: &[u8]) -> Result<TableDef> {
         // Not in the record: a table's sequences are keyed by the columns they fill and are read
         // where the table is loaded (`crate::catalog::View::table_by_id`). A `TableDef` decoded
         // straight from bytes therefore has none, which is what this function is for.
-        sequences: Vec::new(),
         parents,
         children,
         triggers,
         excludes,
-        child_scans: Vec::new(),
         partition_by,
         partition_bound,
         checks,
         foreign_keys,
         triggers_disabled,
-        enums: std::collections::BTreeMap::new(),
+        // **Nothing derived**, which is this function's whole contract: a record is bytes, and
+        // the sequences, child scans and enum labels are read where the table is loaded (#63).
+        hydrated: None,
     })
 }
 

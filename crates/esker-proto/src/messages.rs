@@ -111,6 +111,15 @@ pub enum Method {
     /// deadline. So each call does what is missing and says whether more is needed, which is also
     /// what makes an operator's retry after a `kill -9` a reconciliation rather than a mistake.
     PdMemberChange = 0x030d,
+    /// `Pd::Safepoint` — one round that reports what a reader is holding and answers with the
+    /// garbage-collection safepoint in force
+    /// ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)).
+    ///
+    /// **A new method rather than a field on the store heartbeat.** `PdResp::StoreHeartbeat`
+    /// encodes to zero bytes and the golden file pins those two bytes; widening it would rewrite
+    /// a golden-tested message, which `CLAUDE.md` reserves for the human. Adding one costs a
+    /// round and changes nothing that exists.
+    PdSafepoint = 0x030e,
 
     /// `RaftTransport::Batch` — a tick's worth of Raft messages between two stores
     /// (`docs/DESIGN.md` §6, [ADR 0009](../../../docs/adr/0009-the-wire-carries-the-raft-message.md)).
@@ -220,7 +229,7 @@ pub const SERVICE_ADMIN: u8 = 0x05;
 
 impl Method {
     /// Every method this version defines.
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 44] = [
         Self::Hello,
         Self::RawGet,
         Self::RawBatchGet,
@@ -243,6 +252,7 @@ impl Method {
         Self::PdRaft,
         Self::PdMembers,
         Self::PdMemberChange,
+        Self::PdSafepoint,
         Self::RaftBatch,
         Self::RaftSnapshot,
         Self::TxnGet,
@@ -298,6 +308,7 @@ impl Method {
             0x030b => Some(Self::PdRaft),
             0x030c => Some(Self::PdMembers),
             0x030d => Some(Self::PdMemberChange),
+            0x030e => Some(Self::PdSafepoint),
             0x0601 => Some(Self::FragmentEvaluate),
             0x0701 => Some(Self::SchemaFetch),
             0x0401 => Some(Self::RaftBatch),
@@ -364,6 +375,7 @@ impl Method {
             Self::PdRaft => "Pd::Raft",
             Self::PdMembers => "Pd::Members",
             Self::PdMemberChange => "Pd::MemberChange",
+            Self::PdSafepoint => "Pd::Safepoint",
             Self::FragmentEvaluate => "Fragment::Evaluate",
             Self::SchemaFetch => "Schema::Fetch",
             Self::PdSchemaLease => "Pd::SchemaLease",
@@ -1789,7 +1801,8 @@ mod tests {
                 | Method::PdScanRegions
                 | Method::PdRaft
                 | Method::PdMembers
-                | Method::PdMemberChange => crate::messages::SERVICE_PD,
+                | Method::PdMemberChange
+                | Method::PdSafepoint => crate::messages::SERVICE_PD,
                 Method::TxnGet
                 | Method::TxnScan
                 | Method::TxnPrewrite

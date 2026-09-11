@@ -65,9 +65,11 @@ pub mod code {
     pub const CLUSTER_MISMATCH: u16 = 18;
     /// [`super::ProtoError::PdNotLeader`].
     pub const PD_NOT_LEADER: u16 = 19;
+    /// [`super::ProtoError::SnapshotTooOld`].
+    pub const SNAPSHOT_TOO_OLD: u16 = 20;
 
     /// Every code this version defines, for the tests that sweep them.
-    pub const ALL: [u16; 19] = [
+    pub const ALL: [u16; 20] = [
         NOT_LEADER,
         EPOCH_NOT_MATCH,
         KEY_NOT_IN_REGION,
@@ -87,6 +89,7 @@ pub mod code {
         NOT_BOOTSTRAPPED,
         CLUSTER_MISMATCH,
         PD_NOT_LEADER,
+        SNAPSHOT_TOO_OLD,
     ];
 }
 
@@ -196,6 +199,26 @@ pub enum ProtoError {
     RegionNotFound {
         /// The region the request named.
         region_id: u64,
+    },
+
+    /// The read asked for a snapshot **below this store's garbage-collection safepoint**, and the
+    /// history it wants may already be gone.
+    ///
+    /// **Refused rather than answered from what is left**, which is
+    /// [ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)'s
+    /// decision 5 and the reason the rest of that design is safe to build: a safepoint that is
+    /// wrong by a second should be a loud failure, not a wrong answer to a read. Not retryable —
+    /// asking again cannot bring a version back — so a caller that sees it has to start a new
+    /// transaction at a fresh timestamp.
+    #[error(
+        "the snapshot at {start_ts} is below this store's garbage-collection safepoint \
+         {safepoint}; the history it asks for may already be collected"
+    )]
+    SnapshotTooOld {
+        /// The `start_ts` the read asked for.
+        start_ts: u64,
+        /// The safepoint in force here, so the caller can say how far behind it was.
+        safepoint: u64,
     },
 
     /// The peer speaks another version of the protocol. Negotiated once, on connect: there is
@@ -328,6 +351,7 @@ impl ProtoError {
             Self::ServerIsBusy { .. } => code::SERVER_IS_BUSY,
             Self::Locked { .. } => code::LOCKED,
             Self::RegionNotFound { .. } => code::REGION_NOT_FOUND,
+            Self::SnapshotTooOld { .. } => code::SNAPSHOT_TOO_OLD,
             Self::WireVersion { .. } => code::WIRE_VERSION,
             Self::InvalidRequest { .. } => code::INVALID_REQUEST,
             Self::Unsupported { .. } => code::UNSUPPORTED,
@@ -360,6 +384,7 @@ impl ProtoError {
             | Self::ServerIsBusy { .. }
             | Self::Locked { .. }
             | Self::RegionNotFound { .. }
+            | Self::SnapshotTooOld { .. }
             | Self::WireVersion { .. }
             | Self::InvalidRequest { .. }
             | Self::Unsupported { .. }
@@ -498,6 +523,13 @@ impl ProtoError {
             Self::ServerIsBusy { reason } => out.put_str(reason),
             Self::Locked { lock_info } => out.put_bytes(lock_info),
             Self::RegionNotFound { region_id } => out.put_varint(*region_id),
+            Self::SnapshotTooOld {
+                start_ts,
+                safepoint,
+            } => {
+                out.put_varint(*start_ts);
+                out.put_varint(*safepoint);
+            }
             Self::WireVersion { expected, actual } => {
                 out.put_varint(u64::from(*expected));
                 out.put_varint(u64::from(*actual));
@@ -558,6 +590,10 @@ impl ProtoError {
             },
             code::LOCKED => Self::Locked {
                 lock_info: Bytes::copy_from_slice(input.get_bytes("lock_info")?),
+            },
+            code::SNAPSHOT_TOO_OLD => Self::SnapshotTooOld {
+                start_ts: input.get_varint("start_ts")?,
+                safepoint: input.get_varint("safepoint")?,
             },
             code::REGION_NOT_FOUND => Self::RegionNotFound {
                 region_id: input.get_varint("region_id")?,
@@ -690,6 +726,10 @@ mod tests {
                 lock_info: Bytes::from_static(&[1, 2, 3]),
             },
             ProtoError::RegionNotFound { region_id: 9 },
+            ProtoError::SnapshotTooOld {
+                start_ts: 262_144_000,
+                safepoint: 262_144_999,
+            },
             ProtoError::WireVersion {
                 expected: 1,
                 actual: u32::MAX,

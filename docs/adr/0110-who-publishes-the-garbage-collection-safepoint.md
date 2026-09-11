@@ -1,8 +1,78 @@
 # 0110 — Who publishes the garbage-collection safepoint
 
-Status: **Proposed**, 2026-09-10; **step 1 built 2026-09-11**. Decision material for #58.
-The hand-operated publisher below is built and measured — see *Step 1 is built*. **Step 2, who
-publishes automatically, is proposed and unbuilt**, and is the part that needs a ruling.
+Status: **Accepted**, 2026-09-11 (proposed 2026-09-10; **step 1 built 2026-09-11**). The ruling
+is the user's, on the material below: step 2 is **(c) over an additive channel**, and the
+window-only version is refused. What follows the *Decision* section is the material the ruling was
+made on and is kept as it was written, so a later reader can see what was known at the time.
+
+## Decision
+
+**1. The number is `min(now − retention_window, oldest active read)`** — option (c). The active-read
+floor is the load-bearing half; the window only stops an abandoned reporter from pinning history for
+ever. **The window-only version is refused**: it produces a number that looks right, is published,
+is honoured, and is wrong exactly when a transaction is long — the case nobody tests and everybody
+eventually hits.
+
+**2. The oldest active read is reported by the clients that hold it.** Each client reports the
+minimum `start_ts` over its open transactions; PD publishes the minimum across reporters. A reporter
+that goes silent keeps its last reported value **until its TTL expires**, after which it stops
+pinning anything — silence must not hold history for ever, and it must not release it instantly
+either. The TTL is two report intervals, so one lost message never moves the safepoint.
+
+**3. It reaches a store on PD's answer to the store heartbeat — and the channel is added, never
+changed.** `PdResp::StoreHeartbeat` encodes to **zero bytes** today and
+`crates/esker-proto/tests/golden/messages.hex` pins it as `response pd-store-heartbeat 0203`.
+Hanging a field on it would rewrite a golden-tested wire message, which `CLAUDE.md` reserves for the
+human. So the safepoint travels as **a new message rather than a wider one** — a new method beside
+`0x0306 Tso`, or a new `PdResp` variant — and the golden file only gains lines
+([ADR 0109](0109-operator-verbs-for-flush-compact-and-gc.md) set this precedent: verbs were added,
+none were widened). Ruled 2026-09-11; if the additive form turns out to be impossible, the ADR comes
+back for a second ruling rather than the golden being edited.
+
+**4. A store sets `published` the moment it is told, and holds `0` after a restart** until PD says
+otherwise. Zero collects nothing, which is the safe direction: a restarted store keeps more history
+than it needs rather than less than a reader needs. The existing rule that a safepoint never moves
+backwards stays exactly as it is.
+
+**5. The floor is enforced at the read, not only at the collector.** A read whose `start_ts` is
+below the store's safepoint is **refused, with an error that says so** — never answered from what
+happens to be left. This is the half that makes the rest safe to build: without it, a safepoint that
+is wrong by a second is a wrong *answer* instead of a loud failure, and a wrong answer to a read is
+the one outcome this system exists to prevent. It needs a new `ProtoError` variant, and a new
+variant is a match arm in every crate that classifies errors — `esker-client`'s `retry::classify` is
+the one that decides whether a caller sees it or a retry swallows it, and it must **surface** this
+one: asking again cannot make history come back.
+
+## What the timestamps have to have in common
+
+The window half reads `now`. **`now` and `start_ts` must come from the same clock**, and in this
+system that clock is PD's TSO — a timestamp is `physical_ms << 18 | logical`, so `now − window` is
+arithmetic on the same scale as the `start_ts` a client reports.
+
+**Which is exactly why the window half switches off under `CountingOracle`.** The test oracle
+counts: its timestamps have a **zero physical half**, so `now − retention_ms << 18` underflows to
+zero, and a safepoint of zero collects nothing. That is the correct behaviour and it is asserted
+rather than assumed (*Acceptance*, last bullet) — a cluster on a counting oracle must collect
+**nothing**, not everything. The active-read floor still works there, because it compares reported
+`start_ts` values with each other and never with a wall clock.
+
+The rule this leaves for anyone adding a third source of timestamps: **a safepoint may only be
+computed from values the same oracle issued.** Mixing a wall clock into a counted sequence is the
+one arithmetic mistake here that silently deletes data.
+
+## What it costs
+
+* **One new PD message** (method or response variant) plus its golden lines, and a field on
+  whatever the client already sends PD for reporting. Additive on both sides.
+* **A registry in PD**: reporter → (oldest `start_ts`, last heard). Small, and it is the same shape
+  as the store registry PD already keeps.
+* **A new `ProtoError` variant**, which is a match arm in every crate that classifies errors. Adding
+  one has broken compilation in crates nobody edited before; the change is not done until
+  `esker-client`'s classifier decides it explicitly rather than falling into a catch-all.
+* **A published safepoint is a promise.** Once a store collects below a timestamp, no reader can
+  have it back — so every bug in this path is a data-loss bug, which is why point 5 exists and why
+  the three tests below are the acceptance rather than a nicety.
+
 
 ## Context — the collector exists, works, and has never been given a number
 
@@ -127,8 +197,10 @@ is a property of the deployment, not of PD.
 ### How it reaches a store
 
 * **(e) On the store-heartbeat answer.** `PdClient::store_heartbeat` returns `Result<(), _>` today —
-  it answers nothing. Widening it is additive, it already runs every 10 s, and every store sends
-  one. This is the channel the design implies: *"there is no command channel and no push — PD
+  it answers nothing. It already runs every 10 s, and every store sends one. **"Widening it is
+  additive" — written here and wrong**: `PdResp::StoreHeartbeat` encodes to zero bytes and
+  `golden/messages.hex` pins those two bytes, so a field on it rewrites a golden-tested message.
+  The *Decision* keeps the channel and adds a message instead of widening this one. This is the channel the design implies: *"there is no command channel and no push — PD
   schedules from what heartbeats tell it and replies on the same heartbeat."*
 * **(f) As an `Operator` on the region heartbeat.** Wrong shape: an operator is about one region and
   a safepoint is about a store, and it would arrive once per region per round.
@@ -141,7 +213,8 @@ is a property of the deployment, not of PD.
 
 ## Recommendation
 
-**(c) over (e)**, with **(h) first** as the measurement.
+**(c) over (e)**, with **(h) first** as the measurement. *(Accepted as written, with (e) read as
+"on the heartbeat round" rather than "on the heartbeat response's bytes" — see the Decision.)*
 
 The ordering matters more than the choice. (h) is an afternoon and answers the question this ADR
 exists to inform — *does collecting actually flatten r1's four passes?* — without committing the
@@ -182,6 +255,23 @@ nobody tests and everybody eventually hits.
   and then reads must either answer from its snapshot or fail loudly — never answer differently.
   This is the test the window-only option cannot pass, and it is how to tell the two apart.
 * **A cluster on `CountingOracle` collects nothing**, rather than collecting everything.
+
+### The three that go red first
+
+Written before the implementation, because each of them fails silently if it is written afterwards:
+
+1. **A long read is not stepped over.** A transaction opens, the retention window passes, and the
+   safepoint must not move past its `start_ts` while it is open. The window-only design passes every
+   other test here and fails this one, which is what makes it the discriminator.
+2. **A client that disconnects stops pinning the safepoint after its TTL** — and not before. Two
+   assertions, not one: the safepoint does not move while the reporter is merely quiet for less than
+   the TTL, and it does move once the TTL has passed.
+3. **A read below the safepoint is refused and says why.** Not "returns fewer rows", not "returns
+   the rows that happen to survive" — a named error that reaches the caller, asserted on the
+   caller's side of the wire.
+
+The closing measurement is r1's: **arm A's four passes flat on a real cluster**, and `sst-dump`'s
+dead-to-live ratio falling across a compaction.
 
 ## Step 1 is built, and what it measured
 

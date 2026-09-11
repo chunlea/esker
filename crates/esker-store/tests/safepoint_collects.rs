@@ -205,6 +205,61 @@ fn a_spilled_value_is_collected_with_the_version_that_names_it() {
 /// somewhere else or that they were lost. A read is what tells the two apart, and it is the one
 /// that matters: a value that cannot be read back is a far larger problem than a value that is
 /// never collected.
+/// **A read below the safepoint is refused, and the refusal says what it was refused against.**
+///
+/// [ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)'s decision
+/// 5, and the half that makes the rest of that design safe to build. The collector may already have
+/// taken the versions a read at this timestamp wants; answering from what is left is a **wrong
+/// answer**, where refusing is a loud failure. A safepoint wrong by a second should cost a
+/// transaction, not a row.
+///
+/// Three assertions, because each is a different way to get this wrong: the refusal happens at all,
+/// it carries both numbers so the caller can say how far behind it was, and a read **at** the
+/// safepoint is still served — the safepoint is the timestamp below which versions may go, so a
+/// read exactly on it has lost nothing.
+#[test]
+fn a_read_below_the_safepoint_is_refused_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), StoreOptions::new()).unwrap();
+    let state = store.regions().get(1).expect("the bootstrapped region");
+    fill(&store, &state, VERSIONS, 8);
+
+    let safepoint = u64::MAX / 4;
+    assert_eq!(store.raise_safepoint(safepoint), safepoint);
+
+    let refused = store
+        .handle_txn(
+            &state,
+            TxnKvReq::Get {
+                key: key(0),
+                ts: safepoint - 1,
+            },
+        )
+        .expect_err("a read below the safepoint must be refused");
+    let esker_proto::ProtoError::SnapshotTooOld {
+        start_ts,
+        safepoint: said,
+    } = refused
+    else {
+        panic!("a read below the safepoint answered {refused:?} instead of refusing");
+    };
+    assert_eq!(start_ts, safepoint - 1, "the refusal names the wrong read");
+    assert_eq!(said, safepoint, "the refusal names the wrong safepoint");
+
+    // And the boundary is served: `ts == safepoint` has everything it needs.
+    store
+        .handle_txn(
+            &state,
+            TxnKvReq::Get {
+                key: key(0),
+                ts: safepoint,
+            },
+        )
+        .expect("a read exactly at the safepoint is not below it");
+
+    store.stop();
+}
+
 #[test]
 fn a_long_value_is_readable_after_it_is_committed() {
     let dir = tempfile::tempdir().unwrap();

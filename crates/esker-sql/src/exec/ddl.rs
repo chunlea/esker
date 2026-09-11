@@ -39,7 +39,7 @@
 use std::fmt::Write as _;
 
 use crate::backend::Txn;
-use crate::catalog::{self, CheckDef, ColumnDef, IndexDef, IndexKey, KeyPart, TableDef};
+use crate::catalog::{self, CheckDef, ColumnDef, Hydrated, IndexDef, IndexKey, KeyPart, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::Executor;
 use crate::pgwire::session::Outcome;
@@ -206,14 +206,17 @@ pub(super) fn create_table(
         children: Vec::new(),
         triggers: Vec::new(),
         excludes: create.excludes.clone(),
-        child_scans: Vec::new(),
         primary_key_name,
         // A table starts at schema version 1; `ALTER TABLE ADD COLUMN` moves it.
         schema_version: 1,
-        sequences,
+        // Built rather than read: this table is being created, so its sequences are the ones
+        // just made and there is nothing on disk to hydrate from yet.
+        hydrated: Some(Hydrated {
+            sequences,
+            ..Hydrated::default()
+        }),
         comment: None,
         primary_key_comment: None,
-        enums: std::collections::BTreeMap::new(),
     };
 
     validate_checks(&table)?;
@@ -258,7 +261,7 @@ pub(super) fn create_table(
             &[],
         );
     }
-    for sequence in &table.sequences {
+    for sequence in &table.derived()?.sequences {
         catalog::create_sequence(txn, executor.tenant, sequence)?;
     }
     Ok(Outcome::done("CREATE TABLE"))
@@ -1104,8 +1107,14 @@ fn drop_extension_columns(
     if types.is_empty() {
         return Ok(());
     }
-    let relations = executor.catalog_view(txn)?.relations()?;
-    let tables: Vec<TableDef> = relations
+    // **Filter on the records, hydrate only what survives.** Whether a table has a column of this
+    // extension's type is a question about the record, and the records are already in hand; the
+    // tables that answer yes are then rewritten, which needs the derived half. A catalog of three
+    // hundred relations therefore costs three hundred decodes and *one* hydration rather than
+    // three hundred (#63, and the shape #61 gave `DROP TABLE`).
+    let view = executor.catalog_view(txn)?;
+    let relations = view.relations()?;
+    let wanted: Vec<u64> = relations
         .rows()
         .filter_map(|row| relations.table(row))
         .filter(|table| {
@@ -1113,8 +1122,14 @@ fn drop_extension_columns(
                 .live_columns()
                 .any(|(_, column)| types.contains(&column.ty))
         })
-        .cloned()
+        .map(|table| table.id)
         .collect();
+    let mut tables: Vec<TableDef> = Vec::with_capacity(wanted.len());
+    for id in wanted {
+        if let Some(table) = view.table_by_id(id)? {
+            tables.push((*table).clone());
+        }
+    }
     for table in tables {
         let dependent: Vec<String> = table
             .live_columns()
@@ -1635,7 +1650,7 @@ fn set_column_default(
 
     // Whatever filled this column stops filling it — a sequence, a folded value, an expression.
     // All three are cleared together because a column has **one** default, not one of each.
-    for owned in &mut updated.sequences {
+    for owned in &mut updated.hydrated_mut().sequences {
         if owned.column == Some(at) {
             owned.column = None;
             catalog::replace_sequence(txn, executor.tenant, owned);
@@ -1658,13 +1673,14 @@ fn set_column_default(
             catalog::replace_sequence(txn, executor.tenant, &sequence);
             // The table's own copy, so the cached definition agrees with the records.
             if let Some(held) = updated
+                .hydrated_mut()
                 .sequences
                 .iter_mut()
                 .find(|held| held.id == sequence.id)
             {
                 held.column = Some(at);
             } else {
-                updated.sequences.push(sequence);
+                updated.hydrated_mut().sequences.push(sequence);
             }
         }
         Some(plan::ColumnDefault::Value { expr, .. }) => {
@@ -2458,7 +2474,7 @@ pub(super) fn create_sequence(
         // The owning table's cached definition now has one more sequence in it.
         let mut updated = (*table).clone();
         updated.schema_version += 1;
-        updated.sequences.push(sequence);
+        updated.hydrated_mut().sequences.push(sequence);
         catalog::replace_table(txn, executor.tenant, &table, &updated)?;
     }
     Ok(Outcome::done("CREATE SEQUENCE"))
@@ -2568,7 +2584,10 @@ pub(super) fn drop_sequence(
         // corpus caught it on the `23502` that should have followed.
         let mut updated = (*table).clone();
         updated.schema_version += 1;
-        updated.sequences.retain(|kept| kept.id != sequence.id);
+        updated
+            .hydrated_mut()
+            .sequences
+            .retain(|kept| kept.id != sequence.id);
         catalog::replace_table(txn, executor.tenant, &table, &updated)?;
     }
     Ok(Outcome::done("DROP SEQUENCE"))
@@ -2870,6 +2889,7 @@ fn drop_column(
     // `DROP COLUMN "id"` takes `dc_id_seq` with it — which does not follow from the statement's
     // wording and is measured.
     updated
+        .hydrated_mut()
         .sequences
         .retain(|sequence| sequence.column != Some(at));
 
@@ -4150,13 +4170,12 @@ fn table_from_query(
         children: Vec::new(),
         triggers: Vec::new(),
         excludes: Vec::new(),
-        child_scans: Vec::new(),
+        // Synthetic: built here rather than read, and nothing is derived.
+        hydrated: Some(Hydrated::default()),
         primary_key_name: String::new(),
         schema_version: 1,
-        sequences: Vec::new(),
         comment: None,
         primary_key_comment: None,
-        enums: std::collections::BTreeMap::new(),
     }
 }
 
@@ -4558,7 +4577,7 @@ fn truncate_one_table(
         // of its own because that is the one `nextval` reads in, and this session's reserved
         // block, which would otherwise keep handing out values from inside it. Measured: the
         // counter alone gave 33 and the block alone gave 5, where PostgreSQL gives 1.
-        for sequence in &table.sequences {
+        for sequence in &table.derived()?.sequences {
             executor.restart_sequence(sequence.id)?;
         }
     }
@@ -5078,7 +5097,12 @@ fn drop_one_table(executor: &Executor, txn: &mut dyn Txn, table: &TableDef) -> R
         catalog::replace_table(txn, executor.tenant, &parent, &updated)?;
     }
     catalog::drop_table(txn, executor.tenant, table)?;
-    Ok(table.sequences.iter().map(|sequence| sequence.id).collect())
+    Ok(table
+        .derived()?
+        .sequences
+        .iter()
+        .map(|sequence| sequence.id)
+        .collect())
 }
 
 #[expect(
@@ -7156,6 +7180,7 @@ pub(super) fn alter_table(
             };
             let owner = executor.table_by_id(txn, table_id)?;
             let sequence = owner
+                .derived()?
                 .sequences
                 .iter()
                 .find(|sequence| sequence.id == sequence_id)
@@ -7493,7 +7518,7 @@ pub(super) fn alter_table(
                 increment: 1,
             };
             catalog::create_sequence(txn, executor.tenant, &sequence)?;
-            updated.sequences.push(sequence);
+            updated.hydrated_mut().sequences.push(sequence);
             // A `serial` is `NOT NULL` on a real server whether or not the word was written.
             if let Some(added) = updated.columns.last_mut() {
                 added.not_null = true;

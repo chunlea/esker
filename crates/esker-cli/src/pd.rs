@@ -127,6 +127,15 @@ pub(crate) struct ServeOptions {
     pub(crate) join: String,
     /// The RPC TLS this member speaks to the rest of its group.
     pub(crate) tls: RpcTlsFlags,
+    /// How far behind the present the garbage-collection safepoint may go on the window alone,
+    /// in milliseconds — `None` keeps PD's own default of an hour.
+    ///
+    /// **The window is the half that applies when nobody is reading**
+    /// ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)):
+    /// the other half is the oldest open read, reported by the nodes. Lowering it is how a test
+    /// makes collection observable in seconds instead of an hour — and how an operator who wants
+    /// a shorter history says so.
+    pub(crate) retention_ms: Option<u64>,
 }
 
 impl Default for ServeOptions {
@@ -138,6 +147,7 @@ impl Default for ServeOptions {
             id: 1,
             peers: String::new(),
             join: String::new(),
+            retention_ms: None,
         }
     }
 }
@@ -505,6 +515,9 @@ fn serve(options: &ServeOptions) -> Result<(), String> {
             id: options.id,
             members,
             transport: Some(transport),
+            retention_ms: options
+                .retention_ms
+                .unwrap_or_else(|| PdOptions::new().retention_ms),
             ..PdOptions::new()
         },
     )
