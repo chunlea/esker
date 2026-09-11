@@ -568,9 +568,27 @@ fn serve(options: &ServeOptions) -> Result<(), String> {
 /// The group must already know about this member: `esker pd members add` is what puts it in the
 /// configuration, and starting a process the group has never heard of would leave it campaigning
 /// at a group that will not vote for it.
+///
+/// # Every endpoint is asked, and a member that is merely behind is not the answer
+///
+/// This returned on the **first** member whose membership did not list this one, and that is a
+/// different fact from "the group has never heard of you". `pd members add` proposes `AddLearner`
+/// and returns once it has *committed*; a follower applies it a round trip later. So a member
+/// started in the window between — which is the documented two-shell sequence, run briskly —
+/// asked the one endpoint that was behind and exited with a sentence telling the operator to run
+/// the command they had just run. Three of five runs of
+/// `crates/esker-cli/tests/cluster_pd_member_change.rs` on a warm loopback cluster.
+///
+/// The list is here so that any member can answer, and an **unreachable** one was already skipped;
+/// a *stale* one is the same case arriving as an answer instead of as silence. So the refusal is
+/// remembered and returned only when every endpoint has given it — which is exactly when it is
+/// true, and when its remedy is the right one to print.
 fn join_group(options: &ServeOptions) -> Result<MemberList, String> {
     let endpoints = crate::server::pd_endpoints(&options.join)?;
     let mut refusal = None;
+    // Members that answered and did not list this one. Collected rather than returned on, so the
+    // sentence at the end can tell "nobody has heard of you" from "the one I asked was behind".
+    let mut unaware: Vec<String> = Vec::new();
     for address in &endpoints {
         let pd = match crate::region::PdConn::connect(*address) {
             Ok(pd) => pd,
@@ -582,11 +600,10 @@ fn join_group(options: &ServeOptions) -> Result<MemberList, String> {
         match pd.call(&esker_proto::PdReq::Members) {
             Ok(esker_proto::PdResp::Members(membership)) => {
                 if !membership.members.iter().any(|held| held.id == options.id) {
-                    return Err(format!(
-                        "the group at {address} has no member {}; run `esker pd members add \
-                         {}@<this member's --listen>` against it first",
-                        options.id, options.id
-                    ));
+                    // Not an answer about the group — an answer about *this member's* view of it.
+                    // Ask the others; one of them may have applied the change already.
+                    unaware.push(address.to_string());
+                    continue;
                 }
                 let members: Vec<PdMember> = membership
                     .members
@@ -609,6 +626,18 @@ fn join_group(options: &ServeOptions) -> Result<MemberList, String> {
             Ok(_) => return Err("the placement driver answered a different question".to_owned()),
             Err(error) => refusal = Some(error.to_string()),
         }
+    }
+    if !unaware.is_empty() {
+        return Err(format!(
+            "no member of the group has member {}: asked {}. Run `esker pd members add \
+             {}@{}` against one of them first — and note that it returns once the change has \
+             *committed*, so this can also mean it was run a moment ago and has not reached every \
+             member yet.",
+            options.id,
+            unaware.join(", "),
+            options.id,
+            options.listen,
+        ));
     }
     Err(format!(
         "no placement driver in `--join {}` answered: {}",
