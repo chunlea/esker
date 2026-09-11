@@ -1,0 +1,23 @@
+docs/plans/debts-v1.1.md
+  s_b249f065cef854::t_9f3d837b854260 24,116,132
+crates/esker-sql/tests/captures/pg19_cast_matrix.txt
+  s_b249f065cef854::t_19edfb699aa659 122,143-145,147-153
+crates/esker-sql/tests/user_decided_divergences.rs
+  s_b249f065cef854::t_441972916ee086 3-7,17,22-28,113-173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2c47e851f1077dd2455582c25290ab7e1be2362f",
+  "prompts": {},
+  "sessions": {
+    "s_b249f065cef854": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7c1a94ab-56c5-4769-8981-7863defc92e8",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
