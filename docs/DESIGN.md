@@ -1029,6 +1029,18 @@ is in its first sentence.
   large dependency exception, `sqlparser`, PostgreSQL dialect, by ADR) → catalog in `'m'` key space →
   planner/executor over `esker-client` transactions, using the `'t'` key layout from §3. Postgres
   compatibility is a surface, not a storage format.
+  **A statement reads the catalog once, not once per relation it names**
+  ([ADR 0106](adr/0106-what-a-statement-reads-below-the-sql.md)): `catalog::Catalog` is a per-node
+  cache of definitions keyed on the summed catalog version, and every reader goes through the
+  `catalog::View` a statement opens — names, tables, schemas, views, user types, a table's sequences,
+  and the whole `pg_relations::Relations` bundle the `pg_catalog` and `information_schema` views are
+  built from. **The version counter is the whole of the invalidation**: a view whose version has moved
+  is refused the cache, and a transaction that has *written* the catalog is given a view that neither
+  reads nor fills it, so it sees its own uncommitted DDL and publishes none of it. Measured
+  ([`docs/bench/statement-reads.md`](bench/statement-reads.md)): a repeated catalog introspection
+  went from **60 KV reads to 4**, which are the two catalog views a statement opens and their two
+  version counters — the read [ADR 0105](adr/0105-a-catalog-read-never-waits.md) is about, and the
+  one that must never wait.
   **A subquery is a plan node** ([ADR 0043](adr/0043-a-subquery-is-a-plan-node-run-once-or-per-row.md)):
   one that names nothing outside itself runs **once**, before the cursor opens — the same pass shape
   that fills a `Node::Columnar` from its fragments — and one that names an outer column runs **once per
