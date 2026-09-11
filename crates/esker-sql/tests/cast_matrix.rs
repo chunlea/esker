@@ -181,3 +181,56 @@ fn every_route_into_an_array_cast_is_the_same_cast() {
         "and through the column, which is the route the note said was already right"
     );
 }
+
+/// **Ten pairs this node casts and 19beta1 refuses**, which is the class ADR 0031 ranks worst —
+/// a *value* where a real server raises.
+///
+/// They are what is left of the matrix's "node answers, PG refuses" column, and they are one
+/// mechanism: a cast whose **target** has its own lowering arm never asks `pg_cast` for
+/// permission. `casts_to` is the gate every other cast goes through, and `CastTarget::OidVector`,
+/// `::RegType`, `::RegClass` and `::Oid` each return before it — the same shape the literal-array
+/// arm had before `d4be1a60`, third time in this family.
+///
+/// Measured on 19beta1 (`127.0.0.1:55432`, 2026-09-10), each one `42846 cannot cast type X to Y`:
+///
+/// ```text
+/// '1'::bit::oid                     '{1}'::integer[]::oidvector
+/// 'pg_class'::regclass::regtype     '1 2'::int2vector::oidvector
+/// 'int4'::regtype::regclass         '{1}'::bigint[]::oidvector
+/// ```
+///
+/// **`text -> lquery` is not in this list and was in the capture's**: 19beta1 answers it
+/// (`'x'::text::lquery` is `x`, `'a.b'` likewise), so the node and the oracle agree and that row
+/// needs re-taking, like the four the capture's header already names.
+#[test]
+fn a_cast_with_its_own_lowering_arm_still_asks_pg_cast() {
+    let mut node = parity::Node::new(&["CREATE TABLE pg_class_probe (id bigint)"]);
+    for (written, from, to) in [
+        ("'1'::bit::oid", "bit", "oid"),
+        ("'pg_class'::regclass::regtype", "regclass", "regtype"),
+        ("'int4'::regtype::regclass", "regtype", "regclass"),
+        ("'1 2'::int2vector::oidvector", "int2vector", "oidvector"),
+        ("'{1}'::integer[]::oidvector", "integer[]", "oidvector"),
+        ("'{1}'::bigint[]::oidvector", "bigint[]", "oidvector"),
+        ("'{1}'::oid[]::oidvector", "oid[]", "oidvector"),
+    ] {
+        let answer = node.answer(&format!("SELECT {written}")).to_string();
+        assert_eq!(
+            answer,
+            format!("!42846 cannot cast type {from} to {to}"),
+            "{written} is 42846 on 19beta1"
+        );
+    }
+    // **And the string source still casts**, which is the half `casts_to` already has right: a
+    // cast *out of* a string type is the target's input function and needs no `pg_cast` row.
+    assert_eq!(
+        node.rows("SELECT pg_typeof('25 1043'::text::oidvector)"),
+        vec![vec!["oidvector"]],
+        "the I/O conversion out of a string is not what this refuses"
+    );
+    assert_eq!(
+        node.rows("SELECT ('a.b'::text::lquery)::text"),
+        vec![vec!["a.b"]],
+        "and 19beta1 answers this one too, which the capture's row did not say"
+    );
+}

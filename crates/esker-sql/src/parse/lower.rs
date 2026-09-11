@@ -6835,6 +6835,27 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             },
         };
     };
+    // **Permission is `pg_cast`'s here too**, which is the one thing these four targets were not
+    // asking. Every other cast goes through `casts_to` — the general arm above says so in its own
+    // comment — and a target with its own lowering arm returned before it, so
+    // `'1'::bit::oid`, `'pg_class'::regclass::regtype` and five `… -> oidvector` pairs answered
+    // values where 19beta1 says `42846 cannot cast type X to Y`. Measured, all seven; it is the
+    // same shape the literal-array arm had before `d4be1a60`, and the third time in this family.
+    //
+    // **A source with no type of its own is not refused**: an unquoted literal is `unknown` and
+    // `source_type` answers `None`, which is exactly the case PostgreSQL resolves through the
+    // target's input function. So `'25 1043'::text::oidvector` and `'pg_class'::regclass` are
+    // untouched — the first because `text` is a string category and `casts_to` already says yes,
+    // the second because there is nothing to cast *from* yet.
+    if let Ok(Some(from)) = source_type(expr)
+        && let Some(to) = target.column_type()
+        && !catalog::pg_catalog::casts_to(from, to)
+    {
+        return Err(SqlError::CannotCast {
+            from: from.name(),
+            to: to.name(),
+        });
+    }
     match (target, expr) {
         // `'integer'::regtype::oid` — the inner cast is matched here rather than lowered first.
         (
@@ -7418,6 +7439,20 @@ enum CastTarget {
     Oid,
     /// PostgreSQL's `oidvector`: a list of oids, printed space separated.
     OidVector,
+}
+
+impl CastTarget {
+    /// The type this target **is**, for the one question these four arms did not ask: whether
+    /// `pg_cast` has a row for the pair. Every other cast asks `casts_to`; a target with its own
+    /// lowering arm returned before it.
+    fn column_type(self) -> Option<ColumnType> {
+        Some(match self {
+            CastTarget::RegClass => ColumnType::RegClass,
+            CastTarget::RegType => ColumnType::RegType,
+            CastTarget::Oid => ColumnType::Oid,
+            CastTarget::OidVector => ColumnType::OidVector,
+        })
+    }
 }
 
 /// `sqlparser` files both as custom type names, since neither is in its `DataType`.
