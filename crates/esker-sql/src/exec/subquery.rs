@@ -270,7 +270,16 @@ fn unnest_element(arg: Option<&Expr>, tables: &dyn Tables) -> Option<ColumnType>
             // constructor's side.
             Some(esker_keys::array::ArrayValue::element_of(held).unwrap_or(held))
         }
-        other => esker_keys::array::ArrayValue::element_of(syntactic_type(other, tables)?),
+        // **A vector unnests to its element**, which `element_of` deliberately does not say: a
+        // vector's oid is derived through that function and teaching it there would make
+        // `int2vector` report `_int2`'s number. Measured on 19beta1: `unnest('1 2 3'::int2vector)`
+        // is a `smallint` and `unnest('25 1043'::oidvector)` an `oid`, where this node said `text`
+        // — wire v3 family F10's shape, and the vectors' half of ADR 0107 step 2.
+        other => match syntactic_type(other, tables)? {
+            ColumnType::Int2Vector => Some(ColumnType::Int2),
+            ColumnType::OidVector => Some(ColumnType::Oid),
+            array => esker_keys::array::ArrayValue::element_of(array),
+        },
     }
 }
 

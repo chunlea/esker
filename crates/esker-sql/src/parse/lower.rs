@@ -5818,6 +5818,24 @@ fn lower_array(expr: &Expr) -> Result<Option<Vec<plan::Expr>>> {
         {
             return Ok(None);
         }
+        // **A vector is not written with braces**, and this function is the one reader of the
+        // array grammar that did not know it: `int2vectorout` is space separated, so
+        // `2 = ANY('1 2 3'::int2vector)` reached `parse_array_literal`, found no `{`, and was
+        // `22P02 invalid input syntax for type array` — while **the same comparison through a
+        // column answered `true`**, because that path reads the value with `value::vector::Array`,
+        // which knows both forms. Measured, both halves, and 19beta1 answers `true` to each.
+        //
+        // `None` keeps it an expression, exactly as the `regclass[]` arm above does and for a
+        // sibling reason: the shortcut is only for a list this function can *see*, and a vector's
+        // elements are not written where it is looking.
+        Expr::Cast { data_type, .. }
+            if matches!(
+                lower_type(data_type),
+                Ok((ColumnType::Int2Vector | ColumnType::OidVector, _))
+            ) || cast_target(data_type) == Some(CastTarget::OidVector) =>
+        {
+            return Ok(None);
+        }
         // `'{a,b}'::text[]` and a bare `'{a,b}'`: the cast is a no-op here, because what the array
         // holds is decided by what it is compared against, exactly as an `IN` list's elements are.
         Expr::Cast { expr, .. } => return lower_array(expr),

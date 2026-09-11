@@ -209,3 +209,45 @@ fn accumulating_a_vector_gives_the_vector() {
         vec![vec!["bigint[]"]]
     );
 }
+
+/// **A vector's elements**: the quantifier and `unnest`, which are the two shapes that ask what is
+/// *inside* a vector rather than what it is.
+///
+/// Measured on 19beta1: `2 = ANY('1 2 3'::int2vector)` is `true`, and `unnest` of one yields
+/// `smallint` (`oid` for an `oidvector`).
+#[test]
+fn a_quantifier_and_unnest_see_a_vectors_elements() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE vv (id bigint primary key, iv int2vector)",
+        "INSERT INTO vv VALUES (1, '1 2 3')",
+    ]);
+    // **Both routes**, because they were two answers: the literal went through the lowering
+    // shortcut that reads an array literal — and a vector is not written with braces — while the
+    // column went through the evaluator, which reads both forms.
+    for written in ["'1 2 3'::int2vector", "iv"] {
+        assert_eq!(
+            node.rows(&format!("SELECT (2 = ANY({written}))::text FROM vv")),
+            vec![vec!["true"]],
+            "2 = ANY({written})"
+        );
+        assert_eq!(
+            node.rows(&format!("SELECT (9 = ANY({written}))::text FROM vv")),
+            vec![vec!["false"]],
+            "and a value it does not hold"
+        );
+    }
+    // `unnest` yields the element's own type, not `text`.
+    assert_eq!(
+        node.rows("SELECT pg_typeof(u) FROM unnest('1 2 3'::int2vector) u LIMIT 1"),
+        vec![vec!["smallint"]]
+    );
+    assert_eq!(
+        node.rows("SELECT pg_typeof(u) FROM unnest('25 1043'::oidvector) u LIMIT 1"),
+        vec![vec!["oid"]]
+    );
+    assert_eq!(
+        node.rows("SELECT string_agg(u::text, ',') FROM unnest('1 2 3'::int2vector) u"),
+        vec![vec!["1,2,3"]],
+        "and the values are the vector's, in order"
+    );
+}
