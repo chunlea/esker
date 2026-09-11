@@ -61,7 +61,7 @@ pub use pd::{
     MemberChange, Operator, OperatorProgress, OperatorStatus, PdChannel, PdMemberInfo,
     PdMembership, PdRaftBatch, PdReq, PdResp, PdRole, ScannedRegion, StoreInfo,
 };
-pub use pd_leader::{LeaderBook, Redirects};
+pub use pd_leader::{LeaderBook, Redirects, unreachable};
 pub use raft::{RaftBatch, RaftMessage};
 pub use region::{Epoch, Peer, PeerRole, Region};
 pub use transport::{

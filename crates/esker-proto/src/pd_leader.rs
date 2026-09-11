@@ -29,6 +29,23 @@
 //!   supplies the `Pd::Members` answer — and adopts the new list only if its **group id** is the
 //!   one this book first learned. That check is what keeps ADR 0059's protection: one cluster's
 //!   placement driver still cannot route a client into another's.
+//!
+//! # And a fifth, which the other four cannot reach
+//!
+//! **A killed member says nothing at all.** It does not answer `PdNotLeader`; it does not answer.
+//! A client that moved only on a refusal has nothing to move it, so it re-dials the corpse on its
+//! own cadence for ever while live members sit in its list with a leader between them — which is
+//! the shape of debt #52 one layer up, where a client that never redialled a *store* that came
+//! back cost 111 seconds of unavailability.
+//!
+//! So a member this client **could not reach** is advanced past too, under the same budget:
+//! [`unreachable`] says which failures those are, and it is deliberately the narrowest possible
+//! set. Only `ProtoError::NotSent` — a request that provably never left this process, which is
+//! what a connection that could not be built is. A call that went out and lost its answer is
+//! `Closed` or `Timeout`, and those are returned to the caller as they are: sending such a request
+//! to a different member would be sending, a second time, a request that may already have applied.
+//! The cost of that narrowness is one call — the one in flight when the socket died; the next call
+//! has to build a connection, and that is the failure that moves the book.
 
 use std::net::SocketAddr;
 use std::sync::RwLock;
@@ -55,6 +72,18 @@ pub const NO_LEADER_BACKOFF_MS: u64 = 100;
 
 /// The cap on that backoff.
 pub const NO_LEADER_BACKOFF_MAX_MS: u64 = 800;
+
+/// Whether `error` means *this member could not be reached*, rather than something it said.
+///
+/// The narrowest possible set, and the narrowness is the argument: `ProtoError::NotSent` is the
+/// one failure that **provably never left this process**, so moving to another member and asking
+/// again cannot be asking twice. Everything ambiguous — a connection that closed mid-call, a
+/// request that timed out — is the caller's to report, because a client that re-sent those would
+/// be repeating requests whose outcome it does not know.
+#[must_use]
+pub fn unreachable(error: &ProtoError) -> bool {
+    matches!(error, ProtoError::NotSent { .. })
+}
 
 /// The members of one placement-driver group, and which of them a client believes leads.
 ///
@@ -450,6 +479,33 @@ mod tests {
             last = next;
         }
         assert_eq!(last.as_millis() as u64, NO_LEADER_BACKOFF_MAX_MS);
+    }
+
+    /// **Rule five, and the line it draws.** A connection that could not be built provably sent
+    /// nothing, so another member may be asked. A call that went out and lost its answer did not,
+    /// so it may not — which is the whole reason this is a predicate and not "any error".
+    #[test]
+    fn only_a_request_that_never_left_moves_the_client() {
+        assert!(super::unreachable(&ProtoError::not_sent(
+            "connecting to 127.0.0.1:2379: Connection refused"
+        )));
+        for ambiguous in [
+            ProtoError::Closed {
+                detail: "mid-call".to_owned(),
+            },
+            ProtoError::Timeout {
+                detail: "no answer".to_owned(),
+            },
+            ProtoError::Io {
+                detail: "write failed".to_owned(),
+            },
+            ProtoError::internal("something else"),
+        ] {
+            assert!(
+                !super::unreachable(&ambiguous),
+                "{ambiguous} may have been applied; asking elsewhere would ask twice"
+            );
+        }
     }
 
     fn refuse() -> Result<PdMembership, ProtoError> {
