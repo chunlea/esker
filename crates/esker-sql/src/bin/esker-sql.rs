@@ -211,7 +211,7 @@ struct Args {
     /// A **list**, comma-separated, because only the group's leader answers and leadership moves —
     /// and because a member can be killed, which is the case a node holding one address cannot
     /// survive
-    /// ([ADR 0108](../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)).
+    /// ([ADR 0108](../../../../docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md)).
     /// One address is still valid and is a group of one, so no invocation had to change.
     pd: Vec<std::net::SocketAddr>,
     /// PEM certificate chain for the client port, or `None` to terminate no TLS.
