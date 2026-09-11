@@ -170,14 +170,23 @@ pub struct Relations {
 }
 
 impl Relations {
-    /// Reads the tenant's whole catalog: one scan, then one point read per table and per sequence.
+    /// Reads the tenant's whole catalog: **two scans, and no point read at all**.
     ///
     /// **The fill path of [`super::View::relations`], and its one caller.** Every table it needs
     /// comes from the view, so a table hydrated once in a statement is hydrated once — and the
     /// bundle it returns is itself held at the view's version, which is what stops five catalog
     /// relations in one `FROM` list from being five of these.
+    ///
+    /// **It used to be a point read per table** — the record is what says a table is a materialized
+    /// view and what an index is positioned against, and it asked for one per table by id. That is
+    /// the `n` in the `2n + 16` keys `ActiveRecord`'s `column_definitions` charged for describing
+    /// one six-column table (#63 (c)); the other `n` was the hydration, pinned separately to the
+    /// relation the statement names. [`super::View::table_records`] answers the same question with
+    /// one scan of the range those records already live in, so what is left here is the name scan
+    /// and that one — neither of which grows a read per relation.
     pub(super) fn read(view: &super::View<'_>) -> Result<Relations> {
         let (txn, tenant) = (view.txn(), view.tenant());
+        let records = view.table_records()?;
         let (start, end) = super::record::name_range(tenant);
         let mut rows = Vec::new();
         let mut tables = BTreeMap::new();
@@ -189,7 +198,7 @@ impl Relations {
             }
             let stored = super::record::name_of(tenant, &key)?;
             let relation = super::record::decode_relation(&value)?;
-            rows.push(row_of(view, &stored, relation, &mut tables)?);
+            rows.push(row_of(&records, &stored, relation, &mut tables)?);
         }
         // The `EXCLUDE` constraints' indexes, which have no name record of their own — see
         // [`RelKind::Exclusion`]. Appended after the scan and then re-sorted, so the whole list
@@ -388,7 +397,7 @@ impl Relations {
 
 /// One name record, turned into a row — reading whatever second record its oid lives in.
 fn row_of(
-    view: &super::View<'_>,
+    records: &BTreeMap<u64, Arc<TableDef>>,
     stored: &str,
     relation: Relation,
     tables: &mut BTreeMap<u64, Arc<TableDef>>,
@@ -402,7 +411,7 @@ fn row_of(
         Relation::Table { table_id } => {
             // **A materialized view is a table record**, and this is where the two part company:
             // the letter, and everything downstream that branches on it (ADR 0064).
-            let table = load_table(view, table_id, tables)?;
+            let table = load_table(records, table_id, tables)?;
             let kind = if table.matview.is_some() {
                 RelKind::MaterializedView
             } else {
@@ -433,7 +442,7 @@ fn row_of(
             column: None,
         },
         Relation::Index { table_id, index_id } => {
-            let table = load_table(view, table_id, tables)?;
+            let table = load_table(records, table_id, tables)?;
             let index_at = table.indexes.iter().position(|index| index.id == index_id);
             RelationRow {
                 oid: as_oid(index_id),
@@ -447,7 +456,7 @@ fn row_of(
             }
         }
         Relation::PrimaryKey { table_id } => {
-            load_table(view, table_id, tables)?;
+            load_table(records, table_id, tables)?;
             RelationRow {
                 // Derived: a primary key has no record of its own to carry one. See the module
                 // note — it was the table's own id until this module, which made two rows of
@@ -468,7 +477,7 @@ fn row_of(
         } => {
             // A sequence no column owns has no table to load, and `pg_class` still lists it.
             if table_id != crate::catalog::STANDALONE_SEQUENCE_OWNER {
-                load_table(view, table_id, tables)?;
+                load_table(records, table_id, tables)?;
             }
             // **The sequence's own id, which the name record now carries.** It used to live only
             // in the sequence record, so `pg_class` reported the table's id instead and every
@@ -489,23 +498,24 @@ fn row_of(
     })
 }
 
-/// The table record, read once per snapshot however many relations point at it.
+/// The **record** behind a relation row, taken from the one scan and remembered for this listing.
 ///
-/// **Through [`super::View::table_by_id`]**, which is the same map every ordinary statement fills:
-/// a table hydrated for `pg_class` is the table `SELECT` already had, and a second decode of one
-/// record is a second place for the two to drift (`crate::catalog::hydrate` is the note about the
-/// last time they did).
-/// The **record** behind a relation row, cached for the life of this `Relations`.
+/// **Not a read.** `records` is [`super::View::table_records`] — every table record of the tenant,
+/// from one scan, memoised at the view's version. This used to be a point read per table through
+/// `View::table_record_by_id`, which is the cost #63 (c) was about.
+///
+/// `tables` is still filled rather than being the scan's map wholesale, so this listing holds
+/// exactly the tables its own relations point at, which is what it held before.
 ///
 /// Not hydrated: see [`super::View::table_record_by_id`] for what that buys and what it costs a
 /// reader that needs more. A view that needs the derived half asks the catalog for the table.
 fn load_table<'a>(
-    view: &super::View<'_>,
+    records: &BTreeMap<u64, Arc<TableDef>>,
     table_id: u64,
     tables: &'a mut BTreeMap<u64, Arc<TableDef>>,
 ) -> Result<&'a TableDef> {
     if let std::collections::btree_map::Entry::Vacant(slot) = tables.entry(table_id) {
-        let Some(table) = view.table_record_by_id(table_id)? else {
+        let Some(table) = records.get(&table_id) else {
             // A name points at a table whose record is not there. The two keys are written by one
             // transaction, so this is corruption rather than a missing table — the same reading
             // `Executor::table_by_id` takes.
@@ -513,7 +523,7 @@ fn load_table<'a>(
                 "a name points at table {table_id}, which is not there"
             )));
         };
-        slot.insert(table);
+        slot.insert(Arc::clone(table));
     }
     tables
         .get(&table_id)

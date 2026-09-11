@@ -2527,6 +2527,14 @@ struct Cache {
     /// point read and a sequence scan per relation, which is what asking `relations` this question
     /// cost (#61).
     matviews: BTreeMap<u64, Arc<Vec<MatviewRef>>>,
+    /// One tenant's table **records**, by id, whole — un-hydrated, one scan.
+    ///
+    /// What a relations listing needs and nothing more: a record says whether a table is a
+    /// materialized view and what its indexes are, which is the whole of what
+    /// [`pg_relations::Relations`] was making a point read per table to find out. Same records,
+    /// same order, one scan of the range they already live in — the trade [`View::matviews`]
+    /// already makes for the same question asked about one table (#61).
+    table_records: BTreeMap<u64, Arc<BTreeMap<u64, Arc<TableDef>>>>,
     /// One tenant's user-defined types, whole.
     types: BTreeMap<u64, Arc<Vec<TypeDef>>>,
     /// `(tenant, table_id)` to that table's sequences.
@@ -2987,6 +2995,40 @@ impl<'a> View<'a> {
                 // By id, because the caller reports the *first* dependent and a real server finds
                 // them by oid — the same ordering `dependent_relations` sorts into.
                 found.sort_by_key(|found| found.id);
+                Ok(Arc::new(found))
+            },
+        )
+    }
+
+    /// Every table record this tenant has, by id — **one scan, not a point read each**.
+    ///
+    /// # Why this exists
+    ///
+    /// [`pg_relations::Relations::read`] needs a record per table and needs it for every table:
+    /// the record is what says a table is a materialized view rather than a table (ADR 0064) and
+    /// what an index's row is positioned against. It was asking [`View::table_record_by_id`] once
+    /// per table, which is a point read each — `2n + 16` keys for a catalog of `n` relations, of
+    /// which one half was this and the other was the hydration b4 pinned to the relation the
+    /// statement names (#63 (c)).
+    ///
+    /// This reads the same records as one scan of the range they already live in, which is exactly
+    /// what [`View::matviews`] does and for the same reason. **No format change**: `table_range`
+    /// names keys `table_key` has always written, and the records are decoded by the same
+    /// `decode_table`.
+    ///
+    /// Un-hydrated, like [`View::table_record_by_id`] and unlike [`View::table_by_id`]: a listing
+    /// wants the record, and a reader that needs the derived half asks the catalog for the table.
+    pub fn table_records(&self) -> Result<Arc<BTreeMap<u64, Arc<TableDef>>>> {
+        self.memoise(
+            self.tenant,
+            |cache| &mut cache.table_records,
+            || {
+                let (start, end) = record::table_range(self.tenant);
+                let mut found = BTreeMap::new();
+                for (_, value) in self.txn.scan(&start, &end, 0)? {
+                    let table = record::decode_table(&value)?;
+                    found.insert(table.id, Arc::new(table));
+                }
                 Ok(Arc::new(found))
             },
         )
