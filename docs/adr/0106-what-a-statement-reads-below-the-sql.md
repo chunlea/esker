@@ -521,13 +521,23 @@ SELECT count(*) FROM pg_class seq, pg_depend dep
 
 **A join between two computed catalog views is a cross product**, and five times the catalog is
 twenty-five times the pairs. That is a planner defect and it is in none of this ADR's three options;
-no amount of caching reads touches it. It is recorded here because this is where it was found, and
-it is asked for a debt number in `esker-coord/QUESTION-b4.md` rather than taken.
+no amount of caching reads touches it. It is **`debts-v1.1.md` #54**, opened 2026-09-10 by the user's
+ruling with these numbers, and the `#[ignore]`d test is its red test.
+
+**It is the residue this ADR wrote itself to be refuted by.** *"If the 907 statements turn out to be
+dominated by something this census cannot see — the TSO, the commit, the wire — then none of the
+three options is the answer and the row moves."* It was none of those three; it was the planner, and
+the census could not see it because a count cannot. The pre-registered sentence held anyway: what
+this ADR's options do not touch is now a row of its own rather than a surprise inside this one.
 
 So what closes this row is the **count**, which is what the real topology bills at 232 µs a read
 ([ADR 0102](0102-the-catalogs-read-path.md)) — 35 round trips per `pk_and_sequence_for` on r1's
-measurement, and four keys here. **r1's number on the real cluster is what confirms it**, and it is
-not this lane's to take.
+measurement, and four keys here.
+
+**The acceptance, as the user set it 2026-09-10**: the read-count slope (flat at 4 → 4 over 20 and
+100 relations, cold 12) **plus r1's next real-topology pricing** of `pk_and_sequence_for` — 2.38 s at
+35 round trips, expected well under 0.3 s at 4. The first half is
+`crates/esker-sql/tests/catalog_read_slope.rs`; the second is r1's and is not this lane's to take.
 
 ### A bug the cache found, fixed with it
 

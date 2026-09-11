@@ -21,7 +21,9 @@
 //! **The first is green**, and so is [`a_repeated_statement_reads_only_the_version_keys`], which
 //! was added when the second turned out to be measuring something else.
 //!
-//! **The second is still red, and it is no longer about #49.** Its scenario is right and its
+//! **The second is still red, and it is `debts-v1.1.md` #54's test now, not #49's** — the user's
+//! ruling of 2026-09-10: keep it, `#[ignore]`d, with the reason below, because it was not deleted
+//! or weakened and what it measures is a real debt. Its scenario is right and its
 //! instrument is wrong: it is a *clock* on the in-process node, where a KV read costs nothing, so
 //! what it times is the work that is left after the reads are gone. Measured after option (b)
 //! landed, on the second run of `pk_and_sequence_for` at an unchanged version:
@@ -41,8 +43,9 @@
 //! **The read count is flat and the clock is not**, which is the mirror image of the warning in
 //! the plan: a join of two *computed* catalog views is a cross product, and five times the catalog
 //! is twenty-five times the pairs. That is a planner defect, it is not in ADR 0106's option space,
-//! and no amount of caching reads touches it. So this test now waits on that rather than on #49 —
-//! see `esker-coord/QUESTION-b4.md`, which is where its rewrite is asked for rather than taken.
+//! and no amount of caching reads touches it. So this test waits on **#54** rather than on #49 —
+//! and it is the one place the in-process node measures *better* than the real topology, because a
+//! KV read here is a `BTreeMap` lookup and what the clock sees is the planner and nothing else.
 //!
 //! # Why a count is the acceptance test and a clock is not
 //!
@@ -173,10 +176,10 @@ fn one_statement_reads_no_key_twice() {
 /// **The control is a statement that must grow with the catalog**, so a slow container moves both
 /// numbers and the comparison still says what it says.
 #[test]
-#[ignore = "no longer #49's: after option (b) the second run reads 4 keys at every catalog size \
-            and the residue is a cross product between two computed catalog views \
-            (1.55 ms -> 24.6 ms for 5x the catalog). See this file's header and \
-            esker-coord/QUESTION-b4.md"]
+#[ignore = "this is debts-v1.1.md #54's red test, not #49's: after option (b) the second run reads \
+            4 keys at every catalog size and the residue is a cross product between two computed \
+            catalog views (1.55 ms -> 24.6 ms for 5x the catalog). Kept red by the user's ruling of \
+            2026-09-10 rather than rewritten. See this file's header"]
 fn a_repeated_statement_stops_tracking_the_catalog() {
     /// What five times the catalog may cost, once the statement has been asked before.
     const BOUND: u32 = 2;
