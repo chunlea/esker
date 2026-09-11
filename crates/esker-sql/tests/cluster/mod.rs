@@ -209,7 +209,17 @@ impl Cluster {
     /// would be if the history were reclaimed (ADR 0110 step 1, by hand).
     pub fn collect_everything(&self) {
         for store in &self.stores {
-            store.raise_safepoint(u64::MAX);
+            // **Not `u64::MAX`.** A safepoint above every timestamp says "all history is
+            // collectable", and since ADR 0110 a read below the safepoint is refused — so
+            // `u64::MAX` collects everything and then refuses every read that follows, which is
+            // the floor working rather than a bug. Collect up to *now* instead: that is what an
+            // operator asking for "everything collectable" means, and it leaves the present
+            // readable.
+            let now = self
+                .oracle
+                .timestamp()
+                .expect("a timestamp to collect up to");
+            store.raise_safepoint(now);
             // **Flush first, or this measures a no-op.** `compact_range` compacts SSTs; at the
             // default 64 MiB write buffer a test's whole workload is still in the memtable, so a
             // compaction without this has nothing to compact and reports that nothing changed —
