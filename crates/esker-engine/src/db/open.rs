@@ -178,7 +178,7 @@ impl Db {
     /// the directory and deleted from it, which reclaims nothing in an object store. **A listing
     /// cannot drive object reclamation** — a file the tier has evicted is not in the listing at
     /// all, so its object would never be reached
-    /// ([ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) decision 5) — and at open,
+    /// ([ADR 0024](../../../../docs/adr/0024-tiering-failure-semantics.md) decision 5) — and at open,
     /// which is the one call that runs before any flush or compaction can, that left the objects
     /// of everything the last process abandoned behind for good.
     pub fn purge_obsolete_files(&self) -> Result<Vec<std::path::PathBuf>> {
