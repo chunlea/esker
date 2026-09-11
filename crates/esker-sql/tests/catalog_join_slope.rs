@@ -87,6 +87,21 @@ const EXPLICIT: &str =
 /// the shape it is testing *for* beside the shape it is testing.
 const PRODUCT: &str = "SELECT count(*) FROM pg_class seq, pg_depend dep";
 
+/// **The acceptance's own query**, verbatim from `catalog_read_slope.rs`: five catalog relations in
+/// one comma list, which is `ActiveRecord`'s `pk_and_sequence_for`. Measured here because a fix to
+/// the two-table path is worth nothing if this one is slow for another reason — and this is the
+/// query the `#[ignore]` is waiting on.
+const PK_AND_SEQUENCE_FOR: &str = "SELECT attr.attname, nsp.nspname, seq.relname \
+     FROM pg_class seq, pg_attribute attr, pg_depend dep, pg_constraint cons, pg_namespace nsp \
+     WHERE seq.oid = dep.objid \
+       AND seq.relkind = 'S' \
+       AND attr.attrelid = cons.conrelid \
+       AND attr.attnum = cons.conkey[1] \
+       AND cons.conrelid = dep.refobjid \
+       AND cons.contype = 'p' \
+       AND dep.classid = 'pg_class'::regclass \
+       AND dep.refobjid = '\"pk0\"'::regclass";
+
 fn grow_to(node: &mut parity::Node, target: usize, made: &mut usize) {
     while *made < target {
         node.run(&format!(
@@ -118,6 +133,8 @@ fn the_shape_of_the_catalog_join_at_three_sizes() {
         let join = elapsed(&mut node, JOIN);
         let product = elapsed(&mut node, PRODUCT);
         let explicit = elapsed(&mut node, EXPLICIT);
+        let five = elapsed(&mut node, PK_AND_SEQUENCE_FOR);
+        println!("  n={target}: pk_and_sequence_for {five:?}");
         // The answer, so a plan that got cheap by getting wrong is visible here rather than in a
         // ratio that looks excellent.
         let answer = node.rows(JOIN);
@@ -159,7 +176,7 @@ fn the_catalog_join_says_in_explain_what_it_does() {
     let mut made = 0;
     grow_to(&mut node, 20, &mut made);
 
-    for sql in [JOIN, EXPLICIT] {
+    for sql in [JOIN, EXPLICIT, PK_AND_SEQUENCE_FOR] {
         let plan = node
             .rows(&format!("EXPLAIN {sql}"))
             .into_iter()

@@ -173,10 +173,6 @@ fn one_statement_reads_no_key_twice() {
 /// **The control is a statement that must grow with the catalog**, so a slow container moves both
 /// numbers and the comparison still says what it says.
 #[test]
-#[ignore = "no longer #49's: after option (b) the second run reads 4 keys at every catalog size \
-            and the residue is a cross product between two computed catalog views \
-            (1.55 ms -> 24.6 ms for 5x the catalog). See this file's header and \
-            esker-coord/QUESTION-b4.md"]
 fn a_repeated_statement_stops_tracking_the_catalog() {
     /// What five times the catalog may cost, once the statement has been asked before.
     const BOUND: u32 = 2;

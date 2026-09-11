@@ -1128,15 +1128,9 @@ pub(super) fn plan_under(
 
     let only_join = select.joins.first();
     let using: &[String] = only_join.map_or(&[], |join| &join.using);
-    let condition = match (&only_join, named_table, named_inner) {
-        (Some(join), Some(left), Some(right)) if !join.using.is_empty() => {
-            Some(using_condition(&join.using, left, right)?)
-        }
-        (Some(join), ..) => join.on.clone(),
-        _ => None,
-    };
     let join_kind = only_join.map_or(crate::plan::JoinKind::Inner, |join| join.kind);
     let left_join = join_kind != crate::plan::JoinKind::Inner;
+    let condition = one_joins_condition(select, named_table, named_inner, left_join)?;
 
     // A **derived** side never drives the choice. `drive_from` swaps in order to reach a probe on
     // the inner table's key, and a derived table has none -- so a swap could only move the plan
@@ -1822,21 +1816,38 @@ fn plan_chain(
     // reference to one further right an "undefined column" rather than a silent NULL.
     for at in 0..entries.len() - 1 {
         let scope = Scope::chain(&entries[..=at + 1]).under(enclosing);
-        // A reordered chain is a comma list: every join inner, every `ON` absent, and no entry a
-        // function or a derived table — so the step needs nothing from `select.joins`, whose order
-        // no longer matches.
-        node = chain_step(node, select, &entries, at, reordered, enclosing, &scope)?;
         // **Not below an outer join.** A `WHERE` conjunct applied before the NULL extension would
         // throw away the rows a `LEFT JOIN` exists to keep, which is the one rewrite of this kind
         // that changes an answer rather than a cost. Once a chain has taken an outer join, nothing
         // after it is pushed either: the rows above that step are the extended ones.
-        if !has_full
+        let inner_so_far = !has_full
             && !select.joins[..=at]
                 .iter()
-                .any(|join| join.kind != crate::plan::JoinKind::Inner)
-        {
-            node = pushdown(node, &mut pending, &entries[..=at + 1], enclosing);
-        }
+                .any(|join| join.kind != crate::plan::JoinKind::Inner);
+        // **Taken before the step is built, so it can go *on* the join rather than above it.**
+        // Everything these tables can answer and the tables to their left could not is, by
+        // construction, a condition involving the one being joined here — which is what a join
+        // condition is. Above the loop it costs `outer x inner` joined rows; on the loop a pair
+        // that fails is dropped before a row exists. Debt #54, and `take_answerable` carries the
+        // measurement.
+        let answerable = inner_so_far
+            .then(|| take_answerable(&mut pending, &entries[..=at + 1], enclosing))
+            .flatten();
+        // A reordered chain is a comma list: every join inner, every `ON` absent, and no entry a
+        // function or a derived table — so the step needs nothing from `select.joins`, whose order
+        // no longer matches.
+        node = chain_step(
+            node,
+            select,
+            &entries,
+            &Step {
+                at,
+                reordered,
+                enclosing,
+                scope: &scope,
+            },
+            answerable,
+        )?;
     }
 
     // The **written** order for the scope every output column is resolved against: `SELECT *`
@@ -1932,37 +1943,163 @@ fn pushdown(
     entries: &[(&TableDef, String)],
     enclosing: Option<&Scope<'_>>,
 ) -> Node {
-    if pending.is_empty() {
+    let scope = Scope::chain(entries).under(enclosing);
+    let Some(predicate) = take_answerable(pending, entries, enclosing) else {
         return node;
+    };
+    // Resolved here because a `Filter` holds a resolved predicate; a join resolves its own.
+    let Ok(predicate) = resolve(&predicate, &scope) else {
+        return node;
+    };
+    Node::Filter {
+        input: Box::new(node),
+        predicate,
+    }
+}
+
+/// Takes from `pending` every conjunct the tables in `entries` can answer, and returns them as one
+/// `AND` — **unresolved**, as written.
+///
+/// The selection half of [`pushdown`], split out because its answer has two destinations and only
+/// one of them is a filter. A conjunct a *join step* can answer belongs **on the join**, not above
+/// it, and the difference is the whole of debt #54:
+///
+/// ```text
+/// FROM pg_class seq, pg_depend dep WHERE seq.oid = dep.objid     352 ms over 400 relations
+///     Filter                       <- n x n joined rows are built, then thrown away
+///       Nested Loop
+///
+/// FROM pg_class seq JOIN pg_depend dep ON seq.oid = dep.objid    3.6 ms over the same
+///     Nested Loop
+///       Join Filter                <- a pair that fails is dropped before a row is built
+/// ```
+///
+/// Measured at three catalog sizes in `tests/catalog_join_slope.rs`: the comma form costs very
+/// nearly what the **bare cross product** costs — 352 ms against 455 ms — while the same join
+/// written with `ON` tracks a single catalog scan. It is not the comparison that is quadratic, it
+/// is the rows.
+///
+/// **Unresolved on purpose**: a `Filter` takes a resolved predicate and a join resolves its own
+/// `ON` against the scope it builds, so handing a join something already resolved would resolve it
+/// twice. Resolution is still *attempted* here, because "can these tables answer it" has no other
+/// answer.
+fn take_answerable(
+    pending: &mut Vec<&Expr>,
+    entries: &[(&TableDef, String)],
+    enclosing: Option<&Scope<'_>>,
+) -> Option<Expr> {
+    if pending.is_empty() {
+        return None;
     }
     let scope = Scope::chain(entries).under(enclosing);
-    let mut ready = Vec::new();
+    let mut ready: Vec<&Expr> = Vec::new();
     pending.retain(|conjunct| {
         if !is_pushable(conjunct) {
             return true;
         }
-        match resolve(conjunct, &scope) {
-            Ok(resolved) => {
-                ready.push(resolved);
-                false
-            }
-            Err(_) => true,
+        if resolve(conjunct, &scope).is_ok() {
+            ready.push(conjunct);
+            false
+        } else {
+            true
         }
     });
-    let Some(first) = ready.first() else {
-        return node;
-    };
-    let mut predicate = first.clone();
-    for next in &ready[1..] {
+    let (first, rest) = ready.split_first()?;
+    let mut predicate = (*first).clone();
+    for next in rest {
         predicate = Expr::Binary {
             op: BinaryOp::And,
             left: Box::new(predicate),
-            right: Box::new(next.clone()),
+            right: Box::new((*next).clone()),
         };
     }
-    Node::Filter {
-        input: Box::new(node),
-        predicate,
+    Some(predicate)
+}
+
+/// A single join's condition as written, **plus whatever the `WHERE` contributes to it**.
+///
+/// `FROM a, b WHERE a.x = b.y` puts the equality in the `WHERE`, where it becomes a filter *above*
+/// the loop — so `outer x inner` joined rows are built and then thrown away. On the join, a pair
+/// that fails is dropped before a row exists, which is why the identical query written `JOIN … ON`
+/// was already linear while this one cost very nearly what a bare cross product costs
+/// (`tests/catalog_join_slope.rs`: 352 ms against 455 ms over four hundred relations). Debt #54,
+/// and the chain path applies the same rule at its own steps.
+///
+/// **Copied, not moved.** For an inner join `ON c` and `WHERE c` are the same statement said twice,
+/// so leaving it in the `WHERE` cannot change an answer — and the filter above now sees only rows
+/// that already matched, so it costs a comparison on the rows that survive rather than on the pairs
+/// that never existed. Moving it would mean editing the `Select` this was handed.
+///
+/// **Inner joins only.** A `WHERE` conjunct applied before an outer join's NULL extension throws
+/// away the rows that join exists to keep — the one rewrite of this kind that changes an answer
+/// rather than a cost, and the line the chain path draws in the same words.
+fn one_joins_condition(
+    select: &Select,
+    table: Option<(&TableDef, &str)>,
+    inner: Option<(&TableDef, &str)>,
+    left_join: bool,
+) -> Result<Option<Expr>> {
+    let only_join = select.joins.first();
+    // As written: `USING (a, b)` is the equality it also is, an `ON` is itself, a bare comma join
+    // is nothing at all — which is the case this function exists for.
+    let written = match (&only_join, table, inner) {
+        (Some(join), Some(left), Some(right)) if !join.using.is_empty() => {
+            Some(using_condition(&join.using, left, right)?)
+        }
+        (Some(join), ..) => join.on.clone(),
+        _ => None,
+    };
+    let (Some(left), Some(right)) = (table, inner) else {
+        return Ok(written);
+    };
+    if left_join {
+        return Ok(written);
+    }
+    let using: &[String] = only_join.map_or(&[], |join| &join.using);
+    let scope = Scope::joined(left, right, false, using);
+    let pending = select.filter.as_ref().map(conjuncts_of).unwrap_or_default();
+    Ok(both(written, answerable_in(&pending, &scope, left.0)))
+}
+
+/// The conjuncts a two-table scope can answer that are not about the **outer** side alone, as one
+/// `AND`.
+///
+/// That test, rather than "mentions the inner table", because a *join* condition mentions both
+/// sides by definition and `mentions_only` is the predicate this file already has. What it
+/// separates is `a.x = b.y`, which turns `outer x inner` rows into the ones that match, from
+/// `a.x = 1`, which belongs above the loop where it costs one comparison per outer row rather than
+/// one per pair.
+fn answerable_in(pending: &[&Expr], scope: &Scope<'_>, outer: &TableDef) -> Option<Expr> {
+    let mut ready: Vec<&Expr> = Vec::new();
+    for conjunct in pending {
+        if !is_pushable(conjunct) || mentions_only(conjunct, outer) {
+            continue;
+        }
+        if resolve(conjunct, scope).is_ok() {
+            ready.push(conjunct);
+        }
+    }
+    let (first, rest) = ready.split_first()?;
+    let mut predicate = (*first).clone();
+    for next in rest {
+        predicate = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(predicate),
+            right: Box::new((*next).clone()),
+        };
+    }
+    Some(predicate)
+}
+
+/// `a AND b`, or whichever of the two exists.
+fn both(left: Option<Expr>, right: Option<Expr>) -> Option<Expr> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(left),
+            right: Box::new(right),
+        }),
+        (only, None) | (None, only) => only,
     }
 }
 
@@ -2298,21 +2435,38 @@ fn for_each_column(expr: &Expr, visit: &mut impl FnMut(Option<&str>, &str)) {
 ///
 /// Lifted out of `plan_chain` for its length, and it is a clean seam: everything it needs is the
 /// step's index into `entries` and whether the chain was reordered.
+/// Where one step of a chain is: which entry, whether the chain was reordered, and the two scopes
+/// it resolves against.
+///
+/// A struct because the argument list reached eight, and these four are one thing — *the position
+/// in the chain* — where `node` and the condition are the step's inputs. A call whose seventh and
+/// eighth arguments are a `bool` and an `Option` is a call whose arguments get swapped one day.
+struct Step<'a> {
+    at: usize,
+    reordered: bool,
+    enclosing: Option<&'a Scope<'a>>,
+    scope: &'a Scope<'a>,
+}
+
 fn chain_step(
     node: Node,
     select: &Select,
     entries: &[(&TableDef, String)],
-    at: usize,
-    reordered: bool,
-    enclosing: Option<&Scope<'_>>,
-    scope: &Scope<'_>,
+    step: &Step<'_>,
+    answerable: Option<Expr>,
 ) -> Result<Node> {
+    let Step {
+        at,
+        reordered,
+        enclosing,
+        scope,
+    } = *step;
     let inner = entries[at + 1].0;
     let outer_columns = width_of(&entries[..=at]);
     if reordered {
         return join_node(
             node,
-            None,
+            answerable.as_ref(),
             crate::plan::JoinKind::Inner,
             outer_columns,
             scope,
@@ -2321,13 +2475,17 @@ fn chain_step(
         );
     }
     let join = &select.joins[at];
+    // The written `ON` **and** whatever the `WHERE` contributes to this step. For an inner join
+    // the two are the same thing said in two places, which is why they may be joined with `AND`;
+    // for an outer join nothing is contributed, because the caller does not offer any.
+    let on = both(join.on.clone(), answerable);
     // Implicitly `LATERAL`: the entries strictly to this one's left, which at step `at` is
     // everything up to and including the outer side of this join.
     let left = Scope::chain(&entries[..=at]).under(enclosing);
     let inner_function = source_function(Some(&join.table), inner, &left)?;
     join_node(
         node,
-        join.on.as_ref(),
+        on.as_ref(),
         join.kind,
         outer_columns,
         scope,
