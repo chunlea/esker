@@ -61,6 +61,9 @@ impl StandIn {
         let mut state = self.lock();
         state.seen_cluster_ids.push(cluster_id);
         match request {
+            // The safepoint round (ADR 0110). This stand-in publishes nothing, which is the
+            // safe answer and the one a store must survive: zero collects nothing.
+            PdReq::Safepoint { .. } => PdResp::Safepoint { safepoint: 0 },
             PdReq::Bootstrap { store } => {
                 let first = state.cluster_id == 0;
                 if first {

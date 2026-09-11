@@ -57,6 +57,7 @@ async fn main() -> std::io::Result<()> {
     // The router the client was built on, kept so the fragment path can share it: one region cache
     // for both, so an entry a row read warmed is warm for a fragment.
     let mut router: Option<Arc<esker_client::Router>> = None;
+    let mut reads: Option<Arc<esker_client::TxnClient>> = None;
     let backend: Arc<dyn Backend> = if stores.is_empty() {
         if !pd.is_empty() {
             // The fake keeps nothing and is in this process; a lease from a real placement driver
@@ -84,7 +85,11 @@ async fn main() -> std::io::Result<()> {
                 .await
                 .map_err(std::io::Error::other)??;
         router = Some(built);
-        let backend = StoreBackend::new(Arc::new(client), oracle);
+        let client = Arc::new(client);
+        // Kept so the safepoint reporter can ask it what it still has open (ADR 0110). The
+        // backend owns it either way; this is a second handle, not a second client.
+        reads = Some(Arc::clone(&client));
+        let backend = StoreBackend::new(client, oracle);
         match &lease {
             Some(lease) => Arc::new(backend.with_schema_lease(Arc::clone(lease) as Arc<_>)),
             None => Arc::new(backend),
@@ -99,7 +104,7 @@ async fn main() -> std::io::Result<()> {
     // with no address to renew it at, or an address with no lease to fill in, would both be this
     // function having gone wrong.
     let columnar: Option<Arc<dyn ColumnarReport>> = if let Some(lease) = lease {
-        Some(attach_pd(&pd, lease, &backend).await?)
+        Some(attach_pd(&pd, lease, &backend, reads.clone()).await?)
     } else {
         tracing::info!(
             "no placement driver given: writes are unrestricted, no schema lease is held, and \
@@ -300,6 +305,7 @@ async fn attach_pd(
     members: &[std::net::SocketAddr],
     lease: Arc<PdLease>,
     backend: &Arc<dyn Backend>,
+    reads: Option<Arc<esker_client::TxnClient>>,
 ) -> std::io::Result<Arc<dyn ColumnarReport>> {
     let conn = Arc::new(
         PdConn::to_group(members, esker_proto::TransportConfig::new())
@@ -312,7 +318,31 @@ async fn attach_pd(
     // `block_on`: a synchronous client refuses a thread that is *driving* a runtime, and
     // `spawn_blocking` is the seam for exactly that — the same one every statement takes
     // (`crate::pgwire::server`).
+    //
+    // **Taking the reporter id happens in here too, and that is not tidiness.** `PdConn::alloc_id`
+    // is the same synchronous client, so asking for the id outside this closure panicked the node
+    // on its first line with "Cannot start a runtime from within a runtime" — found by
+    // `esker-cli/tests/safepoint_spares_a_long_read.rs` on its first run, which is the whole
+    // reason that test starts real processes.
+    let taken = Arc::clone(&conn);
     let (refresher, held) = tokio::task::spawn_blocking(move || {
+        let mut refresher = refresher;
+        // **The reader floor of the cluster's safepoint** (ADR 0110). A node that does not report
+        // holds nothing down, so failing to take an id is loud but not fatal: PD's per-reporter
+        // TTL decides what a silent node means, and the window is the other half.
+        if let Some(client) = reads {
+            match taken.alloc_id(1) {
+                Ok(reporter_id) => {
+                    tracing::info!(reporter_id, "reporting this node's oldest open read to PD");
+                    refresher = refresher.reporting_reads_from(client, reporter_id);
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "could not take a reporter id; this node will not report its open reads, and \
+                     the safepoint will rest on the retention window alone"
+                ),
+            }
+        }
         let held = refresher.refresh();
         (refresher, held)
     })

@@ -380,7 +380,7 @@ impl<'a> Scope<'a> {
     ///
     /// A position is an index into the **concatenated** row, so this walks the tables the way
     /// [`Scope::offset`] builds it: the labels live on the table
-    /// (`crate::catalog::TableDef::enums`) and the oid on the column, so both halves have to be
+    /// (`crate::catalog::Hydrated::enums`) and the oid on the column, so both halves have to be
     /// found together (ADR 0050).
     ///
     /// Narrower than [`Scope::user_type_at`] on purpose: everything that rewrites a *value*
@@ -2741,7 +2741,7 @@ fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<N
         });
     }
     let Some(filter) = filter else {
-        return Ok(seq_scan(tenant, table, &columns, false));
+        return seq_scan(tenant, table, &columns, false);
     };
     let equalities = equality_constants(filter, table)?;
 
@@ -2796,19 +2796,22 @@ fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<N
     }
 
     // Rule 2: a bound on the first primary key column narrows the range.
-    Ok(narrowed_scan(tenant, table, &columns, filter))
+    narrowed_scan(tenant, table, &columns, filter)
 }
 
-fn seq_scan(tenant: u64, table: &TableDef, columns: &RowSchema, narrowed: bool) -> Node {
+/// **`Result`, because "no children" and "nobody looked" are different answers.** A `SeqScan`
+/// planned off an un-hydrated record would read the parent's own range and quietly leave every
+/// child's rows out — see `TableDef::hydrated` (#63).
+fn seq_scan(tenant: u64, table: &TableDef, columns: &RowSchema, narrowed: bool) -> Result<Node> {
     let (start, end) = row::table_row_range(tenant, table.id);
-    Node::SeqScan {
+    Ok(Node::SeqScan {
         table_id: table.id,
         columns: columns.clone(),
         start,
         end,
         narrowed,
-        inherited: table.child_scans.clone(),
-    }
+        inherited: table.derived()?.child_scans.clone(),
+    })
 }
 
 /// Rule 2: a bound on the *first* primary key column moves the ends of the scanned range.
@@ -2818,7 +2821,14 @@ fn seq_scan(tenant: u64, table: &TableDef, columns: &RowSchema, narrowed: bool) 
 /// `(a, b)` does not mean anything about where to start, because the rows for `b = 9` are spread
 /// through every value of `a`. The filter still runs either way; narrowing only decides how much
 /// is read.
-fn narrowed_scan(tenant: u64, table: &TableDef, columns: &RowSchema, filter: &Expr) -> Node {
+/// `Result` for the same reason [`seq_scan`] is: an un-hydrated record cannot say what children
+/// a scan has to reach.
+fn narrowed_scan(
+    tenant: u64,
+    table: &TableDef,
+    columns: &RowSchema,
+    filter: &Expr,
+) -> Result<Node> {
     let (mut start, mut end) = row::table_row_range(tenant, table.id);
     let mut narrowed = false;
 
@@ -2850,14 +2860,14 @@ fn narrowed_scan(tenant: u64, table: &TableDef, columns: &RowSchema, filter: &Ex
         }
     }
 
-    Node::SeqScan {
+    Ok(Node::SeqScan {
         table_id: table.id,
         columns: columns.clone(),
         start,
         end,
         narrowed,
-        inherited: table.child_scans.clone(),
-    }
+        inherited: table.derived()?.child_scans.clone(),
+    })
 }
 
 /// Every `column <op> constant` on `ordinal` that the predicate *requires* — conjunctions only,

@@ -82,7 +82,10 @@ use crate::value::{PgDatum, PgType};
 /// not what a client sends. So the question is which kind it is, and only `Enum` answers `text`.
 fn parameter_type(table: &TableDef, at: usize) -> ColumnType {
     let column = &table.columns[at];
-    match column.user_type.and_then(|oid| table.enums.get(&oid)) {
+    match column
+        .user_type
+        .and_then(|oid| table.hydrated()?.enums.get(&oid))
+    {
         Some(def) if matches!(def.kind, crate::catalog::TypeKind::Enum { .. }) => ColumnType::Text,
         // A domain is its base type and a range is its own; a user type the table did not hydrate
         // is the column's own type too, which is what this answered before enums were special.

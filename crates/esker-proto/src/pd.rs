@@ -679,6 +679,20 @@ pub enum PdReq {
     },
 
     /// One store's capacity and load.
+    /// **What this reporter is holding, and what the safepoint is.** One round, both directions
+    /// ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)).
+    ///
+    /// A client sends the oldest `start_ts` it has open and mostly ignores the answer; a store
+    /// sends `None` and uses it. One method rather than two, because the question and the answer
+    /// are the same conversation and a store that is also holding a read is not a special case.
+    Safepoint {
+        /// Who is reporting. A store uses its store id; a client uses the id PD gave it.
+        reporter_id: u64,
+        /// The oldest `start_ts` this reporter still has open, or `None` for "nothing".
+        oldest_read: Option<u64>,
+    },
+
+    /// One store's capacity and load.
     StoreHeartbeat {
         /// Which store is reporting.
         store_id: u64,
@@ -818,6 +832,7 @@ impl PdReq {
         match self {
             Self::Bootstrap { .. } => Method::PdBootstrap,
             Self::StoreHeartbeat { .. } => Method::PdStoreHeartbeat,
+            Self::Safepoint { .. } => Method::PdSafepoint,
             Self::RegionHeartbeat { .. } => Method::PdRegionHeartbeat,
             Self::GetRegion { .. } => Method::PdGetRegion,
             Self::AllocId { .. } => Method::PdAllocId,
@@ -835,6 +850,19 @@ impl PdReq {
     pub(crate) fn encode(&self, out: &mut Encoder) {
         match self {
             Self::Bootstrap { store } => store.encode(out),
+            Self::Safepoint {
+                reporter_id,
+                oldest_read,
+            } => {
+                out.put_varint(*reporter_id);
+                match oldest_read {
+                    Some(ts) => {
+                        out.put_bool(true);
+                        out.put_varint(*ts);
+                    }
+                    None => out.put_bool(false),
+                }
+            }
             Self::StoreHeartbeat {
                 store_id,
                 capacity,
@@ -897,6 +925,13 @@ impl PdReq {
         Ok(match method {
             Method::PdBootstrap => Self::Bootstrap {
                 store: StoreInfo::decode(input)?,
+            },
+            Method::PdSafepoint => Self::Safepoint {
+                reporter_id: input.get_varint("safepoint.reporter_id")?,
+                oldest_read: input
+                    .get_bool("safepoint.oldest_read.present")?
+                    .then(|| input.get_varint("safepoint.oldest_read"))
+                    .transpose()?,
             },
             Method::PdStoreHeartbeat => Self::StoreHeartbeat {
                 store_id: input.get_varint("beat.store_id")?,
@@ -992,6 +1027,13 @@ pub enum PdResp {
         /// The region to create, when this call is the one that bootstrapped the cluster.
         /// `None` means the cluster already existed and this was a registration.
         region: Option<Region>,
+    },
+
+    /// Recorded.
+    /// The safepoint in force, for whoever asked.
+    Safepoint {
+        /// The number a store sets as published, and a client may ignore.
+        safepoint: u64,
     },
 
     /// Recorded.
@@ -1098,6 +1140,7 @@ impl PdResp {
         match self {
             Self::Bootstrap { .. } => Method::PdBootstrap,
             Self::StoreHeartbeat => Method::PdStoreHeartbeat,
+            Self::Safepoint { .. } => Method::PdSafepoint,
             Self::RegionHeartbeat { .. } => Method::PdRegionHeartbeat,
             Self::GetRegion { .. } => Method::PdGetRegion,
             Self::AllocId { .. } => Method::PdAllocId,
@@ -1118,6 +1161,7 @@ impl PdResp {
                 out.put_varint(*cluster_id);
                 encode_opt_region(region.as_ref(), out);
             }
+            Self::Safepoint { safepoint } => out.put_varint(*safepoint),
             Self::StoreHeartbeat | Self::ReportColumnar | Self::Raft => {}
             Self::RegionHeartbeat { operator } => match operator {
                 Some(operator) => {
@@ -1185,6 +1229,9 @@ impl PdResp {
             Method::PdBootstrap => Self::Bootstrap {
                 cluster_id: input.get_varint("bootstrap.cluster_id")?,
                 region: decode_opt_region(input)?,
+            },
+            Method::PdSafepoint => Self::Safepoint {
+                safepoint: input.get_varint("safepoint")?,
             },
             Method::PdStoreHeartbeat => Self::StoreHeartbeat,
             Method::PdReportColumnar => Self::ReportColumnar,
@@ -1383,6 +1430,28 @@ impl PdChannel {
         match response {
             PdResp::StoreHeartbeat => Ok(()),
             other => Err(mismatch("StoreHeartbeat", &other)),
+        }
+    }
+
+    /// Reports what this reporter is holding, and answers with the safepoint in force.
+    ///
+    /// One round for both directions ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)):
+    /// a client sends the oldest `start_ts` it has open, a store sends `None`, and both are told
+    /// the same number.
+    pub async fn safepoint(
+        &self,
+        reporter_id: u64,
+        oldest_read: Option<u64>,
+    ) -> Result<u64, ProtoError> {
+        let response = self
+            .call(PdReq::Safepoint {
+                reporter_id,
+                oldest_read,
+            })
+            .await?;
+        match response {
+            PdResp::Safepoint { safepoint } => Ok(safepoint),
+            other => Err(mismatch("Safepoint", &other)),
         }
     }
 

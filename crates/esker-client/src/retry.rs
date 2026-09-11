@@ -236,6 +236,22 @@ pub fn classify(error: &ProtoError) -> Verdict {
         // unknown leader routes to a peer chosen by the attempt number — so the next try asks a
         // different one rather than the same corpse (`Route::target_at`).
         ProtoError::NotSent { .. } => Verdict::Retry(Redirect::Leader { hint: None }),
+        // **Never retried, and said so here rather than left to the catch-all.** The history the
+        // read wanted is below the store's garbage-collection safepoint and may be collected;
+        // asking again cannot bring a version back, and asking a *different* store is worse —
+        // a peer whose safepoint has not caught up would answer, which is the wrong answer this
+        // refusal exists to prevent ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)
+        // decision 5). The caller starts a new transaction at a fresh timestamp.
+        //
+        // The catch-all below would already surface it — `outcome()` files it as `NotApplied`, so
+        // `may_ask_again` is false for a read as well. It is written out because a default that
+        // happens to be right is not a decision, and the next variant added beside it will not be
+        // this lucky.
+        #[allow(
+            clippy::match_same_arms,
+            reason = "identical to the catch-all on purpose: the arm records the decision, and                       a default that happens to be right is not one"
+        )]
+        ProtoError::SnapshotTooOld { .. } => Verdict::Surface,
         // `KeyNotInRegion` lands here: this client's routing is wrong, and no amount of
         // waiting fixes that. The caller sees it; the cache entry that produced it is dropped
         // by the call site so the next attempt starts from the resolver rather than the same
@@ -278,6 +294,148 @@ mod tests {
         backoff_ms, classify,
     };
     use crate::wire::ProtoError;
+
+    /// **Every variant, one line each, and the compiler counts them.**
+    ///
+    /// `classify` ends in a catch-all, so a variant added tomorrow is classified by whatever that
+    /// happens to be rather than by anybody's decision — and the catch-all is *right* often enough
+    /// that the omission is silent. This table is where the decision is written down, and the
+    /// count below is what fails when a variant is added without a line here.
+    ///
+    /// The table is the rule, not a description of the code: a change that moves a variant from
+    /// one column to the other has to change this file, which is how a reviewer sees it happen.
+    /// The table itself, so the test that reads it stays short enough to read.
+    fn classification_table() -> Vec<(ProtoError, bool)> {
+        use crate::wire::Region;
+
+        // (the error, whether the client retries it)
+        vec![
+            // Retried: each one carries, or implies, somewhere else to ask.
+            (
+                ProtoError::NotLeader {
+                    region_id: 1,
+                    leader_hint: Some(2),
+                },
+                true,
+            ),
+            (
+                ProtoError::EpochNotMatch {
+                    current_regions: Vec::<Region>::new(),
+                },
+                true,
+            ),
+            (ProtoError::RegionNotFound { region_id: 1 }, true),
+            (
+                ProtoError::ServerIsBusy {
+                    reason: "busy".to_owned(),
+                },
+                true,
+            ),
+            // The bytes never left, so there is nothing to have half-happened.
+            (ProtoError::not_sent("connection refused"), true),
+            // Surfaced: asking again, or asking elsewhere, cannot help.
+            (
+                ProtoError::SnapshotTooOld {
+                    start_ts: 1,
+                    safepoint: 2,
+                },
+                false,
+            ),
+            (
+                ProtoError::KeyNotInRegion {
+                    key: bytes::Bytes::from_static(b"k"),
+                    region_id: 1,
+                    start_key: bytes::Bytes::new(),
+                    end_key: bytes::Bytes::new(),
+                },
+                false,
+            ),
+            (
+                ProtoError::Locked {
+                    lock_info: bytes::Bytes::from_static(b"lock"),
+                },
+                false,
+            ),
+            (ProtoError::invalid("nonsense"), false),
+            (
+                ProtoError::Unsupported {
+                    detail: "later".to_owned(),
+                },
+                false,
+            ),
+            (ProtoError::corrupt("a frame", "bad bytes"), false),
+            (
+                ProtoError::Io {
+                    detail: "disk".to_owned(),
+                },
+                false,
+            ),
+            // **Unknown outcome, and a write may not be re-sent on one.** A read may ask again —
+            // that is `may_ask_again`, which needs the method and so is not this table's business.
+            (
+                ProtoError::Closed {
+                    detail: "the peer closed the connection".to_owned(),
+                },
+                false,
+            ),
+            (
+                ProtoError::Timeout {
+                    detail: "no answer".to_owned(),
+                },
+                false,
+            ),
+            (ProtoError::internal("a bug"), false),
+            (ProtoError::DuplicateRequestId { request_id: 1 }, false),
+            (ProtoError::NotBootstrapped, false),
+            (
+                ProtoError::ClusterMismatch {
+                    expected: 1,
+                    actual: 2,
+                },
+                false,
+            ),
+            // **Surfaced here, and retried by `PdConn`.** This client talks to *stores*; a
+            // placement driver's redirect reaching it is a routing mistake, and following it is
+            // the SQL node's business rather than this loop's. The table is where that stops
+            // being a surprise.
+            (
+                ProtoError::PdNotLeader {
+                    leader_id: 1,
+                    leader_address: String::new(),
+                },
+                false,
+            ),
+            (
+                ProtoError::WireVersion {
+                    expected: 1,
+                    actual: 2,
+                },
+                false,
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_error_is_classified_on_purpose() {
+        let table = classification_table();
+        for (error, retried) in &table {
+            let verdict = classify(error);
+            assert_eq!(
+                matches!(verdict, Verdict::Retry(_)),
+                *retried,
+                "{error:?} is classified as {verdict:?}, which this table does not say"
+            );
+        }
+
+        // **The count is the guard.** `code::ALL` has one entry per variant, so a variant added
+        // without a line above makes this fail — which is the whole point of writing the table.
+        assert_eq!(
+            table.len(),
+            esker_proto::error::code::ALL.len(),
+            "a `ProtoError` variant has no line in this table, so nobody decided how the client \
+             treats it"
+        );
+    }
 
     #[test]
     fn backoff_grows_then_flattens() {

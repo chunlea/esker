@@ -495,13 +495,17 @@ fn row_of(
 /// a table hydrated for `pg_class` is the table `SELECT` already had, and a second decode of one
 /// record is a second place for the two to drift (`crate::catalog::hydrate` is the note about the
 /// last time they did).
+/// The **record** behind a relation row, cached for the life of this `Relations`.
+///
+/// Not hydrated: see [`super::View::table_record_by_id`] for what that buys and what it costs a
+/// reader that needs more. A view that needs the derived half asks the catalog for the table.
 fn load_table<'a>(
     view: &super::View<'_>,
     table_id: u64,
     tables: &'a mut BTreeMap<u64, Arc<TableDef>>,
 ) -> Result<&'a TableDef> {
     if let std::collections::btree_map::Entry::Vacant(slot) = tables.entry(table_id) {
-        let Some(table) = view.table_by_id(table_id)? else {
+        let Some(table) = view.table_record_by_id(table_id)? else {
             // A name points at a table whose record is not there. The two keys are written by one
             // transaction, so this is corruption rather than a missing table — the same reading
             // `Executor::table_by_id` takes.
@@ -555,6 +559,7 @@ pub fn attnum_of(table: &TableDef, at: usize) -> i16 {
 #[must_use]
 pub fn sequence_for(table: &TableDef, column: usize) -> Option<&SequenceDef> {
     table
+        .hydrated()?
         .sequences
         .iter()
         .find(|sequence| sequence.column == Some(column))

@@ -226,9 +226,13 @@ pub fn columns(view: &crate::catalog::View<'_>, rendering: Rendering) -> Result<
         .collect();
     let mut rows = Vec::new();
     for relation in relations.of_kind(RelKind::Table) {
-        let Some(table) = relations.table(relation) else {
+        // **Hydrated, not the listing's record.** This view reports a column's default, and a
+        // `bigserial`'s default *is* its sequence — which a record does not carry (#63). Reading
+        // it off the listing answers "no default", which is a wrong answer rather than a loud one.
+        let Some(table) = view.table_by_id(relation.table_id)? else {
             continue;
         };
+        let table = table.as_ref();
         for (position, (at, column)) in table.user_columns().enumerate() {
             let sequence = super::pg_relations::sequence_for(table, at);
             let identity = sequence.map(|sequence| sequence.identity);
@@ -281,7 +285,7 @@ pub fn columns(view: &crate::catalog::View<'_>, rendering: Rendering) -> Result<
                         // A domain's `udt_name` is its base type's too, for the same reason
                         // `data_type` above is: the domain's own name lives in `domain_name`.
                         .filter(|oid| !domains.contains_key(oid))
-                        .and_then(|oid| table.enums.get(&oid))
+                        .and_then(|oid| table.hydrated()?.enums.get(&oid))
                         .map_or_else(
                             || super::pg_catalog::typname(column.ty).to_owned(),
                             |def| def.name.clone(),
@@ -334,7 +338,7 @@ pub fn columns(view: &crate::catalog::View<'_>, rendering: Rendering) -> Result<
                     column
                         .user_type
                         .filter(|oid| !domains.contains_key(oid))
-                        .and_then(|oid| table.enums.get(&oid))
+                        .and_then(|oid| table.hydrated()?.enums.get(&oid))
                         .map_or_else(
                             || PG_CATALOG_SCHEMA.to_owned(),
                             |def| super::split_qualified(&def.name).0.to_owned(),

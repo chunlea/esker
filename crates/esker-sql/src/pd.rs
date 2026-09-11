@@ -187,6 +187,45 @@ impl PdConn {
         }
     }
 
+    /// A block of cluster-unique ids, for a node that needs an identity PD agrees with.
+    ///
+    /// One is what the safepoint reporter takes at startup: PD's registry is keyed by reporter,
+    /// and two nodes sharing a key would each overwrite the other's oldest read — the one bug in
+    /// that registry that loses history rather than keeping too much (ADR 0110).
+    pub fn alloc_id(&self, count: u64) -> Result<u64, ProtoError> {
+        match self.call(&PdReq::AllocId { count })? {
+            PdResp::AllocId {
+                start,
+                count: granted,
+            } if granted == count => Ok(start),
+            PdResp::AllocId { count: granted, .. } => Err(ProtoError::invalid(format!(
+                "asked PD for {count} ids and it granted {granted}"
+            ))),
+            other => Err(ProtoError::internal(format!(
+                "PD answered {other:?} to an id request"
+            ))),
+        }
+    }
+
+    /// Reports this node's oldest open read and answers with the safepoint in force.
+    ///
+    /// **The node reports because it is the thing that can reach PD** — `esker-client` keeps the
+    /// number and has no connection of its own
+    /// ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)).
+    /// Only the minimum goes: a safepoint needs one number and the rest of the set is this
+    /// process's business.
+    pub fn safepoint(&self, reporter_id: u64, oldest_read: Option<u64>) -> Result<u64, ProtoError> {
+        match self.call(&PdReq::Safepoint {
+            reporter_id,
+            oldest_read,
+        })? {
+            PdResp::Safepoint { safepoint } => Ok(safepoint),
+            other => Err(ProtoError::internal(format!(
+                "PD answered {other:?} to a safepoint report"
+            ))),
+        }
+    }
+
     /// One call, to whichever member of the group this node believes leads it.
     ///
     /// The rules are [`esker_proto::LeaderBook`]'s and the store's placement-driver client obeys
@@ -566,6 +605,11 @@ pub struct LeaseRefresher {
     lease: Arc<PdLease>,
     /// What to read the wishes from, or `None` for a refresher that only renews.
     wishes: Option<(Arc<dyn Backend>, u64)>,
+    /// Whose open reads to report, and under what id — `None` for a refresher that reports none.
+    ///
+    /// A node that does not report holds nothing down, which is the safe direction and is what
+    /// PD's per-reporter TTL is for.
+    reads: Option<(Arc<esker_client::TxnClient>, u64)>,
 }
 
 impl LeaseRefresher {
@@ -576,6 +620,7 @@ impl LeaseRefresher {
             conn,
             lease,
             wishes: None,
+            reads: None,
         }
     }
 
@@ -585,6 +630,20 @@ impl LeaseRefresher {
     #[must_use]
     pub fn asserting_columnar_for(mut self, backend: Arc<dyn Backend>, tenant: u64) -> Self {
         self.wishes = Some((backend, tenant));
+        self
+    }
+
+    /// The same refresher, reporting `client`'s oldest open read on every round (ADR 0110).
+    ///
+    /// On the lease's cadence rather than a thread of its own: it is one PD round's worth of work
+    /// and the lease already decides when this node talks to PD.
+    #[must_use]
+    pub fn reporting_reads_from(
+        mut self,
+        client: Arc<esker_client::TxnClient>,
+        reporter_id: u64,
+    ) -> Self {
+        self.reads = Some((client, reporter_id));
         self
     }
 
@@ -647,6 +706,7 @@ impl LeaseRefresher {
             conn,
             lease,
             wishes,
+            reads,
         } = self;
         if let Some((backend, tenant)) = wishes {
             let reporter = Reporter {
@@ -669,7 +729,7 @@ impl LeaseRefresher {
                 );
             }
         }
-        renew_forever(&conn, &lease);
+        renew_forever(&conn, &lease, reads.as_ref());
     }
 }
 
@@ -678,7 +738,11 @@ impl LeaseRefresher {
 /// `sleep` until `round_start + period`, so the time a renewal itself takes comes out of the wait
 /// rather than being added to it. With the report moved off this thread the renewal is a single
 /// fast call, and this is what keeps that true if it ever stops being one.
-fn renew_forever(conn: &PdConn, lease: &PdLease) {
+fn renew_forever(
+    conn: &PdConn,
+    lease: &PdLease,
+    reads: Option<&(Arc<esker_client::TxnClient>, u64)>,
+) {
     loop {
         let round_started = Instant::now();
         match conn.schema_lease() {
@@ -696,6 +760,14 @@ fn renew_forever(conn: &PdConn, lease: &PdLease) {
                 %error,
                 "could not renew the schema lease from the placement driver"
             ),
+        }
+        // **On the same round, because it is the same conversation.** A failure is logged and
+        // dropped like the lease's: a node that could not report holds nothing down, and PD's TTL
+        // decides what that means (ADR 0110).
+        if let Some((client, reporter_id)) = reads
+            && let Err(error) = conn.safepoint(*reporter_id, client.oldest_active_read())
+        {
+            tracing::warn!(%error, "could not report this node's oldest open read");
         }
         let period = lease.refresh_period().unwrap_or(MIN_REFRESH_PERIOD);
         let due = round_started + period;

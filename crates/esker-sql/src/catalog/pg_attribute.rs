@@ -102,9 +102,13 @@ pub fn rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
             }
             continue;
         }
-        let Some(table) = relations.table(relation) else {
+        // **Hydrated, not the listing's record.** This view reports a column's default, and a
+        // `bigserial`'s default *is* its sequence — which a record does not carry (#63). Reading
+        // it off the listing answers "no default", which is a wrong answer rather than a loud one.
+        let Some(table) = view.table_by_id(relation.table_id)? else {
             continue;
         };
+        let table = table.as_ref();
         for (at, (column, position)) in columns_of(relation, table).into_iter().enumerate() {
             rows.push(attribute(relation, &column, table, position, at + 1));
         }
@@ -201,9 +205,13 @@ pub fn default_rows(
     let relations = view.relations()?;
     let mut rows = Vec::new();
     for relation in relations.of_kind(RelKind::Table) {
-        let Some(table) = relations.table(relation) else {
+        // **Hydrated, not the listing's record.** This view reports a column's default, and a
+        // `bigserial`'s default *is* its sequence — which a record does not carry (#63). Reading
+        // it off the listing answers "no default", which is a wrong answer rather than a loud one.
+        let Some(table) = view.table_by_id(relation.table_id)? else {
             continue;
         };
+        let table = table.as_ref();
         for (attnum, (position, column)) in table.user_columns().enumerate() {
             let Some(expression) = default_expression(column, table, position, rendering) else {
                 continue;
@@ -570,7 +578,7 @@ pub fn default_expression(
     // exactly this string. The ordinal is storage and a client must never be shown it (ADR 0050).
     if let Some(def) = column
         .user_type
-        .and_then(|oid| table.enums.get(&oid))
+        .and_then(|oid| table.hydrated()?.enums.get(&oid))
         .filter(|def| matches!(def.kind, super::TypeKind::Enum { .. }))
     {
         let super::TypeKind::Enum { labels } = &def.kind else {

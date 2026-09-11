@@ -75,6 +75,11 @@ fn a_write_outlives_the_store_it_was_routed_to() {
     let began = Instant::now();
     let wrote = client.put(b"after", b"2");
     let took = began.elapsed();
+    // **Printed on the way past, not only on the way down.** The assertion below is a ceiling,
+    // and a ceiling tells you nothing about the margin until the day it is crossed — so the run
+    // says how long it actually took, and a comparison between two trees is a `grep` rather than
+    // a rebuild with a stopwatch.
+    eprintln!("  WRITE-AFTER-KILL {} ms", took.as_millis());
 
     wrote.unwrap_or_else(|error| {
         panic!(

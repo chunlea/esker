@@ -177,6 +177,8 @@ pub struct TxnClient {
     /// The transactions this client is telling the store are still alive
     /// ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)).
     renewals: Arc<crate::renew::Renewals>,
+    /// The snapshots this client still has open — the safepoint's reader floor (ADR 0110).
+    active: Arc<crate::active::Active>,
     lock_ttl_ms: u64,
     max_lock_resolutions: u32,
     max_scan_regions: usize,
@@ -204,6 +206,7 @@ impl TxnClient {
         let router = Arc::new(Router::with_options(transport, resolver, options));
         Self {
             renewals: crate::renew::Renewals::new(Arc::clone(&router), Arc::clone(&oracle)),
+            active: Arc::new(crate::active::Active::default()),
             router,
             oracle,
             lock_ttl_ms: LOCK_TTL_MS,
@@ -221,6 +224,7 @@ impl TxnClient {
     pub fn on_router(router: Arc<Router>, oracle: Arc<dyn TimestampOracle>) -> Self {
         Self {
             renewals: crate::renew::Renewals::new(Arc::clone(&router), Arc::clone(&oracle)),
+            active: Arc::new(crate::active::Active::default()),
             router,
             oracle,
             lock_ttl_ms: LOCK_TTL_MS,
@@ -328,6 +332,24 @@ impl TxnClient {
         Ok(ts_at_ms(physical_ms(now).saturating_sub(ago_ms)))
     }
 
+    /// The oldest snapshot this client still has open, or `None` when it holds none.
+    ///
+    /// **The reader floor of the cluster's safepoint** ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)):
+    /// whoever holds the connection to the placement driver reports this number, and PD publishes
+    /// `min(now − retention, the minimum across reporters)`. A bare client has no such connection
+    /// and a SQL node does, which is why this answers a number rather than sending one.
+    ///
+    /// **Only the minimum leaves this process.** The rest of the set is nobody else's business,
+    /// and a safepoint needs one number.
+    ///
+    /// `None` is a fact rather than an absence — "nothing open here" — and is what lets the window
+    /// half apply. A process that has stopped reporting altogether is a different thing, and PD's
+    /// TTL is what decides it.
+    #[must_use]
+    pub fn oldest_active_read(&self) -> Option<u64> {
+        self.active.oldest()
+    }
+
     /// The garbage-collection safepoint now in force: the oldest timestamp a read can be
     /// answered at.
     ///
@@ -413,6 +435,9 @@ impl TxnClient {
             router: Arc::clone(&self.router),
             oracle: Arc::clone(&self.oracle),
             renewals: Arc::clone(&self.renewals),
+            // **Held for the life of the transaction**, so commit, rollback, abort and panic all
+            // release it through one `Drop` (ADR 0110, `crate::active`).
+            _held: self.active.hold(start_ts),
             start_ts,
             lock_ttl_ms: self.lock_ttl_ms,
             max_lock_resolutions: self.max_lock_resolutions,
@@ -458,6 +483,9 @@ enum State {
 pub struct Transaction {
     router: Arc<Router>,
     oracle: Arc<dyn TimestampOracle>,
+    /// This transaction's registration in the client's open-snapshot set. Never read — being
+    /// alive *is* what it does, and dropping it is what releases the safepoint's reader floor.
+    _held: crate::active::Held,
     /// Shared with the client: what keeps this transaction's lock alive while it is doing nothing
     /// ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)).
     renewals: Arc<crate::renew::Renewals>,

@@ -456,7 +456,14 @@ fn absorb_join(
         .iter()
         .find(|def| def.id == *inner_table_id)
         .ok_or_else(|| plain("a join whose inner table this node cannot resolve"))?;
-    if !inner.child_scans.is_empty() {
+    // An un-hydrated record cannot say whether it has children, and this decision is exactly
+    // "does it have children" — so it is refused with the rest rather than read as "no".
+    let Some(derived) = inner.hydrated() else {
+        return Err(plain(
+            "a join whose inner table reached the planner un-hydrated",
+        ));
+    };
+    if !derived.child_scans.is_empty() {
         // A scan of an inherited table returns its children's rows too, and the key plan built
         // below reads only the table's own range. Refused rather than silently reading less.
         return Err(plain("a join whose inner table has children"));

@@ -72,6 +72,18 @@ struct Reported {
     leader: u64,
 }
 
+/// What one round of talking to PD produced.
+#[derive(Debug, Default)]
+pub struct Tick {
+    /// Work PD asked for, on the region heartbeats' answers.
+    pub operators: Vec<Operator>,
+    /// The garbage-collection safepoint PD published, when it was asked this round.
+    ///
+    /// `None` is "not asked, or PD could not be reached" and never "zero": a store that cannot
+    /// reach PD keeps the safepoint it has, which keeps more history rather than less.
+    pub safepoint: Option<u64>,
+}
+
 /// The heartbeat schedule: a tick counter, and what it has already said.
 #[derive(Debug)]
 pub struct Heartbeats {
@@ -143,14 +155,28 @@ impl Heartbeats {
     /// **The operators come back rather than being acted on here.** This type decides *when* a
     /// store talks to PD; proposing a membership change is the store's business, and a schedule
     /// that also proposed would need a region map, a runtime and a Raft peer to be testable.
-    pub fn tick(&mut self, report: &StoreReport) -> Vec<Operator> {
+    pub fn tick(&mut self, report: &StoreReport) -> Tick {
         self.tick += 1;
         let mut operators = Vec::new();
+        let mut safepoint = None;
 
         if self.store_due() {
             let beat = self.store_beat(report);
             if let Err(error) = self.pd.store_heartbeat(&beat) {
                 tracing::debug!(store_id = self.store_id, %error, "a store heartbeat did not land");
+            }
+            // **A round of its own, on the same cadence** (ADR 0110). A store holds no reads, so
+            // it reports `None` and takes the answer. A failure is dropped like the heartbeat's:
+            // the store keeps the safepoint it has, which keeps more history rather than less.
+            // **Reporter zero: this is a question.** A store holds no reads of its own, and
+            // reporting "nothing open" under its own id would make every cluster's registry
+            // non-empty and let the window publish a safepoint nobody's reader floor is under
+            // (ADR 0110).
+            match self.pd.safepoint(0, None) {
+                Ok(published) => safepoint = Some(published),
+                Err(error) => {
+                    tracing::debug!(store_id = self.store_id, %error, "no safepoint this round");
+                }
             }
             self.last_store = Some(self.tick);
         }
@@ -195,7 +221,10 @@ impl Heartbeats {
         // A region this store no longer hosts must not hold a slot for ever.
         self.last_region
             .retain(|id, _| report.regions.iter().any(|region| region.region.id == *id));
-        operators
+        Tick {
+            operators,
+            safepoint,
+        }
     }
 
     fn store_due(&self) -> bool {

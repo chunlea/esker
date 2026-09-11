@@ -26,6 +26,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod active;
 pub mod clock;
 mod error;
 pub mod fragment;

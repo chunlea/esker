@@ -22,6 +22,7 @@
 //! answer *does* change per row, which is a correlated subquery and is unit 4.
 
 use crate::backend::Txn;
+use crate::catalog::Hydrated;
 use crate::error::{Result, SqlError};
 use crate::exec::cursor::{Cursor, SORT_LIMIT};
 use crate::plan::{
@@ -233,7 +234,8 @@ pub(super) fn table_function_def(
         indexes: Vec::new(),
         primary_key_name: String::new(),
         schema_version: 1,
-        sequences: Vec::new(),
+        // Synthetic: built here rather than read, and nothing is derived.
+        hydrated: Some(Hydrated::default()),
         checks: Vec::new(),
         foreign_keys: Vec::new(),
         triggers_disabled: false,
@@ -241,12 +243,10 @@ pub(super) fn table_function_def(
         children: Vec::new(),
         triggers: Vec::new(),
         excludes: Vec::new(),
-        child_scans: Vec::new(),
         partition_by: None,
         partition_bound: None,
         comment: None,
         primary_key_comment: None,
-        enums: std::collections::BTreeMap::new(),
     })
 }
 
@@ -431,7 +431,8 @@ fn plan_derived(
         // field. Left empty because it is the truth: there is no constraint here to name.
         primary_key_name: String::new(),
         schema_version: 1,
-        sequences: Vec::new(),
+        // Synthetic: built here rather than read, and nothing is derived.
+        hydrated: Some(Hydrated::default()),
         checks: Vec::new(),
         foreign_keys: Vec::new(),
         triggers_disabled: false,
@@ -439,12 +440,10 @@ fn plan_derived(
         children: Vec::new(),
         triggers: Vec::new(),
         excludes: Vec::new(),
-        child_scans: Vec::new(),
         partition_by: None,
         partition_bound: None,
         comment: None,
         primary_key_comment: None,
-        enums: std::collections::BTreeMap::new(),
     }));
     // **The working table**, whose rows are supplied a round at a time by the fixpoint above it.
     // Its `select` was planned for the *shape* only: a working table is as wide as the seed, which

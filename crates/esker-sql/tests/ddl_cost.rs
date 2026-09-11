@@ -474,6 +474,69 @@ fn a_thousand_rounds_of_history() {
     }
 }
 
+/// **#63's acceptance: listing the relations stops reading every one of their sequences.**
+///
+/// The arm below measured it: at 300 background relations the `pg_class` listing issued
+/// `'t' x301` point reads and `'q' x301` scans, one pair per relation, and the scan half is the
+/// half that buys nothing — `Relations::read` hydrates every `TableDef` it decodes, and the row it
+/// builds needs only `matview` to tell a table from a materialized view.
+///
+/// The point-read half stays, and deliberately: the name record does not say which kind a relation
+/// is, so the record has to be read to find out, and teaching the name record its kind is an
+/// on-disk format change. **So the bound here is on the `'q'` scans alone** — the other half is a
+/// different unit and would need an ADR.
+///
+/// The denominator underneath is not decoration: with either instrument switched off every count
+/// is zero, and zero is under any ceiling.
+#[test]
+fn listing_the_relations_does_not_scan_every_sequence() {
+    const BACKGROUND: usize = 150;
+    /// Fixed scans the listing makes whatever the catalog's size — it read one `'q'` before any of
+    /// this and may still; what it may not do is read one *per relation*.
+    const CEILING: u64 = 8;
+
+    esker_sql::stmt_stats::trace_every_read();
+    esker_client::stmt_stats::force_on();
+    let cluster = Cluster::start();
+    let mut s = cluster.session();
+    for at in 0..BACKGROUND {
+        s.run(&format!(
+            "CREATE TABLE bg{at} (id bigserial primary key, a bigint, b text)"
+        ))
+        .unwrap();
+    }
+
+    esker_client::stmt_stats::reset();
+    s.run(
+        "SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = ANY (current_schemas(false)) AND c.relkind IN ('r','v','m','p','f')",
+    )
+    .unwrap();
+    let cost = esker_client::stmt_stats::taken();
+    let named = esker_sql::stmt_stats::name_heads(&cost.scan_heads);
+    let sequence_scans: u64 = named
+        .iter()
+        .filter(|(name, _)| name.contains('q'))
+        .map(|(_, n)| n)
+        .sum();
+    let total: u64 = named.iter().map(|(_, n)| n).sum();
+
+    assert!(
+        total > 0,
+        "the scan counters are off, so the bound below would pass against any implementation"
+    );
+    assert!(
+        sequence_scans <= CEILING,
+        "listing {BACKGROUND} relations scanned sequences {sequence_scans} times — one per \
+         relation, which is the hydration the listing never looks at.\n  scans: {}",
+        named
+            .iter()
+            .map(|(name, n)| format!("{name} x{n}"))
+            .collect::<Vec<String>>()
+            .join(", "),
+    );
+}
+
 /// **#63 — the three catalog-walking shapes, by kind, against a catalog that grows.**
 ///
 /// r1 priced them in run 127 attempt 3: `DROP EXTENSION … CASCADE` **17.0 s** a statement over 563
@@ -525,6 +588,15 @@ fn what_the_catalog_walkers_read() {
     s.run("CREATE EXTENSION IF NOT EXISTS citext").unwrap();
     s.run("CREATE TABLE holder (id bigserial primary key, tag citext)")
         .unwrap();
+    // **A parent with children**, because `child_scans` costs a point read per child and the
+    // plain background tables have none — so without this the third of the three derived things
+    // is invisible to every arm (#63).
+    s.run("CREATE TABLE parent (id bigserial primary key, a bigint)")
+        .unwrap();
+    for at in 0..5 {
+        s.run(&format!("CREATE TABLE kid{at} () INHERITS (parent)"))
+            .unwrap();
+    }
 
     println!("\n  BACKGROUND={background} relations in the catalog");
     println!(

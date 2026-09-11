@@ -414,6 +414,10 @@ Pd options:
                             member at ADDR for the group's id and members. Run
                             `pd members add` against the group first
       --listen HOST:PORT    Address to serve on, for serve (default 127.0.0.1:2379)
+      --retention-ms MS     How far behind the present the garbage-collection safepoint
+                            may go on the retention window alone (default one hour). The
+                            other half of the safepoint is the oldest read the cluster's
+                            nodes report, and no window lets it step over one
       --pd HOST:PORT        The placement driver to ask, for status and members
                             (default 127.0.0.1:2379)
 
@@ -1187,6 +1191,13 @@ fn parse_pd(arguments: &[String]) -> Result<Command, ParseError> {
             }
             "--join" => {
                 serve.join = take_value(arguments, &mut index, inline, "--join")?;
+            }
+            "--retention-ms" => {
+                let value = take_value(arguments, &mut index, inline, "--retention-ms")?;
+                serve.retention_ms = Some(value.parse().map_err(|_| ParseError::InvalidValue {
+                    flag: "--retention-ms",
+                    value: value.clone(),
+                })?);
             }
             "--pd" => {
                 let value = take_value(arguments, &mut index, inline, "--pd")?;

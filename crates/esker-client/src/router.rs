@@ -241,6 +241,11 @@ impl Router {
         // forget it, ask a follower, be told the dead leader leads, believe it. Six of nine
         // attempts went that way in the test that found it.
         let mut unreachable: Option<u64> = None;
+        // **Every store this call has failed to dial**, so the rota stops offering them. One
+        // corpse in a group of three used to come round every third attempt, and each visit cost
+        // a connection refused plus a backoff — time spent on a peer this call had already
+        // watched fail, while the election it is really waiting for ran on the others.
+        let mut corpses: Vec<u64> = Vec::new();
         let mut peers: Vec<esker_proto::Peer> = Vec::new();
         loop {
             if self.clock.now() >= deadline {
@@ -260,7 +265,7 @@ impl Router {
                     // **By attempt**, so a call whose leader is unknown asks the peers in turn
                     // rather than the same one every time — see `Route::target_at`.
                     let target = route
-                        .target_at(attempts - 1)
+                        .target_at_skipping(attempts - 1, &corpses)
                         .ok_or_else(|| Error::NoRegion {
                             key: Bytes::copy_from_slice(body.routing_key()),
                         })?;
@@ -286,6 +291,9 @@ impl Router {
                             sent_epoch = Some(route.region.epoch);
                             if esker_proto::is_unreachable(&error) {
                                 unreachable = Some(target.store_id);
+                                if !corpses.contains(&target.store_id) {
+                                    corpses.push(target.store_id);
+                                }
                                 peers.clone_from(&route.region.peers);
                             }
                             error

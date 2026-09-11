@@ -308,6 +308,10 @@ impl PdClient for RemotePd {
         })
     }
 
+    fn safepoint(&self, reporter_id: u64, oldest_read: Option<u64>) -> Result<u64, ProtoError> {
+        self.ask(move |channel| async move { channel.safepoint(reporter_id, oldest_read).await })
+    }
+
     fn region_heartbeat(
         &self,
         beat: &RegionHeartbeat,
