@@ -314,7 +314,17 @@ impl Router {
             // region went is not one.** Reset rather than decremented: a call that keeps being
             // given fresher routing keeps its full budget for the moment it stops being given
             // any, and the call deadline above is what bounds it either way.
-            if self.learned_a_newer_epoch(body.routing_key(), sent_epoch) {
+            //
+            // **A store that cannot be dialled is the same rule, one error class over.** The
+            // bytes never left, so a `NotSent` carries no epoch and the test above never reaches
+            // it — and yet it is the case with the least to be gained from giving up early: a
+            // leader that has just been killed is being replaced, the replacement takes an
+            // election, and nine dials at the corpse take under two seconds where an election
+            // under load takes longer. The call has ten. So waiting is not failing here either,
+            // and the deadline is what says when the waiting has to stop — which is exactly what
+            // a caller can act on, where "gave up after 9 attempts" was not.
+            let dialling_a_corpse = matches!(error, ProtoError::NotSent { .. });
+            if dialling_a_corpse || self.learned_a_newer_epoch(body.routing_key(), sent_epoch) {
                 fruitless = 0;
             } else {
                 fruitless += 1;

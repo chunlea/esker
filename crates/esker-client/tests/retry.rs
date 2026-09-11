@@ -379,6 +379,84 @@ fn a_moving_epoch_burns_the_budget_with_most_of_the_deadline_unspent() {
     );
 }
 
+/// **The same finding, one error class over**: a leader that has been killed burns the attempt
+/// budget while the deadline sits almost untouched.
+///
+/// `a_moving_epoch_burns_the_budget_with_most_of_the_deadline_unspent` above fixed this for
+/// `EpochNotMatch` by not counting a refusal that taught the client something. A `NotSent` teaches
+/// no epoch, so it never qualified — and a killed leader is exactly the case where there is
+/// nothing to learn and nothing to do but wait for an election that the client has seconds of
+/// deadline to wait through. What it does instead is spend nine attempts in under two seconds:
+///
+/// ```text
+/// the read was refused after 1.721498622s: gave up after 9 attempts: request not sent:
+/// reconnecting to store 3 at 127.0.0.1:38379: Connection refused (os error 111)
+/// ```
+///
+/// That is a real gate failure, from `esker-client::leader_kill_retry` — a test that kills the
+/// leader and asks for a read that should survive it. Under a loaded box the election takes longer
+/// than the attempt budget lasts, and the caller is told the cluster is unhealthy while its own
+/// call had eight seconds left.
+#[test]
+fn a_leader_that_cannot_be_dialled_burns_the_budget_with_the_deadline_unspent() {
+    let harness = harness();
+    // Ten refusals to dial — more than the attempt budget of nine calls, far less than the
+    // ten-second deadline can pay for — and then the election finishes and the read answers.
+    for _ in 0..10 {
+        harness.transport.script(Rule::new(
+            Matcher::Any,
+            Outcome::Fail(ProtoError::not_sent(
+                "reconnecting to store 3 at 127.0.0.1:38379: Connection refused (os error 111)",
+            )),
+        ));
+    }
+    harness
+        .transport
+        .script(always(Outcome::Reply(RawKvResp::Get { value: None })));
+
+    let answer = harness.client.get(b"k");
+    let spent = harness.clock.elapsed();
+    let deadline = Duration::from_millis(esker_client::retry::CALL_TIMEOUT_MS);
+
+    assert_eq!(
+        answer,
+        Ok(None),
+        "gave up after spending {spent:?} of a {deadline:?} deadline, with {} calls made",
+        harness.transport.call_count(),
+    );
+    assert!(
+        spent < deadline,
+        "this call ran out of time rather than out of attempts, which is a different bug"
+    );
+}
+
+/// **And the counterfactual**: a cluster that is wholly gone still ends, at the deadline, saying
+/// which budget it ran out of.
+///
+/// This is the half that makes the rule above safe to want. "Waiting is not failing" is only
+/// tolerable while something else is counting, and the answer a caller gets has to be true: it ran
+/// out of *time*, which is actionable, rather than out of attempts, which was not.
+#[test]
+fn a_cluster_that_never_comes_back_ends_at_the_deadline_and_says_so() {
+    let harness = harness();
+    harness
+        .transport
+        .script(always(Outcome::Fail(ProtoError::not_sent(
+            "reconnecting to store 3 at 127.0.0.1:38379: Connection refused (os error 111)",
+        ))));
+
+    let error = harness.client.get(b"k").expect_err("it cannot succeed");
+    assert!(
+        matches!(error, Error::DeadlineExceeded { .. }),
+        "a cluster nobody can dial should run out of time, not out of attempts: {error}"
+    );
+    assert!(
+        harness.clock.elapsed() >= Duration::from_millis(esker_client::retry::CALL_TIMEOUT_MS) / 2,
+        "it gave up after only {:?}",
+        harness.clock.elapsed()
+    );
+}
+
 /// And a region whose epoch never stops moving is stopped by the **deadline**, not by running for
 /// ever.
 ///
