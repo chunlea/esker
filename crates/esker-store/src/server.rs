@@ -3624,9 +3624,9 @@ fn register_with_the_driver(
         address: options.address.to_owned(),
     };
     let began = std::time::Instant::now();
-    // Set by the first `PdNotLeader`, and the whole of what separates "a group is electing" from
-    // "there is nothing there".
-    let mut electing = false;
+    // Set by the first `PdNotLeader`. It no longer decides anything — see below — and survives
+    // only to sharpen the message if the budget runs out.
+    let mut spoke = false;
     let mut said = false;
     loop {
         let refusal = match pd.bootstrap(&info) {
@@ -3634,27 +3634,43 @@ fn register_with_the_driver(
             Err(error) => error,
         };
         let mid_election = matches!(refusal, ProtoError::PdNotLeader { .. });
-        electing |= mid_election;
-        let worth_waiting_on = mid_election || (electing && esker_proto::is_unreachable(&refusal));
-        if !worth_waiting_on {
-            // Returned exactly as it arrived: this is the path an operator with a mistyped
-            // `--pd` takes, and the socket's own words are what tells them so.
+        spoke |= mid_election;
+        // **Both refusals are waited on, and the same budget covers them.** A member that will not
+        // say who leads is an election; a member that cannot be dialled at all is, inside this
+        // window, most likely a placement driver whose process is up and whose port is not
+        // listening yet. Those are the same situation from a store's point of view, and neither
+        // carries evidence that tells them apart from a mistyped `--pd`.
+        //
+        // This rule was narrower and the difference cost two gates: it waited on an unreachable
+        // member only after some *other* member had answered, on the reasoning that
+        // `esker cluster start` orders the driver before the stores so a refused connection must
+        // be a wrong address. It is also what a store sees when it wins a race against a port —
+        // and a race is decided by the machine's load, so the narrow rule failed only under it.
+        if !(mid_election || esker_proto::is_unreachable(&refusal)) {
+            // Returned exactly as it arrived: this is a refusal that is neither, and the store's
+            // own words are what tells an operator so.
             return Err(StoreError::from(refusal));
         }
         if began.elapsed() >= options.pd_leader_wait {
-            // The bound, and it says it *is* one — a bare "placement driver is not the leader"
-            // after half a minute of waiting reads like the refusal came back instantly.
-            return Err(StoreError::Bootstrap(format!(
-                "no placement driver led the group within {:?}: {refusal}",
-                began.elapsed()
-            )));
+            // The bound, and it says it *is* one — a bare refusal after half a minute of waiting
+            // reads like it came back instantly. The two endings are different diagnoses: a group
+            // that never elected is up and undecided, and one that never answered may not be
+            // there at all. The refusal names the endpoint it last tried, which is what an
+            // operator with a mistyped `--pd` needs and what they now wait thirty seconds for.
+            let waited = began.elapsed();
+            return Err(StoreError::Bootstrap(if spoke {
+                format!("no placement driver led the group within {waited:?}: {refusal}")
+            } else {
+                format!("no placement driver answered within {waited:?}: {refusal}")
+            }));
         }
         if !said {
             said = true;
             tracing::info!(
                 store_id = options.store_id,
                 wait_ms = options.pd_leader_wait.as_millis(),
-                "waiting for a placement driver to lead before registering"
+                answered = spoke,
+                "waiting for a placement driver before registering"
             );
         }
         std::thread::sleep(PD_LEADER_POLL);

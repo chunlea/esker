@@ -157,6 +157,9 @@ fn a_fourth_driver_joins_three_real_processes_and_then_leaves() {
 
 /// One store and [`DRIVERS`] placement drivers, every one of them listening before this returns.
 fn start_the_cluster(data_dir: &std::path::Path, store_port: u16) -> Supervisor {
+    let log = data_dir.join("cluster.log");
+    let out = std::fs::File::create(&log).expect("the cluster log");
+    let errors = out.try_clone().expect("the cluster log");
     let mut cluster = Supervisor(
         Command::new(esker_cli())
             .args([
@@ -169,26 +172,24 @@ fn start_the_cluster(data_dir: &std::path::Path, store_port: u16) -> Supervisor 
             .arg(data_dir)
             .args(["--base-port", &store_port.to_string(), "--pd"])
             .args(["--pd-nodes", &DRIVERS.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // **Kept, not discarded.** When a store exits during startup the supervisor can only
+            // report `exit status: 1`, and the reason is a line the store itself printed. #59 was
+            // readable at a glance because `cluster_pd_group.rs` kept this; the two tests that
+            // discarded it cost a night of guessing at the same failure.
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(errors))
             .spawn()
             .expect("the cluster starts"),
     );
-    let nothing = || String::new();
-    wait_for_port(
-        "the store",
-        store_port,
-        &mut cluster,
-        STARTUP_SECONDS,
-        nothing,
-    );
+    let said = || std::fs::read_to_string(&log).unwrap_or_default();
+    wait_for_port("the store", store_port, &mut cluster, STARTUP_SECONDS, said);
     for at in 0..DRIVERS {
         wait_for_port(
             &format!("placement driver {}", at + 1),
             store_port + NODES + at,
             &mut cluster,
             STARTUP_SECONDS,
-            nothing,
+            said,
         );
     }
     cluster
@@ -334,7 +335,7 @@ fn wait_for_port(
         }
         if let Some(status) = child.0.try_wait().expect("waiting on the child") {
             panic!(
-                "{what} exited with {status} instead of listening on {port}{}",
+                "{what} exited with {status} instead of listening on {port}. What it said:\n{}",
                 said()
             );
         }

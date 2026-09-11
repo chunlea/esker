@@ -54,6 +54,9 @@ fn the_load_arm_keeps_writing_when_the_leading_driver_is_killed() {
     let driver_ports: Vec<u16> = (0..DRIVERS).map(|at| base + NODES + at).collect();
     warm();
 
+    let log = data_dir.path().join("cluster.log");
+    let out = std::fs::File::create(&log).expect("the cluster log");
+    let errors = out.try_clone().expect("the cluster log");
     let mut cluster = Supervisor(
         Command::new(esker_cli())
             .args([
@@ -68,18 +71,20 @@ fn the_load_arm_keeps_writing_when_the_leading_driver_is_killed() {
             .args(["--pd-nodes", &DRIVERS.to_string()])
             // The kill has to stay killed, or this passes on a cluster with no group at all.
             .arg("--no-respawn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(errors))
             .spawn()
             .expect("the cluster starts"),
     );
-    wait_for_port("the store", store_port, &mut cluster, STARTUP_SECONDS);
+    let said = || std::fs::read_to_string(&log).unwrap_or_default();
+    wait_for_port("the store", store_port, &mut cluster, STARTUP_SECONDS, said);
     for (at, port) in driver_ports.iter().enumerate() {
         wait_for_port(
             &format!("placement driver {}", at + 1),
             *port,
             &mut cluster,
             STARTUP_SECONDS,
+            said,
         );
     }
     let endpoints: Vec<String> = driver_ports
@@ -223,18 +228,35 @@ fn free_ports(span: u16) -> u16 {
     panic!("no run of {span} consecutive free ports in 33,100–34,000, this file's own band");
 }
 
-fn wait_for_port(what: &str, port: u16, child: &mut Supervisor, seconds: u64) {
+/// Waits for `port`, and says what the child said if it dies instead.
+///
+/// **The `said` argument is the point.** When a store exits during startup the supervisor can only
+/// report `exit status: 1`; the reason is a line the store itself printed, and this test used to
+/// discard it. #59 was readable at a glance because `cluster_pd_group.rs` kept its children's
+/// output, and the two tests that did not — this one and `cluster_pd_member_change` — cost a night
+/// of guessing at the same failure.
+fn wait_for_port(
+    what: &str,
+    port: u16,
+    child: &mut Supervisor,
+    seconds: u64,
+    said: impl Fn() -> String,
+) {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return;
         }
         if let Some(status) = child.0.try_wait().expect("waiting on the child") {
-            panic!("{what} exited with {status} instead of listening on {port}");
+            panic!(
+                "{what} exited with {status} instead of listening on {port}. What it said:\n{}",
+                said()
+            );
         }
         assert!(
             Instant::now() < deadline,
-            "{what} did not listen on {port} within {seconds}s"
+            "{what} did not listen on {port} within {seconds}s. What it said:\n{}",
+            said()
         );
         std::thread::sleep(Duration::from_millis(100));
     }

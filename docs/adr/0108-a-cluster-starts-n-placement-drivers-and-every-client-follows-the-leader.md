@@ -203,6 +203,22 @@ one, both of which `--pd-nodes 3` produces by construction.
   wrong for *waiting for the first one*. Raising it would make every later redirect on every client
   slower to give up.
 
-  It waits on `PdNotLeader`, and on an unreachable member **only once some member has said an
-  election is running** — before that, a driver that cannot be dialled is the fast, clear failure
-  `esker cluster start`'s ordering already depends on.
+  It waits on `PdNotLeader` **and on a member it cannot dial**, under the one budget. The rule was
+  narrower for a day — an unreachable member was waited on only once some *other* member had
+  answered, on the reasoning that `esker cluster start` orders the driver before the stores, so a
+  refused connection had to be a mistyped `--pd`.
+
+  **That reading was one of two, and the wrong one cost two gates.** A refused connection is also
+  what a store sees when a driver's process is up and its port is not listening yet — ordinary
+  startup timing. The two share a wire error and nothing inside the startup window separates them,
+  so the narrow rule silently took the wrong reading whenever the store won the race, and which way
+  a race goes is decided by the machine's load. On 2026-09-11 two of three gates failed with
+  `the store exited with exit status: 1`, at 2.4 s, on tests green on every gate before.
+
+  **The cost is stated rather than hidden**: a genuinely wrong `--pd` now fails after the budget
+  instead of in a second. The message names the endpoint it last tried, and distinguishes *"no
+  placement driver answered"* from *"none led the group"* — a group that never elected is up and
+  undecided; one that never answered may not be there at all.
+
+  `ProtoError::internal` is still not waited on: `is_unreachable` is `NotSent` alone, the one
+  failure that provably never left the process.

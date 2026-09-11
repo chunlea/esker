@@ -18,18 +18,23 @@
 //! the bug: a start-order race that only a loaded machine loses, so the fix has to be a rule and
 //! not a longer sleep somewhere.
 //!
-//! # Why this is three tests and not one
+//! # The rule was narrower, and the narrow version cost two gates
 //!
-//! The rule has a **boundary**, and a rule tested only from the inside is a rule nothing holds in
-//! place. Waiting is right for a refusal an election explains; it is wrong for a placement driver
-//! that is simply not there, because `esker cluster start` already orders the driver before the
-//! stores on purpose (`cluster/mod.rs`: *"A store whose PD is not up yet fails to open, which is
-//! the behaviour that makes a cluster's start order matter here and nowhere else"*), and a
-//! mistyped `--pd` should say so in a second rather than in half a minute.
+//! It waited on an unreachable member only **after** some other member had answered, on the
+//! reasoning that `esker cluster start` orders the driver before the stores on purpose — so a
+//! refused connection had to be a mistyped `--pd` and should fail in a second rather than in half
+//! a minute.
 //!
-//! So the three tests are: the refusal that is waited out, the one that is not, and the **mixed**
-//! sequence a store meets when it is started before the rest of the group — where a member that is
-//! down is only worth waiting on once some other member has said an election is running.
+//! A refused connection is also what a store sees when a placement driver's **process is up and
+//! its port is not listening yet**. The two share a wire error and nothing inside the startup
+//! window tells them apart, so the narrow rule silently took the wrong reading whenever the store
+//! won the race — which is decided by the machine's load, so it failed only under load. Two of
+//! three gates on 2026-09-11 went red on `cluster_pd_member_change` and `durability_pd_failover`
+//! with `the store exited with exit status: 1`, at 2.4 s, on an otherwise quiet machine.
+//!
+//! **So both refusals are waited on, under one budget.** The cost is real and is stated rather than
+//! hidden: a genuinely wrong `--pd` now fails after the budget instead of in a second, and the
+//! message it fails with names the endpoint it last tried.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -166,28 +171,47 @@ async fn a_store_waits_out_a_placement_driver_election() {
     store.stop();
 }
 
-/// **The boundary.** A placement driver that was never dialled is not an election, and the open
-/// fails on the first refusal rather than spending the election budget on a mistyped address.
+/// **The window this file is named for**: a driver whose port is not up yet, and the store waits
+/// rather than exiting.
 ///
-/// Asserted by the **attempt count**, not by a stopwatch: `calls == 1` says no retry happened at
-/// all, where an elapsed-time bound would pass just as well on a machine that was merely fast.
+/// This is the case the narrow rule got wrong. Nothing has answered, so there is no evidence a
+/// group exists — and the store waits anyway, because inside the startup budget "the port is not
+/// listening yet" and "the address is wrong" are the same bytes.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_store_does_not_wait_for_a_driver_that_was_never_there() {
+async fn a_store_waits_for_a_driver_whose_port_is_not_up_yet() {
     let pd = Electing::answering(vec![not_dialled(), not_dialled(), not_dialled()]);
-    let began = Instant::now();
-    let error = open_against(&pd, ENOUGH).unwrap_err();
+    let store = open_against(&pd, ENOUGH).expect("a store opens against a driver that is starting");
     assert_eq!(
         pd.calls(),
-        1,
-        "an undialled driver is not waited on: {error}"
+        4,
+        "three refused dials waited out, then the answer"
+    );
+    store.stop();
+}
+
+/// **The cost of that, stated rather than hidden.** A driver that is genuinely not there fails the
+/// open — after the budget, not in a second, and with the endpoint it last tried in the message.
+///
+/// The wording matters and is asserted: *answered* is a different diagnosis from *led the group*.
+/// A group that never elected is up and undecided; one that never answered may not be there at all,
+/// and an operator reading the second needs the address, which is why the refusal is carried
+/// through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_driver_that_never_answers_fails_after_the_budget_and_names_it() {
+    let pd = Electing::always(not_dialled);
+    let began = Instant::now();
+    let error = open_against(&pd, Duration::from_millis(600)).unwrap_err();
+    assert!(
+        error.to_string().contains("no placement driver answered"),
+        "a driver that never spoke is not an election that never ended: {error}"
     );
     assert!(
-        error.to_string().contains("Connection refused"),
-        "the refusal a store exits on must still name itself: {error}"
+        error.to_string().contains("127.0.0.1:31102"),
+        "the endpoint it could not reach has to be in the message: {error}"
     );
     assert!(
-        began.elapsed() < ENOUGH,
-        "it failed, but only after waiting: {:?}",
+        began.elapsed() >= Duration::from_millis(600),
+        "it gave up before its own budget: {:?}",
         began.elapsed()
     );
 }
@@ -195,12 +219,12 @@ async fn a_store_does_not_wait_for_a_driver_that_was_never_there() {
 /// **The mixed sequence**, which is what a store started before the rest of its group actually
 /// meets: one member up and leaderless, the other two not yet listening.
 ///
-/// Once *any* member has said an election is running, a member that cannot be dialled is one more
-/// member to wait on rather than a reason to give up — the group provably exists. This is the
-/// second construction the brief named ("store 先于第二个成员起"), and without it the fix is
-/// decided by which endpoint the rotation happened to land on last.
+/// It matters that the two refusals **interleave**. The rotation visits endpoints in turn, so which
+/// one a given attempt lands on is not something the store chooses — and a rule that treated the
+/// two differently would make the outcome depend on the order they happened to arrive in. Here they
+/// alternate, and the store comes up regardless.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_member_that_is_down_is_waited_out_once_the_group_is_known_to_be_electing() {
+async fn a_store_comes_up_whichever_refusal_the_rotation_lands_on() {
     let pd = Electing::answering(vec![electing(), not_dialled(), not_dialled(), electing()]);
     let store =
         open_against(&pd, ENOUGH).expect("a store opens while its group is still assembling");
