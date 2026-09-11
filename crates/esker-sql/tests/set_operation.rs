@@ -486,10 +486,10 @@ fn greatest_takes_the_common_type_and_not_the_wider_one() {
 ///   client that prepares one is told its columns and refused at `Execute` instead of at
 ///   `Describe`.
 ///
-/// `#[ignore]`d rather than deleted: this is the acceptance for the fix, and the fix is a lane
-/// decision rather than this unit's — see `esker-coord/b4-wire-v3-families.md` F11.
+/// **Fixed** by dispatching on `set_arms` where `described_in` called `query::plan` — one call,
+/// after the parameters are typed and the views expanded, which is the order that function
+/// documents at length.
 #[test]
-#[ignore = "F11: Describe reports the first arm's type; the diagnosis is in this header"]
 fn a_prepared_set_operation_describes_the_common_type() {
     let mut node = parity::Node::new(FIXTURE);
     // Every pair r1's gate measured, with 19beta1's answer beside it.
@@ -513,15 +513,72 @@ fn a_prepared_set_operation_describes_the_common_type() {
         ("bpchar", "name", 19),
     ] {
         let sql = format!("SELECT '1'::{left} AS v UNION SELECT '1'::{right}");
-        let fields = node.describe(&sql).unwrap().fields.unwrap();
-        assert_eq!(fields[0].type_oid, expected, "Describe of {sql}");
+        assert_eq!(described(&mut node, &sql).0, expected, "Describe of {sql}");
     }
-    // And the typmod, which the wire gate does not record: neither arm's width survives.
+}
+
+/// **The typmod is the set's too, and the wire gate cannot see it** — it records the
+/// `RowDescription`'s type oid and nothing else, so this shape had to be asked for rather than
+/// found.
+///
+/// A `varchar(3)` beside a `varchar(5)` is a `varchar` with no length on a real server; the
+/// `Describe` path was answering the head arm's `7` (3 + `VARHDRSZ`). Same dispatch, because
+/// `query::append` is where a typmod survives only when both arms agree on it.
+#[test]
+fn a_prepared_set_operation_describes_the_common_typmod() {
+    let mut node = parity::Node::new(FIXTURE);
     let widths = "SELECT '1'::varchar(3) AS v UNION SELECT '1'::varchar(5)";
-    let fields = node.describe(widths).unwrap().fields.unwrap();
     assert_eq!(
-        (fields[0].type_oid, fields[0].type_modifier),
+        described(&mut node, widths),
         (1043, -1),
         "a varchar(3) beside a varchar(5) is a varchar with no length"
     );
+    // **Both arms agreeing keeps it**, which is what says the rule is agreement and not "drop it".
+    assert_eq!(
+        described(
+            &mut node,
+            "SELECT '1'::varchar(3) AS v UNION SELECT '2'::varchar(3)"
+        ),
+        (1043, 7)
+    );
+    // And the simple path, which was right all along — the two answers now match.
+    let esker_sql::pgwire::session::Outcome::Rows { fields, .. } = node.run(widths).unwrap() else {
+        panic!("{widths} returned no rows")
+    };
+    assert_eq!((fields[0].type_oid, fields[0].type_modifier), (1043, -1));
+}
+
+/// **A set operation this node does not have is refused at `Describe`, not after it.**
+///
+/// `INTERSECT` and `EXCEPT` are `0A000` here (`set_arm_supported`), and the `Describe` path never
+/// reached that check: it planned the head arm and answered a shape, so a client that prepares one
+/// was told its columns and then refused at `Execute`. The protocol's own order is that a
+/// statement which cannot run does not describe.
+#[test]
+fn a_prepared_intersect_is_refused_before_it_is_described() {
+    let mut node = parity::Node::new(FIXTURE);
+    for sql in [
+        "SELECT i FROM so INTERSECT SELECT i FROM so",
+        "SELECT i FROM so EXCEPT SELECT i FROM so",
+    ] {
+        let described = node.describe(sql).expect_err("describe answered a shape");
+        assert_eq!(
+            described.sqlstate(),
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{sql}"
+        );
+        // The same refusal the simple path gives, which is the point: one answer per statement.
+        let executed = node.run(sql).expect_err("execute answered rows");
+        assert_eq!(described.to_string(), executed.to_string(), "{sql}");
+    }
+}
+
+/// The `Describe`'s first field, as `(type_oid, type_modifier)`.
+fn described(node: &mut parity::Node, sql: &str) -> (u32, i32) {
+    let fields = node
+        .describe(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error}"))
+        .fields
+        .unwrap_or_else(|| panic!("{sql} described no fields"));
+    (fields[0].type_oid, fields[0].type_modifier)
 }
