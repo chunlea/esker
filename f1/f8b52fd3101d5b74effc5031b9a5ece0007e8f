@@ -1,0 +1,29 @@
+crates/esker-cli/tests/cluster_pd_member_change.rs
+  s_b249f065cef854::t_86efe98a89c280 160-162,175-180,184-185,192,338
+crates/esker-cli/tests/durability_pd_failover.rs
+  s_b249f065cef854::t_31b3cd703d3c26 57-59,74-75,79-80,87,231-244,251-254,258-259
+crates/esker-cli/tests/store_starts_before_its_driver.rs
+  s_b249f065cef854::t_0abc992b48cc0a 1-161
+crates/esker-store/src/server.rs
+  s_b249f065cef854::t_05aa49a165b058 3627-3629,3637-3651,3655-3665,3672-3673
+crates/esker-store/tests/store_open_waits_for_a_pd_leader.rs
+  s_b249f065cef854::t_8f14a19825d60a 21,23-26,28-37,174-175,177-179,181,183,186-206,209-210,213-214,222-225,227
+docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md
+  s_b249f065cef854::t_98e961a1fa3e50 206-224
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f1f8b52fd3101d5b74effc5031b9a5ece0007e8f",
+  "prompts": {},
+  "sessions": {
+    "s_b249f065cef854": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7c1a94ab-56c5-4769-8981-7863defc92e8",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
