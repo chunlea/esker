@@ -130,10 +130,15 @@ fn the_forward_cast_prints_the_name_a_real_server_prints() {
 /// itself was walking the whole store, which `95dbd77` fixed; this is the multiplier that sat on
 /// top of it.
 ///
-/// **Asserted as a ratio against a control**, the way `a_scan_costs_its_range_and_not_the_store`
-/// is: eight literals against one, over the same catalog. One read serves all eight, so the two
-/// statements cost the same; one read per literal makes the second eight times the first. Comparing
-/// them is what makes this a statement about the shape of the work rather than about this machine.
+/// **Asserted as a read count**, which is the property itself rather than its shadow: eight
+/// literals against one, over the same catalog, and the instrument counts the keys each statement
+/// reads (`stmt_stats`). One read serves all eight, so the two counts are the same; one read per
+/// literal makes the second eight times the first.
+///
+/// It was a ratio over the **wall clock** — `eight < one * 4 + 200ms` — until 2026-09-11, when the
+/// sibling assertion in `catalog_read_slope.rs` went red on a gate whose own diff did not touch
+/// this crate, at 3.1× under a load of 8 to 11 (#59). A gate cannot carry a wall-clock assertion,
+/// and here it never had to: the thing being counted was always a count. The timings are printed.
 #[test]
 fn one_catalog_read_serves_every_regclass_in_a_statement() {
     let mut node = parity::Node::new(&[]);
@@ -142,22 +147,48 @@ fn one_catalog_read_serves_every_regclass_in_a_statement() {
             .unwrap();
     }
 
-    let elapsed = |node: &mut parity::Node, sql: &str| {
+    // **Turned on here rather than by the environment**, because a test that needs a variable set
+    // is one the gate never runs (`stmt_stats::trace_every_read`, the idiom `catalog_read_slope`
+    // established).
+    esker_sql::stmt_stats::trace_every_read();
+    assert!(
+        esker_sql::stmt_stats::tracing_reads(),
+        "this test reads the instrument's trace and could not turn it on"
+    );
+    // **The second run of each**, because the first statement in a session pays for the catalog
+    // itself — 409 keys over these two hundred relations — and that load is not what this test is
+    // about. What it is about is the *per-literal* multiplier, which is on every run.
+    let measure = |node: &mut parity::Node, sql: &str| {
+        esker_sql::stmt_stats::clear_trace();
+        node.run(sql).unwrap();
+        let cold = esker_sql::stmt_stats::last_trace().len();
         let start = std::time::Instant::now();
-        for _ in 0..20 {
-            node.run(sql).unwrap();
-        }
-        start.elapsed()
+        esker_sql::stmt_stats::clear_trace();
+        node.run(sql).unwrap();
+        let reads = esker_sql::stmt_stats::last_trace().len();
+        (cold, reads, start.elapsed())
     };
-    let one = elapsed(&mut node, "SELECT 'rc0'::regclass");
-    let eight = elapsed(
+    let (cold, one, one_took) = measure(&mut node, "SELECT 'rc0'::regclass");
+    let (_, eight, eight_took) = measure(
         &mut node,
         "SELECT 'rc0'::regclass, 'rc1'::regclass, 'rc2'::regclass, 'rc3'::regclass, \
          'rc4'::regclass, 'rc5'::regclass, 'rc6'::regclass, 'rc7'::regclass",
     );
+    println!(
+        "one literal: {cold} reads cold, {one} warm in {one_took:?}; eight: {eight} warm in \
+         {eight_took:?}"
+    );
+    // **The instrument answers to catalog work**, which is what says the warm four are a fact
+    // about the statement rather than a trace nobody filled: the very first statement in the
+    // session loads these two hundred relations and the counter sees every key of it.
     assert!(
-        eight < one * 4 + std::time::Duration::from_millis(200),
-        "eight `::regclass` casts took {eight:?} where one took {one:?}: the catalog is being \
+        cold > one,
+        "the first statement read {cold} keys and the second {one}: the counter is not seeing the \
+         catalog load, so the numbers below say nothing"
+    );
+    assert_eq!(
+        eight, one,
+        "eight `::regclass` casts read {eight} keys where one read {one}: the catalog is being \
          read once per literal rather than once per statement"
     );
 }

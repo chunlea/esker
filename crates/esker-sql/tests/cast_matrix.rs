@@ -465,3 +465,152 @@ fn an_element_cast_knows_what_the_element_was() {
         vec![vec!["42", "{42}"]]
     );
 }
+
+/// **A `line` converts to nothing, and the refusal has to come before the parse** — wire v3 family
+/// F12, and the six rows the two-mode sweep found.
+///
+/// `'{1,-1,0}'::line::box` was `22P02 invalid input syntax for type line: "{1,-1,0}"` — a
+/// complaint about the **value**, for a pair that has no cast and whose value is the type's own
+/// canonical text. `value::geometric::to_point` and `convert` both open by reading the source's
+/// coordinates and only then reach the arm that says a `line` has no conversion; a line's
+/// `{A,B,C}` is three coefficients, not a coordinate list, so the parse failed first and answered
+/// about the wrong thing. A gate below a parse, which is this crate's recurring shape.
+///
+/// Measured on 19beta1, 2026-09-11, all six and in both spellings — `42846 cannot cast type line
+/// to <target>`, and the prepared form refuses at `PREPARE`, which is where this node refuses it
+/// too (`bind_infers_over_the_wire.rs::a_line_is_refused_by_the_pair_through_a_bound_parameter`
+/// is that half).
+///
+/// **The bind path was right all along**, which is the only reason this was visible: a bound
+/// parameter's cast is not folded at lowering, so it reaches `exec::cursor` where `casts_to`
+/// refuses the pair before any geometry is read. One-mode sweeps of either kind would have shown a
+/// clean column or a wrong one with no way to tell which.
+#[test]
+fn a_line_is_refused_by_the_pair_and_not_by_its_own_text() {
+    let mut node = parity::Node::new(&["CREATE TABLE ln (id bigint primary key, l line)"]);
+    for target in ["box", "circle", "lseg", "path", "point", "polygon"] {
+        assert_eq!(
+            node.answer(&format!("SELECT '{{1,-1,0}}'::line::{target}"))
+                .to_string(),
+            format!("!42846 cannot cast type line to {target}"),
+            "'{{1,-1,0}}'::line::{target}"
+        );
+        // The same pair through a **column**, which took the other road and was right: one answer
+        // per pair, whichever way it is written.
+        assert_eq!(
+            node.answer(&format!("SELECT l::{target} FROM ln"))
+                .to_string(),
+            format!("!42846 cannot cast type line to {target}"),
+            "a column of line to {target}"
+        );
+    }
+    // **A line still reads and prints**, which is what says the refusal is about the pair: the
+    // text the cast was blaming is the type's own canonical form, and the bracket spelling folds
+    // to it.
+    assert_eq!(
+        node.rows("SELECT ('{1,-1,0}'::line)::text, ('[(0,0),(1,1)]'::line)::text"),
+        vec![vec!["{1,-1,0}", "{1,-1,0}"]]
+    );
+    // **And the fourteen conversions that do exist are untouched**, including the two that read
+    // their coordinates the same way — the guard goes above the parse, not instead of it.
+    assert_eq!(
+        node.rows("SELECT ('((0,0),(1,1))'::box::circle)::text"),
+        vec![vec!["<(0.5,0.5),0.7071067811865476>"]]
+    );
+    assert_eq!(
+        node.rows("SELECT ('((0,0),(1,1))'::box::point)::text"),
+        vec![vec!["(0.5,0.5)"]]
+    );
+    // An **open** path still refuses with its own sentence, which is a value-shaped refusal that
+    // has to survive: `22023` about the path, not `42846` about the pair.
+    assert_eq!(
+        node.answer("SELECT '[(0,0),(1,1)]'::path::polygon")
+            .to_string(),
+        "!22023 open path cannot be converted to polygon"
+    );
+}
+
+/// **An element's cast asks the JSON's kind, as the scalar's does** — seven of the matrix's ten
+/// remaining sqlstate rows, and the same shape `"char"[] -> integer[]` was.
+///
+/// `'{"a":1}'::jsonb::integer` is `22023 cannot cast jsonb object to type integer` here and on
+/// 19beta1: the rule is to ask what kind of JSON it is *before* handing digits to a number's
+/// input function. An **element** never reached that rule — the arm keying on it was in the
+/// evaluator's `Expr::Cast` match and asked the *operand's* declared type, and an element's
+/// operand is the array — so `'{"{\"a\":1}"}'::jsonb[]::integer[]` was
+/// `22P02 invalid input syntax for type integer: "{"a": 1}"`, a complaint about characters for a
+/// document that is simply the wrong shape.
+///
+/// Measured on 19beta1, 2026-09-11: all seven number-ish element casts are `22023` naming the
+/// target, and the conversions that *do* work are unchanged — `'{1,2}'::jsonb[]::integer[]` is
+/// `{1,2}` and `'{"true"}'::jsonb[]::boolean[]` is `{t}`.
+#[test]
+fn a_json_elements_cast_asks_its_kind_first() {
+    let mut node = parity::Node::new(&[]);
+    for (target, named) in [
+        ("smallint", "smallint"),
+        ("integer", "integer"),
+        ("bigint", "bigint"),
+        ("numeric", "numeric"),
+        ("real", "real"),
+        ("double precision", "double precision"),
+        ("boolean", "boolean"),
+    ] {
+        assert_eq!(
+            node.answer(&format!(
+                "SELECT '{{\"{{\\\"a\\\":1}}\"}}'::jsonb[]::{target}[]"
+            ))
+            .to_string(),
+            format!("!22023 cannot cast jsonb object to type {named}"),
+            "an object to {target}[]"
+        );
+        // The scalar, which had the rule all along: one answer per pair, whichever dimension.
+        assert_eq!(
+            node.answer(&format!("SELECT '{{\"a\":1}}'::jsonb::{target}"))
+                .to_string(),
+            format!("!22023 cannot cast jsonb object to type {named}")
+        );
+    }
+    // **What must not move**: the documents that really are numbers still convert, one dimension
+    // out as well as scalar.
+    assert_eq!(
+        node.rows(
+            "SELECT ('{1,2}'::jsonb[]::integer[])::text, ('{\"true\"}'::jsonb[]::boolean[])::text"
+        ),
+        vec![vec!["{1,2}", "{t}"]]
+    );
+}
+
+/// **A `citext` name resolves like a `text` one**, which is the last two of the matrix's sqlstate
+/// rows and is what a string type means.
+///
+/// `'x'::citext::regclass` was `42804 an oid is an integer, not Citext("x")` — an internal
+/// representation in a user's face — where 19beta1 answers `42P01 relation "x" does not exist`:
+/// it *tried* the lookup, because a `citext` is a string and `regclassin` takes a name. The arms
+/// that resolve a name matched `Datum::Text` alone, and a `citext` is a `Datum::Citext`, which is
+/// the one string type in this vocabulary that carries its own variant.
+///
+/// Measured on 19beta1 with `citext` created inside the transaction: `'pg_class'::citext::regclass`
+/// is `pg_class` and `'int4'::citext::regtype` is `integer`.
+#[test]
+fn a_citext_name_resolves_the_way_a_text_one_does() {
+    let mut node = parity::Node::new(&[]);
+    assert_eq!(
+        node.rows("SELECT ('pg_class'::citext::regclass)::text"),
+        vec![vec!["pg_class"]]
+    );
+    assert_eq!(
+        node.rows("SELECT ('int4'::citext::regtype)::text"),
+        vec![vec!["integer"]]
+    );
+    // And a name nothing answers to fails as the lookup, not as the representation.
+    assert_eq!(
+        node.answer("SELECT 'x'::citext::regclass").to_string(),
+        "!42P01 relation \"x\" does not exist"
+    );
+    assert_eq!(
+        node.answer("SELECT 'nosuchtype'::citext::regtype")
+            .to_string(),
+        "!42704 type \"nosuchtype\" does not exist"
+    );
+}

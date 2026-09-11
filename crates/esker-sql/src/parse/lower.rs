@@ -6960,6 +6960,23 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             // since it had to be described as 2205, so `'rc'::regclass::oid` has to actually
             // convert — measured, `'pg_class'::regclass::oid` is `1259` and `::text` of that is
             // the digits, where `::text` of the `regclass` is the name.
+            //
+            // **And the operand may not be a literal**, which is the guard the `regtype` arm above
+            // already has and this one did not: `lower_regclass` reads the name at parse time and
+            // raises `0A000 the cast $1::oid is not supported` for anything else, so a **bound
+            // parameter** — `$1::regclass::oid`, which is how a driver writes it — was refused by
+            // name at `Describe`. The declared divergence this pair carries is
+            // `22003 value "…" is out of range for type oid` (ADR 0097's own consequence), and a
+            // refusal has to be *that* one in both spellings: one boundary, one sentence. Lowering
+            // the whole expression takes the ordinary road, where the name is resolved per row and
+            // the `::oid` narrows exactly as it does for a literal.
+            if cast_operand(inner, data_type).is_err() {
+                return Ok(plan::Expr::Cast {
+                    operand: Box::new(lower_expr(expr)?),
+                    to: ColumnType::Oid,
+                    typmod: NO_TYPMOD,
+                });
+            }
             Ok(plan::Expr::Cast {
                 operand: Box::new(lower_regclass(inner, data_type)?),
                 to: ColumnType::Oid,

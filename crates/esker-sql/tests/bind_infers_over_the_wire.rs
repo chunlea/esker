@@ -558,3 +558,31 @@ fn a_regclass_array_through_a_bound_parameter_resolves_its_names() {
         Err("42P01".to_owned())
     );
 }
+
+/// **The other half of wire v3 family F12**, and the half that was already right: through a bound
+/// parameter a `line`'s cast is refused by the **pair**, which is what 19beta1 says in both
+/// spellings.
+///
+/// It is pinned because it is what made the literal path's `22P02` visible at all — the two-mode
+/// sweep of the cast matrix compares this node against itself, and a mode that disagrees with the
+/// other is a defect with no oracle needed. Fixing the literal path must not "fix" this one into
+/// agreement with the old answer; the two now say the same thing and 19beta1 says it too.
+///
+/// `PREPARE a AS SELECT $1::line::box` is `42846 cannot cast type line to box` on 19beta1 — the
+/// refusal comes at `PREPARE`, before any value is bound, exactly as it does here.
+#[test]
+fn a_line_is_refused_by_the_pair_through_a_bound_parameter() {
+    let mut client = Client::new();
+    for target in ["box", "circle", "lseg", "path", "point", "polygon"] {
+        assert_eq!(
+            client.ask_row(&format!("SELECT $1::line::{target}"), "{1,-1,0}"),
+            Err("42846".to_owned()),
+            "$1::line::{target}"
+        );
+    }
+    // A `line` bound as a parameter still reads: the refusal above is the pair and not the value.
+    assert_eq!(
+        client.ask_row("SELECT $1::line", "{1,-1,0}"),
+        Ok((628, Some("{1,-1,0}".to_owned())))
+    );
+}

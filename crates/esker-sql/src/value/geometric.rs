@@ -294,12 +294,30 @@ fn point(x: f64, y: f64) -> String {
 /// for a radius (150), and a `circle`'s polygon is twelve vertices at
 /// `(cx - r·cos θ, cy + r·sin θ)` (200). `tests/corpus/pg19_cast_matrix.txt` holds one probe per
 /// pair and `tests/corpus/pg19_geometric.txt` the literal forms of all fourteen.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per conversion, and the fourteen of them are what this function is: \
+              splitting it by source kind would hide which pairs exist, which is the only thing \
+              a reader comes here for"
+)]
 pub fn convert(from: Kind, to: Kind, text: &str) -> Result<String> {
-    let parts = coordinates(from, text)?;
     let refuse = || SqlError::CannotCast {
         from: from.name(),
         to: to.name(),
     };
+    // **The pair is refused before the value is read**, and the order is the whole of it. A `line`
+    // has no conversion in either direction — it is the seventh shape and `pg_cast` has no row for
+    // it — and its canonical text is `{A,B,C}`, three coefficients rather than a coordinate list.
+    // So reading the coordinates first meant the refusal that came out was
+    // `22P02 invalid input syntax for type line`, a complaint about a value that is the type's own
+    // output: `'{1,-1,0}'::line::box` blamed the text where 19beta1 says
+    // `42846 cannot cast type line to box`. The same six pairs through a **column** or a **bound
+    // parameter** were right all along, because there `casts_to` refuses the pair before anything
+    // is parsed — wire v3 family F12, found by the cast matrix's two-mode sweep.
+    if from == Kind::Line || to == Kind::Line {
+        return Err(refuse());
+    }
+    let parts = coordinates(from, text)?;
     match (from, to) {
         // A `box`'s canonical text is `(high),(low)`, which is where these four read their corners.
         (Kind::Box, _) => {
@@ -419,11 +437,18 @@ pub fn convert(from: Kind, to: Kind, text: &str) -> Result<String> {
 /// against canonical *text* — so the five conversions it is an end of are here and in
 /// [`box_of_point`] rather than in [`convert`]'s table.
 pub fn to_point(from: Kind, text: &str) -> Result<(f64, f64)> {
-    let parts = coordinates(from, text)?;
     let refuse = || SqlError::CannotCast {
         from: from.name(),
         to: "point",
     };
+    // **The pair first, the value second** — the same order [`convert`] explains at length. The
+    // arm at the bottom of this match already said a `path` and a `line` have no point; it sat
+    // below the parse, and a `line`'s `{A,B,C}` does not parse as coordinates, so the refusal
+    // named the value instead of the pair.
+    if matches!(from, Kind::Path | Kind::Line) {
+        return Err(refuse());
+    }
+    let parts = coordinates(from, text)?;
     match from {
         // The midpoint of the segment, and the centre of the box: the same arithmetic on the same
         // four numbers, which is why a real server has one function for the two of them.
@@ -448,6 +473,8 @@ pub fn to_point(from: Kind, text: &str) -> Result<(f64, f64)> {
             }
             Ok(centroid(&vertices))
         }
+        // Refused above, before the text was read; kept exhaustive because the match is over
+        // [`Kind`] and a new shape has to be decided rather than defaulted.
         Kind::Path | Kind::Line => Err(refuse()),
     }
 }

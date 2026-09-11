@@ -29,81 +29,62 @@
 # server.** That is what makes the mode column worth carrying: every difference below is this
 # node's.
 #
-# ## What this node answers, per mode
+# ## What this node answers, per mode — **and the two modes agree everywhere**
 #
 #                                    literal     bind
-#     agree                          10,080   10,086
+#     agree                          10,095   10,095
 #     node refuses, PG answers            4        4
 #     node answers, PG refuses            0        0
-#     both refuse, different code        16       10
+#     both refuse, different code         1        1
 #
-# **Re-taken 2026-09-11 after the two bind families were fixed**: the bind column's "node refuses"
-# was **26** and is now **4**, and those four are the declared `regclass` divergence. What closed:
-# `oidvector -> T[]` (11), `regclass[] -> …` (11). What is left in that column is a ruling, not a
-# defect.
+# **Mode-dependent pairs: 0**, down from 31 when the second mode was first asked.
 #
-# ## **The finding: the node's two modes disagree where the oracle's never do**
+# **Five pairs are left and four of them are a ruling.** `regclass -> integer|oid` and their arrays
+# refuse because this node's relation ids are 64 bits wide and an `oid` is four bytes — ADR 0097's
+# own consequence, declared by the user on 2026-09-11 and pinned in
+# `tests/user_decided_divergences.rs` in **both** modes.
 #
-# When this file was first taken with both modes, **31** pairs answered differently as a literal
-# and as a bound parameter; on 19beta1 **none of the 10,100 does**. Twenty-two of the 31 were pairs
-# a literal answers and a bind refuses — and `ActiveRecord` binds by default, so that was the mode
-# that mattered and the one nothing had ever swept. Both families are now closed:
+#     text[] -> hstore   node `42846 cannot cast type text[] to hstore`   19beta1 `2202E`
 #
-#     11  `oidvector -> T[]`    was literal ok / bind `22P02`   — `declared_type_of` did not read
-#                               `CatalogFunc::OidVector`, which is how `::oidvector` reaches the
-#                               planner (`sqlparser` has no `DataType` for the name), so the
-#                               evaluator's vector arm never fired and `1 2` met an array reader.
-#                               `int2vector` answered in both modes all along: it reaches
-#                               `lower_type` instead, and that was the whole difference.
-#     11  `regclass[] -> …`     was literal ok / bind `0A000`   — `bind::substitute` read the bound
-#                               text with `Datum::from_text`, and a `regclass`'s input function is
-#                               a **relation lookup** while `crate::value` has no catalog by
-#                               invariant 7. The value is handed to the cast now, and the lookup
-#                               happens where every other `regclass` name is resolved.
+# is the one open row in the whole matrix. A real server *attempts* it — `hstore(text[])` is a real
+# function and the probe's `{x}` is one element, so the refusal is `2202E array must have even
+# number of elements`, about the **array** and not about the pair. This node has no `text[] ->
+# hstore` conversion at all. It needs the constructor, not a sqlstate: with it, `'{a,1}'` becomes
+# `"a"=>"1"` and an odd list keeps PostgreSQL's own `2202E`.
 #
-# **7 pairs still differ by mode**, and neither is a bind defect:
+# ## The finding this instrument was built for, and what it found
 #
-#      6  `line -> <geometry>`  literal `22P02`, bind `42846`, PG `42846` — here the **bind path is
-#                               right**. `value::geometric::to_point` parses the source's
-#                               coordinates *before* the arm that says a `line` converts to
-#                               nothing, and a line's canonical `{A,B,C}` is not a coordinate
-#                               list, so the literal fold blames the value for a pair that has no
-#                               cast. A gate below a parse, which is this crate's recurring shape.
-#                               Recorded as wire v3 family **F12**; not fixed here.
-#      1  `regclass -> oid`     the declared divergence (`tests/user_decided_divergences.rs`),
-#                               which refuses in both modes and with two different sentences:
-#                               `22003` as a literal and `0A000` through a bind. One refusal, two
-#                               codes — worth one line of follow-up, not a new family.
+# On 19beta1 no pair of the 10,100 answers differently as a literal and as a bound parameter. When
+# this node was first asked both ways, **31 did** — and `ActiveRecord` binds by default, so the
+# mode that matters was the one nothing had ever swept. All 31 closed, in four families and **two
+# directions**: `oidvector -> T[]` and `regclass[] -> …` were the bind path (11 each),
+# `line -> <geometry>` was the **literal** path blaming a value for a pair with no cast (6, wire v3
+# family F12), and `regclass -> oid` was one declared boundary refusing with two sentences (3).
 #
-# ## The pairs this node gets wrong, whole (34 rows over both modes)
+# A sweep of either mode alone would have shown a clean column or a wrong one, with nothing to
+# compare it against but an oracle that agrees with itself.
 #
-citext	x	regclass	bind	!42804	!42P01
-citext	x	regclass	literal	!42804	!42P01
-citext	x	regtype	bind	!42804	!42704
-citext	x	regtype	literal	!42804	!42704
-jsonb[]	{"{\"a\":1}"}	bigint[]	bind	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	bigint[]	literal	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	boolean[]	bind	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	boolean[]	literal	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	double precision[]	bind	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	double precision[]	literal	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	integer[]	bind	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	integer[]	literal	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	numeric[]	bind	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	numeric[]	literal	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	real[]	bind	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	real[]	literal	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	smallint[]	bind	!22P02	!22023
-jsonb[]	{"{\"a\":1}"}	smallint[]	literal	!22P02	!22023
-line	{1,-1,0}	box	literal	!22P02	!42846
-line	{1,-1,0}	circle	literal	!22P02	!42846
-line	{1,-1,0}	lseg	literal	!22P02	!42846
-line	{1,-1,0}	path	literal	!22P02	!42846
-line	{1,-1,0}	point	literal	!22P02	!42846
-line	{1,-1,0}	polygon	literal	!22P02	!42846
+# ## The sqlstate family, closed 2026-09-11
+#
+# Ten rows per mode, and nine of them were two mechanisms already named here:
+#
+#      7  `jsonb[] -> <number>[]`   node `22P02`, PG `22023`. The scalar asks what **kind** of
+#                                   document it has before handing digits to a number's input
+#                                   function; an element never reached that rule, because the arm
+#                                   holding it asked the *operand's* declared type and an element's
+#                                   operand is the array. Moved into `cast_one_value` beside the
+#                                   `"char"` rule, which is the same seam one type over.
+#      2  `citext -> regclass|regtype`  node `42804 an oid is an integer, not Citext(…)`, PG
+#                                   `42P01`/`42704`. A `citext` **is** a string, and it is the one
+#                                   string type in this vocabulary with its own `Datum` variant, so
+#                                   the arms that resolve a name had to be told. A real server
+#                                   tries the lookup; so does this one now.
+#
+# ## The pairs this node gets wrong, whole (10 rows over both modes)
+#
 regclass	pg_class	integer	bind	!22003	ok
 regclass	pg_class	integer	literal	!22003	ok
-regclass	pg_class	oid	bind	!0A000	ok
+regclass	pg_class	oid	bind	!22003	ok
 regclass	pg_class	oid	literal	!22003	ok
 regclass[]	{"pg_class"}	integer[]	bind	!22003	ok
 regclass[]	{"pg_class"}	integer[]	literal	!22003	ok
