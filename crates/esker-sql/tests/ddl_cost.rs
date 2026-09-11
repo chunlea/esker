@@ -474,6 +474,101 @@ fn a_thousand_rounds_of_history() {
     }
 }
 
+/// **#63 — the three catalog-walking shapes, by kind, against a catalog that grows.**
+///
+/// r1 priced them in run 127 attempt 3: `DROP EXTENSION … CASCADE` **17.0 s** a statement over 563
+/// round trips, the `pg_class` listing 3.77 s over 382.7, column introspection 2.99 s over 102 —
+/// against `CREATE EXTENSION`'s **3.2 ms**, which is the same catalog and the opposite direction.
+/// Round trips tracked keys one for one in all three (279 reads + 280 scans = 559 against 563
+/// trips), and the count barely moved across all 44 `DROP EXTENSION`s, which is the signature of a
+/// fixed region being walked rather than a dependency set being followed.
+///
+/// # Why by kind, and why three sizes
+///
+/// This is #61's instrument pointed at them, and #61 was found exactly this way: `'t' x152` and
+/// `'q' x152` at 150 relations is a per-relation walk, and no amount of staring at a duration says
+/// so. One count is ambiguous — it could be the statement's own fixed price — and a **slope** is
+/// not: reads that rise with the catalog are a walk of it, reads that do not are a fixed cost that
+/// has to be found somewhere else. So `BACKGROUND` is read from the environment and the arms are
+/// three runs of one binary rather than one run that builds three catalogs and measures the last.
+///
+/// The control is in the list on purpose. `CREATE EXTENSION` costs 5,300× less than the `DROP` of
+/// the same name on the same catalog; if its counts stay flat while the others climb, the climb
+/// belongs to what dropping does and not to extensions, to the session, or to the store.
+#[test]
+#[ignore = "a measurement, not an assertion — see the module doc for how to run it"]
+fn what_the_catalog_walkers_read() {
+    let background: usize = env_or("BACKGROUND", 150);
+
+    // Both switches, for the reason `dropping_one_table_does_not_read_every_relation` gives at
+    // length: with either one off every number below is zero, and zero is a very calm-looking
+    // measurement.
+    esker_sql::stmt_stats::trace_every_read();
+    esker_client::stmt_stats::force_on();
+    assert!(
+        esker_sql::stmt_stats::enabled(),
+        "the read tap is off, so every count below would be zero"
+    );
+
+    let cluster = Cluster::start();
+    let mut s = cluster.session();
+    for at in 0..background {
+        s.run(&format!(
+            "CREATE TABLE bg{at} (id bigserial primary key, a bigint, b text)"
+        ))
+        .unwrap();
+    }
+    // One table whose column the extension's type owns, so the `CASCADE` has something to cascade
+    // to. Without it the drop is a no-op and measures nothing — `drop_extension_columns` returns
+    // early when the extension provides no types at all, and a drop with nothing to take is not
+    // the statement the suite sends.
+    s.run("CREATE EXTENSION IF NOT EXISTS citext").unwrap();
+    s.run("CREATE TABLE holder (id bigserial primary key, tag citext)")
+        .unwrap();
+
+    println!("\n  BACKGROUND={background} relations in the catalog");
+    println!(
+        "\n  -- the control: CREATE EXTENSION (3.2 ms in run 127) --\n  {}",
+        where_the_reads_went(&mut s, "CREATE EXTENSION IF NOT EXISTS hstore")
+    );
+    println!(
+        "\n  -- pg_class listing (3,770 ms, 382.7 trips) --\n  {}",
+        where_the_reads_went(
+            &mut s,
+            "SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = ANY (current_schemas(false)) AND c.relkind IN ('r','v','m','p','f')"
+        )
+    );
+    println!(
+        "\n  -- column introspection of ONE table (2,990 ms, 102 trips) --\n  {}",
+        where_the_reads_went(
+            &mut s,
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE \
+             a.attrelid = 'holder'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY \
+             a.attnum"
+        )
+    );
+    // Last, because it is the one that changes the catalog it is measured against.
+    println!(
+        "\n  -- DROP EXTENSION … CASCADE (16,999 ms, 563 trips) --\n  {}",
+        where_the_reads_went(&mut s, "DROP EXTENSION IF EXISTS citext CASCADE")
+    );
+
+    // And the same four in the units a duration is priced in, so the round-trip half of r1's
+    // observation — one key per trip — can be read off the same run.
+    println!("\n  -- the same four, priced --");
+    for sql in [
+        "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"",
+        "SELECT c.relname FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = ANY (current_schemas(false)) AND c.relkind IN ('r','v','m','p','f')",
+        "SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE \
+         a.attrelid = 'holder'::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+        "DROP EXTENSION IF EXISTS hstore CASCADE",
+    ] {
+        println!("  {}", priced(&mut s, sql));
+    }
+}
+
 /// One `usize` from the environment, or `fallback`. For the probe above, whose arms differ only in
 /// their inputs — a rebuild between them would measure the compiler as well.
 fn env_or(name: &str, fallback: usize) -> usize {
