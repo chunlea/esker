@@ -2602,7 +2602,12 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             // the executor's, carried in rather than rewritten here, and the printed form comes
             // back through `regclass_of` so the search-path qualification is the same one every
             // other `regclass` gets.
-            Datum::Text(name) if *to == ColumnType::RegClass => {
+            // **And a `citext` name is a name**, which is what a string type means: it is the one
+            // string in this vocabulary with its own `Datum` variant, so the arms that resolve a
+            // name had to be told. `'x'::citext::regclass` was
+            // `42804 an oid is an integer, not Citext("x")` — a representation in a user's face —
+            // where 19beta1 tries the lookup and says `42P01 relation "x" does not exist`.
+            Datum::Text(name) | Datum::Citext(name) if *to == ColumnType::RegClass => {
                 let Some(names) = env.settings.names else {
                     return Err(SqlError::unsupported(
                         "a relation name read as a regclass without a catalog",
@@ -2765,12 +2770,9 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             // **Only the plan knows it is a `jsonb`**, for the reason the `"char"` arm below
             // gives at length: a `jsonb` is a `Datum::Text` here, so the value cannot say which
             // cast this is and the operand's declared type can. Same seam, second type.
-            Datum::Text(ref text)
-                if crate::value::json::casts_to_scalar(*to)
-                    && declared_type_of(operand) == Some(ColumnType::Jsonb) =>
-            {
-                crate::value::json::cast_to_scalar(text, *to)?
-            }
+            // The `jsonb` kind rule that stood here is `cast_one_value`'s now, beside the
+            // `"char"` one and for the same reason: an **element** reaches only that function,
+            // and asking the operand's declared type cannot answer for one.
             // The `"char" -> int4` arm that stood here is `cast_one_value`'s now, because an
             // **element** needs the same rule and reaches only that function. `parse::lower` had
             // the pair right for a literal from the day `"char"` arrived, and the evaluator
@@ -4209,8 +4211,14 @@ fn catalog_function(
         // so the datum decides, exactly as it does for `RegTypeName` one arm down. Without this
         // the text went to the oid reader and answered `an oid is an integer, not Text(…)`
         // (`debts-v1.1.md` #41, the shape r1's wire gate found).
-        CatalogFunc::RegClassName if matches!(args.first(), Some(Datum::Text(_))) => {
-            let Some(Datum::Text(name)) = args.first() else {
+        // **A `citext` is a string too**, and it is the one with a `Datum` variant of its own, so
+        // every arm that reads a name has to say both: `'pg_class'::citext::regclass` was
+        // `42804 an oid is an integer, not Citext("pg_class")` — a representation in a user's
+        // face — where 19beta1 resolves it and a name nothing answers to is `42P01`.
+        CatalogFunc::RegClassName
+            if matches!(args.first(), Some(Datum::Text(_) | Datum::Citext(_))) =>
+        {
+            let Some(Datum::Text(name) | Datum::Citext(name)) = args.first() else {
                 unreachable!("the guard above matched a text argument")
             };
             let Some(names) = env.settings.names else {
@@ -4258,10 +4266,13 @@ fn catalog_function(
             // **All digits are an oid here too** (`value::oid_spelled`): `'23'::text::regtype` is
             // `integer` on 19beta1, and this arm is the road a *text* takes — the literal one is
             // `parse::lower`'s. Two readers of `regtypein`'s rule, asking the same function.
-            Some(Datum::Text(name)) if crate::value::oid_spelled(name).is_some() => {
+            Some(Datum::Text(name) | Datum::Citext(name))
+                if crate::value::oid_spelled(name).is_some() =>
+            {
                 crate::value::regtype_of_oid(crate::value::oid_spelled(name).unwrap_or(0))
             }
-            Some(Datum::Text(name)) => {
+            // A `citext` name resolves like a `text` one; see the `regclass` arm's note.
+            Some(Datum::Text(name) | Datum::Citext(name)) => {
                 let named = crate::value::named_type(name)?
                     .ok_or_else(|| SqlError::UndefinedType(name.trim().to_owned()))?;
                 Datum::RegType {
@@ -4759,6 +4770,19 @@ fn cast_one_value(
         && let Datum::Text(text) = value
     {
         return Ok(Datum::Int4(crate::value::char_type::to_int4(text)));
+    }
+    // **A `jsonb` is asked what kind of document it is before its digits are read.**
+    // `'{"a":1}'::jsonb::integer` is `22023 cannot cast jsonb object to type integer` on a real
+    // server, and handing the document to `int4in` instead answers `22P02` about characters — a
+    // complaint about the value for a document that is the wrong *shape*. The rule was an arm in
+    // the evaluator keyed on the operand's declared type, so an element of a `jsonb[]` never
+    // reached it: `'{"{\"a\":1}"}'::jsonb[]::integer[]` was that `22P02`, seven rows of the cast
+    // matrix. Same seam as the `"char"` above, one type over.
+    if from == Some(ColumnType::Jsonb)
+        && crate::value::json::casts_to_scalar(to)
+        && let Datum::Text(text) = value
+    {
+        return crate::value::json::cast_to_scalar(text, to);
     }
     // **Ask whether a real server would have rendered anything at all, first.**
     // `pg_cast.castmethod` says: `i` is the text round trip below and `f` and `b` are

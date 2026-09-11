@@ -529,3 +529,88 @@ fn a_line_is_refused_by_the_pair_and_not_by_its_own_text() {
         "!22023 open path cannot be converted to polygon"
     );
 }
+
+/// **An element's cast asks the JSON's kind, as the scalar's does** — seven of the matrix's ten
+/// remaining sqlstate rows, and the same shape `"char"[] -> integer[]` was.
+///
+/// `'{"a":1}'::jsonb::integer` is `22023 cannot cast jsonb object to type integer` here and on
+/// 19beta1: the rule is to ask what kind of JSON it is *before* handing digits to a number's
+/// input function. An **element** never reached that rule — the arm keying on it was in the
+/// evaluator's `Expr::Cast` match and asked the *operand's* declared type, and an element's
+/// operand is the array — so `'{"{\"a\":1}"}'::jsonb[]::integer[]` was
+/// `22P02 invalid input syntax for type integer: "{"a": 1}"`, a complaint about characters for a
+/// document that is simply the wrong shape.
+///
+/// Measured on 19beta1, 2026-09-11: all seven number-ish element casts are `22023` naming the
+/// target, and the conversions that *do* work are unchanged — `'{1,2}'::jsonb[]::integer[]` is
+/// `{1,2}` and `'{"true"}'::jsonb[]::boolean[]` is `{t}`.
+#[test]
+fn a_json_elements_cast_asks_its_kind_first() {
+    let mut node = parity::Node::new(&[]);
+    for (target, named) in [
+        ("smallint", "smallint"),
+        ("integer", "integer"),
+        ("bigint", "bigint"),
+        ("numeric", "numeric"),
+        ("real", "real"),
+        ("double precision", "double precision"),
+        ("boolean", "boolean"),
+    ] {
+        assert_eq!(
+            node.answer(&format!(
+                "SELECT '{{\"{{\\\"a\\\":1}}\"}}'::jsonb[]::{target}[]"
+            ))
+            .to_string(),
+            format!("!22023 cannot cast jsonb object to type {named}"),
+            "an object to {target}[]"
+        );
+        // The scalar, which had the rule all along: one answer per pair, whichever dimension.
+        assert_eq!(
+            node.answer(&format!("SELECT '{{\"a\":1}}'::jsonb::{target}"))
+                .to_string(),
+            format!("!22023 cannot cast jsonb object to type {named}")
+        );
+    }
+    // **What must not move**: the documents that really are numbers still convert, one dimension
+    // out as well as scalar.
+    assert_eq!(
+        node.rows(
+            "SELECT ('{1,2}'::jsonb[]::integer[])::text, ('{\"true\"}'::jsonb[]::boolean[])::text"
+        ),
+        vec![vec!["{1,2}", "{t}"]]
+    );
+}
+
+/// **A `citext` name resolves like a `text` one**, which is the last two of the matrix's sqlstate
+/// rows and is what a string type means.
+///
+/// `'x'::citext::regclass` was `42804 an oid is an integer, not Citext("x")` — an internal
+/// representation in a user's face — where 19beta1 answers `42P01 relation "x" does not exist`:
+/// it *tried* the lookup, because a `citext` is a string and `regclassin` takes a name. The arms
+/// that resolve a name matched `Datum::Text` alone, and a `citext` is a `Datum::Citext`, which is
+/// the one string type in this vocabulary that carries its own variant.
+///
+/// Measured on 19beta1 with `citext` created inside the transaction: `'pg_class'::citext::regclass`
+/// is `pg_class` and `'int4'::citext::regtype` is `integer`.
+#[test]
+fn a_citext_name_resolves_the_way_a_text_one_does() {
+    let mut node = parity::Node::new(&[]);
+    assert_eq!(
+        node.rows("SELECT ('pg_class'::citext::regclass)::text"),
+        vec![vec!["pg_class"]]
+    );
+    assert_eq!(
+        node.rows("SELECT ('int4'::citext::regtype)::text"),
+        vec![vec!["integer"]]
+    );
+    // And a name nothing answers to fails as the lookup, not as the representation.
+    assert_eq!(
+        node.answer("SELECT 'x'::citext::regclass").to_string(),
+        "!42P01 relation \"x\" does not exist"
+    );
+    assert_eq!(
+        node.answer("SELECT 'nosuchtype'::citext::regtype")
+            .to_string(),
+        "!42704 type \"nosuchtype\" does not exist"
+    );
+}
