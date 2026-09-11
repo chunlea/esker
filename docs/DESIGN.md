@@ -246,6 +246,19 @@ with a concurrent writer and 0 in 20 without
 than the first line — it turns the race into a failed operation on a legal workload instead of a
 corrupt level, which is what the reservation exists to prevent reaching at all.
 
+**What a compaction drops, and the compaction that drops nothing.** A rewrite drops three kinds of
+entry: a version no live snapshot can reach, a point tombstone with nothing beneath it, and whatever
+the `CompactionFilter` refuses. All three are decisions the merge makes while reading, so a
+compaction that does not read makes none of them — and a **trivial move**, which re-labels a single
+non-overlapping input as belonging to the next level with one manifest edit and no bytes, does not
+read. That is correct while the file is on its way down and wrong the moment it arrives: a point
+tombstone becomes droppable exactly when no level below the output can still hold an older value,
+and a move carries it past that moment unread, into a level nothing will ever compact it out of. So
+the shortcut stands down when the output level is the last one — as it already did for a compaction
+filter and for range tombstones — and the file is read once, on arrival. Above the bottom the move
+stays free. Skipping this cost a column family with no filter every put and every delete it had ever
+written (debt #62): 3,546 entries, unchanged by a full compaction.
+
 **Range deletions.** `DeleteRange` is real ([ADR 0017](adr/0017-range-tombstones.md)). A range
 tombstone `[begin, end)` is stored *beside* the sorted run rather than in it — a list in the
 memtable, a block in the tables a flush writes — because it hides keys the run has never seen. A key

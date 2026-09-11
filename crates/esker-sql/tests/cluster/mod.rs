@@ -210,8 +210,21 @@ impl Cluster {
     pub fn collect_everything(&self) {
         for store in &self.stores {
             store.raise_safepoint(u64::MAX);
+            // **Flush first, or this measures a no-op.** `compact_range` compacts SSTs; at the
+            // default 64 MiB write buffer a test's whole workload is still in the memtable, so a
+            // compaction without this has nothing to compact and reports that nothing changed —
+            // which reads exactly like "collecting does not help".
+            store.flush().expect("a flush runs");
+            let before = store.cf_entries().expect("the families");
             for cf in store.cf_names() {
                 store.compact_cf(&cf).expect("a compaction runs");
+            }
+            let after = store.cf_entries().expect("the families");
+            for (was, now) in before.iter().zip(after.iter()) {
+                println!(
+                    "    COLLECT {:>8}: {} entries in {} sst  ->  {} entries in {} sst",
+                    was.cf, was.entries, was.ssts, now.entries, now.ssts
+                );
             }
         }
     }
