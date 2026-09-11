@@ -29,7 +29,6 @@
 //! `stop`, run from another shell, can find them. It is a text format read by one function, so it
 //! is written by hand like every other format in this project; there is no `serde` (`CLAUDE.md`).
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process};
 use std::time::{Duration, Instant};
@@ -39,13 +38,14 @@ pub(crate) const DEFAULT_BASE_PORT: u16 = 20_160;
 
 /// Where `start` records what it launched.
 mod probes;
+mod state;
+
+use state::{Node, STATE_FILE, read_state, write_state};
 
 use probes::{
     PD_START_TIMEOUT, STORE_START_TIMEOUT, wait_until_the_driver_answers,
     wait_until_the_stores_answer,
 };
-
-const STATE_FILE: &str = "cluster.state";
 
 /// What `esker cluster` was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,14 +103,6 @@ pub(crate) enum ClusterOptions {
         /// The directory holding the state file.
         data_dir: PathBuf,
     },
-}
-
-/// One node's identity, as the state file records it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Node {
-    id: u64,
-    address: String,
-    pid: u32,
 }
 
 /// One child this command started and watches.
@@ -805,61 +797,11 @@ fn wait_for_interrupt(
     });
 }
 
-/// `id address pid`, one node per line.
-fn write_state(data_dir: &Path, nodes: &[Node]) -> Result<(), String> {
-    let path = data_dir.join(STATE_FILE);
-    let mut file = std::fs::File::create(&path)
-        .map_err(|error| format!("writing {}: {error}", path.display()))?;
-    for node in nodes {
-        writeln!(file, "{} {} {}", node.id, node.address, node.pid)
-            .map_err(|error| format!("writing {}: {error}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn read_state(data_dir: &Path) -> Result<Vec<Node>, String> {
-    let path = data_dir.join(STATE_FILE);
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| format!("reading {}: {error}", path.display()))?;
-    let mut nodes = Vec::new();
-    for (at, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let mut fields = line.split_whitespace();
-        let parsed = (|| {
-            Some(Node {
-                id: fields.next()?.parse().ok()?,
-                address: fields.next()?.to_owned(),
-                pid: fields.next()?.parse().ok()?,
-            })
-        })();
-        // A state file this command wrote is well formed; one that is not has been edited or
-        // truncated, and guessing at it would stop the wrong process.
-        let node = parsed.ok_or_else(|| {
-            format!(
-                "{}: line {} is not `id address pid`",
-                path.display(),
-                at + 1
-            )
-        })?;
-        if fields.next().is_some() {
-            return Err(format!(
-                "{}: line {} has trailing fields",
-                path.display(),
-                at + 1
-            ));
-        }
-        nodes.push(node);
-    }
-    Ok(nodes)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::{DEFAULT_BASE_PORT, Node, address_of, dir_of, read_state, write_state};
+    use super::{DEFAULT_BASE_PORT, address_of, dir_of};
 
     /// The addresses and directories are derived, not allocated: `esker raw --addr` against node 1
     /// has to be predictable without reading a file.
@@ -868,58 +810,5 @@ mod tests {
         assert_eq!(address_of(DEFAULT_BASE_PORT, 1), "127.0.0.1:20160");
         assert_eq!(address_of(DEFAULT_BASE_PORT, 3), "127.0.0.1:20162");
         assert_eq!(dir_of(Path::new("/data"), 2), Path::new("/data/node-2"));
-    }
-
-    #[test]
-    fn the_state_file_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let nodes = vec![
-            Node {
-                id: 1,
-                address: "127.0.0.1:20160".to_owned(),
-                pid: 111,
-            },
-            Node {
-                id: 2,
-                address: "127.0.0.1:20161".to_owned(),
-                pid: 222,
-            },
-        ];
-        write_state(dir.path(), &nodes).unwrap();
-        assert_eq!(read_state(dir.path()).unwrap(), nodes);
-    }
-
-    /// A state file that has been edited or truncated is refused rather than guessed at: acting on
-    /// half of one would stop the wrong process.
-    #[test]
-    fn a_malformed_state_file_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        for bad in [
-            "1 127.0.0.1:20160",
-            "1 addr notapid",
-            "1 addr 5 extra",
-            "x y z",
-        ] {
-            std::fs::write(dir.path().join("cluster.state"), bad).unwrap();
-            assert!(read_state(dir.path()).is_err(), "accepted `{bad}`");
-        }
-    }
-
-    #[test]
-    fn a_missing_state_file_is_an_error_not_an_empty_cluster() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(read_state(dir.path()).is_err());
-    }
-
-    /// Blank lines are the one thing a hand-edited file gets away with.
-    #[test]
-    fn blank_lines_are_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("cluster.state"),
-            "1 127.0.0.1:20160 111\n\n2 127.0.0.1:20161 222\n",
-        )
-        .unwrap();
-        assert_eq!(read_state(dir.path()).unwrap().len(), 2);
     }
 }
