@@ -147,6 +147,60 @@ fn declared(sql: &str, node: &mut parity::Node) -> u32 {
     }
 }
 
+/// The type OIDs a `Describe` of the **statement** answers for its parameters — the
+/// `ParameterDescription` frame, `t`, which is `count` then one `Int32` per parameter.
+fn described_parameters(sql: &str) -> Result<Vec<u32>, String> {
+    let mut node = parity::Node::new(FIXTURE);
+    let mut session = Session::new();
+    let mut stream = Vec::new();
+    for message in [
+        Frontend::Parse {
+            statement: "s".to_owned(),
+            sql: sql.to_owned(),
+            param_types: Vec::new(),
+        },
+        Frontend::Describe {
+            target: Target::Statement,
+            name: "s".to_owned(),
+        },
+    ] {
+        let mut out = Vec::new();
+        session.handle(&message, &mut node.executor, &mut out);
+        if let Some(refusal) = refusal_in(&out) {
+            return Err(refusal);
+        }
+        stream.extend(out);
+    }
+    let mut at = 0;
+    while at + 5 <= stream.len() {
+        let len = u32::from_be_bytes([
+            stream[at + 1],
+            stream[at + 2],
+            stream[at + 3],
+            stream[at + 4],
+        ]) as usize;
+        if stream[at] == b't' {
+            let body = &stream[at + 5..(at + 1 + len).min(stream.len())];
+            let count = usize::from(u16::from_be_bytes([body[0], body[1]]));
+            return Ok((0..count)
+                .map(|n| {
+                    let at = 2 + n * 4;
+                    u32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]])
+                })
+                .collect());
+        }
+        at += 1 + len;
+    }
+    Err("no ParameterDescription".to_owned())
+}
+
+/// The enum's oid, as this fixture's catalog assigned it — read off a statement that already
+/// answers, so no test here carries a number the catalog is free to move.
+fn enum_oid() -> u32 {
+    let mut node = parity::Node::new(FIXTURE);
+    declared("SELECT 'sad'::mood AS v", &mut node)
+}
+
 /// **A comparison against an enum column takes an enum cast.**
 ///
 /// `WHERE m = 'sad'::mood` is `42883 operator does not exist: mood = smallint` here and answers on
@@ -255,15 +309,14 @@ fn a_set_operation_over_an_enum_is_an_enum() {
 /// types by a road that skips something the execute path does — and it is why a driver sees this
 /// even for the spellings the simple protocol now answers. `ActiveRecord` binds by default.
 ///
-/// **Not fixed here, and not by guessing**: running `resolve_user_cast` inside `described_in`
-/// would meet a *placeholder* where the label goes — `substitute_placeholders` puts an empty
-/// `Datum::Text` there — and resolving that is `22P02 invalid input value for enum mood: ""` for a
-/// statement that runs perfectly once a value arrives. What it needs is either a describing mode
-/// for that pass or `reconcile_enum` reading the unresolved call's own type **name**, which the
-/// node still carries as its first argument. One of those is the next unit; the numbers above are
-/// the acceptance.
+/// **Fixed by the describing mode**, which is the first of the two candidates this header used to
+/// name: `described_in` runs `resolve_user_cast` after `bind::infer` has counted the parameters
+/// and before the placeholders go in, and a `$n` under an enum cast becomes a stand-in **of that
+/// enum** (`Executor::describing_stand_in`) rather than of the representation. Resolving the
+/// placeholder itself was the trap — `substitute_placeholders` puts an empty `Datum::Text` where
+/// the label goes, and reading that is `22P02 invalid input value for enum mood: ""` for a
+/// statement that runs perfectly once a value arrives.
 #[test]
-#[ignore = "#57(b), second half: the Describe path does not resolve a user cast"]
 fn a_bound_parameter_takes_an_enum_cast() {
     assert_eq!(
         bound("SELECT m::text FROM t WHERE m = $1::mood", "ok"),
@@ -278,11 +331,72 @@ fn a_bound_parameter_takes_an_enum_cast() {
         Ok(vec!["sad".to_owned()]),
         "a write with the value bound"
     );
-    let mut rows = bound(
-        "SELECT v::text FROM (SELECT m AS v FROM t UNION SELECT $1::mood) s",
-        "sad",
-    )
-    .expect("the bound spelling answers");
+    // **The set itself, not a derived table over it.** A derived table loses a column's user type
+    // here — `SELECT pg_typeof(v) FROM (SELECT m AS v FROM t) s` is `smallint` with no set
+    // operation in sight — so reading the union through one would measure that gap instead of
+    // this one (`debts-v1.1.md` #57's third finding).
+    let mut rows = bound("SELECT m AS v FROM t UNION SELECT $1::mood", "sad")
+        .expect("the bound spelling answers");
     rows.sort();
-    assert_eq!(rows, vec!["ok".to_owned(), "sad".to_owned()]);
+    assert_eq!(
+        rows,
+        vec!["ok".to_owned(), "sad".to_owned()],
+        "the labels, because the set is an enum"
+    );
+}
+
+/// **A bound parameter under an enum cast is declared as the enum**, which is what a driver reads
+/// out of `ParameterDescription` before it sends a value.
+///
+/// Measured on 19beta1 through `pg_prepared_statements.parameter_types`: all three shapes below
+/// are `{mood}`. Here the parameter is typed `text` — `bind::infer` has no way to say `mood`, for
+/// the same reason the literal had none before `Literal::Typed::user` existed — so the frame
+/// carries 25 where a real server carries the type's own oid.
+///
+/// The oid is compared against the one this fixture's catalog gave the type rather than written
+/// down, because a catalog assigns it. `Executor::user_typed_parameters` reads the statement **as
+/// written**, before the casts are resolved — resolving replaces the `$n` with a stand-in, and the
+/// number is what the frame is indexed by.
+#[test]
+fn a_bound_parameters_type_is_the_enum() {
+    let mood = enum_oid();
+    for sql in [
+        "SELECT m::text FROM t WHERE m = $1::mood",
+        "INSERT INTO t VALUES (2, $1::mood)",
+        "SELECT v::text FROM (SELECT m AS v FROM t UNION SELECT $1::mood) s",
+    ] {
+        assert_eq!(described_parameters(sql), Ok(vec![mood]), "{sql}");
+    }
+}
+
+/// **A column `DEFAULT` takes an enum cast too.**
+///
+/// `DEFAULT 'sad'` is the label and maps, and `DEFAULT 'sad'::mood` was `42804`. Both answer now,
+/// and this test is here because the shape looked like the one the fix would **not** reach — a
+/// stored default is a value by the time `exec::ddl` sees it — and turned out to be covered:
+/// the column's default is evaluated through the same assignment path an `INSERT` takes, so the
+/// claim the literal carries arrives with it. Measured rather than assumed, which is why it is
+/// written down.
+#[test]
+fn a_default_takes_an_enum_cast() {
+    let mut node = parity::Node::new(FIXTURE);
+    node.run("ALTER TABLE t ADD COLUMN m2 mood DEFAULT 'sad'::mood")
+        .unwrap();
+    node.run("INSERT INTO t (id, m) VALUES (9, 'ok')").unwrap();
+    assert_eq!(
+        node.rows("SELECT m2::text FROM t WHERE id = 9"),
+        vec![vec!["sad"]],
+        "the default the cast named"
+    );
+    // And the spelling that has always worked, so this says the cast joined it rather than
+    // replaced it.
+    let mut fresh = parity::Node::new(FIXTURE);
+    fresh
+        .run("ALTER TABLE t ADD COLUMN m3 mood DEFAULT 'ok'")
+        .unwrap();
+    fresh.run("INSERT INTO t (id, m) VALUES (8, 'ok')").unwrap();
+    assert_eq!(
+        fresh.rows("SELECT m3::text FROM t WHERE id = 8"),
+        vec![vec!["ok"]]
+    );
 }
