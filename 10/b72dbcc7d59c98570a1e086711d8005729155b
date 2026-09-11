@@ -1,0 +1,61 @@
+crates/esker-keys/src/array.rs
+  s_e59614afdddccb::t_982e0bafb7fe40 129-130,260-261
+crates/esker-keys/src/columnar.rs
+  s_e59614afdddccb::t_cccbd37587391a 187-188,306-307
+crates/esker-keys/src/row.rs
+  s_e59614afdddccb::t_f77a4a65ba5580 564-566,1275-1278,1531-1532,2291-2292
+crates/esker-keys/src/value.rs
+  s_e59614afdddccb::t_ac5db17fa91777 507-517,627,664-665
+crates/esker-sql/src/catalog/mod.rs
+  s_e59614afdddccb::t_a5e608e8da264e 5075,5168,5259,6744
+crates/esker-sql/src/catalog/pg_catalog.rs
+  s_e59614afdddccb::t_5bb5a723282ea4 2517-2539,3467-3468,3673-3674,3842-3844
+crates/esker-sql/src/catalog/record.rs
+  s_e59614afdddccb::t_cc0c841660cc5d 106,372-378,498-499,660-661
+crates/esker-sql/src/exec/aggregate.rs
+  s_e59614afdddccb::t_c84694cfa8855d 183-200
+crates/esker-sql/src/exec/bind.rs
+  s_e59614afdddccb::t_2a129be042d3f1 1661-1662
+crates/esker-sql/src/exec/cursor.rs
+  s_e59614afdddccb::t_278753757cab3d 2693-2731
+crates/esker-sql/src/exec/fragment.rs
+  s_e59614afdddccb::t_030c78aafd9c68 1142-1143
+crates/esker-sql/src/exec/query.rs
+  s_e59614afdddccb::t_fb267faad314d8 4268-4271
+crates/esker-sql/src/plan/expr.rs
+  s_e59614afdddccb::t_cdfe04adf12280 2665,2755,2927
+crates/esker-sql/src/row.rs
+  s_e59614afdddccb::t_fdd90addfc58ad 187-188
+crates/esker-sql/src/value/mod.rs
+  s_e59614afdddccb::t_49dfc6c4f9cb7d 1666,1668-1671,1719-1720,1722-1724,1787-1790,1903-1904,2088-2092,2284-2285,2388-2389,2694-2696,2986-2988,3841-3842
+crates/esker-sql/tests/array_delimiter.rs
+  s_e59614afdddccb::t_2dadd8e48e170d 169-178
+crates/esker-sql/tests/array_of_void.rs
+  s_e59614afdddccb::t_cb97513a3545ac 74,76-81,87-88,91-99
+crates/esker-sql/tests/catalog_vectors.rs
+  s_e59614afdddccb::t_34a85a042ce053 25-31
+crates/esker-sql/tests/row_order.rs
+  s_e59614afdddccb::t_1398be013dceec 154-157
+crates/esker-sql/tests/vector_to_array.rs
+  s_e59614afdddccb::t_aff263990abe98 1-211
+crates/esker-store/src/columnar/decode.rs
+  s_e59614afdddccb::t_7ffa492c5a3c37 268-271
+docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md
+  s_e59614afdddccb::t_4e3ea41234290b 137-173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "10b72dbcc7d59c98570a1e086711d8005729155b",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
