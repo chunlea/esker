@@ -22,7 +22,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::TcpListener;
+mod port_band;
+
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -41,23 +42,12 @@ const DRIVERS: u64 = 3;
 /// measures progress, not this; this is only ever spent on a run that is already wrong.
 const CEILING: Duration = Duration::from_secs(240);
 
-/// This file's own port band, for the reason `cluster_start.rs` gives at length: binding a run,
-/// releasing it and returning the base races whoever binds next, and the only thing that makes
-/// that harmless between test binaries is that each scans a different band.
+/// A run of consecutive free ports for this file's processes, one port per node plus the driver.
+///
+/// This file used to scan a fixed band of its own — see `tests/port_band/mod.rs` for why that
+/// collided with the other tests in this same binary.
 fn free_port_run() -> u16 {
-    let span = usize::try_from(NODES + DRIVERS).unwrap();
-    for base in (31_100_u16..32_000).step_by(span) {
-        let bound: Vec<TcpListener> = (0..span)
-            .filter_map(|at| {
-                let offset = u16::try_from(at).ok()?;
-                TcpListener::bind(("127.0.0.1", base.checked_add(offset)?)).ok()
-            })
-            .collect();
-        if bound.len() == span {
-            return base;
-        }
-    }
-    panic!("no run of {span} consecutive free ports in 31,100–32,000, this file's own band");
+    port_band::reserve(u16::try_from(NODES).expect("a small node count") + 1).into_base()
 }
 
 /// The supervisor, stopped however the test ends.

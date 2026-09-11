@@ -16,6 +16,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod port_band;
+
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -85,49 +87,12 @@ fn warm_the_binary() {
         .status();
 }
 
-/// A run of `NODES + 1` free ports: the stores' own, and the driver's one above them.
+/// A run of consecutive free ports for this file's processes, one port per node plus the driver.
 ///
-/// # The band is this file's alone, and it was not
-///
-/// Binding a run, releasing it and returning the base is a race against whoever binds next, and
-/// [`PORTS`] closes it only for the *other test in this file* — a `Mutex` is process-local, and
-/// every other cluster test is another binary. So the band has to be the mitigation, and each of
-/// these four scans a different one:
-///
-/// | test | band |
-/// |---|---|
-/// | `cluster_chaos` | 21,000–30,000 |
-/// | **this file** | **30,100–31,000** |
-/// | `tier_acceptance` | 31,000–39,000 |
-/// | `columnar_cluster` | 41,000–50,000 |
-///
-/// This one used to scan **30,100–40,000**, which swallows `tier_acceptance`'s whole band. That
-/// one is `#[ignore]`d and so does not run in the gate — it needs a `MinIO` container — which is
-/// why this is a trap rather than a diagnosis: run its three tests beside a workspace run, which
-/// is exactly what somebody checking phase 6b does, and the failure lands *here*, as a placement
-/// driver that could never listen and a four-node start that announced four nodes and has
-/// `stores (0)`. Sixty seconds later, in another crate, with nothing pointing back
-/// (`docs/plans/phase-14-flakes.md` U3).
-///
-/// A band that is exhausted panics by name. That is the right failure: it says the ports ran out,
-/// where a collision says nothing at all.
+/// This file used to scan a fixed band of its own — see `tests/port_band/mod.rs` for why that
+/// collided with the other tests in this same binary.
 fn free_port_run() -> u16 {
-    let span = usize::try_from(NODES).unwrap() + 1;
-    for base in (30_100_u16..31_000).step_by(span) {
-        let bound: Vec<TcpListener> = (0..span)
-            .filter_map(|at| {
-                let offset = u16::try_from(at).ok()?;
-                TcpListener::bind(("127.0.0.1", base.checked_add(offset)?)).ok()
-            })
-            .collect();
-        if bound.len() == span {
-            return base;
-        }
-    }
-    panic!(
-        "no run of {} consecutive free ports in 30,100–31,000, this file's own band",
-        NODES + 1
-    );
+    port_band::reserve(u16::try_from(NODES).expect("a small node count") + 1).into_base()
 }
 
 /// The supervisor, stopped however the test ends.

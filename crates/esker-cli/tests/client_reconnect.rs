@@ -24,7 +24,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::{SocketAddr, TcpListener};
+mod port_band;
+
+use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -49,12 +51,12 @@ impl Drop for Server {
     }
 }
 
+/// One free port, held until the child that binds it is spawned.
+///
+/// See `tests/port_band/mod.rs`: binding `:0` and releasing immediately is the narrow half of the
+/// same race the fixed bands had, and one allocator is how it stays fixed everywhere at once.
 fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("a free port")
-        .local_addr()
-        .expect("its address")
-        .port()
+    port_band::reserve_one().into_base()
 }
 
 /// One store, on `address` and `dir`, with its output going to `log`.

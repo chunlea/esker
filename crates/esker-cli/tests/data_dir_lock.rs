@@ -12,8 +12,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod port_band;
+
 use std::io::ErrorKind;
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -26,10 +27,12 @@ use tempfile::TempDir;
 /// and a loaded host makes that slower without making it wrong.
 const LISTENING_WITHIN: Duration = Duration::from_secs(30);
 
-/// A port nothing is listening on. Held only long enough to learn the number, like `cluster.rs`.
+/// One free port, held until the child that binds it is spawned.
+///
+/// See `tests/port_band/mod.rs`: binding `:0` and releasing immediately is the narrow half of the
+/// same race the fixed bands had, and one allocator is how it stays fixed everywhere at once.
 fn free_port() -> u16 {
-    let socket = TcpListener::bind(("127.0.0.1", 0)).expect("a free port");
-    socket.local_addr().expect("its address").port()
+    port_band::reserve_one().into_base()
 }
 
 /// A child that is killed however the test leaves.

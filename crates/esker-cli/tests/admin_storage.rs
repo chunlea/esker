@@ -21,7 +21,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::TcpListener;
+mod port_band;
+
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -37,9 +38,12 @@ const LISTENING_WITHIN: Duration = Duration::from_secs(30);
 /// would pass without the verb existing.
 const ROWS: usize = 200;
 
+/// One free port, held until the child that binds it is spawned.
+///
+/// See `tests/port_band/mod.rs`: binding `:0` and releasing immediately is the narrow half of the
+/// same race the fixed bands had, and one allocator is how it stays fixed everywhere at once.
 fn free_port() -> u16 {
-    let socket = TcpListener::bind(("127.0.0.1", 0)).expect("a free port");
-    socket.local_addr().expect("its address").port()
+    port_band::reserve_one().into_base()
 }
 
 /// A child killed however the test leaves.

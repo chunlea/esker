@@ -12,9 +12,12 @@
 
 #![allow(dead_code, unreachable_pub)]
 
+#[path = "../port_band/mod.rs"]
+mod port_band;
+
 use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -636,30 +639,11 @@ fn warm(binary: PathBuf) {
 
 /// A run of `span` consecutive free ports.
 ///
-/// **Bind one and probe upward.** Binding `span` ephemeral ports and hoping they come out
-/// consecutive is what this did first, and three arbitrary ports are consecutive about never — so
-/// it spun for ever before a single process started, and every failure looked like a hung cluster.
-/// The kernel picks the first port; the rest are checked, and the whole run is held until the
-/// children have them.
+/// The allocator this file grew is now everyone's — `tests/port_band/mod.rs` — and the sentence
+/// this one carried, *"the whole run is held until the children have them"*, is true there: the
+/// listeners live in the value it returns instead of being dropped on the way out.
 fn free_ports(span: u16) -> u16 {
-    for _ in 0..256 {
-        let Ok(first) = TcpListener::bind("127.0.0.1:0") else {
-            continue;
-        };
-        let Ok(base) = first.local_addr().map(|addr| addr.port()) else {
-            continue;
-        };
-        if base.checked_add(span).is_none() {
-            continue;
-        }
-        let held: Vec<TcpListener> = (1..span)
-            .filter_map(|step| TcpListener::bind(("127.0.0.1", base + step)).ok())
-            .collect();
-        if held.len() == usize::from(span - 1) {
-            return base;
-        }
-    }
-    panic!("no run of {span} consecutive free ports after 256 attempts");
+    port_band::reserve(span).into_base()
 }
 
 /// Waits for a port to accept, failing early if the child has already exited.

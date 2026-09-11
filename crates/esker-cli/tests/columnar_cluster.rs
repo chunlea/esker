@@ -31,7 +31,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::TcpListener;
+mod port_band;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -209,21 +210,12 @@ fn warm(binary: impl AsRef<std::ffi::OsStr>) {
         .status();
 }
 
-/// A run of `NODES + 2` free ports: the stores', the driver's, and the SQL node's.
+/// A run of consecutive free ports for this file's processes, one port per node plus the driver.
+///
+/// This file used to scan a fixed band of its own — see `tests/port_band/mod.rs` for why that
+/// collided with the other tests in this same binary.
 fn free_port_run() -> u16 {
-    let span = usize::try_from(NODES).unwrap() + 2;
-    for base in (41_000_u16..50_000).step_by(span) {
-        let bound: Vec<TcpListener> = (0..span)
-            .filter_map(|at| {
-                let offset = u16::try_from(at).ok()?;
-                TcpListener::bind(("127.0.0.1", base.checked_add(offset)?)).ok()
-            })
-            .collect();
-        if bound.len() == span {
-            return base;
-        }
-    }
-    panic!("no run of {} consecutive free ports", NODES + 2);
+    port_band::reserve(u16::try_from(NODES).expect("a small node count") + 1).into_base()
 }
 
 fn inspect(pd_dir: &Path) -> String {

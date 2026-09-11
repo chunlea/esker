@@ -24,7 +24,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::net::{TcpListener, TcpStream};
+mod port_band;
+
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -213,19 +215,13 @@ fn warm() {
         .status();
 }
 
-/// This file's own port band, for the reason `cluster_start.rs` gives: releasing a bound run and
-/// returning the base races whoever binds next, and only a private band makes that harmless
-/// between test binaries.
+/// A run of `span` consecutive free ports, from the one allocator every real-process test uses.
+///
+/// This file used to scan a fixed band of its own. See `tests/port_band/mod.rs` for why that
+/// deterministically collided with the other tests in this same binary, and what four gates it
+/// cost before anyone read the stderr.
 fn free_ports(span: u16) -> u16 {
-    for base in (33_100_u16..34_000).step_by(span as usize) {
-        let bound: Vec<TcpListener> = (0..span)
-            .filter_map(|at| TcpListener::bind(("127.0.0.1", base.checked_add(at)?)).ok())
-            .collect();
-        if bound.len() == span as usize {
-            return base;
-        }
-    }
-    panic!("no run of {span} consecutive free ports in 33,100–34,000, this file's own band");
+    port_band::reserve(span).into_base()
 }
 
 /// Waits for `port`, and says what the child said if it dies instead.

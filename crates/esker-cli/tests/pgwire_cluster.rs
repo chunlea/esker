@@ -35,8 +35,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod port_band;
+
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -237,16 +239,13 @@ fn warm(binary: impl AsRef<std::ffi::OsStr>) {
         .status();
 }
 
+/// A run of `span` consecutive free ports, from the one allocator every real-process test uses.
+///
+/// This file used to scan a fixed band of its own. See `tests/port_band/mod.rs` for why that
+/// deterministically collided with the other tests in this same binary, and what four gates it
+/// cost before anyone read the stderr.
 fn free_ports(span: u16) -> u16 {
-    for base in (41_000_u16..50_000).step_by(usize::from(span) + 1) {
-        let bound: Vec<TcpListener> = (0..span)
-            .filter_map(|at| TcpListener::bind(("127.0.0.1", base.checked_add(at)?)).ok())
-            .collect();
-        if bound.len() == usize::from(span) {
-            return base;
-        }
-    }
-    panic!("no run of {span} consecutive free ports");
+    port_band::reserve(span).into_base()
 }
 
 /// Waits for a port to accept, and **gives up early when the process that should open it has

@@ -23,6 +23,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod port_band;
+
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -69,55 +71,14 @@ struct Cluster {
     restarted: Vec<(u64, Child)>,
 }
 
-/// A run of `NODES` consecutive ports, **held** until the caller hands them over.
+/// A run of `NODE_COUNT` consecutive ports, **held** until the caller hands them over.
 ///
-/// `cluster start` numbers its nodes from one base port, so they have to be consecutive — which
-/// rules out binding port zero. And the servers are separate **processes**, so the sockets cannot
-/// be passed to them the way an in-process harness passes a listener to `Server::from_listener`.
-/// The hold therefore cannot last all the way to the bind, and pretending otherwise is what the
-/// comment here used to do. Three things are available instead, and together they are what closed
-/// this:
-///
-/// * the run is **held through the caller's setup** and released on the line before the child is
-///   spawned, rather than at the top of it — the window shrinks from a whole `Cluster::start` to
-///   one statement;
-/// * the scan **starts at a random slot** rather than walking from the bottom of the range, so two
-///   processes running this file at once do not both pick `21_000`;
-/// * and the caller **retries with a fresh run** if the cluster does not come up, because the
-///   remaining window is real and cannot be closed from here.
-///
-/// The first two are why a collision is rare; the third is why one is not a failure.
+/// The reasoning this function grew — hold the run, start at a slot the clock and the pid pick,
+/// stay below the ephemeral range, and retry from the caller because the last window cannot be
+/// closed from here — now lives in `tests/port_band/mod.rs`, where the other twelve real-process
+/// files use it too. They each kept a fixed band until four gates had been spent on it.
 fn reserve_port_run() -> (u16, Vec<TcpListener>) {
-    const LOW: u16 = 21_000;
-    const HIGH: u16 = 30_000;
-    let stride = u16::try_from(NODE_COUNT).expect("a small node count") + 1;
-    let slots = (HIGH - LOW) / stride;
-    // No `rand` here (`CLAUDE.md`'s dependency policy), and none is needed: the clock and the pid
-    // are enough to keep two processes from starting at the same slot.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.subsec_nanos());
-    let start = (nanos ^ std::process::id()) % u32::from(slots);
-    for step in 0..slots {
-        let slot = (start + u32::from(step)) % u32::from(slots);
-        let Some(base) = u16::try_from(slot)
-            .ok()
-            .and_then(|slot| slot.checked_mul(stride))
-            .and_then(|offset| LOW.checked_add(offset))
-        else {
-            continue;
-        };
-        let bound: Vec<TcpListener> = (0..NODE_COUNT)
-            .filter_map(|at| {
-                let offset = u16::try_from(at).ok()?;
-                TcpListener::bind(("127.0.0.1", base.checked_add(offset)?)).ok()
-            })
-            .collect();
-        if bound.len() == NODE_COUNT {
-            return (base, bound);
-        }
-    }
-    panic!("no run of {NODES} consecutive free ports between {LOW} and {HIGH}");
+    port_band::reserve(u16::try_from(NODE_COUNT).expect("a small node count")).into_parts()
 }
 
 fn address_of(base_port: u16, id: u64) -> SocketAddr {
