@@ -2236,6 +2236,17 @@ fn declared_type_of(expr: &Expr) -> Option<ColumnType> {
         Expr::Ordinal { ty, .. } => Some(*ty),
         Expr::Cast { to, .. } => Some(*to),
         Expr::Literal(crate::plan::Literal::Typed(value)) => value.column_type(),
+        // **`::oidvector` is a call and not a cast**, because the parser has no type for the name
+        // (`parse::lower::cast_target` is the list) and `parse::lower` answers it with a
+        // `CatalogFunc::OidVector`. Every arm here
+        // that asks what a value *is* was blind to that: `$1::oidvector::integer[]` reached the
+        // array reader as the text `1 2` and was `22P02 malformed array literal` where the same
+        // cast over `int2vector` — which does reach `lower_type` — answered. Eleven rows of the
+        // cast matrix's bind mode, and the difference between the two vectors was never anything
+        // but which door the spelling comes through.
+        Expr::CatalogFunc(call) if call.func == crate::plan::CatalogFunc::OidVector => {
+            Some(ColumnType::OidVector)
+        }
         _ => None,
     }
 }
