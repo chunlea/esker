@@ -1,0 +1,21 @@
+crates/esker-client/src/tcp.rs
+  s_ac192c209f55d3::t_c6acb96fc54fe1 67-76,140-146,149,151,157-163,170,175-183,186,201-204,252-315,321-327,353-361
+crates/esker-client/tests/first_dial.rs
+  s_ac192c209f55d3::t_c9c58918a08a68 1-211
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7024ef19e299d05a1855b064e7bb50f435397d88",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
