@@ -139,8 +139,12 @@ impl TcpStores {
     /// cluster — but every address failing is, because the book would be empty.
     ///
     /// **An address that did not answer is kept** rather than dropped. It cannot be keyed by a
-    /// store id, because it never reported one; it goes into [`Self::unclaimed`] and is dialled
-    /// again the first time something asks for a store this book cannot name. Before that, a store
+    /// store id, because it never reported one, so it goes on a shelf of its own and is dialled
+    /// again the first time something asks for a store this book cannot name.
+    ///
+    /// (Named in prose and not linked: the shelf is a private field, and a public item's
+    /// documentation may not link to one — `rustdoc::private_intra_doc_links`, which the gate
+    /// runs as an error and a package test run cannot see.) Before that, a store
     /// that was down for the few milliseconds of construction was unreachable for the life of the
     /// client, and the message it produced said so without saying why: *"no address is known for
     /// store 4"*, twenty-six chaos rounds in a row (run 124).

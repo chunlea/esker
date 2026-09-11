@@ -686,7 +686,7 @@ fn restart_command(
 /// that had been taken away from it.
 ///
 /// The startup check is the one that fails the command, and it is a different question:
-/// [`first_child_that_died`] runs before anything is announced, where a dead child means the
+/// [`probes::first_child_that_died`] runs before anything is announced, where a dead child means the
 /// cluster never formed rather than that somebody is testing it.
 fn wait_for_interrupt(
     children: &mut [Supervised],
