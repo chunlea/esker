@@ -388,6 +388,50 @@ fn only_ssts_are_tiered() {
     );
 }
 
+/// **The sweep a caller outside the engine has must reclaim the objects too.**
+///
+/// `Db::purge_obsolete_files` is the public sweep, and it is the one `Db::open` itself calls to
+/// clear whatever the last process left behind. It listed the directory and deleted the files no
+/// version named — and stopped there, so the *object* of every one of them stayed in the store
+/// for the life of the bucket. A listing can never drive object reclamation, which is
+/// [ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) decision 5's whole point: a
+/// file the tier has evicted is not in the listing at all.
+///
+/// The open iterator is what makes this deterministic. It pins the version the compaction starts
+/// from, so the compaction's own sweep sees its inputs as live and correctly leaves their objects
+/// alone; dropping it afterwards makes the *next* sweep the one that has to do the work, and the
+/// next sweep here is the public one and nothing else.
+#[test]
+fn the_public_sweep_reclaims_objects_and_not_only_files() {
+    let fixture = Fixture::new();
+    for batch in 0..5 {
+        fixture.write_and_flush(&format!("b{batch}-"), 100);
+        fixture.db().tier_maintenance().unwrap();
+    }
+    let uploaded = fixture.objects();
+    assert!(
+        uploaded.len() >= 5,
+        "nothing reached the store, so this measures nothing: {uploaded:?}"
+    );
+
+    let pinned = fixture
+        .db()
+        .iter("default", &ReadOptions::default())
+        .unwrap();
+    fixture.db().compact_range("default", None, None).unwrap();
+    fixture.db().tier_maintenance().unwrap();
+    drop(pinned);
+
+    fixture.db().purge_obsolete_files().unwrap();
+
+    let live: BTreeSet<u64> = fixture.db().file_locations().into_keys().collect();
+    let leaked: BTreeSet<u64> = fixture.objects().difference(&live).copied().collect();
+    assert!(
+        leaked.is_empty(),
+        "the public sweep left the objects of {leaked:?} in the store; the version names {live:?}"
+    );
+}
+
 /// An object is deleted only when no live version names its number. A compaction makes its
 /// inputs obsolete; the sweep then reclaims both the local files and the objects.
 #[test]

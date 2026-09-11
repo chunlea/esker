@@ -171,12 +171,19 @@ impl Db {
         Ok(db)
     }
 
-    /// Deletes files no live version needs. Called at open, and after every flush and
-    /// compaction from step 6b on.
+    /// Deletes files no live version needs — and the objects of the files it deleted. Called at
+    /// open, and after every flush and compaction from step 6b on.
+    ///
+    /// This is the same sweep the flush and compaction paths run, and it has to be: it once read
+    /// the directory and deleted from it, which reclaims nothing in an object store. **A listing
+    /// cannot drive object reclamation** — a file the tier has evicted is not in the listing at
+    /// all, so its object would never be reached
+    /// ([ADR 0024](../../../docs/adr/0024-tiering-failure-semantics.md) decision 5) — and at open,
+    /// which is the one call that runs before any flush or compaction can, that left the objects
+    /// of everything the last process abandoned behind for good.
     pub fn purge_obsolete_files(&self) -> Result<Vec<std::path::PathBuf>> {
         self.inner.writable("sweep its obsolete files")?;
-        let mut versions = super::lock(&self.inner.versions)?;
-        versions.purge_obsolete_files()
+        self.inner.purge_and_evict()
     }
 }
 

@@ -737,8 +737,9 @@ impl DbInner {
         Ok(())
     }
 
-    /// Deletes what no version needs, keeping files that are still being written.
-    pub(crate) fn purge_and_evict(&self) -> Result<()> {
+    /// Deletes what no version needs, keeping files that are still being written, and returns
+    /// the paths that went.
+    pub(crate) fn purge_and_evict(&self) -> Result<Vec<std::path::PathBuf>> {
         // Both halves of this decision have to describe the same instant. The listing says
         // which files no live version needs; `pending_outputs` says which of those are outputs
         // that have been created but not yet named by an edit. Sampled one after the other
@@ -760,6 +761,7 @@ impl DbInner {
             let pending: BTreeSet<u64> = lock(&self.pending_outputs)?.clone();
             (obsolete, live, pending)
         };
+        let mut deleted = Vec::new();
         for path in obsolete {
             if let Some(FileKind::Sst(number)) = filename::classify_path(&path) {
                 if pending.contains(&number) {
@@ -770,7 +772,8 @@ impl DbInner {
                 self.table_cache.evict(number);
             }
             match self.fs.delete(&path) {
-                Ok(()) => {}
+                Ok(()) => deleted.push(path),
+                // Gone already: another sweep took it, and the goal is that it be gone.
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(Error::io(&path, err)),
             }
@@ -782,7 +785,7 @@ impl DbInner {
             // would turn a storage cost into an availability one.
             tracing::warn!(error = %err, "reclaiming obsolete objects failed");
         }
-        Ok(())
+        Ok(deleted)
     }
 
     /// The background compaction thread's body. Several run; the reservation set keeps them
