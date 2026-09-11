@@ -1,0 +1,29 @@
+crates/esker-sql/src/parse/lower.rs
+  s_e59614afdddccb::t_96adbf7357fc6c 6963-6979
+crates/esker-sql/src/value/geometric.rs
+  s_e59614afdddccb::t_ea6b2fef68b3c8 297-302,308-320,444-451,476-477
+crates/esker-sql/tests/bind_infers_over_the_wire.rs
+  s_e59614afdddccb::t_026f995c3ae200 561-588
+crates/esker-sql/tests/captures/pg19_cast_matrix.txt
+  s_e59614afdddccb::t_60b51e444854db 32,35,38,40-42,44,46-49,51,53-75,97
+crates/esker-sql/tests/cast_matrix.rs
+  s_e59614afdddccb::t_f8f6f51cd9005b 468-531
+crates/esker-sql/tests/user_decided_divergences.rs
+  s_e59614afdddccb::t_e8f85ad38fab25 163-193,205-266
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9cfd433d7ef817da530f56ae0f7b4084a0342f6b",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
