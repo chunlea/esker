@@ -1,0 +1,19 @@
+crates/esker-sql/tests/captures/pg19_cast_matrix.txt
+  s_e59614afdddccb::t_a4ae37acb779cb 114-119,162-170
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7c774e1ca47d348f70c07c550967911332f80715",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
