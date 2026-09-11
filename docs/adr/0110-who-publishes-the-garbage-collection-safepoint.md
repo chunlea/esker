@@ -233,6 +233,58 @@ case because its values were short. **Whether a large value's `default` entry is
 `write` record is unverified**, and it is the difference between reclaiming version records and
 reclaiming bytes. It is the first thing to check before anyone quotes a space saving.
 
+## The `lock` family's dead entries — a candidate rule, and what is still unconfirmed
+
+Measured above: 192 entries against `write`'s 96, unchanged by any safepoint. Two facts settle what
+they are.
+
+**A lock key carries no version.** `key::lock` is `'x' ++ enc(user_key)` and the doc comment says so
+in as many words — it is *"the unversioned key a lock is stored under"*, and the versioned builders
+are "this plus eight bytes". So the `lock` family has **no MVCC at all**: a key either holds a live
+lock or it does not, and there is no history to preserve.
+
+**The 192 are the engine's own superseded entries.** Every prewrite puts the lock and every commit
+deletes it, so V commits leave `2V` entries for one key — a put and a tombstone per transaction —
+of which at most the newest matters.
+
+### The candidate
+
+**A superseded `lock` entry may be dropped outright, and no safepoint governs it.** Nothing can read
+below the newest entry for a lock key, because there is no timestamp with which to ask: `get_lock`
+takes a user key and no `ts`. That is the whole argument, and it is a stronger one than the `write`
+family's — collecting a version needs a safepoint because a reader may hold an older snapshot, and
+there is no such reader here.
+
+This is **ordinary engine behaviour**, not a filter: an LSM drops a key's superseded entries when it
+compacts the bottommost level holding them. So the candidate is not "write a lock collector" but
+**"find out why the existing compaction did not"**, and the two obvious suspects are that
+`compact_range` did not reach a bottommost level for those keys, or that something pinned a
+snapshot across it.
+
+### What is not confirmed, and it is the part that decides the size
+
+**I did not establish why the 192 survived.** The measurement compacted every family and they did
+not move; whether that is a property of a single manual compaction, of a store with one level, or of
+a rule that would also keep them in a long-lived cluster is exactly what nobody has asked yet. Until
+that is known this is a candidate and not a plan — and it may turn out to be no work at all, which
+is the outcome worth checking before any is done.
+
+### The shape of the test that settles it
+
+Not an assertion about a number, because the number depends on the level layout, but about a
+**difference**:
+
+* commit the same key `V` times so the family holds `2V` entries for it, and verify that it does;
+* force a compaction that reaches the bottommost level for that key — more than one level's worth of
+  data, so the compaction has somewhere to compact *to*;
+* assert the family's entry count falls to about one per key, **and** that `get_lock` still answers
+  correctly for a key that is currently locked, which is the only thing these entries are for;
+* the counterfactual is a key with a **live** lock: its entry must survive, or the rule has been
+  written as "drop locks" rather than "drop superseded locks".
+
+The last one is the one that matters. A rule that collected a live lock would let two transactions
+prewrite the same key, which is the failure the lock family exists to prevent.
+
 ## Consequences
 
 * **#58 stops being a floor.** Tonight's fixes stopped the scan walking the history; this stops the

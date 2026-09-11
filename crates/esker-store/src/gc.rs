@@ -27,9 +27,31 @@
 //!
 //! Below a key's effective safepoint: the **newest** version, because that is what a read at
 //! the safepoint returns and dropping it would make an existing key vanish. Everything older
-//! goes, and so does its `default` entry. A **rollback marker** is the exception — it lives
-//! until the safepoint passes its `start_ts`, because below that there can still be an
-//! in-flight `Prewrite` that the marker is the only thing stopping (`docs/txn-spec.md` §7).
+//! goes. A **rollback marker** is the exception — it lives until the safepoint passes its
+//! `start_ts`, because below that there can still be an in-flight `Prewrite` that the marker is
+//! the only thing stopping (`docs/txn-spec.md` §7).
+//!
+//! # What it does **not** collect, measured rather than intended (#60)
+//!
+//! This paragraph used to say "and so does its `default` entry". It does not: nothing in this
+//! module writes to or deletes from the `default` family — every `cf::DEFAULT` below reads
+//! retention configuration. A value longer than `SHORT_VALUE_MAX_LEN` is stored there at prewrite,
+//! keyed by `(user_key, start_ts)`, and it stays after the `write` record naming it is collected.
+//!
+//! Eight keys, twelve versions, 512-byte values, before and after a safepoint above all of them:
+//!
+//! ```text
+//!      write    96 -> 8       default   96 -> 96       lock   192 -> 192
+//! ```
+//!
+//! **The bytes are precisely what is not reclaimed**, since a version record is tens of bytes and
+//! a value is as large as the user made it. The `lock` family is a separate case with its own
+//! rule, in
+//! [ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md).
+//!
+//! A filter over `write` cannot fix this alone: deciding whether a `default` entry is still
+//! referenced is a question about **another column family**, and a compaction filter sees one.
+//! `docs/plans/debts-v1.1.md` §1 carries #60 with the two routes out.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
