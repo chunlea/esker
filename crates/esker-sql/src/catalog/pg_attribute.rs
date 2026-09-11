@@ -109,8 +109,8 @@ fn pinned<'a>(
 /// all but one away. `ActiveRecord` sends exactly that statement before it can describe any table
 /// (`debts-v1.1.md` #63 (c), `tests/column_introspection_slope.rs`).
 ///
-/// [`catalog_rows`] is built whatever the pin is, and that is deliberate: it reads nothing, and it
-/// is the half that answers `WHERE attrelid = 'pg_class'::regclass` — a relation
+/// The catalog's own rows are built whatever the pin is, and that is deliberate: they read nothing,
+/// and they are the half that answers `WHERE attrelid = 'pg_class'::regclass` — a relation
 /// [`super::pg_relations::Relations`] has no row for, so a pinned lookup finds nothing and the
 /// catalog's own rows are the whole answer.
 pub fn rows(view: &crate::catalog::View<'_>, only: Option<i64>) -> Result<Vec<Vec<Datum>>> {
