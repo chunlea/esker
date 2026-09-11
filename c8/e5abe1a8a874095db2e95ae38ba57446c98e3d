@@ -1,0 +1,19 @@
+crates/esker-sql/src/stmt_stats.rs
+  s_ac192c209f55d3::t_3ba950f1fe9ce9 35,37,115-118,122-140,266,399-438,453,459,525-561
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c8e5abe1a8a874095db2e95ae38ba57446c98e3d",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
