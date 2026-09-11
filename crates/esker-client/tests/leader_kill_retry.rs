@@ -114,13 +114,28 @@ fn a_read_still_answers_after_the_leader_is_taken_away() {
     client.put(b"k", b"v").expect("a healthy cluster writes");
 
     let leader = cluster.leader().expect("somebody leads");
+    let killed = cluster.addrs[leader];
     cluster.kill_node(leader);
 
     let began = Instant::now();
     let read = client.get(b"k");
     let took = began.elapsed();
+    // **Sampled after the read, because the failure's whole question is which store the client
+    // was still dialling.** The error names an address and a store id; on its own that does not
+    // say whether it is the corpse this test just made or a live node that had not yet been
+    // routed to, and those are two different bugs in two different places. So the panic carries
+    // the answer rather than leaving the next reader to work it out from a port number.
+    let leads_now = cluster.leader();
     assert_eq!(
-        read.unwrap_or_else(|error| panic!("the read was refused after {took:?}: {error}")),
+        read.unwrap_or_else(|error| panic!(
+            "the read was refused after {took:?}.\n  killed: node {leader} = store {} at \
+             {killed}\n  leads now: {}\n  error: {error}",
+            leader + 1,
+            leads_now.map_or_else(
+                || "nobody yet".to_owned(),
+                |at| format!("node {at} = store {} at {}", at + 1, cluster.addrs[at])
+            ),
+        )),
         Some(bytes::Bytes::from_static(b"v")),
         "the value written before the kill did not survive it"
     );
