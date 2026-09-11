@@ -351,6 +351,15 @@ pub enum ColumnType {
     /// column in the suite is one, so it has no array type; see [`ColumnType::Ltree`] for the
     /// thing it matches.
     LQuery,
+    /// `lquery[]`, which exists for the reason [`ColumnType::LtreeArray`] does and not because a
+    /// column is one: a real server's `lquery` has a `typarray`, and a base type whose `typarray`
+    /// is `0` is what cost run 53 its 43 tests.
+    ///
+    /// **It is a type, not a model** ([ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
+    /// step 1): `lquery` is an ordinary category-`U` scalar with its own I/O, so its array needs
+    /// nothing but the places every array type has. The two vectors in that ADR are the other
+    /// half and are deliberately not this step.
+    LQueryArray,
     /// `money[]`. No suite test declares one; the type exists because a real server's `money` has
     /// `typarray = 791`, and a base type whose `typarray` is `0` is what cost run 53 its 43
     /// `can't quote Array` tests.
@@ -604,7 +613,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 104] = [
+    pub const ALL: [ColumnType; 105] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -709,6 +718,7 @@ impl ColumnType {
         ColumnType::Ltree,
         ColumnType::LtreeArray,
         ColumnType::LQuery,
+        ColumnType::LQueryArray,
     ];
 
     /// The range representations a **user-defined** type gets, which are deliberately *not* in

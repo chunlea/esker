@@ -1506,7 +1506,12 @@ pub fn extension_types(extension: &str) -> &'static [ColumnType] {
     match extension {
         "citext" => &[ColumnType::Citext],
         "hstore" => &[ColumnType::Hstore, ColumnType::HstoreArray],
-        "ltree" => &[ColumnType::Ltree, ColumnType::LtreeArray],
+        "ltree" => &[
+            ColumnType::Ltree,
+            ColumnType::LtreeArray,
+            ColumnType::LQuery,
+            ColumnType::LQueryArray,
+        ],
         _ => &[],
     }
 }
@@ -3435,6 +3440,7 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::XmlArray => "_xml",
         ColumnType::Ltree => "ltree",
         ColumnType::LtreeArray => "_ltree",
+        ColumnType::LQueryArray => "_lquery",
         ColumnType::LQuery => "lquery",
         ColumnType::Hstore => "hstore",
         ColumnType::TsVector => "tsvector",
@@ -3638,6 +3644,7 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         // **`A` for the two vectors too**, measured: `int2vector` and `oidvector` are in
         // PostgreSQL's array category despite not being array types.
         | ColumnType::Int2Vector
+        | ColumnType::LQueryArray
         | ColumnType::OidVector => "A",
         // **`R` for a range**, its own category — measured, and not `U` the way hstore is.
         // **`G` for geometric**, which is neither the `U` an extension type gets nor the
@@ -3804,7 +3811,8 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::BitArray
         | ColumnType::VarBitArray
         | ColumnType::XmlArray
-        | ColumnType::LtreeArray => "array_in",
+        | ColumnType::LtreeArray
+        | ColumnType::LQueryArray => "array_in",
         ColumnType::Int8 => "int8in",
         ColumnType::Int4 => "int4in",
         ColumnType::Int2 => "int2in",

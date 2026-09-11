@@ -166,7 +166,12 @@ fn every_base_type_has_an_array_or_is_listed() {
     // coming back a scalar `text` — the same shape that took `name` off this list a run earlier.
     // The reason was false for the same reason it was false there: a client does not have to
     // *store* an array of a type to be handed one.
-    let expected = ["int2vector", "lquery", "oidvector"];
+    // **`lquery` left this list with ADR 0107 step 1**, for the reason `regclass` and `name` left
+    // it: a client does not have to *store* an array of a type to be handed one, and a base type
+    // whose `typarray` is `0` is what cost run 53 its 43 tests. What is left is the two vectors,
+    // which are that ADR's **step 2** — they are arrays wearing a scalar's name, and giving them a
+    // `typarray` is a model change rather than a type.
+    let expected = ["int2vector", "oidvector"];
     assert_eq!(
         without, expected,
         "a base type gained or lost its array without this list being updated"

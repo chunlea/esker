@@ -5072,7 +5072,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "24",               // catalog format version
+                "25",               // catalog format version
                 "0900000000000000", // the sequence's own relation id
                 // varint 15, "accounts_id_seq" -- the name a real server derives, and a relation
                 // name like any other: `CREATE TABLE accounts_id_seq` is `42P07` on both servers.
@@ -5165,7 +5165,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "24",             // catalog format version
+                "25",             // catalog format version
                 "03312e31",       // varint 3, "1.1"
                 "067075626c6963", // varint 6, "public" - the schema, since version 36
             )
@@ -5256,7 +5256,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "24",                 // catalog format version
+                "25",                 // catalog format version
                 "0700000000000000",   // table id 7
                 "086163636f756e7473", // varint 8, "accounts"
                 // varint 13, "accounts_pkey" -- the primary key constraint's name. It is a
@@ -6741,7 +6741,7 @@ mod tests {
         assert_eq!(
             hex(&encoded),
             concat!(
-                "24",               // catalog format version
+                "25",               // catalog format version
                 "c027090000000000", // 600000 ms -- ten minutes, little-endian
             )
         );

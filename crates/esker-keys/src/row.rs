@@ -560,7 +560,8 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::BitArray
         | ColumnType::VarBitArray
         | ColumnType::XmlArray
-        | ColumnType::LtreeArray => return decode_array(ty, bytes),
+        | ColumnType::LtreeArray
+        | ColumnType::LQueryArray => return decode_array(ty, bytes),
         ColumnType::Int2 => {
             let (head, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
             (Datum::Int2(i16::from_le_bytes(*head)), rest)
@@ -1265,8 +1266,10 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             // right for one path and has nowhere to put the array's own delimiters.
             | ColumnType::LtreeArray
             // **A pattern is not a key**: it has no comparison at all, which is `json`'s reason
-            // and the reason a column is never declared one.
+            // and the reason a column is never declared one. Its array joins it for both reasons
+            // at once — no comparison, and `ltree[]`'s missing delimiter rule above.
             | ColumnType::LQuery
+            | ColumnType::LQueryArray
             | ColumnType::Point
             | ColumnType::Hstore
             | ColumnType::HstoreArray
@@ -1518,6 +1521,7 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         // `ltree[]` for the array half of that: see `is_index_key`.
         | ColumnType::LtreeArray
         | ColumnType::LQuery
+        | ColumnType::LQueryArray
         // **A point joins them with the sharpest reason of the four**: `json` has no equality
         // with another type, an hstore's *order* is not its text's, a range's order is not its
         // canonical text's — and a point has no equality even with itself, so there is no order
@@ -2275,6 +2279,7 @@ mod tests {
             | ColumnType::MacAddrArray
             | ColumnType::XmlArray
             | ColumnType::LtreeArray
+            | ColumnType::LQueryArray
             | ColumnType::BitArray
             | ColumnType::VarBitArray => {
                 let element = crate::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);

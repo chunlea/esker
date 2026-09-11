@@ -232,9 +232,20 @@ pub const CITEXT_ARRAY_OID: u32 = 16403;
 pub const LTREE_OID: u32 = 16404;
 /// See [`LTREE_OID`].
 pub const LTREE_ARRAY_OID: u32 = 16405;
-/// `lquery`'s oid. It has no array here — no column is a pattern — which is the same named gap
-/// the six geometric shapes have.
+/// `lquery`'s oid, and its array's beside it the way every other pair in this block sits.
+///
+/// **The array is not because a column is a pattern** — none is — but because a real server's
+/// `lquery` has a `typarray` and a base type whose `typarray` is `0` is what cost run 53 its 43
+/// tests. [ADR 0107](../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
+/// step 1, and the same reason `ltree[]` is here.
+///
+/// **These numbers are this node's own and are compared by name**, like every extension type in
+/// this block: 19beta1 gave `lquery` 120271 and `_lquery` 120274 on one install, and an extension
+/// oid is per-install — hardcoding one is the fault that produced twelve UNASKED rows in the wire
+/// probe list.
 pub const LQUERY_OID: u32 = 16406;
+/// See [`LQUERY_OID`].
+pub const LQUERY_ARRAY_OID: u32 = 16407;
 /// The subtype a range column's bounds are, which the column type names.
 ///
 /// `int4range`'s is `Int8` and not `Int4`, because a bare integer constant is an `int8` here — the
@@ -1623,6 +1634,13 @@ pub fn truncate_to_name(text: &str) -> String {
 /// The numbers are not derivable — `_int4` is 1007 and `_int8` is 1016, out of order with their
 /// element types, and `_json` is 199 where `json` is 114 — so each is a measurement.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over the whole type vocabulary, and its exhaustiveness is the point: it is \
+              what makes a new ColumnType decide whether it has an array. Extracting the `=> 0` \
+              group into a predicate was tried and is worse — a guarded arm is not exhaustive, so \
+              the next type added would compile with no answer at all"
+)]
 pub fn array_oid(ty: ColumnType) -> u32 {
     match ty {
         // `regtype` is 2206 and `_regtype` is 2211.
@@ -1691,13 +1709,14 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::BitArray
         | ColumnType::VarBitArray
         // **And a user range**, which has no array type here: a real server builds `_floatrange`
-        // with the type and `range_test.rb` never declares a column of one, so this is a named
-        // gap rather than a guess at an oid that is allocated per database anyway.
+        // with the type and `range_test.rb` never declares a column of one — a named gap rather
+        // than a guess at an oid that is allocated per database anyway.
         | ColumnType::FloatRange
         | ColumnType::VarcharRange
         | ColumnType::XmlArray
+        // `lquery` left this list with ADR 0107 step 1; an array still has no array.
         | ColumnType::LtreeArray
-        | ColumnType::LQuery => 0,
+        | ColumnType::LQueryArray => 0,
         // **Every range type has its array now**, which is what run 58 was: `range_test.rb`
         // declares two range arrays and an array type is built per element type, so three of the
         // four left its 46 tests exactly where they were. The oids are PostgreSQL's own and each
@@ -1759,6 +1778,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // array type itself is not built.
         ColumnType::Citext => CITEXT_ARRAY_OID,
         ColumnType::Ltree => LTREE_ARRAY_OID,
+        ColumnType::LQuery => LQUERY_ARRAY_OID,
+
         ColumnType::TsRange => TSRANGE_ARRAY_OID,
         ColumnType::Jsonb => 3807,
     }
@@ -1867,6 +1888,9 @@ fn takes_typmod(ty: ColumnType) -> bool {
         // Nor does `ltree`: a path has no declared depth.
         | ColumnType::Ltree
         | ColumnType::LQuery
+        // Listed although the early return above already answers for it: an array's typmod is its
+        // element's, and this match is exhaustive over the vocabulary.
+        | ColumnType::LQueryArray
         | ColumnType::Money
         | ColumnType::Inet
         | ColumnType::Cidr
@@ -2049,6 +2073,7 @@ impl PgType for ColumnType {
             ColumnType::Citext => CITEXT_OID,
             ColumnType::Ltree => LTREE_OID,
             ColumnType::LQuery => LQUERY_OID,
+            ColumnType::LQueryArray => LQUERY_ARRAY_OID,
             // PostgreSQL's own, and fixed: unlike an extension's, a range type is built in.
             ColumnType::TsRange => 3908,
             ColumnType::TstzRange => 3910,
@@ -2239,6 +2264,7 @@ impl PgType for ColumnType {
             ColumnType::XmlArray => "xml[]",
             ColumnType::Ltree => "ltree",
             ColumnType::LtreeArray => "ltree[]",
+            ColumnType::LQueryArray => "lquery[]",
             ColumnType::LQuery => "lquery",
             ColumnType::HstoreArray => "hstore[]",
             ColumnType::TsVectorArray => "tsvector[]",
@@ -2340,6 +2366,7 @@ impl PgType for ColumnType {
             | ColumnType::Xml
             | ColumnType::Ltree
             | ColumnType::LQuery
+            | ColumnType::LQueryArray
             | ColumnType::Numeric
             | ColumnType::Bytea
             // However many elements it has, which is the definition of a varlena.
@@ -2643,7 +2670,8 @@ impl PgDatum for Datum {
             | ColumnType::RegClassArray
             | ColumnType::CitextArray
             | ColumnType::XmlArray
-            | ColumnType::LtreeArray => {
+            | ColumnType::LtreeArray
+            | ColumnType::LQueryArray => {
                 let element =
                     esker_keys::array::ArrayValue::element_of(ty).unwrap_or(ColumnType::Text);
                 Datum::Array(array::from_text(text, element)?)
@@ -2932,7 +2960,8 @@ impl PgDatum for Datum {
             | ColumnType::RegClassArray
             | ColumnType::CitextArray
             | ColumnType::XmlArray
-            | ColumnType::LtreeArray => {
+            | ColumnType::LtreeArray
+            | ColumnType::LQueryArray => {
                 return Err(SqlError::unsupported(format!(
                     "a binary-format {}",
                     ty.name()
@@ -3742,6 +3771,16 @@ mod tests {
         assert_eq!(ColumnType::Hstore.oid(), 16400);
         assert_eq!(ColumnType::HstoreArray.oid(), 16401);
         assert_eq!(ColumnType::Citext.oid(), 16402);
+        // **The pair `lquery` did not have**, and the next free number in the block this node
+        // hands out: `ltree`/`ltree[]` are 16404/16405 and `lquery` was 16406 alone. 19beta1 gave
+        // them 120271 and 120274 on one install — an extension oid is per-install, which is why
+        // these are compared by name everywhere a client reads them.
+        assert_eq!(ColumnType::LQuery.oid(), 16406);
+        assert_eq!(ColumnType::LQueryArray.oid(), 16407);
+        assert_eq!(
+            esker_keys::array::ArrayValue::array_of(ColumnType::LQuery),
+            Some(ColumnType::LQueryArray)
+        );
         // The range types are PostgreSQL's own and fixed, unlike an extension's.
         assert_eq!(ColumnType::TsRange.oid(), 3908);
         assert_eq!(ColumnType::TstzRange.oid(), 3910);
@@ -3774,6 +3813,7 @@ mod tests {
                         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray
                         | ColumnType::XmlArray
                         | ColumnType::LtreeArray
+                        | ColumnType::LQueryArray
                         | ColumnType::Bytea
                         // Variable width for the same reason as a string: the digits a value
                         // carries are the value, and `numeric(10,2)` bounds them in the typmod,

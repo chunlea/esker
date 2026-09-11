@@ -103,7 +103,7 @@ use crate::value::{ColumnType, Datum, NO_TYPMOD};
 /// has had a real backend since phase 6a unit 11, so v2 records exist and [`decode_table`] reads
 /// them: a v2 column has no default and no missing value, which is what a column that was never
 /// given one means.
-pub(crate) const CATALOG_FORMAT_VERSION: u8 = 36;
+pub(crate) const CATALOG_FORMAT_VERSION: u8 = 37;
 
 /// The oldest catalog record this crate reads.
 ///
@@ -364,6 +364,11 @@ const TAG_REGPROC_ARRAY: u8 = 105;
 /// `regclass[]`, additive like every tag before it. `regclass` itself is [`TAG_REGCLASS`], which
 /// has been 90 since long before its array existed — a new tag is appended, never renumbered.
 const TAG_REGCLASS_ARRAY: u8 = 106;
+/// `lquery[]`'s tag, appended for [ADR 0107](../../../../docs/adr/0107-a-borrowed-representation-needs-somewhere-to-carry-its-identity.md)
+/// step 1. **107 was claimed out loud before it was written** (`esker-coord/b4-claims-format-37.md`):
+/// this number and [`CATALOG_FORMAT_VERSION`] are a shared resource between branches, whoever lands
+/// second renumbers, and it has collided twice.
+const TAG_LQUERY_ARRAY: u8 = 107;
 
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
@@ -482,6 +487,7 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::XmlArray => TAG_XML_ARRAY,
         ColumnType::Ltree => TAG_LTREE,
         ColumnType::LtreeArray => TAG_LTREE_ARRAY,
+        ColumnType::LQueryArray => TAG_LQUERY_ARRAY,
         ColumnType::LQuery => TAG_LQUERY,
         ColumnType::Bit => TAG_BIT,
         ColumnType::VarBit => TAG_VARBIT,
@@ -641,6 +647,7 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_XML_ARRAY => ColumnType::XmlArray,
         TAG_LTREE => ColumnType::Ltree,
         TAG_LTREE_ARRAY => ColumnType::LtreeArray,
+        TAG_LQUERY_ARRAY => ColumnType::LQueryArray,
         TAG_LQUERY => ColumnType::LQuery,
         TAG_BIT => ColumnType::Bit,
         TAG_VARBIT => ColumnType::VarBit,
