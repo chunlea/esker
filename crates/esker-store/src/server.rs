@@ -65,6 +65,29 @@ const RECORD_CATCHUP_WAIT: std::time::Duration = std::time::Duration::from_milli
 /// nothing to subscribe to; two milliseconds is far below what it is waiting for.
 const RECORD_CATCHUP_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 
+/// How long a store's **first** open waits for a placement-driver group to produce a leader.
+///
+/// A group has no leader for the first one to two seconds of its life — `esker_raft`'s
+/// `election_tick` of 10–20 at `TICK_MS` 100 — and a member with no leader answers
+/// [`ProtoError::PdNotLeader`] to everything ([ADR 0059](../../../docs/adr/0059-pd-is-a-raft-group.md)).
+/// Under load that first election takes longer, and a store may additionally be started before the
+/// members it has to ask.
+///
+/// **This is a startup budget, not a request budget**, and the two nest. `esker_proto`'s
+/// `REDIRECT_BUDGET` is spent *inside* each attempt below — it rotates the endpoint list looking
+/// for a leader that exists, and gives up in about three seconds because a client that chased
+/// hints for ever would never fail. That is the right bound for *finding* a leader and the wrong
+/// one for *waiting for the first one*, which is why this exists rather than the budget being
+/// raised: raising it would make every later redirect on every client slower to give up.
+const PD_LEADER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long between attempts, once one has been refused.
+///
+/// Short, because the expensive waiting already happened inside the attempt: a `RemotePd` spends
+/// its own redirect budget before it returns. This is the interval for the in-process driver,
+/// where an attempt costs nothing at all.
+const PD_LEADER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// How many consecutive leaderless heartbeat rounds make a region worth asking PD about.
 ///
 /// A throttle rather than a bound; see [`Store::sweep_orphaned_regions`] for why the safety is
@@ -124,6 +147,11 @@ pub struct StoreOptions {
     /// the region has changed, since a change beats immediately. Configurable because a test that
     /// waited sixty seconds for a membership change would not be run.
     pub region_heartbeat: std::time::Duration,
+    /// How long the **first** open waits for a placement-driver group to produce a leader.
+    ///
+    /// Defaults to [`PD_LEADER_WAIT`], and is a field for the reason `region_heartbeat` is one:
+    /// a test that waited thirty seconds for the bound to expire would not be run.
+    pub pd_leader_wait: std::time::Duration,
     /// How often each region's peer says what it believes, or `None` for never.
     ///
     /// **Off unless asked for**, and it is a diagnostic rather than a part of how the store
@@ -222,6 +250,7 @@ impl StoreOptions {
             heartbeat_tick: std::time::Duration::from_millis(esker_raft::TICK_MS),
             store_heartbeat: std::time::Duration::from_millis(crate::STORE_HEARTBEAT_MS),
             region_heartbeat: std::time::Duration::from_millis(crate::REGION_HEARTBEAT_MS),
+            pd_leader_wait: PD_LEADER_WAIT,
             region_census: None,
             split: SplitOptions::new(),
             engine: Options {
@@ -568,6 +597,7 @@ impl Store {
             address,
             heartbeat_tick,
             store_heartbeat,
+            pd_leader_wait,
             region_heartbeat,
             region_census,
             split,
@@ -601,6 +631,7 @@ impl Store {
                     address: &address,
                     raft: raft.as_ref(),
                     pd: pd.as_ref(),
+                    pd_leader_wait,
                 },
             )?);
         }
@@ -3405,6 +3436,7 @@ struct BootstrapOptions<'a> {
     address: &'a str,
     raft: Option<&'a RaftOptions>,
     pd: Option<&'a Arc<dyn PdClient>>,
+    pd_leader_wait: std::time::Duration,
 }
 
 /// Decides what a store with no region records of its own should host, and writes the records.
@@ -3429,10 +3461,7 @@ struct BootstrapOptions<'a> {
 fn bootstrap(db: &Arc<Db>, options: &BootstrapOptions<'_>) -> Result<Option<Region>> {
     let region = match options.pd {
         Some(pd) => {
-            let answer = pd.bootstrap(&StoreInfo {
-                store_id: options.store_id,
-                address: options.address.to_owned(),
-            })?;
+            let answer = register_with_the_driver(pd.as_ref(), options)?;
             tracing::info!(
                 store_id = options.store_id,
                 cluster_id = answer.cluster_id,
@@ -3464,6 +3493,75 @@ fn bootstrap(db: &Arc<Db>, options: &BootstrapOptions<'_>) -> Result<Option<Regi
         "bootstrapped a region covering the whole key space"
     );
     Ok(Some(region))
+}
+
+/// Registers this store with the placement driver, waiting out an election rather than exiting.
+///
+/// # Why the open waits at all
+///
+/// A store that exited on [`ProtoError::PdNotLeader`] turned a one-second election into a dead
+/// node, and only on a machine slow enough to lose the race: four ADR 0108 tests failed this way
+/// on a loaded gate and were green on a quiet one, each after `esker cluster start` reported
+/// `node 1 exited with exit status: 1` (#59). The refusal itself is exactly the one worth waiting
+/// on — the member **provably did nothing**, and its answer cannot change until the election ends.
+///
+/// The client side of this already had its rule, in `esker_proto::LeaderBook`; what it does not
+/// have is a store's question, which is asked once, before anything is serving, and has no caller
+/// above it to retry.
+///
+/// # And why it does not wait for everything
+///
+/// A driver that was never dialled is **not** an election. `esker cluster start` orders the driver
+/// before the stores on purpose — *"a store whose PD is not up yet fails to open, which is the
+/// behaviour that makes a cluster's start order matter here and nowhere else"* — and a mistyped
+/// `--pd` should say so in a second rather than in half a minute. So an unreachable member is
+/// waited on **only after some member has said an election is running**, which is the point at
+/// which the group is known to exist. That is the sequence a store started before the rest of its
+/// group actually meets: one member up and leaderless, the others not yet listening.
+fn register_with_the_driver(
+    pd: &dyn PdClient,
+    options: &BootstrapOptions<'_>,
+) -> Result<crate::pd::Bootstrapped> {
+    let info = StoreInfo {
+        store_id: options.store_id,
+        address: options.address.to_owned(),
+    };
+    let began = std::time::Instant::now();
+    // Set by the first `PdNotLeader`, and the whole of what separates "a group is electing" from
+    // "there is nothing there".
+    let mut electing = false;
+    let mut said = false;
+    loop {
+        let refusal = match pd.bootstrap(&info) {
+            Ok(answer) => return Ok(answer),
+            Err(error) => error,
+        };
+        let mid_election = matches!(refusal, ProtoError::PdNotLeader { .. });
+        electing |= mid_election;
+        let worth_waiting_on = mid_election || (electing && esker_proto::is_unreachable(&refusal));
+        if !worth_waiting_on {
+            // Returned exactly as it arrived: this is the path an operator with a mistyped
+            // `--pd` takes, and the socket's own words are what tells them so.
+            return Err(StoreError::from(refusal));
+        }
+        if began.elapsed() >= options.pd_leader_wait {
+            // The bound, and it says it *is* one — a bare "placement driver is not the leader"
+            // after half a minute of waiting reads like the refusal came back instantly.
+            return Err(StoreError::Bootstrap(format!(
+                "no placement driver led the group within {:?}: {refusal}",
+                began.elapsed()
+            )));
+        }
+        if !said {
+            said = true;
+            tracing::info!(
+                store_id = options.store_id,
+                wait_ms = options.pd_leader_wait.as_millis(),
+                "waiting for a placement driver to lead before registering"
+            );
+        }
+        std::thread::sleep(PD_LEADER_POLL);
+    }
 }
 
 /// The membership change an operator asks for, or `None` when there is nothing to propose.
