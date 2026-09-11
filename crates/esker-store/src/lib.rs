@@ -43,6 +43,7 @@
 
 pub mod apply;
 pub mod census;
+pub mod collect;
 pub mod columnar;
 pub mod driver;
 pub mod error;
@@ -170,6 +171,14 @@ pub const PD_LEADER_WAIT: std::time::Duration = std::time::Duration::from_secs(3
 
 /// Interval between store heartbeats to the placement driver, in milliseconds.
 pub const STORE_HEARTBEAT_MS: u64 = 10_000;
+
+/// The default shortest gap between two collections ([`collect`]).
+///
+/// **Conservative and provisional.** A store hears a safepoint every [`STORE_HEARTBEAT_MS`], so
+/// five minutes is thirty heartbeats' worth of quiet between whole-family rewrites — chosen to be
+/// obviously safe rather than measured, because what one sweep costs on a real cluster is what
+/// r1's run 127i is timing. That measurement is what this should finally be set from.
+pub const COLLECT_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Interval between region heartbeats from a leader, in milliseconds.
 pub const REGION_HEARTBEAT_MS: u64 = 60_000;

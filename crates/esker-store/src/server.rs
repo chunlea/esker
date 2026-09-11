@@ -35,6 +35,7 @@ use esker_proto::{
 
 use crate::apply::Command;
 use crate::census;
+use crate::collect;
 use crate::columnar::ColumnarOptions;
 use crate::columnar::region::ColumnarSlot;
 use crate::driver::DriverPool;
@@ -148,6 +149,20 @@ pub struct StoreOptions {
     /// Splitting needs cluster-unique ids, so it needs a placement driver: a store with
     /// [`StoreOptions::pd`] unset never splits, whatever this says.
     pub split: SplitOptions,
+    /// Collect when the safepoint rises, no more often than this. `None` never collects by
+    /// itself.
+    ///
+    /// The gap is measured from the **end** of a sweep, which is what bounds it: see
+    /// [`crate::collect`]. `None` is the behaviour every store had before #70 — the safepoint
+    /// moves and nothing goes to act on it — and it is kept reachable because the acceptance
+    /// needs a control arm that cannot collect.
+    ///
+    /// **The default is conservative and provisional.** Five minutes is a number chosen to be
+    /// obviously safe rather than measured: a store hears a safepoint every ten seconds, so this
+    /// is thirty heartbeats' worth of quiet between whole-family rewrites. r1's run 127i is
+    /// timing what one sweep costs on a real cluster, and that measurement is what this should
+    /// finally be set from.
+    pub collect_debounce: Option<std::time::Duration>,
 }
 
 /// How this store's region is replicated.
@@ -238,6 +253,7 @@ impl StoreOptions {
             pd_leader_wait: crate::PD_LEADER_WAIT,
             region_census: None,
             split: SplitOptions::new(),
+            collect_debounce: Some(crate::COLLECT_DEBOUNCE),
             engine: Options {
                 create_if_missing: true,
                 wal_sync_mode: WalSyncMode::Never,
@@ -269,6 +285,12 @@ pub struct Store {
     /// as the placement driver publishes safepoints ([`crate::gc`]). It holds the safepoint this
     /// store is working to, so there is no second copy of that number to keep in step.
     collector: Arc<MvccCollector>,
+    /// What goes and collects when the safepoint rises, or `None` when this store does not.
+    ///
+    /// Dropped with the store, and its `Drop` waits for a sweep in flight — a database closed
+    /// from under a compaction that is rewriting it is the crash test's scenario arriving by
+    /// accident.
+    sweeper: Option<collect::Sweeper>,
     /// Shared by every mutation, exclusive for `CompareAndSwap`. See the module docs.
     ///
     /// Only used by a store with no Raft peer. Once there is one, the Raft log is the
@@ -569,6 +591,10 @@ impl Store {
     /// **Must be called from inside a `tokio` runtime when [`StoreOptions::raft`] or
     /// [`StoreOptions::pd`] is set**: the peer connections and the heartbeat schedule are tasks.
     /// A store with neither is exactly phase 2's and needs no runtime at all.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear open sequence, and the order is the point: the collector before the                   engine, the peers after the store, the reclaim before the heartbeats. Each step                   carries the comment saying what it must not be moved past, and cutting it into                   helpers to buy two lines would put those reasons somewhere other than the                   sequence they are about."
+    )]
     pub fn open(path: impl AsRef<Path>, options: StoreOptions) -> Result<Arc<Self>> {
         let StoreOptions {
             store_id,
@@ -586,6 +612,7 @@ impl Store {
             region_heartbeat,
             region_census,
             split,
+            collect_debounce,
         } = options;
         // The collector is built before the engine, because the engine has to be opened *with*
         // it: a compaction filter is a column-family setting and this one belongs to `write`
@@ -597,6 +624,9 @@ impl Store {
         let data_dir = path.as_ref().to_path_buf();
         let runs_fs = Arc::clone(&fs);
         let db = Arc::new(open_engine(path, engine, fs, &collector)?);
+        // Started here rather than in the struct below, because `db` is moved into it and the
+        // worker outlives that expression.
+        let sweeper = collect_debounce.map(|gap| collect::Sweeper::start(Arc::clone(&db), gap));
         load_retention(&db, &collector);
 
         discard_interrupted_snapshots(&db)?;
@@ -651,6 +681,7 @@ impl Store {
             store_id,
             limits,
             collector,
+            sweeper,
             write_gate: RwLock::new(()),
             transport,
             raft,
@@ -3420,6 +3451,14 @@ impl Store {
     /// two would drift.
     pub fn raise_safepoint(&self, safepoint: u64) -> u64 {
         let now = self.collector.set_published(safepoint);
+        // **#70.** The number alone changes nothing; this is what goes and acts on it. Asked for
+        // here rather than at either caller because this is the funnel both of them come through,
+        // and a second place that raised a safepoint without asking would be a store that
+        // collected on some safepoints and not others. A safepoint that did not actually move
+        // asks for nothing, which is most heartbeats.
+        if let Some(sweeper) = &self.sweeper {
+            sweeper.wanted(now);
+        }
         // The policy is re-read on every safepoint rather than cached for ever: a `retention`
         // DDL writes a catalog record and bumps nothing, deliberately (ADR 0021 decision 4), so
         // the collector's own next pass is where a change is meant to be picked up. A failure
@@ -3460,6 +3499,15 @@ impl Store {
     #[must_use]
     pub fn collector(&self) -> &Arc<MvccCollector> {
         &self.collector
+    }
+
+    /// What goes and collects when the safepoint rises, when this store does that at all.
+    ///
+    /// Exposed so a test can wait for a sweep exactly rather than sleeping, and so one can assert
+    /// that a flat cost curve was flat *because* something collected.
+    #[must_use]
+    pub fn sweeper(&self) -> Option<&collect::Sweeper> {
+        self.sweeper.as_ref()
     }
 
     /// Compacts the whole `write` column family, so the collector runs over every version now

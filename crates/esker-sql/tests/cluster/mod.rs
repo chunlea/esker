@@ -78,18 +78,38 @@ pub struct Cluster {
     runtime: Option<tokio::runtime::Runtime>,
 }
 
-async fn start_store(id: u64) -> (ServerHandle, tempfile::TempDir, Arc<Store>) {
+/// What a cluster is started with.
+///
+/// **Every field is off by default**, so that the harness the other tests use is the one it has
+/// always been: three stores at the engine's own 64 MiB write buffer, neither of which collects by
+/// itself. Two tests need something else and each says so at its own `Cluster::start_with`, which
+/// is a good deal easier to find than an environment variable.
+#[derive(Clone, Copy, Default)]
+pub struct Settings {
+    /// Memtable bytes before a flush, or `None` for the engine's own.
+    ///
+    /// `natural_compaction` turns it down because its question is about the level scores, and at
+    /// the default this workload writes ~36 KiB per store per round — a hundred rounds short of a
+    /// single flush, which is run 127e's finding and not an answer to anything.
+    pub write_buffer_size: Option<usize>,
+    /// Collect when the safepoint rises, with no debounce at all.
+    ///
+    /// The real default is five minutes, which is the right cadence for a store that runs for days
+    /// and the wrong one for a test that runs for thirty seconds.
+    pub collecting: bool,
+}
+
+async fn start_store(id: u64, settings: Settings) -> (ServerHandle, tempfile::TempDir, Arc<Store>) {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let store = Store::open(
-        dir.path(),
-        StoreOptions {
-            store_id: id,
-            peer_id: id,
-            region_id: id,
-            ..StoreOptions::new()
-        },
-    )
-    .expect("the store opens");
+    let mut options = StoreOptions::new();
+    options.store_id = id;
+    options.peer_id = id;
+    options.region_id = id;
+    options.collect_debounce = settings.collecting.then_some(std::time::Duration::ZERO);
+    if let Some(size) = settings.write_buffer_size {
+        options.engine.cf_options.write_buffer_size = size;
+    }
+    let store = Store::open(dir.path(), options).expect("the store opens");
     let handle = esker_proto::transport::Server::bind(
         "127.0.0.1:0",
         StoreService::new(Arc::clone(&store)),
@@ -118,12 +138,17 @@ fn route(id: u64, start: &[u8], end: &[u8]) -> Route {
 impl Cluster {
     /// Starts three stores on a runtime of its own, for a synchronous test.
     pub fn start() -> Self {
+        Self::start_with(Settings::default())
+    }
+
+    /// The same, with something other than the defaults. See [`Settings`].
+    pub fn start_with(settings: Settings) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
             .build()
             .expect("a runtime");
-        let mut cluster = runtime.block_on(Cluster::start_on_this_runtime());
+        let mut cluster = runtime.block_on(Cluster::start_on_this_runtime_with(settings));
         cluster.runtime = Some(runtime);
         cluster
     }
@@ -131,9 +156,14 @@ impl Cluster {
     /// The same, on the caller's runtime — for a test that is already inside one, where building
     /// a second would panic.
     pub async fn start_on_this_runtime() -> Self {
+        Self::start_on_this_runtime_with(Settings::default()).await
+    }
+
+    /// The same, with something other than the defaults. See [`Settings`].
+    pub async fn start_on_this_runtime_with(settings: Settings) -> Self {
         let mut started = Vec::new();
         for id in 1..=3 {
-            started.push(start_store(id).await);
+            started.push(start_store(id, settings).await);
         }
         let addresses: Vec<_> = started
             .iter()
@@ -201,6 +231,96 @@ impl Cluster {
         self.stores
             .iter()
             .filter_map(|store| store.property(name))
+            .filter_map(|value| value.parse::<u64>().ok())
+            .sum()
+    }
+
+    /// What every store is holding: entries, and the SSTs they are spread over.
+    ///
+    /// **Two numbers, because they fail differently.** Entries are what #58's space half is
+    /// about; the file count is what a read pays directly — run 127h measured
+    /// `corr(seconds, SSTs standing) = +0.58` over twenty identical repeats, against `+0.65` for
+    /// the entries inside them. A store that held its entry count still while its file count
+    /// climbed would be one that had stopped growing and kept getting slower, and one number
+    /// alone would call that a pass.
+    pub fn standing(&self) -> (u64, u64) {
+        self.stores
+            .iter()
+            .filter_map(|store| store.cf_entries().ok())
+            .flatten()
+            .fold((0, 0), |(entries, ssts), family| {
+                (entries + family.entries, ssts + family.ssts)
+            })
+    }
+
+    /// Files per level, summed over every store and every column family.
+    ///
+    /// The shape and not just the count: one file in L0 and one in L6 are the difference between
+    /// versions that are all still there and versions that were merged away, and a total hides
+    /// exactly that (ADR 0109 is why the RPC carries the level at all).
+    pub fn levels(&self) -> std::collections::BTreeMap<u32, usize> {
+        let mut per_level = std::collections::BTreeMap::new();
+        for store in &self.stores {
+            for family in store.sst_files().into_iter().flatten() {
+                for (level, _) in family.files {
+                    *per_level.entry(level).or_default() += 1;
+                }
+            }
+        }
+        per_level
+    }
+
+    /// The highest collection safepoint any store is working to.
+    ///
+    /// A **denominator**: "the store stopped growing" is satisfied perfectly by a cluster in which
+    /// no version was ever collectable, and this is how a test says the measurement took place.
+    pub fn safepoint(&self) -> u64 {
+        self.stores
+            .iter()
+            .map(|store| store.safepoint())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Publishes a collection safepoint to every store — **and does nothing else**.
+    ///
+    /// This is the whole of what a store's heartbeat delivers
+    /// ([ADR 0110](../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)):
+    /// PD answers with a number, the store raises its own, and that is the end of the exchange.
+    /// [`Cluster::collect_everything`] is the other one — it flushes and compacts too — and a
+    /// test asking "does raising the safepoint make the store collect?" must use **this** one,
+    /// or it does the work it is trying to observe.
+    ///
+    /// Publishing at `now` is the small-retention case: the safepoint is
+    /// `min(now - retention, oldest active read)`, and with no transaction held open and a
+    /// retention an operator has turned down, that is `now`. Reads taken after this are above
+    /// it, so decision 5's floor refuses nothing.
+    pub fn publish_safepoint(&self) -> u64 {
+        let now = self
+            .oracle
+            .timestamp()
+            .expect("a timestamp to publish as the safepoint");
+        self.stores
+            .iter()
+            .map(|store| store.raise_safepoint(now))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Bytes the memtables are holding, across every store and every column family.
+    ///
+    /// The counterpart to [`Cluster::standing`], which sees only what has been flushed: at the
+    /// default 64 MiB write buffer a short workload never flushes at all, so a probe that asked
+    /// only about SSTs would report a store that holds nothing while it holds everything.
+    pub fn memtable_bytes(&self) -> u64 {
+        self.stores
+            .iter()
+            .flat_map(|store| {
+                store
+                    .cf_names()
+                    .into_iter()
+                    .filter_map(|cf| store.property(&format!("esker.mem-table-size.{cf}")))
+            })
             .filter_map(|value| value.parse::<u64>().ok())
             .sum()
     }
