@@ -22,9 +22,12 @@
 //! `lower_type` and the ordinary literal path because `sqlparser` has a `DataType` for it, while
 //! `oidvector` is a `CastTarget` and goes down a path written for `ARRAY[…]::oidvector` alone.
 //!
-//! **The second row is not this unit.** `text::regclass[]` is `0A000` — the same runtime `reg*`
-//! resolution hole as family **F8**'s `regclass`/`regclass[]` parameter rows, and it should be
-//! closed with them rather than twice.
+//! **The second row was not this unit and is now closed too**, in
+//! `tests/regclass_array_from_text.rs`: `text -> regclass[]` has no `pg_cast` row, so it is the
+//! target's **input function** — `array_in` with `regclassin` per element — and the per-element
+//! name resolution is the executor's rule carried into the row evaluator. So the sweep's two
+//! refusals are both gone, and `'<value>'::text::<T>` is accepted for all 100 spellings here as
+//! it is on 19beta1.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
