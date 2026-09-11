@@ -1,0 +1,23 @@
+crates/esker-sql/src/exec/cursor.rs
+  s_b249f065cef854::t_f05a4c2cec7d01 2622-2628,2746-2751,2775,2777-2783,2788-2794,4715,4720-4734
+crates/esker-sql/tests/captures/pg19_cast_matrix.txt
+  s_b249f065cef854::t_8391f2fcbcd61c 141-142,148-152
+crates/esker-sql/tests/cast_matrix.rs
+  s_b249f065cef854::t_ef665126367f95 392-451
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e0628eca8fa7be2259f0a030db9a9cc520ccdd63",
+  "prompts": {},
+  "sessions": {
+    "s_b249f065cef854": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7c1a94ab-56c5-4769-8981-7863defc92e8",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
