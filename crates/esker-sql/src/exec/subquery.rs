@@ -413,8 +413,27 @@ fn plan_derived(
             generated_virtual: false,
             comment: None,
             dropped: false,
-            user_type: None,
+            // **The user-defined type travels with the column**, so one clause of wrapping does
+            // not take it off. An enum is stored as its label's ordinal and rendered through the
+            // catalog on the way out (ADR 0050), and every reader that tells a client what a
+            // column is — `pg_typeof`, the `RowDescription` oid, the value's own rendering — asks
+            // `Scope::user_type_at`, which looks this oid up in the table's `enums`. Left `None`,
+            // `SELECT pg_typeof(v) FROM (SELECT m AS v FROM t) s` was `smallint` where 19beta1
+            // says `mood`, and the ordinal reached the client in place of the label
+            // (`debts-v1.1.md` #57's third gap).
+            user_type: output.user_type.as_ref().map(|def| def.oid),
         })
+        .collect();
+    // **Both halves, because they are one fact.** The oid above is only a key; the labels live
+    // here, and `exec::assign::user_type_of` is the lookup that needs both. Built from the
+    // sub-select's own output columns rather than copied from the tables underneath, because a
+    // derived table's columns are its target list — `SELECT 'sad'::mood AS v` has a user type and
+    // no column beneath it at all.
+    let enums: std::collections::BTreeMap<u64, crate::catalog::TypeDef> = planned
+        .columns
+        .iter()
+        .filter_map(|output| output.user_type.as_ref())
+        .map(|def| (def.oid, def.clone()))
         .collect();
     derived.def = Some(std::sync::Arc::new(crate::catalog::TableDef {
         matview: None,
@@ -431,8 +450,12 @@ fn plan_derived(
         // field. Left empty because it is the truth: there is no constraint here to name.
         primary_key_name: String::new(),
         schema_version: 1,
-        // Synthetic: built here rather than read, and nothing is derived.
-        hydrated: Some(Hydrated::default()),
+        // Synthetic: built here rather than read, and the one derived thing it has is the user
+        // types its columns were declared as, which came down with the sub-select's own.
+        hydrated: Some(Hydrated {
+            enums,
+            ..Hydrated::default()
+        }),
         checks: Vec::new(),
         foreign_keys: Vec::new(),
         triggers_disabled: false,
