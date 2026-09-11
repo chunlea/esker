@@ -11,18 +11,24 @@
 //! corpus at three tables passes while the suite hangs. The only thing that can catch it is the
 //! shape of the curve, so that is what this asserts.
 //!
-//! # Asserted as a ratio, with a control
+//! # Asserted as a plan and a read count; the clock is printed
 //!
-//! The shape `a_scan_costs_its_range_and_not_the_store` established and
-//! `one_catalog_read_serves_every_regclass_in_a_statement` reused: the same statement over a
-//! catalog of *n* relations and one of *2n*. A plan whose work is what the statement selects costs
-//! about twice as much for twice the catalog; a plan that enumerates the cross product of five
-//! relations costs far more. Measured on the code this test was written against, the curve was
-//! **4 tables 98 ms, 6 362 ms, 8 935 ms, 10 2.04 s, 12 3.92 s, 14 6.90 s** — 3.5× the catalog for
-//! 70× the time.
+//! It was a **ratio over the wall clock** — `big < small * 4 + 200ms` for twice the catalog — and
+//! that is not a thing a gate can carry: the sibling assertion in `catalog_read_slope.rs` went red
+//! on 2026-09-11 on a gate whose own diff did not touch this crate, at 3.1× under a load of 8 to
+//! 11 (#59). Measured on the code this test was written against, the curve it was built to catch
+//! was **4 tables 98 ms, 6 362 ms, 8 935 ms, 10 2.04 s, 12 3.92 s, 14 6.90 s** — 3.5× the catalog
+//! for 70× the time — and that shape is now asserted where it lives rather than where it shows:
 //!
-//! The control is a statement over the same catalog that *must* grow with it, so a slow machine or
-//! a busy container moves both numbers and the comparison still means what it says.
+//! * **the plan**: a comma join's `WHERE` equality has to be a **join condition**, which is what
+//!   stops the loop building every pair and then filtering (`debts-v1.1.md` #54, fixed
+//!   2026-09-11). `EXPLAIN` is where this node writes that down;
+//! * **the read count**: the second run of the statement reads the two views' version counters and
+//!   nothing else (#49 (b)), which `stmt_stats` counts.
+//!
+//! Neither can flake on a busy box, and between them they say what the ratio said: the work is
+//! what the statement selects, not the catalog crossed. The timings are printed — they are what a
+//! reader wants when both look right and the statement still feels slow.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -85,12 +91,39 @@ fn pk_and_sequence_for_costs_what_it_selects_and_not_the_catalog_crossed() {
     let big_control = elapsed(&mut node, CONTROL);
     let big = elapsed(&mut node, PK_AND_SEQUENCE_FOR);
 
+    // **The plan, which is where the cross product would be.** The five-relation `FROM` list is
+    // comma separated, so every one of its equalities has to reach a join; one left in a `Filter`
+    // above the loop is the shape that made this statement quadratic.
+    let plan = node
+        .rows(&format!("EXPLAIN {PK_AND_SEQUENCE_FOR}"))
+        .into_iter()
+        .map(|row| row.join(" "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let joins = plan.matches("Join Filter").count();
     assert!(
-        big < small * 4 + Duration::from_millis(200),
-        "twice the catalog took {big:?} where half of it took {small:?} — the five-relation FROM \
-         list is being enumerated as a cross product rather than filtered as it is joined. The \
-         control over the same two catalogs went {small_control:?} -> {big_control:?}, so the \
-         machine is not what changed."
+        joins >= 4,
+        "a five-relation comma join needs four join conditions and the plan has {joins}, so the \
+         rest are pairs built and then filtered — which is what makes this statement quadratic in \
+         the catalog:\n{plan}"
+    );
+    // **The control for the string**: a product with no condition names no join filter at all, so
+    // the count above is known to be counting something a plan does not always say.
+    let product = node
+        .rows("EXPLAIN SELECT count(*) FROM pg_class seq, pg_depend dep")
+        .into_iter()
+        .map(|row| row.join(" "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !product.contains("Join Filter"),
+        "a product with no condition named a join filter, so the count above proves nothing:\n\
+         {product}"
+    );
+
+    // **Printed, not asserted**: a wall clock on a shared box is not a gate. See the header.
+    println!(
+        "6 relations {small:?}, 12 relations {big:?}; control {small_control:?} -> {big_control:?}"
     );
 }
 

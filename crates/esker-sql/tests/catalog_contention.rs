@@ -209,8 +209,14 @@ fn a_reader_meeting_a_ddls_commit_on_the_version_counter_does_not_wait() {
         1,
         "the reader sees the catalog as it was before the uncommitted DDL"
     );
-    assert!(
-        took < Duration::from_secs(1),
-        "the reader must not wait behind the counter at all, and it waited {took:?}"
-    );
+    // **Printed, not asserted.** This was `took < Duration::from_secs(1)`, and a wall clock on a
+    // shared box is not a gate — the sibling ratio in `catalog_read_slope.rs` went red on
+    // 2026-09-11 on a gate whose own diff did not touch this crate (#59). What the clock was
+    // guarding is already asserted above and asserted better: a reader that waits behind this
+    // counter does not answer late, it is **refused** — `40001 … a lock from the transaction at N
+    // could not be cleared for a read`, after the client has spent its whole resolution budget —
+    // and that refusal is the `panic!` two screens up. The remaining case a ceiling could catch is
+    // "waited, but under a second", which is a thing this node has no way to do: the wait ends in
+    // the refusal or it never happens.
+    println!("the reader answered in {took:?} with an uncommitted DDL in flight");
 }
