@@ -1,0 +1,31 @@
+crates/esker-cli/src/args.rs
+  s_ac192c209f55d3::t_cdc2aef5e1c382 196-198,1454,1512-1518,1540,2412
+crates/esker-cli/src/cluster.rs
+  s_ac192c209f55d3::t_864d35e06fc12a 5-17,69-76,79-82,114-130,142,157,180,182,185-191,195,197-199,202-204,214-255,257,274-280,286-289,291-306,310-316,330-332,370-373,388,395,398,401,428-440,461,475-481,493,499-500,512-513,519,537-540,558-562,634-635,759,793,829,832-836,841-845,847,879-884,888-891,893-902,922,939-949,963-965,968-973,975,979,981,985-986,988,991,993-1003,1006-1008,1013-1019,1028,1096,1099-1116,1267,1281-1282,1293,1300-1301,1315,1335,1337-1338,1340,1343-1344,1347,1349-1350
+crates/esker-cli/src/durability.rs
+  s_ac192c209f55d3::t_79ad0774992709 478-481
+crates/esker-cli/tests/cluster_pd_group.rs
+  s_ac192c209f55d3::t_5d584b8ca5b67a 1-229
+crates/esker-cli/tests/cluster_start.rs
+  s_ac192c209f55d3::t_a54cc07805f3f9 270
+crates/esker-cli/tests/columnar_cluster.rs
+  s_ac192c209f55d3::t_2c29e52d5c283d 79
+docs/adr/0108-a-cluster-starts-n-placement-drivers-and-every-client-follows-the-leader.md
+  s_ac192c209f55d3::t_cc808e3e3a7154 183-187
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "36f51b4931a1a6f04325797589deea2c9bcd60fb",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
