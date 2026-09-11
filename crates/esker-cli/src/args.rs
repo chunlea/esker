@@ -200,7 +200,8 @@ Commands:
                         its own prefix under the one given). --pd also starts placement
                         drivers on the ports above the nodes -- one, or --pd-nodes N
                         founding one group -- and points every node at all of them,
-                        which is what a SQL node needs to be given with --pd
+                        which is what a SQL node needs to be given with --pd.
+                        --retention-ms MS is handed to each of them (ADR 0110)
   pd serve|inspect|status
                         Run the placement driver, print what a stopped one has
                         stored, or ask a running one what it is doing
@@ -1309,6 +1310,20 @@ fn server_knob(flag: &str) -> &'static str {
 }
 
 /// A `u64` flag value that must be above zero.
+/// A count of milliseconds, **zero included**.
+///
+/// The sibling of [`positive_u64`] that does not reject zero, because the flag it reads forwards
+/// to one that does not: a retention window of zero means "the safepoint is the present", which is
+/// exactly what a measurement wanting to watch a collection happen asks for. A passthrough that
+/// refused a value the command it forwards to accepts would be a second, stricter parser for one
+/// flag.
+fn millis_u64(raw: &str, flag: &'static str) -> Result<u64, ParseError> {
+    raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+        flag,
+        value: raw.to_owned(),
+    })
+}
+
 fn positive_u64(raw: &str, flag: &'static str) -> Result<u64, ParseError> {
     raw.parse::<u64>()
         .ok()
@@ -1527,6 +1542,11 @@ fn parse_bench_mpp(arguments: &[String]) -> Result<Command, ParseError> {
     Ok(Command::BenchMpp(options))
 }
 
+/// The same flat dispatch as [`parse_server`], and long for the same reason: eleven flags, each
+/// beside the local it sets. It sat at exactly the hundred-line limit, so `--retention-ms` is the
+/// flag that tipped it — and splitting the loop to buy three lines would put a flag and its
+/// meaning in two places, which is the trade that comment refuses.
+#[allow(clippy::too_many_lines)]
 fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
     let Some(action) = arguments.first() else {
         return Err(ParseError::MissingArgument("cluster <start|stop>"));
@@ -1546,6 +1566,7 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
     let mut pd_nodes = 1_u64;
     let mut no_respawn = false;
     let mut region_census_ms: Option<u64> = None;
+    let mut retention_ms: Option<u64> = None;
     let mut index = 0;
 
     while index < rest.len() {
@@ -1613,6 +1634,10 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
                 let raw = take_value(rest, &mut index, inline, "--region-census-ms")?;
                 region_census_ms = Some(positive_u64(&raw, "--region-census-ms")?);
             }
+            "--retention-ms" => {
+                let raw = take_value(rest, &mut index, inline, "--retention-ms")?;
+                retention_ms = Some(millis_u64(&raw, "--retention-ms")?);
+            }
             other if other.starts_with('-') => {
                 return Err(ParseError::UnknownFlag(other.to_owned()));
             }
@@ -1632,6 +1657,7 @@ fn parse_cluster(arguments: &[String]) -> Result<Command, ParseError> {
             pd_nodes,
             no_respawn,
             region_census_ms,
+            retention_ms,
         })),
         "stop" => Ok(Command::Cluster(ClusterOptions::Stop { data_dir })),
         other => Err(ParseError::UnknownCommand(format!("cluster {other}"))),
@@ -2504,6 +2530,7 @@ mod tests {
             pd_nodes: _,
             no_respawn,
             region_census_ms,
+            retention_ms,
         }) = parse_ok(&[
             "cluster",
             "start",
@@ -2524,6 +2551,10 @@ mod tests {
         assert_eq!(
             write_buffer_size, None,
             "and keeps the engine's memtable size"
+        );
+        assert_eq!(
+            retention_ms, None,
+            "and leaves the retention window to `pd serve`"
         );
         assert!(!pd, "a cluster starts no placement driver unless asked");
         assert!(
@@ -2546,6 +2577,26 @@ mod tests {
         assert!(
             parse(["cluster", "start", "--region-census-ms", "0"].into_iter()).is_err(),
             "a census every zero milliseconds is a busy loop, not a cadence"
+        );
+
+        let Command::Cluster(ClusterOptions::Start { retention_ms, .. }) =
+            parse_ok(&["cluster", "start", "--retention-ms", "1000"])
+        else {
+            panic!("expected a cluster start");
+        };
+        assert_eq!(
+            retention_ms,
+            Some(1_000),
+            "the window a cluster is started with is the one its drivers get"
+        );
+        let Command::Cluster(ClusterOptions::Start { retention_ms, .. }) =
+            parse_ok(&["cluster", "start"])
+        else {
+            panic!("expected a cluster start");
+        };
+        assert_eq!(
+            retention_ms, None,
+            "without the flag the drivers keep `pd serve`'s own default"
         );
 
         let Command::Cluster(ClusterOptions::Start { no_respawn, .. }) =

@@ -97,6 +97,15 @@ pub(crate) enum ClusterOptions {
         /// Off by default, and a diagnostic: nothing reads it. Passed straight through to
         /// `esker server --region-census-ms` (`esker_store::census`).
         region_census_ms: Option<u64>,
+        /// How far behind the present each spawned driver puts the collection safepoint.
+        ///
+        /// Passed straight through to `esker pd serve --retention-ms`, and `None` leaves that
+        /// command's own default. It belongs here rather than in `Tuning` because nothing about
+        /// it reaches a store: the window is PD's, and a store learns only the number PD
+        /// publishes ([ADR 0110](../../../../docs/adr/0110-who-publishes-the-garbage-collection-safepoint.md)).
+        /// A measurement wanting to see collection happen in minutes rather than in an hour has
+        /// no other way to ask for it — which is what stopped run 127i.
+        retention_ms: Option<u64>,
     },
     /// Stop a cluster `start` launched.
     Stop {
@@ -136,6 +145,7 @@ pub(crate) fn run(options: &ClusterOptions) -> Result<(), String> {
             pd_nodes,
             no_respawn,
             region_census_ms,
+            retention_ms,
         } => start(
             *nodes,
             data_dir,
@@ -150,6 +160,7 @@ pub(crate) fn run(options: &ClusterOptions) -> Result<(), String> {
                 pd: *pd,
                 pd_nodes: *pd_nodes,
                 respawn: !*no_respawn,
+                retention_ms: *retention_ms,
             },
         ),
         ClusterOptions::Stop { data_dir } => stop(data_dir),
@@ -214,12 +225,13 @@ fn start_drivers(
     binary: &Path,
     data_dir: &Path,
     group: &[String],
+    retention_ms: Option<u64>,
     children: &mut Vec<Supervised>,
     launched: &mut Vec<Node>,
 ) -> Result<(), String> {
     for (at, address) in group.iter().enumerate() {
         let member = at as u64 + 1;
-        let (node, mut child) = start_pd(binary, data_dir, address, member, group)?;
+        let (node, mut child) = start_pd(binary, data_dir, address, member, group, retention_ms)?;
         if let Err(error) = wait_until_the_driver_answers(address, &mut child, PD_START_TIMEOUT) {
             let _ = child.kill();
             // The members already up are stopped too: a half-formed group is one that cannot
@@ -245,8 +257,9 @@ fn start_pd(
     address: &str,
     member: u64,
     group: &[String],
+    retention_ms: Option<u64>,
 ) -> Result<(Node, Child), String> {
-    let child = pd_command(binary, data_dir, address, member, group)
+    let child = pd_command(binary, data_dir, address, member, group, retention_ms)
         .spawn()
         .map_err(|error| format!("starting placement driver {member}: {error}"))?;
     Ok((
@@ -271,6 +284,7 @@ fn pd_command(
     address: &str,
     member: u64,
     group: &[String],
+    retention_ms: Option<u64>,
 ) -> Process {
     let mut process = Process::new(binary);
     process
@@ -285,6 +299,12 @@ fn pd_command(
         .arg(address)
         .arg("--id")
         .arg(member.to_string());
+    // **Absent means absent.** `pd serve` has its own default window and a flag carrying it
+    // would be this command asserting a value it was never given — so a cluster started without
+    // `--retention-ms` produces exactly the command line every existing invocation produced.
+    if let Some(window) = retention_ms {
+        process.arg("--retention-ms").arg(window.to_string());
+    }
     if group.len() > 1 {
         // **Founding, not joining.** Every member is handed the same list, so the group id is
         // derived from it once and written down (ADR 0061); `--join` is for adding a member to a
@@ -324,6 +344,13 @@ struct Layout<'a> {
     /// Every placement driver's address, once they are known to be listening. Empty without
     /// `--pd`.
     pd: &'a [String],
+    /// `--retention-ms` for a driver this supervisor restarts.
+    ///
+    /// Here as well as in [`Supervision`] for the reason `write_buffer_size` is in both: a
+    /// restart rebuilds the command line, and one that dropped the window would replace a driver
+    /// collecting on a minute's retention with one collecting on an hour's — the cluster looking
+    /// healthy while the measurement it was started for quietly stopped.
+    retention_ms: Option<u64>,
     /// `id@address` for every node, which every node is told in full.
     peers: &'a [String],
 }
@@ -472,7 +499,14 @@ fn start(
         .into_iter()
         .flatten()
         .collect();
-    start_drivers(&binary, data_dir, &pd, &mut children, &mut launched)?;
+    start_drivers(
+        &binary,
+        data_dir,
+        &pd,
+        supervision.retention_ms,
+        &mut children,
+        &mut launched,
+    )?;
 
     // Named once and used twice: `spawn_stores` starts them and the supervisor restarts them, and
     // a store is whatever this says it is.
@@ -485,6 +519,7 @@ fn start(
         write_buffer_size: tuning.write_buffer_size,
         region_census_ms: tuning.region_census_ms,
         pd: &pd,
+        retention_ms: supervision.retention_ms,
         peers: &peers,
     };
     if let Err(error) = spawn_stores(&binary, &layout, &mut children, &mut launched) {
@@ -585,6 +620,8 @@ struct Supervision {
     pd_nodes: u64,
     /// Restart a store that exits.
     respawn: bool,
+    /// `--retention-ms` for each driver, or the `pd serve` default.
+    retention_ms: Option<u64>,
 }
 
 const SUPERVISE_TICK: Duration = Duration::from_millis(250);
@@ -661,6 +698,7 @@ fn restart_command(
         address,
         member as u64 + 1,
         layout.pd,
+        layout.retention_ms,
     ))
 }
 
@@ -801,7 +839,56 @@ fn wait_for_interrupt(
 mod tests {
     use std::path::Path;
 
-    use super::{DEFAULT_BASE_PORT, address_of, dir_of};
+    use super::{DEFAULT_BASE_PORT, address_of, dir_of, pd_command};
+
+    /// One spawned command line, as strings, so a test can say what is on it.
+    fn command_line(process: &std::process::Command) -> Vec<String> {
+        process
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// `cluster start --retention-ms` reaches the drivers it spawns.
+    ///
+    /// **Both halves, because only the pair is a forwarding.** A command line that always carried
+    /// the flag would pass the first assertion while overriding `pd serve`'s own default for
+    /// every cluster ever started here, so the absent case is the one that says this is a
+    /// passthrough and not a new default.
+    ///
+    /// Run 127i needed this: its arms drive the cluster through `cluster start --pd`, which spawns
+    /// the driver itself, and the window is the only way to make a collection observable in
+    /// minutes rather than in the hour `pd serve` otherwise waits (ADR 0110).
+    #[test]
+    fn a_cluster_hands_its_retention_window_to_every_driver_it_starts() {
+        let group = vec!["127.0.0.1:9100".to_owned()];
+        let with = command_line(&pd_command(
+            Path::new("esker"),
+            Path::new("/tmp/cluster"),
+            &group[0],
+            1,
+            &group,
+            Some(1_000),
+        ));
+        assert!(
+            with.windows(2)
+                .any(|pair| pair == ["--retention-ms", "1000"]),
+            "the driver was started without the window the cluster was given: {with:?}"
+        );
+
+        let without = command_line(&pd_command(
+            Path::new("esker"),
+            Path::new("/tmp/cluster"),
+            &group[0],
+            1,
+            &group,
+            None,
+        ));
+        assert!(
+            !without.iter().any(|arg| arg == "--retention-ms"),
+            "a cluster that was not given a window asserted one anyway: {without:?}"
+        );
+    }
 
     /// The addresses and directories are derived, not allocated: `esker raw --addr` against node 1
     /// has to be predictable without reading a file.
