@@ -1,0 +1,31 @@
+docs/DESIGN.md
+  s_e59614afdddccb::t_723b09472730f0 229-236,836-840
+docs/adr/0111-a-deleted-keys-versions-are-dropped-as-one-segment.md
+  s_e59614afdddccb::t_a6e68dca763985 1-225
+crates/esker-store/src/collect.rs
+  s_ac192c209f55d3::t_368eaeb6bea26c 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a5a3959f42420f5cb175073bde3bcadf1dca4700",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    },
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
