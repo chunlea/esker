@@ -92,6 +92,16 @@ impl Safepoints {
         self.reporters
             .retain(|_, reporter| now.saturating_sub(reporter.heard) <= ttl);
 
+        // **Nobody reporting is not the same as nobody reading.** A reporter that says `None` has
+        // told this registry something — it has nothing open — and the window may apply. An empty
+        // registry has told it nothing at all: PD has just restarted, or no client has reached it
+        // yet, and a long read could be open behind any of that silence. So the safepoint does not
+        // advance, and the store keeps what it has (ADR 0110: every unknown resolves to "collect
+        // less").
+        if self.reporters.is_empty() {
+            return self.published;
+        }
+
         // **Saturating, and that is the CountingOracle case.** A `now` whose physical half is zero
         // is smaller than any retention window expressed in milliseconds, so this floors at zero —
         // a safepoint of zero collects nothing, which is the direction that cannot lose data.
@@ -167,26 +177,63 @@ mod tests {
     /// Two assertions and not one, because each side is a different bug: releasing early collects
     /// history a live-but-quiet reader still needs, and never releasing lets one crashed client
     /// keep every version for ever.
+    ///
+    /// **Two reporters, so the TTL is what is being measured.** With one, its timing out empties
+    /// the registry and `an_empty_registry_does_not_advance_the_safepoint` takes over — a
+    /// different rule, and the test would be passing on it rather than on this one.
     #[test]
     fn a_silent_reporter_stops_pinning_after_its_ttl_and_not_before() {
         let mut safepoints = Safepoints::new(WINDOW_MS, TTL_MS);
         let began = ts(1_000);
         let heard = ts(3_600_000);
+        // One holding a long read, and one that keeps reporting with nothing open.
         safepoints.report(1, Some(began), heard);
+        safepoints.report(2, None, heard);
 
         // Quiet for less than the TTL: still holding.
-        let inside = safepoints.safepoint(heard + ts(TTL_MS - 1));
+        let inside = heard + ts(TTL_MS - 1);
+        safepoints.report(2, None, inside);
+        let held = safepoints.safepoint(inside);
         assert!(
-            inside <= began,
-            "a reporter quiet for less than its TTL stopped pinning: {inside} > {began}"
+            held <= began,
+            "a reporter quiet for less than its TTL stopped pinning: {held} > {began}"
         );
 
-        // Past it: gone, and the window is the answer again.
+        // Past it: gone, and the reporter still talking decides.
         let outside = heard + ts(TTL_MS + 1);
+        safepoints.report(2, None, outside);
         assert_eq!(
             safepoints.safepoint(outside),
             outside - ts(WINDOW_MS),
             "a reporter past its TTL is still pinning the safepoint"
+        );
+    }
+
+    /// **Silence is not "nothing open".** With no reporter at all — a PD that has just restarted,
+    /// or a cluster whose clients have not reached it yet — the safepoint does not move, however
+    /// long the window says it could.
+    ///
+    /// The pair to `with_no_reader_the_window_is_the_answer` above, and the distinction is the
+    /// whole of it: that one has a reporter *saying* it holds nothing, which is information. This
+    /// one has no information, and the direction of an unknown is "collect less".
+    #[test]
+    fn an_empty_registry_does_not_advance_the_safepoint() {
+        let mut safepoints = Safepoints::new(WINDOW_MS, TTL_MS);
+
+        assert_eq!(
+            safepoints.safepoint(ts(3_600_000)),
+            0,
+            "PD published a safepoint without one reader having said anything"
+        );
+
+        // And a reporter that times out puts it back into that state rather than releasing.
+        safepoints.report(1, Some(ts(1_000)), ts(3_600_000));
+        let held = safepoints.safepoint(ts(3_600_000));
+        let long_after = ts(3_600_000) + ts(TTL_MS * 10);
+        assert_eq!(
+            safepoints.safepoint(long_after),
+            held,
+            "the last reporter timing out advanced the safepoint on nobody's word"
         );
     }
 
