@@ -37,11 +37,29 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Whether the instrument is on, read once from the environment.
+/// Turned on by a test rather than by the environment — see [`trace_every_read`].
+static FORCED: AtomicBool = AtomicBool::new(false);
+
+/// Turns the instrument **and** its trace on for this process, whatever the environment says.
+///
+/// **For a test whose subject is the trace.** `tests/catalog_read_slope.rs` asserts how many keys
+/// a statement reads, which is the acceptance test for `debts-v1.1.md` #49 — and one that only
+/// runs when somebody remembers two environment variables is one the gate never runs. The
+/// variables stay the way a *hunt* turns this on, against a released binary; this is the way a
+/// test does, in its own process.
+///
+/// It is one-way and process-wide, which is what makes it safe to read with a relaxed load: a
+/// reader that sees `false` late costs a missing line in a trace nobody is reading yet.
+pub fn trace_every_read() {
+    FORCED.store(true, Ordering::Relaxed);
+}
+
+/// Whether the instrument is on: [`trace_every_read`], or read once from the environment.
 #[must_use]
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("ESKER_STMT_STATS").is_some())
+    FORCED.load(Ordering::Relaxed)
+        || *ON.get_or_init(|| std::env::var_os("ESKER_STMT_STATS").is_some())
 }
 
 /// How slow a statement has to be before it gets a line of its own, in milliseconds.
@@ -82,7 +100,8 @@ thread_local! {
 #[must_use]
 pub fn tracing_reads() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| enabled() && std::env::var_os("ESKER_STMT_STATS_TRACE").is_some())
+    FORCED.load(Ordering::Relaxed)
+        || *ON.get_or_init(|| enabled() && std::env::var_os("ESKER_STMT_STATS_TRACE").is_some())
 }
 
 /// Statements finished, and what they did between them.

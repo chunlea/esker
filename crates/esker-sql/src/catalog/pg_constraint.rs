@@ -46,7 +46,6 @@
 use super::NO_LENGTH;
 use std::fmt::Write as _;
 
-use crate::backend::Txn;
 use crate::catalog::pg_relations::{self, RelKind, Relations};
 use crate::catalog::{IndexDef, TableDef, UniqueKind};
 use crate::error::Result;
@@ -189,11 +188,10 @@ fn check_of(oid: i64) -> Option<(u64, usize)> {
 const NO_FOREIGN_ACTION: &str = " ";
 
 /// Every `pg_constraint` row this tenant has.
-pub fn rows(txn: &dyn Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
-    Ok(rows_from(
-        &Relations::read(txn, tenant)?,
-        &super::schemas(txn, tenant)?,
-    ))
+pub fn rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
+    let relations = view.relations()?;
+    let schemas = view.schemas()?;
+    Ok(rows_from(&relations, &schemas))
 }
 
 /// The same, over a snapshot somebody else has already read — which is how

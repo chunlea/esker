@@ -1,12 +1,10 @@
-//! **The acceptance tests for `debts-v1.1.md` #49 option (b), written red and left red.**
+//! **The acceptance tests for `debts-v1.1.md` #49 option (b)** — written red before the work and
+//! read again after it.
 //!
 //! `docs/plans/debt-49-catalog-cache.md` is the plan and
-//! [ADR 0106](../../../docs/adr/0106-what-a-statement-reads-below-the-sql.md) is the decision it
-//! waits on. These are the two assertions that have to turn green when it lands, written now so
-//! that the target exists before the work does and cannot be chosen to fit it.
-//!
-//! **Both are `#[ignore]`d and both genuinely fail.** An ignored test that would have passed is
-//! worse than no test, so each was run and read before it was committed:
+//! [ADR 0106](../../../docs/adr/0106-what-a-statement-reads-below-the-sql.md) is the decision.
+//! Both tests below were run and read while they were still `#[ignore]`d, so that the target
+//! existed before the work did and could not be chosen to fit it:
 //!
 //! ```text
 //! one_statement_reads_no_key_twice
@@ -18,29 +16,46 @@
 //!   is 2x. Super-linear, and the control over the same two catalogs went 0.57 ms -> 3.38 ms.
 //! ```
 //!
-//! **The second one passed on its first draft** and had to be tightened: a 50 ms absolute slack,
-//! copied from an older test written at a different scale, swamped a 4.4x curve on numbers of two
-//! and eight milliseconds. That is the failure this file's own header warns about, met while
-//! writing it.
+//! # What landing option (b) did to each of them
 //!
-//! **Delete the `#[ignore]` when option (b) lands.** Nothing else about them should need changing;
-//! if one does, the change is not option (b).
+//! **The first is green**, and so is [`a_repeated_statement_reads_only_the_version_keys`], which
+//! was added when the second turned out to be measuring something else.
 //!
-//! # Why these two and not a slope alone
+//! **The second is still red, and it is no longer about #49.** Its scenario is right and its
+//! instrument is wrong: it is a *clock* on the in-process node, where a KV read costs nothing, so
+//! what it times is the work that is left after the reads are gone. Measured after option (b)
+//! landed, on the second run of `pk_and_sequence_for` at an unchanged version:
 //!
-//! The obvious acceptance test — *"the same statement over a catalog of n and of 5n, and the ratio
-//! must stop tracking n"* — is half of it, and on its own it is a **timing** assertion on a shared
-//! box. The other half is deterministic and is the one that actually names the defect:
-//! `pk_and_sequence_for` reads **one key sixteen times** and repeats **one five-read hydration
-//! bundle five times** inside a single statement, at one snapshot, where the answer cannot have
-//! changed. That is countable, it does not flake, and no catalog size is needed to see it.
+//! ```text
+//!  20 relations   4 reads   1.96 ms          <- the four version counters, and nothing else
+//! 100 relations   4 reads  14.38 ms
 //!
-//! **And a read count alone would be green for the wrong reason.** A tenant-wide *scan* is one
-//! read whatever it walks, so the number of reads barely moves with the catalog while the cost
-//! moves linearly with it — measured on run 117's tap, `pk_and_sequence_for` went 1,432 ms to
-//! 3,377 ms across one file as its catalog grew, 2.36x, which is the same 2.3x r1 measured between
-//! two files. So the count catches the repetition and the clock catches the size, and neither
-//! catches the other.
+//! and where those milliseconds are, per statement, at 20 -> 100 relations:
+//!     SELECT count(*) FROM pg_class                            164 us ->   639 us   3.9x
+//!     SELECT count(*) FROM pg_attribute                        316 us ->   737 us   2.3x
+//!     SELECT count(*) FROM pg_class, pg_namespace              371 us ->  1355 us   3.7x
+//!     SELECT count(*) FROM pg_class seq, pg_depend dep
+//!                    WHERE seq.oid = dep.objid               1552 us -> 24646 us  15.9x
+//! ```
+//!
+//! **The read count is flat and the clock is not**, which is the mirror image of the warning in
+//! the plan: a join of two *computed* catalog views is a cross product, and five times the catalog
+//! is twenty-five times the pairs. That is a planner defect, it is not in ADR 0106's option space,
+//! and no amount of caching reads touches it. So this test now waits on that rather than on #49 —
+//! see `esker-coord/QUESTION-b4.md`, which is where its rewrite is asked for rather than taken.
+//!
+//! # Why a count is the acceptance test and a clock is not
+//!
+//! On the real topology a KV read is **232 µs** ([ADR 0102](../../../docs/adr/0102-the-catalogs-read-path.md)),
+//! so the read count *is* the cost — run 117 put `pk_and_sequence_for` at 35 round trips and p50
+//! 2,382 ms. On the in-process node the same read is a `BTreeMap` lookup, so the clock here cannot
+//! see the change at all and times the executor instead. The count is also deterministic, which
+//! the clock on a shared box is not.
+//!
+//! What a count alone would miss is repetition *within* one statement, which is what the first
+//! test bounds, and the size of a scan — which is why the third test asserts an absolute number
+//! at two catalog sizes rather than a ratio: **a tenant-wide scan is one read whatever it walks**,
+//! so a ratio over sizes was green before the work and says nothing.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -90,18 +105,19 @@ fn elapsed(node: &mut parity::Node, sql: &str) -> Duration {
 /// `catalog::schema_exists`/`pg_relations::Relations::read` go around it, which is the whole of
 /// option (b).
 ///
-/// **Needs `ESKER_STMT_STATS=1 ESKER_STMT_STATS_TRACE=1`**, and says so by failing rather than by
-/// passing on an empty trace — a test whose instrument is off must not be a green tick.
+/// **Turns the instrument on itself** (`stmt_stats::trace_every_read`) and still asserts the trace
+/// is not empty — a test whose instrument is off must not be a green tick.
 #[test]
-#[ignore = "red until debts-v1.1.md #49 option (b) lands; see docs/plans/debt-49-catalog-cache.md"]
 fn one_statement_reads_no_key_twice() {
     /// One per catalog view a statement opens, and no more.
     const BOUND: usize = 2;
 
+    // **Turned on here rather than by the environment**, because this is the acceptance test and
+    // one that needs two variables set is one the gate never runs (`stmt_stats::trace_every_read`).
+    esker_sql::stmt_stats::trace_every_read();
     assert!(
         esker_sql::stmt_stats::tracing_reads(),
-        "this test reads the instrument's trace: run it with ESKER_STMT_STATS=1 \
-         ESKER_STMT_STATS_TRACE=1, or it cannot say anything"
+        "this test reads the instrument's trace and could not turn it on"
     );
     let mut node = parity::Node::new(&[
         "CREATE TABLE pk0 (id bigserial primary key, a int8, b text)",
@@ -157,7 +173,10 @@ fn one_statement_reads_no_key_twice() {
 /// **The control is a statement that must grow with the catalog**, so a slow container moves both
 /// numbers and the comparison still says what it says.
 #[test]
-#[ignore = "red until debts-v1.1.md #49 option (b) lands; see docs/plans/debt-49-catalog-cache.md"]
+#[ignore = "no longer #49's: after option (b) the second run reads 4 keys at every catalog size \
+            and the residue is a cross product between two computed catalog views \
+            (1.55 ms -> 24.6 ms for 5x the catalog). See this file's header and \
+            esker-coord/QUESTION-b4.md"]
 fn a_repeated_statement_stops_tracking_the_catalog() {
     /// What five times the catalog may cost, once the statement has been asked before.
     const BOUND: u32 = 2;
@@ -199,4 +218,65 @@ fn a_repeated_statement_stops_tracking_the_catalog() {
          relation in its FROM list. The control over the same two catalogs went {small_control:?} \
          -> {big_control:?}, so the machine is not what changed."
     );
+}
+
+/// **A statement asked a second time at an unchanged version reads only the version counters** —
+/// whatever the catalog holds.
+///
+/// The acceptance test for option (b), and the one that translates: on the real topology a read is
+/// a round trip, so this is `pk_and_sequence_for`'s **35 round trips** going to four.
+///
+/// **Red before option (b) at 60 reads** (`docs/bench/statement-reads.md`, the committed census),
+/// green after at 4 — and 4 at both catalog sizes, which is the half a ratio cannot state: a
+/// tenant-wide scan is one read whatever it walks, so "the count does not grow with the catalog"
+/// was true before the work as well. What was not true is the number.
+///
+/// The four are two catalog views' two counters each ([ADR 0105](../../../docs/adr/0105-a-catalog-read-never-waits.md)
+/// counts the same two, and `debts-v1.1.md` #50 is the one about making them one).
+///
+/// *The counterfactual*: take the memo off `View::relations` — the whole of the bundle's cache —
+/// and this is **red at 9 reads over twenty relations**, with the five whole-catalog loads back
+/// (`scan name(t1)…` and the four beside it). `one_statement_reads_no_key_twice` goes red with
+/// it, which is the two of them agreeing about one line.
+#[test]
+fn a_repeated_statement_reads_only_the_version_keys() {
+    /// Two catalog views, two counters each, and nothing else.
+    const BOUND: usize = 4;
+
+    // **Turned on here rather than by the environment**, because this is the acceptance test and
+    // one that needs two variables set is one the gate never runs (`stmt_stats::trace_every_read`).
+    esker_sql::stmt_stats::trace_every_read();
+    assert!(
+        esker_sql::stmt_stats::tracing_reads(),
+        "this test reads the instrument's trace and could not turn it on"
+    );
+    let mut node = parity::Node::new(&[]);
+    let mut made = 0;
+    for size in [20usize, 100] {
+        grow_to(&mut node, size, &mut made);
+        // The **first** run fills; what has to be flat is every run after it.
+        assert_eq!(
+            node.rows(PK_AND_SEQUENCE_FOR),
+            [["id", "public", "pk0_id_seq"]],
+            "the answer first, so a statement that got cheap by getting wrong fails here"
+        );
+        esker_sql::stmt_stats::clear_trace();
+        assert_eq!(
+            node.rows(PK_AND_SEQUENCE_FOR),
+            [["id", "public", "pk0_id_seq"]],
+            "the same one row over a catalog of {size}"
+        );
+        let trace = esker_sql::stmt_stats::last_trace();
+        assert!(
+            !trace.is_empty(),
+            "the trace is empty, so the statement was never instrumented and the bound below \
+             would pass by not looking"
+        );
+        assert!(
+            trace.len() <= BOUND,
+            "over {size} relations the second run of this statement read {} keys, not {BOUND}:\n    {}",
+            trace.len(),
+            trace.join("\n    ")
+        );
+    }
 }
