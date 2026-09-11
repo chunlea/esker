@@ -2622,7 +2622,7 @@ impl Executor {
         self.resolve_advisory(&mut statement)?;
         self.resolve_functional_notation(txn, &mut statement)?;
         self.resolve_regclass(txn, &mut statement)?;
-        self.resolve_user_cast(txn, &mut statement)?;
+        self.resolve_user_cast(txn, &mut statement, false)?;
         self.resolve_user_functions(txn, &mut statement)?;
         self.refuse_unavailable_functions(txn, &statement)?;
         Ok(statement)
@@ -3270,7 +3270,12 @@ impl Executor {
     ///
     /// **The projection is walked first**, because the general walk below rewrites every cast it
     /// finds and would leave nothing to tell the two positions apart.
-    fn resolve_user_cast(&self, txn: &dyn Txn, statement: &mut Statement) -> Result<()> {
+    fn resolve_user_cast(
+        &self,
+        txn: &dyn Txn,
+        statement: &mut Statement,
+        describing: bool,
+    ) -> Result<()> {
         use crate::plan::Expr;
 
         let mut failure = None;
@@ -3312,6 +3317,14 @@ impl Executor {
                     // pair `OID::Enum` is built from; taken here because this is the last place
                     // the type's name is still in the tree.
                     let named = Self::cast_target(&view, &mut types, expr, &path);
+                    if describing
+                        && let Some(stand_in) =
+                            Self::describing_stand_in(&view, &mut types, expr, &path)
+                    {
+                        *expr = stand_in;
+                        *user_type = named;
+                        continue;
+                    }
                     match Self::user_cast(&view, &mut types, expr, printed, &path) {
                         Ok(Some(resolved)) => {
                             *expr = resolved;
@@ -3325,19 +3338,130 @@ impl Executor {
                 }
             }
         }
-        let mut resolve =
-            |expr: &mut Expr| match Self::user_cast(&view, &mut types, expr, false, &path) {
+        let mut resolve = |expr: &mut Expr| {
+            if describing
+                && let Some(stand_in) = Self::describing_stand_in(&view, &mut types, expr, &path)
+            {
+                *expr = stand_in;
+                return;
+            }
+            match Self::user_cast(&view, &mut types, expr, false, &path) {
                 Ok(Some(resolved)) => *expr = resolved,
                 Ok(None) => {}
                 Err(error) => {
                     failure.get_or_insert(error);
                 }
-            };
+            }
+        };
         bind::walk_mut(statement, &mut resolve);
         match failure {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Every `$n` that a statement casts to a **user-defined type**, with that type's oid.
+    ///
+    /// What a `Describe` answers for its parameters, and `bind::infer` cannot: it speaks in
+    /// `ColumnType`s and none of them spells `mood`. Read off the statement as written — before
+    /// `Executor::resolve_user_cast` replaces the cast with a stand-in, which is the point at
+    /// which the parameter's *number* stops being visible.
+    fn user_typed_parameters(
+        &self,
+        txn: &dyn Txn,
+        statement: &Statement,
+    ) -> Result<Vec<(u32, u32)>> {
+        use crate::plan::{Expr, Literal};
+
+        let mut found = Vec::new();
+        let mut types = None;
+        let path = self.resolution_path(txn)?;
+        let view = self.catalog_view(txn)?;
+        let mut failure = None;
+        bind::for_each_expr(statement, &mut |expr| {
+            let Expr::CatalogFunc(call) = expr else {
+                return;
+            };
+            if call.func != crate::plan::CatalogFunc::UserCast {
+                return;
+            }
+            let (Some(Expr::Literal(Literal::String(name))), Some(Expr::Parameter(number))) =
+                (call.args.first(), call.args.get(1))
+            else {
+                return;
+            };
+            let known = match &mut types {
+                Some(known) => known,
+                None => match view.user_types() {
+                    Ok(known) => types.insert(known),
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                        return;
+                    }
+                },
+            };
+            if let Some(def) = Self::qualified_user_type(known, name, &path)
+                && let Ok(oid) = u32::try_from(def.oid)
+            {
+                found.push((*number, oid));
+            }
+        });
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(found),
+        }
+    }
+
+    /// **What a cast to a user type stands for while a statement is only being described.**
+    ///
+    /// `Describe` answers a statement's shape before any value is bound, so `$1::mood` cannot be
+    /// resolved the way `'sad'::mood` is: there is no label to look up yet. It still has a
+    /// **type**, and that is the whole of what a `Describe` is for — without one the cast stayed a
+    /// `CatalogFunc::UserCast` declaring the `int2` placeholder and
+    /// `SELECT … WHERE m = $1::mood` was refused `42883 operator does not exist: mood = smallint`
+    /// before the client ever sent a value (`debts-v1.1.md` #57 (b)).
+    ///
+    /// So a parameter under an enum cast becomes a stand-in of that enum: ordinal zero, carrying
+    /// the type's oid. The same shape `bind::substitute_placeholders` already uses one pass
+    /// over — *a placeholder carries a representation* — with the type beside it, and the value
+    /// is never evaluated because nothing runs during a `Describe`.
+    ///
+    /// `None` for everything else, including a cast whose operand is a literal: that one resolves
+    /// properly, here as in the execute path.
+    fn describing_stand_in(
+        view: &crate::catalog::View<'_>,
+        types: &mut Option<Arc<Vec<crate::catalog::TypeDef>>>,
+        expr: &crate::plan::Expr,
+        path: &[String],
+    ) -> Option<crate::plan::Expr> {
+        use crate::plan::{Expr, Literal};
+
+        let Expr::CatalogFunc(call) = expr else {
+            return None;
+        };
+        if call.func != crate::plan::CatalogFunc::UserCast {
+            return None;
+        }
+        let (Some(Expr::Literal(Literal::String(name))), Some(Expr::Parameter(_))) =
+            (call.args.first(), call.args.get(1))
+        else {
+            return None;
+        };
+        let known = match types {
+            Some(known) => known,
+            None => types.insert(view.user_types().ok()?),
+        };
+        let def = Self::qualified_user_type(known, name, path)?;
+        // Only an enum: every other kind's value *is* something `ColumnType` can spell — a
+        // domain is its base, a range is its representation, a composite is text — so a
+        // placeholder of the inferred type already describes them correctly.
+        if !matches!(def.kind, crate::catalog::TypeKind::Enum { .. }) {
+            return None;
+        }
+        Some(Expr::Literal(Literal::Typed {
+            value: Box::new(Datum::Int2(0)),
+            user: Some(def.oid),
+        }))
     }
 
     /// A user-defined type by the name a statement wrote, **schema and all**.
@@ -4893,7 +5017,20 @@ impl Executor {
         self.resolve_functional_notation(txn, &mut statement)?;
         let tables = self.tables_for(txn, &statement)?;
         let types = bind::infer(&statement, &tables, declared);
-        let parameters = types.iter().copied().map(ColumnType::oid).collect();
+        let mut parameters: Vec<u32> = types.iter().copied().map(ColumnType::oid).collect();
+        // **A parameter under a cast to a user type is declared as that type.** Measured on
+        // 19beta1 through `pg_prepared_statements.parameter_types`: `$1::mood` is `{mood}` in a
+        // comparison, in an `INSERT` and in a set operation's arm. `bind::infer` answers in
+        // `ColumnType`s, which cannot spell one, so the frame carried `text`'s 25 — and a driver
+        // reads this before it sends anything (`debts-v1.1.md` #57 (b)).
+        //
+        // Read **before** the casts are resolved, because resolving replaces the `$n` with a
+        // stand-in and the number is what this needs.
+        for (number, oid) in self.user_typed_parameters(txn, &statement)? {
+            if let Some(slot) = parameters.get_mut((number as usize).saturating_sub(1)) {
+                *slot = oid;
+            }
+        }
 
         // The expansion itself is still required, and for its own reason: a derived table's shape
         // is what a `Describe` answers, and before it `FROM v` reached `relation_of` as a table
@@ -4904,6 +5041,17 @@ impl Executor {
             self.expand_views(txn, select)?;
         }
 
+        // **A cast to a user type is resolved for a `Describe` too**, and it has to happen here:
+        // after `bind::infer` has counted and typed the parameters — replacing one would make a
+        // statement with a `$1` describe none — and before the placeholders go in, because a
+        // parameter under an enum cast becomes a stand-in **of that enum** rather than of the
+        // representation (`Executor::describing_stand_in`).
+        //
+        // Without this the `Describe` path was the only one that never ran this pass, so
+        // `SELECT … WHERE m = $1::mood` was `42883 operator does not exist: mood = smallint`
+        // before a value was ever bound — wire v3 family F11's shape, one pass over, and the half
+        // of `debts-v1.1.md` #57 (b) a driver actually meets, since `ActiveRecord` binds.
+        self.resolve_user_cast(txn, &mut statement, true)?;
         // Planning needs every expression to have a type, and a `$1` has none until now. Nothing
         // is run, so a placeholder of the right type is all the planner needs to answer the shape.
         bind::substitute_placeholders(&mut statement, &types);
