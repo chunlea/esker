@@ -1,0 +1,27 @@
+crates/esker-cli/src/bench_route.rs
+  s_e59614afdddccb::t_d23a0e5d5ec91b 79-82
+crates/esker-cli/src/durability.rs
+  s_e59614afdddccb::t_d7acc6eb54b3bb 50-52,55-58,76-80,82,84-87
+crates/esker-cli/src/raw.rs
+  s_e59614afdddccb::t_af77aaa3479b37 192-211
+crates/esker-cli/src/region.rs
+  s_e59614afdddccb::t_b2a67ccde0d97d 31,33,37-38,135-141,151,156-158,163,166-168,173-251,255-256,259-276,278-293
+crates/esker-cli/tests/durability_pd_failover.rs
+  s_e59614afdddccb::t_950b7fb8a563af 1-241
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "90070e0948cee7336d61304b6386f6ddfeb4bcfb",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
