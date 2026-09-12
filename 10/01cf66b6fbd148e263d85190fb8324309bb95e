@@ -1,0 +1,23 @@
+crates/esker-client/src/raw.rs
+  s_dc640bf0df4adb::t_229367c0ce8027 12,221-223,236-255,312-315,319-327,336-339,346,357
+crates/esker-client/tests/raw_scan_across_a_split.rs
+  s_dc640bf0df4adb::t_4014a2268c715d 1-182
+docs/DESIGN.md
+  s_dc640bf0df4adb::t_f3fc548ce96e4e 951-959
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1001cf66b6fbd148e263d85190fb8324309bb95e",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
