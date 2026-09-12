@@ -1,0 +1,29 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_e59614afdddccb::t_51e8a9863aec61 3007
+crates/esker-store/src/collect.rs
+  s_e59614afdddccb::t_75f1026bd41b64 194-202,242-244,246-255,261,263-273,275-286
+crates/esker-store/src/columnar/region.rs
+  s_e59614afdddccb::t_e3cdb04a280207 889-899,903-915
+crates/esker-store/src/heartbeat.rs
+  s_e59614afdddccb::t_1d18a3f3aa201c 176-187
+crates/esker-store/src/server.rs
+  s_e59614afdddccb::t_c9dc1bdec293ec 3451,3453-3464
+crates/esker-store/tests/snapshot.rs
+  s_e59614afdddccb::t_a140c1840acced 2070-2197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "21a191bc0b9c79122f0e5e296fb135ced65bdd34",
+  "prompts": {},
+  "sessions": {
+    "s_e59614afdddccb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44a58a56-3a84-4bae-96b8-28598da3fac6",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
