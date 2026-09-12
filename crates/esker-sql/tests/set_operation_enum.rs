@@ -243,15 +243,23 @@ fn an_enum_beside_another_category_is_named_by_its_storage_for_now() {
 /// statement **at the top level answers correctly**, which is what says it is the nesting and not
 /// the cast.
 ///
-/// Measured on 19beta1, 2026-09-11: both forms answer `sad` then `ok`, and `pg_typeof(v)` is
-/// `mood`. Red here at `1 ; 2`.
+/// **Re-measured on 19beta1 2026-09-11 for this fix**, in one `BEGIN … ROLLBACK` with a savepoint
+/// per statement so that no refusal swallows the rest — every expectation below is that server's:
 ///
-/// It is also what blocks the other half of this file's own rule: while an arm's user type can be
-/// absent because nobody resolved it, an absent one cannot be read as "not an enum", which is why
-/// `SELECT m FROM t UNION SELECT 1::smallint` still answers rows one test up. Removing the
-/// `#[ignore]` **is** the acceptance for both.
+/// ```text
+/// SELECT m FROM t UNION SELECT 'sad'::mood ORDER BY 1                      sad ; ok
+/// SELECT v FROM (SELECT m AS v FROM t UNION SELECT 'sad'::mood) s …        sad ; ok
+/// WITH c AS (… UNION SELECT 'sad'::mood) SELECT v FROM c …                 sad ; ok
+/// SELECT pg_typeof(v) FROM (… UNION SELECT 'sad'::mood) s LIMIT 1          mood
+/// WITH c AS (… UNION SELECT 'sad'::mood) SELECT pg_typeof(v) FROM c …      mood
+/// ```
+///
+/// Red before the fix at `1 ; 2` — the ordinals, which is the set declared `smallint`.
+///
+/// **`pg_typeof` is asserted and not only the rows**, because the rows alone pass for a node that
+/// prints a label it does not know the type of: the mechanism is that the arm carries an identity
+/// through `query::append`, and the type is where that shows.
 #[test]
-#[ignore = "#76: a nested set operation's arms never reach `resolve_user_cast`; see this header"]
 fn a_nested_set_operation_loses_its_arms_user_type() {
     let mut node = parity::Node::new(FIXTURE);
     // The control, and the reason this is the nesting: the same statement one clause up is right.
@@ -263,7 +271,7 @@ fn a_nested_set_operation_loses_its_arms_user_type() {
     assert_eq!(
         node.rows("SELECT v FROM (SELECT m AS v FROM t UNION SELECT 'sad'::mood) s ORDER BY 1"),
         vec![vec!["sad"], vec!["ok"]],
-        "a derived table one clause down: 19beta1 answers the labels and `pg_typeof(v)` is `mood`"
+        "a derived table one clause down: 19beta1 answers the labels"
     );
     assert_eq!(
         node.rows(
@@ -271,6 +279,46 @@ fn a_nested_set_operation_loses_its_arms_user_type() {
         ),
         vec![vec!["sad"], vec!["ok"]],
         "and a `WITH` is the same relation by another name"
+    );
+    assert_eq!(
+        node.rows(
+            "SELECT pg_typeof(v) FROM (SELECT m AS v FROM t UNION SELECT 'sad'::mood) s LIMIT 1"
+        ),
+        vec![vec!["mood"]],
+        "the column is the enum, not the storage it shares with every other enum"
+    );
+    assert_eq!(
+        node.rows(
+            "WITH c AS (SELECT m AS v FROM t UNION SELECT 'sad'::mood) \
+             SELECT pg_typeof(v) FROM c LIMIT 1"
+        ),
+        vec![vec!["mood"]],
+        "and through a `WITH`"
+    );
+}
+
+/// **A set operation two clauses down, and one inside an expression subquery** — the same walk,
+/// where a single level of recursion would not have reached.
+///
+/// Measured on 19beta1 in the same capture: both answer `sad` then `ok`.
+#[test]
+fn a_set_operation_reached_through_two_clauses_keeps_its_type() {
+    let mut node = parity::Node::new(FIXTURE);
+    assert_eq!(
+        node.rows(
+            "SELECT v FROM (SELECT v FROM (SELECT m AS v FROM t UNION SELECT 'sad'::mood) a) b \
+             ORDER BY 1"
+        ),
+        vec![vec!["sad"], vec!["ok"]],
+        "a derived table inside a derived table"
+    );
+    assert_eq!(
+        node.rows(
+            "WITH c AS (SELECT v FROM (SELECT m AS v FROM t UNION SELECT 'sad'::mood) a) \
+             SELECT v FROM c ORDER BY 1"
+        ),
+        vec![vec!["sad"], vec!["ok"]],
+        "and a `WITH` over a derived table over the set"
     );
 }
 

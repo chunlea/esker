@@ -3299,44 +3299,59 @@ impl Executor {
             // every arm's projection — the head's included, it is one of them — resolves to the
             // ordinal and carries the type beside it, and the *set's* column renders the label
             // out of the `user_type` `query::append` unified.
-            let printed = select.set_arms.is_empty();
-            let mut projections = vec![&mut select.projection];
-            for arm in &mut select.set_arms {
-                projections.push(&mut arm.select.projection);
-            }
-            for projection in projections {
-                for item in projection {
-                    let crate::plan::SelectItem::Expr {
-                        expr, user_type, ..
-                    } = item
-                    else {
-                        continue;
-                    };
-                    // **What the cast named, before it is folded away.** The value a client gets
-                    // is the label (ADR 0050) and the type it is told is the enum's, which is the
-                    // pair `OID::Enum` is built from; taken here because this is the last place
-                    // the type's name is still in the tree.
-                    let named = Self::cast_target(&view, &mut types, expr, &path);
-                    if describing
-                        && let Some(stand_in) =
-                            Self::describing_stand_in(&view, &mut types, expr, &path)
-                    {
-                        *expr = stand_in;
-                        *user_type = named;
-                        continue;
-                    }
-                    match Self::user_cast(&view, &mut types, expr, printed, &path) {
-                        Ok(Some(resolved)) => {
-                            *expr = resolved;
+            let mut one = |select: &mut crate::plan::Select| {
+                let printed = select.set_arms.is_empty();
+                let mut projections = vec![&mut select.projection];
+                for arm in &mut select.set_arms {
+                    projections.push(&mut arm.select.projection);
+                }
+                for projection in projections {
+                    for item in projection {
+                        let crate::plan::SelectItem::Expr {
+                            expr, user_type, ..
+                        } = item
+                        else {
+                            continue;
+                        };
+                        // **What the cast named, before it is folded away.** The value a client
+                        // gets is the label (ADR 0050) and the type it is told is the enum's,
+                        // which is the pair `OID::Enum` is built from; taken here because this is
+                        // the last place the type's name is still in the tree.
+                        let named = Self::cast_target(&view, &mut types, expr, &path);
+                        if describing
+                            && let Some(stand_in) =
+                                Self::describing_stand_in(&view, &mut types, expr, &path)
+                        {
+                            *expr = stand_in;
                             *user_type = named;
+                            continue;
                         }
-                        Ok(None) => {}
-                        Err(error) => {
-                            failure.get_or_insert(error);
+                        match Self::user_cast(&view, &mut types, expr, printed, &path) {
+                            Ok(Some(resolved)) => {
+                                *expr = resolved;
+                                *user_type = named;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                failure.get_or_insert(error);
+                            }
                         }
                     }
                 }
-            }
+            };
+            // The statement's own select, and then **every set operation written below it**
+            // (`debts-v1.1.md` #76). A set one clause down — in a derived table, in a `WITH`
+            // item, inside an expression subquery — never reached this list, so its arm's
+            // `'sad'::mood` was folded to an ordinal by the walk at the end of this function and
+            // no `user_type` was recorded beside it. `query::append` then had nothing to unify,
+            // declared the set `smallint`, and the client was sent the **ordinals**: `1 ; 2`
+            // where 19beta1 answers `sad ; ok` and `pg_typeof` is `mood`, measured in both forms.
+            //
+            // Only a set operation is visited. A nested select with no arms keeps the behaviour
+            // it has, which is the walk's: this row is about the arms, and the projection rule
+            // for a plain sub-select is a different question with no measurement behind it.
+            one(select);
+            Self::for_each_nested_set_operation(select, &mut one);
         }
         let mut resolve = |expr: &mut Expr| {
             if describing
@@ -3358,6 +3373,64 @@ impl Executor {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Applies `visit` to every set operation written **below** `select` — never to `select`
+    /// itself, which its caller has already handled.
+    ///
+    /// A set operation is a select that has arms, and it can be written anywhere a select can:
+    /// in a `FROM (SELECT … UNION …)`, in a `WITH` item, in the recursive term of one, inside an
+    /// expression subquery, or inside another arm. `Executor::resolve_user_cast` has to reach
+    /// each of them, because an arm's projection is the only place a user-defined type's identity
+    /// survives the fold (`debts-v1.1.md` #76). It is #57 (a)'s walker shape one level further
+    /// out, and the reason it is a `dyn` closure rather than a generic one is that it recurses.
+    ///
+    /// **An arm is descended into but only visited when it has arms of its own.** Its projection
+    /// belongs to the select that owns it, and resolving it twice would meet an expression that
+    /// is already folded and record no type for it — which is the defect, not the fix.
+    fn for_each_nested_set_operation(
+        select: &mut crate::plan::Select,
+        visit: &mut dyn FnMut(&mut crate::plan::Select),
+    ) {
+        for arm in &mut select.set_arms {
+            Self::visit_set_operation(&mut arm.select, visit);
+        }
+        for entry in select
+            .from
+            .iter_mut()
+            .chain(select.joins.iter_mut().map(|join| &mut join.table))
+            .chain(select.ctes.iter_mut())
+        {
+            let Some(derived) = &mut entry.derived else {
+                continue;
+            };
+            Self::visit_set_operation(&mut derived.select, visit);
+            // A `WITH RECURSIVE`'s iterated term is a select of its own and may be a set.
+            if let Some(recursive) = &mut derived.recursive {
+                Self::visit_set_operation(&mut recursive.select, visit);
+            }
+        }
+        subquery::for_each_written_expr_mut(select, &mut |expr| {
+            // The walk's own result is about the closure below, which cannot fail.
+            let _: Result<()> = subquery::walk_mut(expr, &mut |expr| {
+                if let crate::plan::Expr::Subquery(sub) = expr {
+                    Self::visit_set_operation(&mut sub.select, visit);
+                }
+                Ok(())
+            });
+        });
+    }
+
+    /// [`Executor::for_each_nested_set_operation`] for one select: visit it when it is a set
+    /// operation, and descend either way.
+    fn visit_set_operation(
+        select: &mut crate::plan::Select,
+        visit: &mut dyn FnMut(&mut crate::plan::Select),
+    ) {
+        if !select.set_arms.is_empty() {
+            visit(select);
+        }
+        Self::for_each_nested_set_operation(select, visit);
     }
 
     /// Every `$n` that a statement casts to a **user-defined type**, with that type's oid.
