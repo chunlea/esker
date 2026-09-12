@@ -193,6 +193,14 @@ impl RawClient {
     /// only answers "who holds this key", so there is no key to ask with when `end` is empty. It
     /// therefore enumerates the regions forward and visits them backwards, which costs the walk up
     /// front and is the only order that can be right.
+    /// **One call is not one region's worth** (#79). A store's answer is bounded by the caller's
+    /// limit and by a byte budget no caller can see, so a batch shorter than the page is not the
+    /// end of the piece — only an **empty** batch is. `rawkv::scan` checks its byte budget after
+    /// the first pair is counted, so a piece holding any key at all answers with at least one,
+    /// which is what makes the empty batch mean what this reads it as.
+    ///
+    /// A `limit` of zero means **every pair in the range**, as it does on the wire and as
+    /// `Transaction::scan` now reads it.
     fn scan_with(
         &self,
         start: &[u8],
@@ -200,15 +208,58 @@ impl RawClient {
         limit: u32,
         reverse: bool,
     ) -> Result<Vec<(Bytes, Bytes)>> {
-        let limit = self.bounded_limit(limit);
+        let want = if limit == 0 {
+            usize::MAX
+        } else {
+            limit as usize
+        };
+        let page = self.bounded_limit(limit);
         let mut pairs = Vec::new();
-        for (from, to) in self.regions_of(start, end, reverse)? {
-            if pairs.len() >= limit as usize {
-                break;
+        let mut calls = 0usize;
+
+        'pieces: for (mut from, to) in self.regions_of(start, end, reverse)? {
+            loop {
+                if pairs.len() >= want {
+                    break 'pieces;
+                }
+                calls += 1;
+                if calls > crate::txn::MAX_SCAN_CALLS {
+                    return Err(Error::Internal(format!(
+                        "a raw scan of {start:?}..{end:?} did not reach the end of its range in \
+                         {} calls",
+                        crate::txn::MAX_SCAN_CALLS
+                    )));
+                }
+                let batch = self.scan_region(&from, &to, page, reverse)?;
+                // **A reverse scan is not paged here, and that is deliberate.** `regions_of`
+                // hands out its pieces low-to-high whichever way the walk goes, while a reverse
+                // `RawKvReq::Scan` reads its `start` field as the *upper* bound
+                // (`rawkv::scan_bounds`) — so which end of a piece a reverse resume moves is a
+                // question about that pairing rather than about this loop, and answering it by
+                // guess would be worse than the one call this leaves. `scan_reverse` has one
+                // caller in the repository and it is a test. Recorded in #79's handover.
+                if reverse {
+                    pairs.extend(batch);
+                    break;
+                }
+                // Empty: this piece is exhausted, whatever the page said.
+                let Some((last, _)) = batch.last().cloned() else {
+                    break;
+                };
+                pairs.extend(batch);
+                // The immediate successor in byte order, so the key just read is excluded and
+                // nothing between it and the next one can be skipped.
+                let mut next = Vec::with_capacity(last.len() + 1);
+                next.extend_from_slice(&last);
+                next.push(0);
+                let next = Bytes::from(next);
+                if !to.is_empty() && next >= to {
+                    break;
+                }
+                from = next;
             }
-            pairs.extend(self.scan_region(&from, &to, limit, reverse)?);
         }
-        pairs.truncate(limit as usize);
+        pairs.truncate(want);
         Ok(pairs)
     }
 

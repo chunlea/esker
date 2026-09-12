@@ -764,7 +764,7 @@ fn a_request_too_large_for_a_frame_is_refused_before_it_is_sent() {
 /// A scan whose limit is larger than a frame can hold would be answered with a response nobody
 /// can send. Capping turns that into a smaller answer instead of a failed call.
 #[test]
-fn a_scan_limit_is_capped_and_zero_means_the_protocol_default() {
+fn a_scan_limit_is_capped_and_zero_is_a_page_size_not_an_answer_size() {
     let harness = harness();
     harness
         .transport
@@ -781,12 +781,68 @@ fn a_scan_limit_is_capped_and_zero_means_the_protocol_default() {
     assert_eq!(
         limit_of(&harness.transport.nth_call(0).unwrap()),
         esker_client::wire::DEFAULT_SCAN_LIMIT,
-        "zero must not mean unlimited"
+        "zero is one page on the wire — what it must not do is end the scan there (#79)"
     );
 
     harness.transport.clear_log();
     harness.client.scan(b"a", b"z", 7).expect("scan");
     assert_eq!(limit_of(&harness.transport.nth_call(0).unwrap()), 7);
+}
+
+/// **A short batch is not the end of a range; an empty one is** (#79).
+///
+/// A store's answer is bounded by the caller's page and by a byte budget the caller cannot see,
+/// so a client that stopped on "fewer pairs than I asked for" would hand back a prefix of the
+/// range with nothing to notice. That is what lost five catalog table records in run 127
+/// attempt 4.
+///
+/// The counterfactual is the second assertion: with the old rule the first batch — one pair
+/// against a page of a thousand — ended the scan, and `b"b"` never came back.
+#[test]
+fn a_scan_pages_past_a_short_batch_and_stops_only_on_an_empty_one() {
+    let harness = harness();
+    let pair = |key: &'static [u8]| (Bytes::from_static(key), Bytes::from_static(b"v"));
+    harness.transport.script_all([
+        Rule::new(
+            Matcher::Any,
+            Outcome::Reply(RawKvResp::Scan {
+                pairs: vec![pair(b"a")],
+            }),
+        ),
+        Rule::new(
+            Matcher::Any,
+            Outcome::Reply(RawKvResp::Scan {
+                pairs: vec![pair(b"b")],
+            }),
+        ),
+        always(Outcome::Reply(RawKvResp::Scan { pairs: vec![] })),
+    ]);
+
+    let pairs = harness.client.scan(b"a", b"z", 0).expect("scan");
+    assert_eq!(
+        pairs.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(),
+        vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        "a short batch ended the scan and the rest of the range was never asked for"
+    );
+    assert_eq!(
+        harness.transport.call_count(),
+        3,
+        "two batches and the empty one that ends them"
+    );
+
+    // Each call resumes from the immediate successor of the last key the one before it gave, so
+    // no key can be read twice and none between them can be skipped.
+    let started_at = |n: usize| match harness
+        .transport
+        .nth_call(n)
+        .and_then(|c| c.body().cloned())
+    {
+        Some(RawKvReq::Scan { start, .. }) => start,
+        other => panic!("expected a scan, got {other:?}"),
+    };
+    assert_eq!(&started_at(0)[..], b"a");
+    assert_eq!(&started_at(1)[..], b"a\0");
+    assert_eq!(&started_at(2)[..], b"b\0");
 }
 
 // ---------------------------------------------------------------------------------------

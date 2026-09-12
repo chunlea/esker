@@ -575,17 +575,19 @@ impl MemoryBackend {
     /// Caps every scan at `max` pairs, and reads a `limit` of 0 as `max` rather than as "no
     /// limit".
     ///
-    /// **This is the real client's behaviour, not a fault injected for fun.**
-    /// `esker_client::Transaction::scan` puts every limit through
-    /// `Router::bounded_limit(limit, DEFAULT_SCAN_LIMIT)`, which turns 0 into 1024 and then caps
-    /// it at `max_scan_limit`. A fake that answered 0 as "everything" let code that asked for a
-    /// whole range look correct here and truncate silently against the real backend — a `DROP
-    /// TABLE` that left rows, and a `CREATE INDEX` whose index made a query return *fewer* rows
-    /// than the same query without it (`docs/plans/phase-6a.md` §10a).
+    /// **This is a real store's behaviour, not a fault injected for fun.** One `TxnKvReq::Scan`
+    /// answers with at most a page and at most four megabytes, so code that asks for a whole
+    /// range and reads one answer gets a prefix of it — a `DROP TABLE` that left rows, and a
+    /// `CREATE INDEX` whose index made a query return *fewer* rows than the same query without
+    /// it (`docs/plans/phase-6a.md` §10a).
     ///
-    /// So this exists to make that difference *visible to a test*: set it to two and any code
-    /// that does not page comes back with two rows. Everything that walks a range goes through
-    /// the executor's `for_each_page`, and the tests that pin it set this.
+    /// Since #79 the *client* pages over that for a caller who asked for the whole range, so the
+    /// real `StoreBackend` no longer truncates — which is precisely why this fake still must.
+    /// It stands in for one store answer, and it exists to make the difference *visible to a
+    /// test*: set it to two and any code that does not page comes back with two rows. Everything
+    /// that walks a range goes through the executor's `for_each_page`, whose termination rule is
+    /// the same one the client now uses — **an empty batch, never a short one** — and the tests
+    /// that pin it set this.
     #[must_use]
     pub fn with_scan_limit(mut self, max: u32) -> Self {
         self.max_scan = max;

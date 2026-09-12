@@ -121,12 +121,24 @@ pub fn is_expired(start_ts: u64, ttl_ms: u64, now_ts: u64) -> bool {
     physical_ms(now_ts) > physical_ms(start_ts).saturating_add(ttl_ms)
 }
 
-/// Most regions one scan walks before it answers with what it has.
+/// Most regions one scan walks before it gives up **loudly**.
 ///
-/// A bound rather than a limit on correctness: a scan that has crossed this many regions has
-/// read a great deal, and a caller wanting more asks again from where it stopped. Without one, a
-/// region cache that kept naming regions would make a scan of a small range unbounded work.
+/// Without one, a region cache that kept naming regions would make a scan of a small range
+/// unbounded work. It used to be a bound on the *answer* — "a scan that has crossed this many
+/// regions has read a great deal, and a caller wanting more asks again from where it stopped" —
+/// and that is exactly the silent partial answer #79 is about, so exhausting it is an error now.
 pub const MAX_SCAN_REGIONS: usize = 64;
+
+/// Most store calls one [`Transaction::scan`] makes before it gives up **loudly**.
+///
+/// A scan pages until an empty batch (#79), so the call count is the range's size over the page
+/// size plus one per region — a number the data decides and not the caller. This is the guard
+/// against a cluster whose routing never lets a scan finish, and it is deliberately far above
+/// anything a real range reaches: at a full page each, it is tens of millions of pairs.
+///
+/// **Exhausting it is an error and not a short answer.** A caller handed part of a range with no
+/// way to tell it was part is precisely the defect this constant was added alongside.
+pub const MAX_SCAN_CALLS: usize = 4096;
 
 /// How many times a reader will resolve a lock and try again before giving up.
 ///
@@ -247,7 +259,7 @@ impl TxnClient {
         self
     }
 
-    /// Sets how many regions one scan will walk.
+    /// Sets how many regions one scan will walk before it fails.
     #[must_use]
     pub fn with_max_scan_regions(mut self, regions: usize) -> Self {
         self.max_scan_regions = regions;
@@ -1192,40 +1204,100 @@ impl Transaction {
     /// and the result is in key order either way. The `limit` is applied **after** the merge,
     /// so a scan cannot return fewer rows than it would have because the buffer displaced some.
     ///
-    /// # A range is not a region
+    /// # A range is not a region, and a batch is not a range
     ///
     /// One request reaches **one** region, and a store answers only for the keys it owns — so a
     /// scan whose range spans a split boundary would come back holding the first region's keys
     /// and nothing else, with no error and nothing to notice. That is the failure this walks
-    /// region by region to avoid: it asks, learns from the region cache where that region ended,
-    /// and asks again from there until the range is exhausted or the limit is full.
+    /// region by region to avoid.
     ///
-    /// The cache is a *hint* here as everywhere else (`docs/DESIGN.md` §10). If it does not know
-    /// where a region ended, the walk stops rather than guessing — a short answer, which is what
-    /// a caller gets from any bounded scan, rather than a wrong one.
+    /// **And one request is not one region's worth either** (#79). A store's answer is bounded
+    /// by the caller's `limit` and by a byte budget the caller cannot see, so "fewer pairs than I
+    /// asked for" is not "that is all there is" — reading it that way is how a catalog scan came
+    /// back holding a prefix of its own range and a name record ended up pointing at a table that
+    /// was not there. **Only an empty batch ends a range.** A non-empty one resumes from just
+    /// past its last key, inside the same region or over the boundary into the next; an empty one
+    /// steps to the next region; an empty one in the last region is the end.
+    ///
+    /// `limit` of **zero means every pair in the range**, which is what it has always meant on
+    /// the wire (`esker_proto::DEFAULT_SCAN_LIMIT`) and what every `scan(.., 0)` caller in
+    /// `esker-sql` has always assumed. It used to mean one page of 1,024 and stop.
+    ///
+    /// The cache is a *hint* here as everywhere else (`docs/DESIGN.md` §10). A route that does
+    /// not advance, or a range that outlasts [`MAX_SCAN_CALLS`], is a **loud** failure rather
+    /// than a short answer: both mean the cluster's routing is not making progress, and a caller
+    /// that was handed part of a range with no way to tell is the defect this paragraph used to
+    /// describe as a feature.
     pub fn scan(&self, start: &[u8], end: &[u8], limit: u32) -> Result<Vec<(Bytes, Bytes)>> {
-        let limit = self.router.bounded_limit(limit, DEFAULT_SCAN_LIMIT);
+        // What the caller wants, and what one call asks for. They are the same number only when
+        // the caller named a small limit.
+        let want = if limit == 0 {
+            usize::MAX
+        } else {
+            limit as usize
+        };
+        let page = self.router.bounded_limit(limit, DEFAULT_SCAN_LIMIT);
         let mut merged: BTreeMap<Bytes, Bytes> = BTreeMap::new();
         let mut cursor = Bytes::copy_from_slice(start);
+        let mut calls = 0usize;
+        let mut regions = 0usize;
 
-        for _ in 0..self.max_scan_regions {
-            let (page, next) = self.scan_region(&cursor, end, limit)?;
-            merged.extend(page);
-            if merged.len() >= limit as usize {
+        loop {
+            calls += 1;
+            if calls > MAX_SCAN_CALLS {
+                return Err(Error::Internal(format!(
+                    "a scan of {start:?}..{end:?} did not reach the end of its range in \
+                     {MAX_SCAN_CALLS} calls"
+                )));
+            }
+            let (batch, boundary) = self.scan_region(&cursor, end, page)?;
+            let last = batch.last().map(|(key, _)| key.clone());
+            merged.extend(batch);
+            if merged.len() >= want {
                 break;
             }
-            // An empty `end_key` is the end of the key space, so a region carrying one is the
-            // last there is and the range is exhausted.
-            if next.is_empty() {
-                break;
+            match last {
+                // **Not empty, so not the end.** The store may have stopped on the caller's page
+                // limit or on its byte budget, and neither is visible from here. Carry on from
+                // just past the last key it gave: `route` finds the next region on its own if
+                // that key is over the boundary.
+                Some(key) => {
+                    let mut next = Vec::with_capacity(key.len() + 1);
+                    next.extend_from_slice(&key);
+                    // The immediate successor in byte order, so the key just read is excluded
+                    // and nothing between it and the next one can be skipped.
+                    next.push(0);
+                    let next = Bytes::from(next);
+                    if !end.is_empty() && next.as_ref() >= end {
+                        break;
+                    }
+                    cursor = next;
+                }
+                // **Empty, so this region's share of the range is done.** An empty `end_key` is
+                // the end of the key space, so a region carrying one is the last there is.
+                None => {
+                    if boundary.is_empty() {
+                        break;
+                    }
+                    if !end.is_empty() && boundary.as_ref() >= end {
+                        break;
+                    }
+                    if boundary <= cursor {
+                        return Err(Error::Internal(format!(
+                            "a scan is not advancing: the route for {cursor:?} ends at \
+                             {boundary:?}"
+                        )));
+                    }
+                    regions += 1;
+                    if regions > self.max_scan_regions {
+                        return Err(Error::Internal(format!(
+                            "a scan of {start:?}..{end:?} crossed more than {} regions",
+                            self.max_scan_regions
+                        )));
+                    }
+                    cursor = boundary;
+                }
             }
-            // Past the range the caller asked for, or not moving. The second is the guard that
-            // matters: a route naming a region that ends at or before the cursor would otherwise
-            // ask the same region for ever.
-            if (!end.is_empty() && next.as_ref() >= end) || next <= cursor {
-                break;
-            }
-            cursor = next;
         }
 
         for (key, write) in self.in_range(start, end) {
@@ -1234,7 +1306,7 @@ impl Transaction {
                 Write::Delete => merged.remove(key),
             };
         }
-        Ok(merged.into_iter().take(limit as usize).collect())
+        Ok(merged.into_iter().take(want).collect())
     }
 
     /// One region's worth of a scan, and where that region ends.

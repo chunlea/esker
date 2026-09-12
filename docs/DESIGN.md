@@ -925,6 +925,37 @@ and `Bootstrap` may send zero because asking is how a caller learns it; PD's own
 `NotBootstrapped` and `ClusterMismatch{expected, actual}`, and neither is retryable. Unknown methods and fields are errors, not
 ignored — forward compatibility is handled by `WIRE_VERSION` negotiation on connect.
 
+**What a `Scan` promises, and what it does not** (#79). One answer is bounded three ways: the
+caller's `limit`, the store's own cap on a batch, and a **byte budget the caller cannot see**
+(`esker_store::txnkv::MAX_SCAN_BYTES`, four megabytes, so that a response always fits a frame). A
+`limit` of zero has always meant *"as many as the server will give"* rather than zero pairs. So a
+batch holding fewer pairs than the caller asked for says **nothing at all** about whether the range
+is finished, and a client that reads it as "that is all there is" gets a silent subset of the range
+with the same type and the same `Ok` as a complete answer. That is not a hypothetical: it cost run
+127 attempt 4 five catalog table records that were on disk and readable the whole time.
+
+The contract is therefore:
+
+- **Only an empty batch ends a range.** A client scanning a range pages: it asks, and while the
+  answer is non-empty it asks again from the immediate successor of the last key it was given,
+  across a region boundary as readily as inside one. `esker_client::Transaction::scan` and
+  `RawClient::scan` both do this, and a `limit` of zero means every pair in the range.
+- **A store never answers empty while a live key remains.** Both `txnkv::scan` and `rawkv::scan`
+  check the byte budget *after* pushing a pair, so one live key always produces one pair. Without
+  that half the rule above would end a scan on the first oversized row.
+- **What a store's cap counts is pairs it is returning**, never work it did to find them. The
+  version records of deleted keys are the case that made this a defect rather than a detail: a
+  catalog range with 8,064 dropped tables and 278 live ones exhausted a ceiling of 8,192 *keys*
+  while the answer held 278 *pairs*, so every number the caller could see said the answer was
+  complete.
+- **A scan that cannot finish fails loudly.** Routing that does not advance, or a range that
+  outlasts `MAX_SCAN_CALLS`, is an error and not a short answer.
+
+The alternative considered and not taken is a **resumption cursor** on the wire: the store says
+where it stopped and whether more remains, which costs a field and buys back the one empty round
+trip per scan that the rule above spends. It is the better design if that round trip ever measures;
+it is a wire change and this is not.
+
 Method numbers are `service:method`, so a service's numbers stay contiguous and one can be reserved
 before it is written: `0x00` system (`0x0001` Hello), `0x01` RawKv (`0x0101`–`0x0108`, in the order
 listed above), `0x03` Pd (`0x0301`–`0x0306`, in the order listed above), `0x04` RaftTransport

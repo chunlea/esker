@@ -29,7 +29,9 @@ use crate::region::{Epoch, Region};
 ///
 /// A limit of zero on the wire means "as many as the server will give", and this is that
 /// number. It exists so an unbounded scan of a whole region is many bounded answers rather
-/// than one frame that cannot fit.
+/// than one frame that cannot fit — **many**, which is the half that has to be read as well:
+/// a client whose scan ends on the first of those answers has read a prefix of the range
+/// (`docs/DESIGN.md` §9, #79).
 pub const DEFAULT_SCAN_LIMIT: u32 = 1024;
 
 /// Which request or response a body holds (*fixed*).
@@ -588,7 +590,11 @@ pub enum RawKvReq {
         /// Exclusive end; empty means "to the end of the region".
         end: Bytes,
         /// Most pairs to return. Zero means [`DEFAULT_SCAN_LIMIT`]; the server caps it either
-        /// way, so a scan is always a bounded answer.
+        /// way, so **one answer** is always a bounded answer.
+        ///
+        /// It bounds the answer and never the range: a batch shorter than this says nothing
+        /// about whether the range is finished, because the server's byte budget can end one
+        /// too. Only an **empty** batch ends a range (`docs/DESIGN.md` §9, #79).
         limit: u32,
         /// Walk from the high end of the range towards the low one.
         reverse: bool,
