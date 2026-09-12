@@ -9,6 +9,7 @@
 //! bounds and `DeleteRange`. A client that added it too would double-prefix, and the damage
 //! would not show up until a scan came back full of keys nobody wrote.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -222,7 +223,9 @@ impl RawClient {
         let mut pairs = Vec::new();
         let mut calls = 0usize;
 
-        'pieces: for (mut from, mut to) in self.regions_of(start, end, reverse)? {
+        let mut pieces: VecDeque<(Bytes, Bytes)> = self.regions_of(start, end, reverse)?.into();
+
+        'pieces: while let Some((mut from, mut to)) = pieces.pop_front() {
             loop {
                 if pairs.len() >= want {
                     break 'pieces;
@@ -235,7 +238,32 @@ impl RawClient {
                         crate::txn::MAX_SCAN_CALLS
                     )));
                 }
-                let batch = self.scan_region(&from, &to, page, reverse)?;
+                let (batch, reached) = self.scan_region(&from, &to, page, reverse)?;
+                // **A store that narrowed the range has split since the plan was made**, and the
+                // plan is made once, before anything is sent (`regions_of`). So the part of this
+                // piece above `reached` belongs to nobody now unless it is put back — and the
+                // walk below cannot notice it is missing, because a piece that runs out looks
+                // exactly like a piece that is done. `Transaction::scan` has no hole here for the
+                // same reason in the other shape: its `scan_region` answers the boundary it
+                // actually used and its caller carries on from that.
+                //
+                // **This runs before the paging below and the two compose**, which is worth
+                // saying because they arrived from different branches (#79's review and #80).
+                // `to` is the piece's *unscanned* upper bound — the paging lowers it as a reverse
+                // walk descends — so what is split here is what is left of the piece and never
+                // what has already been answered.
+                if reached != to {
+                    if reverse {
+                        // Descending, the half **above** `reached` is the half that comes first,
+                        // so this batch is from the wrong end of the piece. One call is wasted
+                        // re-planning; a split has to have raced the scan to get here at all.
+                        pieces.push_front((from.clone(), reached.clone()));
+                        pieces.push_front((reached, to));
+                        continue 'pieces;
+                    }
+                    pieces.push_front((reached.clone(), to.clone()));
+                    to = reached;
+                }
                 // Empty: this piece is exhausted, whatever the page said.
                 let Some((last, _)) = batch.last().cloned() else {
                     break;
@@ -292,14 +320,22 @@ impl RawClient {
                 || (!end.is_empty() && boundary.as_ref() >= end)
                 || boundary <= cursor
             {
-                break;
+                if reverse {
+                    pieces.reverse();
+                }
+                return Ok(pieces);
             }
             cursor = boundary;
         }
-        if reverse {
-            pieces.reverse();
-        }
-        Ok(pieces)
+        // **Running out of pieces is a failure and not a shorter plan** (#79). The walk above
+        // cannot tell a plan that covers the range from one that stops in the middle of it, so a
+        // plan that stopped would be answered as if it were the whole range — which is the silent
+        // partial answer this whole walk exists to prevent. `Transaction::scan` raises the same
+        // bound as an error for the same reason; this used to `break` and answer a prefix.
+        Err(Error::Internal(format!(
+            "a raw scan of {start:?}..{end:?} crosses more than {} regions",
+            crate::txn::MAX_SCAN_REGIONS
+        )))
     }
 
     /// One region's worth, repairing a boundary the region has moved under.
@@ -308,13 +344,17 @@ impl RawClient {
     /// cache for the reason `Transaction::scan_region` records: a store knows about its own split
     /// at once and the placement driver at the next heartbeat, so re-asking the driver inside that
     /// window returns the same stale boundary.
+    ///
+    /// **Answers the end bound it actually used**, which is the whole point of returning a pair:
+    /// a repair below narrows the range, and a caller that did not learn the new bound would
+    /// leave the rest of its piece unscanned and unmentioned (#79).
     fn scan_region(
         &self,
         from: &Bytes,
         to: &Bytes,
         limit: u32,
         reverse: bool,
-    ) -> Result<Vec<(Bytes, Bytes)>> {
+    ) -> Result<(Vec<(Bytes, Bytes)>, Bytes)> {
         let mut to = to.clone();
         let mut refreshes = 0;
         loop {
@@ -345,7 +385,7 @@ impl RawClient {
                 reverse,
             };
             match self.call(&request) {
-                Ok(RawKvResp::Scan { pairs }) => return Ok(pairs),
+                Ok(RawKvResp::Scan { pairs }) => return Ok((pairs, to)),
                 Ok(other) => return Err(unexpected(Method::RawScan, &other)),
                 Err(Error::Store(refusal))
                     if matches!(refusal, crate::wire::ProtoError::KeyNotInRegion { .. })

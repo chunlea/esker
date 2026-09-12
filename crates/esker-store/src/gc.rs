@@ -399,7 +399,13 @@ impl MvccCollector {
 }
 
 impl CompactionFilter for MvccCollector {
-    fn filter(&self, _level: usize, engine_key: &[u8], value: &[u8]) -> FilterDecision {
+    fn filter(
+        &self,
+        _level: usize,
+        engine_key: &[u8],
+        value: &[u8],
+        nothing_below: &dyn Fn(&[u8], &[u8]) -> bool,
+    ) -> FilterDecision {
         // A key this collector does not understand is not its business. Every decision below
         // needs a `write` record and a version, and a key without them belongs to someone else.
         let Ok((user_key, commit_ts)) = key::split(engine_key) else {
@@ -451,6 +457,39 @@ impl CompactionFilter for MvccCollector {
             return FilterDecision::Keep;
         }
         if self.keep_as_newest(&user_key, commit_ts) {
+            // **The newest version, and what it says decides the whole segment** (ADR 0111).
+            //
+            // For a `Put` this is the value a read at the safepoint returns, so it stays. For a
+            // `Delete` it is the *answer* "gone" — and keeping a record to say so keeps it for
+            // ever: the key it sits on is never written again, so nothing merges it away and every
+            // read of the range walks past it. #70's twelve-round probe measured twelve dropped
+            // tables leaving ninety-six such records a round, each landing in a file of its own
+            // that the bottom level never merges.
+            //
+            // Dropping it is the one collection decision that can **resurrect** a key, so it is
+            // taken only where nothing older can survive it:
+            //
+            // * **the whole version span**, not this one key. The timestamp suffix is complemented
+            //   (`esker_keys::codec::enc_ts`), so an older version sorts *after* the delete — a
+            //   point query about the delete's own key answers "nothing below" while the older
+            //   version is directly beneath it. `key::version_range` is the span and
+            //   `nothing_below` is the engine's answer over it;
+            // * **and everything under it is already collectable.** The entries arrive newest
+            //   first, so every version after this one is older, and the engine only offers this
+            //   filter entries at or below its own floor — the oldest live snapshot. A reader
+            //   holding an older version pins the safepoint under the delete (ADR 0110 decision 1)
+            //   and this branch is not reached at all, which is what
+            //   `a_reader_below_the_delete_keeps_the_whole_segment` asserts.
+            //
+            // Composition with the rest of this filter: the segment rule only ever **narrows**.
+            // A record outside the safepoint, an undecodable one, or a table that keeps everything
+            // has already returned `Keep` above and never reaches here.
+            if record.kind == Kind::Delete {
+                let (start, end) = key::version_range(&user_key);
+                if nothing_below(&start, &end) {
+                    return FilterDecision::Remove;
+                }
+            }
             // The newest version at or below the safepoint: what a read at the safepoint
             // returns, so dropping it would make an existing key vanish.
             return FilterDecision::Keep;
@@ -466,6 +505,14 @@ impl CompactionFilter for MvccCollector {
 #[cfg(test)]
 mod tests {
     use super::{MvccCollector, RETENTION_FOREVER, RetentionPolicy, decode_retention};
+
+    /// **The aggressive answer**, which is the one a compaction that has reached the bottom gives
+    /// and the one ADR 0111's segment rule acts on: no level below holds any version of the key.
+    /// Saying `false` here would make every test below assert the *conservative* branch and never
+    /// reach the rule.
+    fn nothing_below(_start: &[u8], _end: &[u8]) -> bool {
+        true
+    }
     use esker_engine::compaction::{CompactionFilter, FilterDecision};
     use esker_keys::prefix;
     use esker_txn::codec::{Kind, WriteRecord};
@@ -539,7 +586,12 @@ mod tests {
         commit_ts: u64,
         record: &WriteRecord,
     ) -> FilterDecision {
-        collector.filter(0, &key::write(user_key, commit_ts), &record.encode())
+        collector.filter(
+            0,
+            &key::write(user_key, commit_ts),
+            &record.encode(),
+            &nothing_below,
+        )
     }
 
     /// The rule of `docs/txn-spec.md` §7: below the safepoint, the newest version survives and
@@ -601,11 +653,11 @@ mod tests {
     fn what_it_cannot_read_it_keeps() {
         let collector = MvccCollector::new(RetentionPolicy::uniform(0), u64::MAX);
         assert_eq!(
-            collector.filter(0, b"not a txn key", b"whatever"),
+            collector.filter(0, b"not a txn key", b"whatever", &nothing_below),
             FilterDecision::Keep
         );
         assert_eq!(
-            collector.filter(0, &key::write(b"k", 1), b"\xff\xff\xff"),
+            collector.filter(0, &key::write(b"k", 1), b"\xff\xff\xff", &nothing_below),
             FilterDecision::Keep
         );
     }
