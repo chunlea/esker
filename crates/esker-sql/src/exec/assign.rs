@@ -39,7 +39,7 @@ pub(super) fn into_column(
     value: Datum,
     column: &ColumnDef,
     user_type: Option<&crate::catalog::TypeDef>,
-    from: Option<u64>,
+    from: Option<&crate::catalog::TypeDef>,
     rendering: crate::value::Rendering,
 ) -> Result<Datum> {
     // **An enum first, and by its own rule.** The column is an `int2` in the row, so every test
@@ -81,7 +81,10 @@ pub(super) fn into_column(
             column_type: column.ty.name().to_owned(),
             // A NULL fits every column and never reaches here, so a value with no type cannot
             // either.
-            expression_type: value.column_type().map_or("unknown", PgType::name),
+            expression_type: value
+                .column_type()
+                .map_or("unknown", PgType::name)
+                .to_owned(),
         })
     })
 }
@@ -219,7 +222,9 @@ pub(super) fn user_type_of<'a>(
 /// `"1"` and answer `22P02` where a real server says
 /// `column "current_mood" is of type mood but expression is of type integer`, which is a different
 /// error about a different mistake.
-pub(super) fn enum_literal(literal: &crate::plan::Literal) -> (Datum, Option<u64>) {
+pub(super) fn enum_literal(
+    literal: &crate::plan::Literal,
+) -> (Datum, Option<crate::catalog::TypeDef>) {
     use crate::plan::Literal;
     match literal {
         Literal::Null | Literal::TypedNull(_) => (Datum::Null, None),
@@ -227,7 +232,7 @@ pub(super) fn enum_literal(literal: &crate::plan::Literal) -> (Datum, Option<u64
         // **The type it was cast to travels with it.** `'sad'::mood` is already this enum's
         // ordinal and says which enum (`plan::Literal::Typed::user`, `debts-v1.1.md` #57); every
         // other literal says nothing, which is what keeps `VALUES (1)` a `42804`.
-        Literal::Typed { value, user } => ((**value).clone(), *user),
+        Literal::Typed { value, user } => ((**value).clone(), user.as_deref().cloned()),
         // A bare integer constant's datum is an `i64` whatever width it is *declared* — the
         // ladder narrows types and not values (ADR 0087) — and either way it is not a label.
         Literal::Integer(value) => (Datum::Int8(*value), None),
@@ -260,7 +265,7 @@ pub(super) fn into_enum(
     value: Datum,
     column: &ColumnDef,
     def: &crate::catalog::TypeDef,
-    from: Option<u64>,
+    from: Option<&crate::catalog::TypeDef>,
 ) -> Result<Datum> {
     let crate::catalog::TypeKind::Enum { labels } = &def.kind else {
         return Err(SqlError::Internal(
@@ -284,11 +289,25 @@ pub(super) fn into_enum(
         // before this was the `42804` below, for a statement a real server answers
         // (`debts-v1.1.md` #57). **A bare `1` still cannot**: it carries no identity to match,
         // which is the measured rule this arm sits above.
-        Datum::Int2(ordinal) if from == Some(def.oid) => Ok(Datum::Int2(ordinal)),
+        Datum::Int2(ordinal) if from.is_some_and(|from| from.oid == def.oid) => {
+            Ok(Datum::Int2(ordinal))
+        }
+        // **And a value of *another* user type is named by that type.** `'sad'::other_mood` into
+        // a `mood` column is `42804 … but expression is of type other_mood` on 19beta1, measured;
+        // the storage under it is an `int2` and saying so named the representation instead of the
+        // type, which is a sentence about a mistake nobody made.
         other => Err(SqlError::DatatypeMismatchInColumn {
             column: column.name.clone(),
             column_type: def.name.clone(),
-            expression_type: other.column_type().map_or("unknown", PgType::name),
+            expression_type: from.map_or_else(
+                || {
+                    other
+                        .column_type()
+                        .map_or("unknown", PgType::name)
+                        .to_owned()
+                },
+                |from| from.name.clone(),
+            ),
         }),
     }
 }
@@ -313,7 +332,10 @@ fn into_composite(
         other => Err(SqlError::DatatypeMismatchInColumn {
             column: column.name.clone(),
             column_type: def.name.clone(),
-            expression_type: other.column_type().map_or("unknown", PgType::name),
+            expression_type: other
+                .column_type()
+                .map_or("unknown", PgType::name)
+                .to_owned(),
         }),
     }
 }

@@ -1170,7 +1170,12 @@ pub enum SqlError {
         column_type: String,
         /// The expression's type, as PostgreSQL names it — `integer` for a small constant, not
         /// `bigint`.
-        expression_type: &'static str,
+        ///
+        /// Owned for `column_type`'s reason, one operand over: a value may be of a **user-defined**
+        /// type too. `'sad'::other_mood` into a `mood` column is `… but expression is of type
+        /// other_mood` on 19beta1, measured, and naming the `int2` an enum is stored as reports
+        /// the representation instead of the type (`debts-v1.1.md` #57).
+        expression_type: String,
     },
 
     /// A `$1` with nothing bound to it. The simple query protocol has no way to carry one, so a

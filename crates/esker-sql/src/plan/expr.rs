@@ -2421,13 +2421,21 @@ pub enum Literal {
     /// write was `42804`, and a `UNION` answered ordinals under `smallint` — three readers, one
     /// missing fact (`debts-v1.1.md` #57, ADR 0050's unfinished half).
     ///
+    /// **The type and not its oid**, which is the same slot [`crate::plan::SelectItem::Expr`]
+    /// holds one position over. An oid settles *identity* — is this the enum the column was
+    /// declared as — and there are two readers that need more than that: `42883 operator does not
+    /// exist: mood = other_mood` and `42804 … expression is of type other_mood` both name the
+    /// other type, and the row evaluator has no catalog to look a number up in. Measured on
+    /// 19beta1; this node said `smallint` for both.
+    ///
     /// `None` is every other literal, which is most of them: the field says *which user-defined
     /// type this value is a value of*, and a `bigint` is not one.
     Typed {
         /// The resolved value — an enum's ordinal, a date's day count, a range's canonical text.
         value: Box<Datum>,
-        /// `catalog::TypeDef::oid`, when the value's type is one this vocabulary cannot spell.
-        user: Option<u64>,
+        /// The `catalog::TypeDef` it was declared as, when the value's type is one this vocabulary
+        /// cannot spell. Boxed so that a literal stays the size it was.
+        user: Option<Box<crate::catalog::TypeDef>>,
     },
 }
 
@@ -2568,7 +2576,7 @@ impl Literal {
             Err(SqlError::DatatypeMismatchInColumn {
                 column: column.to_owned(),
                 column_type: ty.name().to_owned(),
-                expression_type: self.type_name(),
+                expression_type: self.type_name().to_owned(),
             })
         };
         match self {

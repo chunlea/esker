@@ -823,7 +823,7 @@ fn value_for_column(
         };
         // Through `into_column` rather than straight to `into_enum`: the kind is decided in one
         // place, so a composite is canonicalised here exactly as an enum is mapped.
-        return super::assign::into_column(value, column, Some(def), from, rendering);
+        return super::assign::into_column(value, column, Some(def), from.as_ref(), rendering);
     }
     match expr {
         crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name),
@@ -903,7 +903,7 @@ fn regclass_array_from_names(
 fn assigned_value(
     value: &crate::plan::Expr,
     at: &mut AssignedIn<'_>,
-) -> Result<(Datum, Option<u64>)> {
+) -> Result<(Datum, Option<crate::catalog::TypeDef>)> {
     // **The `UPDATE` half of the assignment rule** (`debts-v1.1.md` #41), and the same sentence
     // `value_for_column` carries for `INSERT`: an assignment goes through `regclassin` and
     // resolves the name, where a comparison reads the literal as an oid. The name is discarded —
@@ -1272,7 +1272,7 @@ pub(super) fn update(
                     evaluated.0,
                     column,
                     super::assign::rewriting_type_of(&table, column),
-                    evaluated.1,
+                    evaluated.1.as_ref(),
                     executor.rendering(),
                 )?;
             }
