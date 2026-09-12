@@ -86,9 +86,21 @@ fn never() -> Harness {
     })
 }
 
+/// The three waits this file makes, named for what they are waiting for.
+///
+/// **All three are preconditions, not measurements.** Nothing here asserts that a region elects
+/// quickly, that routing settles quickly, or that a split lands quickly — only that each happens at
+/// all, so that a cluster which will never get there fails rather than hangs. They were five, ten
+/// and twenty seconds, which are bounds on the box this was written on; a gate running several
+/// clusters at once is the box they have to hold on. Every failure below now carries how long it
+/// actually waited, so a run that only just made it is visible rather than merely green.
+const ELECTS_WITHIN: Duration = Duration::from_secs(60);
+const ROUTING_SETTLES_WITHIN: Duration = Duration::from_secs(60);
+const SPLIT_LANDS_WITHIN: Duration = Duration::from_secs(60);
+
 impl Harness {
     async fn wait_for_leader(&self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let began = Instant::now();
         while !self
             .store
             .regions()
@@ -96,7 +108,11 @@ impl Harness {
             .iter()
             .any(|state| state.peer().is_some_and(|peer| peer.is_leader()))
         {
-            assert!(Instant::now() < deadline, "no region ever elected a leader");
+            assert!(
+                began.elapsed() < ELECTS_WITHIN,
+                "no region ever elected a leader in {:?}",
+                began.elapsed()
+            );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
@@ -111,7 +127,7 @@ impl Harness {
 
     /// Writes one key through the replicated path, retrying while the routing moves under it.
     async fn put(&self, key: &[u8], value: &[u8]) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let began = Instant::now();
         loop {
             let header = self.header_for(key).expect("every key is covered");
             let request = RawKvReq::put(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
@@ -122,7 +138,11 @@ impl Harness {
                         error.is_retryable(),
                         "writing {key:?} failed terminally: {error}"
                     );
-                    assert!(Instant::now() < deadline, "writing {key:?} never succeeded");
+                    assert!(
+                        began.elapsed() < ROUTING_SETTLES_WITHIN,
+                        "writing {key:?} never succeeded in {:?}",
+                        began.elapsed()
+                    );
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
             }
@@ -164,7 +184,7 @@ impl Harness {
     /// One transactional request, retried while the routing moves under it, refusing anything
     /// that came back as a Percolator status rather than as an error.
     async fn txn(&self, key: &[u8], request: TxnKvReq) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let began = Instant::now();
         loop {
             let header = self.header_for(key).expect("every key is covered");
             match self.store.serve_txn(header, request.clone()).await {
@@ -186,8 +206,9 @@ impl Harness {
                         "a transaction on {key:?} failed terminally: {error}"
                     );
                     assert!(
-                        Instant::now() < deadline,
-                        "a transaction on {key:?} never succeeded"
+                        began.elapsed() < ROUTING_SETTLES_WITHIN,
+                        "a transaction on {key:?} never succeeded in {:?}",
+                        began.elapsed()
                     );
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
@@ -197,7 +218,7 @@ impl Harness {
 
     /// Reads one committed key at `ts`, through whichever region now owns it.
     async fn read(&self, key: &[u8], ts: u64) -> Option<Bytes> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let began = Instant::now();
         loop {
             let header = self.header_for(key).expect("every key is covered");
             let request = TxnKvReq::Get {
@@ -209,7 +230,11 @@ impl Harness {
                 Ok(other) => panic!("{other:?}"),
                 Err(error) => {
                     assert!(error.is_retryable(), "reading {key:?}: {error}");
-                    assert!(Instant::now() < deadline, "reading {key:?} never succeeded");
+                    assert!(
+                        began.elapsed() < ROUTING_SETTLES_WITHIN,
+                        "reading {key:?} never succeeded in {:?}",
+                        began.elapsed()
+                    );
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
             }
@@ -217,7 +242,7 @@ impl Harness {
     }
 
     async fn get(&self, key: &[u8]) -> Option<Bytes> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let began = Instant::now();
         loop {
             let header = self.header_for(key).expect("every key is covered");
             let request = RawKvReq::get(Bytes::copy_from_slice(key));
@@ -226,7 +251,11 @@ impl Harness {
                 Ok(other) => panic!("{other:?}"),
                 Err(error) => {
                     assert!(error.is_retryable(), "reading {key:?}: {error}");
-                    assert!(Instant::now() < deadline, "reading {key:?} never succeeded");
+                    assert!(
+                        began.elapsed() < ROUTING_SETTLES_WITHIN,
+                        "reading {key:?} never succeeded in {:?}",
+                        began.elapsed()
+                    );
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
             }
@@ -234,12 +263,13 @@ impl Harness {
     }
 
     async fn wait_for_regions(&self, count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let began = Instant::now();
         while self.store.regions().len() < count {
             assert!(
-                Instant::now() < deadline,
-                "the store stopped at {} regions, wanted {count}",
-                self.store.regions().len()
+                began.elapsed() < SPLIT_LANDS_WITHIN,
+                "the store stopped at {} regions in {:?}, wanted {count}",
+                self.store.regions().len(),
+                began.elapsed()
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -364,15 +394,16 @@ async fn the_child_starts_its_own_group_on_the_parents_stores() {
     );
 
     // And it elects: a group of one whose log starts empty reaches office on its own.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let began = Instant::now();
     let peer = harness
         .store
         .peer_of(child.id)
         .expect("the child has a peer");
     while !peer.is_leader() {
         assert!(
-            Instant::now() < deadline,
-            "the child never elected a leader"
+            began.elapsed() < ELECTS_WITHIN,
+            "the child never elected a leader in {:?}",
+            began.elapsed()
         );
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
@@ -816,11 +847,12 @@ async fn a_split_committed_but_not_applied_is_finished_by_the_restart() {
     )
     .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let began = Instant::now();
     while store.regions().len() < 2 {
         assert!(
-            Instant::now() < deadline,
-            "the restart never finished the split"
+            began.elapsed() < SPLIT_LANDS_WITHIN,
+            "the restart never finished the split in {:?}",
+            began.elapsed()
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
