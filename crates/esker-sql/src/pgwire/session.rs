@@ -252,13 +252,38 @@ pub trait Execute {
         Ok(())
     }
 
+    /// **The session is ending: give back everything that outlives a statement.**
+    ///
+    /// Advisory locks, the open transaction, and whatever a session owns that a statement does
+    /// not — [`crate::exec::Executor`] also takes its temporary schema back here
+    /// ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+    ///
+    /// **Required rather than defaulted**, for the reason [`Execute::terminated`] is: a default
+    /// that does nothing reads as "this executor holds nothing a session outlives" and is
+    /// indistinguishable from an implementor that forgot — and what that produces is a lock or a
+    /// schema nobody can reach and nothing that says so. Three of the four implementors in this
+    /// repository really do hold nothing, and each says so in a line.
+    ///
+    /// **Called from exactly one place** — the single ending in
+    /// [`crate::pgwire::server::Connection::run`] — and **on the blocking pool**, because for a
+    /// real executor this reaches the stores: a rollback is a Percolator rollback and dropping a
+    /// schema is a transaction of its own. That is the whole of `#83`. It used to be five
+    /// `release_advisory_locks` calls at five of the seven ways out of that loop, with the
+    /// transaction and the schema left to `Executor`'s destructor — which ran on a runtime thread,
+    /// where [`esker_proto::transport::BlockingTransport`] refuses rather than blocking,
+    /// so the cleanup was skipped in silence.
+    fn close(&mut self);
+
     /// Releases every advisory lock this session holds, because it is ending.
     ///
     /// **Not tidying: the other half of the lifetime.** An advisory lock survives `ROLLBACK` and
     /// survives the statement that took it, so the only two things that release one are an
     /// explicit unlock and the session going away — and the connection is the only thing that
-    /// knows about the second (`crate::advisory`). Every path out of
-    /// [`crate::pgwire::server::Connection::run`] calls it.
+    /// knows about the second (`crate::advisory`).
+    ///
+    /// Reached through [`Execute::close`], which is the one ending; this used to say "every path
+    /// out of `Connection::run` calls it" and that was false for two of the seven — a message that
+    /// would not decode, and every `?`.
     ///
     /// Does nothing by default, which is right for an executor that has no locks.
     fn release_advisory_locks(&self) {}
@@ -1251,6 +1276,12 @@ mod tests {
 
         fn remember_prepared(&mut self, statements: Vec<crate::session::PreparedStatement>) {
             self.prepared = statements;
+        }
+
+        /// Records the ending, so a test can assert the connection reached it; this fake holds no
+        /// lock, no transaction and no schema.
+        fn close(&mut self) {
+            self.calls.push("close".to_string());
         }
 
         /// Records the option so a test can assert it reached the executor.

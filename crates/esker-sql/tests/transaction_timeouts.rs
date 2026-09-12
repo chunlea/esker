@@ -749,6 +749,12 @@ impl Execute for Idling {
         false
     }
 
+    /// The ending. This fake's whole subject is that the block is given back before the socket
+    /// goes, and `rollback` is what records it.
+    fn close(&mut self) {
+        let _ = self.rollback();
+    }
+
     /// Discarded: this fake answers `SELECT 1` and has no catalog to read the view from.
     fn remember_prepared(&mut self, _statements: Vec<esker_sql::session::PreparedStatement>) {}
 
