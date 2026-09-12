@@ -855,6 +855,55 @@ mod tests {
         assert!(picker.is_bottom_level_for_key(cf, 3, b"n"));
     }
 
+    /// **#82.** The point query and the range query disagree, and the range one is the sound half.
+    ///
+    /// This is the whole reason [`Picker::nothing_below`] exists, stated where it can fail. A
+    /// logical key whose versions are several engine keys — which is every MVCC key,
+    /// `'x' ++ enc(user_key) ++ enc_ts(commit_ts)` with the timestamp **complemented** — has its
+    /// *older* versions sorting **after** its newer ones. So a level below holding only an older
+    /// version does not overlap the newer one's key at all, and asking about that one key answers
+    /// "nothing below" while something is very much below.
+    ///
+    /// [ADR 0111](../../../../docs/adr/0111-a-deleted-keys-versions-are-dropped-as-one-segment.md)
+    /// drops a deleted key's whole segment on that answer, so getting it from the point query
+    /// resurrects the key: the delete goes and the older value underneath it comes back.
+    ///
+    /// `k0` stands for the newer version and `k9` for the older, which is the order the complement
+    /// produces. The engine is byte-opaque (invariant 7) and so is this test: what it asserts is a
+    /// property of two keys sharing a prefix, not anything about timestamps.
+    #[test]
+    fn a_range_sees_what_a_point_query_under_it_cannot() {
+        // File 3 sits at L4 and holds **only the older version**.
+        let version = version(&[
+            (1, 1, "a", "z", 10),
+            (2, 2, "a", "z", 10),
+            (4, 3, "k9", "k9", 10),
+        ]);
+        let picker = picker();
+        let cf = cf(&version);
+
+        assert!(
+            picker.is_bottom_level_for_key(cf, 1, b"k0"),
+            "the point query is supposed to answer `true` here — it is asked about the newer \
+             version's key, and no file below holds that key. This is the unsound answer ADR 0111 \
+             must not act on, and if it ever changes the range form below is no longer why"
+        );
+        assert!(
+            !picker.nothing_below(cf, 1, b"k0", b"k9"),
+            "the range form answered `nothing below` for a span a lower level overlaps: dropping \
+             the segment on this would leave the older version with nothing above it, and a key \
+             that was deleted would read as present again (#82, ADR 0111 condition 2)"
+        );
+
+        // And the other side, so this is a discriminator and not a refusal: with nothing under the
+        // span the range form says so, and the rule is allowed to fire.
+        assert!(
+            picker.nothing_below(cf, 3, b"k0", b"k9"),
+            "compacting L3 into L4 puts the output beside the only file below, so nothing is under \
+             the span and the segment may go"
+        );
+    }
+
     #[test]
     fn level_targets_grow_by_the_multiplier() {
         let picker = picker();
