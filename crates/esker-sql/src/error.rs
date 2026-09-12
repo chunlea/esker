@@ -2781,9 +2781,15 @@ pub enum SqlError {
 
     /// `SELECT 1, 2 UNION ALL SELECT 3`: the arms of a set operation are not the same width.
     ///
-    /// **`42601`, the grammar's code**, not a typing one — measured, and it is the sentence a real
-    /// server gives whichever operator is written: `each UNION query must have the same number of
-    /// columns`.
+    /// **`42601`, the grammar's code**, not a typing one — measured.
+    ///
+    /// **The operator names itself and this said it does not.** Measured on 19beta1, 2026-09-11:
+    /// `SELECT 1, 2 INTERSECT SELECT 3` is `each INTERSECT query must have the same number of
+    /// columns`. The word is left hard-coded because `INTERSECT` and `EXCEPT` are `0A000 … is not
+    /// supported` (`exec::set_arm_supported`), so no statement this node can plan reaches this
+    /// sentence with another word in it — and the two sentences below say `UNION` for the same
+    /// reason. `tests/set_operation_enum.rs` pins the `0A000`, so the day either operator is built
+    /// the test that stops passing names all three.
     #[error("each UNION query must have the same number of columns")]
     SetOperationArity,
 
@@ -2796,9 +2802,14 @@ pub enum SqlError {
     #[error("UNION types {left} and {right} cannot be matched")]
     SetOperationTypes {
         /// The first arm's type, named as a client would write it.
-        left: &'static str,
+        ///
+        /// Owned, because an arm may be of a **user-defined** type: `SELECT m FROM t UNION SELECT
+        /// 'sad'::text` is `UNION types mood and text cannot be matched` on 19beta1, and an enum
+        /// is an `int2` in the row — naming the storage reports a mistake nobody made
+        /// (`debts-v1.1.md` #57).
+        left: String,
         /// The later arm's.
-        right: &'static str,
+        right: String,
     },
 
     /// The same `42846` a set operation gets, for a `COALESCE` or a `CASE` — one category, no
@@ -2827,10 +2838,12 @@ pub enum SqlError {
     /// the type it *could not convert* is the later arm's.
     #[error("UNION could not convert type {from} to {to}")]
     SetOperationCannotConvert {
-        /// The arm's type, named as a client would write it.
-        from: &'static str,
+        /// The arm's type, named as a client would write it. Owned for
+        /// [`SqlError::SetOperationTypes`]'s reason: **two enums** are one category, so this is the
+        /// sentence they get — `UNION could not convert type other_mood to mood`, measured.
+        from: String,
         /// The type the set settled on.
-        to: &'static str,
+        to: String,
     },
 
     /// A function argument a real server refuses with `22023` and a sentence of its own.

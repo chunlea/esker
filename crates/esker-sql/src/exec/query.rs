@@ -664,6 +664,13 @@ pub(super) fn append(
             return Err(SqlError::SetOperationArity);
         }
         for (at, column) in arm.columns.iter().enumerate() {
+            // **The user-defined type first, because it decides which sentence gets written.**
+            // An enum is its label's ordinal in the row (ADR 0050), so `common_of` below sees two
+            // `int2`s where the arms are a `mood` and an `other_mood` — and *answers*, under
+            // `smallint`, with the ordinals — and it names `smallint` where the arms are a `mood`
+            // and a `text`. Both are decided here, from the identity the storage cannot carry.
+            columns[at].user_type =
+                unify_user_type(columns[at].user_type.as_ref(), column.user_type.as_ref())?;
             // **The same `select_common_type` a `COALESCE` and a `CASE` ask** — this path had
             // both of its passes and the right two sentences first, and `common_of` is that rule
             // written once so the other two stopped having their own.
@@ -672,10 +679,6 @@ pub(super) fn append(
             // `varchar(3)` beside a `varchar(5)` is a `varchar` with no length on a real server.
             if columns[at].typmod != column.typmod {
                 columns[at].typmod = crate::value::NO_TYPMOD;
-            }
-            // And a user-defined type only where both arms are the same one.
-            if columns[at].user_type != column.user_type {
-                columns[at].user_type = None;
             }
         }
         arm_types.push(arm.columns.iter().map(|c| c.ty).collect());
@@ -690,8 +693,8 @@ pub(super) fn append(
             let to = columns[at].ty;
             if !reaches_implicitly(*from, to) {
                 return Err(SqlError::SetOperationCannotConvert {
-                    from: from.name(),
-                    to: to.name(),
+                    from: from.name().to_owned(),
+                    to: to.name().to_owned(),
                 });
             }
         }
@@ -820,6 +823,55 @@ fn one_of(mut nodes: Vec<Node>) -> Node {
     Node::Append { arms: nodes }
 }
 
+/// The user-defined type one output column of a set operation has, across two arms — or the
+/// refusal a real server gives when they disagree.
+///
+/// **Only an enum decides anything here**, and it is the one kind whose value is not what is
+/// stored: an enum is its label's ordinal in the row (ADR 0050), so two enums look like two
+/// `int2`s and an enum beside a `smallint` looks like one type. Everything [`common_of`] is asked
+/// afterwards is about the storage, which is why this runs first. A domain is its base type for
+/// this purpose and a range is its own [`ColumnType`], so neither reaches the rules below and
+/// both keep the behaviour they had.
+///
+/// Two measured sentences, and which one you get is the **category**:
+///
+/// * two enums are one category (`E`), so a real server tries the conversion and fails —
+///   `42846 UNION could not convert type other_mood to mood`, the later arm's type first. **That
+///   is what this decides**;
+/// * an enum beside anything else is two categories and never gets that far —
+///   `42804 UNION types mood and text cannot be matched`, in the arms' own order. **That one is
+///   not written here yet**, and the arm below says why.
+///
+/// The same enum on both sides survives, which is what makes `SELECT m FROM t UNION SELECT
+/// 'sad'::mood` a `mood` whose values are labels rather than a `smallint` whose values are 1 and 2.
+fn unify_user_type(
+    running: Option<&crate::catalog::TypeDef>,
+    arm: Option<&crate::catalog::TypeDef>,
+) -> Result<Option<crate::catalog::TypeDef>> {
+    let is_enum =
+        |def: &crate::catalog::TypeDef| matches!(def.kind, crate::catalog::TypeKind::Enum { .. });
+    match (running, arm) {
+        (Some(left), Some(right)) if left.oid == right.oid => Ok(Some(left.clone())),
+        (Some(left), Some(right)) if is_enum(left) && is_enum(right) => {
+            Err(SqlError::SetOperationCannotConvert {
+                from: right.name.clone(),
+                to: left.name.clone(),
+            })
+        }
+        // **One arm with a type and one without is left alone, and that is not the rule.**
+        // `SELECT m FROM t UNION SELECT 1::smallint` is
+        // `42804 UNION types mood and smallint cannot be matched` on 19beta1 and answers rows
+        // here. What stops it being written is that **an absent `user_type` is ambiguous**:
+        // `Executor::resolve_user_cast` walks the *top-level* select's projection and its arms,
+        // and no further — so a set operation inside a derived table or a `WITH` reaches here with
+        // its cast arm carrying no type at all. Refusing on the asymmetry turned
+        // `SELECT v FROM (SELECT m AS v FROM t UNION SELECT 'sad'::mood) s`, which answers, into a
+        // `42804`. The nesting gap is the row to pay first; this arm is one line once an absent
+        // type means "not a user type" (`tests/set_operation_enum.rs` carries both measurements).
+        _ => Ok(None),
+    }
+}
+
 /// One arm's rows as the set's types, or the arm unchanged when it already produces them.
 ///
 /// A projection of casts, which is what PostgreSQL puts in each arm's target list. The `Ordinal`
@@ -895,8 +947,8 @@ impl Unifying {
     fn mismatch(self, left: ColumnType, right: ColumnType) -> SqlError {
         match self {
             Unifying::SetOperation => SqlError::SetOperationTypes {
-                left: left.name(),
-                right: right.name(),
+                left: left.name().to_owned(),
+                right: right.name().to_owned(),
             },
             Unifying::Coalesce => SqlError::DatatypeMismatch(format!(
                 "COALESCE types {} and {} cannot be matched",
@@ -918,8 +970,8 @@ impl Unifying {
     fn cannot_convert(self, from: ColumnType, to: ColumnType) -> SqlError {
         match self {
             Unifying::SetOperation => SqlError::SetOperationCannotConvert {
-                from: from.name(),
-                to: to.name(),
+                from: from.name().to_owned(),
+                to: to.name().to_owned(),
             },
             Unifying::Coalesce => SqlError::CannotConvertBranch {
                 kind: "COALESCE",
@@ -1011,8 +1063,8 @@ pub(super) fn unify(left: ColumnType, right: ColumnType) -> Result<ColumnType> {
     }
     if pg_catalog::typcategory(left) != pg_catalog::typcategory(right) {
         return Err(SqlError::SetOperationTypes {
-            left: left.name(),
-            right: right.name(),
+            left: left.name().to_owned(),
+            right: right.name().to_owned(),
         });
     }
     // **PostgreSQL's `select_common_type`, and it is asymmetric.** The running candidate keeps the
