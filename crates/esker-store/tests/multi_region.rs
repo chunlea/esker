@@ -20,6 +20,16 @@ use esker_store::pd::{FakePd, PdClient, StoreInfo};
 use esker_store::{Store, StoreOptions, meta};
 
 /// A store hosting one region covering everything, as a fresh database bootstraps it.
+/// How long a wait on a **heartbeat** or an **election** is given before it is called a failure.
+///
+/// Both are preconditions: nothing below asserts that a store beats quickly or that a lone voter
+/// takes office quickly, only that either happens at all. So they are sized against the worst
+/// machine — a gate running several clusters at once — rather than against the one they were
+/// written on, where a heartbeat tick is two milliseconds and an election is a handful of them.
+/// They were five and ten seconds, which is a bound on the *good* box.
+const BEATS_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+const ELECTS_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn open(dir: &tempfile::TempDir) -> Arc<Store> {
     Store::open(dir.path(), StoreOptions::new()).unwrap()
 }
@@ -507,9 +517,13 @@ async fn a_store_reports_itself_and_its_regions_to_the_placement_driver() {
     .unwrap();
 
     // The first tick reports both, so this waits on one tick rather than on an interval.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let began = std::time::Instant::now();
     while pd.store_beats().is_empty() || pd.region_beats().is_empty() {
-        assert!(std::time::Instant::now() < deadline, "no heartbeat arrived");
+        assert!(
+            began.elapsed() < BEATS_WITHIN,
+            "no heartbeat arrived in {:?}, against a heartbeat tick of 2 ms",
+            began.elapsed()
+        );
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
 
@@ -689,11 +703,12 @@ async fn a_peer_started_from_a_record_with_a_learner_knows_about_it() {
     let store = Store::open(dir.path(), replicated()).unwrap();
 
     let peer = store.peer_of(child.id).expect("the child is replicated");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let began = std::time::Instant::now();
     while !peer.is_leader() {
         assert!(
-            std::time::Instant::now() < deadline,
-            "the lone voter never took office"
+            began.elapsed() < ELECTS_WITHIN,
+            "the lone voter never took office in {:?}",
+            began.elapsed()
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }

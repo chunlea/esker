@@ -226,30 +226,44 @@ fn collecting_takes_the_climb_out_of_the_same_work() {
     // `{6: 12}` over twelve rounds, one more every time, each consulted by every read. With the
     // segment rule the files oscillate between two and three and the count does not grow.
     //
-    // **A band and not a trend, which is why this is a spread and not a slope.** With the segment
-    // rule the count settles into an oscillation — two files, three, two — as sweeps merge and
-    // split, and a least-squares slope over an oscillation is a small number with a narrow
-    // interval that lands on either side of zero depending on where the last round fell. Measured:
-    // the same build gave `+0.07` and `+0.13` on consecutive runs, one of which a
-    // slope-contains-zero assertion would have called a regression. What the claim actually is —
-    // "the file count stops growing" — is a statement about the *spread*: a count that gains one
-    // a round spans eleven over twelve rounds, and one that oscillates spans one.
+    // **A slope on this arm alone, because this quantity has no denominator.** The spread was
+    // `high - low <= 2` over the settled rounds and it went red on a gate running several clusters
+    // at once: the sweeper's debounce lands differently against the rounds when the box is busy, so
+    // a round is sampled just before a sweep instead of just after and an oscillation between two
+    // and three reads as one to four. Nothing about the claim had changed.
     //
-    // **From the second round.** The first has no files at all — nothing has been swept yet, so
-    // its zero is "no count" and not "a count of zero", and including it made the spread depend on
-    // whether the last round happened to land on two or three. That is a warm-up, not a trend, and
-    // reading it as one is what a band needs guarding against.
-    let settled = &collected_files[1..];
-    let (low, high) = (
-        settled.iter().min().copied().unwrap_or(0),
-        settled.iter().max().copied().unwrap_or(0),
-    );
+    // The control cannot stand in for it. `twelve_rounds` asserts that the control **never
+    // compacts**, so it has no sweep output at all and its file count is flat — measured `+0.00`
+    // against the collecting arm's `+0.08`. The `{6: 1}` … `{6: 12}` climb this rule is about was
+    // the *collecting* arm before ADR 0111, not the control. So the read cost gets a ratio and this
+    // gets a bound, and the bound is named rather than borrowed.
+    //
+    // **The bound is the mechanism, not a taste.** Before the segment rule each sweep of a round of
+    // dropped tables emitted exactly one file of immortal delete records — one a round, twelve over
+    // twelve, each consulted by every read. So "less than half a file a round" is not a threshold
+    // somebody picked between two numbers; it is "that does not happen any more", sitting between
+    // the defect's `+1.00` by construction and the `+0.08` and `+0.15` measured on two runs here.
+    // Two observations is thin, and the bound is deliberately nearer the defect than the noise:
+    // a slope of `+0.50` over eleven rounds is five more files by the end, which is the mechanism
+    // and not a sampling artefact.
+    //
+    // **A slope and not a spread, which is the load-sensitive half of the old assertion.** A spread
+    // is decided by its two extremes, so one unlucky sample widens it; a least-squares slope over
+    // eleven rounds is decided by the trend, and load moves *where in the oscillation* a round
+    // lands without making the count climb. The objection that retired the slope once — that a fit
+    // over an oscillation is a small number falling on either side of zero — was about asserting a
+    // **sign**. This asserts a one-sided bound half an order of magnitude away from zero, which a
+    // wobbling sign cannot reach.
+    //
+    // **From the second round.** The first has no files at all — nothing has been swept yet, so its
+    // zero is "no count" and not "a count of zero".
+    let files_with = slope_with_interval(&collected_files[1..]).0;
     assert!(
-        high - low <= 2,
-        "the tables on the books ranged from {low} to {high} over {ROUNDS} rounds while \
-         collecting — before ADR 0111 that was one more every round, each a file of delete \
-         records at a key range nothing writes again and each consulted by every read — \
-         {collected_files:?}"
+        files_with < 0.5,
+        "the tables on the books grew {files_with:+.2} a round while collecting — before ADR 0111 \
+         that was one more every round, each a file of delete records at a key range nothing \
+         writes again and each consulted by every read. collecting {collected_files:?}, control \
+         {control_files:?}"
     );
     assert!(
         with.0 * 4.0 <= without.0,

@@ -625,7 +625,9 @@ pub(super) fn matching_rows_as(
     table: &TableDef,
     name: String,
 ) -> Result<Node> {
-    let mut node = access_path(filter, tenant, table)?;
+    // The filter travels with the name this statement refers to the relation by, because that is
+    // what a qualifier in it has to match (`#87`).
+    let mut node = access_path(filter.map(|expr| (expr, name.as_str())), tenant, table)?;
     if let Some(filter) = filter {
         let scope = Scope::single_as(table, name);
         let predicate = resolve(filter, &scope)?;
@@ -1285,6 +1287,11 @@ pub(super) fn plan_under(
         using,
     );
     let scope = scope.under(outer);
+    // **The name a qualifier must write for whichever side is driving**, swapped with the tables
+    // below so the two cannot go out of step — which is how `#87` happened: `drive_from` may put
+    // the *aliased* copy of a self-joined table on the outside, and the predicate placement below
+    // was still asking about "the table".
+    let outer_name = if swapped { names.1 } else { names.0 };
     let (outer_table, inner_table) = match (table, inner, swapped) {
         (Some(left), Some(right), false) => (Some(left), Some(right)),
         (Some(left), Some(right), true) => (Some(right), Some(left)),
@@ -1326,11 +1333,10 @@ pub(super) fn plan_under(
             if let Some(plan) = outer_entry.and_then(crate::plan::TableRef::derived_plan) {
                 plan.clone()
             } else {
-                let usable = select
-                    .filter
-                    .as_ref()
-                    .filter(|filter| inner_table.is_none() || mentions_only(filter, table));
-                access_path(usable, tenant, table)?
+                let usable = select.filter.as_ref().filter(|filter| {
+                    inner_table.is_none() || mentions_only(filter, table, outer_name)
+                });
+                access_path(usable.map(|expr| (expr, outer_name)), tenant, table)?
             }
         }
     };
@@ -2087,12 +2093,20 @@ fn pushdown(
     // Taken from the predicate this pushdown is about to apply, so it can only restrict rows this
     // filter would have discarded.
     let mut node = node;
+    // `entries.first()`, because a bare `CatalogView` here **is** the first entry's access path —
+    // the chain has not joined anything onto it yet, which is the only state this arm matches in —
+    // and the name it is referred to by is what a qualifier in the predicate has to write (`#87`).
     if let Node::CatalogView { view, only, .. } = &mut node
         && only.is_none()
+        && let Some((_, as_named)) = entries.first()
     {
-        *only = pinned_relation(Some(&predicate), *view, &view.table_def())
-            .ok()
-            .flatten();
+        *only = pinned_relation(
+            Some((&predicate, as_named.as_str())),
+            *view,
+            &view.table_def(),
+        )
+        .ok()
+        .flatten();
     }
     // Resolved here because a `Filter` holds a resolved predicate; a join resolves its own.
     let Ok(predicate) = resolve(&predicate, &scope) else {
@@ -2205,7 +2219,7 @@ fn one_joins_condition(
     let using: &[String] = only_join.map_or(&[], |join| &join.using);
     let scope = Scope::joined(left, right, false, using);
     let pending = select.filter.as_ref().map(conjuncts_of).unwrap_or_default();
-    Ok(both(written, answerable_in(&pending, &scope, left.0)))
+    Ok(both(written, answerable_in(&pending, &scope, left)))
 }
 
 /// The conjuncts a two-table scope can answer that are not about the **outer** side alone, as one
@@ -2216,10 +2230,10 @@ fn one_joins_condition(
 /// separates is `a.x = b.y`, which turns `outer x inner` rows into the ones that match, from
 /// `a.x = 1`, which belongs above the loop where it costs one comparison per outer row rather than
 /// one per pair.
-fn answerable_in(pending: &[&Expr], scope: &Scope<'_>, outer: &TableDef) -> Option<Expr> {
+fn answerable_in(pending: &[&Expr], scope: &Scope<'_>, outer: (&TableDef, &str)) -> Option<Expr> {
     let mut ready: Vec<&Expr> = Vec::new();
     for conjunct in pending {
-        if !is_pushable(conjunct) || mentions_only(conjunct, outer) {
+        if !is_pushable(conjunct) || mentions_only(conjunct, outer.0, outer.1) {
             continue;
         }
         if resolve(conjunct, scope).is_ok() {
@@ -2540,11 +2554,20 @@ fn drive_from<'a>(
 }
 
 /// Whether every column reference in an expression belongs to `table`.
-fn mentions_only(expr: &Expr, table: &TableDef) -> bool {
+/// Whether every column in `expr` belongs to **this relation instance**, which `as_named` is the
+/// qualifier for.
+///
+/// **The instance and not the table** (`#87`). This compared the qualifier to `table.name`, which
+/// is the same string for both sides of a self-join — so `WHERE topics.id = 1` "mentioned only"
+/// `topics` whichever of `FROM topics INNER JOIN topics replies_topics` was being asked, the
+/// predicate was pushed into the wrong one, and `access_path` pinned its primary key. Both sides
+/// planned as point reads, the outer fetched the parent whose `parent_id` is NULL, and
+/// `reset_counters` wrote the 0 that came back.
+fn mentions_only(expr: &Expr, table: &TableDef, as_named: &str) -> bool {
     let mut only = true;
     for_each_column(expr, &mut |qualifier, name| {
-        only &= qualifier.is_none_or(|qualifier| qualifier == table.name)
-            && table.column(name).is_some();
+        only &=
+            qualifier.is_none_or(|qualifier| qualifier == as_named) && table.column(name).is_some();
     });
     only
 }
@@ -2888,7 +2911,7 @@ fn function_node(entry: &crate::plan::TableRef, def: &TableDef, scope: &Scope<'_
 
 /// Rule 1, 2 and 3 from `plan::query`: pin the whole primary key, bound its first column, or pin a
 /// unique index's whole key. Otherwise a scan.
-fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<Node> {
+fn access_path(filter: Option<(&Expr, &str)>, tenant: u64, table: &TableDef) -> Result<Node> {
     let columns = table.row_schema();
     // A `pg_catalog` relation is computed, so it has no key range to narrow and no index to seek
     // in: one access path, all of its rows, and the `WHERE` above it does the rest. Returned
@@ -2909,10 +2932,10 @@ fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<N
             columns,
         });
     }
-    let Some(filter) = filter else {
+    let Some((filter, as_named)) = filter else {
         return seq_scan(tenant, table, &columns, false);
     };
-    let equalities = equality_constants(filter, table)?;
+    let equalities = equality_constants(filter, table, as_named)?;
 
     // Rule 1: the whole primary key, pinned.
     if let Some(key) = pinned(&table.primary_key, &equalities) {
@@ -3097,15 +3120,20 @@ fn flip(op: BinaryOp) -> BinaryOp {
 ///
 /// Only conjunctions count: a constant under an `OR` is not required, and treating it as though it
 /// were would return the wrong rows. That is the whole reason this walks `AND` and stops.
-fn equality_constants(expr: &Expr, table: &TableDef) -> Result<Vec<(usize, Datum)>> {
+fn equality_constants(
+    expr: &Expr,
+    table: &TableDef,
+    as_named: &str,
+) -> Result<Vec<(usize, Datum)>> {
     let mut found = Vec::new();
-    collect_equalities(expr, table, &mut found)?;
+    collect_equalities(expr, table, as_named, &mut found)?;
     Ok(found)
 }
 
 fn collect_equalities(
     expr: &Expr,
     table: &TableDef,
+    as_named: &str,
     found: &mut Vec<(usize, Datum)>,
 ) -> Result<()> {
     match expr {
@@ -3114,17 +3142,43 @@ fn collect_equalities(
             left,
             right,
         } => {
-            collect_equalities(left, table, found)?;
-            collect_equalities(right, table, found)
+            collect_equalities(left, table, as_named, found)?;
+            collect_equalities(right, table, as_named, found)
         }
         Expr::Binary {
             op: BinaryOp::Eq,
             left,
             right,
         } => {
+            // **The qualifier decides which relation this is about, and dropping it is `#87`.**
+            // `Expr::Column` carries it on purpose — its own documentation says it is kept
+            // *"rather than dropped, which it used to be … the argument is wrong, because it also
+            // throws away the case where it is **not** right"* — and this matched
+            // `Expr::Column { name, .. }`, throwing it away again. With two aliases of one table
+            // that makes `topics.id = 1` a primary-key equality on *either* of them.
             let pair = match (left.as_ref(), right.as_ref()) {
-                (Expr::Column { name, .. }, Expr::Literal(literal))
-                | (Expr::Literal(literal), Expr::Column { name, .. }) => (name, literal),
+                (
+                    Expr::Column {
+                        table: qualifier,
+                        name,
+                    },
+                    Expr::Literal(literal),
+                )
+                | (
+                    Expr::Literal(literal),
+                    Expr::Column {
+                        table: qualifier,
+                        name,
+                    },
+                ) => {
+                    if qualifier
+                        .as_deref()
+                        .is_some_and(|written| written != as_named)
+                    {
+                        return Ok(());
+                    }
+                    (name, literal)
+                }
                 _ => return Ok(()),
             };
             let Some(ordinal) = table.column(pair.0) else {
@@ -3157,17 +3211,17 @@ fn collect_equalities(
 /// integer or oid column is the number it is"). Two contradictory equalities are a query that
 /// answers nothing and this takes the first: the filter above still applies both.
 fn pinned_relation(
-    filter: Option<&Expr>,
+    filter: Option<(&Expr, &str)>,
     view: pg_catalog::CatalogView,
     table: &TableDef,
 ) -> Result<Option<i64>> {
-    let (Some(filter), Some(name)) = (filter, view.relation_column()) else {
+    let (Some((filter, as_named)), Some(name)) = (filter, view.relation_column()) else {
         return Ok(None);
     };
     let Some(ordinal) = table.column(name) else {
         return Ok(None);
     };
-    Ok(equality_constants(filter, table)?
+    Ok(equality_constants(filter, table, as_named)?
         .into_iter()
         .find_map(|(at, value)| match value {
             Datum::Int8(oid) if at == ordinal => Some(oid),

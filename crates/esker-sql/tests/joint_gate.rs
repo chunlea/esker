@@ -1147,6 +1147,128 @@ fn strand_a_secondary_lock(
 /// version except the ones a resolver produced, for ever, and only for transactions whose client
 /// died at exactly the wrong moment. `esker_store::peer`'s `commits_of` covers it, and this is
 /// what says so from outside.
+/// **#86: a lock nobody has resolved yet is a row the columnar copy cannot see.**
+///
+/// The test below is this one with the two reads in the other order, and the order is the whole
+/// difference. It resolves the lock **first**, through the row scan, and only then asks the copy —
+/// so it proves that a resolver's `write` record reaches the copy. This asks the copy **while the
+/// lock is still standing**, which is the state the cluster is in whenever a client's secondary
+/// commit did not land: `Transaction::commit` discards that result on purpose (*"a secondary that
+/// fails here is not a failed transaction … a reader that meets one of these locks will roll it
+/// forward"*), so *primary committed, secondary still locked* is a normal intermediate state and
+/// not a fault.
+///
+/// The row path is built for it. `txnkv::user_keys_in` collects **every key that is only locked**
+/// beside every key with a version, and says why in the sentence this test is named after:
+///
+/// > The `lock` column family is the half that is easy to leave out, and leaving it out is a silent
+/// > wrong answer. A key prewritten by a transaction that has since **committed its primary** has a
+/// > lock and no `write` record … A scan built from versions alone answers without the row and
+/// > reports no lock, so the caller has nothing to resolve and no way to notice.
+///
+/// **The columnar path is a scan built from versions alone.** `columnar::region::convert` walks
+/// `cf::WRITE`; the tee fires on commits; nothing on either path reads `cf::LOCK`. So the copy
+/// answers without the row, the row store answers with it, and nobody reports anything — which
+/// `e8d31d68`'s gate saw once as `only the row scan has [Int8(4), Text("barbara"), …]`.
+///
+/// A learner cannot resolve a lock: resolution is a write and it is not a voter. So the answer is
+/// to **refuse** and let the planner fall back to the row path, which resolves it and answers — and
+/// a later fragment then succeeds, which is exactly what `RefusalReason::TooFarBehind` promises
+/// ("the same node may succeed later"). Answering short is the one thing it must not do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fragment_refuses_while_a_committed_transaction_is_still_locked() {
+    let gate = Gate::start().await;
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, name text)",
+        );
+        settle(
+            &mut session,
+            "INSERT INTO t VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger')",
+        );
+        settle(&mut session, "ALTER TABLE t SET (columnar_replicas = 1)");
+    });
+    wait_for("PD to place a columnar learner", 60, || {
+        gate.columnar_learners().len() == 1
+    })
+    .await;
+    wait_for("the store to build the learner", 60, || {
+        gate.learner_node().store.regions().find(b"t").is_some()
+    })
+    .await;
+
+    let table_id = tokio::task::block_in_place(|| gate.table_id("t"));
+    let region_id = gate.learner_node().store.regions().find(b"t").unwrap().id();
+    let primary = row_key(table_id, 4);
+    let secondary = row_key(table_id, 5);
+
+    // Primary committed, secondary left locked — and past its TTL, so the lock is *resolvable*.
+    // That matters: a lock still inside its lease is one the row path waits on rather than rolls
+    // forward, and then neither engine answers and there is nothing to disagree about.
+    let ttl_ms = 300;
+    tokio::task::block_in_place(|| {
+        strand_a_secondary_lock(&gate, region_id, &primary, &secondary, ttl_ms);
+    });
+    tokio::time::sleep(Duration::from_millis(ttl_ms * 4)).await;
+
+    let ts = gate.oracle.timestamp().unwrap();
+    let min_apply_index = gate
+        .nodes
+        .iter()
+        .filter_map(|node| node.store.peer_of(region_id))
+        .filter(|peer| peer.is_leader())
+        .map(|peer| peer.applied_index())
+        .max()
+        .expect("some store leads the region");
+
+    // **The copy first, while the lock still stands.** Asked through `Gate::ask` and not
+    // `Gate::fragment`, because a refusal is the answer this is about and `fragment` panics on one.
+    let answer = tokio::task::block_in_place(|| {
+        Gate::ask(
+            gate.learner_node(),
+            region_id,
+            TENANT,
+            table_id,
+            ts,
+            min_apply_index,
+            vec![0, 1],
+        )
+    });
+
+    // And the row path at the same instant, so the row the copy could not see is on the record.
+    let rows = tokio::task::block_in_place(|| gate.row_scan(ts, table_id, &[0, 1]));
+    let rolled_forward = rows.contains(&vec![Cell::Int8(5), Cell::Text("barbara".to_owned())]);
+    assert!(
+        rolled_forward,
+        "the row scan did not roll the stranded lock forward, so the state this test is about was          never reached: {rows:?}"
+    );
+
+    match answer {
+        FragmentResp::Refused { reason, detail } => {
+            assert_eq!(
+                reason,
+                RefusalReason::TooFarBehind,
+                "a lock this learner cannot resolve is something it may answer later, not                  something it can never answer: {detail}"
+            );
+        }
+        FragmentResp::Result { result, .. } => {
+            let Body::Rows { rows: answered, .. } =
+                esker_proto::fragment::result::decode(&result).unwrap()
+            else {
+                panic!("a scan fragment came back as groups");
+            };
+            panic!(
+                "the copy answered with {} rows while a committed transaction's secondary was                  still locked, so it answered without a row the row store has — the silent                  disagreement ADR 0022 calls the worst failure this feature can have. The row                  scan, at the same instant, answered {rows:?}",
+                answered.len()
+            );
+        }
+    }
+
+    gate.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines() {
     let gate = Gate::start().await;
@@ -1258,6 +1380,99 @@ async fn a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines() {
 /// So the workload ends with an `ADD COLUMN ... NOT NULL DEFAULT`, one row inserted after it at
 /// the new width, and one older row rewritten — three widths of row alive at the timestamp this
 /// reads at.
+/// **The half that hides: a copy opened over rows nothing touches again.**
+///
+/// #86. `the_learner_answers_fragments_that_agree_with_a_row_scan` below writes four rows *before*
+/// the flag and then rewrites or deletes three of them after it, so three of the four reach the copy
+/// through the live tee whatever the conversion at open does. On `e8d31d68`'s gate the fragment came
+/// back without **`id 4`** — the one row of the six that nothing touched after the flag, so the only
+/// row whose sole possible source was the conversion. Every row the answer *did* hold was one the
+/// stream had supplied. Read that way the dump says the conversion produced nothing and one row
+/// happened to notice; the same run passed three times over when re-run, because whether the
+/// conversion is asked before or after the stream is a race.
+///
+/// So this is that test with the stream taken away: **every row is written before the flag and not a
+/// byte after it**, which leaves the conversion as the only thing that can put a row in the copy. A
+/// fragment that agrees here is a conversion that ran and covered the region; one that comes back
+/// short — or refused, which `Gate::fragment` panics on rather than reading as agreement — is the
+/// conversion, with nothing else to blame.
+///
+/// It is deliberately *not* a construction of the race. If this is green the conversion is right on
+/// its own and the defect is in the interleaving, which needs a different instrument: holding a
+/// fragment between "the entry is committed" and "its batch is written", and again between "the
+/// batch is written" and "the tee has run".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_opened_over_rows_nothing_rewrites_holds_all_of_them() {
+    let gate = Gate::start().await;
+
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session();
+        settle(
+            &mut session,
+            "CREATE TABLE t (id int8 PRIMARY KEY, name text)",
+        );
+        settle(
+            &mut session,
+            "INSERT INTO t VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger'), (4, 'barbara')",
+        );
+        // **The flag last, and nothing after it.** The copy therefore has history to convert and no
+        // stream to hide behind: a row in the answer can only have come from the walk at open.
+        settle(&mut session, "ALTER TABLE t SET (columnar_replicas = 1)");
+    });
+
+    wait_for("PD to place a columnar learner", 60, || {
+        gate.columnar_learners().len() == 1
+    })
+    .await;
+    wait_for("the store to build the learner", 60, || {
+        gate.learner_node().store.regions().find(b"t").is_some()
+    })
+    .await;
+
+    let table_id = tokio::task::block_in_place(|| gate.table_id("t"));
+    let ts = gate.oracle.timestamp().unwrap();
+    let region_id = gate.learner_node().store.regions().find(b"t").unwrap().id();
+    let min_apply_index = gate
+        .nodes
+        .iter()
+        .filter_map(|node| node.store.peer_of(region_id))
+        .filter(|peer| peer.is_leader())
+        .map(|peer| peer.applied_index())
+        .max()
+        .expect("some store leads the region");
+
+    let projection = vec![0, 1];
+    let columns = tokio::task::block_in_place(|| {
+        gate.fragment(TENANT, table_id, ts, min_apply_index, projection.clone())
+    });
+    let rows = tokio::task::block_in_place(|| gate.row_scan(ts, table_id, &projection));
+
+    compare(
+        &gate,
+        &Comparison {
+            ts,
+            min_apply_index,
+            table_id,
+            region_id,
+            projection,
+            columns: columns.clone(),
+            rows: rows.clone(),
+            ids: vec![1, 2, 3, 4],
+        },
+    );
+    // **And the count, said separately.** `compare` reports a disagreement between the two engines;
+    // this says the workload happened at all, so a run in which both sides answered nothing cannot
+    // pass as agreement.
+    assert_eq!(
+        columns.len(),
+        4,
+        "the conversion at open put {} of four rows in the copy: {columns:?}",
+        columns.len()
+    );
+
+    gate.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_learner_answers_fragments_that_agree_with_a_row_scan() {
     let gate = Gate::start().await;
@@ -1308,9 +1523,21 @@ async fn the_learner_answers_fragments_that_agree_with_a_row_scan() {
     let table_id = tokio::task::block_in_place(|| gate.table_id("t"));
     // One instant, read two ways. Taken after the writes, so both sides see all of them.
     let ts = gate.oracle.timestamp().unwrap();
-    // The leader's apply index, so the learner has to **catch up** before it may answer — the
-    // half of Decision 4 that a fragment at `min_apply_index = 0` would never exercise.
     let region_id = gate.learner_node().store.regions().find(b"t").unwrap().id();
+    let projection = vec![0, 1, 2];
+
+    // **The row scan first, and the order is load-bearing** (#86). A read on the row path
+    // *resolves* what it meets: a committed transaction whose secondary is still locked is rolled
+    // forward by it, and a fragment asked before that has no version for such a key — it refuses
+    // now and answered without the row before, which is how `e8d31d68`'s gate lost `id 4`. Asking
+    // the copy *while* a lock stands is
+    // `a_fragment_refuses_while_a_committed_transaction_is_still_locked`'s question, not this
+    // one's; the sibling test below takes the same care and for the same reason.
+    let rows = tokio::task::block_in_place(|| gate.row_scan(ts, table_id, &projection));
+
+    // The leader's apply index, so the learner has to **catch up** before it may answer — the half
+    // of Decision 4 that a fragment at `min_apply_index = 0` would never exercise. Sampled after
+    // the scan, so it includes whatever that scan's resolutions proposed.
     let min_apply_index = gate
         .nodes
         .iter()
@@ -1319,12 +1546,9 @@ async fn the_learner_answers_fragments_that_agree_with_a_row_scan() {
         .map(|peer| peer.applied_index())
         .max()
         .expect("some store leads the region");
-
-    let projection = vec![0, 1, 2];
     let columns = tokio::task::block_in_place(|| {
         gate.fragment(TENANT, table_id, ts, min_apply_index, projection.clone())
     });
-    let rows = tokio::task::block_in_place(|| gate.row_scan(ts, table_id, &projection));
 
     compare(
         &gate,

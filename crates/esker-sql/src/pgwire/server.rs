@@ -251,11 +251,43 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
         let Some(executor) = self.open_session(executors).await? else {
             return Ok(());
         };
-        let mut work = Work {
+        let mut work = Some(Work {
             session: Session::new(),
             executor,
             out: std::mem::take(&mut self.out),
-        };
+        });
+        let outcome = self.messages(&mut work).await;
+        // **The one ending, and it is here so that no way out of the loop can miss it** (`#83`).
+        //
+        // There are seven, and three of them used to do this for themselves while the other four
+        // — the client leaving, a `Terminate`, a message that would not decode, and every `?` —
+        // left the bundle to be dropped on this thread, where `Executor`'s destructor reached
+        // `BlockingTransport::call`, was refused, and skipped the session's cleanup in silence.
+        // Run 128 leaked a temporary schema that way and the only trace was `tokio`'s caught panic
+        // in the log. Written as one ending rather than seven for the reason `exec::wait_for_row`
+        // gives for its own: *"there are five of those and the two that were missed are the two
+        // nobody thinks of as a wait ending."* A `?` inside `messages` cannot escape this now,
+        // because the bundle is `run`'s and not the loop's.
+        //
+        // **On the blocking pool**, because for a real executor every part of `close` reaches the
+        // stores: a rollback is a Percolator rollback and dropping the schema is a transaction of
+        // its own. This is the same reason session creation is there.
+        if let Some(mut ending) = work.take()
+            && let Err(error) = tokio::task::spawn_blocking(move || ending.executor.close()).await
+        {
+            tracing::warn!(%error, "a session's ending did not finish");
+        }
+        outcome
+    }
+
+    /// The message loop, which owns nothing it has to give back.
+    ///
+    /// The bundle stays in [`Connection::run`]'s hand and is only ever *borrowed* here, so that
+    /// every way out of this loop — including an `?` nobody has written yet — ends at the one
+    /// place that closes the session. `None` on the way out means the bundle went to the blocking
+    /// pool with a statement and did not come back, which is a panicking statement: it is dropped
+    /// there, where the destructor's fallback works.
+    async fn messages(&mut self, work: &mut Option<Work>) -> std::io::Result<()> {
         loop {
             // **A session idling inside a transaction block is on a clock.** PostgreSQL's
             // `idle_in_transaction_session_timeout` does not cancel a statement, it **terminates
@@ -268,30 +300,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             // A block that has *failed* is idling too — PostgreSQL reports it as "idle in
             // transaction (aborted)" and times it out the same way, which is why the test is
             // "not idle" rather than "in transaction".
-            let waiting_in_a_block = work.session.status() != TransactionStatus::Idle;
+            let Some(held) = work.as_ref() else {
+                return Ok(());
+            };
+            let waiting_in_a_block = held.session.status() != TransactionStatus::Idle;
             let deadline = waiting_in_a_block
-                .then(|| work.executor.idle_in_transaction_timeout())
+                .then(|| held.executor.idle_in_transaction_timeout())
                 .flatten();
             let next = match deadline {
                 Some(limit) => match tokio::time::timeout(limit, self.read_message()).await {
                     Ok(next) => next?,
                     Err(_elapsed) => {
                         // The block is abandoned before the socket goes, so nothing it wrote is
-                        // left half-open behind a connection nobody can reach any more.
-                        //
-                        // **On the blocking pool, for the same reason session creation is**:
-                        // `rollback` is a Percolator rollback against the stores on a real
-                        // cluster, so it reaches `BlockingTransport` exactly as the catalog read
-                        // does. This is the second site the audit for that bug turned up; the
-                        // `release_advisory_locks` beside it is in-process
-                        // (`crate::advisory::Locks`) and needs no thread of its own.
-                        let mut ending = work;
-                        tokio::task::spawn_blocking(move || {
-                            let _ = ending.executor.rollback();
-                            ending.executor.release_advisory_locks();
-                        })
-                        .await
-                        .map_err(std::io::Error::other)?;
+                        // left half-open behind a connection nobody can reach any more — the
+                        // ending in `run` is what abandons it, and it runs before this function's
+                        // caller returns and therefore before the socket is dropped.
                         self.send_error(&SqlError::IdleInTransactionTimeout).await?;
                         return Ok(());
                     }
@@ -299,10 +322,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 None => self.read_message().await?,
             };
             let Some((tag, body)) = next else {
-                // The client left. Its advisory locks go with it — they survive `ROLLBACK` and are
-                // released by an explicit unlock or by the session ending, and this is the ending
-                // (`crate::advisory`).
-                work.executor.release_advisory_locks();
+                // The client left, which is the commonest ending a connection has. Everything it
+                // was holding goes back at `run`'s ending: its advisory locks, which survive
+                // `ROLLBACK` and are released by an explicit unlock or by the session ending
+                // (`crate::advisory`), its open block, and its temporary schema. This arm used to
+                // take the first of those three and leave the other two to a destructor that could
+                // not send anything from here (`#83`).
                 return Ok(());
             };
             // **`pg_terminate_backend` ends the session, and this is where it lands.** The flag is
@@ -313,14 +338,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             // The unwinding is the idle-in-transaction path's, for the same reason and on the same
             // pool: an open block is given back before the socket goes, so nothing it wrote is
             // left half-open behind a connection nobody can reach.
-            if work.executor.terminated() {
-                let mut ending = work;
-                tokio::task::spawn_blocking(move || {
-                    let _ = ending.executor.rollback();
-                    ending.executor.release_advisory_locks();
-                })
-                .await
-                .map_err(std::io::Error::other)?;
+            if work.as_ref().is_some_and(|held| held.executor.terminated()) {
                 self.send_error(&SqlError::TerminatedByAdministrator)
                     .await?;
                 return Ok(());
@@ -336,14 +354,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
                 }
             };
             if matches!(message, crate::pgwire::message::Frontend::Terminate) {
-                work.executor.release_advisory_locks();
                 return Ok(());
             }
             // Onto a blocking thread and back. `spawn_blocking` rather than `block_in_place`
             // because a node serves many connections at once: blocking a *worker* thread per
             // statement would starve the runtime of the threads it needs to read the next
             // message, where the blocking pool exists to be blocked.
-            work = self.handle_while_watching(work, message).await?;
+            let Some(taken) = work.take() else {
+                return Ok(());
+            };
+            // On the error path the bundle has already moved onto the blocking pool and is
+            // dropped there, so `work` stays `None` and `run`'s ending has nothing to do — the
+            // destructor's fallback is the ending in that one case, and a blocking thread is
+            // where it works.
+            *work = Some(self.handle_while_watching(taken, message).await?);
             // **A session may terminate itself**, and then its own answer must not be sent:
             // `SELECT pg_terminate_backend(pg_backend_pid())` on PostgreSQL replies `FATAL` and
             // closes — the `t` the function computed never reaches the client. The check before
@@ -352,20 +376,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Connection<S> {
             //
             // It also tightens the cross-session case: a victim terminated while its statement was
             // running is told so when that statement ends, rather than answering once more first.
-            if work.executor.terminated() {
-                let mut ending = work;
-                tokio::task::spawn_blocking(move || {
-                    let _ = ending.executor.rollback();
-                    ending.executor.release_advisory_locks();
-                })
-                .await
-                .map_err(std::io::Error::other)?;
+            if work.as_ref().is_some_and(|held| held.executor.terminated()) {
                 self.send_error(&SqlError::TerminatedByAdministrator)
                     .await?;
                 return Ok(());
             }
-            if !work.out.is_empty() {
-                self.stream.write_all(&work.out).await?;
+            if let Some(held) = work.as_ref()
+                && !held.out.is_empty()
+            {
+                self.stream.write_all(&held.out).await?;
                 self.stream.flush().await?;
             }
         }
@@ -1063,6 +1082,9 @@ impl Execute for NotYetExecuting {
     fn terminated(&self) -> bool {
         false
     }
+
+    /// Nothing was ever opened, so there is nothing to give back.
+    fn close(&mut self) {}
 
     /// Discarded: there is no catalog behind this, so nothing can read the view they would fill.
     fn remember_prepared(&mut self, _statements: Vec<crate::session::PreparedStatement>) {}
