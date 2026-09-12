@@ -1127,11 +1127,32 @@ fn dropping_a_column_family_takes_its_data_with_it() {
     // directory: a WAL segment rolled or a manifest written between the two listings offsets the
     // reclaimed table and the count does not drop, which has nothing to do with what was reclaimed.
     // The claim is about the dropped family's tables, so it is made about those.
-    let after = ssts(&memfs);
+    //
+    // **Waited for, with a bound.** `Db::drop_cf` sweeps synchronously and that is the right
+    // semantics — a drop takes its data with it — but a sweep cannot delete a file another thread
+    // still has in `pending_outputs`, which is the guard that stops one sweep removing a file a
+    // second thread is in the middle of writing. On a loaded machine a background flush can hold
+    // the number at the instant the drop sweeps, and this asserted immediately: seen once on the
+    // gate of 2026-09-11 (`before: {4} after: {4}`) and never in five hundred local runs. Making
+    // the drop *wait* for that holder would be a wait taken across the version lock, which is a
+    // deadlock, so the wait is here — and it is bounded, so a reclaim that never happens is still
+    // a failure and says which file it was waiting for.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut after = ssts(&memfs);
+    while !(after.is_subset(&before) && after.len() < before.len())
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        db.purge_obsolete_files().unwrap();
+        after = ssts(&memfs);
+    }
     assert!(
         after.is_subset(&before) && after.len() < before.len(),
-        "the dropped family's tables should have been reclaimed and nothing else added\n  \
-         before: {before:?}\n  after:  {after:?}"
+        "the dropped family's tables were still there ten seconds after the drop, so nothing was \
+         holding them transiently and they are simply not being reclaimed\n  \
+         before: {before:?}\n  after:  {after:?}\n  \
+         still there: {:?}",
+        after.intersection(&before).collect::<Vec<_>>()
     );
     assert_eq!(get(&db, b"keep").as_deref(), Some(&b"me"[..]));
     drop(db);

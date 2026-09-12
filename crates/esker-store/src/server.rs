@@ -2584,7 +2584,27 @@ impl Store {
         }
 
         // 4. Adopt, in one batch, so the region becomes complete or stays absent.
+        let region_id = header.region.id;
         self.adopt_snapshot(&header).await?;
+        // **The columnar copy of this region is now stale, and this is the moment it is knowable.**
+        //
+        // A snapshot writes committed versions straight into the column families: no entry
+        // applies, so `ColumnarSlot::commit` never runs and the copy is not told. The slot itself
+        // survives the transfer — it is keyed by region on the store and `retire_region_now` stops
+        // the peer, not the slot — so what comes back is the copy that was there before, missing
+        // everything the snapshot brought.
+        //
+        // `ColumnarSlot::saw` already catches that gap, but only on the **next entry applied**:
+        // its own documentation says "the first entry applied after the transfer is the gap, and
+        // this is where it is caught". A learner that takes a snapshot and then goes quiet has no
+        // next entry, and answers fragments from the stale copy for as long as the quiet lasts —
+        // which is the disagreement `esker-sql`'s `joint_gate` differential reports, a fragment
+        // short of a row that every store holds.
+        //
+        // Closing it here makes the next open re-walk the region, which now holds what the
+        // snapshot brought. A rebuild and not a replay, deliberately: the snapshot **replaced**
+        // the log, so there are no entries between the copy's index and this one to replay.
+        self.columnar_slot(region_id).close();
         self.host_region(header.region)?;
         Ok(())
     }

@@ -240,6 +240,79 @@ fn a_copy_is_built_from_what_the_region_holds_and_kept_up_by_what_arrives() {
     assert_eq!(read(&slot, &db, 5), Vec::new(), "nothing existed yet");
 }
 
+/// **A copy opened before the rest of the history arrived still answers for it.**
+///
+/// `ColumnarSlot::ensure` builds a table's copy **once** — it returns early for a table already in
+/// `tables.open` — and the build converts what the `write` column family holds *at that instant*.
+/// Everything after that is the tee's: `RaftPeer::tee_columnar` feeds each applied entry in.
+///
+/// So a row that reaches the engine **without passing through the tee, after the copy is open** is
+/// invisible to both halves: too late for the conversion, never offered to the tee. That is not a
+/// hypothetical arrival path — it is what a **Raft snapshot install onto an already-open copy**
+/// leaves behind, which is the state of a columnar learner that fell behind far enough for the
+/// leader to compact past it. (`snapshot.rs`'s
+/// `a_columnar_learner_caught_up_by_a_snapshot_answers_for_what_it_brought` covers the other
+/// order — a snapshot *before* any copy exists — and passes, because the conversion then sees
+/// everything the snapshot brought.)
+///
+/// This constructs that state directly rather than through Raft, which is what makes it
+/// deterministic: `esker-sql`'s `joint_gate` differential produces it about one run in five, and
+/// only under load.
+#[test]
+fn a_copy_opened_before_the_rest_of_the_history_arrived_still_answers_for_it() {
+    let (dir, db) = open_db();
+
+    // The catalog record, as the `ALTER` that asks for a copy writes it.
+    commit(
+        &db,
+        10,
+        11,
+        &[TxnMutation::Put {
+            key: Bytes::from(esker_keys::columnar::key(TENANT, TABLE)),
+            value: Bytes::from(published(1)),
+            read_ts: None,
+        }],
+    );
+    // Part of the history.
+    commit(&db, 20, 21, &[put(1, "ada")]);
+
+    let slot = slot(dir.path());
+    // **The copy opens here**, converting what the region holds at this instant — one row. The
+    // assertion is the denominator: if this were empty the test below would pass by measuring a
+    // copy that never worked at all.
+    assert_eq!(
+        read(&slot, &db, 100),
+        vec![(1, "ada".to_owned())],
+        "the copy did not convert the history that was there when it opened"
+    );
+
+    // The rest of the history reaches the engine **without the tee**, which is what a snapshot
+    // install does: the peer's applied index jumps and no entry passes through `tee_columnar`.
+    commit(&db, 30, 31, &[put(2, "grace")]);
+
+    // **Stale, and this is the defect stated.** The copy was built once and never looks again, so
+    // the row is invisible to a fragment and present to a row scan — the disagreement `joint_gate`
+    // reports.
+    assert_eq!(
+        read(&slot, &db, 100),
+        vec![(1, "ada".to_owned())],
+        "a copy that was already open somehow noticed a row that reached the engine without the \
+         tee; if that is now true the repair below is no longer what makes this work"
+    );
+
+    // **And this is the repair, at the seam production now uses.** `Store::fetch_snapshot` closes
+    // this region's slot the moment it adopts a snapshot, because that is the moment the staleness
+    // is knowable: `ColumnarSlot::saw` catches the same gap from the *next entry applied*, and a
+    // learner that takes a snapshot and then goes quiet has no next entry.
+    slot.close();
+    assert_eq!(
+        read(&slot, &db, 100),
+        vec![(1, "ada".to_owned()), (2, "grace".to_owned())],
+        "closing the copy did not make the next ask re-walk the region, so a snapshot's rows still \
+         never reach it"
+    );
+}
+
 /// A table nobody asked for a copy of does not get one, and says so.
 #[test]
 fn a_table_with_no_columnar_record_has_no_copy() {
