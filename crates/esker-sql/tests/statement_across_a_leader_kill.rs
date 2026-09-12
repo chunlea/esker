@@ -213,8 +213,7 @@ fn a_statement_answers_after_the_store_leading_its_region_is_killed() {
     );
     let (mut sql, _catalog) = cluster.sql_node();
 
-    run(&mut sql, "CREATE TABLE t (id int PRIMARY KEY, v text)");
-    run(&mut sql, "INSERT INTO t VALUES (1, 'before')");
+    setup(&mut sql);
 
     let leader = cluster.leader().expect("somebody leads");
     cluster.kill(leader);
@@ -261,6 +260,104 @@ fn a_statement_answers_after_the_store_leading_its_region_is_killed() {
 }
 
 /// Runs one statement that must succeed, and answers with how many rows came back.
+/// **#68's acceptance.** The fixture is safe to repeat, and does not need a settled cluster.
+///
+/// The setup used to be two bare statements through `run`, which panics on any error, and a
+/// natural election during startup made its `CREATE TABLE` answer `40003` — four red gates, none
+/// of them about the thing this file tests:
+///
+/// ```text
+/// 40003: the transaction's outcome is unknown: the `TxnPrewrite` may or may not have been
+/// applied … region 1 stopped leading with this proposal in its log; it may still commit
+/// ```
+///
+/// **Two halves, and the second is the one that can be made deterministic.** A `40003` says the
+/// write *may already have landed*, so a retry is only safe if the statement is safe to repeat —
+/// and that half is testable without an election at all: call the fixture twice. With the bare
+/// statements the second call answers `42P07` on the table and `23505` on the row, which is
+/// exactly what a retry after a `40003` would have met.
+///
+/// The first half — that it tolerates a region which is electing — is exercised by taking the
+/// leader away first. That is **not** where the discrimination is, and this test says so rather
+/// than implying it: a kill before the first statement lets the cluster elect while the node is
+/// still connecting, so it passes with the bare form too. It is here because it costs nothing and
+/// the shape is the one the gate kept finding.
+#[test]
+fn the_setup_is_safe_to_repeat_and_does_not_need_a_settled_cluster() {
+    let cluster = Cluster::start();
+    assert!(
+        cluster.settle(Duration::from_secs(20)),
+        "the cluster never elected a leader to take away"
+    );
+    let leader = cluster.leader().expect("somebody leads");
+    cluster.kill(leader);
+
+    // No `settle` after the kill, deliberately: the point is that the fixture does not need one.
+    let (mut sql, _catalog) = cluster.sql_node();
+    setup(&mut sql);
+    // **The discriminating half.** This is what a retry after an outcome-unknown does.
+    setup(&mut sql);
+
+    assert_eq!(
+        run(&mut sql, "SELECT v FROM t WHERE id = 1"),
+        1,
+        "the fixture ran twice and left either no row or two"
+    );
+}
+
+/// The fixture this file's tests need, written so that repeating it is safe.
+///
+/// # Why idempotent **and** retried, rather than either
+///
+/// A bare retry is wrong on its own: `40003` means the write may already have landed, so resending
+/// `CREATE TABLE` meets `42P07` and resending the `INSERT` meets `23505`. And idempotence is not
+/// enough on its own either — `IF NOT EXISTS` still has to be *sent again* after the connection
+/// that carried the first one was closed. So each statement is written to be safe to repeat, and
+/// then repeated while the error says the cluster is still changing its mind.
+///
+/// Waiting for a settled cluster is what `Cluster::settle` already does and it is **not** a
+/// substitute: a leader can be lost at any moment, not only during startup, and a fixture that
+/// only works between elections is one that fails on a loaded gate.
+fn setup(sql: &mut cluster::Session) {
+    for statement in [
+        "CREATE TABLE IF NOT EXISTS t (id int PRIMARY KEY, v text)",
+        "INSERT INTO t VALUES (1, 'before') ON CONFLICT (id) DO UPDATE SET v = 'before'",
+    ] {
+        retry_while_the_cluster_settles(sql, statement);
+    }
+}
+
+/// Sends `statement` until it takes, or until the deadline says the cluster is not settling.
+///
+/// **Only the states that mean "ask again".** An error outside them is a real failure and is raised
+/// as one: a fixture that swallowed a syntax error would make every test in this file pass by not
+/// running.
+fn retry_while_the_cluster_settles(sql: &mut cluster::Session, statement: &str) {
+    /// Long enough for an election and a retry or two, short enough that a cluster which is never
+    /// going to settle fails rather than hangs.
+    const WITHIN: Duration = Duration::from_secs(30);
+    let deadline = Instant::now() + WITHIN;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let Err(error) = sql.run(statement) else {
+            return;
+        };
+        let state = error.sqlstate();
+        assert!(
+            matches!(state, "40003" | "40001" | "08006" | "08000"),
+            "`{statement}` failed with SQLSTATE {state}, which is not the cluster changing its \
+             mind: {error}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "`{statement}` was still answering SQLSTATE {state} after {WITHIN:?} and {attempts} \
+             attempts, so the cluster is not settling: {error}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn run(sql: &mut cluster::Session, statement: &str) -> usize {
     match sql.run(statement) {
         Ok(Outcome::Rows { rows, .. }) => rows.len(),
