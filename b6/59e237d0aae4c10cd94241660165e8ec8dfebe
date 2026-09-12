@@ -1,0 +1,21 @@
+crates/esker-sql/tests/column_introspection_slope.rs
+  s_dc640bf0df4adb::t_57b103948bcea1 68-70,72-88,168-175,192-195,263-270,272-275
+crates/esker-store/tests/snapshot.rs
+  s_dc640bf0df4adb::t_010d2cbe964f1d 2125-2127,2136-2150
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b659e237d0aae4c10cd94241660165e8ec8dfebe",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
