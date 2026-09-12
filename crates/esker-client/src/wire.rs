@@ -155,11 +155,26 @@ pub fn routing_key(request: &RawKvReq) -> &[u8] {
         | RawKvReq::CompareAndSwap { key, .. } => key,
         RawKvReq::BatchGet { keys } => keys.first().map_or(&[][..], |key| &key[..]),
         RawKvReq::BatchPut { pairs, .. } => pairs.first().map_or(&[][..], |(key, _)| &key[..]),
-        // `TODO(debt-c6 #2)`: for a reverse scan `start` is the **exclusive** upper bound, so a
-        // `start` sitting exactly on a region boundary routes to the region above the one holding
-        // every key the scan should return, and the answer is an empty page that reads like the
-        // end of the range (`docs/plans/debt-c6.md` §4).
-        RawKvReq::DeleteRange { start, .. } | RawKvReq::Scan { start, .. } => start,
+        // **A reverse `Scan` routes by its lower bound**, which is the `end` field (#80, and the
+        // `TODO(debt-c6 #2)` this replaces). `start` is the *exclusive upper* bound there, so
+        // routing by it sends the request to the region **above** the one holding every key the
+        // scan should return whenever the bound sits on a boundary — and an empty upper bound,
+        // which is how "from the top of the key space" is written, routes to the region at the
+        // other end entirely. The lower bound is inclusive and is always inside the range, which
+        // is the property a routing key needs.
+        RawKvReq::Scan {
+            start,
+            end,
+            reverse,
+            ..
+        } => {
+            if *reverse {
+                end
+            } else {
+                start
+            }
+        }
+        RawKvReq::DeleteRange { start, .. } => start,
     }
 }
 

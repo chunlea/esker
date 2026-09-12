@@ -271,35 +271,46 @@ struct ReadAsOf {
     local: bool,
 }
 
-/// **A session takes its temporary relations with it**, which is the third of the four rules a
+/// **The fallback ending**, for an executor nobody called [`Execute::close`] on — and it is a
+/// fallback since `#83`, not the path.
+///
+/// A session takes its temporary relations with it, which is the third of the four rules a
 /// temporary table is ([ADR 0054](../../../../docs/adr/0054-a-temporary-table-is-a-relation-in-a-schema-that-belongs-to-one-session.md)).
+/// The connection does that at its one ending, on the blocking pool. What is left for here is
+/// every executor that never belonged to a connection — a test, the CLI, an in-process node — and
+/// the one connection case that cannot reach the ending: a statement's blocking task panicking,
+/// which drops the bundle on the blocking thread, where this works.
 ///
-/// Best effort, deliberately: this runs where a failure cannot be reported to anybody, so a
-/// backend that will not answer leaves the schema behind rather than panicking in a destructor.
-/// That is the same outcome an abrupt disconnect has, and the ADR says what it costs — the
-/// records and rows stay, unreachable, until the sweeper the session registry unblocks.
+/// # Why this attempts the work rather than testing the thread first
 ///
-/// A session that made no temporary relation does nothing at all, which is almost every session:
-/// the field is `None` and there is no transaction to open.
+/// The obvious guard is "skip when `tokio::runtime::Handle::try_current()` is `Ok`", and it is
+/// wrong here for a reason this repository has already measured:
+/// [`esker_proto::transport::BlockingTransport::call`] used to be exactly that test and
+/// *"refused every caller that was doing the right thing"*, because `tokio` sets a handle on a
+/// `spawn_blocking` thread and on a worker thread alike. Skipping on that predicate would skip
+/// the cleanup on the blocking pool — the one place the fallback still has to work. So this asks
+/// the question the only way it can be answered: it does the work, and reports what came back.
+///
+/// A failure leaves the schema behind, which is what the ADR already says an abrupt disconnect
+/// costs — the records and rows stay, unreachable, until the sweeper the session registry
+/// unblocks. What changed is that it is no longer **silent**: the old destructor read a refusal as
+/// `let Ok(..) = .. else { return }`, so run 128's session leaked its schema with nothing in the
+/// log but `tokio`'s caught panic, which names the thread and not the loss.
+///
+/// A session that made no temporary relation and holds no transaction does nothing at all, which
+/// is almost every session.
 impl Drop for Executor {
     fn drop(&mut self) {
-        let Some(schema) = self.temp_schema.take() else {
+        if self.temp_schema.is_none() && self.open.is_none() {
             return;
-        };
-        // The open transaction goes first: a session that disconnects mid-block has its writes
-        // rolled back, and dropping the schema is a *new* transaction rather than a rider on one
-        // that is about to be abandoned.
-        if let Some(txn) = self.open.take() {
-            let _ = txn.rollback();
         }
-        let Ok(mut txn) = self.begin_txn() else {
-            return;
-        };
-        if let Ok(forgotten) = ddl::drop_temp_schema(self, &mut *txn, &schema) {
-            for sequence_id in forgotten {
-                self.forget_sequence_block(sequence_id);
-            }
-            let _ = txn.commit();
+        if let Err(error) = self.give_back() {
+            tracing::warn!(
+                %error,
+                pid = self.identity.pid,
+                "a session ended without giving its temporary schema back; it stands until the \
+                 sweeper takes it"
+            );
         }
     }
 }
@@ -942,6 +953,39 @@ impl Executor {
         let mut txn = self.backend.begin()?;
         txn.owned_by_session(self.identity.pid);
         Ok(txn)
+    }
+
+    /// **Everything this session holds that a statement does not**, given back — and it answers
+    /// what it could not give back rather than swallowing it.
+    ///
+    /// The one ending, reached from two places: [`Execute::close`], which the connection calls on
+    /// the blocking pool, and the destructor, which is the fallback for an executor nobody closed.
+    ///
+    /// **All three parts reach the stores on a real cluster**, which is why where this runs is a
+    /// correctness question and not a performance one: a rollback is a Percolator rollback, and
+    /// dropping the schema is a transaction of its own. Only the advisory locks are in-process.
+    fn give_back(&mut self) -> Result<()> {
+        self.release_advisory_locks();
+        // The open transaction goes first: a session that disconnects mid-block has its writes
+        // rolled back, and dropping the schema is a *new* transaction rather than a rider on one
+        // that is about to be abandoned.
+        //
+        // Best effort on purpose: a rollback that cannot be sent leaves the Percolator lock to its
+        // TTL, and that is a delay rather than a wrong answer — where a schema left behind is
+        // unreachable until the sweeper takes it, so that one is worth reporting.
+        if let Some(txn) = self.open.take() {
+            let _ = txn.rollback();
+        }
+        let Some(schema) = self.temp_schema.take() else {
+            return Ok(());
+        };
+        let mut txn = self.begin_txn()?;
+        let forgotten = ddl::drop_temp_schema(self, &mut *txn, &schema)?;
+        for sequence_id in forgotten {
+            self.forget_sequence_block(sequence_id);
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     /// Opens a transaction at whatever snapshot this session reads at.
@@ -4614,10 +4658,28 @@ impl Execute for Executor {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The session's ending: advisory locks, the open transaction, and the temporary schema.
+    ///
+    /// Reported rather than swallowed, because this is the path that can report — the connection
+    /// calls it on the blocking pool, where every part of it can actually be sent.
+    fn close(&mut self) {
+        if let Err(error) = self.give_back() {
+            tracing::warn!(
+                %error,
+                pid = self.identity.pid,
+                "a session ended without giving its temporary schema back; it stands until the \
+                 sweeper takes it"
+            );
+        }
+    }
+
     /// Everything this session holds, released — what the end of a connection owes the node.
     ///
     /// A session's locks die with it on a real server and nothing else releases them: they survive
     /// `ROLLBACK`, measured. So this is not tidying, it is the other half of the lifetime.
+    ///
+    /// Reached through [`Execute::close`] from the connection; still public on the trait because a
+    /// test takes this half on its own (`tests/advisory_lock.rs`).
     fn release_advisory_locks(&self) {
         self.locks.unlock_all(self.session);
     }

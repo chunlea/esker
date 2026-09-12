@@ -202,6 +202,11 @@ impl RawClient {
     ///
     /// A `limit` of zero means **every pair in the range**, as it does on the wire and as
     /// `Transaction::scan` now reads it.
+    ///
+    /// **Both directions page** since #80. A forward piece resumes from the immediate successor
+    /// of the last key it was given; a reverse one lowers its exclusive upper bound to the last
+    /// key, which is the smallest of a descending batch. Which end moves is the only thing the
+    /// two have to answer differently.
     fn scan_with(
         &self,
         start: &[u8],
@@ -241,6 +246,12 @@ impl RawClient {
                 // exactly like a piece that is done. `Transaction::scan` has no hole here for the
                 // same reason in the other shape: its `scan_region` answers the boundary it
                 // actually used and its caller carries on from that.
+                //
+                // **This runs before the paging below and the two compose**, which is worth
+                // saying because they arrived from different branches (#79's review and #80).
+                // `to` is the piece's *unscanned* upper bound — the paging lowers it as a reverse
+                // walk descends — so what is split here is what is left of the piece and never
+                // what has already been answered.
                 if reached != to {
                     if reverse {
                         // Descending, the half **above** `reached` is the half that comes first,
@@ -253,22 +264,22 @@ impl RawClient {
                     pieces.push_front((reached.clone(), to.clone()));
                     to = reached;
                 }
-                // **A reverse scan is not paged here, and that is deliberate.** `regions_of`
-                // hands out its pieces low-to-high whichever way the walk goes, while a reverse
-                // `RawKvReq::Scan` reads its `start` field as the *upper* bound
-                // (`rawkv::scan_bounds`) — so which end of a piece a reverse resume moves is a
-                // question about that pairing rather than about this loop, and answering it by
-                // guess would be worse than the one call this leaves. `scan_reverse` has one
-                // caller in the repository and it is a test. Recorded in #79's handover.
-                if reverse {
-                    pairs.extend(batch);
-                    break;
-                }
                 // Empty: this piece is exhausted, whatever the page said.
                 let Some((last, _)) = batch.last().cloned() else {
                     break;
                 };
                 pairs.extend(batch);
+                if reverse {
+                    // **A reverse batch is descending, so its last pair is the smallest key it
+                    // carried** — and the piece's upper bound is exclusive, so naming it is what
+                    // resumes below it. The lower bound is inclusive, so a batch that reached it
+                    // has nothing under it left (#80).
+                    if last <= from {
+                        break;
+                    }
+                    to = last;
+                    continue;
+                }
                 // The immediate successor in byte order, so the key just read is excluded and
                 // nothing between it and the next one can be skipped.
                 let mut next = Vec::with_capacity(last.len() + 1);
@@ -347,9 +358,29 @@ impl RawClient {
         let mut to = to.clone();
         let mut refreshes = 0;
         loop {
+            // **A reverse scan names its bounds the other way round on the wire** (#80).
+            // `rawkv::scan_bounds` reads a reverse `Scan`'s `start` as the *exclusive upper*
+            // bound to walk down from and its `end` as the inclusive lower one, which is what
+            // the wire's own doc says and what `esker-store`'s
+            // `a_reverse_scan_walks_down_from_its_upper_bound` pins. This client's arguments are
+            // `(low, high)` in **both** directions — `regions_of` routes on the low key and
+            // clamps with `clamp_end`, and `esker raw scan <start> --end <end> --reverse` writes
+            // an ordinary range — so one convention meets the other here, in the one place that
+            // builds a request.
+            //
+            // Sending them unswapped made the store refuse every **bounded** reverse scan:
+            // `range start [108] is after its end [107]` for `scan_reverse(b"k", b"l", …)`,
+            // because it had been handed `low = "l"` and `high = "k"`. The one caller in the
+            // repository passes two empty bounds, which is the single shape where the swap
+            // cannot show itself.
+            let (start, end) = if reverse {
+                (to.clone(), from.clone())
+            } else {
+                (from.clone(), to.clone())
+            };
             let request = RawKvReq::Scan {
-                start: from.clone(),
-                end: to.clone(),
+                start,
+                end,
                 limit,
                 reverse,
             };
