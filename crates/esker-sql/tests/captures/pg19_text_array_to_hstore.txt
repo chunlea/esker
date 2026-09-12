@@ -1,0 +1,215 @@
+# **`text[]` to `hstore`** — PostgreSQL 19beta1, 2026-09-11, one `BEGIN … ROLLBACK` with
+# `CREATE EXTENSION hstore` inside it and **a `SAVEPOINT` per probe**.
+#
+# The cast matrix's one open row (`pg19_cast_matrix.txt`): this node answered
+# `42846 cannot cast type text[] to hstore` where 19beta1 answers `2202E`. The matrix's probe is
+# the one-element `{x}`, so the refusal there is about the **array** — which is what says a real
+# server attempted the conversion rather than refusing the pair. What was needed was the
+# constructor, not a sqlstate.
+#
+# **stdout and stderr interleave** below; each `ERROR` quotes its own statement.
+#
+# ## The conversion
+#
+#     '{a,1}'::text[]::hstore              "a"=>"1"
+#     '{a,1,b,2}'::text[]::hstore          "a"=>"1", "b"=>"2"
+#     '{}'::text[]::hstore                 the empty hstore
+#     '{a,NULL}'::text[]::hstore           "a"=>NULL          a NULL *value* is a value
+#     '{a,1,a,2}'::text[]::hstore          "a"=>"1"           the **first** of a repeat wins
+#     '{bb,2,a,1,ccc,3}'::text[]::hstore   "a"=>"1", "bb"=>"2", "ccc"=>"3"
+#     pg_typeof('{a,1}'::text[]::hstore)   hstore
+#
+# The order is hstore's canonical one — **length first, then bytes** — and not the order written.
+# The duplicate rule is the one a `BTreeMap` gets backwards by default: the first value stays.
+#
+# ## The two refusals, and they are about different things
+#
+#     '{x}'::text[]::hstore        2202E array must have even number of elements
+#     '{NULL,1}'::text[]::hstore   22004 null value not allowed for hstore key
+#     '{NULL,NULL}'::text[]::hstore  22004, the same — it is the key that cannot be NULL
+#
+# Neither is `42846`. Sqlstates read with `VERBOSITY verbose`.
+#
+# ## The boundary: one row, one direction, one source type
+#
+#     SELECT castsource::regtype, casttarget::regtype, castcontext, castmethod
+#       FROM pg_cast WHERE casttarget = 'hstore'::regtype
+#         ->  text[] | hstore | e | f          one row, explicit, by function
+#
+#     '{a,1}'::varchar[]::hstore   42846 cannot cast type character varying[] to hstore
+#     'a=>1'::hstore::text[]       42846 cannot cast type hstore to text[]
+#     NULL::text[]::hstore         NULL
+#
+# ## The function spellings, measured but not built
+#
+#     hstore('{a,1}'::text[])                 "a"=>"1"
+#     hstore(ARRAY[['a','1'],['b','2']])      "a"=>"1", "b"=>"2"    a 2-D array
+#     hstore('{a,b}'::text[], '{1,2}'::text[])  "a"=>"1", "b"=>"2"  keys and values apart
+#
+# The cast is the one-argument, one-dimensional form. The other two are `hstore()` overloads and
+# nothing asks for them yet; recorded so that whoever does has the answers.
+#
+# ---- the probe script, as sent
+# \set ON_ERROR_STOP 0
+# BEGIN;
+# CREATE EXTENSION IF NOT EXISTS hstore;
+# \echo '### 1 the pair the matrix left open'
+# SAVEPOINT s; SELECT ('{x}'::text[]::hstore)::text; ROLLBACK TO s;
+# \echo '### 2 an even list becomes pairs'
+# SAVEPOINT s; SELECT ('{a,1}'::text[]::hstore)::text; ROLLBACK TO s;
+# SAVEPOINT s; SELECT ('{a,1,b,2}'::text[]::hstore)::text; ROLLBACK TO s;
+# \echo '### 3 empty'
+# SAVEPOINT s; SELECT ('{}'::text[]::hstore)::text; ROLLBACK TO s;
+# \echo '### 4 NULLs'
+# SAVEPOINT s; SELECT ('{a,NULL}'::text[]::hstore)::text; ROLLBACK TO s;
+# SAVEPOINT s; SELECT ('{NULL,1}'::text[]::hstore)::text; ROLLBACK TO s;
+# \echo '### 5 a duplicate key'
+# SAVEPOINT s; SELECT ('{a,1,a,2}'::text[]::hstore)::text; ROLLBACK TO s;
+# \echo '### 6 ordering of the result'
+# SAVEPOINT s; SELECT ('{bb,2,a,1,ccc,3}'::text[]::hstore)::text; ROLLBACK TO s;
+# \echo '### 7 the function spellings'
+# SAVEPOINT s; SELECT hstore('{a,1}'::text[])::text; ROLLBACK TO s;
+# SAVEPOINT s; SELECT hstore(ARRAY[['a','1'],['b','2']])::text; ROLLBACK TO s;
+# SAVEPOINT s; SELECT hstore('{a,b}'::text[], '{1,2}'::text[])::text; ROLLBACK TO s;
+# \echo '### 8 the pg_cast row, if any'
+# SAVEPOINT s; SELECT castsource::regtype::text, casttarget::regtype::text, castcontext, castmethod FROM pg_cast WHERE casttarget = 'hstore'::regtype ORDER BY 1; ROLLBACK TO s;
+# \echo '### 9 the reverse'
+# SAVEPOINT s; SELECT ('a=>1'::hstore::text[])::text; ROLLBACK TO s;
+# \echo '### 10 a NULL array and an array of one NULL'
+# SAVEPOINT s; SELECT (NULL::text[]::hstore) IS NULL; ROLLBACK TO s;
+# SAVEPOINT s; SELECT ('{NULL,NULL}'::text[]::hstore)::text; ROLLBACK TO s;
+# \echo '### 11 the declared type of the cast'
+# SAVEPOINT s; SELECT pg_typeof('{a,1}'::text[]::hstore); ROLLBACK TO s;
+# \echo '### 12 a varchar[] and a citext[] through the same door'
+# SAVEPOINT s; SELECT ('{a,1}'::varchar[]::hstore)::text; ROLLBACK TO s;
+# ROLLBACK;
+#
+# ---- the two sqlstates, read with VERBOSITY verbose, as sent
+# \set VERBOSITY verbose
+# \set ON_ERROR_STOP 0
+# BEGIN;
+# CREATE EXTENSION IF NOT EXISTS hstore;
+# SAVEPOINT s; SELECT '{x}'::text[]::hstore; ROLLBACK TO s;
+# SAVEPOINT s; SELECT '{NULL,1}'::text[]::hstore; ROLLBACK TO s;
+# ROLLBACK;
+
+==== output of the probe script, verbatim ====
+
+BEGIN
+CREATE EXTENSION
+### 1 the pair the matrix left open
+SAVEPOINT
+psql:/tmp/cap_hstore.sql:5: ERROR:  array must have even number of elements
+ROLLBACK
+### 2 an even list becomes pairs
+SAVEPOINT
+   text   
+----------
+ "a"=>"1"
+(1 row)
+
+ROLLBACK
+SAVEPOINT
+        text        
+--------------------
+ "a"=>"1", "b"=>"2"
+(1 row)
+
+ROLLBACK
+### 3 empty
+SAVEPOINT
+ text 
+------
+ 
+(1 row)
+
+ROLLBACK
+### 4 NULLs
+SAVEPOINT
+psql:/tmp/cap_hstore.sql:13: ERROR:  null value not allowed for hstore key
+   text    
+-----------
+ "a"=>NULL
+(1 row)
+
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+### 5 a duplicate key
+SAVEPOINT
+   text   
+----------
+ "a"=>"1"
+(1 row)
+
+ROLLBACK
+### 6 ordering of the result
+SAVEPOINT
+              text               
+---------------------------------
+ "a"=>"1", "bb"=>"2", "ccc"=>"3"
+(1 row)
+
+ROLLBACK
+### 7 the function spellings
+SAVEPOINT
+  hstore  
+----------
+ "a"=>"1"
+(1 row)
+
+ROLLBACK
+SAVEPOINT
+       hstore       
+--------------------
+ "a"=>"1", "b"=>"2"
+(1 row)
+
+ROLLBACK
+SAVEPOINT
+       hstore       
+--------------------
+ "a"=>"1", "b"=>"2"
+(1 row)
+
+ROLLBACK
+### 8 the pg_cast row, if any
+SAVEPOINT
+ castsource | casttarget | castcontext | castmethod 
+------------+------------+-------------+------------
+ text[]     | hstore     | e           | f
+(1 row)
+
+ROLLBACK
+### 9 the reverse
+SAVEPOINT
+psql:/tmp/cap_hstore.sql:25: ERROR:  cannot cast type hstore to text[]
+LINE 1: SELECT ('a=>1'::hstore::text[])::text;
+                              ^
+ROLLBACK
+### 10 a NULL array and an array of one NULL
+SAVEPOINT
+ ?column? 
+----------
+ t
+(1 row)
+
+ROLLBACK
+psql:/tmp/cap_hstore.sql:28: ERROR:  null value not allowed for hstore key
+SAVEPOINT
+ROLLBACK
+### 11 the declared type of the cast
+SAVEPOINT
+ pg_typeof 
+-----------
+ hstore
+(1 row)
+
+ROLLBACK
+### 12 a varchar[] and a citext[] through the same door
+SAVEPOINT
+psql:/tmp/cap_hstore.sql:32: ERROR:  cannot cast type character varying[] to hstore
+LINE 1: SELECT ('{a,1}'::varchar[]::hstore)::text;
+                                  ^
+ROLLBACK
+ROLLBACK

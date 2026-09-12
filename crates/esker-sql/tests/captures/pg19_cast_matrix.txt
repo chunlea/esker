@@ -39,18 +39,22 @@
 #
 # **Mode-dependent pairs: 0**, down from 31 when the second mode was first asked.
 #
-# **Five pairs are left and four of them are a ruling.** `regclass -> integer|oid` and their arrays
+# **Four pairs are left and all four are a ruling** (five until the row below closed). `regclass -> integer|oid` and their arrays
 # refuse because this node's relation ids are 64 bits wide and an `oid` is four bytes — ADR 0097's
 # own consequence, declared by the user on 2026-09-11 and pinned in
 # `tests/user_decided_divergences.rs` in **both** modes.
 #
 #     text[] -> hstore   node `42846 cannot cast type text[] to hstore`   19beta1 `2202E`
 #
-# is the one open row in the whole matrix. A real server *attempts* it — `hstore(text[])` is a real
-# function and the probe's `{x}` is one element, so the refusal is `2202E array must have even
-# number of elements`, about the **array** and not about the pair. This node has no `text[] ->
-# hstore` conversion at all. It needs the constructor, not a sqlstate: with it, `'{a,1}'` becomes
-# `"a"=>"1"` and an odd list keeps PostgreSQL's own `2202E`.
+# was the one open row in the whole matrix, and is **closed, 2026-09-11**. A real server *attempts*
+# it — `hstore(text[])` is a real function and the probe's `{x}` is one element, so the refusal is
+# `2202E array must have even number of elements`, about the **array** and not about the pair. This
+# node had no `text[] -> hstore` conversion at all. It needed the constructor, not a sqlstate: with
+# it, `'{a,1}'` becomes `"a"=>"1"` and an odd list keeps PostgreSQL's own `2202E`. Both halves are
+# built — the `pg_cast` row `text[] -> hstore  e  f` and `value::hstore::from_text_array` — and the
+# rest of the rule is measured in `pg19_text_array_to_hstore.txt`: a NULL value is a value, a NULL
+# key is `22004`, the first of a repeated key wins, and the order is hstore's canonical one. So the
+# matrix's residue is now **four rows and all four are a ruling**.
 #
 # ## The finding this instrument was built for, and what it found
 #
@@ -90,8 +94,8 @@ regclass[]	{"pg_class"}	integer[]	bind	!22003	ok
 regclass[]	{"pg_class"}	integer[]	literal	!22003	ok
 regclass[]	{"pg_class"}	oid[]	bind	!22003	ok
 regclass[]	{"pg_class"}	oid[]	literal	!22003	ok
-text[]	{"x"}	hstore	bind	!42846	!2202E
-text[]	{"x"}	hstore	literal	!42846	!2202E
+text[]	{"x"}	hstore	bind	!2202E	!2202E
+text[]	{"x"}	hstore	literal	!2202E	!2202E
 #
 # ## Earlier takes, kept because how the numbers moved is the useful half of a record
 #

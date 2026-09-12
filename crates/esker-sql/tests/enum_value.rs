@@ -70,21 +70,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "a VALUES list's synthetic TableDef carries no user type, so the ordinal prints",
             "UNMEASURED",
         ),
-        // **The standing constant-width divergence, in three sentences that are otherwise
-        // identical**: a bare integer constant is `int8` here and `int4` there, so the type this
-        // node names in the refusal is `bigint` where a real server says `integer`. Same SQLSTATE,
-        // same shape, same HINT — one word differs, and it is the word `tests/unknown_literal.rs`
-        // declares everywhere else.
-        (
-            "INSERT INTO postgresql_enums (current_mood) VALUES (1)",
-            "a bare integer constant is int8 here and int4 there",
-            "UNMEASURED",
-        ),
-        (
-            "UPDATE postgresql_enums SET current_mood = 1 WHERE id = 1",
-            "a bare integer constant is int8 here and int4 there",
-            "UNMEASURED",
-        ),
+        // **The standing constant-width divergence used to be here, in two sentences that are
+        // otherwise identical**: a bare integer constant's *datum* is an `int8`, so the type this
+        // node named in the refusal was `bigint` where a real server says `integer` — same
+        // SQLSTATE, same shape, same HINT, one word. **Closed by #73**, which made the write path
+        // ask the literal rather than the datum, and this harness is what said so: it refuses to
+        // pass while a row is declared a divergence and agrees. The two rows now match, so the
+        // entries are gone rather than struck.
         // `DO $$ … $$` was here, refused by name. This entry predicted its own unit would be
         // "a large one — it is a language, not a statement"; the measurement said otherwise.
         // All 36 `DO` statements the suite sends are `create_enum`'s one template, so the block

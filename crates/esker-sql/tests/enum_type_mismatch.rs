@@ -209,12 +209,82 @@ fn the_other_refusals_still_name_what_they_always_named() {
     );
     assert_eq!(
         said(&mut node, "INSERT INTO t VALUES (2, 1, 'sad')"),
-        // **`bigint` where 19beta1 says `integer`, and that is a different divergence.** An
-        // unsuffixed integer literal is an `int4` there and an `int8` here until a column says
-        // otherwise (`plan::Literal::Integer`), and the *comparison* above says `integer` because
-        // `expr_type` reads the literal's width from its value. Pinned as this node answers it so
-        // that the enum half of the sentence is what this test is about; the width is not.
-        "!42804 column \"m\" is of type mood but expression is of type bigint",
+        // **This said `bigint` until #73.** An unsuffixed integer literal's datum is an `i64`
+        // whatever width it was written as, and the message was built from the datum; the
+        // *comparison* above has always said `integer`, because it asks the literal. One fact,
+        // two readers, and the write path had the third and wrong one.
+        "!42804 column \"m\" is of type mood but expression is of type integer",
         "a bare integer into an enum column is still the integer's own refusal"
     );
+}
+
+/// **What width a refusal calls an integer literal** — `debts-v1.1.md` **#73**.
+///
+/// The rule is the literal's, not the datum's: a bare constant is named by the width its **value**
+/// needs and a written cast by the width it was **declared**. `Literal::type_name` has carried that
+/// ladder since it was written and the comparison path has always used it; the write path built its
+/// sentence out of the `Datum` instead, and a bare `1` is an `i64` in a row and an `integer` in a
+/// sentence.
+///
+/// Measured on 19beta1 2026-09-11, **the same statements asserted here**, one `BEGIN … ROLLBACK`
+/// with a savepoint per probe (`tests/captures/pg19_integer_literal_width.txt`):
+///
+/// ```text
+/// INSERT INTO t VALUES (2, 1, 'sad')             integer
+/// INSERT INTO t VALUES (2, 1::bigint, 'sad')     bigint
+/// INSERT INTO t VALUES (2, 1::smallint, 'sad')   smallint
+/// INSERT INTO t VALUES (2, 1::integer, 'sad')    integer
+/// INSERT INTO t VALUES (2, 3000000000, 'sad')    bigint
+/// INSERT INTO t VALUES (2, 1.5, 'sad')           numeric
+/// INSERT INTO t VALUES (2, true, 'sad')          boolean
+/// UPDATE t SET m = 1                             integer
+/// UPDATE t SET m = 1::bigint                     bigint
+/// UPDATE t SET m = 3000000000                    bigint
+/// ```
+///
+/// **The `bigint` rows are the control**: a rule that simply renamed every integer `integer` would
+/// pass the first row and fail these, and a rule reading the datum's width would pass `3000000000`
+/// and fail `1::bigint`. Only "ask the literal" passes all of them.
+#[test]
+fn an_integer_literal_is_named_by_the_width_it_was_written_as() {
+    let mut node = parity::Node::new(FIXTURE);
+    let refused = |node: &mut parity::Node, sql: &str, ty: &str| {
+        assert_eq!(
+            said(node, sql),
+            format!("!42804 column \"m\" is of type mood but expression is of type {ty}"),
+            "{sql}"
+        );
+    };
+    refused(&mut node, "INSERT INTO t VALUES (2, 1, 'sad')", "integer");
+    refused(
+        &mut node,
+        "INSERT INTO t VALUES (2, 1::bigint, 'sad')",
+        "bigint",
+    );
+    refused(
+        &mut node,
+        "INSERT INTO t VALUES (2, 1::smallint, 'sad')",
+        "smallint",
+    );
+    refused(
+        &mut node,
+        "INSERT INTO t VALUES (2, 1::integer, 'sad')",
+        "integer",
+    );
+    refused(
+        &mut node,
+        "INSERT INTO t VALUES (2, 3000000000, 'sad')",
+        "bigint",
+    );
+    refused(&mut node, "INSERT INTO t VALUES (2, 1.5, 'sad')", "numeric");
+    refused(
+        &mut node,
+        "INSERT INTO t VALUES (2, true, 'sad')",
+        "boolean",
+    );
+    // **The `UPDATE` half**, which reaches the same sentence through `assigned_value` rather than
+    // through `value_for_column` — two paths, one rule, and the row said so before it was fixed.
+    refused(&mut node, "UPDATE t SET m = 1", "integer");
+    refused(&mut node, "UPDATE t SET m = 1::bigint", "bigint");
+    refused(&mut node, "UPDATE t SET m = 3000000000", "bigint");
 }

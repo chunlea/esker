@@ -139,7 +139,8 @@ fn the_three_refusals_are_postgresqls_own() {
 /// ```
 ///
 /// The capture's header has listed these since 2026-09-05 and **nothing checked them against the
-/// node** — the first of them passed by accident, because both its arms are `text` anyway.
+/// node** — the first of them passed by accident, because both its arms are `text` anyway. The
+/// 2026-09-11 re-measurement is `tests/captures/pg19_set_operation_enums.txt`.
 #[test]
 fn an_unknown_arm_takes_the_other_arms_type() {
     let mut node = parity::Node::new(FIXTURE);

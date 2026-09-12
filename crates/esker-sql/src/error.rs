@@ -1563,6 +1563,23 @@ pub enum SqlError {
     #[error("cannot accumulate empty arrays")]
     ArrayAccumulateEmpty,
 
+    /// `2202E` — a `text[]` converted to an `hstore` with an odd number of elements.
+    ///
+    /// The array is read as key, value, key, value, so a list with a spare element has a key with
+    /// nothing to be the value of. **The complaint is about the array and not about the pair of
+    /// types**, which is what says a real server *attempted* the conversion: measured,
+    /// `'{x}'::text[]::hstore` is this and `'{a,1}'::text[]::hstore` is `"a"=>"1"`.
+    #[error("array must have even number of elements")]
+    HstoreArrayOddLength,
+
+    /// `22004` — a `text[]` converted to an `hstore` with a NULL where a key goes.
+    ///
+    /// **A NULL *value* is fine** and is the whole reason an hstore's values are optional:
+    /// `'{a,NULL}'::text[]::hstore` is `"a"=>NULL`. A key is a different thing, because it is what
+    /// the pair is found by. Measured, `'{NULL,1}'` and `'{NULL,NULL}'` are both this.
+    #[error("null value not allowed for hstore key")]
+    HstoreNullKey,
+
     /// `2202E` — an `ARRAY[…]` whose operands are arrays of unequal dimensions.
     ///
     /// **A NULL array operand has no dimensions**, so `ARRAY['{1,2}'::int[], NULL::int[]]` raises
@@ -3338,8 +3355,11 @@ impl SqlError {
             SqlError::UuidLength { .. } => sqlstate::INVALID_BINARY_REPRESENTATION,
             SqlError::ArrayExpressionDimensions
             | SqlError::ArrayAccumulateDimensions
-            | SqlError::ArrayAccumulateEmpty => sqlstate::ARRAY_SUBSCRIPT_ERROR,
-            SqlError::ArrayAccumulateNull => sqlstate::NULL_VALUE_NOT_ALLOWED,
+            | SqlError::ArrayAccumulateEmpty
+            | SqlError::HstoreArrayOddLength => sqlstate::ARRAY_SUBSCRIPT_ERROR,
+            SqlError::ArrayAccumulateNull | SqlError::HstoreNullKey => {
+                sqlstate::NULL_VALUE_NOT_ALLOWED
+            }
             SqlError::EmptyArrayType | SqlError::IndeterminateParameterType(_) => {
                 sqlstate::INDETERMINATE_DATATYPE
             }

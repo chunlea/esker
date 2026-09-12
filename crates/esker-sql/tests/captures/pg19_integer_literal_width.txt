@@ -1,0 +1,409 @@
+# **What width PostgreSQL calls an unsuffixed integer literal** — PostgreSQL 19beta1, 2026-09-11.
+# Three `BEGIN … ROLLBACK` sessions, **a `SAVEPOINT` per probe**.
+#
+# Taken for `debts-v1.1.md` #73. The savepoint per probe is the shape, not a flourish: without it
+# the first refusal aborts the transaction and every later statement answers `current transaction
+# is aborted` instead of the thing being measured. **stdout and stderr interleave** in the raw
+# output below, so an `ERROR` can print one echo block late; each quotes its own statement on its
+# `LINE 1:` line.
+#
+# ## The ladder: a literal's type is the width its value needs
+#
+#     pg_typeof(1)                       integer
+#     pg_typeof(-1)                      integer
+#     pg_typeof(2147483647)              integer      the last int4
+#     pg_typeof(-2147483648)             integer
+#     pg_typeof(2147483648)              bigint       one past it
+#     pg_typeof(3000000000)              bigint
+#     pg_typeof(100000000000000000000)   numeric      past int8
+#
+#     SELECT 1 AS one         \gdesc     integer      and the RowDescription agrees
+#     SELECT ARRAY[1,2] AS a  \gdesc     integer[]
+#     pg_typeof(ARRAY[1,2,3])            integer[]
+#     pg_typeof(ARRAY[1,3000000000])     bigint[]     the constructor takes the widest element
+#
+# ## A written cast wins over the value's width
+#
+#     INSERT INTO t VALUES (2, 1, 'sad')             …expression is of type integer
+#     INSERT INTO t VALUES (2, 1::bigint, 'sad')     …expression is of type bigint
+#     INSERT INTO t VALUES (2, 1::smallint, 'sad')   …expression is of type smallint
+#     INSERT INTO t VALUES (2, 1::integer, 'sad')    …expression is of type integer
+#     INSERT INTO t VALUES (2, 3000000000, 'sad')    …expression is of type bigint
+#     INSERT INTO t VALUES (2, 1.5, 'sad')           …expression is of type numeric
+#     INSERT INTO t VALUES (2, true, 'sad')          …expression is of type boolean
+#
+#     UPDATE t SET m = 1                             …expression is of type integer
+#     UPDATE t SET m = 1::bigint                     …expression is of type bigint
+#     UPDATE t SET m = 3000000000                    …expression is of type bigint
+#
+# **These two halves are the whole rule** and together they refute both easy fixes: naming every
+# integer `integer` fails the `1::bigint` rows, and reading the width off the stored value fails
+# them too. Only asking the **literal** — the width it was written as, falling back to the width
+# its value needs — passes all of them.
+#
+# ## The same names appear wherever a type is reported, not only on assignment
+#
+#     SELECT m = 1 FROM t          operator does not exist: mood = integer
+#     SELECT m + 1 FROM t          operator does not exist: mood + integer
+#     INSERT INTO t (m) SELECT i   …expression is of type integer     (an `integer` column)
+#     INSERT INTO t (m) SELECT s   …expression is of type smallint    (a `smallint` column)
+#
+# A **column** is named by its own declared type, which is the case an evaluated expression
+# already gets right: the value's width there really is its type.
+#
+# ## And assignment still coerces
+#
+#     INSERT INTO t (i) VALUES (1)            ok, an integer column
+#     INSERT INTO t (b) VALUES (1)            ok, a bigint column
+#     INSERT INTO t (i) VALUES (3000000000)   integer out of range
+#
+# The literal's own type is not the column's: assigning narrows or widens, and only a value that
+# will not fit is refused — **and it is refused as being out of range, not as a type mismatch**.
+#
+# ---- probe 1: the ladder, arrays, assignment, as sent
+# \set ON_ERROR_STOP 0
+# BEGIN;
+# CREATE TYPE mood AS ENUM ('sad','ok');
+# CREATE TABLE t (m mood, i integer, b bigint);
+# INSERT INTO t VALUES ('ok', 1, 1);
+#
+# \echo '### 1 the message #73 is about'
+# SAVEPOINT s; INSERT INTO t (m) VALUES (1); ROLLBACK TO s;
+# \echo '### 2 the comparison path, which already agrees'
+# SAVEPOINT s; SELECT m = 1 FROM t; ROLLBACK TO s;
+# \echo '### 3 a bare literal type'
+# SAVEPOINT s; SELECT pg_typeof(1); ROLLBACK TO s;
+# SAVEPOINT s; SELECT pg_typeof(3000000000); ROLLBACK TO s;
+# SAVEPOINT s; SELECT pg_typeof(100000000000000000000); ROLLBACK TO s;
+# SAVEPOINT s; SELECT pg_typeof(-1); ROLLBACK TO s;
+# SAVEPOINT s; SELECT pg_typeof(2147483647); ROLLBACK TO s;
+# SAVEPOINT s; SELECT pg_typeof(2147483648); ROLLBACK TO s;
+# SAVEPOINT s; SELECT pg_typeof(-2147483648); ROLLBACK TO s;
+# \echo '### 4 an array constructor of literals'
+# SAVEPOINT s; SELECT pg_typeof(ARRAY[1,2,3]); ROLLBACK TO s;
+# SAVEPOINT s; SELECT pg_typeof(ARRAY[1,3000000000]); ROLLBACK TO s;
+# \echo '### 5 assigning a literal into a column of another width'
+# SAVEPOINT s; INSERT INTO t (i) VALUES (1) RETURNING i; ROLLBACK TO s;
+# SAVEPOINT s; INSERT INTO t (b) VALUES (1) RETURNING b; ROLLBACK TO s;
+# SAVEPOINT s; INSERT INTO t (i) VALUES (3000000000); ROLLBACK TO s;
+# \echo '### 6 other messages that name a literal type'
+# SAVEPOINT s; INSERT INTO t (m) VALUES (3000000000); ROLLBACK TO s;
+# SAVEPOINT s; INSERT INTO t (m) VALUES (1.5); ROLLBACK TO s;
+# SAVEPOINT s; SELECT m + 1 FROM t; ROLLBACK TO s;
+# \echo '### 7 what a RowDescription says for a literal'
+# SAVEPOINT s; SELECT 1 AS one \gdesc
+# ROLLBACK TO s;
+# SAVEPOINT s; SELECT ARRAY[1,2] AS a \gdesc
+# ROLLBACK TO s;
+# ROLLBACK;
+#
+# ---- probe 2: a written cast against a bare literal, as sent
+# \set ON_ERROR_STOP 0
+# BEGIN;
+# CREATE TYPE mood AS ENUM ('sad','ok');
+# CREATE TABLE t (m mood, i integer, s smallint);
+# \echo '### a bare literal'
+# SAVEPOINT s; INSERT INTO t (m) VALUES (1); ROLLBACK TO s;
+# \echo '### b declared bigint, small value'
+# SAVEPOINT s; INSERT INTO t (m) VALUES (1::bigint); ROLLBACK TO s;
+# \echo '### c declared smallint, small value'
+# SAVEPOINT s; INSERT INTO t (m) VALUES (1::smallint); ROLLBACK TO s;
+# \echo '### d declared integer'
+# SAVEPOINT s; INSERT INTO t (m) VALUES (1::integer); ROLLBACK TO s;
+# \echo '### e a column of another type'
+# SAVEPOINT s; INSERT INTO t (m) SELECT i FROM t; ROLLBACK TO s;
+# SAVEPOINT s; INSERT INTO t (m) SELECT s FROM t; ROLLBACK TO s;
+# \echo '### f UPDATE says the same'
+# SAVEPOINT s; UPDATE t SET m = 1; ROLLBACK TO s;
+# SAVEPOINT s; UPDATE t SET m = 1::bigint; ROLLBACK TO s;
+# ROLLBACK;
+#
+# ---- probe 3: the exact statements `enum_type_mismatch.rs` asserts, as sent
+# \set ON_ERROR_STOP 0
+# BEGIN;
+# CREATE TYPE mood AS ENUM ('sad','ok','happy');
+# CREATE TYPE other_mood AS ENUM ('sad','ok');
+# CREATE TABLE t (id bigint primary key, m mood, n other_mood);
+# INSERT INTO t VALUES (1, 'ok', 'sad');
+# SAVEPOINT s; INSERT INTO t VALUES (2, 1, 'sad'); ROLLBACK TO s;
+# SAVEPOINT s; INSERT INTO t VALUES (2, 1::bigint, 'sad'); ROLLBACK TO s;
+# SAVEPOINT s; INSERT INTO t VALUES (2, 1::smallint, 'sad'); ROLLBACK TO s;
+# SAVEPOINT s; INSERT INTO t VALUES (2, 1::integer, 'sad'); ROLLBACK TO s;
+# SAVEPOINT s; INSERT INTO t VALUES (2, 3000000000, 'sad'); ROLLBACK TO s;
+# SAVEPOINT s; INSERT INTO t VALUES (2, 1.5, 'sad'); ROLLBACK TO s;
+# SAVEPOINT s; INSERT INTO t VALUES (2, true, 'sad'); ROLLBACK TO s;
+# SAVEPOINT s; UPDATE t SET m = 1; ROLLBACK TO s;
+# SAVEPOINT s; UPDATE t SET m = 1::bigint; ROLLBACK TO s;
+# SAVEPOINT s; UPDATE t SET m = 3000000000; ROLLBACK TO s;
+# ROLLBACK;
+
+==== output of probe 1, verbatim ====
+
+BEGIN
+CREATE TYPE
+CREATE TABLE
+INSERT 0 1
+### 1 the message #73 is about
+SAVEPOINT
+psql:/tmp/cap73.sql:8: ERROR:  column "m" is of type mood but expression is of type integer
+LINE 1: INSERT INTO t (m) VALUES (1);
+                                  ^
+HINT:  You will need to rewrite or cast the expression.
+ROLLBACK
+### 2 the comparison path, which already agrees
+SAVEPOINT
+ROLLBACK
+### 3 a bare literal type
+SAVEPOINT
+psql:/tmp/cap73.sql:10: ERROR:  operator does not exist: mood = integer
+LINE 1: SELECT m = 1 FROM t;
+                 ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
+ pg_typeof 
+-----------
+ integer
+(1 row)
+
+ROLLBACK
+SAVEPOINT
+ pg_typeof 
+-----------
+ bigint
+(1 row)
+
+ROLLBACK
+SAVEPOINT
+ pg_typeof 
+-----------
+ numeric
+(1 row)
+
+ROLLBACK
+SAVEPOINT
+ pg_typeof 
+-----------
+ integer
+(1 row)
+
+ROLLBACK
+SAVEPOINT
+ pg_typeof 
+-----------
+ integer
+(1 row)
+
+ROLLBACK
+SAVEPOINT
+ pg_typeof 
+-----------
+ bigint
+(1 row)
+
+ROLLBACK
+SAVEPOINT
+ pg_typeof 
+-----------
+ integer
+(1 row)
+
+ROLLBACK
+### 4 an array constructor of literals
+SAVEPOINT
+ pg_typeof 
+-----------
+ integer[]
+(1 row)
+
+ROLLBACK
+SAVEPOINT
+ pg_typeof 
+-----------
+ bigint[]
+(1 row)
+
+psql:/tmp/cap73.sql:25: ERROR:  integer out of range
+psql:/tmp/cap73.sql:27: ERROR:  column "m" is of type mood but expression is of type bigint
+LINE 1: INSERT INTO t (m) VALUES (3000000000);
+                                  ^
+HINT:  You will need to rewrite or cast the expression.
+psql:/tmp/cap73.sql:28: ERROR:  column "m" is of type mood but expression is of type numeric
+LINE 1: INSERT INTO t (m) VALUES (1.5);
+                                  ^
+HINT:  You will need to rewrite or cast the expression.
+psql:/tmp/cap73.sql:29: ERROR:  operator does not exist: mood + integer
+LINE 1: SELECT m + 1 FROM t;
+                 ^
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
+ROLLBACK
+### 5 assigning a literal into a column of another width
+SAVEPOINT
+ i 
+---
+ 1
+(1 row)
+
+INSERT 0 1
+ROLLBACK
+SAVEPOINT
+ b 
+---
+ 1
+(1 row)
+
+INSERT 0 1
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+### 6 other messages that name a literal type
+SAVEPOINT
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+### 7 what a RowDescription says for a literal
+SAVEPOINT
+ Column |  Type   
+--------+---------
+ one    | integer
+(1 row)
+
+ROLLBACK
+SAVEPOINT
+ Column |   Type    
+--------+-----------
+ a      | integer[]
+(1 row)
+
+ROLLBACK
+ROLLBACK
+==== output of probe 2, verbatim ====
+
+BEGIN
+CREATE TYPE
+CREATE TABLE
+### a bare literal
+SAVEPOINT
+psql:/tmp/cap73b.sql:6: ERROR:  column "m" is of type mood but expression is of type integer
+LINE 1: INSERT INTO t (m) VALUES (1);
+                                  ^
+HINT:  You will need to rewrite or cast the expression.
+ROLLBACK
+### b declared bigint, small value
+SAVEPOINT
+psql:/tmp/cap73b.sql:8: ERROR:  column "m" is of type mood but expression is of type bigint
+LINE 1: INSERT INTO t (m) VALUES (1::bigint);
+                                  ^
+HINT:  You will need to rewrite or cast the expression.
+ROLLBACK
+### c declared smallint, small value
+SAVEPOINT
+ROLLBACK
+### d declared integer
+psql:/tmp/cap73b.sql:10: ERROR:  column "m" is of type mood but expression is of type smallint
+LINE 1: INSERT INTO t (m) VALUES (1::smallint);
+                                  ^
+HINT:  You will need to rewrite or cast the expression.
+psql:/tmp/cap73b.sql:12: ERROR:  column "m" is of type mood but expression is of type integer
+LINE 1: INSERT INTO t (m) VALUES (1::integer);
+                                  ^
+HINT:  You will need to rewrite or cast the expression.
+SAVEPOINT
+ROLLBACK
+### e a column of another type
+SAVEPOINT
+psql:/tmp/cap73b.sql:14: ERROR:  column "m" is of type mood but expression is of type integer
+LINE 1: INSERT INTO t (m) SELECT i FROM t;
+                                 ^
+HINT:  You will need to rewrite or cast the expression.
+ROLLBACK
+SAVEPOINT
+psql:/tmp/cap73b.sql:15: ERROR:  column "m" is of type mood but expression is of type smallint
+LINE 1: INSERT INTO t (m) SELECT s FROM t;
+                                 ^
+HINT:  You will need to rewrite or cast the expression.
+ROLLBACK
+### f UPDATE says the same
+psql:/tmp/cap73b.sql:17: ERROR:  column "m" is of type mood but expression is of type integer
+LINE 1: UPDATE t SET m = 1;
+                         ^
+HINT:  You will need to rewrite or cast the expression.
+SAVEPOINT
+ROLLBACK
+SAVEPOINT
+psql:/tmp/cap73b.sql:18: ERROR:  column "m" is of type mood but expression is of type bigint
+LINE 1: UPDATE t SET m = 1::bigint;
+                         ^
+HINT:  You will need to rewrite or cast the expression.
+ROLLBACK
+ROLLBACK
+==== output of probe 3, verbatim ====
+
+BEGIN
+CREATE TYPE
+CREATE TYPE
+CREATE TABLE
+psql:/tmp/cap73c.sql:7: ERROR:  column "m" is of type mood but expression is of type integer
+LINE 1: INSERT INTO t VALUES (2, 1, 'sad');
+                                 ^
+HINT:  You will need to rewrite or cast the expression.
+psql:/tmp/cap73c.sql:8: ERROR:  column "m" is of type mood but expression is of type bigint
+LINE 1: INSERT INTO t VALUES (2, 1::bigint, 'sad');
+                                 ^
+HINT:  You will need to rewrite or cast the expression.
+psql:/tmp/cap73c.sql:9: ERROR:  column "m" is of type mood but expression is of type smallint
+LINE 1: INSERT INTO t VALUES (2, 1::smallint, 'sad');
+                                 ^
+HINT:  You will need to rewrite or cast the expression.
+psql:/tmp/cap73c.sql:10: ERROR:  column "m" is of type mood but expression is of type integer
+LINE 1: INSERT INTO t VALUES (2, 1::integer, 'sad');
+                                 ^
+HINT:  You will need to rewrite or cast the expression.
+psql:/tmp/cap73c.sql:11: ERROR:  column "m" is of type mood but expression is of type bigint
+LINE 1: INSERT INTO t VALUES (2, 3000000000, 'sad');
+                                 ^
+HINT:  You will need to rewrite or cast the expression.
+psql:/tmp/cap73c.sql:12: ERROR:  column "m" is of type mood but expression is of type numeric
+LINE 1: INSERT INTO t VALUES (2, 1.5, 'sad');
+                                 ^
+HINT:  You will need to rewrite or cast the expression.
+psql:/tmp/cap73c.sql:13: ERROR:  column "m" is of type mood but expression is of type boolean
+LINE 1: INSERT INTO t VALUES (2, true, 'sad');
+                                 ^
+HINT:  You will need to rewrite or cast the expression.
+psql:/tmp/cap73c.sql:14: ERROR:  column "m" is of type mood but expression is of type integer
+LINE 1: UPDATE t SET m = 1;
+                         ^
+HINT:  You will need to rewrite or cast the expression.
+psql:/tmp/cap73c.sql:15: ERROR:  column "m" is of type mood but expression is of type bigint
+LINE 1: UPDATE t SET m = 1::bigint;
+                         ^
+HINT:  You will need to rewrite or cast the expression.
+psql:/tmp/cap73c.sql:16: ERROR:  column "m" is of type mood but expression is of type bigint
+LINE 1: UPDATE t SET m = 3000000000;
+                         ^
+HINT:  You will need to rewrite or cast the expression.
+INSERT 0 1
+SAVEPOINT
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+SAVEPOINT
+ROLLBACK
+ROLLBACK

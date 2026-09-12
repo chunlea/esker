@@ -102,6 +102,44 @@ pub fn from_text(text: &str) -> Result<Hstore> {
     }
 }
 
+/// The pairs a `text[]` stands for — `hstore(text[])`, which is the function the `pg_cast` row
+/// `text[] -> hstore` calls (`e`, by function; measured in `pg_cast` on 19beta1, 2026-09-11).
+///
+/// The array is read **key, value, key, value**, so:
+///
+/// ```text
+/// '{a,1}'::text[]::hstore        "a"=>"1"
+/// '{a,1,b,2}'::text[]::hstore    "a"=>"1", "b"=>"2"
+/// '{}'::text[]::hstore           the empty hstore
+/// '{a,NULL}'::text[]::hstore     "a"=>NULL        a NULL value is a value
+/// '{a,1,a,2}'::text[]::hstore    "a"=>"1"         the first of a repeated key wins
+/// '{bb,2,a,1,ccc,3}'            "a"=>"1", "bb"=>"2", "ccc"=>"3"   canonical order, not written
+/// '{x}'::text[]::hstore          2202E array must have even number of elements
+/// '{NULL,1}'::text[]::hstore     22004 null value not allowed for hstore key
+/// ```
+///
+/// **The odd-length refusal is about the array**, which is what says a real server attempted the
+/// conversion at all rather than refusing the pair of types — `42846 cannot cast type text[] to
+/// hstore` was this node's answer and was the last open row of the cast matrix
+/// (`tests/captures/pg19_cast_matrix.txt`).
+///
+/// `or_insert` and not `insert`, because a repeated key keeps its **first** value; a `BTreeMap`
+/// would otherwise keep the last, which is the opposite and is measured.
+pub fn from_text_array(elements: &[Option<String>]) -> Result<Hstore> {
+    if !elements.len().is_multiple_of(2) {
+        return Err(SqlError::HstoreArrayOddLength);
+    }
+    let mut map = Hstore::new();
+    for pair in elements.chunks(2) {
+        let (key, value) = (&pair[0], &pair[1]);
+        let Some(key) = key else {
+            return Err(SqlError::HstoreNullKey);
+        };
+        map.entry(Key(key.clone())).or_insert_with(|| value.clone());
+    }
+    Ok(map)
+}
+
 /// The canonical text, which is what a client is sent and what the row holds.
 #[must_use]
 pub fn to_text(map: &Hstore) -> String {
