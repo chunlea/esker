@@ -509,7 +509,7 @@ fn fold_user_default(
         // `42804` it was — one shape of `debts-v1.1.md` #57 this unit does not reach, pinned in
         // `tests/enum_cast_identity.rs`.
         (catalog::TypeKind::Enum { .. }, _) => {
-            super::assign::into_enum(value.clone(), column, def, None)?
+            super::assign::into_enum(value.clone(), column, def, None, None)?
         }
         // A composite `DEFAULT` is canonicalised like any other value of one, so the column's
         // default and a row written by hand are the same string.

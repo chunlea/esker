@@ -1,0 +1,402 @@
+# **A set operation's arms when one of them is an enum, an unknown literal, a domain or a range**
+# — PostgreSQL 19beta1, 2026-09-11. Two `BEGIN … ROLLBACK` sessions, **a `SAVEPOINT` per probe**.
+#
+# Taken for `debts-v1.1.md` #75, #76 and #57's last shape, and it settled #81 as well. The
+# savepoint per probe is the point of the shape: without it the first refusal aborts the
+# transaction and every later statement answers `current transaction is aborted` instead of the
+# thing being measured.
+#
+# **stdout and stderr interleave** in the raw output below — an `ERROR` line can appear one echo
+# block later than the statement it belongs to. Each one quotes its own statement on the `LINE 1:`
+# line, so the attribution is never in doubt; it is recorded here rather than tidied away.
+#
+# ## What an arm one clause down does (#76, closed)
+#
+#     SELECT m FROM t UNION SELECT 'sad'::mood                        sad ; ok
+#     SELECT v FROM (SELECT m AS v FROM t UNION SELECT 'sad'::mood) s  sad ; ok   pg_typeof mood
+#     WITH c AS (… UNION SELECT 'sad'::mood) SELECT v FROM c           sad ; ok   pg_typeof mood
+#
+# The nesting changes nothing: a set operation in a derived table or a `WITH` resolves its arms'
+# casts exactly as one at the top level does, and the column is the enum in all three.
+#
+# ## What an arm with no type of its own does (#75, four rules)
+#
+#     SELECT 'lit' UNION ALL SELECT tt FROM u      lit ; a          pg_typeof  text
+#     SELECT NULL  UNION ALL SELECT 1              NULL ; 1         pg_typeof  integer
+#     SELECT NULL  UNION ALL SELECT NULL           NULL ; NULL      pg_typeof  text
+#     SELECT 1     UNION ALL SELECT NULL           1 ; NULL
+#     SELECT 1     UNION ALL SELECT 'abc'          22P02 invalid input syntax for type integer: "abc"
+#
+# An unknown literal takes the type of the arms that **have** one and is then read as it — so a
+# literal that will not parse fails **as that type**, which is `22P02` about the value and not the
+# `42804` about a pair of types. When every arm is unknown the column is `text`.
+#
+# ## The same rule with an enum on the other side (#81, open)
+#
+#     SELECT m FROM t UNION SELECT 'sad'           sad ; ok
+#     SELECT m FROM t UNION SELECT NULL            ok ; NULL
+#     SELECT m FROM t UNION SELECT 'nope'          22P02 invalid input value for enum mood: "nope"
+#
+# The third is the failure case of the same rule, one type over: the literal is read **as the
+# enum**, so the complaint names the enum's own input function. This node reaches neither — it
+# refuses the pair — which is #81.
+#
+# ## An enum beside another category (#57's last shape, closed)
+#
+#     SELECT m FROM t UNION SELECT 'sad'::text     UNION types mood and text cannot be matched
+#     SELECT 'sad'::text UNION SELECT m FROM t     UNION types text and mood cannot be matched
+#     SELECT m FROM t UNION SELECT 1::integer      UNION types mood and integer cannot be matched
+#     SELECT m FROM t UNION SELECT 1::smallint     UNION types mood and smallint cannot be matched
+#     SELECT v FROM (SELECT m AS v FROM t) q UNION SELECT 1::smallint
+#                                                  UNION types mood and smallint cannot be matched
+#
+# Two categories, so the conversion is never tried and the `42846` two enums get is never reached.
+# **The sentence names the enum**, not the `int2` it is stored as — and the `smallint` row is the
+# sharp one, because that *is* an enum's storage here and this node answered the ordinals for it.
+#
+#     SELECT m FROM t UNION SELECT o FROM t        UNION could not convert type other_mood to mood
+#     SELECT m FROM t UNION SELECT 'sad'::mood     sad ; ok
+#     SELECT max(m) FROM t UNION SELECT 'sad'::mood  sad ; ok
+#
+# Two **different** enums are one category, so that one does reach the conversion and is `42846`
+# with the later arm's type first. The same enum on both sides answers, and so does an enum that
+# arrives through `max()` — an aggregate that keeps its argument's type is still that type.
+#
+# ## What the rule must not touch: a domain and a range
+#
+#     SELECT d FROM t UNION SELECT 2::integer      1 ; 2            pg_typeof  integer
+#     SELECT d FROM t UNION SELECT 'a'::text       UNION types integer and text cannot be matched
+#     SELECT r FROM t UNION SELECT '[2,3)'::int4range   [1,5) ; [2,3)
+#     SELECT r FROM t UNION SELECT 'a'::text       UNION types int4range and text cannot be matched
+#
+# **A domain is its base type here and is never named**: `posint` does not appear in either
+# sentence, and it unifies with `integer` rather than being refused against it. A range is its own
+# type and was already named correctly. So the enum rule above has to be enum-only, and these four
+# rows are what says so.
+#
+# ---- probe script 1 (#75, #76, #81), as sent
+# \set ON_ERROR_STOP 0
+# \timing off
+# BEGIN;
+# CREATE TYPE mood AS ENUM ('sad','ok');
+# CREATE TABLE t (m mood);
+# INSERT INTO t VALUES ('ok');
+# CREATE TABLE u (tt text, i integer);
+# INSERT INTO u VALUES ('a', 1);
+#
+# \echo '### 76.1 top level (the control)'
+# SAVEPOINT s; SELECT m FROM t UNION SELECT 'sad'::mood ORDER BY 1; ROLLBACK TO s;
+# \echo '### 76.2 derived table'
+# SAVEPOINT s; SELECT v FROM (SELECT m AS v FROM t UNION SELECT 'sad'::mood) s ORDER BY 1; ROLLBACK TO s;
+# \echo '### 76.3 WITH'
+# SAVEPOINT s; WITH c AS (SELECT m AS v FROM t UNION SELECT 'sad'::mood) SELECT v FROM c ORDER BY 1; ROLLBACK TO s;
+# \echo '### 76.4 pg_typeof through the derived table'
+# SAVEPOINT s; SELECT pg_typeof(v) FROM (SELECT m AS v FROM t UNION SELECT 'sad'::mood) s LIMIT 1; ROLLBACK TO s;
+# \echo '### 76.5 pg_typeof through the WITH'
+# SAVEPOINT s; WITH c AS (SELECT m AS v FROM t UNION SELECT 'sad'::mood) SELECT pg_typeof(v) FROM c LIMIT 1; ROLLBACK TO s;
+# \echo '### 57-rest enum beside another category'
+# SAVEPOINT s; SELECT m FROM t UNION SELECT 1::smallint; ROLLBACK TO s;
+#
+# \echo '### 75.1 unknown literal takes the other arm (text)'
+# SAVEPOINT s; SELECT 'lit' UNION ALL SELECT tt FROM u; ROLLBACK TO s;
+# SAVEPOINT s; SELECT pg_typeof(x) FROM (SELECT 'lit' AS x UNION ALL SELECT tt FROM u) q LIMIT 1; ROLLBACK TO s;
+# \echo '### 75.2 NULL takes the other arm (integer)'
+# SAVEPOINT s; SELECT NULL UNION ALL SELECT 1; ROLLBACK TO s;
+# SAVEPOINT s; SELECT pg_typeof(x) FROM (SELECT NULL AS x UNION ALL SELECT 1) q LIMIT 1; ROLLBACK TO s;
+# \echo '### 75.3 NULL beside NULL is text'
+# SAVEPOINT s; SELECT NULL UNION ALL SELECT NULL; ROLLBACK TO s;
+# SAVEPOINT s; SELECT pg_typeof(x) FROM (SELECT NULL AS x UNION ALL SELECT NULL) q LIMIT 1; ROLLBACK TO s;
+# \echo '### 75.4 a literal that will not read as the resolved type fails AS that type'
+# SAVEPOINT s; SELECT 1 UNION ALL SELECT 'abc'; ROLLBACK TO s;
+# \echo '### 75.5 integer beside NULL'
+# SAVEPOINT s; SELECT 1 UNION ALL SELECT NULL; ROLLBACK TO s;
+# \echo '### 75.6 an unknown literal beside an enum'
+# SAVEPOINT s; SELECT m FROM t UNION SELECT 'sad' ORDER BY 1; ROLLBACK TO s;
+# \echo '### 75.7 a bare NULL beside an enum'
+# SAVEPOINT s; SELECT m FROM t UNION SELECT NULL ORDER BY 1; ROLLBACK TO s;
+# \echo '### 75.8 an unknown literal that is not a label of that enum'
+# SAVEPOINT s; SELECT m FROM t UNION SELECT 'nope' ORDER BY 1; ROLLBACK TO s;
+# ROLLBACK;
+#
+# ---- probe script 2 (#57, and the domain/range guards), as sent
+# \set ON_ERROR_STOP 0
+# BEGIN;
+# CREATE TYPE mood AS ENUM ('sad','ok');
+# CREATE TYPE other_mood AS ENUM ('x','y');
+# CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
+# CREATE TABLE t (m mood, o other_mood, d posint, r int4range, i integer, s smallint, tt text);
+# INSERT INTO t VALUES ('ok','x',1,'[1,5)',1,1,'a');
+#
+# \echo '### A enum beside text (cast)'
+# SAVEPOINT s; SELECT m FROM t UNION SELECT 'sad'::text; ROLLBACK TO s;
+# \echo '### B text beside enum (order swapped)'
+# SAVEPOINT s; SELECT 'sad'::text UNION SELECT m FROM t; ROLLBACK TO s;
+# \echo '### C enum beside integer'
+# SAVEPOINT s; SELECT m FROM t UNION SELECT 1::integer; ROLLBACK TO s;
+# \echo '### D enum beside smallint (its own storage)'
+# SAVEPOINT s; SELECT m FROM t UNION SELECT 1::smallint; ROLLBACK TO s;
+# \echo '### E the same enum on both sides must still answer'
+# SAVEPOINT s; SELECT m FROM t UNION SELECT 'sad'::mood ORDER BY 1; ROLLBACK TO s;
+# \echo '### F two different enums'
+# SAVEPOINT s; SELECT m FROM t UNION SELECT o FROM t; ROLLBACK TO s;
+# \echo '### G a DOMAIN beside its base type must still answer'
+# SAVEPOINT s; SELECT d FROM t UNION SELECT 2::integer ORDER BY 1; ROLLBACK TO s;
+# SAVEPOINT s; SELECT pg_typeof(x) FROM (SELECT d AS x FROM t UNION SELECT 2::integer) q LIMIT 1; ROLLBACK TO s;
+# \echo '### H a DOMAIN beside text'
+# SAVEPOINT s; SELECT d FROM t UNION SELECT 'a'::text; ROLLBACK TO s;
+# \echo '### I a range beside its own type'
+# SAVEPOINT s; SELECT r FROM t UNION SELECT '[2,3)'::int4range ORDER BY 1; ROLLBACK TO s;
+# \echo '### J a range beside text'
+# SAVEPOINT s; SELECT r FROM t UNION SELECT 'a'::text; ROLLBACK TO s;
+# \echo '### K enum beside an aggregate of itself'
+# SAVEPOINT s; SELECT max(m) FROM t UNION SELECT 'sad'::mood ORDER BY 1; ROLLBACK TO s;
+# \echo '### L enum in a derived table beside a smallint at the top'
+# SAVEPOINT s; SELECT v FROM (SELECT m AS v FROM t) q UNION SELECT 1::smallint; ROLLBACK TO s;
+# ROLLBACK;
+
+==== output of script 1, verbatim ====
+
+Timing is off.
+BEGIN
+CREATE TYPE
+CREATE TABLE
+INSERT 0 1
+CREATE TABLE
+INSERT 0 1
+### 76.1 top level (the control)
+SAVEPOINT
+  m  
+-----
+ sad
+ ok
+(2 rows)
+
+ROLLBACK
+### 76.2 derived table
+SAVEPOINT
+  v  
+-----
+ sad
+ ok
+(2 rows)
+
+ROLLBACK
+### 76.3 WITH
+SAVEPOINT
+  v  
+-----
+ sad
+ ok
+(2 rows)
+
+ROLLBACK
+### 76.4 pg_typeof through the derived table
+SAVEPOINT
+ pg_typeof 
+-----------
+ mood
+(1 row)
+
+ROLLBACK
+### 76.5 pg_typeof through the WITH
+SAVEPOINT
+ pg_typeof 
+-----------
+ mood
+(1 row)
+
+ROLLBACK
+### 57-rest enum beside another category
+SAVEPOINT
+ROLLBACK
+### 75.1 unknown literal takes the other arm (text)
+SAVEPOINT
+psql:/tmp/capture.sql:21: ERROR:  UNION types mood and smallint cannot be matched
+LINE 1: SELECT m FROM t UNION SELECT 1::smallint;
+                                     ^
+ ?column? 
+----------
+ lit
+ a
+(2 rows)
+
+ROLLBACK
+SAVEPOINT
+ pg_typeof 
+-----------
+ text
+(1 row)
+
+ROLLBACK
+### 75.2 NULL takes the other arm (integer)
+SAVEPOINT
+ ?column? 
+----------
+         
+        1
+(2 rows)
+
+ROLLBACK
+SAVEPOINT
+ pg_typeof 
+-----------
+ integer
+(1 row)
+
+ROLLBACK
+### 75.3 NULL beside NULL is text
+SAVEPOINT
+ ?column? 
+----------
+ 
+ 
+(2 rows)
+
+ROLLBACK
+SAVEPOINT
+ pg_typeof 
+-----------
+ text
+(1 row)
+
+ROLLBACK
+### 75.4 a literal that will not read as the resolved type fails AS that type
+SAVEPOINT
+ROLLBACK
+### 75.5 integer beside NULL
+psql:/tmp/capture.sql:33: ERROR:  invalid input syntax for type integer: "abc"
+LINE 1: SELECT 1 UNION ALL SELECT 'abc';
+                                  ^
+SAVEPOINT
+ ?column? 
+----------
+        1
+         
+(2 rows)
+
+ROLLBACK
+### 75.6 an unknown literal beside an enum
+SAVEPOINT
+  m  
+-----
+ sad
+ ok
+(2 rows)
+
+ROLLBACK
+### 75.7 a bare NULL beside an enum
+SAVEPOINT
+ m  
+----
+ ok
+ 
+(2 rows)
+
+ROLLBACK
+### 75.8 an unknown literal that is not a label of that enum
+SAVEPOINT
+psql:/tmp/capture.sql:41: ERROR:  invalid input value for enum mood: "nope"
+LINE 1: SELECT m FROM t UNION SELECT 'nope' ORDER BY 1;
+                                     ^
+ROLLBACK
+ROLLBACK
+==== output of script 2, verbatim ====
+
+BEGIN
+CREATE TYPE
+CREATE TYPE
+CREATE DOMAIN
+CREATE TABLE
+INSERT 0 1
+### A enum beside text (cast)
+SAVEPOINT
+ROLLBACK
+### B text beside enum (order swapped)
+SAVEPOINT
+ROLLBACK
+### C enum beside integer
+SAVEPOINT
+ROLLBACK
+### D enum beside smallint (its own storage)
+SAVEPOINT
+ROLLBACK
+### E the same enum on both sides must still answer
+SAVEPOINT
+psql:/tmp/cap57.sql:10: ERROR:  UNION types mood and text cannot be matched
+LINE 1: SELECT m FROM t UNION SELECT 'sad'::text;
+                                     ^
+psql:/tmp/cap57.sql:12: ERROR:  UNION types text and mood cannot be matched
+LINE 1: SELECT 'sad'::text UNION SELECT m FROM t;
+                                        ^
+psql:/tmp/cap57.sql:14: ERROR:  UNION types mood and integer cannot be matched
+LINE 1: SELECT m FROM t UNION SELECT 1::integer;
+                                     ^
+psql:/tmp/cap57.sql:16: ERROR:  UNION types mood and smallint cannot be matched
+LINE 1: SELECT m FROM t UNION SELECT 1::smallint;
+                                     ^
+  m  
+-----
+ sad
+ ok
+(2 rows)
+
+ROLLBACK
+### F two different enums
+SAVEPOINT
+ROLLBACK
+psql:/tmp/cap57.sql:20: ERROR:  UNION could not convert type other_mood to mood
+LINE 1: SELECT m FROM t UNION SELECT o FROM t;
+                                     ^
+### G a DOMAIN beside its base type must still answer
+SAVEPOINT
+ d 
+---
+ 1
+ 2
+(2 rows)
+
+ROLLBACK
+SAVEPOINT
+psql:/tmp/cap57.sql:25: ERROR:  UNION types integer and text cannot be matched
+LINE 1: SELECT d FROM t UNION SELECT 'a'::text;
+                                     ^
+psql:/tmp/cap57.sql:29: ERROR:  UNION types int4range and text cannot be matched
+LINE 1: SELECT r FROM t UNION SELECT 'a'::text;
+                                     ^
+psql:/tmp/cap57.sql:33: ERROR:  UNION types mood and smallint cannot be matched
+LINE 1: ...LECT v FROM (SELECT m AS v FROM t) q UNION SELECT 1::smallin...
+                                                             ^
+ pg_typeof 
+-----------
+ integer
+(1 row)
+
+ROLLBACK
+### H a DOMAIN beside text
+SAVEPOINT
+ROLLBACK
+### I a range beside its own type
+SAVEPOINT
+   r   
+-------
+ [1,5)
+ [2,3)
+(2 rows)
+
+ROLLBACK
+### J a range beside text
+SAVEPOINT
+ROLLBACK
+### K enum beside an aggregate of itself
+SAVEPOINT
+ max 
+-----
+ sad
+ ok
+(2 rows)
+
+ROLLBACK
+### L enum in a derived table beside a smallint at the top
+SAVEPOINT
+ROLLBACK
+ROLLBACK
