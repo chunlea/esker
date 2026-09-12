@@ -814,16 +814,29 @@ fn value_for_column(
         // **The literal's own type travels with its value**: a cast to this enum resolved to the
         // label's ordinal and says which enum it is one of, which is what lets a write take it
         // (`debts-v1.1.md` #57). An evaluated expression carries no such claim.
-        let (value, from) = match expr {
-            crate::plan::Expr::Literal(literal) => super::assign::enum_literal(literal),
+        // **And the name a refusal would use.** `None` for an evaluated expression, where the
+        // value's own width *is* its type; a literal's is its own, which is the width it was
+        // written as rather than the `i64` its datum is (`debts-v1.1.md` #73).
+        let (value, from, declared) = match expr {
+            crate::plan::Expr::Literal(literal) => {
+                let (value, from, named) = super::assign::enum_literal(literal);
+                (value, from, Some(named))
+            }
             other => {
                 let resolved = query::resolve(other, &query::Scope::empty())?;
-                (cursor::evaluate_in_txn(&resolved, &[], txn)?, None)
+                (cursor::evaluate_in_txn(&resolved, &[], txn)?, None, None)
             }
         };
         // Through `into_column` rather than straight to `into_enum`: the kind is decided in one
         // place, so a composite is canonicalised here exactly as an enum is mapped.
-        return super::assign::into_column(value, column, Some(def), from.as_ref(), rendering);
+        return super::assign::into_column(
+            value,
+            column,
+            Some(def),
+            from.as_ref(),
+            rendering,
+            declared,
+        );
     }
     match expr {
         crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name),
@@ -847,6 +860,7 @@ fn value_for_column(
                 super::assign::rewriting_type_of(table, column),
                 None,
                 rendering,
+                None,
             )
         }
     }
@@ -903,7 +917,7 @@ fn regclass_array_from_names(
 fn assigned_value(
     value: &crate::plan::Expr,
     at: &mut AssignedIn<'_>,
-) -> Result<(Datum, Option<crate::catalog::TypeDef>)> {
+) -> Result<(Datum, Option<crate::catalog::TypeDef>, Option<&'static str>)> {
     // **The `UPDATE` half of the assignment rule** (`debts-v1.1.md` #41), and the same sentence
     // `value_for_column` carries for `INSERT`: an assignment goes through `regclassin` and
     // resolves the name, where a comparison reads the literal as an oid. The name is discarded —
@@ -913,7 +927,7 @@ fn assigned_value(
     {
         let relations = std::cell::RefCell::new(None);
         let oid = at.executor.name_rule(at.txn, &relations)(name)?;
-        return Ok((crate::value::regclass_of_oid(oid), None));
+        return Ok((crate::value::regclass_of_oid(oid), None, None));
     }
     // The array beside it, by the same rule and the same parser.
     if at.column.ty == ColumnType::RegClassArray
@@ -922,7 +936,7 @@ fn assigned_value(
         let relations = std::cell::RefCell::new(None);
         let rule = at.executor.name_rule(at.txn, &relations);
         if let Some(resolved) = regclass_array_from_names(text, &rule)? {
-            return Ok((resolved, None));
+            return Ok((resolved, None, None));
         }
     }
     match value {
@@ -937,17 +951,20 @@ fn assigned_value(
             ),
             None => column_default_value(at.table, at.column, at.txn, at.executor.tenant),
         }
-        .map(|value| (value, None)),
+        .map(|value| (value, None, None)),
         // An enum column takes a label, so the literal keeps its own type here and `into_column`
-        // reads it against the enum rather than against the `int2` the row holds.
+        // reads it against the enum rather than against the `int2` the row holds — **and the name
+        // a refusal would use travels with it**, because a bare integer's datum is an `i64` and
+        // its sentence is `integer` (`debts-v1.1.md` #73).
         crate::plan::Expr::Literal(literal)
             if super::assign::rewriting_type_of(at.table, at.column).is_some() =>
         {
-            Ok(super::assign::enum_literal(literal))
+            let (value, user, named) = super::assign::enum_literal(literal);
+            Ok((value, user, Some(named)))
         }
         crate::plan::Expr::Literal(literal) => literal
             .assign(at.column.ty, &at.column.name)
-            .map(|value| (value, None)),
+            .map(|value| (value, None, None)),
         other => {
             let resolved = query::resolve_against_scope(other, at.scope)?;
             // Against the row as the statement found it, and **the whole joined row**:
@@ -956,7 +973,7 @@ fn assigned_value(
             //
             // In the transaction, so `SET updated_at = CURRENT_TIMESTAMP` reads the instant
             // rather than reporting a clock with nothing to read.
-            cursor::evaluate_in_txn(&resolved, at.joined, at.txn).map(|value| (value, None))
+            cursor::evaluate_in_txn(&resolved, at.joined, at.txn).map(|value| (value, None, None))
         }
     }
 }
@@ -1274,6 +1291,7 @@ pub(super) fn update(
                     super::assign::rewriting_type_of(&table, column),
                     evaluated.1.as_ref(),
                     executor.rendering(),
+                    evaluated.2,
                 )?;
             }
             fit_typmods(&table, &mut new)?;
@@ -1755,6 +1773,7 @@ fn apply_conflict_update(
             super::assign::rewriting_type_of(table, column),
             None,
             rendering,
+            None,
         )?;
     }
     fit_typmods(table, &mut updated)?;

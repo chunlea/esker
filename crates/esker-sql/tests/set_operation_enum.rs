@@ -61,6 +61,10 @@
 //!
 //! **What must not move**: the same enum on both sides answers, an unquoted literal takes the
 //! enum and comes back as a **label**, and a bare `NULL` arm is still a row.
+//!
+//! **The oracle capture is `tests/captures/pg19_set_operation_enums.txt`** — two
+//! `BEGIN … ROLLBACK` sessions with a `SAVEPOINT` per probe, taken 2026-09-11, holding every
+//! sentence this file asserts and every one it records as a divergence.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

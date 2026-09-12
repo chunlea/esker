@@ -41,13 +41,16 @@ pub(super) fn into_column(
     user_type: Option<&crate::catalog::TypeDef>,
     from: Option<&crate::catalog::TypeDef>,
     rendering: crate::value::Rendering,
+    declared: Option<&str>,
 ) -> Result<Datum> {
     // **An enum first, and by its own rule.** The column is an `int2` in the row, so every test
     // below would be about the storage: `'angry'` would be `22P02 invalid input syntax for type
     // smallint` where a real server names the enum and the label it did not have.
     if let Some(def) = user_type {
         match &def.kind {
-            crate::catalog::TypeKind::Enum { .. } => return into_enum(value, column, def, from),
+            crate::catalog::TypeKind::Enum { .. } => {
+                return into_enum(value, column, def, from, declared);
+            }
             // **A composite arrives as text and is stored canonically**, so what a client wrote
             // and what a real server would have printed are the same string by the time it is a
             // row: `'(Paris,Rue Basse)'` becomes `(Paris,"Rue Basse")`, which is
@@ -222,11 +225,20 @@ pub(super) fn user_type_of<'a>(
 /// `"1"` and answer `22P02` where a real server says
 /// `column "current_mood" is of type mood but expression is of type integer`, which is a different
 /// error about a different mistake.
+///
+/// **And the name the refusal will use, taken here** (`debts-v1.1.md` #73). A bare integer
+/// constant's datum is an `i64` whatever width it is *declared* — the line below says so and ADR
+/// 0087 is why — so a message built from the `Datum` said `bigint` for `VALUES (1)` where 19beta1
+/// says `integer`. `Literal::type_name` is the crate's answer to exactly this question and already
+/// carries the ladder in both directions: a bare constant takes the width its **value** needs and
+/// a cast one takes the width it was **declared**, which is `1::bigint` naming `bigint` and
+/// `1::smallint` naming `smallint`. Measured, all four, 2026-09-11.
 pub(super) fn enum_literal(
     literal: &crate::plan::Literal,
-) -> (Datum, Option<crate::catalog::TypeDef>) {
+) -> (Datum, Option<crate::catalog::TypeDef>, &'static str) {
     use crate::plan::Literal;
-    match literal {
+    let named = literal.type_name();
+    let (value, user) = match literal {
         Literal::Null | Literal::TypedNull(_) => (Datum::Null, None),
         Literal::String(text) => (Datum::Text(text.clone()), None),
         // **The type it was cast to travels with it.** `'sad'::mood` is already this enum's
@@ -243,7 +255,8 @@ pub(super) fn enum_literal(
             None,
         ),
         Literal::Bool(flag) => (Datum::Bool(*flag), None),
-    }
+    };
+    (value, user, named)
 }
 
 /// One value, ready to store in a column declared as an **enum**: the ordinal of the label it
@@ -266,6 +279,7 @@ pub(super) fn into_enum(
     column: &ColumnDef,
     def: &crate::catalog::TypeDef,
     from: Option<&crate::catalog::TypeDef>,
+    declared: Option<&str>,
 ) -> Result<Datum> {
     let crate::catalog::TypeKind::Enum { labels } = &def.kind else {
         return Err(SqlError::Internal(
@@ -299,12 +313,23 @@ pub(super) fn into_enum(
         other => Err(SqlError::DatatypeMismatchInColumn {
             column: column.name.clone(),
             column_type: def.name.clone(),
+            // **The expression's type, in the order a real server decides it**: a user-defined
+            // type names itself, then the type the *expression* was written as — which is
+            // `Literal::type_name`'s ladder and the half #73 was about — and only then the datum
+            // the value happens to be sitting in. That last one is right for an evaluated
+            // expression, where the value's width **is** its type, and was wrong for a literal,
+            // where a bare `1` is an `i64` in the row and an `integer` in the sentence.
             expression_type: from.map_or_else(
                 || {
-                    other
-                        .column_type()
-                        .map_or("unknown", PgType::name)
-                        .to_owned()
+                    declared.map_or_else(
+                        || {
+                            other
+                                .column_type()
+                                .map_or("unknown", PgType::name)
+                                .to_owned()
+                        },
+                        str::to_owned,
+                    )
                 },
                 |from| from.name.clone(),
             ),

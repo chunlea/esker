@@ -2237,7 +2237,7 @@ fn pg_depend_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
 ///
 /// `(castsource, casttarget, castcontext, castmethod)`. `castcontext` is `e` explicit, `a`
 /// assignment, `i` implicit; `castmethod` is `f` a function, `b` binary-coercible, `i` I/O.
-pub const CASTS: [(i64, i64, &str, &str); 159] = [
+pub const CASTS: [(i64, i64, &str, &str); 160] = [
     // **A bit string's eight rows, measured** rather than reasoned:
     //
     //     SELECT castsource::regtype, casttarget::regtype, castcontext, castmethod
@@ -2498,6 +2498,19 @@ pub const CASTS: [(i64, i64, &str, &str); 159] = [
     // (`value::hstore::to_json`). The two rows back do not exist, in either direction.
     (16400, 114, "e", "f"),
     (16400, 3802, "e", "f"),
+    // **And the row *into* an hstore, which is the third in the family and was the cast matrix's
+    // one open pair** (`tests/captures/pg19_cast_matrix.txt`). Measured in the same transaction:
+    //
+    //     text[] -> hstore  e  f        '{a,1}'::text[]::hstore      "a"=>"1"
+    //
+    // The function is `hstore(text[])` (`value::hstore::from_text_array`), which is why an odd
+    // list is `2202E array must have even number of elements` — a complaint about the **array**,
+    // and the thing that says a real server attempted the conversion rather than refusing the
+    // pair. Explicit, so `'{a,1}'::text[]` never becomes an hstore by itself. **Only `text[]`**:
+    // `'{a,1}'::varchar[]::hstore` is `42846` there, measured beside it, so this is one row and
+    // not a family — and the array rule above never reaches it, because an `hstore` is not an
+    // array and has no element for it to recurse on.
+    (1009, 16400, "e", "f"),
 ];
 
 /// The built-in functions this node has, as PostgreSQL numbers them.
