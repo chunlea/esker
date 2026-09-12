@@ -60,6 +60,16 @@ const CLIENTS: usize = 6;
 /// Leader kills, and the pause on either side of each one.
 const KILLS: u32 = 4;
 const BETWEEN: Duration = Duration::from_millis(400);
+/// Kills this will do **if four have not yet produced a refusal to check**.
+///
+/// The promise under test is about a write the client was told had *not* happened, so a run in
+/// which nobody was ever told that has checked nothing — and `!refusals.is_empty()` below is the
+/// denominator that says so. It is a **race**, not a certainty: a kill that lands while a write is
+/// in flight can just as easily answer `Unknown`, which is the client declining to claim anything
+/// and is deliberately not collected. On a gate running several clusters at once four kills came up
+/// empty and the run failed for having found nothing, which is a fixture that depends on the
+/// weather. So the kills go on until the thing to be checked exists.
+const KILLS_AT_MOST: u32 = 16;
 
 /// One write the client was told had not happened.
 struct Refusal {
@@ -67,6 +77,26 @@ struct Refusal {
     key: Vec<u8>,
     /// What it was refused with, so a failure names the error that lied.
     error: String,
+}
+
+/// Kills the leader and brings it back, until the run has **both** enough kills to have exercised
+/// the path and a refusal to check at the end of it. Answers how many kills that took.
+///
+/// A run that already has both stops at [`KILLS`], so the common case costs what it always did.
+fn kill_until_there_is_a_refusal(cluster: &Cluster, refusals: &Mutex<Vec<Refusal>>) -> u32 {
+    let mut killed = 0;
+    for _ in 0..KILLS_AT_MOST {
+        std::thread::sleep(BETWEEN);
+        let Some(at) = cluster.leader() else { continue };
+        cluster.kill_node(at);
+        killed += 1;
+        std::thread::sleep(BETWEEN);
+        cluster.start_node(at);
+        if killed >= KILLS && !refusals.lock().unwrap().is_empty() {
+            break;
+        }
+    }
+    killed
 }
 
 #[test]
@@ -128,15 +158,7 @@ fn a_refused_write_is_never_in_the_database() {
         })
         .collect();
 
-    let mut killed = 0;
-    for _ in 0..KILLS {
-        std::thread::sleep(BETWEEN);
-        let Some(at) = cluster.leader() else { continue };
-        cluster.kill_node(at);
-        killed += 1;
-        std::thread::sleep(BETWEEN);
-        cluster.start_node(at);
-    }
+    let killed = kill_until_there_is_a_refusal(&cluster, &refusals);
 
     stop.store(true, Ordering::Relaxed);
     for writer in writers {
@@ -167,7 +189,10 @@ fn a_refused_write_is_never_in_the_database() {
     );
     assert!(
         !refusals.is_empty(),
-        "not one write was refused, so the promise was never made and nothing was checked"
+        "not one write was refused in {killed} kills, so the promise was never made and nothing \
+         was checked. Every error the writers saw was ambiguous rather than a refusal, which is \
+         the client declining to claim anything — that is not a failure of the rule, it is a run \
+         with no evidence in it"
     );
     assert!(
         landed.is_empty(),
