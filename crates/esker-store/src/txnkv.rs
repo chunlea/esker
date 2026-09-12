@@ -343,9 +343,9 @@ pub fn get(db: &Db, user_key: &[u8], ts: u64) -> Result<TxnKvResp, ProtoError> {
 /// costs: a tenant with 8,342 catalog table records, 278 of them live, and the 150 ids past the
 /// 8,192nd key unreachable, so `a name points at table 34755, which is not there`.
 ///
-/// The ceiling that remains is a **chunk** ([`KEY_CHUNK`]) rather than a quota: a key the read
-/// finds nothing live under costs an iteration step and no slot, and the walk asks for another
-/// chunk until it has filled the caller's limit or run out of range.
+/// The ceiling that remains is a **chunk** (`KEY_CHUNK`, private to this module) rather than a
+/// quota: a key the read finds nothing live under costs an iteration step and no slot, and the
+/// walk asks for another chunk until it has filled the caller's limit or run out of range.
 ///
 /// # A short answer is never the end of the range, and an empty one always is
 ///

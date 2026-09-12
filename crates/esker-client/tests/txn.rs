@@ -210,25 +210,23 @@ fn a_scan_across_a_split_boundary_reads_both_regions() {
     let transport = Arc::new(FakeTransport::new());
     // Region 1 owns `..m` and region 2 owns `m..`, each answering only for its own keys —
     // which is what a real store does, and what the old scan silently believed was everything.
+    // **Each region answers its keys once and then answers empty**, which is what a store does
+    // and what the walk needs: a batch that is merely *short* proves nothing, so the client asks
+    // again from past the last key and only the empty answer ends the region (#79).
     transport
-        .script(
-            Rule::new(
-                Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(1)]),
-                Outcome::TxnReply(TxnKvResp::Scan {
-                    pairs: vec![(key(b"a"), key(b"1")), (key(b"b"), key(b"2"))],
-                }),
-            )
-            .forever(),
-        )
-        .script(
-            Rule::new(
-                Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(2)]),
-                Outcome::TxnReply(TxnKvResp::Scan {
-                    pairs: vec![(key(b"n"), key(b"3")), (key(b"o"), key(b"4"))],
-                }),
-            )
-            .forever(),
-        );
+        .script(Rule::new(
+            Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(1)]),
+            Outcome::TxnReply(TxnKvResp::Scan {
+                pairs: vec![(key(b"a"), key(b"1")), (key(b"b"), key(b"2"))],
+            }),
+        ))
+        .script(Rule::new(
+            Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(2)]),
+            Outcome::TxnReply(TxnKvResp::Scan {
+                pairs: vec![(key(b"n"), key(b"3")), (key(b"o"), key(b"4"))],
+            }),
+        ))
+        .unmatched(Outcome::TxnReply(TxnKvResp::Scan { pairs: vec![] }));
     let resolver = two_regions();
     let client = client_on(
         &transport,
@@ -247,13 +245,22 @@ fn a_scan_across_a_split_boundary_reads_both_regions() {
         ],
         "both regions, in key order"
     );
-    assert_eq!(transport.stores(), vec![1, 2], "one request per region");
+    assert_eq!(
+        transport.stores(),
+        vec![1, 1, 2, 2],
+        "each region is asked until it answers empty"
+    );
 
-    // The second request starts where the first region ended, not where the caller asked.
-    match nth_txn(&transport, 1) {
-        TxnKvReq::Scan { start, .. } => assert_eq!(start, key(b"m")),
+    // Where each request started: past the last key inside a region, and at the boundary when
+    // the region is done. The third is the one the old single-request scan never sent.
+    let started_at = |at: usize| match nth_txn(&transport, at) {
+        TxnKvReq::Scan { start, .. } => start,
         other => panic!("{other:?}"),
-    }
+    };
+    assert_eq!(started_at(0), key(b"a"), "where the caller asked");
+    assert_eq!(started_at(1), key(b"b\0"), "past the last key of the batch");
+    assert_eq!(started_at(2), key(b"m"), "where the first region ended");
+    assert_eq!(started_at(3), key(b"o\0"));
 }
 
 /// **A scan never asks a region for keys it does not hold.**
@@ -324,24 +331,20 @@ fn a_scan_repairs_a_route_a_split_has_moved_under_it() {
                 end_key: key(b"f"),
             }),
         ))
-        .script(
-            Rule::new(
-                Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(1)]),
-                Outcome::TxnReply(TxnKvResp::Scan {
-                    pairs: vec![(key(b"a"), key(b"1"))],
-                }),
-            )
-            .forever(),
-        )
-        .script(
-            Rule::new(
-                Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(2)]),
-                Outcome::TxnReply(TxnKvResp::Scan {
-                    pairs: vec![(key(b"n"), key(b"2"))],
-                }),
-            )
-            .forever(),
-        );
+        .script(Rule::new(
+            Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(1)]),
+            Outcome::TxnReply(TxnKvResp::Scan {
+                pairs: vec![(key(b"a"), key(b"1"))],
+            }),
+        ))
+        .script(Rule::new(
+            Matcher::All(vec![Matcher::Method(Method::TxnScan), Matcher::Store(2)]),
+            Outcome::TxnReply(TxnKvResp::Scan {
+                pairs: vec![(key(b"n"), key(b"2"))],
+            }),
+        ))
+        // Each region's second answer is empty, which is what ends it (#79).
+        .unmatched(Outcome::TxnReply(TxnKvResp::Scan { pairs: vec![] }));
     let client = client_on(
         &transport,
         two_regions() as Arc<dyn esker_client::RegionResolver>,
@@ -361,9 +364,14 @@ fn a_scan_repairs_a_route_a_split_has_moved_under_it() {
 #[test]
 fn a_scan_stops_at_the_end_of_its_range() {
     let transport = Arc::new(FakeTransport::new());
-    transport.unmatched(Outcome::TxnReply(TxnKvResp::Scan {
-        pairs: vec![(key(b"a"), key(b"1"))],
-    }));
+    transport
+        .script(Rule::new(
+            Matcher::Method(Method::TxnScan),
+            Outcome::TxnReply(TxnKvResp::Scan {
+                pairs: vec![(key(b"a"), key(b"1"))],
+            }),
+        ))
+        .unmatched(Outcome::TxnReply(TxnKvResp::Scan { pairs: vec![] }));
     let resolver = two_regions();
     let client = client_on(
         &transport,
@@ -376,8 +384,8 @@ fn a_scan_stops_at_the_end_of_its_range() {
     assert_eq!(pairs, vec![(key(b"a"), key(b"1"))]);
     assert_eq!(
         transport.stores(),
-        vec![1],
-        "the far region is not in the range"
+        vec![1, 1],
+        "the far region is not in the range, and the first is asked until it answers empty"
     );
 }
 
@@ -409,9 +417,14 @@ fn a_scan_stops_when_the_limit_is_full() {
 #[test]
 fn a_scan_merges_the_buffer_over_what_the_store_returned() {
     let transport = Arc::new(FakeTransport::new());
-    transport.unmatched(Outcome::TxnReply(TxnKvResp::Scan {
-        pairs: vec![(key(b"a"), key(b"stored-a")), (key(b"c"), key(b"stored-c"))],
-    }));
+    transport
+        .script(Rule::new(
+            Matcher::Method(Method::TxnScan),
+            Outcome::TxnReply(TxnKvResp::Scan {
+                pairs: vec![(key(b"a"), key(b"stored-a")), (key(b"c"), key(b"stored-c"))],
+            }),
+        ))
+        .unmatched(Outcome::TxnReply(TxnKvResp::Scan { pairs: vec![] }));
     let client = client(&transport);
     let mut txn = client.begin().unwrap();
     txn.put(b"b", b"mine-b");

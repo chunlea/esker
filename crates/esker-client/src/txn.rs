@@ -1256,48 +1256,54 @@ impl Transaction {
             if merged.len() >= want {
                 break;
             }
-            match last {
-                // **Not empty, so not the end.** The store may have stopped on the caller's page
-                // limit or on its byte budget, and neither is visible from here. Carry on from
-                // just past the last key it gave: `route` finds the next region on its own if
-                // that key is over the boundary.
-                Some(key) => {
-                    let mut next = Vec::with_capacity(key.len() + 1);
-                    next.extend_from_slice(&key);
-                    // The immediate successor in byte order, so the key just read is excluded
-                    // and nothing between it and the next one can be skipped.
-                    next.push(0);
-                    let next = Bytes::from(next);
-                    if !end.is_empty() && next.as_ref() >= end {
-                        break;
-                    }
-                    cursor = next;
+            // **Not empty, so not the end.** The store may have stopped on the caller's page
+            // limit or on its byte budget, and neither is visible from here. Carry on from just
+            // past the last key it gave: `route` finds the next region on its own if that key is
+            // over the boundary.
+            if let Some(key) = last {
+                let mut next = Vec::with_capacity(key.len() + 1);
+                next.extend_from_slice(&key);
+                // The immediate successor in byte order, so the key just read is excluded and
+                // nothing between it and the next one can be skipped.
+                next.push(0);
+                let next = Bytes::from(next);
+                if !end.is_empty() && next.as_ref() >= end {
+                    break;
                 }
-                // **Empty, so this region's share of the range is done.** An empty `end_key` is
-                // the end of the key space, so a region carrying one is the last there is.
-                None => {
-                    if boundary.is_empty() {
-                        break;
-                    }
-                    if !end.is_empty() && boundary.as_ref() >= end {
-                        break;
-                    }
-                    if boundary <= cursor {
-                        return Err(Error::Internal(format!(
-                            "a scan is not advancing: the route for {cursor:?} ends at \
-                             {boundary:?}"
-                        )));
-                    }
-                    regions += 1;
-                    if regions > self.max_scan_regions {
-                        return Err(Error::Internal(format!(
-                            "a scan of {start:?}..{end:?} crossed more than {} regions",
-                            self.max_scan_regions
-                        )));
-                    }
-                    cursor = boundary;
+                // **A batch that does not move the cursor is a store answering for keys it was
+                // not asked about.** It cannot happen against a store that honours its `start`,
+                // and if it ever does the loop below must not spin until its call budget runs
+                // out — the same reasoning as the boundary that does not advance.
+                if next <= cursor {
+                    return Err(Error::Internal(format!(
+                        "a scan is not advancing: a batch from {cursor:?} ended at {key:?}"
+                    )));
                 }
+                cursor = next;
+                continue;
             }
+
+            // **Empty, so this region's share of the range is done.** An empty `end_key` is the
+            // end of the key space, so a region carrying one is the last there is.
+            if boundary.is_empty() {
+                break;
+            }
+            if !end.is_empty() && boundary.as_ref() >= end {
+                break;
+            }
+            if boundary <= cursor {
+                return Err(Error::Internal(format!(
+                    "a scan is not advancing: the route for {cursor:?} ends at {boundary:?}"
+                )));
+            }
+            regions += 1;
+            if regions > self.max_scan_regions {
+                return Err(Error::Internal(format!(
+                    "a scan of {start:?}..{end:?} crossed more than {} regions",
+                    self.max_scan_regions
+                )));
+            }
+            cursor = boundary;
         }
 
         for (key, write) in self.in_range(start, end) {
