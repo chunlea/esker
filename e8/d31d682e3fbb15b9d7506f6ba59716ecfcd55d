@@ -1,0 +1,44 @@
+crates/esker-client/src/raw.rs
+  h_44076b318daf9c 12,226-228,241-266,323-326,330-338,347-350,357,388
+crates/esker-client/tests/raw_scan_across_a_split.rs
+  h_44076b318daf9c 1-182
+crates/esker-engine/src/compaction/job.rs
+  h_44076b318daf9c 54-70,132-134,225-226,396-402,447,540,738,772,814-820
+crates/esker-engine/src/compaction/picker.rs
+  h_44076b318daf9c 335-365,858-906
+crates/esker-engine/src/db/compact.rs
+  h_44076b318daf9c 686-689,699
+crates/esker-engine/tests/a_segment_is_kept_when_something_is_below.rs
+  h_44076b318daf9c 1-138
+crates/esker-engine/tests/db.rs
+  h_44076b318daf9c 1540-1548
+crates/esker-sql/tests/collection_keeps_up.rs
+  h_44076b318daf9c 223-253
+crates/esker-sql/tests/statement_across_a_leader_kill.rs
+  h_44076b318daf9c 19-26,47-51,63-67,109-119,170-175,216,230-358,364,374-376,392-398,446,493-509,522-524,526-528
+crates/esker-store/src/gc.rs
+  h_44076b318daf9c 402-408,460-492,508-515,589-594,656,660
+crates/esker-store/tests/a_deleted_key_goes_whole.rs
+  h_44076b318daf9c 1-217
+crates/esker-store/tests/a_lock_is_not_a_version.rs
+  h_44076b318daf9c 52-59,186-202,274-279,285-286
+docs/DESIGN.md
+  h_44076b318daf9c 951-959
+docs/adr/0111-a-deleted-keys-versions-are-dropped-as-one-segment.md
+  h_44076b318daf9c 3-12
+docs/adr/0112-collecting-a-spilled-value.md
+  h_44076b318daf9c 1-125
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,111,115,117,130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e8d31d682e3fbb15b9d7506f6ba59716ecfcd55d",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
