@@ -585,6 +585,11 @@ impl Gate {
     /// [`Gate::start_splitting`], with the two numbers that decide how much Raft one process is
     /// driving: the tick every group counts in, and how many threads the pool spreads them over.
     async fn start_with(split_size: u64, tick: Duration, workers: usize) -> Self {
+        // Every cluster in this file goes through here. See `tests/trace`: the subscriber is
+        // installed at the harness rather than remembered per test, so `RUST_LOG` works on the
+        // test somebody is already debugging.
+        cluster::trace::on();
+
         println!("{}", the_box_right_now("starting a cluster"));
         let pd_listener = reserve();
         let pd_address = pd_listener.local_addr().unwrap();

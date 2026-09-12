@@ -33,6 +33,9 @@
 #[path = "../provenance/mod.rs"]
 mod provenance;
 
+#[path = "../trace/mod.rs"]
+mod trace;
+
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -319,6 +322,10 @@ impl Node {
         database: &str,
         fixture: &[&str],
     ) -> Self {
+        // **In `on` rather than in `new`, which delegates here**: the same reason `cluster`
+        // installs it in its one shared constructor — `RUST_LOG` should work on the test somebody
+        // is already debugging, without an edit to that test first.
+        trace::on();
         let mut node = Node {
             executor: Executor::new(backend, catalog, tenant, esker_sql::session::register())
                 .serving_database(database),

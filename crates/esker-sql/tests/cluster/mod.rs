@@ -36,6 +36,14 @@
 )]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+/// The subscriber, shared with every test binary that includes this harness.
+///
+/// **Declared once per binary, here.** Clippy's `duplicate_mod` refuses the same file loaded as
+/// two modules, and four of this crate's cluster tests include both this harness and their own,
+/// so the declaration lives with the harness they all already have and they call through it.
+#[path = "../trace/mod.rs"]
+pub(crate) mod trace;
+
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -161,6 +169,10 @@ impl Cluster {
 
     /// The same, with something other than the defaults. See [`Settings`].
     pub async fn start_on_this_runtime_with(settings: Settings) -> Self {
+        // **Every cluster this crate's tests build goes through here**, which is why the
+        // subscriber is installed here rather than remembered at each test: `RUST_LOG` should
+        // work without anyone having added a line to the test being debugged.
+        trace::on();
         let mut started = Vec::new();
         for id in 1..=3 {
             started.push(start_store(id, settings).await);

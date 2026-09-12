@@ -276,6 +276,11 @@ impl Gate {
     }
 
     async fn start_with(balance: bool) -> Self {
+        // Every cluster in this file goes through here. See `tests/trace`: the subscriber is
+        // installed at the harness rather than remembered per test, so `RUST_LOG` works on the
+        // test somebody is already debugging.
+        cluster::trace::on();
+
         let pd_listener = reserve();
         let pd_address = pd_listener.local_addr().unwrap();
         let listeners: Vec<std::net::TcpListener> = (0..STORES).map(|_| reserve()).collect();

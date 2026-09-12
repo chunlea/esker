@@ -72,6 +72,11 @@ struct Cluster {
 
 impl Cluster {
     fn start() -> Self {
+        // Every cluster in this file goes through here. See `tests/trace`: the subscriber is
+        // installed at the harness rather than remembered per test, so `RUST_LOG` works on the
+        // test somebody is already debugging.
+        cluster::trace::on();
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
