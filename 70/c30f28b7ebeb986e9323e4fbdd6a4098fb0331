@@ -1,0 +1,23 @@
+crates/esker-store/src/gc.rs
+  s_cd9e291597edd3::t_e04350832a4208 28,30-41,421-442
+docs/adr/0111-a-deleted-keys-versions-are-dropped-as-one-segment.md
+  s_cd9e291597edd3::t_1d95657f92b814 109-134
+docs/plans/debts-v1.1.md
+  s_cd9e291597edd3::t_8e4543d268f15f 24,129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "70c30f28b7ebeb986e9323e4fbdd6a4098fb0331",
+  "prompts": {},
+  "sessions": {
+    "s_cd9e291597edd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "81b290aa-a015-4347-9f4b-ae3daa2044ef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
