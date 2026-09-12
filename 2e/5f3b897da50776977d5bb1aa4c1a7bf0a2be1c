@@ -1,0 +1,18 @@
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 628-630,1290-1294,1336-1339,2096-2098,2101,2103-2109,2222,2233,2236,2557-2566,2569-2570,2914,2935,2938,3123-3127,3129,3136,3145-3146,3153-3158,3160-3181,3214,3218,3224
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 111
+crates/esker-sql/tests/a_self_join_counts_nothing.rs
+  h_44076b318daf9c 177-183,192,198,204,222-365
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2e5f3b897da50776977d5bb1aa4c1a7bf0a2be1c",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
