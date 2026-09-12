@@ -1,0 +1,21 @@
+crates/esker-sql/tests/cluster/mod.rs
+  s_cd9e291597edd3::t_7903fbc917d335 322,324-338
+crates/esker-sql/tests/name_without_its_table.rs
+  s_cd9e291597edd3::t_41f43a0eabe2e9 1-2,4-5,13-15,17-38,55-56,58-59,69,74,80,82,86,90,92-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c7f95eddc78231600344feabc16bd8ec4d0ad80f",
+  "prompts": {},
+  "sessions": {
+    "s_cd9e291597edd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "81b290aa-a015-4347-9f4b-ae3daa2044ef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
