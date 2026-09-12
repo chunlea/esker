@@ -325,6 +325,29 @@ impl CatalogView {
         CatalogView::InformationSchemaReferentialConstraints,
     ];
 
+    /// The column that names the **relation a row is about**, for a view that holds a row per
+    /// column or per index of one — and `None` for every view whose rows are not about a relation
+    /// that way.
+    ///
+    /// This is what makes `WHERE attrelid = '"t"'::regclass` a key rather than a filter: the row
+    /// source can look one relation up instead of hydrating every one of them and letting the
+    /// `Filter` above discard the rest (`debts-v1.1.md` #63 (c)). Named here rather than in the
+    /// planner because it is a fact about the view's own column list, and a view whose columns
+    /// move would otherwise leave a string behind in another module.
+    ///
+    /// **Only the two that pay a read per relation.** `pg_index` and `pg_indexes` have the same
+    /// shape and read their tables off the listing (`Relations::table`), so narrowing them saves
+    /// work and no reads; `pg_indexes` is keyed by the table's *name* besides, which this
+    /// `Option<i64>` cannot carry. Both are left for when there is a measurement asking for them.
+    #[must_use]
+    pub fn relation_column(self) -> Option<&'static str> {
+        match self {
+            CatalogView::PgAttribute => Some("attrelid"),
+            CatalogView::PgAttrdef => Some("adrelid"),
+            _ => None,
+        }
+    }
+
     /// The name a query spells it.
     #[must_use]
     pub fn name(self) -> &'static str {
@@ -989,14 +1012,20 @@ impl CatalogView {
     /// `pg_get_expr` renders a constant through the type's **output function**, so an `interval`
     /// default reads `'3 years'::interval` under the boot style and `'P3Y'::interval` under the one
     /// `ActiveRecord` sets. Measured; it is the whole of `test_schema_dump_with_default_value`.
+    ///
+    /// `only` is the relation the predicate pinned, when the planner found one — see
+    /// [`CatalogView::relation_column`]. Every view but the two that read it ignores it, and those
+    /// two answer the same rows either way: it decides how many relations they build rows for, not
+    /// which rows survive.
     pub fn rows_of(
         self,
         view: &crate::catalog::View<'_>,
         rendering: crate::value::Rendering,
         prepared: &[crate::session::PreparedStatement],
         advisory: Option<&crate::advisory::Locks>,
+        only: Option<i64>,
     ) -> Result<Vec<Vec<Datum>>> {
-        let mut rows = self.built_rows(view, rendering, prepared, advisory)?;
+        let mut rows = self.built_rows(view, rendering, prepared, advisory, only)?;
         self.as_declared(&mut rows);
         Ok(rows)
     }
@@ -1053,6 +1082,7 @@ impl CatalogView {
         rendering: crate::value::Rendering,
         prepared: &[crate::session::PreparedStatement],
         advisory: Option<&crate::advisory::Locks>,
+        only: Option<i64>,
     ) -> Result<Vec<Vec<Datum>>> {
         let (txn, tenant) = (view.txn(), view.tenant());
         match self {
@@ -1062,8 +1092,8 @@ impl CatalogView {
             CatalogView::PgDepend => pg_depend_rows(view),
             CatalogView::PgSequence => pg_sequence_rows(view),
             CatalogView::PgClass => pg_class_rows(view),
-            CatalogView::PgAttribute => super::pg_attribute::rows(view),
-            CatalogView::PgAttrdef => super::pg_attribute::default_rows(view, rendering),
+            CatalogView::PgAttribute => super::pg_attribute::rows(view, only),
+            CatalogView::PgAttrdef => super::pg_attribute::default_rows(view, rendering, only),
             CatalogView::PgIndex => super::pg_index::rows(view),
             CatalogView::PgInherits => inherits_rows(view),
             CatalogView::PgProc => proc_rows(txn, tenant),

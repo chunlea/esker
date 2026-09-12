@@ -3460,7 +3460,7 @@ impl Executor {
         }
         Some(Expr::Literal(Literal::Typed {
             value: Box::new(Datum::Int2(0)),
-            user: Some(def.oid),
+            user: Some(Box::new(def.clone())),
         }))
     }
 
@@ -3774,7 +3774,7 @@ impl Executor {
             // spell `mood`; the oid can, and the catalog has the labels behind it.
             Expr::Literal(Literal::Typed {
                 value: Box::new(Datum::Int2(ordinal)),
-                user: Some(def.oid),
+                user: Some(Box::new(def.clone())),
             })
         }))
     }

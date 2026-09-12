@@ -521,6 +521,20 @@ pub enum Node {
         view: CatalogView,
         /// How its rows are shaped, so everything above it reads a row like any other.
         columns: RowSchema,
+        /// **The one relation the predicate pinned**, for the views that hold a row per column or
+        /// per index *of* a relation — `pg_attribute.attrelid`, `pg_attrdef.adrelid`.
+        ///
+        /// `WHERE attrelid = '"t"'::regclass` asks about one table and used to cost the whole
+        /// tenant: the row source hydrated every relation to build its rows and the `Filter` above
+        /// threw all but one away. `ActiveRecord` sends exactly that statement before it can
+        /// describe any table at all, and it read `2n + 16` keys for a catalog of `n` relations
+        /// (`debts-v1.1.md` #63 (c), `tests/column_introspection_slope.rs`).
+        ///
+        /// **An optimisation and not a replacement**: the `Filter` above still runs, with this
+        /// equality still in it. So a pin that is missed is slow and a pin that is wrong is
+        /// impossible — the only thing this can do is build fewer rows than the filter would have
+        /// kept, which is why it is taken from conjunctions alone (`equality_constants`).
+        only: Option<i64>,
     },
     /// The rows a `WITH RECURSIVE` produces, by iterating its recursive term to a fixed point.
     ///
@@ -693,6 +707,11 @@ pub enum Node {
         /// Set when the inner side is a `pg_catalog` relation, which has no key range to scan.
         /// Always paired with [`Probe::Materialize`]: a computed relation has no index to seek in.
         inner_view: Option<CatalogView>,
+        /// The relation the `WHERE` pins on that view, carried across this join's `ON` — the inner
+        /// half of what [`Node::CatalogView::only`] does for a view read on its own.
+        ///
+        /// Always `None` without an `inner_view`, and for a `FULL JOIN` even with one.
+        inner_only: Option<i64>,
         /// Its name, for `EXPLAIN`.
         inner_table: String,
         /// How the inner table's rows decode.
@@ -1097,9 +1116,19 @@ impl Node {
             // No costs and no alternative: a computed relation has one access path. The name says
             // what it is rather than implying a choice that was not made -- the same rule the
             // aggregate and access-path plans already print by.
-            Node::CatalogView { view, .. } => {
-                (format!("Catalog Scan on {}", view.name()), None, None)
-            }
+            // **And which relation it was narrowed to, when it was.** A push-down a user cannot
+            // see is a push-down they cannot tell from a scan that got lucky, and the whole point
+            // of this one is that a statement asking about one table stops reading the catalog.
+            Node::CatalogView { view, only, .. } => (
+                format!("Catalog Scan on {}", view.name()),
+                None,
+                only.map(|oid| {
+                    format!(
+                        "Relation: {} = {oid}",
+                        view.relation_column().unwrap_or("relation")
+                    )
+                }),
+            ),
             // Unreachable: `explain_into` prints this node itself, because it is the one place the
             // table and column names change on the way down. Kept total rather than `unreachable!`
             // so that a plan is never a panic.

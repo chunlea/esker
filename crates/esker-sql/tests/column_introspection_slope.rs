@@ -50,7 +50,30 @@
 //! **building** a row per column of every relation out of the cache and filtering afterwards. The
 //! reads are the visible half of that; the rest is CPU no counter here can see.
 //!
-//! Red today at 56 → 216.
+//! # What the push-down did, and what is left
+//!
+//! Re-measured on 2026-09-11 after merging h1's `#63` variant B, which moved the numbers before
+//! anything here changed — the listing reads a **record** per relation where it used to hydrate
+//! one, so the baseline for this statement became `3n + 17` rather than `2n + 16`:
+//!
+//! ```text
+//! relations   before A+B    after A+B     what the difference is
+//!   20            77            37
+//!  100           317           117        2 reads a relation: the hydration, gone
+//!  300           917           317
+//! ```
+//!
+//! Three reads a relation were the listing's record, the hydration's record and the hydration's
+//! sequence scan; two of the three are the *hydration*, and after the push-down exactly **one
+//! relation is hydrated** — the one the statement names. What is left is one read a relation in
+//! `pg_relations::Relations::read`, which point-reads every table's record to tell a table from a
+//! materialized view and to place an index. That listing is `#63`'s own machinery and is cached
+//! per tenant and version, so narrowing it is a change to what a cached `Relations` *means* —
+//! h1's file family, and not this row's.
+//!
+//! So the flat assertion below is still red, and the one above it — a **slope** of one read a
+//! relation rather than three — is what the push-down bought and what a regression of it would
+//! break.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -122,20 +145,116 @@ fn first_run(size: usize) -> (usize, usize, std::time::Duration, std::time::Dura
     (cold, warm, cold_took, warm_took)
 }
 
+/// **One table's columns hydrate one table.**
+///
+/// The half `debts-v1.1.md` #63 (c) closed: `pg_attribute`'s row source is asked about the one
+/// relation the predicate names instead of hydrating every relation of the tenant and letting the
+/// `Filter` above throw all but one away — and `pg_attrdef`, whose tie to the statement is a join
+/// condition rather than a constant, is pinned across the `ON` (`exec::query::pinned_across_join`).
+///
+/// **A slope, because the intercept is somebody else's.** Every catalog view reads the relations
+/// listing, and that listing point-reads one record per relation; what this statement used to add
+/// on top was two more reads a relation, which is the hydration. One read per added relation is
+/// the listing alone. Measured 2026-09-11: three a relation before, one after.
+#[test]
+fn column_introspection_hydrates_one_relation() {
+    esker_sql::stmt_stats::trace_every_read();
+    assert!(
+        esker_sql::stmt_stats::tracing_reads(),
+        "this test reads the instrument's trace and could not turn it on"
+    );
+    let (small, ..) = first_run(20);
+    let (big, ..) = first_run(100);
+    assert!(
+        small > 0,
+        "the trace is empty, so the statement was never instrumented and the bound below would \
+         pass by not looking"
+    );
+    assert_eq!(
+        big - small,
+        80,
+        "{small} reads over 20 relations and {big} over 100 is {} a relation where one is the \
+         listing's record and everything above it is `pg_attribute` or `pg_attrdef` hydrating a \
+         relation the statement did not name (#63 (c))",
+        (big - small) / 80
+    );
+}
+
+/// **A pinned view still answers about the catalog's own relations**, which have no row in the
+/// relations listing at all.
+///
+/// The trap in the push-down: `pg_attribute`'s rows are the tenant's relations *plus* a row per
+/// column of every `pg_catalog` relation, and only the first half is narrowed. An oid the listing
+/// has no row for finds nothing there — and the catalog's own rows, which cost no read, are the
+/// whole answer.
+#[test]
+fn a_pinned_catalog_view_still_describes_the_catalog() {
+    let mut node = parity::Node::new(&[SUBJECT]);
+    assert_eq!(
+        node.rows("SELECT attname FROM pg_attribute WHERE attrelid = 'pg_class'::regclass AND attnum > 0 ORDER BY attnum")
+            .first()
+            .map(|row| row[0].clone()),
+        Some("oid".to_owned()),
+        "pg_class describes itself, and the pin must not take that away"
+    );
+    // And a relation nobody has: no rows, not an error, and not the whole catalog either.
+    assert_eq!(
+        node.rows("SELECT count(*) FROM pg_attribute WHERE attrelid = 2147483647"),
+        vec![vec!["0"]]
+    );
+}
+
+/// **Only a conjunction pins.** A constant under an `OR` is not required by the query, and
+/// narrowing on one would return the rows of one table where the statement asks for two.
+#[test]
+fn a_disjunction_does_not_pin_a_catalog_view() {
+    let mut node =
+        parity::Node::new(&[SUBJECT, "CREATE TABLE other (a bigint primary key, b text)"]);
+    assert_eq!(
+        node.rows(
+            "SELECT count(*) FROM pg_attribute WHERE (attrelid = '\"holder\"'::regclass \
+             OR attrelid = '\"other\"'::regclass) AND attnum > 0"
+        ),
+        vec![vec!["8"]],
+        "six columns of one table and two of the other"
+    );
+}
+
+/// **The plan says which relation it was narrowed to**, because a push-down a user cannot see is
+/// one they cannot tell from a scan that got lucky.
+#[test]
+fn the_plan_names_the_relation_a_catalog_view_was_pinned_to() {
+    let mut node = parity::Node::new(&[SUBJECT]);
+    let oid = node.rows("SELECT '\"holder\"'::regclass::oid")[0][0].clone();
+    let plan: Vec<String> = node
+        .rows("EXPLAIN SELECT attname FROM pg_attribute WHERE attrelid = '\"holder\"'::regclass")
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    assert!(
+        plan.iter()
+            .any(|line| line.trim() == format!("Relation: attrelid = {oid}")),
+        "the plan does not say what it was narrowed to: {plan:#?}"
+    );
+}
+
 /// **One table's columns cost one table's columns.**
 ///
 /// Six columns and a catalog of twenty relations, then the same six columns and a catalog of a
 /// hundred: the statement names one table by `regclass`, so what it reads must not move.
 ///
-/// **Red today at 56 → 216**, which is `2n + 16`: the `pg_attribute` row source builds a row for
-/// every column of every relation in the tenant and the equality is applied afterwards, so the
-/// reads are the catalog's and the answer is one table's. The fix is the predicate —
-/// `attrelid = <oid>` is a key, not a filter.
-/// `#[ignore]`d rather than left red: the fix is one file away from h1's #63 change, which is on
-/// hold and not yet on main, and two lanes editing `pg_attribute`'s row source in the same hour is
-/// the merge this queue does not need. Removing the attribute **is** the acceptance.
+/// **Red at 37 → 117 after the push-down**, down from 77 → 317. What is left is one read a
+/// relation, and it is not this statement's to save: every catalog view reads the relations
+/// listing, and `pg_relations::Relations::read` point-reads one record per relation to tell a
+/// table from a materialized view and to place an index. That bundle is memoised per tenant and
+/// version, so a listing narrowed to one relation would be a *cached* answer that no longer holds
+/// every relation — a change to what `Relations` means, in h1's file family and under #63's own
+/// row rather than this one.
+///
+/// Kept `#[ignore]`d and kept red: it is the whole defect's acceptance, and the slope test above
+/// is the half that is paid. Removing the attribute **is** the acceptance.
 #[test]
-#[ignore = "#63(c): the acceptance for the predicate push-down; the diagnosis is in this header"]
+#[ignore = "#63(c): the listing's own read per relation is what is left; see this header"]
 fn column_introspection_reads_one_tables_columns() {
     /// Room over the six columns for the four catalog relations the statement joins and their
     /// version counters — generous on purpose, because what is being separated is a constant from

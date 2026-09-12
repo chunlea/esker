@@ -1232,6 +1232,7 @@ pub(super) fn plan_under(
             inner_function
                 .as_ref()
                 .or_else(|| inner_entry.and_then(crate::plan::TableRef::derived_plan)),
+            select.filter.as_ref(),
         )?;
     }
 
@@ -1947,6 +1948,21 @@ fn pushdown(
     let Some(predicate) = take_answerable(pending, entries, enclosing) else {
         return node;
     };
+    // **And the same conjunct narrows a catalog view, where `access_path` could not see it.** A
+    // chain builds its first access path before it knows which conjuncts belong to that table —
+    // "the `WHERE` cannot narrow the outer access path here" — so a statement that joins is
+    // exactly the one whose `attrelid = '"t"'::regclass` never reached the row source, and
+    // `ActiveRecord`'s column introspection is a four-relation join (`debts-v1.1.md` #63 (c)).
+    // Taken from the predicate this pushdown is about to apply, so it can only restrict rows this
+    // filter would have discarded.
+    let mut node = node;
+    if let Node::CatalogView { view, only, .. } = &mut node
+        && only.is_none()
+    {
+        *only = pinned_relation(Some(&predicate), *view, &view.table_def())
+            .ok()
+            .flatten();
+    }
     // Resolved here because a `Filter` holds a resolved predicate; a join resolves its own.
     let Ok(predicate) = resolve(&predicate, &scope) else {
         return node;
@@ -2239,6 +2255,7 @@ pub(super) fn joined_target_rows(
             &scope,
             inner,
             inner_source.as_ref().or_else(|| join.table.derived_plan()),
+            filter,
         )?;
     }
     if let Some(filter) = filter {
@@ -2472,6 +2489,7 @@ fn chain_step(
             scope,
             inner,
             None,
+            select.filter.as_ref(),
         );
     }
     let join = &select.joins[at];
@@ -2493,6 +2511,7 @@ fn chain_step(
         inner_function
             .as_ref()
             .or_else(|| join.table.derived_plan()),
+        select.filter.as_ref(),
     )
 }
 
@@ -2502,6 +2521,11 @@ fn width_of(entries: &[(&TableDef, String)]) -> usize {
     entries.iter().map(|(def, _)| def.row_schema().len()).sum()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one join step's inputs, each from a different place in the caller: a struct would \
+              name them all twice and be built at one call site"
+)]
 fn join_node(
     outer: Node,
     on: Option<&Expr>,
@@ -2510,6 +2534,7 @@ fn join_node(
     scope: &Scope<'_>,
     inner: &TableDef,
     inner_plan: Option<&Node>,
+    where_filter: Option<&Expr>,
 ) -> Result<Node> {
     // **A full join reads its inner side into memory whatever the `ON` says.** A probe answers
     // "which inner row matches this outer row" and nothing else; a full join also has to answer
@@ -2521,6 +2546,14 @@ fn join_node(
     // than left to `probe_for`, so that a view can never be reached through a key. A **derived
     // table** is the same case for the same reason: its rows come from a plan.
     let inner_view = pg_catalog::view_of(inner);
+    // **The relation the `WHERE` pins on the other side of the join.** A catalog view that holds a
+    // row per column of a relation is narrowed by `attrelid = <oid>` where a statement writes one
+    // (`access_path`), and `ActiveRecord`'s column introspection writes one — but only on the
+    // *outer* side: the inner side's tie is `ON a.attrelid = d.adrelid`, a join condition and not
+    // a constant. So the equality is carried across (`debts-v1.1.md` #63 (c)).
+    let inner_only = inner_view
+        .filter(|_| !full)
+        .and_then(|view| pinned_across_join(on, where_filter, view, inner, outer_columns, scope));
     let probed = on
         .filter(|_| !full && inner_view.is_none() && inner_plan.is_none())
         .and_then(|on| probe_for(on, scope, inner));
@@ -2546,6 +2579,7 @@ fn join_node(
         outer_columns,
         inner_table_id: inner.id,
         inner_view,
+        inner_only,
         inner_table: inner.name.clone(),
         inner_columns: inner.row_schema(),
         inner_plan: inner_plan.map(|plan| Box::new(plan.clone())),
@@ -2730,7 +2764,11 @@ fn access_path(filter: Option<&Expr>, tenant: u64, table: &TableDef) -> Result<N
     // before any key is built, so the reserved id a view's `TableDef` carries never reaches a
     // range (`crate::catalog::pg_catalog`).
     if let Some(view) = pg_catalog::view_of(table) {
-        return Ok(Node::CatalogView { view, columns });
+        return Ok(Node::CatalogView {
+            only: pinned_relation(filter, view, table)?,
+            view,
+            columns,
+        });
     }
     // A sequence's relation has no rows of its own: its one row is the counter, read at open.
     if let Some(sequence_id) = crate::catalog::sequence_of_relation(table.id) {
@@ -2971,6 +3009,124 @@ fn collect_equalities(
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+/// The **relation** a catalog view's predicate pins, when it pins one.
+///
+/// `pg_attribute` and `pg_attrdef` hold a row per column *of* a relation, so
+/// `WHERE attrelid = '"t"'::regclass` names one table out of the tenant — and the row source can
+/// look it up instead of hydrating every relation and letting the `Filter` above discard the rest
+/// (`debts-v1.1.md` #63 (c)). `None` for every other view, and for a predicate that does not pin.
+///
+/// **Through [`equality_constants`], which is what makes this safe rather than clever.** It walks
+/// conjunctions only — a constant under an `OR` is not required by the query — and it reads the
+/// literal through the column's own assignment, which is where `'"t"'::regclass` becomes the
+/// `int8` this column is declared as (`plan::Literal::assign`'s "a regclass or regtype into an
+/// integer or oid column is the number it is"). Two contradictory equalities are a query that
+/// answers nothing and this takes the first: the filter above still applies both.
+fn pinned_relation(
+    filter: Option<&Expr>,
+    view: pg_catalog::CatalogView,
+    table: &TableDef,
+) -> Result<Option<i64>> {
+    let (Some(filter), Some(name)) = (filter, view.relation_column()) else {
+        return Ok(None);
+    };
+    let Some(ordinal) = table.column(name) else {
+        return Ok(None);
+    };
+    Ok(equality_constants(filter, table)?
+        .into_iter()
+        .find_map(|(at, value)| match value {
+            Datum::Int8(oid) if at == ordinal => Some(oid),
+            _ => None,
+        }))
+}
+
+/// The relation the `WHERE` pins on a catalog view that is a join's **inner** side.
+///
+/// `access_path` narrows a catalog view from a constant in the predicate; a join's inner side has
+/// no constant to read — `ON a.attrelid = d.adrelid` ties it to a column of the outer row. So the
+/// equality is carried across: if the `ON` equates the inner view's relation column with some
+/// column of the combined row, and the `WHERE` pins *that* column to a constant, the inner view is
+/// pinned to the same one.
+///
+/// **Why it cannot lose a row.** The `WHERE` runs above the join over the already-combined row, so
+/// every row the statement returns has that column equal to the constant; the `ON` then makes the
+/// inner side's relation column equal to it too. An inner row with any other relation could only
+/// have joined to an outer row the `WHERE` discards — and for a `LEFT JOIN`, an outer row that
+/// finds no match is NULL-extended and discarded by the same conjunct. A `FULL JOIN` is excluded
+/// by the caller: there an unmatched *inner* row survives on its own, and that is a row this would
+/// remove.
+///
+/// **Positions, not names.** Both sides are resolved through the scope, so the column the `WHERE`
+/// pins and the column the `ON` equates are compared as places in the combined row — `WHERE
+/// d.adrelid = 5` and `WHERE a.attrelid = 5` are different facts and a name match would read them
+/// as one. Every resolution failure is `None`: this is an optimisation, and a `WHERE` that names a
+/// relation this step has not joined yet is an ordinary thing for it to fail on.
+fn pinned_across_join(
+    on: Option<&Expr>,
+    where_filter: Option<&Expr>,
+    view: pg_catalog::CatalogView,
+    inner: &TableDef,
+    outer_columns: usize,
+    scope: &Scope<'_>,
+) -> Option<i64> {
+    let (on, where_filter, name) = (on?, where_filter?, view.relation_column()?);
+    let relation_at = outer_columns + inner.column(name)?;
+    // The other end of whichever `ON` conjunct equates the inner view's relation column.
+    let tied_to = conjuncts_of(on).into_iter().find_map(|conjunct| {
+        let Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } = conjunct
+        else {
+            return None;
+        };
+        let (left, right) = (position_of(left, scope)?, position_of(right, scope)?);
+        match (left == relation_at, right == relation_at) {
+            (true, false) => Some(right),
+            (false, true) => Some(left),
+            _ => None,
+        }
+    })?;
+    // And the constant the `WHERE` requires of that position.
+    let column = inner.columns.get(inner.column(name)?)?;
+    conjuncts_of(where_filter).into_iter().find_map(|conjunct| {
+        let Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } = conjunct
+        else {
+            return None;
+        };
+        let ((reference, Expr::Literal(literal)) | (Expr::Literal(literal), reference)) =
+            (left.as_ref(), right.as_ref())
+        else {
+            return None;
+        };
+        if position_of(reference, scope)? != tied_to {
+            return None;
+        }
+        match literal.assign(column.ty, &column.name) {
+            Ok(Datum::Int8(oid)) => Some(oid),
+            _ => None,
+        }
+    })
+}
+
+/// Where a column reference sits in the combined row, or `None` for anything that is not one — and
+/// for a name this scope cannot resolve, which is not an error here.
+fn position_of(expr: &Expr, scope: &Scope<'_>) -> Option<usize> {
+    match expr {
+        Expr::Column { table, name } => match scope.lookup(table.as_deref(), name) {
+            Ok((0, at, _)) => Some(at),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -4564,9 +4720,22 @@ fn reconcile_enum(
     let (def, other, flipped) = match (enum_of(left), enum_of(right)) {
         (Some(def), None) => (def, right, false),
         (None, Some(def)) => (def, left, true),
-        // Neither side is one, or **both are**: two ordinals compare as they stand, and the
-        // ordinary path is already right for them.
-        _ => return Ok(None),
+        // **Both are, and the ordinary path is right only if they are the same enum.** Two
+        // ordinals compare as they stand — which is exactly the trap: a `mood` and an
+        // `other_mood` are both `int2` in the row, so comparing them answered a boolean where
+        // 19beta1 says `42883 operator does not exist: mood = other_mood`. Measured, and it is a
+        // wrong *answer* rather than a wrong message (`debts-v1.1.md` #57).
+        (Some(left), Some(right)) => {
+            if left.oid == right.oid {
+                return Ok(None);
+            }
+            return Err(SqlError::UndefinedOperator {
+                left: left.name.clone(),
+                op: op.symbol(),
+                right: right.name.clone(),
+            });
+        }
+        (None, None) => return Ok(None),
     };
     let coerced = match other {
         // Still nothing, whatever the type it was written with.
@@ -4582,8 +4751,8 @@ fn reconcile_enum(
         // message this node cannot write until an expression's user type is readable from
         // anywhere but here (recorded, not fixed).
         Expr::Literal(Literal::Typed {
-            user: Some(oid), ..
-        }) if *oid == def.oid => return Ok(None),
+            user: Some(user), ..
+        }) if user.oid == def.oid => return Ok(None),
         // The `unknown` literal, and the only spelling that is coerced.
         Expr::Literal(Literal::String(text)) => {
             match crate::catalog::enum_ordinal(enum_labels(def)?, text) {
@@ -4598,8 +4767,18 @@ fn reconcile_enum(
         }
         // Anything with a type of its own, including a cast that folded to one.
         other => {
-            let named = expr_type(other, scope)
-                .map_or_else(|_| "unknown".to_owned(), |ty| ty.name().to_owned());
+            // **A value of another user-defined type is named by that type.** A cast folded to an
+            // enum's ordinal carries the `TypeDef` it was cast to, so `m = 'sad'::other_mood` is
+            // `42883 operator does not exist: mood = other_mood` the way 19beta1 says it; reading
+            // the ordinal's own `expr_type` answered `smallint`, which names the representation
+            // rather than the type (`debts-v1.1.md` #57).
+            let named = match other {
+                Expr::Literal(Literal::Typed {
+                    user: Some(user), ..
+                }) => user.name.clone(),
+                other => expr_type(other, scope)
+                    .map_or_else(|_| "unknown".to_owned(), |ty| ty.name().to_owned()),
+            };
             let (left, right) = if flipped {
                 (named, def.name.clone())
             } else {
