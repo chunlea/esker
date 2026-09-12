@@ -1963,6 +1963,35 @@ fn table_row(id: i64, name: &str) -> Bytes {
 /// the whole of `Store::serve_fragment` runs — the epoch check, the role check and the catch-up —
 /// with nothing between the assertion and the code under test.
 async fn fragment_ids(node: &Node, region_id: u64, min_apply_index: u64) -> Vec<i64> {
+    let answer = fragment_answer(node, region_id, min_apply_index).await;
+    let esker_proto::fragment::FragmentResp::Result { result, .. } = answer else {
+        panic!("the learner refused the fragment: {answer:?}");
+    };
+    let esker_proto::fragment::result::Body::Rows { rows, .. } =
+        esker_proto::fragment::result::decode(&result).unwrap()
+    else {
+        panic!("a scan fragment came back as groups");
+    };
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .map(|row| match row.first() {
+            Some(esker_proto::fragment::result::Value::Int8(id)) => *id,
+            other => panic!("the first column of a row came back as {other:?}"),
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// The same ask, answered raw, for the test whose subject **is** the refusal.
+///
+/// One asker with two readings rather than two askers: a second copy of this would be a second
+/// thing to keep in step with the wire.
+async fn fragment_answer(
+    node: &Node,
+    region_id: u64,
+    min_apply_index: u64,
+) -> esker_proto::fragment::FragmentResp {
     let epoch = node
         .store
         .regions()
@@ -1993,23 +2022,7 @@ async fn fragment_ids(node: &Node, region_id: u64, min_apply_index: u64) -> Vec<
     let Reply::Unary(Response::Fragment(answer)) = reply else {
         panic!("a fragment request was answered with {reply:?}");
     };
-    let esker_proto::fragment::FragmentResp::Result { result, .. } = answer else {
-        panic!("the learner refused the fragment: {answer:?}");
-    };
-    let esker_proto::fragment::result::Body::Rows { rows, .. } =
-        esker_proto::fragment::result::decode(&result).unwrap()
-    else {
-        panic!("a scan fragment came back as groups");
-    };
-    let mut ids: Vec<i64> = rows
-        .iter()
-        .map(|row| match row.first() {
-            Some(esker_proto::fragment::result::Value::Int8(id)) => *id,
-            other => panic!("the first column of a row came back as {other:?}"),
-        })
-        .collect();
-    ids.sort_unstable();
-    ids
+    answer
 }
 
 /// The catalog record that asks for a copy, and the four rows that predate the learner.
@@ -2208,6 +2221,193 @@ async fn a_columnar_learner_caught_up_by_a_snapshot_answers_for_what_it_brought(
          brought; the learner's row store holds all five (id, versions) = {rows:?}, and the bar it \
          caught up to was {bar}",
     );
+
+    first.stop().await;
+    second.stop().await;
+}
+
+/// **#85: a learner placed and then left alone answers, instead of waiting for ever.**
+///
+/// This is the test below with one statement taken out — the row committed *after* the placement —
+/// and that statement was the only thing keeping the test below from hanging. `serve_fragment`
+/// calls `Store::catch_up` before it evaluates anything, and `catch_up`'s first act is a
+/// `ReadIndex` round. A leader answers one by knowing its commit index is current, and it knows
+/// that by having committed an entry in its current term; a learner joined by a conf change and
+/// then left alone is exactly the state where nothing has. The oneshot then resolves only when the
+/// peer **stops**, and nothing else on the path has a bound: `catch_up` *refuses* on
+/// `min_apply_index` rather than waiting for it, so this was the only wait in `serve_fragment` and
+/// it had no end. Measured on this construction: sixty seconds, three separate runs, and one
+/// unrelated `put` between the placement and the fragment made it answer at once.
+///
+/// **What the fix claims, and what it does not.** Option (b), the user's ruling of 2026-09-12: the
+/// round is bounded, and a peer with nothing outstanding — `applied == commit == last_index` — is
+/// read as caught up and answered from what it has applied. That is the weaker claim; it does not
+/// prove the leader has committed nothing this peer has not heard of, which is what the round was
+/// for. Option (a), a leader appending a no-op after a conf change so the round is answerable at
+/// once, removes the condition rather than reading past it and is recorded as an ADR candidate on
+/// #85.
+///
+/// **The other half of the pair is the test below**, unchanged: with a row committed after the
+/// placement the round *is* answerable, and the answer must be the same five rows it always was.
+/// The bound must not fire when the strong claim can be had, and that test is what says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_columnar_learner_answers_before_anything_else_commits() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+
+    let first = open(
+        first_address_listener,
+        1,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+
+    let region = first.store.regions().regions()[0].clone();
+    commit_the_history(&first.store, &region).await;
+
+    let second = open(
+        second_address_listener,
+        2,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![2])),
+        2,
+    )
+    .await;
+    let leader = first.store.peer_of(1).unwrap();
+    place_a_columnar_learner(&pd, &first, &second).await;
+
+    // **And nothing after it.** Every other test in this file commits something here; that write
+    // is what made the read-index round answerable, and it is the whole of what this one removes.
+    let bar = leader
+        .status()
+        .await
+        .expect("the leader answers its own status")
+        .applied;
+    wait_for(
+        "the learner to reach the index the leader acknowledged",
+        || {
+            second
+                .store
+                .peer_of(1)
+                .is_some_and(|peer| peer.applied_index() >= bar)
+        },
+    )
+    .await;
+
+    let answered = within(
+        "the fragment to be answered by a learner nothing has committed to since it joined",
+        fragment_ids(&second, 1, bar),
+    )
+    .await;
+    assert_eq!(
+        answered,
+        vec![1, 2, 3, 4],
+        "the copy answered for the rows that predate the learner, but only because something \
+         committed after the placement — take that away and this is #85's wait with no end",
+    );
+
+    first.stop().await;
+    second.stop().await;
+}
+
+/// **And the bound does not answer for a learner that really is behind.**
+///
+/// The fallback #85's fix adds is a *weaker claim*, so the thing to guard is that it fires only
+/// where the round cannot be answered and never where the peer has work outstanding. Asked with a
+/// `min_apply_index` above anything the cluster has, the answer must still be a refusal: the peer
+/// cannot reach that floor, and `TooFarBehind` is what says *another replica may be closer, and
+/// this one may succeed later*.
+///
+/// A store-level twin of `esker-sql`'s `a_fragment_is_refused_by_a_voter_and_by_a_learner_that_is_
+/// behind`, here because the code the ruling changed is here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fragment_asked_past_what_the_cluster_has_is_still_refused() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+
+    let first = open(
+        first_address_listener,
+        1,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+    let region = first.store.regions().regions()[0].clone();
+    commit_the_history(&first.store, &region).await;
+
+    let second = open(
+        second_address_listener,
+        2,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![2])),
+        2,
+    )
+    .await;
+    let leader = first.store.peer_of(1).unwrap();
+    place_a_columnar_learner(&pd, &first, &second).await;
+    let bar = leader
+        .status()
+        .await
+        .expect("the leader answers its own status")
+        .applied;
+    wait_for(
+        "the learner to reach the index the leader acknowledged",
+        || {
+            second
+                .store
+                .peer_of(1)
+                .is_some_and(|peer| peer.applied_index() >= bar)
+        },
+    )
+    .await;
+
+    // A floor no entry in this cluster will ever reach.
+    let answer = within(
+        "the fragment asked past the cluster's own index to be refused",
+        fragment_answer(&second, 1, bar + 1_000),
+    )
+    .await;
+    match answer {
+        esker_proto::fragment::FragmentResp::Refused { reason, detail } => {
+            assert_eq!(
+                reason,
+                esker_proto::fragment::RefusalReason::TooFarBehind,
+                "a floor this peer cannot reach is something another replica may have, and this \
+                 one may have later: {detail}"
+            );
+        }
+        answered @ esker_proto::fragment::FragmentResp::Result { .. } => panic!(
+            "a fragment asked for apply index {} was answered rather than refused: {answered:?}",
+            bar + 1_000
+        ),
+    }
 
     first.stop().await;
     second.stop().await;

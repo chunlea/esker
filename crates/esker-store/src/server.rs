@@ -54,6 +54,22 @@ use crate::split::{self, SplitOptions};
 use crate::transport::{PeerAddress, StoreAddress, StoreTransport};
 use crate::{OPERATOR_TIMEOUT, SNAPSHOT_STREAM_DEPTH, TRANSFER_LAG_ALLOWANCE};
 
+/// How long a fragment's read-index round is waited for before this store answers from what it has
+/// applied instead (#85).
+///
+/// **Short on purpose, and the measurement is why.** A round that *can* be answered is a message
+/// to the leader and back — milliseconds on a loopback, tens on a network — so two seconds is two
+/// orders of magnitude of headroom for the strong claim. A round that **cannot** be answered is
+/// never answered, which is what #85 measured: the test this constant exists for sat on the full
+/// bound and then took the fallback, so every second here is latency on the first fragment of a
+/// freshly placed learner and buys nothing at all.
+///
+/// **The outstanding case does not want a longer one either.** Where this peer still has work to
+/// do the fallback *refuses*, and a longer bound would sometimes turn that refusal into an answer
+/// by letting the peer catch up while a connection is held. `TooFarBehind` already means *ask
+/// again*, and the caller's retry is a better place to spend that time than this one.
+const READ_INDEX_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long a snapshot ask waits for the conf change that placed its peer to apply here.
 ///
 /// An apply is microseconds behind its commit, so this is a bound on a mistake rather than a
@@ -3065,13 +3081,72 @@ impl Store {
         // harness with no consensus in it (`esker-store/tests/schema_fetch.rs`, which says so).
         // Named in `docs/plans/phase-10-routing.md` §5 rather than left here to be discovered.
         let peer = state.peer()?;
-        let index = match peer.read_index_as_learner().await {
-            Ok(index) => index,
-            Err(error) => {
+        // **Bounded, because the round can be unanswerable rather than merely unanswered** (#85,
+        // ruled 2026-09-12 as option (b)). A `ReadIndex` is answered by a leader that knows its
+        // own commit index is current, and a leader knows that by having committed an entry in
+        // its current term. A learner placed by a conf change and then left alone is exactly the
+        // state where nothing has — so the oneshot below resolves only when the peer *stops*, and
+        // there is no other bound on this path: `catch_up` refuses on `min_apply_index` rather
+        // than waiting for it, so this was the only wait in `serve_fragment` and it had no end.
+        // Measured: the same construction hung here for sixty seconds on three separate runs, and
+        // committing one unrelated `put` between the placement and the fragment made it answer at
+        // once — that write was the only thing that changed.
+        let index = match tokio::time::timeout(READ_INDEX_WITHIN, peer.read_index_as_learner())
+            .await
+        {
+            Ok(Ok(index)) => index,
+            Ok(Err(error)) => {
                 return Some(refused(
                     RefusalReason::TooFarBehind,
                     format!("could not reach the leader to catch up: {error}"),
                 ));
+            }
+            // **The round did not answer inside the bound, so ask what this peer knows.**
+            //
+            // `applied == commit == last_index` is *nothing outstanding*: every entry this peer
+            // has is committed, and every committed entry is applied. A learner in that state has
+            // applied everything its leader has told it was committed, and the row this
+            // implements says why that is enough to answer with: a learner that has applied
+            // everything its leader has committed is current by definition.
+            //
+            // **What it does not prove, said plainly.** It does not prove the leader has not
+            // committed something this peer has not heard of — that is what the round was for,
+            // and skipping it is a weaker claim. Option (a) — a leader appending a no-op after a
+            // conf change, so the round is answerable at once — removes the condition instead of
+            // reading past it, and is the better shape; it changes the log, so it is an ADR
+            // candidate and is recorded as one on #85 rather than dropped. This is the local half
+            // the user chose, and the bound above is generous for that reason: whenever the strong
+            // claim can be had, it is had.
+            Err(_) => {
+                let status = match peer.status().await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        return Some(refused(
+                            RefusalReason::TooFarBehind,
+                            format!(
+                                "the read-index round did not answer in {READ_INDEX_WITHIN:?} and \
+                                 this peer could not say where it stands: {error}"
+                            ),
+                        ));
+                    }
+                };
+                if status.applied < status.commit || status.commit < status.last_index {
+                    return Some(refused(
+                        RefusalReason::TooFarBehind,
+                        format!(
+                            "the read-index round did not answer in {READ_INDEX_WITHIN:?} and this \
+                             peer has work outstanding: applied {}, commit {}, last {}",
+                            status.applied, status.commit, status.last_index
+                        ),
+                    ));
+                }
+                tracing::debug!(
+                    region_id = state.region().id,
+                    applied = status.applied,
+                    "the read-index round did not answer and this peer has nothing outstanding; \
+                     answering from what it has applied (#85)"
+                );
+                status.applied
             }
         };
         // The round has already waited for the index it established. What is left is the caller's
