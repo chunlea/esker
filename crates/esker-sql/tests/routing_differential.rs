@@ -650,7 +650,7 @@ impl Gate {
                 .await,
             );
         }
-        wait_for("the region to reach three voters", 60, || {
+        wait_for("the region to reach three voters", PLACEMENT_WITHIN, || {
             pd.regions().is_ok_and(|regions| {
                 regions.iter().any(|record| {
                     record
@@ -904,7 +904,7 @@ impl Gate {
     /// an answer, not a placement: a learner that exists and has not caught up refuses, and a test
     /// that started comparing then would be comparing the row engine with itself.
     async fn wait_for_a_learner_that_answers(&self, table: &str) {
-        wait_for("PD to place a columnar learner", 60, || {
+        wait_for("PD to place a columnar learner", PLACEMENT_WITHIN, || {
             self.pd.regions().is_ok_and(|regions| {
                 regions.iter().any(|record| {
                     record
@@ -917,7 +917,7 @@ impl Gate {
         })
         .await;
 
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(PLACEMENT_WITHIN);
         loop {
             let answered = tokio::task::block_in_place(|| {
                 let mut session = self.session();
@@ -1111,6 +1111,17 @@ async fn open_store(
 fn reserve() -> std::net::TcpListener {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
+
+/// How long a wait on a **placement or a catch-up** is given before it is called a failure.
+///
+/// **A precondition and not a measurement.** Nothing here asserts that the placement driver is
+/// fast; these waits exist because the comparison below cannot start until a learner exists and has
+/// caught up, and a bound is only here so that a cluster which is never going to get there fails
+/// rather than hangs. So it is sized against the worst machine this runs on and not against the
+/// good one: at sixty seconds it went red twice in one night on a gate running four thousand tests
+/// beside it — `the columnar learner never answered a fragment over t` — with nothing wrong but the
+/// box. Three minutes costs nothing on a run that succeeds, because a wait that is satisfied stops.
+const PLACEMENT_WITHIN: u64 = 180;
 
 async fn wait_for<F: FnMut() -> bool>(what: &str, seconds: u64, mut ready: F) {
     let deadline = Instant::now() + Duration::from_secs(seconds);

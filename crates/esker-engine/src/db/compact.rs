@@ -1178,21 +1178,33 @@ mod tests {
         );
     }
 
+    /// How long the register gets to empty before that is called a failure.
+    ///
+    /// **A precondition, not a measurement.** What the caller is about to read is only meaningful
+    /// once the flush's bookkeeping has run, and the work between `flush` returning and the number
+    /// being released is microseconds — so this is not a claim that the engine is fast, it is the
+    /// bound that stops a register which will never empty from hanging the suite. Sized for the
+    /// worst machine rather than the good one: it was two seconds, and a thread can lose two
+    /// seconds to the scheduler on a box running four thousand tests at once without anything
+    /// being wrong.
+    const DRAINS_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Waits for the register of files being written to empty.
     ///
     /// A deadline rather than an instant reading, because a flush releases its own number a
     /// moment after `flush` returns and an exact reading would race it. What has to be true is
     /// that the register empties at all.
     fn drain(db: &Db, when: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let began = std::time::Instant::now();
         loop {
             let held = db.inner.pending_outputs.lock().expect("the register").len();
             if held == 0 {
                 return;
             }
             assert!(
-                std::time::Instant::now() < deadline,
-                "the register still holds {held} number(s) {when}"
+                began.elapsed() < DRAINS_WITHIN,
+                "the register still holds {held} number(s) {when}, {:?} after the wait began",
+                began.elapsed()
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

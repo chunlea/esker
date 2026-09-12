@@ -118,11 +118,19 @@ async fn a_lapsed_lease_refuses_writes_and_still_serves_reads() {
     // connected, and this node is simply no longer able to renew.
     pd_handle.shutdown().await.unwrap();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // **Expressed as multiples of the lease, because that is what it is waiting for.** A bare ten
+    // seconds says nothing about whether it is generous; thirty leases does. The lapse itself takes
+    // one lease (`standin_pd::LEASE_MS`, 600 ms) plus however long the refresher takes to notice,
+    // and this is a precondition rather than a measurement — nothing here asserts that lapsing is
+    // quick, only that it happens at all.
+    let lapses_within = Duration::from_millis(standin_pd::LEASE_MS * 30);
+    let began = std::time::Instant::now();
     while node.backend.schema_lease_remaining().is_some() {
         assert!(
-            std::time::Instant::now() < deadline,
-            "the lease never lapsed with PD stopped",
+            began.elapsed() < lapses_within,
+            "the lease never lapsed with PD stopped, {:?} after it was told to stop ({} leases)",
+            began.elapsed(),
+            began.elapsed().as_millis() / u128::from(standin_pd::LEASE_MS),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

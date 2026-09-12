@@ -55,6 +55,17 @@ const STARTUP_SECONDS: u64 = 120;
 /// time so a run that only just made it is visible rather than merely green.
 const RECOVERY: Duration = Duration::from_secs(60);
 
+/// How long the cluster gets to answer its **first** statement, before anything is killed.
+///
+/// **A listening port is not a node that can answer.** `wait_for_port` proves that something
+/// accepted a connection; the first `SELECT 1` used to go out microseconds after that and be read
+/// as a precondition, so a node still wiring itself up failed the test with
+/// `the cluster could not answer a statement before the kill: ""` — in 1.95 seconds, on a gate
+/// running four thousand tests beside it, with nothing wrong. The same bound and the same reasoning
+/// as [`RECOVERY`]: a precondition, not a measurement, sized for the worst machine and printing the
+/// elapsed time so a run that only just made it is visible.
+const READY_WITHIN: Duration = Duration::from_secs(60);
+
 #[test]
 fn a_statement_returns_after_the_leading_driver_is_killed() {
     let data_dir = TempDir::new().unwrap();
@@ -115,11 +126,25 @@ fn a_statement_returns_after_the_leading_driver_is_killed() {
     wait_for_port("the SQL node", sql_port, &mut sql, STARTUP_SECONDS);
 
     // Before anything is killed, so a failure below is about the kill and not about the cluster.
-    let before = one_query(sql_port, "SELECT 1");
-    assert!(
-        before.contains('D') && before.contains('C'),
-        "the cluster could not answer a statement before the kill: {before:?}"
-    );
+    // Waited for rather than asked once: the port is open, which is not the same as ready.
+    let ready_at = Instant::now();
+    loop {
+        let before = one_query(sql_port, "SELECT 1");
+        if before.contains('D') && before.contains('C') {
+            eprintln!(
+                "  READY {} ms after the port opened",
+                ready_at.elapsed().as_millis()
+            );
+            break;
+        }
+        assert!(
+            ready_at.elapsed() < READY_WITHIN,
+            "the cluster could not answer a statement in {:?}, so nothing below is about the \
+             kill. Last answer: {before:?}",
+            ready_at.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     // **The member that is leading**, from the group's own answer rather than from a guess: any
     // member will say, which is why `pd members` exists.

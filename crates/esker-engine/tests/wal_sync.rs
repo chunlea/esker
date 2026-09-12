@@ -270,6 +270,14 @@ fn an_explicit_demand_is_honoured_whatever_the_mode_says() {
 /// The interval is now a real background syncer, and this asserts the property that separates the
 /// two modes: a write that asked for nothing is not synced on its own thread, and *is* synced
 /// without anybody asking again.
+/// How long the background syncer gets to make its first sync before that is a failure.
+///
+/// **A precondition, not a measurement.** The interval under test is ten milliseconds, so what the
+/// wait is for takes one of them; the bound exists so that "there is no background syncer at all"
+/// fails instead of hanging, and it is sized for a box that cannot schedule a thread for a while
+/// rather than for the one it was written on, where it was ten seconds.
+const SYNCS_WITHIN: Duration = Duration::from_secs(60);
+
 #[test]
 fn interval_syncs_in_the_background_without_the_writer_waiting() {
     let fs = CountingFs::new();
@@ -281,11 +289,12 @@ fn interval_syncs_in_the_background_without_the_writer_waiting() {
         "the writer waited for a sync under a mode whose whole point is that it does not"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let began = Instant::now();
     while fs.wal_syncs() == 0 {
         assert!(
-            Instant::now() < deadline,
-            "an interval of 10 ms produced no background sync in ten seconds"
+            began.elapsed() < SYNCS_WITHIN,
+            "an interval of 10 ms produced no background sync in {:?}",
+            began.elapsed()
         );
         std::thread::sleep(Duration::from_millis(5));
     }
