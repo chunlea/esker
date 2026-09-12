@@ -319,6 +319,23 @@ impl Cluster {
             .unwrap_or(0)
     }
 
+    /// Publishes an **arbitrary** safepoint, for a test that needs the collector to actually bite.
+    ///
+    /// [`Cluster::publish_safepoint`] publishes the oracle's `now`, and this harness's oracle is a
+    /// `CountingOracle` — its timestamps have a zero physical half, so a retention window expressed
+    /// in milliseconds underflows and `MvccCollector` keeps everything. A probe that used it and
+    /// watched the entry count fall would be watching the *engine's* rules, not the collector's.
+    /// Reaching the past by token rather than by instant is the same rule
+    /// `Cluster::collect_everything` follows and the trap `esker-pd`'s
+    /// `a_counting_oracle_collects_nothing` exists for.
+    pub fn publish_safepoint_at(&self, safepoint: u64) -> u64 {
+        self.stores
+            .iter()
+            .map(|store| store.raise_safepoint(safepoint))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Bytes the memtables are holding, across every store and every column family.
     ///
     /// The counterpart to [`Cluster::standing`], which sees only what has been flushed: at the

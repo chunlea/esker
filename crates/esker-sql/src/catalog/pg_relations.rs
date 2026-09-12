@@ -198,7 +198,7 @@ impl Relations {
             }
             let stored = super::record::name_of(tenant, &key)?;
             let relation = super::record::decode_relation(&value)?;
-            rows.push(row_of(&records, &stored, relation, &mut tables)?);
+            rows.push(row_of(view, &records, &stored, relation, &mut tables)?);
         }
         // The `EXCLUDE` constraints' indexes, which have no name record of their own — see
         // [`RelKind::Exclusion`]. Appended after the scan and then re-sorted, so the whole list
@@ -397,6 +397,7 @@ impl Relations {
 
 /// One name record, turned into a row — reading whatever second record its oid lives in.
 fn row_of(
+    view: &super::View<'_>,
     records: &BTreeMap<u64, Arc<TableDef>>,
     stored: &str,
     relation: Relation,
@@ -411,7 +412,7 @@ fn row_of(
         Relation::Table { table_id } => {
             // **A materialized view is a table record**, and this is where the two part company:
             // the letter, and everything downstream that branches on it (ADR 0064).
-            let table = load_table(records, table_id, tables)?;
+            let table = load_table(view, records, table_id, tables)?;
             let kind = if table.matview.is_some() {
                 RelKind::MaterializedView
             } else {
@@ -442,7 +443,7 @@ fn row_of(
             column: None,
         },
         Relation::Index { table_id, index_id } => {
-            let table = load_table(records, table_id, tables)?;
+            let table = load_table(view, records, table_id, tables)?;
             let index_at = table.indexes.iter().position(|index| index.id == index_id);
             RelationRow {
                 oid: as_oid(index_id),
@@ -456,7 +457,7 @@ fn row_of(
             }
         }
         Relation::PrimaryKey { table_id } => {
-            load_table(records, table_id, tables)?;
+            load_table(view, records, table_id, tables)?;
             RelationRow {
                 // Derived: a primary key has no record of its own to carry one. See the module
                 // note — it was the table's own id until this module, which made two rows of
@@ -477,7 +478,7 @@ fn row_of(
         } => {
             // A sequence no column owns has no table to load, and `pg_class` still lists it.
             if table_id != crate::catalog::STANDALONE_SEQUENCE_OWNER {
-                load_table(records, table_id, tables)?;
+                load_table(view, records, table_id, tables)?;
             }
             // **The sequence's own id, which the name record now carries.** It used to live only
             // in the sequence record, so `pg_class` reported the table's id instead and every
@@ -510,20 +511,42 @@ fn row_of(
 /// Not hydrated: see [`super::View::table_record_by_id`] for what that buys and what it costs a
 /// reader that needs more. A view that needs the derived half asks the catalog for the table.
 fn load_table<'a>(
+    view: &super::View<'_>,
     records: &BTreeMap<u64, Arc<TableDef>>,
     table_id: u64,
     tables: &'a mut BTreeMap<u64, Arc<TableDef>>,
 ) -> Result<&'a TableDef> {
     if let std::collections::btree_map::Entry::Vacant(slot) = tables.entry(table_id) {
-        let Some(table) = records.get(&table_id) else {
-            // A name points at a table whose record is not there. The two keys are written by one
-            // transaction, so this is corruption rather than a missing table — the same reading
-            // `Executor::table_by_id` takes.
+        // **The scan is the fast path, not the authority.** `View::table_records` answers from one
+        // scan of the range these records live in, memoised at the view's version, and that is what
+        // took the per-relation point read out of this listing (#63 (c)). But run 128 stopped five
+        // files in a row on `a name points at table N, which is not there` — a name record whose
+        // table record the scan did not have — and it was not reproducible in process, so the scan
+        // is treated as an optimisation it has to earn: a miss asks the way this always asked,
+        // through the transaction, before anything is called corruption.
+        //
+        // The fallback costs a point read **only when the scan missed**, so a healthy catalog pays
+        // exactly what it paid after #63 (c) — the acceptance in `column_introspection_slope`
+        // measures that and would go red if this fired in the ordinary case.
+        let found = if let Some(table) = records.get(&table_id) {
+            Some(Arc::clone(table))
+        } else {
+            tracing::warn!(
+                table_id,
+                scanned = records.len(),
+                "a name points at a table the catalog scan did not hold; reading it directly"
+            );
+            view.table_record_by_id(table_id)?
+        };
+        let Some(table) = found else {
+            // A name points at a table whose record is not there **by either route**. The two keys
+            // are written by one transaction, so this is corruption rather than a missing table —
+            // the same reading `Executor::table_by_id` takes.
             return Err(SqlError::DataCorrupted(format!(
                 "a name points at table {table_id}, which is not there"
             )));
         };
-        slot.insert(Arc::clone(table));
+        slot.insert(table);
     }
     tables
         .get(&table_id)
