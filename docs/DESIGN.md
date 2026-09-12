@@ -948,8 +948,15 @@ The contract is therefore:
   catalog range with 8,064 dropped tables and 278 live ones exhausted a ceiling of 8,192 *keys*
   while the answer held 278 *pairs*, so every number the caller could see said the answer was
   complete.
-- **A scan that cannot finish fails loudly.** Routing that does not advance, or a range that
-  outlasts `MAX_SCAN_CALLS`, is an error and not a short answer.
+- **A scan that cannot finish fails loudly.** Routing that does not advance, a range that outlasts
+  `MAX_SCAN_CALLS`, or one that needs more pieces than `MAX_SCAN_REGIONS` is an error and not a
+  short answer. `RawClient::scan` used to enumerate its regions up front and simply stop at the
+  budget, answering a plan that covered a prefix of the range.
+- **A region that split under a scan is still that scan's to finish.** A store's refusal names the
+  narrower range it now owns, and the walk carries on from the bound it was actually served rather
+  than from the plan it made before sending anything. `Transaction::scan` does this by answering
+  the boundary it used; `RawClient::scan` does it by putting the unserved half back on its queue,
+  ahead of the pieces below it when the walk is descending.
 
 The alternative considered and not taken is a **resumption cursor** on the wire: the store says
 where it stopped and whether more remains, which costs a field and buys back the one empty round
