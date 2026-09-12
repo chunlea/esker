@@ -260,3 +260,77 @@ fn collecting_takes_the_climb_out_of_the_same_work() {
         without.0,
     );
 }
+
+/// One arm of the spilling workload: what `default` holds after each round.
+fn twelve_spilling_rounds(collecting: bool) -> Vec<u64> {
+    /// Past `SHORT_VALUE_MAX_LEN` (255), so prewrite spills it rather than inlining it.
+    const WIDE: usize = 1024;
+
+    let cluster = Cluster::start_with(cluster::Settings {
+        collecting,
+        ..cluster::Settings::default()
+    });
+    let mut session = cluster.session();
+    let wide = "x".repeat(WIDE);
+
+    let mut spilled = Vec::with_capacity(ROUNDS);
+    println!("  --- collecting: {collecting} ---");
+    for round in 1..=ROUNDS {
+        for at in 0..TABLES {
+            session
+                .run(&format!(
+                    "CREATE TABLE w{at} (id bigserial primary key, b text)"
+                ))
+                .unwrap();
+            for row in 0..2 {
+                session
+                    .run(&format!("INSERT INTO w{at} (b) VALUES ('{wide}{row}')"))
+                    .unwrap();
+            }
+            session.run(&format!("DROP TABLE w{at}")).unwrap();
+        }
+        // Both arms publish, so the only difference between them is whether the store acts on it.
+        cluster.publish_safepoint();
+        // And both flush, so both are counted the same way: the collecting arm flushes on its way
+        // through a sweep and the control would otherwise report zero for everything it holds.
+        cluster.flush();
+        let held = cluster.entries_in("default");
+        println!("  round {round:>3}: default holds {held:>7} entries");
+        spilled.push(held);
+    }
+    spilled
+}
+
+/// **ADR 0112's arm of this probe.** A workload whose values spill does not grow `default` either.
+///
+/// Every value the rounds above write is a catalog record short enough to inline, so `default`
+/// stays empty and the measurement says nothing about **bytes** — which is exactly why #58's space
+/// half was not closed by it. A value past `esker_txn::SHORT_VALUE_MAX_LEN` lands in `default`
+/// keyed by `(user_key, start_ts)`, and until ADR 0112 nothing collected those: #60 measured
+/// `write` 96 → 8 against `default` 96 → 96.
+///
+/// **With its own control**, because "it did not grow" is satisfied perfectly by a workload that
+/// never spilled: the same rounds with collection off are what say the values were there to be
+/// collected.
+#[test]
+fn a_spilling_workload_does_not_grow_the_default_family() {
+    let collected = twelve_spilling_rounds(true);
+    let control = twelve_spilling_rounds(false);
+
+    // **The denominator, and it is a curve rather than a threshold.** Without collection the
+    // spilled values accumulate, one per version written and never removed.
+    let grew = control.last().copied().unwrap_or(0);
+    assert!(
+        grew > 0,
+        "the control held nothing in `default` after {ROUNDS} rounds, so nothing spilled and this \
+         measured the same inlined workload as the test above — {control:?}"
+    );
+
+    let held = collected.iter().max().copied().unwrap_or(0);
+    assert!(
+        held * 4 <= grew,
+        "collecting left {held} spilled values standing against the control's {grew} — a value \
+         whose `write` record was collected has nothing that can ever name it again, and nothing \
+         collected those until ADR 0112. collecting {collected:?}, control {control:?}"
+    );
+}

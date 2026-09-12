@@ -224,6 +224,128 @@ impl RetentionPolicy {
     }
 }
 
+/// Deletes the spilled values nothing can ever name again, and answers how many went.
+///
+/// # Why this is a pass of its own and not part of the filter
+///
+/// A value longer than [`esker_txn::SHORT_VALUE_MAX_LEN`] is stored at **prewrite** in `default`
+/// under `key::value(user_key, start_ts)`, and the `write` record's `start_ts` is the only link
+/// back to it. `MvccCollector` is installed on `write` alone, so nothing ever collected these —
+/// #60 measured `write` 96 → 8 against `default` 96 → 96 — and
+/// [ADR 0111](../../../docs/adr/0111-a-deleted-keys-versions-are-dropped-as-one-segment.md) made
+/// it sharper, because a deleted key's records now go entirely and the value loses its last
+/// reference.
+///
+/// The filter cannot do it: a `CompactionFilter` returns a decision and `CompactionJob` writes to
+/// one family's files, so there is no path from the `write` compaction to the `default` family.
+/// Option (a) of [ADR 0112](../../../docs/adr/0112-collecting-a-spilled-value.md) is really a
+/// durable queue out of the filter that has to survive a crash mid-compaction; this is option (b),
+/// which needs no channel — a pass that dies half-way leaves work rather than damage.
+///
+/// # One snapshot, and that **is** the snapshot discipline
+///
+/// The rule ADR 0112 names is that the `write` family must be read at a snapshot no older than the
+/// one `default` is walked at, and this states it the only way that cannot drift: **there is one
+/// snapshot and both use it.** Arranging it by the order of two calls would be a rule that holds
+/// until somebody moves a line.
+///
+/// # What is kept, and why each
+///
+/// An entry goes only when every one of these is false, because the failure direction here is
+/// keeping a dead value and the other direction is losing a live one:
+///
+/// * **a surviving `write` record names its `start_ts`** — that link is how the read path resolves
+///   a spilled value, so deleting it would read a committed row back as corruption;
+/// * **the key still holds a lock** — the value lands at prewrite and the record that names it at
+///   commit, so a transaction between the two has an entry nothing names *yet*. Deleting it there
+///   loses a value that is about to be committed;
+/// * **its `start_ts` is at or above the safepoint** — above the safepoint nothing is collectable
+///   at all, and this pass has no business being the exception.
+pub fn collect_spilled_values(db: &Db, safepoint: u64) -> Result<u64, ProtoError> {
+    let pinned = db.snapshot();
+    let options = ReadOptions {
+        snapshot: Some(pinned.clone()),
+        ..ReadOptions::default()
+    };
+
+    // Walked in key order, so every entry of one user key arrives together and the `write` scan
+    // that judges them is one per key rather than one per entry.
+    let mut orphans: Vec<Vec<u8>> = Vec::new();
+    let mut iter = db
+        .iter(cf::DEFAULT, &options)
+        .map_err(|error| engine_to_proto(&error))?;
+    let mut current: Option<(Vec<u8>, Vec<u64>, bool)> = None;
+    iter.seek_to_first();
+    while iter.valid() {
+        let engine_key = iter.key().to_vec();
+        // A key this pass does not understand belongs to someone else — `RawKv` pairs live in
+        // `default` too — and is left alone.
+        if let Ok((user_key, start_ts)) = key::split(&engine_key) {
+            let named = match &current {
+                Some((key, ..)) if key == &user_key => current.as_ref(),
+                _ => {
+                    current = Some((
+                        user_key.clone(),
+                        starts_named_by_write(db, &options, &user_key)?,
+                        locked(db, &options, &user_key)?,
+                    ));
+                    current.as_ref()
+                }
+            };
+            if let Some((_, named, locked)) = named
+                && start_ts < safepoint
+                && !*locked
+                && !named.contains(&start_ts)
+            {
+                orphans.push(engine_key);
+            }
+        }
+        iter.next();
+    }
+    iter.status().map_err(|error| engine_to_proto(&error))?;
+    drop(iter);
+
+    let count = orphans.len() as u64;
+    for key in orphans {
+        db.delete(cf::DEFAULT, &key)
+            .map_err(|error| engine_to_proto(&error))?;
+    }
+    Ok(count)
+}
+
+/// Every `start_ts` a surviving `write` record of `user_key` names.
+fn starts_named_by_write(
+    db: &Db,
+    options: &ReadOptions,
+    user_key: &[u8],
+) -> Result<Vec<u64>, ProtoError> {
+    let (start, end) = key::version_range(user_key);
+    let mut named = Vec::new();
+    let mut iter = db
+        .iter(cf::WRITE, options)
+        .map_err(|error| engine_to_proto(&error))?;
+    iter.seek(&start);
+    while iter.valid() && iter.key() < end.as_slice() {
+        if let Ok(record) = WriteRecord::decode(iter.value()) {
+            named.push(record.start_ts);
+        } else {
+            // Unreadable: keep whatever it might have named, which is what every other decision in
+            // this module does with corruption.
+            return Ok(Vec::new());
+        }
+        iter.next();
+    }
+    iter.status().map_err(|error| engine_to_proto(&error))?;
+    Ok(named)
+}
+
+/// Whether `user_key` still holds a lock — a transaction that has prewritten and not resolved.
+fn locked(db: &Db, options: &ReadOptions, user_key: &[u8]) -> Result<bool, ProtoError> {
+    db.get(cf::LOCK, &key::lock(user_key), options)
+        .map(|found| found.is_some())
+        .map_err(|error| engine_to_proto(&error))
+}
+
 /// The table an `'x'`-space key belongs to, if it belongs to one.
 ///
 /// The engine key is `'x' ++ enc(user_key) ++ !ts`, so the user key has to come back out before

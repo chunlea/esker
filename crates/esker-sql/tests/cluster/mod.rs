@@ -282,6 +282,33 @@ impl Cluster {
         per_level
     }
 
+    /// Flushes every store's memtables, so what they hold is on the books and countable.
+    ///
+    /// **A measurement's, not a workload's.** [`Cluster::standing`] and [`Cluster::entries_in`]
+    /// read SST properties, so an arm that never flushes reports zero however much it is holding —
+    /// and an arm that sweeps flushes on its way. Comparing the two without this compares "flushed"
+    /// against "never flushed" and calls the difference a collection.
+    pub fn flush(&self) {
+        for store in &self.stores {
+            store.flush().expect("a flush runs");
+        }
+    }
+
+    /// Entries one column family's SSTs hold, summed over every store.
+    ///
+    /// `standing` sums every family, which is the right number for "what does a read walk" and the
+    /// wrong one for a question about **bytes**: a value too long to inline lives in `default`
+    /// alone, and #60's whole point is that the two families were collected differently.
+    pub fn entries_in(&self, family: &str) -> u64 {
+        self.stores
+            .iter()
+            .filter_map(|store| store.cf_entries().ok())
+            .flatten()
+            .filter(|entries| entries.cf == family)
+            .map(|entries| entries.entries)
+            .sum()
+    }
+
     /// The highest collection safepoint any store is working to.
     ///
     /// A **denominator**: "the store stopped growing" is satisfied perfectly by a cluster in which

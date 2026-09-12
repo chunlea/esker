@@ -47,7 +47,9 @@ use esker_engine::{Db, cf};
 /// they hold is reachable only through a `write` record: once that record goes, so may they, and
 /// a sweep that took `write` alone would leave the two families that a dropped table's rows
 /// actually sit in.
-const COLLECTABLE: [&str; 3] = [cf::DEFAULT, cf::LOCK, cf::WRITE];
+/// **`write` first and `default` last**, because the pass that removes orphaned spilled values
+/// runs between them: it reads what `write`'s compaction decided and is read by `default`'s.
+const COLLECTABLE: [&str; 3] = [cf::WRITE, cf::LOCK, cf::DEFAULT];
 
 /// What the worker and its owner share.
 struct Shared {
@@ -242,6 +244,7 @@ fn sweep_forever(shared: &Arc<Shared>) {
         let started = Instant::now();
         let mut before = 0u64;
         let mut after = 0u64;
+        let mut orphans = 0;
         for name in COLLECTABLE {
             // **Flushed before the count, because the sweep flushes anyway.** `compact_range`
             // starts with a flush, so a "before" taken without one counts the SSTs and not the
@@ -271,6 +274,22 @@ fn sweep_forever(shared: &Arc<Shared>) {
             );
             before += held;
             after += left;
+
+            // **Between the two compactions, and that is the whole of the ordering.** The pass
+            // reads what `write`'s compaction decided — ADR 0111 drops a deleted key's records
+            // there, and only then does the value they named look like an orphan — and what it
+            // writes is read by `default`'s, which is the next family in `COLLECTABLE` and applies
+            // the tombstones this leaves rather than carrying them to the next sweep. Run before
+            // the first, it sees every record still in place and finds nothing; run after the
+            // second, its deletions wait a whole debounce to take effect.
+            if name == cf::WRITE {
+                match crate::gc::collect_spilled_values(&shared.db, target) {
+                    Ok(count) => orphans = count,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "collecting orphaned spilled values failed");
+                    }
+                }
+            }
         }
         // **One line per sweep at `info`**, because a sweep is rare by construction — at most one
         // per debounce — and it is the answer to "did publishing that safepoint reclaim anything".
@@ -281,6 +300,7 @@ fn sweep_forever(shared: &Arc<Shared>) {
             before,
             after,
             dropped = before.saturating_sub(after),
+            orphans,
             took_ms = started.elapsed().as_millis(),
             "collected"
         );

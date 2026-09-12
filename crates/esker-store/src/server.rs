@@ -3541,6 +3541,17 @@ impl Store {
         self.sweeper.as_ref()
     }
 
+    /// Deletes the spilled values nothing can name any more, and answers how many went.
+    ///
+    /// The `default` half of a collection ([ADR 0112](../../../docs/adr/0112-collecting-a-spilled-value.md)):
+    /// a value too long to inline is written at prewrite and named by the `write` record its commit
+    /// leaves, and nothing collected those until now. Exposed so a test can run the sweeper's own
+    /// sequence by hand, the way `compact_write_cf` is.
+    pub fn collect_spilled_values(&self) -> Result<u64> {
+        crate::gc::collect_spilled_values(&self.db, self.safepoint())
+            .map_err(|error| StoreError::Bootstrap(format!("collecting spilled values: {error}")))
+    }
+
     /// Compacts the whole `write` column family, so the collector runs over every version now
     /// rather than when the level scores say so.
     ///

@@ -112,7 +112,17 @@ fn entries_of(store: &Arc<Store>, want: &str) -> u64 {
 /// same compaction twice and reports "collected nothing" whatever the collector did.
 fn entries_after_collecting_at(safepoint: u64, value_len: usize, family: &str) -> u64 {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path(), StoreOptions::new()).unwrap();
+    let store = Store::open(
+        dir.path(),
+        StoreOptions {
+            // **The sweeper off**, because this drives its sequence by hand below. Left on, the
+            // round `raise_safepoint` wakes races the measurement and what comes back is whichever
+            // of the two finished first.
+            collect_debounce: None,
+            ..StoreOptions::new()
+        },
+    )
+    .unwrap();
     let state = store.regions().get(1).expect("the bootstrapped region");
     fill(&store, &state, VERSIONS, value_len);
     store.flush().unwrap();
@@ -122,6 +132,12 @@ fn entries_after_collecting_at(safepoint: u64, value_len: usize, family: &str) -
         in_force, safepoint,
         "the store took the safepoint it was given"
     );
+    // `collect::Sweeper`'s order, and it is load-bearing: `write` first, so the collection has
+    // decided which records survive; then the pass that removes the spilled values nothing names
+    // any more (ADR 0112); then the rest, so `default`'s compaction applies what the pass wrote.
+    store.compact_cf(esker_engine::cf::WRITE).unwrap();
+    store.collect_spilled_values().unwrap();
+    store.flush().unwrap();
     for cf in store.cf_names() {
         store.compact_cf(&cf).unwrap();
     }
@@ -177,10 +193,12 @@ fn a_safepoint_collects_the_versions_below_it_and_zero_collects_nothing() {
 /// not reclaimed** — a version record is tens of bytes and a value is as large as the user made
 /// it — so a space measurement taken after collecting will barely move, and the reason is here.
 ///
-/// `#[ignore]`d rather than weakened: it is the acceptance for #60 and it should stay red until
-/// something collects them.
+/// **Green since [ADR 0112](../../../docs/adr/0112-collecting-a-spilled-value.md), 2026-09-12.**
+/// `collect::Sweeper` runs a pass over `default` between the two compactions — after `write`'s, so
+/// it can see which records the collection left, and before `default`'s, so the deletions it
+/// writes are applied by the same sweep. It was `#[ignore]`d rather than weakened for exactly this
+/// day: removing the attribute is what closing #60 means.
 #[test]
-#[ignore = "#60: the `default` family is not collected; this is its acceptance"]
 fn a_spilled_value_is_collected_with_the_version_that_names_it() {
     let all_of_them = entries_after_collecting_at(0, SPILLED, esker_engine::cf::DEFAULT);
     assert_eq!(
