@@ -411,19 +411,43 @@ impl Gate {
         min_apply_index: u64,
         projection: Vec<u32>,
     ) -> Vec<Vec<Cell>> {
+        // **A refusal is designed behaviour here, not a failure** (`#86`, `#88`). A columnar copy
+        // cannot see an unresolved secondary lock, so rather than answer one row short in silence
+        // it refuses the **whole** scan — which means a fragment asked while a committed
+        // transaction still has a lock standing comes back refused, and a test that panicked on
+        // that would be failing the design rather than a defect.
+        //
+        // What clears it is a **row** read: `row_scan` meets the standing lock and resolves it,
+        // which is the same mechanism the row path uses in production. So that is what happens
+        // between attempts rather than a sleep — it makes the thing the next ask needs happen,
+        // instead of waiting for somebody else to do it. The bound is named and every refusal is
+        // carried into the message, so a copy that refuses for a *different* reason still fails
+        // with all of them in front of the reader.
+        const ATTEMPTS: usize = 8;
         let learner = self.learner_node();
         let region_id = learner.store.regions().find(b"t").unwrap().id();
-        let answer = Self::ask(
-            learner,
-            region_id,
-            tenant,
-            table_id,
-            ts,
-            min_apply_index,
-            projection,
-        );
-        let FragmentResp::Result { result, .. } = answer else {
-            panic!("the learner refused the fragment: {answer:?}");
+        let mut refusals: Vec<String> = Vec::new();
+        let result = loop {
+            let answer = Self::ask(
+                learner,
+                region_id,
+                tenant,
+                table_id,
+                ts,
+                min_apply_index,
+                projection.clone(),
+            );
+            if let FragmentResp::Result { result, .. } = answer {
+                break result;
+            }
+            refusals.push(format!("attempt {}: {answer:?}", refusals.len() + 1));
+            assert!(
+                refusals.len() < ATTEMPTS,
+                "the learner refused the fragment {ATTEMPTS} times, with a row read between each \
+                 to resolve any lock that was standing:\n  {}",
+                refusals.join("\n  ")
+            );
+            let _ = self.row_scan(ts, table_id, &projection);
         };
         let Body::Rows { rows, .. } = esker_proto::fragment::result::decode(&result).unwrap()
         else {
