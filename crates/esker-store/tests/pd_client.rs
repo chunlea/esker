@@ -164,6 +164,13 @@ impl Service for StandIn {
     }
 }
 
+/// How long the first heartbeat gets to reach the placement driver before that is a failure.
+///
+/// **A precondition, not a measurement**: the wait is for a heartbeat arriving at all, and the
+/// bound is only here so that a store which will never report fails rather than hangs. Sized for a
+/// gate running several clusters at once; it was five seconds, which is a bound on a quiet box.
+const BEATS_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn serve() -> (Arc<StandIn>, ServerHandle, std::net::SocketAddr) {
     let pd = Arc::new(StandIn::default());
     let server = Server::bind(
@@ -266,7 +273,7 @@ async fn a_store_bootstraps_and_reports_over_the_wire() {
     .unwrap();
     assert_eq!(store.regions().len(), 1, "PD told it to create region 1");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let began = std::time::Instant::now();
     loop {
         {
             let state = pd.lock();
@@ -277,8 +284,9 @@ async fn a_store_bootstraps_and_reports_over_the_wire() {
             }
         }
         assert!(
-            std::time::Instant::now() < deadline,
-            "no heartbeat reached the placement driver"
+            began.elapsed() < BEATS_WITHIN,
+            "no heartbeat reached the placement driver in {:?}",
+            began.elapsed()
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
