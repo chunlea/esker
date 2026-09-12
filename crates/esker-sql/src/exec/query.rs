@@ -535,6 +535,15 @@ pub(super) struct OutputColumn {
     /// A **pseudo-type** the projection was cast to: a type no value has, reported through the
     /// `RowDescription` and nowhere else. See [`crate::plan::PseudoType`].
     pub(super) pseudo: Option<crate::plan::PseudoType>,
+    /// Whether this column is a literal PostgreSQL would call **`unknown`** — a bare `NULL` or a
+    /// quoted string with no cast — rather than a value of the type in [`OutputColumn::ty`].
+    ///
+    /// This node has no `unknown`: such a literal is already a `text` by the time anything can ask
+    /// (`is_unknown_literal`'s own header). So the fact has to be carried rather than recovered,
+    /// and one place needs it — a set operation, where an unknown arm takes the **other** arm's
+    /// type instead of contributing its `text` to the unification (`debts-v1.1.md` #75). Everywhere
+    /// else it is `false` and unread.
+    pub(super) unknown: bool,
 }
 
 pub(super) struct Planned {
@@ -658,12 +667,49 @@ pub(super) fn append(
         .ok_or_else(|| SqlError::Internal("a set operation with no arms".to_owned()))?;
     let mut columns = first.columns.clone();
     let mut arm_types = vec![first.columns.iter().map(|c| c.ty).collect::<Vec<_>>()];
+    // Which of each arm's columns were **unknown literals**, beside the types they were planned
+    // as. Carried separately because the unification below settles `columns[at].ty` and the arms
+    // still have to be told apart afterwards: an unknown one is *parsed* as the settled type and
+    // a typed one has to *reach* it (`debts-v1.1.md` #75).
+    let mut arm_unknown = vec![first.columns.iter().map(|c| c.unknown).collect::<Vec<_>>()];
     let mut nodes = vec![first.node];
     for arm in arms {
         if arm.columns.len() != columns.len() {
             return Err(SqlError::SetOperationArity);
         }
         for (at, column) in arm.columns.iter().enumerate() {
+            // **An arm with no type of its own does not get a vote** (#75). PostgreSQL resolves a
+            // set operation's column from the arms that *have* a type and then reads each unknown
+            // literal as that type — which is why `SELECT NULL UNION ALL SELECT 1` is an
+            // `integer` there and `SELECT 1 UNION ALL SELECT 'abc'` is
+            // `22P02 invalid input syntax for type integer: "abc"` rather than a mismatch. Here
+            // both literals were already `text` by the time this ran, so the vote they were given
+            // made every one of those a `42804`. Measured on 19beta1 2026-09-11.
+            //
+            // When *every* arm is unknown the column stays unknown and stays `text`, which is
+            // 19beta1's answer for `SELECT NULL UNION ALL SELECT NULL` and already this node's.
+            // **Not where a user-defined type is on either side**, and that is a boundary rather
+            // than an oversight. Reading `'sad'` as a `mood` means looking its label up in the
+            // catalog, and this function has no view — a set operation's arms are already planned
+            // by the time they get here. So `SELECT m FROM t UNION SELECT 'sad'` keeps the
+            // `42804` this node writes, where 19beta1 answers the labels; it is pinned as a
+            // divergence in `tests/set_operation_enum.rs` with that answer beside it, and it is
+            // #75's remaining half rather than a second row.
+            let typed_name = columns[at].user_type.is_some() || column.user_type.is_some();
+            match (
+                columns[at].unknown && !typed_name,
+                column.unknown && !typed_name,
+            ) {
+                (true, false) => {
+                    columns[at].ty = column.ty;
+                    columns[at].typmod = column.typmod;
+                    columns[at].user_type.clone_from(&column.user_type);
+                    columns[at].unknown = false;
+                    continue;
+                }
+                (false, true) => continue,
+                _ => {}
+            }
             // **The user-defined type first, because it decides which sentence gets written.**
             // An enum is its label's ordinal in the row (ADR 0050), so `common_of` below sees two
             // `int2`s where the arms are a `mood` and an `other_mood` — and *answers*, under
@@ -682,14 +728,21 @@ pub(super) fn append(
             }
         }
         arm_types.push(arm.columns.iter().map(|c| c.ty).collect());
+        arm_unknown.push(arm.columns.iter().map(|c| c.unknown).collect());
         nodes.push(arm.node);
     }
     // **Every arm has to reach the type the set settled on, by an implicit cast**: agreeing on a
     // category is not enough. `money` beside `numeric` is one category with no implicit cast either
     // way, which a real server refuses as `42846 UNION could not convert type numeric to money` —
     // a different sentence from the categories' `42804`, measured beside it.
-    for types in &arm_types {
+    for (types, unknown) in arm_types.iter().zip(&arm_unknown) {
         for (at, from) in types.iter().enumerate() {
+            // An unknown literal is **read as** the settled type rather than converted to it, so
+            // there is no implicit cast to require: `'abc'` reaching an `integer` is a `22P02`
+            // about the value and never a `42846` about the types (#75).
+            if unknown.get(at).copied().unwrap_or(false) {
+                continue;
+            }
             let to = columns[at].ty;
             if !reaches_implicitly(*from, to) {
                 return Err(SqlError::SetOperationCannotConvert {
@@ -5760,6 +5813,7 @@ fn output_columns(
                         user_type: scope.user_type_at(at).cloned(),
                         // A `*` expands to columns, and a column's type is one the catalog holds.
                         pseudo: None,
+                        unknown: false,
                     }
                 }));
             }
@@ -5832,6 +5886,8 @@ fn output_columns(
                     typmod,
                     user_type,
                     pseudo: *pseudo,
+                    // The one thing about this column that cannot be read back off its type.
+                    unknown: is_unknown_literal(expr),
                 });
             }
         }

@@ -370,12 +370,14 @@ fn the_ordinary_set_operation_refusals_are_what_they_were() {
         said(&mut node, "SELECT 1, 2 UNION ALL SELECT 3"),
         "!42601 each UNION query must have the same number of columns"
     );
-    // **The unknown-arm divergence again, in its general form** — no enum in sight, so the row it
-    // belongs to is not #57's.
+    // **The unknown-arm divergence closed** — `debts-v1.1.md` #75, and this assertion is what
+    // said so: it was written as this node's `42804` with 19beta1's answer beside it, and the fix
+    // made the two the same sentence. An unknown literal takes the other arm's type and then
+    // fails to read as it, so the complaint is about the **value**.
     assert_eq!(
         said(&mut node, "SELECT 1 UNION ALL SELECT 'abc'"),
-        "!42804 UNION types integer and text cannot be matched",
-        "19beta1: 22P02 invalid input syntax for type integer: \"abc\""
+        "!22P02 invalid input syntax for type integer: \"abc\"",
+        "19beta1's own sentence, since #75"
     );
     assert_eq!(
         said(&mut node, "SELECT 'lit' UNION ALL SELECT t FROM u"),

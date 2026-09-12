@@ -120,6 +120,105 @@ fn the_three_refusals_are_postgresqls_own() {
     );
 }
 
+/// **An arm with no type of its own takes the other arm's** — `debts-v1.1.md` **#75**.
+///
+/// PostgreSQL resolves a set operation's column from the arms that *have* a type and then reads
+/// each unknown literal — a bare `NULL` or a quoted string with no cast — as that type. This node
+/// has no `unknown`: such a literal is already a `text` by the time anything asks, so it was given
+/// a vote in the unification and every one of these was a `42804`.
+///
+/// **Re-measured on 19beta1 2026-09-11** for this fix, in one `BEGIN … ROLLBACK` with a savepoint
+/// per statement so no refusal swallows the rest. Every expectation below is that server's:
+///
+/// ```text
+/// SELECT 'lit' UNION ALL SELECT tt FROM u     lit ; a        pg_typeof  text
+/// SELECT NULL UNION ALL SELECT 1              NULL ; 1       pg_typeof  integer
+/// SELECT NULL UNION ALL SELECT NULL           NULL ; NULL    pg_typeof  text
+/// SELECT 1 UNION ALL SELECT NULL              1 ; NULL
+/// SELECT 1 UNION ALL SELECT 'abc'             ERROR  invalid input syntax for type integer: "abc"
+/// ```
+///
+/// The capture's header has listed these since 2026-09-05 and **nothing checked them against the
+/// node** — the first of them passed by accident, because both its arms are `text` anyway.
+#[test]
+fn an_unknown_arm_takes_the_other_arms_type() {
+    let mut node = parity::Node::new(FIXTURE);
+
+    // The one that already worked, and the reason it is not evidence on its own.
+    assert_eq!(
+        node.rows("SELECT 'lit' UNION ALL SELECT t FROM so"),
+        vec![vec!["lit"], vec!["a"], vec!["b"]]
+    );
+    assert_eq!(
+        node.rows(
+            "SELECT pg_typeof(x) FROM (SELECT 'lit' AS x UNION ALL SELECT t FROM so) q LIMIT 1"
+        ),
+        vec![vec!["text"]]
+    );
+
+    // A bare `NULL` beside an integer is an **integer**, not a refusal.
+    assert_eq!(
+        node.rows("SELECT NULL UNION ALL SELECT 1"),
+        vec![vec!["\\N"], vec!["1"]]
+    );
+    assert_eq!(
+        node.rows("SELECT pg_typeof(x) FROM (SELECT NULL AS x UNION ALL SELECT 1) q LIMIT 1"),
+        vec![vec!["integer"]],
+        "the typed arm decides, whichever side it is written on"
+    );
+    assert_eq!(
+        node.rows("SELECT 1 UNION ALL SELECT NULL"),
+        vec![vec!["1"], vec!["\\N"]]
+    );
+
+    // Every arm unknown leaves the column `text`, which is where this node already was.
+    assert_eq!(
+        node.rows("SELECT NULL UNION ALL SELECT NULL"),
+        vec![vec!["\\N"], vec!["\\N"]]
+    );
+    assert_eq!(
+        node.rows("SELECT pg_typeof(x) FROM (SELECT NULL AS x UNION ALL SELECT NULL) q LIMIT 1"),
+        vec![vec!["text"]]
+    );
+
+    // And a literal that will not read as the settled type fails **as that type**: the value is
+    // wrong, not the pair of types. It is `22P02`, where a mismatch would be `42804`.
+    let error = node.run("SELECT 1 UNION ALL SELECT 'abc'").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::INVALID_TEXT_REPRESENTATION);
+    assert_eq!(
+        error.to_string(),
+        "invalid input syntax for type integer: \"abc\""
+    );
+}
+
+/// **What must not move**: the two refusals that are about *types* are still about types.
+///
+/// An unknown arm not voting must not turn a real mismatch into an answer — both arms below have
+/// a type of their own, so nothing here is unknown and the sentences are the ones 19beta1 writes.
+#[test]
+fn a_real_mismatch_is_still_a_mismatch() {
+    let mut node = parity::Node::new(FIXTURE);
+    assert_eq!(
+        node.run("SELECT t FROM so UNION ALL SELECT i FROM so")
+            .unwrap_err()
+            .to_string(),
+        "UNION types text and integer cannot be matched"
+    );
+    assert_eq!(
+        node.run("SELECT 1, 2 UNION ALL SELECT 3")
+            .unwrap_err()
+            .to_string(),
+        "each UNION query must have the same number of columns"
+    );
+    // A cast is not unknown, whatever it casts: `'abc'::text` has a type and keeps its vote.
+    assert_eq!(
+        node.run("SELECT i FROM so UNION ALL SELECT 'abc'::text")
+            .unwrap_err()
+            .to_string(),
+        "UNION types integer and text cannot be matched"
+    );
+}
+
 /// **What is not built yet is refused by name**, so the three commits after this one are visible.
 /// **`UNION` without `ALL` deduplicates**, and `NULL` counts as equal to `NULL` for it.
 #[test]
