@@ -1,0 +1,35 @@
+crates/esker-engine/src/compaction/job.rs
+  s_b249f065cef854::t_7d237e9c47ad99 54-70,132-134,225-226,396-402,447,540,738,772,814-820
+crates/esker-engine/src/compaction/picker.rs
+  s_b249f065cef854::t_cd6401d5b7db88 335-365
+crates/esker-engine/src/db/compact.rs
+  s_b249f065cef854::t_9a6d2cf27d0c2b 686-689,699
+crates/esker-engine/tests/db.rs
+  s_b249f065cef854::t_d916f173a94f2b 1540-1548
+crates/esker-sql/tests/collection_keeps_up.rs
+  s_b249f065cef854::t_f97cbdd9901400 223-253
+crates/esker-store/src/gc.rs
+  s_b249f065cef854::t_f80db9986b614f 402-408,460-492,508-515,589-594,656,660
+crates/esker-store/tests/a_deleted_key_goes_whole.rs
+  s_b249f065cef854::t_8e5ce0a96dd028 1-217
+crates/esker-store/tests/a_lock_is_not_a_version.rs
+  s_b249f065cef854::t_fd89d3db1dbd56 52-59,186-202,274-279,285-286
+docs/adr/0111-a-deleted-keys-versions-are-dropped-as-one-segment.md
+  s_b249f065cef854::t_10cafce2d58fe7 3-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "680726c593c10536ef8d90ece9deff78aeb17faf",
+  "prompts": {},
+  "sessions": {
+    "s_b249f065cef854": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7c1a94ab-56c5-4769-8981-7863defc92e8",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
