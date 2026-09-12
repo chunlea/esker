@@ -1,0 +1,21 @@
+crates/esker-sql/tests/routing_differential.rs
+  s_cd9e291597edd3::t_b6a2f1e963d934 1175-1189,1191,1214-1221,1235-1249,1251,1271-1278
+docs/plans/debts-v1.1.md
+  s_cd9e291597edd3::t_ab5ae0188ddd4b 24,111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "00e4027f3388054b5222ff823efd2ba679211909",
+  "prompts": {},
+  "sessions": {
+    "s_cd9e291597edd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "81b290aa-a015-4347-9f4b-ae3daa2044ef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
