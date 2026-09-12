@@ -106,6 +106,32 @@ segment."** Drop **all** versions of a key, the delete included, if and only if:
 
 Otherwise the segment is kept as it is today.
 
+### "Newest" means newest **version**, and this is not a detail (#78)
+
+Added 2026-09-11, after the same word cost five catalog table records in run 127 attempt 4.
+
+`Kind::Lock` is a record and not a version. It is what a committed `Op::Check` leaves — a
+SERIALIZABLE transaction's validated read set (ADR 0062, ADR 0067) and the row lock a
+`SELECT … FOR UPDATE` takes (ADR 0088) — and the read side steps past it looking for a version
+(`esker_txn::percolator::newest_version_at`). `Kind::Rollback` is the same. So the newest *record*
+of a segment and its newest *version* are different things, and **condition (1) is about the
+version**: `Kind::is_a_version` is the predicate, exactly as `MvccCollector::filter` now uses it.
+
+Reading it the other way is what #78 was. `filter` asked "is this the newest record at or below the
+safepoint" and a `Lock` answered yes, which kept the lock and dropped the `Put` under it — a key
+that a transaction had only *read* came back absent, and a catalog name record was left pointing at
+a table record that was no longer there.
+
+For this ADR the same confusion costs the other direction, which is merely a missed collection: a
+segment `Lock@30 · Delete@20 · Put@10` has a newest record that is not a `Delete`, so condition (1)
+is false and the segment is kept although every version in it could go.
+
+**It also costs the streaming shortcut below.** "The decision is available at the segment's first
+entry" holds for the newest *record*; the newest *version* may be one or more records further in. A
+design that decides at the first entry must step past the non-versions at the head of the segment
+first — which is bounded (a key collects at most one lock record per validating transaction) but is
+not zero, and is the thing to get right when this is implemented.
+
 ### What each condition refuses, stated as a counterfactual
 
 - **Without (1):** a key whose newest version is a `Put` loses its current value. This is the

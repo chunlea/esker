@@ -25,9 +25,20 @@
 //!
 //! # What the collector keeps
 //!
-//! Below a key's effective safepoint: the **newest** version, because that is what a read at
+//! Below a key's effective safepoint: the **newest version**, because that is what a read at
 //! the safepoint returns and dropping it would make an existing key vanish. Everything older
-//! goes. A **rollback marker** is the exception — it lives until the safepoint passes its
+//! goes.
+//!
+//! **Version** is `Kind::is_a_version` and not "whatever record is newest" (#78). A `Kind::Lock`
+//! record — a committed `Op::Check`, which is what a SERIALIZABLE transaction and a
+//! `SELECT … FOR UPDATE` leave on a key they only *read* — sits above the version it validated
+//! and is **not** one: the read side steps past it looking for a version
+//! (`esker_txn::percolator::newest_version_at`). A collector that let one stand in for the newest
+//! would keep the lock, drop the `Put` under it, and leave the key reading as absent — which is
+//! exactly how run 127 attempt 4 lost five catalog table records while the names pointing at them
+//! survived. So a lock record goes on its own `commit_ts` and never claims the slot.
+//!
+//! A **rollback marker** is the other non-version, and it lives until the safepoint passes its
 //! `start_ts`, because below that there can still be an in-flight `Prewrite` that the marker is
 //! the only thing stopping (`docs/txn-spec.md` §7).
 //!
@@ -407,12 +418,28 @@ impl CompactionFilter for MvccCollector {
             return FilterDecision::Keep;
         };
 
-        // A rollback marker lives until the safepoint passes its `start_ts`, not its
-        // `commit_ts` — they are the same number for a marker, but the rule is about the
-        // transaction it kills, and below it a `Prewrite` from that transaction can still
-        // arrive with nothing else to stop it (`docs/txn-spec.md` §7).
-        if record.kind == Kind::Rollback {
-            return if record.start_ts < safepoint {
+        // **A record that is not a version never claims the newest slot** (#78). `keep_as_newest`
+        // answers "is this what a read at the safepoint returns", and a reader steps straight past
+        // a rollback marker and a lock record looking for a version
+        // (`esker_txn::percolator::newest_version_at`). One that went in would keep *itself* and
+        // make the `Put` underneath it "older than the one we kept" — which collects the value and
+        // leaves the key reading as absent. That is the P0 of run 127 attempt 4.
+        if !record.kind.is_a_version() {
+            // A rollback marker lives until the safepoint passes its `start_ts`, not its
+            // `commit_ts` — they are the same number for a marker, but the rule is about the
+            // transaction it kills, and below it a `Prewrite` from that transaction can still
+            // arrive with nothing else to stop it (`docs/txn-spec.md` §7).
+            //
+            // A lock record has no such duty: it is a committed `Op::Check`, and nothing reads it
+            // — the conflict check steps past it (ADR 0088) and so does the version walk. It goes
+            // on its own `commit_ts`, at the same boundary the marker uses, because keeping one
+            // record more is the side that costs space rather than rows.
+            let bound = if record.kind == Kind::Rollback {
+                record.start_ts
+            } else {
+                commit_ts
+            };
+            return if bound < safepoint {
                 FilterDecision::Remove
             } else {
                 FilterDecision::Keep
