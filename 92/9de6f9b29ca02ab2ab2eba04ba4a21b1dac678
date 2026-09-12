@@ -1,0 +1,23 @@
+crates/esker-engine/src/compaction/picker.rs
+  s_ac192c209f55d3::t_cb5981fa07b329 858-906
+crates/esker-engine/tests/a_segment_is_kept_when_something_is_below.rs
+  s_ac192c209f55d3::t_03b772c16c0488 1-138
+docs/plans/debts-v1.1.md
+  s_ac192c209f55d3::t_a2cc2ce7cd0a81 129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "929de6f9b29ca02ab2ab2eba04ba4a21b1dac678",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
