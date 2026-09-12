@@ -715,8 +715,12 @@ pub(super) fn append(
             // `int2`s where the arms are a `mood` and an `other_mood` — and *answers*, under
             // `smallint`, with the ordinals — and it names `smallint` where the arms are a `mood`
             // and a `text`. Both are decided here, from the identity the storage cannot carry.
-            columns[at].user_type =
-                unify_user_type(columns[at].user_type.as_ref(), column.user_type.as_ref())?;
+            columns[at].user_type = unify_user_type(
+                columns[at].user_type.as_ref(),
+                column.user_type.as_ref(),
+                columns[at].ty,
+                column.ty,
+            )?;
             // **The same `select_common_type` a `COALESCE` and a `CASE` ask** — this path had
             // both of its passes and the right two sentences first, and `common_of` is that rule
             // written once so the other two stopped having their own.
@@ -892,17 +896,29 @@ fn one_of(mut nodes: Vec<Node>) -> Node {
 ///   `42846 UNION could not convert type other_mood to mood`, the later arm's type first. **That
 ///   is what this decides**;
 /// * an enum beside anything else is two categories and never gets that far —
-///   `42804 UNION types mood and text cannot be matched`, in the arms' own order. **That one is
-///   not written here yet**, and the arm below says why.
+///   `42804 UNION types mood and text cannot be matched`, in the arms' own order.
 ///
 /// The same enum on both sides survives, which is what makes `SELECT m FROM t UNION SELECT
 /// 'sad'::mood` a `mood` whose values are labels rather than a `smallint` whose values are 1 and 2.
+///
+/// The storage types are passed in because the **sentence** needs them: an enum is named by its
+/// own name and everything else by the type a client would write, which for a domain is its base
+/// — `SELECT d FROM t UNION SELECT 'a'::text` is `UNION types integer and text` on 19beta1 and
+/// never names the domain (measured, 2026-09-11, beside the four rows above).
 fn unify_user_type(
     running: Option<&crate::catalog::TypeDef>,
     arm: Option<&crate::catalog::TypeDef>,
+    running_ty: ColumnType,
+    arm_ty: ColumnType,
 ) -> Result<Option<crate::catalog::TypeDef>> {
     let is_enum =
         |def: &crate::catalog::TypeDef| matches!(def.kind, crate::catalog::TypeKind::Enum { .. });
+    // What a client would call this side: its own name when it is an enum, and the storage type
+    // otherwise — a domain is its base and a range is already its own `ColumnType`.
+    let named = |def: Option<&crate::catalog::TypeDef>, ty: ColumnType| match def {
+        Some(def) if is_enum(def) => def.name.clone(),
+        _ => ty.name().to_owned(),
+    };
     match (running, arm) {
         (Some(left), Some(right)) if left.oid == right.oid => Ok(Some(left.clone())),
         (Some(left), Some(right)) if is_enum(left) && is_enum(right) => {
@@ -911,16 +927,26 @@ fn unify_user_type(
                 to: left.name.clone(),
             })
         }
-        // **One arm with a type and one without is left alone, and that is not the rule.**
-        // `SELECT m FROM t UNION SELECT 1::smallint` is
-        // `42804 UNION types mood and smallint cannot be matched` on 19beta1 and answers rows
-        // here. What stops it being written is that **an absent `user_type` is ambiguous**:
-        // `Executor::resolve_user_cast` walks the *top-level* select's projection and its arms,
-        // and no further — so a set operation inside a derived table or a `WITH` reaches here with
-        // its cast arm carrying no type at all. Refusing on the asymmetry turned
-        // `SELECT v FROM (SELECT m AS v FROM t UNION SELECT 'sad'::mood) s`, which answers, into a
-        // `42804`. The nesting gap is the row to pay first; this arm is one line once an absent
-        // type means "not a user type" (`tests/set_operation_enum.rs` carries both measurements).
+        // **Exactly one enum is two categories, and a real server never tries the conversion**
+        // (`debts-v1.1.md` #57). It reaches `42804` and not the `42846` above, and the sentence
+        // names the enum rather than the `int2` it is in the row — naming the storage reports a
+        // mistake nobody made, and for the last two shapes there was no sentence at all: an enum
+        // beside an `integer` or a `smallint` *answered the ordinals*.
+        //
+        // **What made this unwritable until #76** is that an absent `user_type` used to be
+        // ambiguous: `resolve_user_cast` reached the top-level select's arms and no further, so a
+        // set operation one clause down arrived carrying no type, and refusing on the asymmetry
+        // turned statements that answer into `42804`s — tried, and the suite caught it. Since #76
+        // every set operation in the statement is resolved, so an absent type means *not a user
+        // type* and this is the one line that comment promised.
+        (Some(one), other) | (other, Some(one)) if is_enum(one) && !other.is_some_and(is_enum) => {
+            Err(SqlError::SetOperationTypes {
+                left: named(running, running_ty),
+                right: named(arm, arm_ty),
+            })
+        }
+        // A domain, a range, or anything else with a user-defined type beside a plain column:
+        // both are their storage here and `common_of` decides, exactly as before.
         _ => Ok(None),
     }
 }

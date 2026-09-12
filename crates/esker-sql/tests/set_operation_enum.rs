@@ -192,43 +192,111 @@ fn the_other_two_operators_are_refused_before_a_sentence_can_name_them() {
     );
 }
 
-/// **An enum beside anything else is the other sentence and the other code, and this node does
-/// not write it yet** — two categories, so a real server never tries the conversion.
+/// **An enum beside another category is refused, and the sentence names the enum** —
+/// `debts-v1.1.md` **#57**'s remaining half, which #76 unblocked.
 ///
-/// Measured on 19beta1 and pinned here as this node answers it, because the reason it is not
-/// written is a *different* gap and it has to be paid first: `Executor::resolve_user_cast` walks
-/// the top-level select's projection and its arms and no further, so a set operation inside a
-/// derived table or a `WITH` arrives with its cast arm carrying **no user type at all** — and an
-/// absent type therefore cannot be read as "not an enum". Refusing on the asymmetry turns
-/// `SELECT v FROM (SELECT m AS v FROM t UNION SELECT 'sad'::mood) s`, which answers, into a
-/// `42804`; measured, on the same tree, in the same hour.
+/// Two categories, so a real server never tries the conversion and never reaches the `42846` two
+/// enums get. What stopped this being written was that an **absent `user_type` was ambiguous**:
+/// `resolve_user_cast` reached the top-level select's arms and no further, so a set operation one
+/// clause down arrived carrying no type at all, and refusing on the asymmetry turned statements
+/// that answer into `42804`s — b4 tried it and the suite caught it. Since #76 an absent type
+/// means *not a user type*, and this arm is the one line the code's own comment promised.
 ///
-/// The last two rows below are the ones that matter most: an enum is an `int2` in the row, so a
-/// node unifying *representations* **answers rows** for them.
+/// **The last two mattered most**: an enum is an `int2` in the row, so a node unifying
+/// *representations* answered **rows** for them — `1 ; 2`, the ordinals, under `smallint`.
+///
+/// Measured on 19beta1 2026-09-11, one `BEGIN … ROLLBACK` with a savepoint per statement:
+///
+/// ```text
+/// SELECT m FROM t UNION SELECT 'sad'::text     UNION types mood and text cannot be matched
+/// SELECT 'sad'::text UNION SELECT m FROM t     UNION types text and mood cannot be matched
+/// SELECT m FROM t UNION SELECT 1::integer      UNION types mood and integer cannot be matched
+/// SELECT m FROM t UNION SELECT 1::smallint     UNION types mood and smallint cannot be matched
+/// ```
 #[test]
-fn an_enum_beside_another_category_is_named_by_its_storage_for_now() {
+fn an_enum_beside_another_category_is_refused_and_the_enum_is_named() {
     let mut node = parity::Node::new(FIXTURE);
     assert_eq!(
         said(&mut node, "SELECT m FROM t UNION SELECT 'sad'::text"),
-        "!42804 UNION types smallint and text cannot be matched",
-        "19beta1: UNION types mood and text cannot be matched"
+        "!42804 UNION types mood and text cannot be matched"
     );
     assert_eq!(
         said(&mut node, "SELECT 'sad'::text UNION SELECT m FROM t"),
-        "!42804 UNION types text and smallint cannot be matched",
-        "19beta1: UNION types text and mood cannot be matched"
+        "!42804 UNION types text and mood cannot be matched",
+        "the names are in the arms' order"
     );
     assert_eq!(
-        node.answer("SELECT m FROM t UNION SELECT 1::integer ORDER BY 1")
-            .to_string(),
-        "integer\t1 ; 2",
-        "19beta1: 42804 UNION types mood and integer cannot be matched"
+        said(&mut node, "SELECT m FROM t UNION SELECT 1::integer"),
+        "!42804 UNION types mood and integer cannot be matched",
+        "it answered the ordinals under `integer` before this"
     );
     assert_eq!(
-        node.answer("SELECT m FROM t UNION SELECT 1::smallint ORDER BY 1")
-            .to_string(),
-        "smallint\t1 ; 2",
-        "19beta1: 42804 UNION types mood and smallint cannot be matched"
+        said(&mut node, "SELECT m FROM t UNION SELECT 1::smallint"),
+        "!42804 UNION types mood and smallint cannot be matched",
+        "and under `smallint`, which is the enum's own storage — the hardest of the four"
+    );
+    // **One clause down, which is what #76 bought.** The arm reaches the rule with its type, so
+    // the refusal is the same sentence wherever the set is written.
+    assert_eq!(
+        said(
+            &mut node,
+            "SELECT v FROM (SELECT m AS v FROM t) q UNION SELECT 1::smallint"
+        ),
+        "!42804 UNION types mood and smallint cannot be matched",
+        "19beta1 writes the same sentence for this one"
+    );
+}
+
+/// **What an enum-only rule must not touch**, all of it measured in the same capture.
+///
+/// A **domain** is its base type for this purpose — `SELECT d FROM t UNION SELECT 2::integer`
+/// answers on 19beta1 and `pg_typeof` is `integer`, and beside a `text` the refusal names
+/// `integer` and not the domain. A **range** is its own `ColumnType` and was already named right.
+/// Neither is an enum, so neither reaches the rule above.
+#[test]
+fn a_domain_and_a_range_keep_the_behaviour_they_had() {
+    let mut node = parity::Node::new(&[
+        "CREATE DOMAIN posint AS integer CHECK (VALUE > 0)",
+        "CREATE TABLE dr (d posint, r int4range)",
+        "INSERT INTO dr VALUES (1, '[1,5)')",
+    ]);
+    assert_eq!(
+        node.rows("SELECT d FROM dr UNION SELECT 2::integer ORDER BY 1"),
+        vec![vec!["1"], vec!["2"]],
+        "a domain unifies with its base type, which an enum never does"
+    );
+    assert_eq!(
+        node.rows(
+            "SELECT pg_typeof(x) FROM (SELECT d AS x FROM dr UNION SELECT 2::integer) q LIMIT 1"
+        ),
+        vec![vec!["integer"]]
+    );
+    assert_eq!(
+        said(&mut node, "SELECT d FROM dr UNION SELECT 'a'::text"),
+        "!42804 UNION types integer and text cannot be matched",
+        "the domain is named by its base, which is 19beta1's own sentence"
+    );
+    assert_eq!(
+        node.rows("SELECT r FROM dr UNION SELECT '[2,3)'::int4range ORDER BY 1"),
+        vec![vec!["[1,5)"], vec!["[2,3)"]]
+    );
+    assert_eq!(
+        said(&mut node, "SELECT r FROM dr UNION SELECT 'a'::text"),
+        "!42804 UNION types int4range and text cannot be matched"
+    );
+}
+
+/// **And an enum that arrives through something other than a column or a cast still answers.**
+///
+/// `max(m)` keeps its argument's type (`output_columns` reads that case), so the aggregate's
+/// column carries the enum and the two sides are the same one. 19beta1 answers `sad` then `ok`;
+/// a rule that read "no `user_type`" as "not an enum" without this case would refuse it.
+#[test]
+fn an_aggregate_of_an_enum_is_still_that_enum() {
+    let mut node = parity::Node::new(FIXTURE);
+    assert_eq!(
+        node.rows("SELECT max(m) FROM t UNION SELECT 'sad'::mood ORDER BY 1"),
+        vec![vec!["sad"], vec!["ok"]]
     );
 }
 
@@ -345,13 +413,14 @@ fn one_enum_across_the_arms_still_answers() {
     // the day they close, a test says so.
     assert_eq!(
         said(&mut node, "SELECT m FROM t UNION SELECT 'sad' ORDER BY 1"),
-        "!42804 UNION types smallint and text cannot be matched",
-        "19beta1 answers two rows, `sad` then `ok`: an unknown literal takes the enum (#75)"
+        "!42804 UNION types mood and text cannot be matched",
+        "19beta1 answers two rows, `sad` then `ok`: an unknown literal takes the enum (#81). \
+         Since #57 the refusal at least names the enum rather than the `int2` it is stored as"
     );
     assert_eq!(
         said(&mut node, "SELECT m FROM t UNION SELECT NULL ORDER BY 1"),
-        "!42804 UNION types smallint and text cannot be matched",
-        "19beta1 answers two rows: a bare NULL takes the other arm's type too (#75)"
+        "!42804 UNION types mood and text cannot be matched",
+        "19beta1 answers two rows: a bare NULL takes the other arm's type too (#81)"
     );
 }
 
