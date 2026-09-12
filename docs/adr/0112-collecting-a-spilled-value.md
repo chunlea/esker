@@ -1,9 +1,16 @@
 # 0112 — Collecting a spilled value
 
-Status: **Proposed**, 2026-09-11. Opened because [ADR 0111](0111-a-deleted-keys-versions-are-dropped-as-one-segment.md)
+Status: **Accepted**, 2026-09-12 — the user took **(b)**, the recommendation below. Proposed
+2026-09-11, opened because [ADR 0111](0111-a-deleted-keys-versions-are-dropped-as-one-segment.md)
 made the shape of #60 sharper: the records that named these values are now dropped outright, so the
-values they named are orphans with nothing pointing at them at all. **No code is written against
-this.**
+values they named are orphans with nothing pointing at them at all.
+
+**Implemented as (b)**: `gc::collect_spilled_values(db, safepoint)`, one snapshot for both families,
+run by `collect::Sweeper` **between** the `write` family's compaction and the `default` family's —
+which is why `COLLECTABLE` is ordered `[write, lock, default]` and not alphabetically. An entry is
+kept when a surviving `write` record names its `start_ts`, when the key still holds a lock, or when
+`start_ts >= safepoint`; the first of those is the ask this option is named for and the other two are
+the states in which no `write` record can be expected to name it yet.
 
 ## The problem
 
