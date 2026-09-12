@@ -16,10 +16,14 @@
 //! # The arrangement
 //!
 //! Three real stores in one process, replicating one region over real sockets, and a SQL node over
-//! them with its own executor. No placement driver: what is under test is the store path, and a
-//! `CountingOracle` keeps the timestamp question out of it (this is one node, which is the one
-//! case a local counter is a correct oracle for — `tests/two_nodes_one_clock.rs` is where that
-//! stops being true).
+//! them with its own executor. No placement driver: what is under test is the store path, so the
+//! oracle is local — one node is the one case a local counter would be correct for, and
+//! `tests/two_nodes_one_clock.rs` is where that stops being true.
+//!
+//! **But it counts in milliseconds, not in tokens** ([`TickingOracle`]). A bare `CountingOracle`
+//! is correct about ordering and silent about *leases*, and a file that kills a leader needs the
+//! second half: a lock orphaned between a prewrite and its commit is cleared by its TTL running
+//! out, and a TTL is compared in the timestamp's physical half.
 //!
 //! The kill is `Store::stop` plus a server shutdown — the in-process stand-in for a `SIGKILL`, as
 //! `esker-client`'s `chaos_cluster` argues at length. What it proves is bounded and it is the
@@ -40,8 +44,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use esker_client::region_cache::StaticRegion;
-use esker_client::{ClientOptions, CountingOracle, Router, TcpStores, TimestampOracle, TxnClient};
-use esker_proto::{Server, ServerHandle, TransportConfig};
+use esker_client::{
+    ClientOptions, LOCK_TTL_MS, Router, TcpStores, TimestampOracle, TxnClient, is_expired,
+    physical_ms, ts_at_ms,
+};
+use esker_proto::{ProtoError, Server, ServerHandle, TransportConfig};
 use esker_sql::backend::{Backend, StoreBackend};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
@@ -206,7 +213,7 @@ impl Cluster {
                 ..ClientOptions::default()
             },
         );
-        let oracle: Arc<dyn TimestampOracle> = Arc::new(CountingOracle::starting_at(1_000));
+        let oracle: Arc<dyn TimestampOracle> = Arc::new(TickingOracle::new());
         let client = Arc::new(TxnClient::on_router(Arc::new(router), Arc::clone(&oracle)));
         let backend: Arc<dyn Backend> = Arc::new(StoreBackend::new(client, oracle));
         let catalog = Arc::new(Catalog::new());
@@ -218,6 +225,135 @@ impl Cluster {
         );
         (cluster::Session { executor }, catalog)
     }
+}
+
+/// A timestamp oracle whose **physical half advances with real time**, because a lease depends on
+/// it.
+///
+/// # What the counting oracle could not do here
+///
+/// `CountingOracle::starting_at(1_000)` hands out `1000, 1001, …`, and `esker_txn::physical_ms` is
+/// `ts >> TSO_LOGICAL_BITS` with eighteen logical bits — so every timestamp this test could reach
+/// reads as **physical millisecond zero**. `esker_txn::is_expired` compares in exactly that domain:
+///
+/// ```text
+/// is_expired(1000, LOCK_TTL_MS, now) == physical_ms(now) > physical_ms(1000) + LOCK_TTL_MS
+///                                    == 0 > 0 + 1000
+///                                    == false, for every timestamp this fixture will ever mint
+/// ```
+///
+/// So a lock minted here **never expires**, and `Transaction::classify` answers `Alive` about it
+/// for ever. That is fine while every transaction finishes: nothing is ever left behind to expire.
+/// It stops being fine the moment this file's kill lands between a prewrite and its commit — the
+/// lock that prewrite wrote is then orphaned, and *every* later statement meets it, waits out the
+/// client's resolution budget and answers
+///
+/// ```text
+/// 40001 … a lock from the transaction at 1000 could not be cleared for a read
+/// ```
+///
+/// which is what the gate saw 120 times in a row over 632 seconds. Retrying cannot help: each
+/// retry is a new transaction and none of them can clear ts 1000. The design says so itself —
+/// `Transaction::prewrite_or_roll_back`'s "what it cannot clean the TTL still will" — and here the
+/// TTL never will.
+///
+/// # Why this shape
+///
+/// The same one `esker-client`'s `txn_cluster::SharedOracle` uses, for the sentence written beside
+/// it there: *"the physical half has to advance with real time or no lease ever runs out."* That is
+/// the other real-cluster fixture that kills leaders, and it reached this answer first.
+///
+/// `catalog_contention.rs` relies on the **opposite** property on purpose — "`CountingOracle` has
+/// no physical clock, so this lock never expires" is how it makes an unresolvable lock
+/// deterministic. Same fact, wanted one way there and the other way here.
+#[derive(Debug)]
+struct TickingOracle {
+    state: std::sync::Mutex<esker_pd::tso::Oracle>,
+    /// Wall-clock milliseconds at construction, and the monotonic instant they were read at.
+    epoch_ms: u64,
+    started: Instant,
+}
+
+impl TickingOracle {
+    fn new() -> Self {
+        let epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(0));
+        Self {
+            state: std::sync::Mutex::new(esker_pd::tso::Oracle::load(None, epoch_ms, 3_000)),
+            epoch_ms,
+            started: Instant::now(),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch_ms
+            .saturating_add(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
+impl TimestampOracle for TickingOracle {
+    fn tso(&self, count: u32) -> Result<u64, ProtoError> {
+        let now = self.now_ms();
+        let mut oracle = self
+            .state
+            .lock()
+            .map_err(|_| ProtoError::invalid("the oracle's lock was poisoned"))?;
+        // Nothing here restarts, so there is nothing for the high-water mark to be durable
+        // against; a real PD persists it before handing out a timestamp above it.
+        oracle
+            .allocate(count.max(1), now, |_mark| Ok(()))
+            .map_err(|error| ProtoError::invalid(error.to_string()))
+    }
+}
+
+/// **What the two tests below silently depend on**, asserted so that it cannot be taken away
+/// again: a lock minted by this file's oracle can die of old age.
+///
+/// This is the whole of the defect [`TickingOracle`] documents, written as the arithmetic it is —
+/// no cluster, no kill, no load, and no way to flake. It goes red the moment this fixture is given
+/// an oracle without a physical half, which is the state it spent a night failing the gate in:
+/// 120 attempts, 632 seconds, `40001 … a lock from the transaction at 1000 could not be cleared
+/// for a read`, every one of them.
+///
+/// The negative half is about a counter and not about a type, deliberately: if `CountingOracle`
+/// ever grows a clock this assertion is the one that says so, and the right answer then is to
+/// delete this half rather than to work around it.
+#[test]
+fn a_lock_this_fixture_mints_can_run_out_of_lease() {
+    let oracle = TickingOracle::new();
+    let minted = oracle.timestamp().expect("the oracle answers");
+
+    assert!(
+        physical_ms(minted) > 1_600_000_000_000,
+        "this fixture's oracle stamps physical millisecond {}, which is not a wall clock — a lease \
+         is compared in that half and one that never moves never runs out",
+        physical_ms(minted)
+    );
+    assert!(
+        is_expired(
+            minted,
+            LOCK_TTL_MS,
+            ts_at_ms(physical_ms(minted) + LOCK_TTL_MS + 1)
+        ),
+        "a lock minted at {minted} is still alive {} ms later, so a lock this file's kill orphans \
+         could never be cleared and every later statement would answer 40001",
+        LOCK_TTL_MS + 1
+    );
+
+    // The counting oracle this file used to hold, as arithmetic: it starts at 1,000 and hands out
+    // consecutive integers, and `physical_ms` is a shift of eighteen bits — so a *million*
+    // timestamps later it has aged three milliseconds against a three-second lease.
+    assert_eq!(
+        physical_ms(1_000),
+        0,
+        "a counter's timestamps read as physical millisecond zero"
+    );
+    assert!(
+        !is_expired(1_000, LOCK_TTL_MS, 1_000 + 1_000_000),
+        "a lock at 1,000 is still alive a million timestamps later, which is why a counting \
+         oracle cannot be used by a fixture that can orphan a lock"
+    );
 }
 
 /// **The acceptance.** A statement after the leading store is taken away must answer, not `08006`.
