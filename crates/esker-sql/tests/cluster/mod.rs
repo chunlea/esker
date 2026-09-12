@@ -319,15 +319,23 @@ impl Cluster {
             .unwrap_or(0)
     }
 
-    /// Publishes an **arbitrary** safepoint, for a test that needs the collector to actually bite.
+    /// Publishes an **arbitrary** safepoint, for a test that needs one other than `now`.
     ///
-    /// [`Cluster::publish_safepoint`] publishes the oracle's `now`, and this harness's oracle is a
-    /// `CountingOracle` — its timestamps have a zero physical half, so a retention window expressed
-    /// in milliseconds underflows and `MvccCollector` keeps everything. A probe that used it and
-    /// watched the entry count fall would be watching the *engine's* rules, not the collector's.
-    /// Reaching the past by token rather than by instant is the same rule
-    /// `Cluster::collect_everything` follows and the trap `esker-pd`'s
-    /// `a_counting_oracle_collects_nothing` exists for.
+    /// **The usual reason is a control arm, not a bigger bite.** This doc used to say that
+    /// [`Cluster::publish_safepoint`] could not make the collector decide anything, because a
+    /// retention window in milliseconds underflows against a `CountingOracle`'s timestamps — and
+    /// that is true of *PD*, which is where the window is subtracted (`esker-pd`'s
+    /// `a_counting_oracle_collects_nothing` is the trap, and it is PD's).
+    /// `MvccCollector::effective_safepoint` does not subtract it: it adjusts a published safepoint
+    /// by a table's override against the cluster default and returns it unchanged when there is
+    /// none. So a store told `now` collects everything at or below `now`, and
+    /// `publish_safepoint` bites — `name_without_its_table` measures 3,001 entries standing
+    /// against 817 over the same two hundred rounds.
+    ///
+    /// What this is for is the other arm: a safepoint that **rises** every round, so the sweeper
+    /// flushes and compacts exactly as it does in the other arm, and that is **below** every
+    /// version's `commit_ts`, so the collector is reached, asked, and unable to drop anything. That
+    /// is what makes a fall in the entry count the collector's rule rather than the engine's.
     pub fn publish_safepoint_at(&self, safepoint: u64) -> u64 {
         self.stores
             .iter()
