@@ -99,7 +99,17 @@ impl Cluster {
         for (at, listener) in reserved.into_iter().enumerate() {
             let id = at as u64 + 1;
             let mut raft = RaftOptions::new(peers.clone(), 20_260_911);
-            raft.tick = Duration::from_millis(5);
+            // **Twenty-five, because five churns leadership on scheduler noise.** The election
+            // timeout is 10–20 ticks (`esker_raft::config`), so a five-millisecond tick puts it at
+            // 50–100 ms — below the delay a busy machine can impose on a thread, and two live
+            // replicas then keep taking the term off each other instead of electing one leader.
+            // Every proposal in flight answers `40003 … region 1 stopped leading with this
+            // proposal in its log`, which is what three gate runs and a loaded reproduction here
+            // all show. `chaos_cluster/mod.rs` already wrote the rule down — "a tick that is too
+            // short churns leadership on scheduler noise alone" — and every other fixture in this
+            // repository that kills a node uses this number (`txn_cluster`, `retire`, `census`,
+            // `balance`). Production is 100 ms; this is still four times faster than that.
+            raft.tick = Duration::from_millis(25);
             let store = {
                 let _guard = runtime.enter();
                 Store::open(
@@ -353,7 +363,13 @@ fn retry_while_the_cluster_settles(sql: &mut cluster::Session, statement: &str) 
     /// deadline is not: each attempt already carries the client's own timeout, so the wall time
     /// this spans grows with the load rather than running out under it, while a cluster that is
     /// never going to settle still fails rather than hangs.
-    const ATTEMPTS: usize = 120;
+    ///
+    /// **Forty and not a hundred and twenty.** The first number was picked to be generous, and a
+    /// loaded round spent 546 seconds exhausting it and failed anyway — a budget is not what
+    /// saves this fixture, the tick above is, so the budget's job is only to keep a genuine
+    /// failure short. Forty attempts is about thirty seconds of asking per statement, ten times
+    /// an election at the tick this file now uses.
+    const ATTEMPTS: usize = 40;
     let mut attempts = 0usize;
     loop {
         attempts += 1;
