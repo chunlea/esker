@@ -381,14 +381,18 @@ fn a_reverse_raw_scan_visits_the_regions_from_the_top() {
         vec![3, 2, 1],
         "the highest region first: {sent:?}"
     );
-    for (store, start, end) in &sent {
+    // **A reverse request names its bounds the other way round** (#80): `start` is the exclusive
+    // upper bound to walk down from and `end` the inclusive lower one, which is what
+    // `rawkv::scan_bounds` reads and what `esker-store`'s own reverse test pins. So the same two
+    // questions are asked of the two fields swapped.
+    for (store, upper, lower) in &sent {
         let (from, to) = owned(*store);
         assert!(
-            start.as_slice() >= from,
+            lower.as_slice() >= from,
             "store {store} asked below its region"
         );
         assert!(
-            to.is_empty() || (!end.is_empty() && end.as_slice() <= to),
+            to.is_empty() || (!upper.is_empty() && upper.as_slice() <= to),
             "store {store} was asked past its own end"
         );
     }
