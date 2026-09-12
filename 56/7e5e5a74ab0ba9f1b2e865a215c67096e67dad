@@ -1,0 +1,21 @@
+crates/esker-sql/tests/statement_across_a_leader_kill.rs
+  s_b249f065cef854::t_c3fcdd2a4729a5 216,263-360
+docs/plans/debts-v1.1.md
+  s_b249f065cef854::t_d05f08187cc0c6 111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "567e5e5a74ab0ba9f1b2e865a215c67096e67dad",
+  "prompts": {},
+  "sessions": {
+    "s_b249f065cef854": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7c1a94ab-56c5-4769-8981-7863defc92e8",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
