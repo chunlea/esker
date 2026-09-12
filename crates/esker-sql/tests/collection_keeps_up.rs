@@ -220,6 +220,37 @@ fn collecting_takes_the_climb_out_of_the_same_work() {
     );
     // Four times, not a hard number: measured, it is fourteen times, and the margin is there so
     // that a slower machine reports a regression rather than the weather.
+    // **ADR 0111's own acceptance**, and the half that is now flat outright rather than merely
+    // smaller. Before it, the sweep's output for a round of dropped tables was a file of immortal
+    // delete records at a key range nothing would write again — `levels {6: 1}` through
+    // `{6: 12}` over twelve rounds, one more every time, each consulted by every read. With the
+    // segment rule the files oscillate between two and three and the count does not grow.
+    //
+    // **A band and not a trend, which is why this is a spread and not a slope.** With the segment
+    // rule the count settles into an oscillation — two files, three, two — as sweeps merge and
+    // split, and a least-squares slope over an oscillation is a small number with a narrow
+    // interval that lands on either side of zero depending on where the last round fell. Measured:
+    // the same build gave `+0.07` and `+0.13` on consecutive runs, one of which a
+    // slope-contains-zero assertion would have called a regression. What the claim actually is —
+    // "the file count stops growing" — is a statement about the *spread*: a count that gains one
+    // a round spans eleven over twelve rounds, and one that oscillates spans one.
+    //
+    // **From the second round.** The first has no files at all — nothing has been swept yet, so
+    // its zero is "no count" and not "a count of zero", and including it made the spread depend on
+    // whether the last round happened to land on two or three. That is a warm-up, not a trend, and
+    // reading it as one is what a band needs guarding against.
+    let settled = &collected_files[1..];
+    let (low, high) = (
+        settled.iter().min().copied().unwrap_or(0),
+        settled.iter().max().copied().unwrap_or(0),
+    );
+    assert!(
+        high - low <= 2,
+        "the tables on the books ranged from {low} to {high} over {ROUNDS} rounds while \
+         collecting — before ADR 0111 that was one more every round, each a file of delete \
+         records at a key range nothing writes again and each consulted by every read — \
+         {collected_files:?}"
+    );
     assert!(
         with.0 * 4.0 <= without.0,
         "collecting left {:+.1} entries a round of climb against the control's {:+.1} — under a \

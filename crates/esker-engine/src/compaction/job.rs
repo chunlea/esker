@@ -51,7 +51,23 @@ pub enum FilterDecision {
 /// told (invariant 7).
 pub trait CompactionFilter: Send + Sync + fmt::Debug {
     /// Decides about one entry. `level` is the level the entry came from.
-    fn filter(&self, level: usize, user_key: &[u8], value: &[u8]) -> FilterDecision;
+    ///
+    /// `nothing_below` answers, for a **key range**, whether any level below this compaction's
+    /// output still holds something in it. A filter that groups several engine keys into one
+    /// logical key — which `esker-txn` does, one per MVCC version — needs that question about the
+    /// whole group, and only the caller knows which keys are a group
+    /// ([ADR 0111](../../../../docs/adr/0111-a-deleted-keys-versions-are-dropped-as-one-segment.md)).
+    /// A filter with no such grouping ignores it.
+    ///
+    /// **A parameter and not a defaulted method**, so that a filter added later cannot silently
+    /// opt out of a question it should have asked.
+    fn filter(
+        &self,
+        level: usize,
+        user_key: &[u8],
+        value: &[u8],
+        nothing_below: &dyn Fn(&[u8], &[u8]) -> bool,
+    ) -> FilterDecision;
 
     /// A name for logs and for properties.
     fn name(&self) -> &str;
@@ -113,6 +129,9 @@ pub struct CompactionJob<'a> {
     pub filter: Option<&'a dyn CompactionFilter>,
     /// Whether no level below the output level holds this user key.
     pub is_bottom: &'a dyn Fn(&[u8]) -> bool,
+    /// The same question over a **range**, for a filter whose logical key spans several engine
+    /// keys. See [`CompactionFilter::filter`].
+    pub nothing_below: &'a dyn Fn(&[u8], &[u8]) -> bool,
     /// The range tombstones this compaction is **discharging**.
     ///
     /// Empty for every ordinary compaction. When it is not, this compaction has taken every
@@ -203,7 +222,8 @@ impl CompactionJob<'_> {
             } else if kind == EntryKind::Put
                 && seqno <= self.floor
                 && let Some(filter) = self.filter
-                && filter.filter(self.level, user_key, &value) == FilterDecision::Remove
+                && filter.filter(self.level, user_key, &value, self.nothing_below)
+                    == FilterDecision::Remove
             {
                 stats.dropped_by_filter += 1;
                 // Vanishing outright is only safe where nothing older is underneath.
@@ -373,7 +393,13 @@ mod tests {
     struct RemoveValuesStartingWith(u8);
 
     impl CompactionFilter for RemoveValuesStartingWith {
-        fn filter(&self, _level: usize, _user_key: &[u8], value: &[u8]) -> FilterDecision {
+        fn filter(
+            &self,
+            _level: usize,
+            _user_key: &[u8],
+            value: &[u8],
+            _nothing_below: &dyn Fn(&[u8], &[u8]) -> bool,
+        ) -> FilterDecision {
             if value.first() == Some(&self.0) {
                 FilterDecision::Remove
             } else {
@@ -418,6 +444,7 @@ mod tests {
             level: 0,
             target_file_size: u64::MAX,
             filter: None,
+            nothing_below: &|_, _| true,
             is_bottom: &is_bottom,
             tombstones,
         };
@@ -510,6 +537,7 @@ mod tests {
             level: 1,
             target_file_size: u64::MAX,
             filter,
+            nothing_below: &|_, _| true,
             is_bottom: &is_bottom,
             tombstones: &RangeTombstones::new(),
         };
@@ -707,6 +735,7 @@ mod tests {
             level: 1,
             target_file_size: 8 << 20,
             filter: None,
+            nothing_below: &|_, _| true,
             is_bottom: &is_bottom,
             tombstones: &RangeTombstones::new(),
         };
@@ -740,6 +769,7 @@ mod tests {
             level: 1,
             target_file_size: 40,
             filter: None,
+            nothing_below: &|_, _| true,
             is_bottom: &is_bottom,
             tombstones: &RangeTombstones::new(),
         };
@@ -781,7 +811,13 @@ mod tests {
         #[derive(Debug)]
         struct Recorder(std::sync::Mutex<Vec<Vec<u8>>>);
         impl CompactionFilter for Recorder {
-            fn filter(&self, _level: usize, user_key: &[u8], _value: &[u8]) -> FilterDecision {
+            fn filter(
+                &self,
+                _level: usize,
+                user_key: &[u8],
+                _value: &[u8],
+                _nothing_below: &dyn Fn(&[u8], &[u8]) -> bool,
+            ) -> FilterDecision {
                 self.0.lock().unwrap().push(user_key.to_vec());
                 FilterDecision::Keep
             }

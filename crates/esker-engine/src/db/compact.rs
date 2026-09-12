@@ -683,6 +683,10 @@ impl DbInner {
         let is_bottom = |user_key: &[u8]| {
             picker.is_bottom_level_for_key(cf_version, compaction.output_level() - 1, user_key)
         };
+        // The range form, measured from the same level and for the same reason.
+        let nothing_below = |start: &[u8], end: &[u8]| {
+            picker.nothing_below(cf_version, compaction.output_level() - 1, start, end)
+        };
 
         let mut output = TableWriter::new(self, table_options);
         let job = CompactionJob {
@@ -692,6 +696,7 @@ impl DbInner {
             target_file_size: compaction.target_file_size,
             filter: cf.options().compaction_filter.as_deref(),
             is_bottom: &is_bottom,
+            nothing_below: &nothing_below,
             tombstones,
         };
         match job.run(&mut input, &mut output) {

@@ -1,8 +1,15 @@
 # 0111 — A deleted key's versions are dropped as one segment
 
-Status: **Proposed**, 2026-09-11. Opened by the coordinator after #70's (d) landed and the climb it
-was meant to flatten did not reach zero. **No code is written against this**; what follows is the
-material for a ruling.
+Status: **Accepted**, 2026-09-11 (proposed the same day). The ruling is the user's, on the material
+below: the three conditions stand as written, and **"newest" means the newest *version*** — the
+`is_a_version` reading that #78 established the hard way while this was still proposed.
+
+What follows the *Decision* section is the material the ruling was made on and is kept as it was
+written, so a later reader can see what was known at the time. Two things were **not** known and are
+marked where they appear: that a `Lock` record breaks the "decide at the segment's first entry"
+shortcut (§"Newest" means newest version), and that run 127's own symptom turned out to be a scan
+ceiling and not this (#79) — so the climb this ADR flattens is a real cost and was never the
+corruption.
 
 ## Context: what #70 left behind, measured
 

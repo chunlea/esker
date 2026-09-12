@@ -332,6 +332,37 @@ impl Picker {
         tombstones.iter().all(|tombstone| tombstone.seqno <= floor)
     }
 
+    /// Whether no level below `level + 1` holds **anything in `[start, end]`**.
+    ///
+    /// The range form of [`Picker::is_bottom_level_for_key`], and the difference is not a
+    /// convenience. A point query asks about one key, and MVCC versions of one logical key are
+    /// *different* keys — `esker_txn::key::write` is `'x' ++ enc(user_key) ++ enc_ts(commit_ts)`
+    /// with the timestamp **complemented**, so an older version sorts **after** the newer one it
+    /// hides under. A file below holding only the older version does not overlap the newer one's
+    /// key at all, so the point query answers "nothing below" while something is very much below —
+    /// and a caller that drops a delete on that answer resurrects the key it deleted
+    /// ([ADR 0111](../../../../docs/adr/0111-a-deleted-keys-versions-are-dropped-as-one-segment.md)).
+    ///
+    /// The engine does not know which keys are versions of which; the caller passes the span.
+    pub fn nothing_below(
+        &self,
+        version: &CfVersion,
+        level: usize,
+        start: &[u8],
+        end: &[u8],
+    ) -> bool {
+        let user = self.comparator.user_comparator().as_ref();
+        for below in (level + 2)..version.num_levels() {
+            if !version
+                .overlapping(below, Some(start), Some(end), user)
+                .is_empty()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Whether no level below `level + 1` holds `user_key`.
     ///
     /// A tombstone may only be dropped where nothing older can be hiding beneath it. This is

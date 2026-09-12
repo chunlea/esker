@@ -49,6 +49,14 @@ const KEY: &[u8] = b"books";
 /// The value that must survive being held.
 const VALUE: &[u8] = b"the table definition";
 
+/// **The aggressive answer**: no level below holds any version of the key, which is what a
+/// compaction that has reached the bottom reports and what ADR 0111's segment rule acts on. This
+/// file's exhaustive property therefore covers that rule too — if dropping a deleted key's whole
+/// segment ever changed an answer at or above the safepoint, it would fail here.
+fn nothing_below(_start: &[u8], _end: &[u8]) -> bool {
+    true
+}
+
 fn prewrite_and_commit(
     store: &Arc<Store>,
     state: &Arc<RegionState>,
@@ -175,6 +183,23 @@ fn a_key_held_by_a_read_keeps_its_value_through_a_collection() {
     store.stop();
 }
 
+/// What a reader **sees**, which is what the property below is about.
+///
+/// [`read_of`] answers with the record that decides, and this turns that into the answer: a `Put`
+/// is its value, and **a `Delete` and no record at all are the same thing** — the key is not there.
+///
+/// The distinction started to matter with [ADR 0111](../../../docs/adr/0111-a-deleted-keys-versions-are-dropped-as-one-segment.md),
+/// which drops a deleted key's whole segment where nothing below can hide an older version: the
+/// record that said "gone" goes with it, and comparing *records* calls that a changed answer when
+/// no reader can tell. Comparing answers still catches #78, which is what this file is for — there
+/// a `Put` was lost under a `Lock`, and the answer went from a value to absent.
+fn answer_of(history: &[(u64, Kind)], ts: u64) -> Option<u64> {
+    match read_of(history, ts) {
+        Some((commit_ts, Kind::Put)) => Some(commit_ts),
+        _ => None,
+    }
+}
+
 /// The read a store answers with, as `esker_txn::percolator::newest_version_at` performs it:
 /// newest first, stepping past everything that is not a version, and the first version decides.
 fn read_of(history: &[(u64, Kind)], ts: u64) -> Option<(u64, Kind)> {
@@ -246,15 +271,19 @@ fn no_read_above_the_safepoint_changes_its_answer_when_the_collector_runs() {
                         Kind::Rollback => WriteRecord::rollback(*commit_ts),
                         _ => WriteRecord::new(*kind, commit_ts - 1),
                     };
-                    collector.filter(0, &key::write(KEY, *commit_ts), &record.encode())
-                        == FilterDecision::Keep
+                    collector.filter(
+                        0,
+                        &key::write(KEY, *commit_ts),
+                        &record.encode(),
+                        &nothing_below,
+                    ) == FilterDecision::Keep
                 })
                 .collect();
 
             for ts in [safepoint, safepoint.saturating_add(1), u64::MAX] {
                 assert_eq!(
-                    read_of(&survivors, ts),
-                    read_of(history, ts),
+                    answer_of(&survivors, ts),
+                    answer_of(history, ts),
                     "safepoint {safepoint}, read at {ts}: the collection changed the answer\n\
                      before {history:?}\nafter  {survivors:?}"
                 );

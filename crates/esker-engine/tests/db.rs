@@ -1537,7 +1537,15 @@ fn a_compaction_filter_drops_what_it_refuses() {
     // configuration; a test one is a literal, which clippy would rather see as `'static`.
     #[allow(clippy::unnecessary_literal_bound)]
     impl CompactionFilter for DropOddKeys {
-        fn filter(&self, _level: usize, user_key: &[u8], _value: &[u8]) -> FilterDecision {
+        // The range question is for a filter whose logical key spans several engine keys, which
+        // this one's does not: one key, one decision.
+        fn filter(
+            &self,
+            _level: usize,
+            user_key: &[u8],
+            _value: &[u8],
+            _nothing_below: &dyn Fn(&[u8], &[u8]) -> bool,
+        ) -> FilterDecision {
             match user_key.last() {
                 Some(byte) if (byte - b'0') % 2 == 1 => FilterDecision::Remove,
                 _ => FilterDecision::Keep,
