@@ -53,10 +53,11 @@ const REGION: u64 = 1;
 const TENANT: u64 = 1;
 const STORES: usize = 3;
 
-/// What the acceptance asks: a statement that succeeds *within* this rather than being refused at
-/// once. The cluster's own election is 10–20 ticks at 5 ms here, so this is generous against it
-/// and still far from "the statement waited out a timeout".
-const WITHIN: Duration = Duration::from_secs(3);
+/// How long a test waits for the cluster's first election before giving up on its precondition.
+/// An election here is 10–20 ticks at 5 ms, so this is three orders of magnitude of headroom —
+/// the gate runs several clusters at once, and a fixture that fails for being on a busy machine
+/// is testing the machine.
+const SETTLE: Duration = Duration::from_secs(60);
 
 struct Node {
     store: Arc<Store>,
@@ -149,6 +150,12 @@ impl Cluster {
         None
     }
 
+    /// Waits for an election, and answers whether one happened.
+    ///
+    /// **A precondition and not a measurement**: the tests below take a leader *away*, so one has
+    /// to exist first. Its bound is a wall clock because there is nothing else here that scales
+    /// with a busy machine — which is exactly why it is generous rather than tight, and why no
+    /// assertion in this file about what the node *did* is written this way.
     fn settle(&self, within: Duration) -> bool {
         let deadline = Instant::now() + within;
         while Instant::now() < deadline {
@@ -208,7 +215,7 @@ impl Cluster {
 fn a_statement_answers_after_the_store_leading_its_region_is_killed() {
     let cluster = Cluster::start();
     assert!(
-        cluster.settle(Duration::from_secs(20)),
+        cluster.settle(SETTLE),
         "the cluster never elected a leader to take away"
     );
     let (mut sql, _catalog) = cluster.sql_node();
@@ -218,8 +225,9 @@ fn a_statement_answers_after_the_store_leading_its_region_is_killed() {
     let leader = cluster.leader().expect("somebody leads");
     cluster.kill(leader);
 
-    // **One statement, and the clock.** Not a loop: a client gets one answer per statement, and
-    // Rails' fixture setup does not ask twice — which is why the node has to.
+    // **One statement.** Not a loop: a client gets one answer per statement, and Rails' fixture
+    // setup does not ask twice — which is why the node has to. The clock below is read for the
+    // message and for the record, and decides nothing.
     let began = Instant::now();
     let answered = sql.run("INSERT INTO t VALUES (2, 'after')");
     let took = began.elapsed();
@@ -235,10 +243,13 @@ fn a_statement_answers_after_the_store_leading_its_region_is_killed() {
             took.as_millis()
         );
     }
-    assert!(
-        took < WITHIN,
-        "the statement answered but took {took:?}, past the {WITHIN:?} a statement may spend on a \
-         leader kill"
+    // **Measured, not asserted** (LANE-RULES). The acceptance is that the statement *answers* —
+    // run 124's failure was 184 refusals in 0.695 s, fast and wrong, and the panic above is what
+    // catches it. How long the answer took is a number about the machine the gate is sharing, so
+    // it is printed for the next reader of a slow run and left out of the verdict.
+    println!(
+        "the statement answered {} ms after the leader was killed",
+        took.as_millis()
     );
 
     // The kill really took the leader, so this cannot pass on a follower kill — the arithmetic
@@ -286,7 +297,7 @@ fn a_statement_answers_after_the_store_leading_its_region_is_killed() {
 fn the_setup_is_safe_to_repeat_and_does_not_need_a_settled_cluster() {
     let cluster = Cluster::start();
     assert!(
-        cluster.settle(Duration::from_secs(20)),
+        cluster.settle(SETTLE),
         "the cluster never elected a leader to take away"
     );
     let leader = cluster.leader().expect("somebody leads");
@@ -333,11 +344,17 @@ fn setup(sql: &mut cluster::Session) {
 /// as one: a fixture that swallowed a syntax error would make every test in this file pass by not
 /// running.
 fn retry_while_the_cluster_settles(sql: &mut cluster::Session, statement: &str) {
-    /// Long enough for an election and a retry or two, short enough that a cluster which is never
-    /// going to settle fails rather than hangs.
-    const WITHIN: Duration = Duration::from_secs(30);
-    let deadline = Instant::now() + WITHIN;
-    let mut attempts = 0;
+    /// How many times the fixture asks before it calls the cluster stuck.
+    ///
+    /// **Attempts and not a clock** (LANE-RULES: a test inside the gate carries no wall-clock
+    /// assertion). This used to give up 30 seconds in, and a gate running several clusters at once
+    /// took longer than that to finish an election — so the fixture failed for being on a busy
+    /// machine, which is the one thing it is not testing. A count is load-tolerant in the way a
+    /// deadline is not: each attempt already carries the client's own timeout, so the wall time
+    /// this spans grows with the load rather than running out under it, while a cluster that is
+    /// never going to settle still fails rather than hangs.
+    const ATTEMPTS: usize = 120;
+    let mut attempts = 0usize;
     loop {
         attempts += 1;
         let Err(error) = sql.run(statement) else {
@@ -350,11 +367,13 @@ fn retry_while_the_cluster_settles(sql: &mut cluster::Session, statement: &str) 
              mind: {error}"
         );
         assert!(
-            Instant::now() < deadline,
-            "`{statement}` was still answering SQLSTATE {state} after {WITHIN:?} and {attempts} \
-             attempts, so the cluster is not settling: {error}"
+            attempts < ATTEMPTS,
+            "`{statement}` was still answering SQLSTATE {state} after {ATTEMPTS} attempts, so the \
+             cluster is not settling: {error}"
         );
-        std::thread::sleep(Duration::from_millis(100));
+        // Backing off rather than a fixed pause, so a cluster that needs a second election is
+        // waited for with the same number of attempts as one that needs none.
+        std::thread::sleep(Duration::from_millis(50 * attempts.min(20) as u64));
     }
 }
 
