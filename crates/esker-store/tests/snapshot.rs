@@ -2122,6 +2122,9 @@ async fn a_columnar_learner_caught_up_by_a_snapshot_answers_for_what_it_brought(
     // The columnar record and rows 1-4, committed while this store is alone.
     let region = first.store.regions().regions()[0].clone();
     commit_the_history(&first.store, &region).await;
+    // The last index the history occupies, so the assertion below can say the log no longer holds
+    // it rather than assume so.
+    let history_end = first.store.peer_of(1).unwrap().applied_index();
 
     // Enough unrelated writes to compact the log past all of it. Raw pairs under their own `'k'`
     // prefix, so nothing here touches the table the fragment asks about.
@@ -2129,6 +2132,21 @@ async fn a_columnar_learner_caught_up_by_a_snapshot_answers_for_what_it_brought(
         let region = first.store.regions().regions()[0].clone();
         put(&[&first.store], &region, key(n), b"filler").await;
     }
+
+    // **The denominator, and without it this test is worthless.** Everything below is about a
+    // learner that *cannot* replay the history, and that is true only if the leader has actually
+    // thrown those entries away. A run where the compaction had not caught up yet would place the
+    // learner, catch it up entry by entry, and pass — proving the path this test does not test.
+    let state = esker_store::raft_log::read_state(first.store.db(), 1, None)
+        .expect("the leader's raft state is readable")
+        .expect("the region has a state record");
+    assert!(
+        state.truncated_index >= history_end,
+        "the leader's log still holds the entries that wrote the history — truncated at {}, the \
+         history ends at {history_end} — so the learner could catch up by replay and this is not \
+         a test about a snapshot",
+        state.truncated_index
+    );
 
     let second = open(
         second_address_listener,

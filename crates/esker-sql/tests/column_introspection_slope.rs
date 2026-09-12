@@ -65,15 +65,27 @@
 //!
 //! Three reads a relation were the listing's record, the hydration's record and the hydration's
 //! sequence scan; two of the three are the *hydration*, and after the push-down exactly **one
-//! relation is hydrated** — the one the statement names. What is left is one read a relation in
-//! `pg_relations::Relations::read`, which point-reads every table's record to tell a table from a
-//! materialized view and to place an index. That listing is `#63`'s own machinery and is cached
-//! per tenant and version, so narrowing it is a change to what a cached `Relations` *means* —
-//! h1's file family, and not this row's.
+//! relation is hydrated** — the one the statement names. What was left was one read a relation in
+//! `pg_relations::Relations::read`, which point-read every table's record to tell a table from a
+//! materialized view and to place an index.
 //!
-//! So the flat assertion below is still red, and the one above it — a **slope** of one read a
-//! relation rather than three — is what the push-down bought and what a regression of it would
-//! break.
+//! # The last read a relation, and the flat line
+//!
+//! That listing now takes the same records as **one scan** of the range they live in
+//! (`View::table_records`, the shape `View::matviews` already had), so the per-relation term is
+//! gone from this statement too. Measured on the merged tree, 2026-09-11:
+//!
+//! ```text
+//! relations   before A+B    after A      after A+B
+//!   20            77            37           17
+//!  100           317           117           17
+//!  300           917           317            —
+//! ```
+//!
+//! **Seventeen either way.** Both assertions below are green, and they are not the same assertion:
+//! the first says there is **no per-relation cost**, the second says **and the constant is small**.
+//! A measurement can satisfy the first and fail the second — a flat line whose constant is the
+//! whole catalog is exactly what `#49`'s cache produced and what the `#[ignore]` was waiting on.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -153,9 +165,14 @@ fn first_run(size: usize) -> (usize, usize, std::time::Duration, std::time::Dura
 /// condition rather than a constant, is pinned across the `ON` (`exec::query::pinned_across_join`).
 ///
 /// **A slope, because the intercept is somebody else's.** Every catalog view reads the relations
-/// listing, and that listing point-reads one record per relation; what this statement used to add
-/// on top was two more reads a relation, which is the hydration. One read per added relation is
-/// the listing alone. Measured 2026-09-11: three a relation before, one after.
+/// listing; what this statement used to add on top was two more reads a relation, which is the
+/// hydration.
+///
+/// The pin was **one** a relation — the listing's own record — which is what the push-down left
+/// behind. That read is gone too now: the listing takes every table's record in one scan rather
+/// than one point read each (`View::table_records`), so the two halves of `#63 (c)` together leave
+/// **no per-relation cost at all**. Measured 2026-09-11 on the merged tree: three a relation
+/// before, one after the push-down, **zero after both**.
 #[test]
 fn column_introspection_hydrates_one_relation() {
     esker_sql::stmt_stats::trace_every_read();
@@ -172,10 +189,10 @@ fn column_introspection_hydrates_one_relation() {
     );
     assert_eq!(
         big - small,
-        80,
-        "{small} reads over 20 relations and {big} over 100 is {} a relation where one is the \
-         listing's record and everything above it is `pg_attribute` or `pg_attrdef` hydrating a \
-         relation the statement did not name (#63 (c))",
+        0,
+        "{small} reads over 20 relations and {big} over 100 is {} a relation: either \
+         `pg_attribute`/`pg_attrdef` is hydrating a relation the statement did not name, or the \
+         relations listing is point-reading a record per table again (#63 (c), both halves)",
         (big - small) / 80
     );
 }
@@ -243,18 +260,20 @@ fn the_plan_names_the_relation_a_catalog_view_was_pinned_to() {
 /// Six columns and a catalog of twenty relations, then the same six columns and a catalog of a
 /// hundred: the statement names one table by `regclass`, so what it reads must not move.
 ///
-/// **Red at 37 → 117 after the push-down**, down from 77 → 317. What is left is one read a
-/// relation, and it is not this statement's to save: every catalog view reads the relations
-/// listing, and `pg_relations::Relations::read` point-reads one record per relation to tell a
-/// table from a materialized view and to place an index. That bundle is memoised per tenant and
-/// version, so a listing narrowed to one relation would be a *cached* answer that no longer holds
-/// every relation — a change to what `Relations` means, in h1's file family and under #63's own
-/// row rather than this one.
+/// It was red at 77 → 317, then at **37 → 117** after the push-down. The read a relation that
+/// remained was the relations listing's: `pg_relations::Relations::read` point-read one record per
+/// relation to tell a table from a materialized view and to place an index, and narrowing *that*
+/// was a change to what a `Relations` memoised per tenant and version means — the other lane's
+/// file family, which is why this was `#[ignore]`d rather than left red while one half was in.
 ///
-/// Kept `#[ignore]`d and kept red: it is the whole defect's acceptance, and the slope test above
-/// is the half that is paid. Removing the attribute **is** the acceptance.
+/// Both halves are in. The listing takes those records as **one scan** of the range they live in
+/// (`View::table_records`), so the per-relation term is gone and this reads **17 either way**.
+///
+/// **It is not the slope test above restated.** That one says there is no cost per relation; this
+/// one says the cost is also *small*. A statement whose reads are flat at the size of the whole
+/// catalog satisfies the first and fails this — which is exactly the shape `#49`'s version-keyed
+/// cache produced, and the reason the bound below is here at all.
 #[test]
-#[ignore = "#63(c): the listing's own read per relation is what is left; see this header"]
 fn column_introspection_reads_one_tables_columns() {
     /// Room over the six columns for the four catalog relations the statement joins and their
     /// version counters — generous on purpose, because what is being separated is a constant from
