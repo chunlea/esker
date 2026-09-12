@@ -2977,6 +2977,49 @@ impl Store {
             }
         };
 
+        // **A lock this learner cannot resolve is a row it cannot see** (debt #86). The copy is
+        // built from the `write` column family on both its paths — the history walk and the tee —
+        // so a key whose transaction committed its primary and left this secondary locked has no
+        // version here and would simply be absent from the answer. The row path meets that lock and
+        // rolls it forward; a learner is not a voter and cannot, so it refuses and the planner falls
+        // back to the row path, which resolves it. `columnar::region::unresolved_lock` carries the
+        // argument and `esker_txn::read`'s own predicate.
+        //
+        // `TooFarBehind` and not a reason of its own: what it promises is exactly true here — *the
+        // same node may succeed later* — and a new `RefusalReason` is a wire change.
+        let bounds = {
+            let region = state.region();
+            (region.start_key.to_vec(), region.end_key.to_vec())
+        };
+        match crate::columnar::region::unresolved_lock(
+            &self.db,
+            request.ts,
+            fragment.table.tenant,
+            fragment.table.table_id,
+            &bounds,
+        ) {
+            Ok(None) => {}
+            Ok(Some((key, start_ts))) => {
+                return Ok(refused(
+                    RefusalReason::TooFarBehind,
+                    format!(
+                        "a transaction at {start_ts} still holds a lock on {} in region {}, and \
+                         a columnar copy holds no version for a key until that lock is resolved",
+                        crate::columnar::region::printable(&key),
+                        header.region_id
+                    ),
+                ));
+            }
+            // Unreadable rather than absent: answering from the copy would be answering without
+            // knowing whether a row is hidden, which is the thing this check exists to stop.
+            Err(error) => {
+                return Ok(refused(
+                    RefusalReason::TooFarBehind,
+                    format!("this store could not read its lock column family: {error}"),
+                ));
+            }
+        }
+
         match evaluate(
             slot.fs().as_ref(),
             &runs,

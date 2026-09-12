@@ -63,7 +63,7 @@ use esker_columnar::Schema;
 use esker_engine::fs::FileSystem;
 use esker_engine::{Db, ReadOptions, Snapshot, cf};
 use esker_keys::prefix::{self, TablePart};
-use esker_txn::{Kind, ReadOutcome, TxnSnapshot, WriteRecord};
+use esker_txn::{Kind, LockRecord, ReadOutcome, TxnSnapshot, WriteRecord};
 
 use super::decode::TableDecoder;
 use super::{ColumnarApply, ColumnarOptions};
@@ -901,7 +901,7 @@ fn convert(
 }
 
 /// A key as a log line can carry it.
-fn printable(key: &[u8]) -> String {
+pub(crate) fn printable(key: &[u8]) -> String {
     key.iter()
         .map(|byte| {
             if byte.is_ascii_graphic() {
@@ -919,6 +919,71 @@ fn printable(key: &[u8]) -> String {
 /// right: an empty region `start` is the beginning of the key space and constrains nothing, an
 /// empty region `end` is the end of it and constrains nothing either. A table range is never
 /// empty-bounded, so the result is always concrete.
+/// The first lock in `region ∩ table` that a read at `ts` would have to resolve, if any.
+///
+/// # Why a columnar copy has to ask this and cannot answer it
+///
+/// A copy is built from the **`write`** column family — `convert` walks it, and the tee is fed by
+/// the commits that write it. `txnkv::user_keys_in` says what that leaves out, for the other engine
+/// and in so many words:
+///
+/// > The `lock` column family is the half that is easy to leave out, and leaving it out is a silent
+/// > wrong answer. A key prewritten by a transaction that has since **committed its primary** has a
+/// > lock and no `write` record: the transaction is committed, so the row exists, and until someone
+/// > resolves that lock there is nothing in the `write` CF to find it by. A scan built from versions
+/// > alone answers without the row and reports no lock, so the caller has nothing to resolve and no
+/// > way to notice.
+///
+/// **A columnar copy is a scan built from versions alone**, and that state is not a fault but a
+/// normal one: `Transaction::commit` discards the result of its secondaries' commit on purpose —
+/// *"a secondary that fails here is not a failed transaction … a reader that meets one of these
+/// locks will roll it forward"* — so *primary committed, secondary still locked* is where the
+/// cluster sits whenever that call did not land. Debt #86 is one row of a differential lost exactly
+/// there.
+///
+/// The row path resolves such a lock while reading. A columnar learner **cannot**: resolution is a
+/// write and it is not a voter. So the answer is to refuse and let the planner fall back to the row
+/// path, which resolves it and answers — and the fragment after that succeeds.
+///
+/// The predicate is `esker_txn::read`'s, key for key: a lock at or below `ts` whose kind is not
+/// [`Kind::Lock`]. A pure read lock writes no version and hides nothing; a lock **above** `ts`
+/// belongs to a transaction that cannot commit at or below it.
+///
+/// Cheap by shape: the `lock` family holds one entry per key with an *unfinished* transaction on
+/// it, so this walk is over the cluster's in-flight writes in this range and not over its data.
+pub(crate) fn unresolved_lock(
+    db: &Db,
+    ts: u64,
+    tenant: u64,
+    table_id: u64,
+    region: &(Vec<u8>, Vec<u8>),
+) -> Result<Option<(Vec<u8>, u64)>> {
+    let (table_start, table_end) = esker_keys::row::table_row_range(tenant, table_id);
+    let (start, end) = intersect(&table_start, &table_end, region);
+    if start >= end {
+        return Ok(None);
+    }
+    let low = esker_txn::key::prefix(&start);
+    let high = esker_txn::key::prefix(&end);
+    let mut iter = db
+        .iter(cf::LOCK, &ReadOptions::default())
+        .map_err(|error| bootstrap(&format!("walking the lock column family: {error}")))?;
+    iter.seek(&low);
+    while iter.valid() && iter.key() < high.as_slice() {
+        let user_key = esker_txn::key::split_lock(iter.key())
+            .map_err(|error| bootstrap(&format!("a lock key: {error}")))?;
+        let lock = LockRecord::decode(iter.value())
+            .map_err(|error| bootstrap(&format!("a lock record: {error}")))?;
+        if lock.start_ts <= ts && lock.kind != Kind::Lock {
+            return Ok(Some((user_key, lock.start_ts)));
+        }
+        iter.next();
+    }
+    iter.status()
+        .map_err(|error| bootstrap(&format!("walking the lock column family: {error}")))?;
+    Ok(None)
+}
+
 fn intersect(
     table_start: &[u8],
     table_end: &[u8],
