@@ -1,0 +1,31 @@
+crates/esker-sql/tests/cluster/mod.rs
+  s_ac192c209f55d3::t_af972d59fa9df8 39-46,172-175
+crates/esker-sql/tests/joint_gate.rs
+  s_ac192c209f55d3::t_afe7c41436a85b 279-283
+crates/esker-sql/tests/multi_region_rows.rs
+  s_ac192c209f55d3::t_4f1bde32bfa30c 96-100
+crates/esker-sql/tests/parity_harness/mod.rs
+  s_ac192c209f55d3::t_6b20b6bd139090 36-38,325-328
+crates/esker-sql/tests/routing_differential.rs
+  s_ac192c209f55d3::t_916ca23b66ddd8 588-592
+crates/esker-sql/tests/statement_across_a_leader_kill.rs
+  s_ac192c209f55d3::t_04592d578a9696 75-79
+crates/esker-sql/tests/trace/mod.rs
+  s_ac192c209f55d3::t_880128916bf2d2 1-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "205c5a81575c18971c4db59a49076d166248482c",
+  "prompts": {},
+  "sessions": {
+    "s_ac192c209f55d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d2c3f83e-4001-40fc-8bdd-ca51e91453e3",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
