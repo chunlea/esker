@@ -886,7 +886,31 @@ fn convert(
     }
     iter.status()
         .map_err(|error| bootstrap(&format!("walking the write column family: {error}")))?;
+    // **What the conversion actually saw**, which is the question every disagreement between the
+    // two engines turns into: a copy missing a row either never walked its key or walked it and
+    // found nothing committed. Run 127i had no way to tell those apart.
+    tracing::debug!(
+        tenant,
+        table_id,
+        rows,
+        low = %printable(&low),
+        high = %printable(&high),
+        "converted a table's history from the write column family"
+    );
     Ok(rows)
+}
+
+/// A key as a log line can carry it.
+fn printable(key: &[u8]) -> String {
+    key.iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() {
+                (*byte as char).to_string()
+            } else {
+                format!("\\x{byte:02x}")
+            }
+        })
+        .collect()
 }
 
 /// `[table_start, table_end)` narrowed to the region's own `[start, end)`.

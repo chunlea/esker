@@ -2067,6 +2067,134 @@ async fn place_a_columnar_learner(pd: &Arc<FakePd>, first: &Node, second: &Node)
     .await;
 }
 
+/// **#74.** The same claim as the test below, for history that arrives by **snapshot**.
+///
+/// [`a_placed_columnar_learner_answers_for_the_rows_that_predate_it`] places the learner while the
+/// leader's log still holds the entries that wrote the history, so the rows reach it as entries and
+/// the tee and the conversion both have something to work from. That is one of the two ways a
+/// learner can be brought up to date, and the other one has no entries at all: when the leader's
+/// log has been compacted past what the learner needs, the region arrives as a **snapshot**, its
+/// applied index jumps to the snapshot's, and **nothing passes through `RaftPeer::tee_columnar`**.
+///
+/// So the copy's only source for those rows is `ColumnarSlot::ensure`'s walk of the `write` column
+/// family — and `ensure` runs **once**: it returns early for a table already in `tables.open`. A
+/// copy opened before the snapshot landed has no second chance at it.
+///
+/// This is the shape `esker-sql`'s `joint_gate` differential produced on the gate of 2026-09-11:
+/// the fragment answered four rows where the row scan answered five, and the missing one was the
+/// only row in the workload with no log entry of its own after the learner joined. Every store held
+/// it in the row store, including the learner's — so it was not a replication failure and not a
+/// collected version, which is what rules out both of #70's suspects.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_columnar_learner_caught_up_by_a_snapshot_answers_for_what_it_brought() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+
+    // **Aggressive, and that is the experiment.** The leader throws its log away almost at once,
+    // so the entries that wrote the history are gone before the learner is placed and a snapshot
+    // is the only way it can have them.
+    let compaction = LogCompaction {
+        threshold: 8,
+        keep: 2,
+        ..LogCompaction::new()
+    };
+    let first = open(
+        first_address_listener,
+        1,
+        &pd,
+        raft_options(peers.clone(), compaction, Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+
+    // The columnar record and rows 1-4, committed while this store is alone.
+    let region = first.store.regions().regions()[0].clone();
+    commit_the_history(&first.store, &region).await;
+
+    // Enough unrelated writes to compact the log past all of it. Raw pairs under their own `'k'`
+    // prefix, so nothing here touches the table the fragment asks about.
+    for n in 0..60 {
+        let region = first.store.regions().regions()[0].clone();
+        put(&[&first.store], &region, key(n), b"filler").await;
+    }
+
+    let second = open(
+        second_address_listener,
+        2,
+        &pd,
+        raft_options(peers.clone(), compaction, Some(vec![2])),
+        2,
+    )
+    .await;
+    place_a_columnar_learner(&pd, &first, &second).await;
+
+    // **The stream**, exactly as in the test below: one row after the placement, so a copy fed
+    // only by the tee answers this one and none of the four the snapshot brought.
+    let region = first.store.regions().regions()[0].clone();
+    let leader = first.store.peer_of(1).unwrap();
+    commit_value(
+        &first.store,
+        &region,
+        table_row_key(5),
+        table_row(5, "katherine"),
+        30,
+        31,
+    )
+    .await;
+
+    let bar = leader
+        .status()
+        .await
+        .expect("the leader answers its own status")
+        .applied;
+    wait_for(
+        "the learner to reach the index the leader acknowledged",
+        || {
+            second
+                .store
+                .peer_of(1)
+                .is_some_and(|peer| peer.applied_index() >= bar)
+        },
+    )
+    .await;
+
+    // **The precondition, so a failure below cannot be a replication failure wearing a columnar
+    // costume.** If the snapshot did not bring the rows, the row store is short too and this says
+    // so first.
+    let rows: Vec<(i64, u64)> = (1..=5i64)
+        .map(|id| (id, second.store.write_records(&table_row_key(id)).unwrap()))
+        .collect();
+    assert!(
+        rows.iter().all(|(_, versions)| *versions == 1),
+        "the learner's row store is short before the copy is even asked, so the snapshot itself \
+         did not arrive whole: (id, versions) = {rows:?}"
+    );
+
+    let answered = fragment_ids(&second, 1, bar).await;
+    assert_eq!(
+        answered,
+        vec![1, 2, 3, 4, 5],
+        "the copy answered for the rows that arrived as entries and not for the ones the snapshot \
+         brought; the learner's row store holds all five (id, versions) = {rows:?}, and the bar it \
+         caught up to was {bar}",
+    );
+
+    first.stop().await;
+    second.stop().await;
+}
+
 /// **The twin of [`a_placed_columnar_learner_holds_what_the_leader_holds`], asked of the copy.**
 ///
 /// That test proves the learner's **row** column families hold what the leader's do, and stops

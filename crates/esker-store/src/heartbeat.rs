@@ -173,7 +173,18 @@ impl Heartbeats {
             // non-empty and let the window publish a safepoint nobody's reader floor is under
             // (ADR 0110).
             match self.pd.safepoint(0, None) {
-                Ok(published) => safepoint = Some(published),
+                Ok(published) => {
+                    // **The success path logs too.** Only the failure did, so a cluster that was
+                    // publishing a safepoint every round looked exactly like one that had never
+                    // been asked — which is the gap run 127i hit: the number the whole of
+                    // ADR 0110 is about was unobservable at any log level.
+                    tracing::debug!(
+                        store_id = self.store_id,
+                        published,
+                        "the placement driver published a garbage-collection safepoint"
+                    );
+                    safepoint = Some(published);
+                }
                 Err(error) => {
                     tracing::debug!(store_id = self.store_id, %error, "no safepoint this round");
                 }

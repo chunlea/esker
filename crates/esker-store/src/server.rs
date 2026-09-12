@@ -3448,7 +3448,20 @@ impl Store {
     /// `AdminReq::Gc` — and a second copy of "never lower it, then reload the policy" is how the
     /// two would drift.
     pub fn raise_safepoint(&self, safepoint: u64) -> u64 {
+        let before = self.collector.published();
         let now = self.collector.set_published(safepoint);
+        // **`info` on a change, and nothing on a repeat.** PD republishes the same number every
+        // heartbeat when nothing has moved, so logging each one would bury the moves; a move is
+        // the event — it is what makes a batch of history collectable, and since #70 it is also
+        // what asks for the collection.
+        if now > before {
+            tracing::info!(
+                store_id = self.store_id,
+                from = before,
+                to = now,
+                "the garbage-collection safepoint moved"
+            );
+        }
         // **#70.** The number alone changes nothing; this is what goes and acts on it. Asked for
         // here rather than at either caller because this is the funnel both of them come through,
         // and a second place that raised a safepoint without asking would be a store that

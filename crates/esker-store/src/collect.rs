@@ -191,6 +191,15 @@ impl Drop for Sweeper {
     }
 }
 
+/// Entries one column family's SSTs hold, or `0` when the engine will not say.
+///
+/// A count and not a `Result`: this is a log line's denominator, and a sweep that collected must
+/// not fail because the number it wanted to report about itself was unavailable.
+fn entries(db: &Db, cf: &str) -> u64 {
+    db.sst_entries(cf)
+        .map_or(0, |ssts| ssts.iter().map(|(_, _, entries)| entries).sum())
+}
+
 /// The worker's body.
 fn sweep_forever(shared: &Arc<Shared>) {
     loop {
@@ -230,14 +239,51 @@ fn sweep_forever(shared: &Arc<Shared>) {
             }
         };
 
+        let started = Instant::now();
+        let mut before = 0u64;
+        let mut after = 0u64;
         for name in COLLECTABLE {
+            // **Flushed before the count, because the sweep flushes anyway.** `compact_range`
+            // starts with a flush, so a "before" taken without one counts the SSTs and not the
+            // memtable the sweep is about to add to them — and the sweep would read as having
+            // *gained* entries. This is the same flush, moved one line earlier so that the two
+            // numbers are comparable.
+            if let Err(error) = shared.db.flush(name) {
+                tracing::warn!(cf = name, error = %error, "flushing before a collection failed");
+                continue;
+            }
+            let held = entries(&shared.db, name);
             if let Err(error) = shared.db.compact_range(name, None, None) {
                 // Loud, and not fatal. The safepoint is unchanged, so the next rise asks again,
                 // and a store that refused to serve because a collection failed would be trading
                 // a space problem for an availability one.
                 tracing::warn!(cf = name, error = %error, "collecting the column family failed");
+                continue;
             }
+            let left = entries(&shared.db, name);
+            tracing::debug!(
+                cf = name,
+                safepoint = target,
+                before = held,
+                after = left,
+                dropped = held.saturating_sub(left),
+                "collected a column family"
+            );
+            before += held;
+            after += left;
         }
+        // **One line per sweep at `info`**, because a sweep is rare by construction — at most one
+        // per debounce — and it is the answer to "did publishing that safepoint reclaim anything".
+        // Until this existed the only way to tell a collection that dropped three quarters of the
+        // store from one that dropped nothing was to measure the directory (run 127i).
+        tracing::info!(
+            safepoint = target,
+            before,
+            after,
+            dropped = before.saturating_sub(after),
+            took_ms = started.elapsed().as_millis(),
+            "collected"
+        );
 
         let Ok(mut state) = shared.state.lock() else {
             return;

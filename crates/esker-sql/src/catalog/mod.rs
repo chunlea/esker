@@ -3004,7 +3004,7 @@ impl<'a> View<'a> {
     ///
     /// # Why this exists
     ///
-    /// [`pg_relations::Relations::read`] needs a record per table and needs it for every table:
+    /// `pg_relations::Relations::read` needs a record per table and needs it for every table:
     /// the record is what says a table is a materialized view rather than a table (ADR 0064) and
     /// what an index's row is positioned against. It was asking [`View::table_record_by_id`] once
     /// per table, which is a point read each — `2n + 16` keys for a catalog of `n` relations, of
