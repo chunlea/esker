@@ -1,0 +1,68 @@
+crates/esker-cli/tests/pgwire_pd_failover.rs
+  h_44076b318daf9c 58-68,129-147
+crates/esker-client/src/raw.rs
+  h_44076b318daf9c 205-209,249-254,272-282,361-380,382-383
+crates/esker-client/src/wire.rs
+  h_44076b318daf9c 158-177
+crates/esker-client/tests/leader_kill_retry.rs
+  h_44076b318daf9c 84-87,137-139
+crates/esker-client/tests/multi_region.rs
+  h_44076b318daf9c 384-388,391,395
+crates/esker-client/tests/raw_scan_reverse.rs
+  h_44076b318daf9c 1-175
+crates/esker-client/tests/refusals.rs
+  h_44076b318daf9c 63-72,82-101,161,192-195
+crates/esker-engine/src/db/compact.rs
+  h_44076b318daf9c 1181-1191,1198,1205-1207
+crates/esker-engine/tests/wal_sync.rs
+  h_44076b318daf9c 273-280,292,295-297
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 274-277,279-292,294-298,300-301,304,307-313,958-990,4661-4675,4680-4682
+crates/esker-sql/src/exec/query.rs
+  h_44076b318daf9c 628-630,1290-1294,1336-1339,2096-2098,2101,2103-2109,2222,2233,2236,2557-2566,2569-2570,2914,2935,2938,3123-3127,3129,3136,3145-3146,3153-3158,3160-3181,3214,3218,3224
+crates/esker-sql/src/pgwire/server.rs
+  h_44076b318daf9c 254,258-290,303-306,308,315-317,325-330,341,363-370,379,384-387,1086-1088
+crates/esker-sql/src/pgwire/session.rs
+  h_44076b318daf9c 255-276,282-286,1281-1286
+crates/esker-sql/tests/a_self_join_counts_nothing.rs
+  h_44076b318daf9c 1-365
+crates/esker-sql/tests/a_session_that_ends_gives_back_what_it_held.rs
+  h_44076b318daf9c 1-264
+crates/esker-sql/tests/collection_keeps_up.rs
+  h_44076b318daf9c 229-233,235-260,262-266
+crates/esker-sql/tests/joint_gate.rs
+  h_44076b318daf9c 1150-1271,1383-1475,1527-1540
+crates/esker-sql/tests/pd_wiring.rs
+  h_44076b318daf9c 121-127,130-133
+crates/esker-sql/tests/routing_differential.rs
+  h_44076b318daf9c 653,907,920,1115-1125
+crates/esker-sql/tests/transaction_timeouts.rs
+  h_44076b318daf9c 752-757
+crates/esker-store/src/columnar/region.rs
+  h_44076b318daf9c 66,904,922-986
+crates/esker-store/src/server.rs
+  h_44076b318daf9c 2980-3022
+crates/esker-store/tests/a_collection_under_many_keys.rs
+  h_44076b318daf9c 1-445
+crates/esker-store/tests/a_live_key_a_scan_does_not_answer_for.rs
+  h_44076b318daf9c 1-365
+crates/esker-store/tests/multi_region.rs
+  h_44076b318daf9c 23-32,520,522-526,706,709-711
+crates/esker-store/tests/pd_client.rs
+  h_44076b318daf9c 167-173,276,287-289
+crates/esker-store/tests/split.rs
+  h_44076b318daf9c 89-100,103,111-115,130,141-145,187,209-211,221,233-237,245,254-258,266,269-272,397,404-406,850,853-855
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,111-115,118-120,133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "84b84f1668fde2a9d42d17ec3a99278368ea0b4b",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
