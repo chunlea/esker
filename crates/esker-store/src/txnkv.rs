@@ -59,6 +59,15 @@ pub const MAX_SCAN_LIMIT: u32 = 8192;
 /// caller never sees at all.
 pub const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 
+/// Most distinct user keys one pass of [`user_keys_in`] collects before `scan` reads them.
+///
+/// **A chunk, not a quota** (#79). What a key costs the caller's `limit` is decided by the read
+/// at `ts` — a key whose newest version is a `Delete` costs an iteration step and nothing else —
+/// so this bounds only how much of the range is held in memory at once, and `scan` asks for
+/// another chunk until the limit is full or the range is done. It was `MAX_SCAN_LIMIT` and it
+/// was the quota, which is how a catalog with 8,064 dropped tables lost the live ones above them.
+const KEY_CHUNK: usize = 1024;
+
 /// The five questions of `docs/txn-spec.md` §5, answered out of one engine snapshot.
 ///
 /// Pinned for the whole of one request: every read a decision makes must see the same instant,
@@ -324,6 +333,28 @@ pub fn get(db: &Db, user_key: &[u8], ts: u64) -> Result<TxnKvResp, ProtoError> {
 /// Stops at the first lock rather than skipping it: a scan that returned the rows it could read
 /// and silently omitted the locked one would be a scan whose result is not a snapshot of
 /// anything. The client resolves and asks again.
+///
+/// # What the limit counts, and why that is the whole of #79
+///
+/// `limit` counts **pairs this answer carries**. It used to be spent on every distinct user key
+/// the range held, live or dead — `user_keys_in` collected at most `MAX_SCAN_LIMIT` of them and
+/// the read at `ts` then threw most away — so a range whose dead keys outnumbered the ceiling
+/// answered with a **prefix of itself and no sign that it had**. Run 127 attempt 4 is what that
+/// costs: a tenant with 8,342 catalog table records, 278 of them live, and the 150 ids past the
+/// 8,192nd key unreachable, so `a name points at table 34755, which is not there`.
+///
+/// The ceiling that remains is a **chunk** ([`KEY_CHUNK`]) rather than a quota: a key the read
+/// finds nothing live under costs an iteration step and no slot, and the walk asks for another
+/// chunk until it has filled the caller's limit or run out of range.
+///
+/// # A short answer is never the end of the range, and an empty one always is
+///
+/// Two things still stop this early — the caller's `limit`, and [`MAX_SCAN_BYTES`], which no
+/// caller can see — so a client must not read "fewer pairs than I asked for" as "that is all
+/// there is" (`docs/DESIGN.md` §9). What makes the other half of that contract work is here:
+/// the byte budget is checked **after** a pair is pushed, so a range holding any live key at all
+/// answers with at least one. An **empty** answer therefore means the range is exhausted, and it
+/// is the only thing that does.
 pub fn scan(
     db: &Db,
     start: &[u8],
@@ -333,23 +364,47 @@ pub fn scan(
     reverse: bool,
 ) -> Result<TxnKvResp, ProtoError> {
     let snapshot = EngineSnapshot::new(db);
+    // **Zero is "as many as the server will give"**, which is what a `Scan`'s `limit` means on
+    // the wire (`esker_proto::DEFAULT_SCAN_LIMIT`) and what `rawkv::scan` has always done. This
+    // read it as a literal zero and answered with nothing at all.
+    let limit = if limit == 0 {
+        MAX_SCAN_LIMIT
+    } else {
+        limit.min(MAX_SCAN_LIMIT)
+    } as usize;
+
     let mut pairs = Vec::new();
     let mut bytes = 0usize;
-    let limit = limit.min(MAX_SCAN_LIMIT) as usize;
+    // The last user key the walk has consumed, and where the next chunk resumes from.
+    let mut after: Option<Vec<u8>> = None;
 
-    for user_key in user_keys_in(db, &snapshot, start, end, reverse)? {
-        if pairs.len() >= limit || bytes >= MAX_SCAN_BYTES {
-            break;
+    'chunks: loop {
+        let keys = user_keys_in(db, &snapshot, start, end, reverse, after.as_deref())?;
+        // A chunk the walk could not fill is the end of the range; a full one may not be.
+        let exhausted = keys.len() < KEY_CHUNK;
+        after = keys.last().cloned();
+        for user_key in keys {
+            match esker_txn::read(&snapshot, &user_key, ts).map_err(txn_to_proto)? {
+                ReadOutcome::Value(value) => {
+                    bytes += user_key.len() + value.len();
+                    pairs.push((Bytes::from(user_key), value));
+                    // **Checked after the push**, so one live key always produces one pair and
+                    // an empty answer can only mean an exhausted range. A single pair larger
+                    // than the whole budget is still returned: a scan that can never make
+                    // progress is worse than a large frame.
+                    if pairs.len() >= limit || bytes >= MAX_SCAN_BYTES {
+                        break 'chunks;
+                    }
+                }
+                // A dead key. It cost a step and it costs no slot.
+                ReadOutcome::NotFound => {}
+                ReadOutcome::Locked(lock) => {
+                    return Err(lock_info(&user_key, &lock).into_error());
+                }
+            }
         }
-        match esker_txn::read(&snapshot, &user_key, ts).map_err(txn_to_proto)? {
-            ReadOutcome::Value(value) => {
-                bytes += user_key.len() + value.len();
-                pairs.push((Bytes::from(user_key), value));
-            }
-            ReadOutcome::NotFound => {}
-            ReadOutcome::Locked(lock) => {
-                return Err(lock_info(&user_key, &lock).into_error());
-            }
+        if exhausted {
+            break;
         }
     }
     Ok(TxnKvResp::Scan { pairs })
@@ -371,22 +426,45 @@ pub fn scan(
 /// promises not to have. Including the key means `read` meets the lock and refuses, the client
 /// resolves it and asks again, and the row appears (or does not, if the transaction was rolled
 /// back) for a reason rather than by luck.
+///
+/// # One chunk, and where the next one starts
+///
+/// At most [`KEY_CHUNK`] keys come back, taken from the low end of the range walking forward and
+/// from the high end walking back, and `after` names the last key the caller has already
+/// consumed so the next chunk resumes **strictly past** it. That is what bounds the memory of a
+/// scan over a range of eight thousand dropped keys without bounding the *answer*, which is the
+/// mistake #79 was.
+///
+/// Each column family is walked for its own `KEY_CHUNK` keys and the union is then cut to
+/// `KEY_CHUNK`. The cut is safe because it falls at the `KEY_CHUNK`-th key of the union, so any
+/// key either family holds on the near side of it is already inside that family's own chunk —
+/// and anything beyond is picked up by the next resume.
 fn user_keys_in(
     db: &Db,
     snapshot: &EngineSnapshot<'_>,
     start: &[u8],
     end: &[u8],
     reverse: bool,
+    after: Option<&[u8]>,
 ) -> Result<Vec<Vec<u8>>, ProtoError> {
-    let low = key::prefix(start);
-    let high = if end.is_empty() {
+    let mut low = key::prefix(start);
+    let mut high = if end.is_empty() {
         namespace_end()
     } else {
         key::prefix(end)
     };
-    // Enough to fill any limit the caller could have asked for, and a bound so a scan of a
-    // region with millions of keys cannot be made to collect them all.
-    let ceiling = MAX_SCAN_LIMIT as usize;
+    // The resume point, **exclusive on both families**: `key::prefix` is the `lock` entry of a
+    // key and sorts below every one of its `write` versions, and `version_range().1` sorts above
+    // all of them — so cutting the range at those two excludes the key itself whichever family
+    // it was found in.
+    if let Some(key) = after {
+        if reverse {
+            high = key::prefix(key);
+        } else {
+            low = key::version_range(key).1;
+        }
+    }
+
     // A set rather than a run of adjacent duplicates: the two column families are walked
     // separately and a key can be in both. Memcomparable order is user-key order, so what
     // comes out is still sorted.
@@ -395,17 +473,33 @@ fn user_keys_in(
     let mut versions = db
         .iter(cf::WRITE, &snapshot.options)
         .map_err(|error| engine_to_proto(&error))?;
-    versions.seek(&low);
-    while versions.valid() && versions.key() < high.as_slice() && keys.len() < ceiling {
-        let (user_key, _) = key::split(versions.key()).map_err(txn_to_proto)?;
-        // **Past the whole key, not on to its next version** (#58). Every remaining entry under
-        // this prefix is an older version of a key already taken, and the answer is a *set of
-        // keys* — so stepping them cost `O(keys × versions)` and produced nothing. The set
-        // deduped the answer and hid the work: the rows never grew and the steps grew with every
-        // commit in the range's history.
-        let (_, past_this_key) = key::version_range(&user_key);
-        keys.insert(user_key);
-        versions.seek(&past_this_key);
+    let mut taken = 0usize;
+    if reverse {
+        step_below(&mut versions, &high);
+        while versions.valid() && versions.key() >= low.as_slice() && taken < KEY_CHUNK {
+            let (user_key, _) = key::split(versions.key()).map_err(txn_to_proto)?;
+            // Past the whole key on the way down, for the reason the forward walk has below.
+            let (first_of_key, _) = key::version_range(&user_key);
+            if keys.insert(user_key) {
+                taken += 1;
+            }
+            step_below(&mut versions, &first_of_key);
+        }
+    } else {
+        versions.seek(&low);
+        while versions.valid() && versions.key() < high.as_slice() && taken < KEY_CHUNK {
+            let (user_key, _) = key::split(versions.key()).map_err(txn_to_proto)?;
+            // **Past the whole key, not on to its next version** (#58). Every remaining entry
+            // under this prefix is an older version of a key already taken, and the answer is a
+            // *set of keys* — so stepping them cost `O(keys × versions)` and produced nothing.
+            // The set deduped the answer and hid the work: the rows never grew and the steps
+            // grew with every commit in the range's history.
+            let (_, past_this_key) = key::version_range(&user_key);
+            if keys.insert(user_key) {
+                taken += 1;
+            }
+            versions.seek(&past_this_key);
+        }
     }
     versions.status().map_err(|error| engine_to_proto(&error))?;
 
@@ -413,10 +507,21 @@ fn user_keys_in(
     let mut locks = db
         .iter(cf::LOCK, &snapshot.options)
         .map_err(|error| engine_to_proto(&error))?;
-    locks.seek(&low);
-    while locks.valid() && locks.key() < high.as_slice() && keys.len() < ceiling {
-        keys.insert(key::split_lock(locks.key()).map_err(txn_to_proto)?);
-        locks.next();
+    let mut held = 0usize;
+    if reverse {
+        step_below(&mut locks, &high);
+        while locks.valid() && locks.key() >= low.as_slice() && held < KEY_CHUNK {
+            keys.insert(key::split_lock(locks.key()).map_err(txn_to_proto)?);
+            held += 1;
+            locks.prev();
+        }
+    } else {
+        locks.seek(&low);
+        while locks.valid() && locks.key() < high.as_slice() && held < KEY_CHUNK {
+            keys.insert(key::split_lock(locks.key()).map_err(txn_to_proto)?);
+            held += 1;
+            locks.next();
+        }
     }
     locks.status().map_err(|error| engine_to_proto(&error))?;
 
@@ -424,7 +529,20 @@ fn user_keys_in(
     if reverse {
         keys.reverse();
     }
+    // The union of two chunks can be twice a chunk; the answer is the near end of it.
+    keys.truncate(KEY_CHUNK);
     Ok(keys)
+}
+
+/// Puts `iter` on the largest key **strictly below** `target`.
+///
+/// `seek_for_prev` lands on the largest key at or below its target, so the step down is a loop
+/// and not a single call: an engine key equal to the target is one this walk has already taken.
+fn step_below(iter: &mut esker_engine::DbIterator, target: &[u8]) {
+    iter.seek_for_prev(target);
+    while iter.valid() && iter.key() >= target {
+        iter.prev();
+    }
 }
 
 /// One past every key in the `'x'` namespace.

@@ -1,6 +1,6 @@
-//! **The P0 of run 127 attempt 4, and it is not the collector.** A transactional `Scan` over a
-//! range holding more distinct keys than `txnkv::MAX_SCAN_LIMIT` answers with a **prefix** of the
-//! range and no sign that it did.
+//! **#79 — the P0 of run 127 attempt 4, and it is not the collector.** A transactional `Scan`
+//! over a range holding more distinct keys than `txnkv::MAX_SCAN_LIMIT` answered with a **prefix**
+//! of the range and no sign that it had.
 //!
 //! # What the preserved data directory says
 //!
@@ -34,13 +34,25 @@
 //! where zero means "as many as the server will give". It is given a prefix, builds its map from it,
 //! and a name record pointing above the cutoff is then a name pointing at a table that is not there.
 //!
-//! # `#[ignore]`d, and that is the shape of an acceptance
+//! # Two bugs, and the first one hid the second
 //!
-//! Fixing it is a decision about what a `Scan` promises — walk until the caller's limit is filled in
-//! *live* pairs, or answer with a resumption cursor and let the caller page — and both change the
-//! contract this store offers. That is the human's call (`CLAUDE.md`, "Ask before doing"), so this
-//! file pins the defect the way `safepoint_collects.rs` pins #60: red on purpose, and removing the
-//! attribute is the acceptance.
+//! `limit` also arrived here as a literal number rather than as what the wire says it means:
+//! `scan` did `limit.min(MAX_SCAN_LIMIT)`, so a caller passing **zero** — "as many as the server
+//! will give", which is what `rawkv::scan` has always done with it — was answered with nothing at
+//! all. No client ever sent zero, because `Router::bounded_limit` turned it into 1,024 first, so
+//! the only way to meet it was to call the store directly. This test did, which is why its first
+//! red printed `0 pairs` where the ceiling alone explains `0` just as well. **The evidence for the
+//! ceiling is on disk and not here**: tenant 1's 8,342 table keys, the 8,192nd of them at id
+//! 34617, and the five failures at positions 8255 to 8325.
+//!
+//! # What the fix is
+//!
+//! The ceiling counts **live pairs**, not keys with any version: a dead key costs an iteration
+//! step and no slot, and `user_keys_in` became a chunk the walk asks for again rather than a
+//! quota. `scan`'s byte budget is checked after a pair is pushed, so a range holding any live key
+//! answers with at least one — which is what lets a client read an empty batch as the end of a
+//! range and a short one as nothing at all. The client half is
+//! `esker-client/tests/scan_pages_the_whole_range.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -107,12 +119,12 @@ fn commit(
     }
 }
 
-/// **A scan of a range whose dead keys outnumber the ceiling loses the live ones above them.**
+/// **A range whose dead keys outnumber the ceiling still answers for the live ones above them.**
 ///
 /// The call is the catalog's: the whole range, `limit = 0` — "as many as the server will give".
+/// Before the fix it answered with nothing at all, and the eight keys at the top of the range were
+/// simply not in it.
 #[test]
-#[ignore = "the P0 of run 127 attempt 4: a scan silently answers with a prefix of its range; \
-            fixing it changes what Scan promises and is the human's call"]
 fn a_scan_of_the_whole_range_answers_for_every_live_key_in_it() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), StoreOptions::new()).unwrap();
@@ -165,10 +177,15 @@ fn a_scan_of_the_whole_range_answers_for_every_live_key_in_it() {
 
     let found: Vec<Bytes> = pairs.into_iter().map(|(key, _)| key).collect();
     let want: Vec<Bytes> = (KEYS - ALIVE..KEYS).map(key).collect();
+    println!(
+        "  {KEYS} distinct keys · {ALIVE} live · {} stepped past · {} pairs read",
+        KEYS - ALIVE,
+        found.len()
+    );
     assert_eq!(
         found,
         want,
-        "{KEYS} distinct keys in the range, {ALIVE} of them live, and the store's ceiling is \
+        "{KEYS} distinct keys in the range, {ALIVE} of them live, and the old ceiling was \
          {MAX_SCAN_LIMIT} keys — so the scan stopped {} keys short of the live ones and answered \
          with {} pairs and no sign it had stopped",
         KEYS - MAX_SCAN_LIMIT as usize,

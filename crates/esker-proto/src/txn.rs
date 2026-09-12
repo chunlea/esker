@@ -404,12 +404,16 @@ pub enum TxnKvReq {
         ts: u64,
     },
     /// Read `[start, end)` as of `ts`, at most `limit` pairs.
+    ///
+    /// **One answer, not the range.** The store also stops on a byte budget the caller cannot
+    /// see, so a batch shorter than `limit` is not the end of the range — only an empty batch is
+    /// (`docs/DESIGN.md` §9, #79).
     Scan {
         /// Inclusive lower bound.
         start: Bytes,
         /// Exclusive upper bound; empty means the end of the key space.
         end: Bytes,
-        /// Most pairs to return.
+        /// Most pairs to return, or zero for "as many as the server will give".
         limit: u32,
         /// The reading transaction's snapshot.
         ts: u64,
