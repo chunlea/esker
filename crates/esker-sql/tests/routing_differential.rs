@@ -1172,8 +1172,23 @@ impl TimestampOracle for WallClockOracle {
 /// A statement that has to succeed, retried through the leadership gap a saturated machine
 /// produces (`docs/plans/phase-9-rails.md` §8).
 fn settle(session: &mut Session, sql: &str) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // **Attempts, not seconds** (`#89`). This was a thirty-second wall clock, and thirty seconds is
+    // not a property of the statement — it is a property of the box. Measured on one run of this
+    // binary at load 3.6–4.3, its tests ranged from **4.2 s to 252 s**, so a statement that needs
+    // one retry on a quiet box and thirty on a busy one is the same statement, and the bound has to
+    // count the asking rather than the clock. The same change `#68` made to
+    // `statement_across_a_leader_kill` for the same reason, and the lane rule that a gate test must
+    // not assert on wall clock says it in general.
+    //
+    // What this does **not** do is excuse a cluster with no leader: forty attempts with a rising
+    // backoff is a long time to ask, the elapsed is in the message, and the failure names the
+    // attempt count and the last answer — so a real liveness hole is still a failure with a
+    // diagnosis rather than a timeout.
+    const ATTEMPTS: usize = 40;
+    let began = Instant::now();
+    let mut attempts = 0usize;
     loop {
+        attempts += 1;
         match session.run(sql) {
             // Applied — or applied by an attempt whose answer was lost, which is what a duplicate
             // says to a retry of an idempotent statement. One arm because they are one outcome:
@@ -1196,8 +1211,14 @@ fn settle(session: &mut Session, sql: &str) {
                 | esker_sql::SqlError::StoreUnavailable(_)
                 | esker_sql::SqlError::SerializationFailure { .. }),
             ) => {
-                assert!(Instant::now() < deadline, "`{sql}` never settled: {error}");
-                std::thread::sleep(Duration::from_millis(100));
+                assert!(
+                    attempts < ATTEMPTS,
+                    "`{sql}` never settled in {ATTEMPTS} attempts over {:?}; last answer {error}",
+                    began.elapsed()
+                );
+                // Rising and capped, so a statement that needs one wait is not made to wait as
+                // long as one that needs twenty.
+                std::thread::sleep(Duration::from_millis(50 * attempts.min(20) as u64));
             }
             Err(error) => panic!("`{sql}`: {error}"),
         }
@@ -1211,8 +1232,23 @@ fn settle(session: &mut Session, sql: &str) {
 /// list is shorter than [`settle`]'s and needs no duplicate arm. Anything outside it is the test's
 /// answer, not a condition to wait out.
 fn rows(session: &mut Session, sql: &str) -> Vec<Vec<Option<String>>> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // **Attempts, not seconds** (`#89`). This was a thirty-second wall clock, and thirty seconds is
+    // not a property of the statement — it is a property of the box. Measured on one run of this
+    // binary at load 3.6–4.3, its tests ranged from **4.2 s to 252 s**, so a statement that needs
+    // one retry on a quiet box and thirty on a busy one is the same statement, and the bound has to
+    // count the asking rather than the clock. The same change `#68` made to
+    // `statement_across_a_leader_kill` for the same reason, and the lane rule that a gate test must
+    // not assert on wall clock says it in general.
+    //
+    // What this does **not** do is excuse a cluster with no leader: forty attempts with a rising
+    // backoff is a long time to ask, the elapsed is in the message, and the failure names the
+    // attempt count and the last answer — so a real liveness hole is still a failure with a
+    // diagnosis rather than a timeout.
+    const ATTEMPTS: usize = 40;
+    let began = Instant::now();
+    let mut attempts = 0usize;
     loop {
+        attempts += 1;
         match session.run(sql) {
             Ok(esker_sql::pgwire::session::Outcome::Rows { rows, .. }) => {
                 return rows
@@ -1232,8 +1268,14 @@ fn rows(session: &mut Session, sql: &str) -> Vec<Vec<Option<String>>> {
                 | esker_sql::SqlError::StoreUnavailable(_)
                 | esker_sql::SqlError::SerializationFailure { .. }),
             ) => {
-                assert!(Instant::now() < deadline, "`{sql}` never settled: {error}");
-                std::thread::sleep(Duration::from_millis(100));
+                assert!(
+                    attempts < ATTEMPTS,
+                    "`{sql}` never settled in {ATTEMPTS} attempts over {:?}; last answer {error}",
+                    began.elapsed()
+                );
+                // Rising and capped, so a statement that needs one wait is not made to wait as
+                // long as one that needs twenty.
+                std::thread::sleep(Duration::from_millis(50 * attempts.min(20) as u64));
             }
             Err(error) => panic!("`{sql}`: {error}"),
         }
