@@ -409,7 +409,7 @@ impl Gate {
         table_id: u64,
         ts: u64,
         min_apply_index: u64,
-        projection: Vec<u32>,
+        projection: &[u32],
     ) -> Vec<Vec<Cell>> {
         // **A refusal is designed behaviour here, not a failure** (`#86`, `#88`). A columnar copy
         // cannot see an unresolved secondary lock, so rather than answer one row short in silence
@@ -435,7 +435,7 @@ impl Gate {
                 table_id,
                 ts,
                 min_apply_index,
-                projection.clone(),
+                projection.to_vec(),
             );
             if let FragmentResp::Result { result, .. } = answer {
                 break result;
@@ -447,7 +447,7 @@ impl Gate {
                  to resolve any lock that was standing:\n  {}",
                 refusals.join("\n  ")
             );
-            let _ = self.row_scan(ts, table_id, &projection);
+            let _ = self.row_scan(ts, table_id, projection);
         };
         let Body::Rows { rows, .. } = esker_proto::fragment::result::decode(&result).unwrap()
         else {
@@ -1356,7 +1356,7 @@ async fn a_lock_the_ttl_kills_resolves_the_same_way_on_both_engines() {
         .max()
         .expect("some store leads the region");
     let columns = tokio::task::block_in_place(|| {
-        gate.fragment(TENANT, table_id, ts, min_apply_index, projection.clone())
+        gate.fragment(TENANT, table_id, ts, min_apply_index, &projection)
     });
 
     compare(
@@ -1467,7 +1467,7 @@ async fn a_copy_opened_over_rows_nothing_rewrites_holds_all_of_them() {
 
     let projection = vec![0, 1];
     let columns = tokio::task::block_in_place(|| {
-        gate.fragment(TENANT, table_id, ts, min_apply_index, projection.clone())
+        gate.fragment(TENANT, table_id, ts, min_apply_index, &projection)
     });
     let rows = tokio::task::block_in_place(|| gate.row_scan(ts, table_id, &projection));
 
@@ -1571,7 +1571,7 @@ async fn the_learner_answers_fragments_that_agree_with_a_row_scan() {
         .max()
         .expect("some store leads the region");
     let columns = tokio::task::block_in_place(|| {
-        gate.fragment(TENANT, table_id, ts, min_apply_index, projection.clone())
+        gate.fragment(TENANT, table_id, ts, min_apply_index, &projection)
     });
 
     compare(
