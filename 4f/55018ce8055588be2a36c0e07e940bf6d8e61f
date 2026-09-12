@@ -1,0 +1,19 @@
+crates/esker-store/tests/a_scan_answers_with_a_subset.rs
+  s_cd9e291597edd3::t_70fb078c170992 1-178
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4f55018ce8055588be2a36c0e07e940bf6d8e61f",
+  "prompts": {},
+  "sessions": {
+    "s_cd9e291597edd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "81b290aa-a015-4347-9f4b-ae3daa2044ef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
