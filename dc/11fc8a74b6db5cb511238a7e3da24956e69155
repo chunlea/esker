@@ -1,0 +1,19 @@
+crates/esker-store/tests/a_lock_is_not_a_version.rs
+  s_cd9e291597edd3::t_1cb25ecce1aae5 1-266
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "dc11fc8a74b6db5cb511238a7e3da24956e69155",
+  "prompts": {},
+  "sessions": {
+    "s_cd9e291597edd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "81b290aa-a015-4347-9f4b-ae3daa2044ef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
