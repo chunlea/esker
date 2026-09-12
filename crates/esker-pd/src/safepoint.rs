@@ -106,10 +106,21 @@ impl Safepoints {
         // is smaller than any retention window expressed in milliseconds, so this floors at zero —
         // a safepoint of zero collects nothing, which is the direction that cannot lose data.
         let window = now.saturating_sub(as_ts(self.retention_ms));
+        // **A reporter that said "nothing open" pins its own last word**, not nothing at all. It
+        // spoke about the instant it spoke; a transaction may have begun immediately after, and it
+        // will not reach PD until that reporter's next round. Treating the silence between rounds
+        // as "no constraint" is what let the window walk past a live read — measured on the gate
+        // of 2026-09-11 at 598 ms past a fifteen-second-old snapshot, with a one-second window and
+        // a report riding the schema lease's refresh period, which is seconds.
+        //
+        // The cost is paid only where the reports are slower than the window: there the safepoint
+        // lags the last round instead of the window, which collects less history and never the
+        // wrong history. Where reports are faster — every deployment that has not turned the
+        // window down — `heard` is newer than the window and this changes nothing.
         let oldest = self
             .reporters
             .values()
-            .filter_map(|reporter| reporter.oldest)
+            .map(|reporter| reporter.oldest.unwrap_or(reporter.heard))
             .min();
         let computed = oldest.map_or(window, |oldest| window.min(oldest));
 
@@ -234,6 +245,52 @@ mod tests {
             safepoints.safepoint(long_after),
             held,
             "the last reporter timing out advanced the safepoint on nobody's word"
+        );
+    }
+
+    /// **A reporter's silence is only a statement about the instant it spoke.**
+    ///
+    /// A reporter that said "nothing open" at `R` has told PD nothing about `R + 1`: a transaction
+    /// may have begun the moment after, and it will not be reported until the reporter's next
+    /// round. So the window must not walk past `R` on that reporter's word — the same rule
+    /// `an_empty_registry_does_not_advance_the_safepoint` applies to a registry with nothing in
+    /// it, applied to the gap between one reporter's rounds.
+    ///
+    /// **This is not hypothetical and the window being short is not the cause.** A node reports on
+    /// its schema lease's refresh period, which is seconds; `esker-cli`'s
+    /// `safepoint_spares_a_long_read` runs with a one-second window, and on the gate of 2026-09-11
+    /// it refused a fifteen-second-old read whose snapshot was **598 ms** below the published
+    /// safepoint. A retention window shorter than a report interval is a configuration an operator
+    /// may reasonably choose, and it must cost history rather than correctness.
+    #[test]
+    fn the_window_does_not_walk_past_a_reporters_last_word() {
+        // **Its own window**, and a short one: this is about a window shorter than the interval
+        // between reports, which is exactly the configuration `esker-cli`'s end-to-end test runs
+        // with. The module's `WINDOW_MS` is ten minutes, against which every timestamp here would
+        // underflow to zero and the test would pass by measuring nothing.
+        let mut safepoints = Safepoints::new(1_000, TTL_MS);
+
+        // It has nothing open, and says so — at 10 s, and then not again.
+        safepoints.report(1, None, ts(10_000));
+
+        // Two seconds later, with a one-second window. A read that began at 10.5 s is held by this
+        // reporter and has not reached PD yet, so a safepoint above 10 s would collect under it.
+        let published = safepoints.safepoint(ts(12_000));
+        assert!(
+            published <= ts(10_000),
+            "the safepoint reached {published} on the word of a reporter that last spoke at \
+             {}: anything it has opened since is invisible, and the window is not allowed to \
+             assume otherwise",
+            ts(10_000)
+        );
+
+        // And it still moves when the reporter keeps speaking, which is the half that makes this a
+        // constraint rather than a freeze.
+        safepoints.report(1, None, ts(12_000));
+        assert_eq!(
+            safepoints.safepoint(ts(12_000)),
+            ts(11_000),
+            "a reporter speaking at the same instant leaves the window in charge"
         );
     }
 
