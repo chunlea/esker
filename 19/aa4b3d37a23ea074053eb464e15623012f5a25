@@ -1,0 +1,46 @@
+crates/esker-sql/src/catalog/pg_catalog.rs
+  h_44076b318daf9c 2240,2501-2513
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 1566-1582,3358-3362
+crates/esker-sql/src/exec/assign.rs
+  h_44076b318daf9c 44,51-53,228-235,238,240-241,258-259,282,316-321,324-332
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 512
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 817-824,827,832-839,863,920,930,939,954,956-958,962-963,967,976,1294,1776
+crates/esker-sql/src/value/hstore.rs
+  h_44076b318daf9c 105-142
+crates/esker-sql/src/value/mod.rs
+  h_44076b318daf9c 980-994
+crates/esker-sql/tests/captures/pg19_cast_matrix.txt
+  h_44076b318daf9c 42,49-57,97-98
+crates/esker-sql/tests/captures/pg19_integer_literal_width.txt
+  h_44076b318daf9c 1-409
+crates/esker-sql/tests/captures/pg19_set_operation_enums.txt
+  h_44076b318daf9c 1-402
+crates/esker-sql/tests/captures/pg19_text_array_to_hstore.txt
+  h_44076b318daf9c 1-215
+crates/esker-sql/tests/cast_matrix.rs
+  h_44076b318daf9c 409-496
+crates/esker-sql/tests/enum_type_mismatch.rs
+  h_44076b318daf9c 212-216,220-290
+crates/esker-sql/tests/enum_value.rs
+  h_44076b318daf9c 73-79
+crates/esker-sql/tests/set_operation.rs
+  h_44076b318daf9c 142-143
+crates/esker-sql/tests/set_operation_enum.rs
+  h_44076b318daf9c 64-67
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,114-115,129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "19aa4b3d37a23ea074053eb464e15623012f5a25",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
