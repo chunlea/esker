@@ -1,0 +1,35 @@
+crates/esker-sql/src/exec/assign.rs
+  s_cd9e291597edd3::t_a7cc5de0281148 44,51-53,228-235,238,240-241,258-259,282,316-321,324-332
+crates/esker-sql/src/exec/ddl.rs
+  s_cd9e291597edd3::t_b28d8924d4e9fb 512
+crates/esker-sql/src/exec/dml.rs
+  s_cd9e291597edd3::t_4dd00d1cc99762 817-824,827,832-839,863,920,930,939,954,956-958,962-963,967,976,1294,1776
+crates/esker-sql/tests/captures/pg19_integer_literal_width.txt
+  s_cd9e291597edd3::t_a79a67e96eff56 1-409
+crates/esker-sql/tests/captures/pg19_set_operation_enums.txt
+  s_cd9e291597edd3::t_0d859c2cb2ab2d 1-402
+crates/esker-sql/tests/enum_type_mismatch.rs
+  s_cd9e291597edd3::t_2d1d938c696558 212-216,220-290
+crates/esker-sql/tests/enum_value.rs
+  s_cd9e291597edd3::t_87fb54bb1df1c1 73-79
+crates/esker-sql/tests/set_operation.rs
+  s_cd9e291597edd3::t_a541221bc95803 142-143
+crates/esker-sql/tests/set_operation_enum.rs
+  s_cd9e291597edd3::t_bb8f4802071abb 64-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c24164f7f3432e72cc0aaf3c0958f0526f1274c6",
+  "prompts": {},
+  "sessions": {
+    "s_cd9e291597edd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "81b290aa-a015-4347-9f4b-ae3daa2044ef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
