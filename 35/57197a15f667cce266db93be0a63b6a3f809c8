@@ -1,0 +1,21 @@
+crates/esker-sql/tests/a_self_join_counts_nothing.rs
+  s_cd9e291597edd3::t_489a1ad7a95f25 1-219
+docs/plans/debts-v1.1.md
+  s_cd9e291597edd3::t_e8abc23f22277b 111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3557197a15f667cce266db93be0a63b6a3f809c8",
+  "prompts": {},
+  "sessions": {
+    "s_cd9e291597edd3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "81b290aa-a015-4347-9f4b-ae3daa2044ef",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
