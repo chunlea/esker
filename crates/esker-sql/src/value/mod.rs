@@ -977,6 +977,21 @@ pub fn convert_without_text(value: &Datum, to: ColumnType) -> Option<Result<Datu
         (Datum::Hstore(text), ColumnType::Json | ColumnType::Jsonb) => {
             Some(hstore::from_text(text).map(|map| Datum::Text(hstore::to_json(&map))))
         }
+        // **A `text[]` into an hstore**, the third row of that family and the one the cast matrix
+        // had open: `hstore(text[])` reads the array as key, value, key, value. Here for the same
+        // reason the two above are — the fold, a cast over a column and an element of an
+        // `hstore[]` must not disagree — and guarded on the element type because the row is
+        // `text[]` alone: `'{a,1}'::varchar[]::hstore` is `42846` on 19beta1, measured.
+        (Datum::Array(array), ColumnType::Hstore)
+            if array.element == ColumnType::Text && array.dims.len() <= 1 =>
+        {
+            let elements: Vec<Option<String>> = array
+                .values
+                .iter()
+                .map(|element| element.as_ref().and_then(PgDatum::to_text))
+                .collect();
+            Some(hstore::from_text_array(&elements).map(|map| Datum::Hstore(hstore::to_text(&map))))
+        }
         // **A `bool` and an `int4`, both ways.** `pg_cast` has the two rows and no others in the
         // family: `true::int4` is `1`, `0::int4::bool` is `false` and anything else is `true`.
         // Through the text this was `int4in` reading `t`.

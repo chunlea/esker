@@ -406,6 +406,94 @@ fn an_hstore_casts_to_a_json_document() {
     }
 }
 
+/// **A `text[]` converts to an `hstore`** — the one open row of the whole cast matrix, closed.
+///
+/// This node had no `text[] -> hstore` conversion at all and answered `42846 cannot cast type
+/// text[] to hstore`. A real server *attempts* it: `hstore(text[])` is a real function, the
+/// matrix's probe is the one-element `{x}`, and the refusal is therefore `2202E array must have
+/// even number of elements` — **about the array, not about the pair of types**. What was needed
+/// was the constructor and not a sqlstate, which is what the capture said when the row was left
+/// open (`tests/captures/pg19_cast_matrix.txt`).
+///
+/// Measured on 19beta1 2026-09-11 with `CREATE EXTENSION hstore` inside a rolled-back
+/// transaction, a savepoint per probe (`tests/captures/pg19_text_array_to_hstore.txt`):
+///
+/// ```text
+/// '{a,1}'::text[]::hstore          "a"=>"1"
+/// '{a,1,b,2}'::text[]::hstore      "a"=>"1", "b"=>"2"
+/// '{}'::text[]::hstore             the empty hstore
+/// '{a,NULL}'::text[]::hstore       "a"=>NULL              a NULL value is a value
+/// '{a,1,a,2}'::text[]::hstore      "a"=>"1"               the first of a repeat wins
+/// '{bb,2,a,1,ccc,3}'::text[]::hstore   "a"=>"1", "bb"=>"2", "ccc"=>"3"
+/// '{x}'::text[]::hstore            2202E array must have even number of elements
+/// '{NULL,1}'::text[]::hstore       22004 null value not allowed for hstore key
+/// pg_typeof('{a,1}'::text[]::hstore)   hstore
+/// '{a,1}'::varchar[]::hstore       42846 cannot cast type character varying[] to hstore
+/// 'a=>1'::hstore::text[]           42846 cannot cast type hstore to text[]
+/// ```
+///
+/// **The two refusals at the end are the boundary**: the `pg_cast` row is `text[]` alone and it
+/// goes one way, so a `varchar[]` and the reverse direction must stay `42846`.
+#[test]
+fn a_text_array_converts_to_an_hstore() {
+    let mut node = parity::Node::new(&["CREATE EXTENSION hstore"]);
+    for (written, expected) in [
+        ("'{a,1}'::text[]::hstore", "\"a\"=>\"1\""),
+        ("'{a,1,b,2}'::text[]::hstore", "\"a\"=>\"1\", \"b\"=>\"2\""),
+        ("'{}'::text[]::hstore", ""),
+        ("'{a,NULL}'::text[]::hstore", "\"a\"=>NULL"),
+        // A repeated key keeps its **first** value, which a map that simply inserted would get
+        // backwards and which no same-key-once test can see.
+        ("'{a,1,a,2}'::text[]::hstore", "\"a\"=>\"1\""),
+        // Canonical order — length first, then bytes — and not the order they were written.
+        (
+            "'{bb,2,a,1,ccc,3}'::text[]::hstore",
+            "\"a\"=>\"1\", \"bb\"=>\"2\", \"ccc\"=>\"3\"",
+        ),
+    ] {
+        assert_eq!(
+            node.rows(&format!("SELECT ({written})::text")),
+            vec![vec![expected.to_owned()]],
+            "{written}"
+        );
+    }
+    assert_eq!(
+        node.rows("SELECT pg_typeof('{a,1}'::text[]::hstore)"),
+        vec![vec!["hstore"]],
+        "the cast's declared type is the hstore and not the array it came from"
+    );
+    // **The two refusals, and they are about different things.** An odd list is the array's
+    // complaint, a NULL key is the hstore's, and neither is `42846` about the pair — which is the
+    // whole reason this row was a defect rather than a ruling.
+    let odd = node.run("SELECT '{x}'::text[]::hstore").unwrap_err();
+    assert_eq!(odd.sqlstate(), esker_sql::sqlstate::ARRAY_SUBSCRIPT_ERROR);
+    assert_eq!(odd.to_string(), "array must have even number of elements");
+    let key = node.run("SELECT '{NULL,1}'::text[]::hstore").unwrap_err();
+    assert_eq!(key.sqlstate(), esker_sql::sqlstate::NULL_VALUE_NOT_ALLOWED);
+    assert_eq!(key.to_string(), "null value not allowed for hstore key");
+    // **The boundary**: one row, one direction, one source type.
+    assert_eq!(
+        node.run("SELECT '{a,1}'::varchar[]::hstore")
+            .unwrap_err()
+            .to_string(),
+        "cannot cast type character varying[] to hstore"
+    );
+    assert_eq!(
+        node.run("SELECT 'a=>1'::hstore::text[]")
+            .unwrap_err()
+            .to_string(),
+        "cannot cast type hstore to text[]"
+    );
+    // And the catalog says the row exists, which is what a client reads.
+    assert_eq!(
+        node.rows(
+            "SELECT castcontext, castmethod FROM pg_cast \
+             WHERE castsource = 'text[]'::regtype AND casttarget = 'hstore'::regtype"
+        ),
+        vec![vec!["e", "f"]]
+    );
+}
+
 /// **An element's cast needs the element's declared type**, which is the last row of the matrix
 /// that is a defect rather than a ruling.
 ///
