@@ -12,7 +12,7 @@
 //!
 //! **A corpus holds no command tags** — `psql -q` prints none — so the second test compares them:
 //! the corpus replayed in order on one node, and every `INSERT` that succeeded on PostgreSQL 19 told
-//! the tag it sent there in the same session (`esker-coord/s1-unit-j/tags.out`).
+//! the tag it sent there in the same session (`esker-coord/s1-unit-j/tags-2.out`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -23,10 +23,46 @@ use esker_sql::pgwire::session::Outcome;
 
 const CORPUS: &str = include_str!("corpus/pg19_insert_select.txt");
 
+/// The reason a `RETURNING` that returned no row is listed — `pg19_plpgsql_trigger.txt`'s shape.
+const RETURNED_NO_ROW: &str = "the capture records a `RETURNING` that returned no row as a command: \
+                               `\\gdesc` describes each statement on a connection of its own, \
+                               where the capture's uncommitted tables do not exist, so it has no \
+                               types to tell a result set of no rows from a command. PostgreSQL \
+                               19 sent the result set — `psql` printed the column `id` and \
+                               `(0 rows)` in the same session (`esker-coord/s1-unit-j/tags-2.out`) \
+                               — and this node answers it: `integer`, and no row";
+
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[],
+    answers: &[
+        (
+            "INSERT INTO ti (id) SELECT 100 WHERE false RETURNING id",
+            RETURNED_NO_ROW,
+            "pg19_insert_select.txt:49",
+        ),
+        (
+            "INSERT INTO ti (id, name) SELECT id, 'again' FROM s ORDER BY id ON CONFLICT (id) DO \
+             NOTHING RETURNING id",
+            RETURNED_NO_ROW,
+            "pg19_insert_select.txt:72",
+        ),
+        (
+            "INSERT INTO ti VALUES (1, 'v') ON CONFLICT (id) DO NOTHING RETURNING id",
+            RETURNED_NO_ROW,
+            "pg19_insert_select.txt:77",
+        ),
+        (
+            "INSERT INTO ti (id, name) SELECT 1, 'x' UNION ALL SELECT 1, 'y' ON CONFLICT (id) DO UPDATE \
+         SET name = EXCLUDED.name",
+            "sqlparser 0.62.0 does not read this statement — it stops at `CONFLICT` (`Expected: end of \
+         statement, found: CONFLICT`) — so this node answers 42601 before the statement reaches \
+         the planner. The same set operation parenthesised, four lines down, is read and answers \
+         PostgreSQL 19's 21000: the rule this row measures is built, and the statement is the \
+         parser's",
+            "pg19_insert_select.txt:79",
+        ),
+    ],
 };
 
 #[test]
@@ -131,6 +167,14 @@ const TAGS: &[(&str, &str)] = &[
         "INSERT INTO ti (id, name) SELECT id, name || '!' FROM s ORDER BY id ON CONFLICT (id) DO \
          UPDATE SET name = EXCLUDED.name RETURNING id, name",
         "INSERT 0 3",
+    ),
+    (
+        "INSERT INTO ti VALUES (1, 'v'), (200, 'v') ON CONFLICT (id) DO NOTHING",
+        "INSERT 0 1",
+    ),
+    (
+        "INSERT INTO ti VALUES (1, 'v') ON CONFLICT (id) DO NOTHING RETURNING id",
+        "INSERT 0 0",
     ),
     (
         "INSERT INTO ti (id, name) SELECT 90, 91 RETURNING id, name",

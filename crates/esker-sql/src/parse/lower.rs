@@ -3648,19 +3648,34 @@ fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
             table,
             columns,
             rows: vec![Vec::new()],
+            query: None,
             returning,
             on_conflict: insert.on.as_ref().map(lower_on_conflict).transpose()?,
         });
     };
-    refuse_if(source.with.is_some(), "INSERT ... WITH")?;
-    refuse_if(source.order_by.is_some(), "INSERT ... ORDER BY")?;
-    refuse_if(source.limit_clause.is_some(), "INSERT ... LIMIT")?;
-    refuse_if(source.fetch.is_some(), "INSERT ... FETCH")?;
     refuse_if(!source.locks.is_empty(), "INSERT with a locking clause")?;
 
-    let SetExpr::Values(values) = source.body.as_ref() else {
-        // `INSERT INTO t SELECT ...` needs the query executor, which unit 6c brings.
-        return Err(SqlError::unsupported("INSERT ... SELECT"));
+    // **Anything but a bare `VALUES` list is a query, and its rows are the rows**
+    // (`plan::Insert::query`): a `SELECT`, a set operation, the parenthesised form Arel writes, and a
+    // `VALUES` with a query's own clauses — PostgreSQL 19 inserts one row for
+    // `INSERT INTO t VALUES (1), (2) LIMIT 1`. The `WITH`, `ORDER BY`, `LIMIT` and `OFFSET` written
+    // there are the query's, and `lower_query` reads them as it reads any query's.
+    let bare = source.with.is_none()
+        && source.order_by.is_none()
+        && source.limit_clause.is_none()
+        && source.fetch.is_none();
+    let values = match source.body.as_ref() {
+        SetExpr::Values(values) if bare => values,
+        _ => {
+            return Ok(plan::Insert {
+                table,
+                columns,
+                rows: Vec::new(),
+                query: Some(Box::new(lower_query(source)?)),
+                returning,
+                on_conflict: insert.on.as_ref().map(lower_on_conflict).transpose()?,
+            });
+        }
     };
     refuse_if(values.explicit_row, "INSERT ... VALUES ROW(...)")?;
 
@@ -3673,6 +3688,7 @@ fn lower_insert(insert: &sqlparser::ast::Insert) -> Result<plan::Insert> {
         table,
         columns,
         rows,
+        query: None,
         returning,
         on_conflict: insert.on.as_ref().map(lower_on_conflict).transpose()?,
     })

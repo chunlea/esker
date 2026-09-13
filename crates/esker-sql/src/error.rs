@@ -1064,6 +1064,18 @@ pub enum SqlError {
     #[error("INSERT has more expressions than target columns")]
     InsertTooManyExpressions,
 
+    /// A column list longer than the query's columns: `INSERT INTO t (a, b) SELECT 1`. The same
+    /// grammar class as the one above and decided the same way — before a row is read, so a query
+    /// with no rows is refused too. Measured on PostgreSQL 19.
+    #[error("INSERT has more target columns than expressions")]
+    InsertTooManyTargetColumns,
+
+    /// `DEFAULT` written where no column takes it: `SELECT DEFAULT`, `WHERE DEFAULT`, the query of
+    /// an `INSERT … SELECT`. PostgreSQL's analyzer refuses it with this one sentence wherever it
+    /// appears (`transformExprRecurse`), as a syntax error. Measured on PostgreSQL 19.
+    #[error("DEFAULT is not allowed in this context")]
+    DefaultNotAllowed,
+
     /// A float literal is well-formed and outside the type's range, in either direction:
     /// PostgreSQL raises this for `1e-400` as well as for `1e400`, rather than rounding to zero.
     #[error("\"{value}\" is out of range for type {ty}")]
@@ -3270,6 +3282,8 @@ impl SqlError {
             | SqlError::TypeModifierNotAllowed(_)
             | SqlError::InvalidTypeName(_)
             | SqlError::InsertTooManyExpressions
+            | SqlError::InsertTooManyTargetColumns
+            | SqlError::DefaultNotAllowed
             // A ragged `VALUES` list is a **syntax** error and not a type one, which is worth
             // saying out loud: the rows have no common shape, so there is nothing to type.
             | SqlError::ValuesRowLength

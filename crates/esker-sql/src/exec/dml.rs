@@ -329,15 +329,16 @@ fn refuse_matview_write(table: &TableDef, named: &str) -> Result<()> {
 fn row_at_defaults(
     table: &TableDef,
     targets: &[usize],
-    values: &[crate::plan::Expr],
+    values: &Supplied<'_>,
     txn: &dyn Txn,
     tenant: u64,
 ) -> Result<Vec<Datum>> {
     let supplied: std::collections::BTreeSet<usize> = targets
         .iter()
-        .zip(values)
-        .filter(|(_, expr)| !matches!(expr, crate::plan::Expr::Default))
-        .map(|(target, _)| *target)
+        .take(values.len())
+        .enumerate()
+        .filter(|(at, _)| values.supplies(*at))
+        .map(|(_, target)| *target)
         .collect();
     table
         .columns
@@ -615,12 +616,15 @@ pub(super) fn insert(
         validate_on_conflict(&table, on_conflict)?;
         trigger::refuse_on_conflict(&table)?;
     }
-    // The rows the `AFTER INSERT` triggers will see, and the rows a `BEFORE` trigger took out of the
-    // statement, which its tag does not count.
+    // The rows the `AFTER INSERT` triggers will see, and the rows the statement's tag does not count:
+    // the ones a `BEFORE` trigger took out of the statement, and the ones `ON CONFLICT` did nothing
+    // with.
     let mut after = AfterRows::new(Event::Insert);
     let mut skipped = 0;
+    let source = Source::of(executor, txn, insert, &targets)?;
 
-    for values in &insert.rows {
+    for at in 0..source.len() {
+        let values = source.row(at);
         if values.len() > targets.len() {
             // PostgreSQL calls this a syntax error, oddly enough, and says so before it looks at
             // any of the values.
@@ -641,14 +645,14 @@ pub(super) fn insert(
         // into a table whose `id` defaults to a function this node stores and cannot run was
         // `0A000` for a row that never needed the function. `DEFAULT` written for a column is not
         // supplying it — that spelling *asks* for the default — so it is not in this set.
-        let mut row = row_at_defaults(&table, &targets, values, &*txn, executor.tenant)?;
-        for (target, expr) in targets.iter().zip(values) {
+        let mut row = row_at_defaults(&table, &targets, &values, &*txn, executor.tenant)?;
+        for (position, target) in targets.iter().enumerate().take(values.len()) {
             let column = &table.columns[*target];
             // `DEFAULT` written for a column is the column keeping its own default, which is what
             // the row already holds — including, below, its sequence. It is *not* an explicit
             // value, so a `GENERATED ALWAYS` column takes it: measured, `VALUES (DEFAULT, …)` into
             // one is accepted where `VALUES (7, …)` is `428C9`.
-            if matches!(expr, crate::plan::Expr::Default) {
+            if !values.supplies(position) {
                 continue;
             }
             // `GENERATED ALWAYS` refuses a value the user wrote, and names the clause that
@@ -669,9 +673,9 @@ pub(super) fn insert(
                     column: column.name.clone(),
                 });
             }
-            row[*target] = value_for_column(expr, column, &table, &*txn, &*executor)?;
+            row[*target] = values.value(position, column, &table, &*txn, &*executor)?;
         }
-        fill_sequences(executor, &table, &targets, values, &mut row)?;
+        fill_sequences(executor, &table, &targets, &values, &mut row)?;
         // A table with no declared key carries an internal row id the user cannot write, so the
         // executor fills it (`crate::catalog::TableDef::row_id`).
         if let Some(at) = table.row_id() {
@@ -727,6 +731,9 @@ pub(super) fn insert(
                 if let Some(returned) = &mut returned {
                     returned.push(&updated)?;
                 }
+            } else {
+                // PostgreSQL 19's tag for a `DO NOTHING` whose proposals all collided is `INSERT 0 0`.
+                skipped += 1;
             }
             continue;
         }
@@ -747,7 +754,7 @@ pub(super) fn insert(
 
     // The leading zero is the OID of the inserted row, which PostgreSQL stopped assigning in 8.1
     // and still reports as 0. A client that parses the tag expects three fields.
-    let counted = insert.rows.len() - skipped;
+    let counted = source.len() - skipped;
     Ok(finish(returned, format!("INSERT 0 {counted}")))
 }
 
@@ -759,7 +766,7 @@ fn fill_sequences(
     executor: &mut Executor,
     table: &TableDef,
     targets: &[usize],
-    values: &[crate::plan::Expr],
+    values: &Supplied<'_>,
     row: &mut [Datum],
 ) -> Result<()> {
     for sequence in &table.derived()?.sequences {
@@ -773,7 +780,7 @@ fn fill_sequences(
             .iter()
             .take(values.len())
             .position(|at| *at == fills)
-            .is_some_and(|at| !matches!(values[at], crate::plan::Expr::Default))
+            .is_some_and(|at| values.supplies(at))
         {
             continue;
         }
@@ -786,6 +793,172 @@ fn fill_sequences(
         )?;
     }
     Ok(())
+}
+
+/// Where an `INSERT`'s rows come from: the tuples a `VALUES` list wrote, or the rows of the query
+/// an `INSERT … SELECT` names.
+///
+/// **The query is read to the end before the first row is written** ([`Source::of`]), and that is
+/// the whole of how a query over the table being written reads the table as the statement found
+/// it: PostgreSQL 19 inserts one row for `INSERT INTO r SELECT n + 1 FROM r` over one row, then two,
+/// then four, then eight (`tests/corpus/pg19_insert_select.txt`). A query read while its own rows
+/// were being written would meet them, because this transaction's buffer is merged into every read
+/// it makes; reading at a statement snapshot instead would need the buffer to tell this
+/// statement's writes from the earlier statements', which it cannot. `CREATE TABLE … AS` reads its
+/// query the same way (`Executor::planned_rows`). The cost is the query's rows, held for the length
+/// of the statement.
+enum Source<'a> {
+    Written(&'a [Vec<crate::plan::Expr>]),
+    Selected {
+        rows: Vec<Vec<Datum>>,
+        /// Per column, whether the query wrote a bare string literal there: a value with no type
+        /// yet, which PostgreSQL reads as the target column's type, as it does in `VALUES`.
+        untyped: Vec<bool>,
+    },
+}
+
+impl<'a> Source<'a> {
+    fn of(
+        executor: &mut Executor,
+        txn: &mut dyn Txn,
+        insert: &'a Insert,
+        targets: &[usize],
+    ) -> Result<Self> {
+        let Some(query) = &insert.query else {
+            return Ok(Source::Written(&insert.rows));
+        };
+        let listed = insert.columns.is_some();
+        // **Arity is the query's columns against the target's, and it is decided before a row is
+        // read** — so a query with no rows is refused too, and a sequence the query calls has drawn
+        // nothing when it is. A projection of expressions says its width without running; `*` and a
+        // set operation are counted off the plan, once the query has run.
+        let plain = query.set_arms.is_empty()
+            && query
+                .projection
+                .iter()
+                .all(|item| matches!(item, crate::plan::SelectItem::Expr { .. }));
+        if plain {
+            refuse_arity(query.projection.len(), targets.len(), listed)?;
+        }
+        let (planned, rows) = executor.planned_rows(txn, query)?;
+        refuse_arity(planned.columns.len(), targets.len(), listed)?;
+        let untyped = query
+            .projection
+            .iter()
+            .map(|item| {
+                plain
+                    && matches!(
+                        item,
+                        crate::plan::SelectItem::Expr {
+                            expr: crate::plan::Expr::Literal(crate::plan::Literal::String(_)),
+                            ..
+                        }
+                    )
+            })
+            .collect();
+        Ok(Source::Selected { rows, untyped })
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Source::Written(rows) => rows.len(),
+            Source::Selected { rows, .. } => rows.len(),
+        }
+    }
+
+    fn row(&self, at: usize) -> Supplied<'_> {
+        match self {
+            Source::Written(rows) => Supplied::Written(rows.get(at).map_or(&[], Vec::as_slice)),
+            Source::Selected { rows, untyped } => Supplied::Selected {
+                values: rows.get(at).map_or(&[], Vec::as_slice),
+                untyped,
+            },
+        }
+    }
+}
+
+/// `INSERT has more expressions than target columns`, and the other way round when a column list
+/// was written — without one, a short row fills the table's columns from the left.
+fn refuse_arity(width: usize, targets: usize, listed: bool) -> Result<()> {
+    if width > targets {
+        return Err(SqlError::InsertTooManyExpressions);
+    }
+    if listed && width < targets {
+        return Err(SqlError::InsertTooManyTargetColumns);
+    }
+    Ok(())
+}
+
+/// One row's supplied values: what a `VALUES` tuple wrote, or what the query produced.
+#[derive(Clone, Copy)]
+enum Supplied<'a> {
+    Written(&'a [crate::plan::Expr]),
+    Selected {
+        values: &'a [Datum],
+        untyped: &'a [bool],
+    },
+}
+
+impl Supplied<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Supplied::Written(exprs) => exprs.len(),
+            Supplied::Selected { values, .. } => values.len(),
+        }
+    }
+
+    /// Whether the statement supplies position `at`. `DEFAULT` written for a column supplies
+    /// nothing — it asks for the default — and a query cannot write it.
+    fn supplies(&self, at: usize) -> bool {
+        match self {
+            Supplied::Written(exprs) => exprs
+                .get(at)
+                .is_some_and(|expr| !matches!(expr, crate::plan::Expr::Default)),
+            Supplied::Selected { values, .. } => at < values.len(),
+        }
+    }
+
+    /// Position `at`'s value, ready for `column`: a written expression by [`value_for_column`], and a
+    /// selected value by the assignment rule — or, where the query wrote a bare string literal, by the
+    /// literal's rule, which is the one `VALUES` uses and the one PostgreSQL 19 applies there too:
+    /// `SELECT '92'` into an `integer` is `92`, and the same literal through a `UNION ALL` is `42804`.
+    fn value(
+        &self,
+        at: usize,
+        column: &crate::catalog::ColumnDef,
+        table: &TableDef,
+        txn: &dyn Txn,
+        executor: &Executor,
+    ) -> Result<Datum> {
+        let missing = || SqlError::Internal(format!("an INSERT row has no value at position {at}"));
+        match self {
+            Supplied::Written(exprs) => value_for_column(
+                exprs.get(at).ok_or_else(missing)?,
+                column,
+                table,
+                txn,
+                executor,
+            ),
+            Supplied::Selected { values, untyped } => {
+                let value = values.get(at).cloned().ok_or_else(missing)?;
+                if untyped.get(at).copied().unwrap_or(false)
+                    && let Datum::Text(text) = &value
+                {
+                    let literal =
+                        crate::plan::Expr::Literal(crate::plan::Literal::String(text.clone()));
+                    return value_for_column(&literal, column, table, txn, executor);
+                }
+                super::assign::into_column(
+                    value,
+                    column,
+                    super::assign::rewriting_type_of(table, column),
+                    None,
+                    executor.rendering(),
+                    None,
+                )
+            }
+        }
+    }
 }
 
 /// One `VALUES` expression, as the column's own value.

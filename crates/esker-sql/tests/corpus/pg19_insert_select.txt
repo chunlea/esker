@@ -13,7 +13,7 @@
 # One session, inside `BEGIN … ROLLBACK`, in a schema of its own — the oracle's `public` holds a
 # schema load — with every refusal in its own `SAVEPOINT` / `ROLLBACK TO`. The last line proves the
 # `ROLLBACK` left nothing. Command tags are not in this file (psql -q prints none); they are captured
-# beside it, in `esker-coord/s1-unit-j/tags.out`.
+# beside it, in `esker-coord/s1-unit-j/tags-2.out`.
 #!escaped
 BEGIN		-
 CREATE SCHEMA s1j		-
@@ -35,8 +35,9 @@ ROLLBACK TO p1		-
 SAVEPOINT p2		-
 INSERT INTO ti (id, name) SELECT 5, DEFAULT	!42601 DEFAULT is not allowed in this context
 ROLLBACK TO p2		-
-# An identity draws its number per row, and refuses a selected one.
-CREATE TABLE ident (id integer GENERATED ALWAYS AS IDENTITY, v text)		-
+# An identity draws its number per row, and refuses a selected one. Keyed: on the node a key-less
+# identity or serial draws nothing through VALUES either, a gap older than this statement.
+CREATE TABLE ident (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text)		-
 INSERT INTO ident (v) SELECT 'a' UNION ALL SELECT 'b' RETURNING id, v		1|a ; 2|b
 SAVEPOINT p3		-
 INSERT INTO ident (id, v) SELECT 5, 'c'	!428C9 cannot insert a non-DEFAULT value into column "id" DETAIL: Column "id" is an identity column defined as GENERATED ALWAYS. HINT: Use OVERRIDING SYSTEM VALUE to override.
@@ -71,9 +72,16 @@ SELECT count(*) FROM r		16
 INSERT INTO ti (id, name) SELECT id, 'again' FROM s ORDER BY id ON CONFLICT (id) DO NOTHING RETURNING id		-
 INSERT INTO ti (id, name) SELECT id + 80, name FROM s ORDER BY id ON CONFLICT DO NOTHING RETURNING id		81 ; 82 ; 83
 INSERT INTO ti (id, name) SELECT id, name || '!' FROM s ORDER BY id ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name RETURNING id, name		1|one! ; 2|two! ; 3|three!
+# A proposal DO NOTHING leaves is not counted, from VALUES as from a query: the tag is the rows written.
+INSERT INTO ti VALUES (1, 'v'), (200, 'v') ON CONFLICT (id) DO NOTHING		-
+INSERT INTO ti VALUES (1, 'v') ON CONFLICT (id) DO NOTHING RETURNING id		-
 SAVEPOINT p4		-
 INSERT INTO ti (id, name) SELECT 1, 'x' UNION ALL SELECT 1, 'y' ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name	!21000 ON CONFLICT DO UPDATE command cannot affect row a second time HINT: Ensure that no rows proposed for insertion within the same command have duplicate constrained values.
 ROLLBACK TO p4		-
+# The same set operation, parenthesised.
+SAVEPOINT p4b		-
+INSERT INTO ti (id, name) (SELECT 1, 'x' UNION ALL SELECT 1, 'y') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name	!21000 ON CONFLICT DO UPDATE command cannot affect row a second time HINT: Ensure that no rows proposed for insertion within the same command have duplicate constrained values.
+ROLLBACK TO p4b		-
 # A duplicate the query brings, without ON CONFLICT.
 SAVEPOINT p5		-
 INSERT INTO ti (id) SELECT id FROM s	!23505 duplicate key value violates unique constraint "ti_pkey" DETAIL: Key (id)=(1) already exists.
@@ -91,6 +99,10 @@ ROLLBACK TO p8		-
 SAVEPOINT p9		-
 INSERT INTO ti (id, name) SELECT 1 WHERE false	!42601 INSERT has more target columns than expressions
 ROLLBACK TO p9		-
+# A row that would refuse on its own does not get the chance: arity comes first.
+SAVEPOINT p9b		-
+INSERT INTO ti (id) SELECT 1 / 0, 2	!42601 INSERT has more expressions than target columns
+ROLLBACK TO p9b		-
 # Types: an assignment cast, a missing one, an unknown literal, a literal a set operation typed,
 # a cast that exists and refuses the value, and a NULL where the key cannot take one.
 INSERT INTO ti (id, name) SELECT 90, 91 RETURNING id, name		90|91
@@ -108,7 +120,7 @@ ROLLBACK TO p12		-
 SAVEPOINT p13		-
 INSERT INTO ti (id) SELECT NULL::integer	!23502 null value in column "id" of relation "ti" violates not-null constraint DETAIL: Failing row contains (null, dflt, null, null).
 ROLLBACK TO p13		-
-SELECT count(*) FROM ti		27
+SELECT count(*) FROM ti		28
 # Row triggers fire once per selected row: s2's statement, verbatim, on s2's table shape.
 CREATE TABLE t (id integer PRIMARY KEY, name text)		-
 CREATE TABLE audit (note text)		-

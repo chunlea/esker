@@ -185,9 +185,9 @@ fn text_into_an_integer_column_is_still_refused() {
 /// **The same rule on the statement that also assigns.** An `INSERT`'s `VALUES` tuple asks
 /// `exec::assign` the same question a `SET` does.
 ///
-/// Written with an explicit cast rather than `INSERT … SELECT`, which this node refuses outright
-/// (`0A000 INSERT ... SELECT is not supported`) — a separate and much larger gap that the first
-/// draft of this file accidentally tested instead of the cast rule.
+/// Written with an explicit cast rather than `INSERT … SELECT`, which this node refused outright
+/// when this file was written (`0A000 INSERT ... SELECT is not supported`) — a separate and much
+/// larger gap that the first draft of this file accidentally tested instead of the cast rule.
 #[test]
 fn insert_takes_the_same_casts() {
     let mut node = parity::Node::new(WIDTHS);
