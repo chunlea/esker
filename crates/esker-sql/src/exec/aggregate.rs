@@ -364,7 +364,10 @@ impl Aggregation {
                 // `VALUES` row rather than the family. It does not. The rule is the whole `reg*`
                 // group, and this is the correction — the same shape as `"char"`'s four columns
                 // that were eighteen.
-                ColumnType::RegProc | ColumnType::RegType | ColumnType::RegClass => {
+                ColumnType::RegProc
+                | ColumnType::RegType
+                | ColumnType::RegClass
+                | ColumnType::RegNamespace => {
                     Ok(ColumnType::Oid)
                 }
                 _ => Ok(arg),
@@ -1594,7 +1597,10 @@ impl Accumulator {
             State::Extreme(best) => match best.clone() {
                 None => Datum::Null,
                 Some(
-                    value @ (Datum::RegType { .. } | Datum::RegProc { .. } | Datum::RegClass { .. }),
+                    value @ (Datum::RegType { .. }
+                    | Datum::RegProc { .. }
+                    | Datum::RegClass { .. }
+                    | Datum::RegNamespace { .. }),
                 ) => crate::value::stored_shape(
                     value,
                     ColumnType::Oid,

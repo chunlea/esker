@@ -6131,6 +6131,18 @@ fn lower_array_cast(expr: &Expr, data_type: &DataType) -> Result<Option<plan::Ex
     {
         return lower_regclass_array(expr).map(Some);
     }
+    // **`regnamespace[]`, per row**: every element is a schema's name or an oid, and the evaluator is
+    // where the tenant's schemas are (ADR 0115).
+    if let DataType::Array(inner) = data_type
+        && let Some(inner) = array_element(inner)
+        && cast_target(inner) == Some(CastTarget::RegNamespace)
+    {
+        return Ok(Some(plan::Expr::Cast {
+            operand: Box::new(lower_expr(expr)?),
+            to: ColumnType::RegNamespaceArray,
+            typmod: NO_TYPMOD,
+        }));
+    }
     if let DataType::Array(inner) = data_type
         && let Some(element) = array_element(inner)
         && let Ok((element, NO_TYPMOD)) = lower_type(element)
@@ -7018,6 +7030,23 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             func: plan::CatalogFunc::RegClassName,
             args: vec![lower_expr(expr)?],
         }))),
+        // **`regnamespace` both ways, told apart the way `regclass`'s are** (ADR 0115): a string
+        // literal is a name, resolved once per statement against the tenant's schemas, and anything
+        // else is an oid, named per row.
+        (CastTarget::RegNamespace, _) if is_string_literal(expr) => {
+            Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func: plan::CatalogFunc::RegNamespace,
+                args: vec![plan::Expr::Literal(plan::Literal::String(cast_operand(
+                    expr, data_type,
+                )?))],
+            })))
+        }
+        (CastTarget::RegNamespace, _) => {
+            Ok(plan::Expr::CatalogFunc(Box::new(plan::CatalogFuncCall {
+                func: plan::CatalogFunc::RegNamespaceName,
+                args: vec![lower_expr(expr)?],
+            })))
+        }
         // **The inverse, and per row**: an oid rather than a name. `t.typelem::regtype` is how
         // `ActiveRecord` reads what an array type is over, and its operand is a catalog column.
         // `23::regtype` is `integer` on a real server too, so a number goes this way as well.
@@ -7098,7 +7127,10 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
             // `value::convert_without_text` has the pair — so the node is kept and the conversion
             // happens where the value can speak for itself. The `regtype` and `regclass` arms
             // above never reach this one; `regproc` is the third of the family and had no arm.
-            if source_type(expr)? == Some(ColumnType::RegProc) {
+            if matches!(
+                source_type(expr)?,
+                Some(ColumnType::RegProc | ColumnType::RegNamespace)
+            ) {
                 return Ok(plan::Expr::Cast {
                     operand: Box::new(lower_expr(expr)?),
                     to: ColumnType::Oid,
@@ -7562,6 +7594,9 @@ enum CastTarget {
     Oid,
     /// PostgreSQL's `oidvector`: a list of oids, printed space separated.
     OidVector,
+    /// PostgreSQL's `regnamespace`: a **schema**, named — resolved where the tenant's schemas are, as
+    /// [`CastTarget::RegClass`] is (ADR 0115).
+    RegNamespace,
 }
 
 impl CastTarget {
@@ -7574,6 +7609,7 @@ impl CastTarget {
             CastTarget::RegType => ColumnType::RegType,
             CastTarget::Oid => ColumnType::Oid,
             CastTarget::OidVector => ColumnType::OidVector,
+            CastTarget::RegNamespace => ColumnType::RegNamespace,
         }
     }
 }
@@ -7595,6 +7631,7 @@ fn cast_target(data_type: &DataType) -> Option<CastTarget> {
         "regtype" => Some(CastTarget::RegType),
         "oidvector" => Some(CastTarget::OidVector),
         "regclass" => Some(CastTarget::RegClass),
+        "regnamespace" => Some(CastTarget::RegNamespace),
         "oid" => Some(CastTarget::Oid),
         _ => None,
     }

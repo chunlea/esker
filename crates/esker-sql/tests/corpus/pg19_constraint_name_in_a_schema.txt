@@ -1,0 +1,75 @@
+# A constraint on a table in a schema other than `public` — its name in `pg_constraint`, what
+# `VALIDATE`, `DROP` and `ADD CONSTRAINT` find and refuse by it, and how each sentence spells the
+# constraint and its relation — as a real PostgreSQL 19beta1 answers it.
+#
+# Captured 2026-09-13 by lane s2-plpgsql with `sesscap.py` (`esker-coord/s2-cnames.stmts`), found
+# while capturing `pg19_regnamespace.txt`: its census `UPDATE` selects a foreign key by `conname` in a
+# schema. One session inside `BEGIN … ROLLBACK`, every refusal in its own `SAVEPOINT` / `ROLLBACK TO`,
+# in a schema of its own; the last line proves it left nothing behind. The `\gdesc` pass runs on a
+# connection of its own, where that schema does not exist, so a statement naming it has an empty
+# declared-types column.
+#
+#!escaped
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **Every constraint's name is bare, however it was named**: `s2cn.c`'s primary key is `c_pkey`,
+#     its derived foreign key `c_p_fkey`, its `NOT NULL`s `c_id_not_null` and `c_q_not_null`. The
+#     schema is `connamespace`, never part of `conname`.
+#   * **A constraint sentence names its relation bare** — `of relation "c"`, `for relation "c"`,
+#     `new row for relation "c"`, `on table "c"` — but **the `2BP01` dependency sentence qualifies
+#     every relation and no constraint**: `constraint p_pkey on table s2cn.p`, `depends on index
+#     s2cn.p_pkey`.
+#   * **A `UNIQUE` constraint's name collides as a relation**: adding `c_u_key` again is
+#     `42P07 relation "c_u_key" already exists`, not `42710` — the name is its index's.
+#   * **Dropping the primary key keeps its column's `NOT NULL`**: `c_id_not_null` outlives `c_pkey`.
+#   * **A table `CHECK` over one column is named for that column**: `k`'s `CHECK (a > 0)` is `k_a_check`,
+#     the name a column constraint would get — `<table>_check` only when the expression reads no
+#     column or more than one.
+#
+BEGIN		-
+CREATE SCHEMA s2cn		-
+CREATE TABLE s2cn.p (id integer PRIMARY KEY)		-
+CREATE TABLE s2cn.c (id integer PRIMARY KEY CHECK (id > 0), p integer REFERENCES s2cn.p, q integer NOT NULL, u integer UNIQUE)		-
+SELECT 'r', conname, contype FROM pg_constraint WHERE connamespace = 's2cn'::regnamespace ORDER BY conname		r|c_id_check|c ; r|c_id_not_null|n ; r|c_p_fkey|f ; r|c_pkey|p ; r|c_q_not_null|n ; r|c_u_key|u ; r|p_id_not_null|n ; r|p_pkey|p
+CREATE TABLE s2cn.k (a integer, CHECK (a > 0))		-
+SELECT 'r', conname FROM pg_constraint WHERE conrelid = 's2cn.k'::regclass ORDER BY conname		r|k_a_check
+SAVEPOINT a		-
+ALTER TABLE s2cn.c VALIDATE CONSTRAINT nosuch	!42704 constraint "nosuch" of relation "c" does not exist
+ROLLBACK TO a		-
+SAVEPOINT b		-
+ALTER TABLE s2cn.c DROP CONSTRAINT nosuch	!42704 constraint "nosuch" of relation "c" does not exist
+ROLLBACK TO b		-
+ALTER TABLE s2cn.c DROP CONSTRAINT IF EXISTS nosuch		-
+SAVEPOINT c		-
+ALTER TABLE s2cn.c ADD CONSTRAINT c_p_fkey CHECK (id > 1)	!42710 constraint "c_p_fkey" for relation "c" already exists
+ROLLBACK TO c		-
+SAVEPOINT d		-
+ALTER TABLE s2cn.c ADD CONSTRAINT c_id_check CHECK (id > 1)	!42710 constraint "c_id_check" for relation "c" already exists
+ROLLBACK TO d		-
+SAVEPOINT e		-
+ALTER TABLE s2cn.c ADD CONSTRAINT c_u_key UNIQUE (q)	!42P07 relation "c_u_key" already exists
+ROLLBACK TO e		-
+SAVEPOINT f		-
+INSERT INTO s2cn.c VALUES (0, NULL, 1, 1)	!23514 new row for relation "c" violates check constraint "c_id_check" DETAIL: Failing row contains (0, null, 1, 1).
+ROLLBACK TO f		-
+SAVEPOINT h		-
+INSERT INTO s2cn.c VALUES (5, 99, 1, 5)	!23503 insert or update on table "c" violates foreign key constraint "c_p_fkey" DETAIL: Key (p)=(99) is not present in table "p".
+ROLLBACK TO h		-
+SAVEPOINT g		-
+ALTER TABLE s2cn.p DROP CONSTRAINT p_pkey	!2BP01 cannot drop constraint p_pkey on table s2cn.p because other objects depend on it DETAIL: constraint c_p_fkey on table s2cn.c depends on index s2cn.p_pkey HINT: Use DROP ... CASCADE to drop the dependent objects too.
+ROLLBACK TO g		-
+ALTER TABLE s2cn.c VALIDATE CONSTRAINT c_p_fkey		-
+ALTER TABLE s2cn.c VALIDATE CONSTRAINT c_id_check		-
+ALTER TABLE s2cn.c DROP CONSTRAINT c_p_fkey		-
+ALTER TABLE s2cn.c DROP CONSTRAINT c_q_not_null		-
+ALTER TABLE s2cn.c DROP CONSTRAINT c_u_key		-
+ALTER TABLE s2cn.c DROP CONSTRAINT c_id_check		-
+ALTER TABLE s2cn.c DROP CONSTRAINT c_pkey		-
+SELECT 'r', conname, contype FROM pg_constraint WHERE connamespace = 's2cn'::regnamespace ORDER BY conname		r|c_id_not_null|n ; r|k_a_check|c ; r|p_id_not_null|n ; r|p_pkey|p
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname = 's2cn'	bigint	0

@@ -638,6 +638,14 @@ fn constraints_of(relations: &Relations, table: &TableDef, table_oid: i64) -> Ve
             convalidated: true,
         });
     }
+    // **Every name bare, and ordered bare.** A derived name is stored qualified —
+    // `plan::make_object_name` re-qualifies, so `s.t`'s primary key is `s\0t_pkey` — while a given
+    // one is stored as written; `conname` is the identifier either way, and `connamespace` says where
+    // it lives. The stored form put the NUL on the wire (`s2nst_pkey` where a real server says
+    // `t_pkey`), and the census's `WHERE conname = 'c_p_fkey'` then selected nothing to validate.
+    for constraint in &mut out {
+        constraint.name = super::split_qualified(&constraint.name).1.to_owned();
+    }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }

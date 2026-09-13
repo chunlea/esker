@@ -372,6 +372,9 @@ pub const UNDEFINED_PARAMETER: &str = "42P02";
 pub const INVALID_OBJECT_DEFINITION: &str = "42P17";
 /// A function definition PostgreSQL refuses to store: `LANGUAGE sql` returning `trigger`.
 pub const INVALID_FUNCTION_DEFINITION: &str = "42P13";
+/// `42602` — a string that is not a well-formed name, which is `regnamespacein`'s
+/// `invalid name syntax` (ADR 0115).
+pub const INVALID_NAME: &str = "42602";
 /// A table definition that cannot be built — no primary key, in our case.
 pub const INVALID_TABLE_DEFINITION: &str = "42P16";
 /// An identifier longer than 63 bytes. A *notice*, not an error: PostgreSQL truncates and carries
@@ -524,6 +527,7 @@ mod tests {
         ("INVALID_COLUMN_REFERENCE", super::INVALID_COLUMN_REFERENCE),
         ("INVALID_RECURSION", super::INVALID_RECURSION),
         ("INVALID_TABLE_DEFINITION", super::INVALID_TABLE_DEFINITION),
+        ("INVALID_NAME", super::INVALID_NAME),
         (
             "INVALID_FUNCTION_DEFINITION",
             super::INVALID_FUNCTION_DEFINITION,

@@ -116,8 +116,10 @@ pub fn encode_row(types: &[ColumnType], values: &[Datum]) -> Result<Vec<u8>> {
         // the number alone. The assignment cast above this crate turns it into the plain number; a
         // datum that still carries the name here is a bug above, and it is refused rather than
         // written as a row the next read would report as corruption.
-        if matches!(value, Datum::RegClass { .. } | Datum::RegType { .. })
-            && value.column_type() != Some(*ty)
+        if matches!(
+            value,
+            Datum::RegClass { .. } | Datum::RegType { .. } | Datum::RegNamespace { .. }
+        ) && value.column_type() != Some(*ty)
         {
             return Err(RowError::Mismatch(format!(
                 "column {index} is {ty:?} and was given {value:?}, whose bytes carry a name that \
@@ -161,6 +163,12 @@ fn encode_column(value: &Datum, out: &mut Vec<u8>) {
             varint::put_u64(name.len() as u64, out);
             out.extend_from_slice(name.as_bytes());
         }
+        // **Four bytes and no name** — the `regclass` rule below, for a schema (ADR 0115). A
+        // tenant's schema can be renamed and dropped, which a built-in type or function cannot, so
+        // a name in the row would go stale the way a relation's did. Measured: a stored
+        // `regnamespace` prints the schema's new name after `ALTER SCHEMA … RENAME TO`, and its
+        // digits once the schema is dropped.
+        Datum::RegNamespace { oid, .. } => out.extend_from_slice(&oid.to_le_bytes()),
         // **Eight bytes and no name**, which is the whole of `debts-v1.1.md` #35. A relation's id
         // is an `i64` here where a real server's oid is four bytes; what is *not* here is the name
         // the datum carries beside it, because a name in a row goes stale the moment its relation
@@ -502,6 +510,25 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
                 rest,
             )
         }
+        // **Four bytes, and the name is the unresolved form** — `regclass`'s arrangement below, for
+        // a schema (ADR 0115): the digits, and `-` for oid 0, which is what `regnamespaceout`
+        // prints for an oid no schema has. `crate::row`'s wrapper in `esker-sql` puts the schema's
+        // name back, where there is a catalog to ask.
+        ColumnType::RegNamespace => {
+            let (head, rest) = bytes.split_first_chunk::<4>().ok_or_else(truncated)?;
+            let oid = u32::from_le_bytes(*head);
+            (
+                Datum::RegNamespace {
+                    oid,
+                    name: if oid == 0 {
+                        "-".into()
+                    } else {
+                        oid.to_string().into_boxed_str()
+                    },
+                },
+                rest,
+            )
+        }
         // **Eight bytes, and the name is the digits.** The row does not hold one, so what comes
         // out is the *unresolved* form — and that form is not a placeholder this crate invented:
         // it is exactly what a real server prints for an oid that names nothing, measured. So a
@@ -552,6 +579,7 @@ fn decode_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::OidArray
         | ColumnType::RegTypeArray
         | ColumnType::RegProcArray | ColumnType::RegClassArray
+        | ColumnType::RegNamespaceArray
         | ColumnType::CitextArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray
@@ -767,7 +795,8 @@ fn encode_key_column(value: &Datum, out: &mut Vec<u8>) {
         | Datum::Point { .. }
         | Datum::Geometry { .. }
         | Datum::RegType { .. }
-        | Datum::RegProc { .. } => {}
+        | Datum::RegProc { .. }
+        | Datum::RegNamespace { .. } => {}
         // **A `regclass` is a key, and the key is its number** (`debts-v1.1.md` #39). The choice
         // the comment above describes is not a choice here: the row holds the oid and nothing else
         // since #35, so the order that matches the comparison is the only order there is —
@@ -1255,6 +1284,8 @@ pub fn is_index_key(ty: ColumnType) -> bool {
             | ColumnType::RegTypeArray
             | ColumnType::RegProc
             | ColumnType::RegProcArray | ColumnType::RegClassArray
+            | ColumnType::RegNamespace
+            | ColumnType::RegNamespaceArray
             // **A pseudo-type is not a key because it is not a column.** Nothing is ever stored as
             // a `void`, so there is no order for a key to encode.
             | ColumnType::Void
@@ -1317,6 +1348,8 @@ fn decode_key_column(ty: ColumnType, bytes: &[u8]) -> Result<(Datum, &[u8])> {
         | ColumnType::RegTypeArray
         | ColumnType::RegProc
         | ColumnType::RegProcArray | ColumnType::RegClassArray
+        | ColumnType::RegNamespace
+        | ColumnType::RegNamespaceArray
         | ColumnType::Void
         | ColumnType::Int2Vector
         | ColumnType::OidVector => {
@@ -2183,6 +2216,19 @@ mod tests {
                     name: name.into(),
                 })
                 .boxed(),
+            // **A row holds a `regnamespace`'s number and not its name**, as it holds a
+            // `regclass`'s below, so the value that round-trips is the unresolved one;
+            // `a_regnamespace_row_keeps_the_number_and_not_the_name` states the named case.
+            ColumnType::RegNamespace => any::<u32>()
+                .prop_map(|oid| Datum::RegNamespace {
+                    oid,
+                    name: if oid == 0 {
+                        "-".into()
+                    } else {
+                        oid.to_string().into_boxed_str()
+                    },
+                })
+                .boxed(),
             // The same, and for the same reason: a `regclass`'s name is qualified or bare
             // depending on the search path that resolved it, so the codec must carry whatever it
             // was given rather than a shape it expects.
@@ -2280,6 +2326,7 @@ mod tests {
             | ColumnType::RegTypeArray
             | ColumnType::RegProcArray
             | ColumnType::RegClassArray
+            | ColumnType::RegNamespaceArray
             | ColumnType::CitextArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray
@@ -2546,6 +2593,34 @@ mod tests {
         // oid that names nothing — so a reader that never resolves is wrong the way a dangling
         // oid is wrong, rather than wrong in a way no server would produce.
         assert_eq!(decode_row(&schema, &with_name).unwrap(), vec![bare]);
+    }
+
+    /// **The same for a `regnamespace`** (ADR 0115), stated by the printed name as well as by the
+    /// bytes: a `regnamespace` compares by its number, so a decoded value would equal the named one
+    /// whether or not the name had been stored — only the name tells the two apart.
+    #[test]
+    fn a_regnamespace_row_keeps_the_number_and_not_the_name() {
+        let schema = RowSchema::nullable(vec![ColumnType::RegNamespace]);
+        let named = Datum::RegNamespace {
+            oid: 16_390,
+            name: "s2ns".into(),
+        };
+        let bare = Datum::RegNamespace {
+            oid: 16_390,
+            name: "16390".into(),
+        };
+        let with_name =
+            encode_row(&[ColumnType::RegNamespace], std::slice::from_ref(&named)).unwrap();
+        let without = encode_row(&[ColumnType::RegNamespace], std::slice::from_ref(&bare)).unwrap();
+        assert_eq!(
+            with_name, without,
+            "the name must not reach the row, or renaming the schema leaves it stale"
+        );
+        let decoded = decode_row(&schema, &with_name).unwrap();
+        let [Datum::RegNamespace { oid, name }] = decoded.as_slice() else {
+            panic!("a regnamespace column decoded as {decoded:?}");
+        };
+        assert_eq!((*oid, &**name), (16_390, "16390"));
     }
 
     #[test]

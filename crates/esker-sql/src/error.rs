@@ -2216,6 +2216,12 @@ pub enum SqlError {
     #[error("schema \"{0}\" does not exist")]
     UndefinedSchema(String),
 
+    /// A string `regnamespacein` cannot read as exactly one name — `'a.b'`, `'S2 Mixed'`, `''`:
+    /// `42602`, measured, and a different answer from `3F000`, which is for a well-formed name no
+    /// schema has (ADR 0115).
+    #[error("invalid name syntax")]
+    InvalidNameSyntax,
+
     /// `DROP SCHEMA` with something still in it: `2BP01`, naming one dependent.
     ///
     /// **`IF EXISTS` does not excuse it**: the clause covers absence, not dependence. Measured.
@@ -3267,6 +3273,7 @@ impl SqlError {
             SqlError::InvalidRegex(_) => sqlstate::INVALID_REGULAR_EXPRESSION,
             SqlError::DuplicateSchema(_) => sqlstate::DUPLICATE_SCHEMA,
             SqlError::UndefinedSchema(_) => sqlstate::INVALID_SCHEMA_NAME,
+            SqlError::InvalidNameSyntax => sqlstate::INVALID_NAME,
             SqlError::OnConflictAffectedTwice | SqlError::CardinalityViolation => {
                 sqlstate::CARDINALITY_VIOLATION
             }

@@ -1106,6 +1106,8 @@ fn column_type(ty: crate::value::ColumnType) -> Option<esker_columnar::ColumnTyp
         Row::RegType
         | Row::RegProc
         | Row::RegProcArray | Row::RegClassArray
+        | Row::RegNamespace
+        | Row::RegNamespaceArray
         | Row::RegTypeArray
         | Row::RegClass
         | Row::Int2Vector
@@ -1224,6 +1226,7 @@ fn datum_to_value(datum: &Datum) -> esker_columnar::Value {
         | Datum::RegType { .. }
         | Datum::RegProc { .. }
         | Datum::RegClass { .. }
+        | Datum::RegNamespace { .. }
         | Datum::Range { .. } => Value::Null,
         Datum::Int8(int) => Value::Int8(*int),
         Datum::Int4(int) => Value::Int4(*int),

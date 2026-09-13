@@ -376,6 +376,14 @@ const TAG_LQUERY_ARRAY: u8 = 107;
 const TAG_INT2VECTOR_ARRAY: u8 = 108;
 /// See [`TAG_INT2VECTOR_ARRAY`].
 const TAG_OIDVECTOR_ARRAY: u8 = 109;
+/// `regnamespace` and `regnamespace[]`, appended for [ADR 0115](../../../../docs/adr/0115-regnamespace-is-an-oid-that-prints-as-a-schema.md).
+/// **110 and 111 were claimed out loud before they were written**
+/// (`esker-coord/s2-claims-format-regnamespace.md`), one below `esker_keys::columnar`'s 111 and 112 —
+/// and [`CATALOG_FORMAT_VERSION`] stays where it was, as ADR 0098 left it for `regproc`: an older
+/// build refuses tag 110 as a type it does not know rather than as a newer version.
+const TAG_REGNAMESPACE: u8 = 110;
+/// See [`TAG_REGNAMESPACE`].
+const TAG_REGNAMESPACE_ARRAY: u8 = 111;
 
 const TAG_BIT: u8 = 69;
 const TAG_VARBIT: u8 = 70;
@@ -538,6 +546,8 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::RegTypeArray => TAG_REGTYPE_ARRAY,
         ColumnType::RegProcArray => TAG_REGPROC_ARRAY,
         ColumnType::RegClassArray => TAG_REGCLASS_ARRAY,
+        ColumnType::RegNamespace => TAG_REGNAMESPACE,
+        ColumnType::RegNamespaceArray => TAG_REGNAMESPACE_ARRAY,
         ColumnType::Int8Array => TAG_INT8_ARRAY,
         ColumnType::Int4Array => TAG_INT4_ARRAY,
         ColumnType::Int2Array => TAG_INT2_ARRAY,
@@ -700,6 +710,8 @@ fn type_of(tag: u8) -> Result<ColumnType> {
         TAG_REGTYPE_ARRAY => ColumnType::RegTypeArray,
         TAG_REGPROC_ARRAY => ColumnType::RegProcArray,
         TAG_REGCLASS_ARRAY => ColumnType::RegClassArray,
+        TAG_REGNAMESPACE => ColumnType::RegNamespace,
+        TAG_REGNAMESPACE_ARRAY => ColumnType::RegNamespaceArray,
         TAG_INT8_ARRAY => ColumnType::Int8Array,
         TAG_INT4_ARRAY => ColumnType::Int4Array,
         TAG_INT2_ARRAY => ColumnType::Int2Array,

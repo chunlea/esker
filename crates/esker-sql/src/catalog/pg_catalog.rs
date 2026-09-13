@@ -2237,7 +2237,7 @@ fn pg_depend_rows(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
 ///
 /// `(castsource, casttarget, castcontext, castmethod)`. `castcontext` is `e` explicit, `a`
 /// assignment, `i` implicit; `castmethod` is `f` a function, `b` binary-coercible, `i` I/O.
-pub const CASTS: [(i64, i64, &str, &str); 160] = [
+pub const CASTS: [(i64, i64, &str, &str); 167] = [
     // **A bit string's eight rows, measured** rather than reasoned:
     //
     //     SELECT castsource::regtype, casttarget::regtype, castcontext, castmethod
@@ -2277,6 +2277,16 @@ pub const CASTS: [(i64, i64, &str, &str); 160] = [
     // `'int4'::regtype::oid` was folded at parse time and never asked `pg_cast`.
     (2206, 26, "i", "b"),
     (26, 2206, "i", "b"),
+    // **`regnamespace`'s seven rows, measured** (`tests/corpus/pg19_regnamespace.txt`, ADR 0115):
+    // `oid` both ways and `integer` in by reinterpretation, `bigint` and `smallint` in through a
+    // function, and out to the integers by assignment — `regclass`'s shape without its text rows.
+    (20, 4089, "i", "f"),
+    (21, 4089, "i", "f"),
+    (23, 4089, "i", "b"),
+    (26, 4089, "i", "b"),
+    (4089, 20, "a", "f"),
+    (4089, 23, "a", "b"),
+    (4089, 26, "i", "b"),
     (16, 23, "e", "f"),
     (16, 25, "a", "f"),
     (16, 1042, "a", "f"),
@@ -3529,6 +3539,8 @@ pub(crate) fn typname(ty: ColumnType) -> &'static str {
         ColumnType::RegTypeArray => "_regtype",
         ColumnType::RegProcArray => "_regproc",
         ColumnType::RegClassArray => "_regclass",
+        ColumnType::RegNamespace => "regnamespace",
+        ColumnType::RegNamespaceArray => "_regnamespace",
         // **An array type's internal name is the element's with a leading underscore** — `_int4`,
         // not `int4[]`. That spelling is what `pg_type.typname` holds on a real server and what a
         // client matching on it expects.
@@ -3700,6 +3712,7 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::RegType
         | ColumnType::RegProc
         | ColumnType::RegClass
+        | ColumnType::RegNamespace
         // **And a money**, which a real server puts here too — not in `U` with the extension
         // types and not in a category of its own. Measured.
         | ColumnType::Money => "N",
@@ -3753,6 +3766,7 @@ pub(crate) fn typcategory(ty: ColumnType) -> &'static str {
         | ColumnType::TsVectorArray
         | ColumnType::TsQueryArray
         | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::CitextArray | ColumnType::MoneyArray | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::XmlArray | ColumnType::LtreeArray
+        | ColumnType::RegNamespaceArray
         // **`A` for the two vectors too**, measured: `int2vector` and `oidvector` are in
         // PostgreSQL's array category despite not being array types.
         | ColumnType::Int2Vector
@@ -3870,6 +3884,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         ColumnType::RegType => "regtypein",
         ColumnType::RegProc => "regprocin",
         ColumnType::RegClass => "regclassin",
+        ColumnType::RegNamespace => "regnamespacein",
         ColumnType::Int2Vector => "int2vectorin",
         ColumnType::OidVector => "oidvectorin",
         // **`array_in` for every array type**, and this one value is load-bearing beyond the
@@ -3917,6 +3932,7 @@ fn typinput(ty: ColumnType) -> &'static str {
         | ColumnType::RegTypeArray
         | ColumnType::RegProcArray
         | ColumnType::RegClassArray
+        | ColumnType::RegNamespaceArray
         | ColumnType::CitextArray
         | ColumnType::MoneyArray
         | ColumnType::InetArray

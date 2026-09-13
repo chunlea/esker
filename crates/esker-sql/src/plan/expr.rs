@@ -1324,6 +1324,17 @@ pub enum CatalogFunc {
     /// the difference shows. Resolved once per statement like [`CatalogFunc::RegClass`], since its
     /// argument is a literal.
     ToRegClass,
+    /// `'<name>'::regnamespace`: the **schema** a name names, as a `regnamespace` — ADR 0115.
+    /// Resolved before the plan is built, once per statement, like [`CatalogFunc::RegClass`]: a
+    /// schema is a catalog object, and a `WHERE connamespace = 's2ns'::regnamespace` must not read
+    /// the catalog once per row.
+    RegNamespace,
+    /// `<oid>::regnamespace`, per row: the schema an oid names, printed as its name — its digits
+    /// when no schema has it and `-` for 0, measured. A string argument is read as a name.
+    RegNamespaceName,
+    /// `to_regnamespace('<name>')`: [`CatalogFunc::RegNamespace`] with `NULL` wherever the cast
+    /// raises — a missing schema and a malformed name alike, measured.
+    ToRegNamespace,
     /// `pg_typeof(x)`: the name of the type `x` has.
     ///
     /// **Read from the value, not from the plan.** A real server answers the *static* type, and
@@ -1602,6 +1613,7 @@ impl CatalogFunc {
                 Some(CatalogFunc::PgGetTriggerdef)
             }
             () if name.eq_ignore_ascii_case("to_regclass") => Some(CatalogFunc::ToRegClass),
+            () if name.eq_ignore_ascii_case("to_regnamespace") => Some(CatalogFunc::ToRegNamespace),
             () if name.eq_ignore_ascii_case("pg_typeof") => Some(CatalogFunc::PgTypeof),
             () if name.eq_ignore_ascii_case("current_date") => Some(CatalogFunc::CurrentDate),
             () if name.eq_ignore_ascii_case("random") => Some(CatalogFunc::Random),
@@ -1719,6 +1731,7 @@ impl CatalogFunc {
             CatalogFunc::TextToLtree => "text2ltree",
             // Two directions of one cast, and PostgreSQL names both of them `regclass`.
             CatalogFunc::RegClass | CatalogFunc::RegClassName => "regclass",
+            CatalogFunc::RegNamespace | CatalogFunc::RegNamespaceName => "regnamespace",
             // Both halves of a `regtype` are called that: one reads an oid and prints a name,
             // the other reads a name and answers its oid.
             CatalogFunc::RegTypeName | CatalogFunc::UserRegType => "regtype",
@@ -1733,6 +1746,7 @@ impl CatalogFunc {
             CatalogFunc::ArrayLength => "array_length",
             CatalogFunc::Cardinality => "cardinality",
             CatalogFunc::ToRegClass => "to_regclass",
+            CatalogFunc::ToRegNamespace => "to_regnamespace",
             CatalogFunc::PgTypeof => "pg_typeof",
             CatalogFunc::Now => "now",
             CatalogFunc::CurrentDate => "current_date",
@@ -1861,6 +1875,9 @@ impl CatalogFunc {
             | CatalogFunc::JsonbFetch
             | CatalogFunc::JsonFetchText
             | CatalogFunc::ToRegClass
+            | CatalogFunc::RegNamespace
+            | CatalogFunc::RegNamespaceName
+            | CatalogFunc::ToRegNamespace
             | CatalogFunc::IsEmpty
             | CatalogFunc::PathIsOpen
             | CatalogFunc::PathIsClosed
@@ -1970,6 +1987,9 @@ impl CatalogFunc {
             CatalogFunc::RegClass | CatalogFunc::RegClassName | CatalogFunc::ToRegClass => {
                 ColumnType::RegClass
             }
+            CatalogFunc::RegNamespace
+            | CatalogFunc::RegNamespaceName
+            | CatalogFunc::ToRegNamespace => ColumnType::RegNamespace,
             // **The storage, which is what an enum's value is** (ADR 0050) — and the label
             // the projection form is replaced by is a `text` literal by then, so nothing
             // reads this for that shape.
@@ -2516,6 +2536,7 @@ impl Literal {
                     // (wire v3 family F8).
                     | ColumnType::RegClass
                     | ColumnType::RegType
+                    | ColumnType::RegNamespace
                     | ColumnType::Numeric
             ),
             Literal::Decimal(_) => matches!(
@@ -2622,6 +2643,12 @@ impl Literal {
                 // resolvable oid prints is put on the datum where the catalog is, so what is
                 // built here carries the digits.
                 ColumnType::RegClass => Ok(crate::value::regclass_of_oid(*value)),
+                // **And an integer is a `regnamespace`**, printing its digits until something with
+                // the tenant's schemas names it (ADR 0115).
+                ColumnType::RegNamespace => u32::try_from(*value).map_or_else(
+                    |_| mismatch(),
+                    |oid| Ok(crate::value::reg_namespace::unnamed(oid)),
+                ),
                 ColumnType::Int8 => Ok(Datum::Int8(*value)),
                 // **A whole number of currency units, not of cents.** `VALUES (123)` into a
                 // money column is `$123.00` on a real server, which is the assignment cast
@@ -2703,7 +2730,7 @@ impl Literal {
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
                 | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
-                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery | ColumnType::LQueryArray | ColumnType::Int2VectorArray | ColumnType::OidVectorArray
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::RegNamespaceArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery | ColumnType::LQueryArray | ColumnType::Int2VectorArray | ColumnType::OidVectorArray
                 // **A pseudo-type takes no value at all**: no column is declared `void`, so an
                 // assignment to one is a type mismatch like any other.
                 | ColumnType::Void => mismatch(),
@@ -2793,7 +2820,7 @@ impl Literal {
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
                 | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
-                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::RegType | ColumnType::RegProc | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery | ColumnType::LQueryArray | ColumnType::Int2VectorArray | ColumnType::OidVectorArray
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::RegNamespaceArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::RegType | ColumnType::RegProc | ColumnType::RegNamespace | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery | ColumnType::LQueryArray | ColumnType::Int2VectorArray | ColumnType::OidVectorArray
                 // **A pseudo-type takes no value at all**: no column is declared `void`, so an
                 // assignment to one is a type mismatch like any other.
                 | ColumnType::Void => mismatch(),
@@ -2804,11 +2831,13 @@ impl Literal {
             // taken before `fits` can hand the name-carrying datum through: the same rule as
             // `into_column`'s, because this is the other write path (`crate::value::stored_shape`).
             Literal::Typed { value, .. }
-                if matches!(**value, Datum::RegClass { .. } | Datum::RegType { .. })
-                    && matches!(
-                        ty,
-                        ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Oid
-                    ) =>
+                if matches!(
+                    **value,
+                    Datum::RegClass { .. } | Datum::RegType { .. } | Datum::RegNamespace { .. }
+                ) && matches!(
+                    ty,
+                    ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Oid
+                ) =>
             {
                 crate::value::stored_shape(
                     (**value).clone(),
@@ -2967,7 +2996,7 @@ impl Literal {
                 | ColumnType::Inet | ColumnType::Cidr | ColumnType::MacAddr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray
                 | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray
                 | ColumnType::Lseg | ColumnType::Box | ColumnType::Path | ColumnType::Polygon | ColumnType::Circle | ColumnType::Line
-                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::RegType | ColumnType::RegProc | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery | ColumnType::LQueryArray | ColumnType::Int2VectorArray | ColumnType::OidVectorArray
+                | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::RegNamespaceArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::RegType | ColumnType::RegProc | ColumnType::RegNamespace | ColumnType::CitextArray | ColumnType::Point | ColumnType::Xml | ColumnType::XmlArray | ColumnType::Ltree | ColumnType::LtreeArray | ColumnType::LQuery | ColumnType::LQueryArray | ColumnType::Int2VectorArray | ColumnType::OidVectorArray
                 // **A pseudo-type takes no value at all**: no column is declared `void`, so an
                 // assignment to one is a type mismatch like any other.
                 | ColumnType::Void => mismatch(),

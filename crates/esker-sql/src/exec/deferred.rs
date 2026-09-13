@@ -170,7 +170,7 @@ impl Check {
                 }
                 Err(SqlError::ForeignKeyViolation {
                     relation: super::foreign_key::message_name(&table.name).to_owned(),
-                    constraint: key.name.clone(),
+                    constraint: super::foreign_key::message_name(&key.name).to_owned(),
                     detail: format!(
                         "Key ({})=({}) is not present in table \"{}\".",
                         super::foreign_key::column_names(table, &key.columns),

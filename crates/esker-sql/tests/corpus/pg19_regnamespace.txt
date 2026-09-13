@@ -1,0 +1,141 @@
+# `regnamespace` — an oid that prints as a schema, the second of ADR 0098's kind — as a real
+# PostgreSQL 19beta1 answers it, and the one statement of the suite that needs it:
+# `check_all_foreign_keys_valid!`'s `UPDATE pg_catalog.pg_constraint … connamespace::regnamespace = …`.
+#
+# Captured 2026-09-13 by lane s2-plpgsql with `sesscap.py` (`esker-coord/s2-regns.stmts`, then
+# `s2-regns2.stmts` for the type's own rows and `s2-regns4.stmts` for a value stored across a rename), in three sessions, each inside `BEGIN … ROLLBACK`, every refusal in its own `SAVEPOINT` / `ROLLBACK TO`, in two
+# schemas of its own; the last line proves it left nothing behind. The `\gdesc` pass runs on a
+# connection of its own, where those schemas do not exist, so a statement naming one of them has an
+# empty declared-types column. The second session's widest `pg_type` query and its `pg_cast` query
+# each sit in a savepoint of their own, so a server whose `pg_type` lacks a column keeps the rest.
+#
+#!escaped
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **An untyped literal beside a `regnamespace` is read as an `oid`, not as a name**:
+#     `ns = 'public'` is `22P02 invalid input syntax for type oid: "public"`. The comparison is
+#     `oid`'s, so the literal takes `oid`'s input function; `ns = 'public'::regnamespace` works.
+#   * **Output is a name, and input folds like an identifier**: `'PUBLIC'::regnamespace` is `public`,
+#     `'"S2 Mixed"'::regnamespace` prints back quoted, and an unquoted space or a dot is
+#     `42602 invalid name syntax` — not `3F000`, which is for a well-formed name no schema has.
+#   * **An oid no schema has prints as the number, and `0` prints as `-`.**
+#   * **A stored value is its number, not the name it was written with**: after `ALTER SCHEMA … RENAME TO`
+#     it prints the schema's new name, and once the schema is dropped, its digits.
+#   * **`to_regnamespace` answers `NULL` where the cast refuses.**
+#   * **The census's `UPDATE` selects by `connamespace::regnamespace = '<schema>'::regnamespace`**, and
+#     `VALIDATE CONSTRAINT` then validates the constraint it marked.
+#   * **Digits are an oid, whatever schema has it**: `'11'::regnamespace` is `pg_catalog` and `'2200'` is
+#     `public` — PostgreSQL's bootstrap oids. A leading space is trimmed, `''` is `42602`, and `'-'` is oid 0.
+#   * **It is `oid` underneath, in both directions implicitly and without a function**, `int4` too (an
+#     assignment cast the other way); `int8` and `int2` go through a function. `min` and `max` answer `oid`,
+#     `ns = 11` compares as an oid, and `ARRAY[ns]` is `regnamespace[]`.
+#   * **An assignment reads a bare literal as a name** (`SET ns = 's2ns2'`), where a comparison reads it as an
+#     oid — ADR 0098's rule for `regproc`, measured again for this type.
+BEGIN		-
+CREATE SCHEMA s2ns		-
+CREATE SCHEMA "S2 Mixed"		-
+# input, output, and the type it reports
+SELECT 'r', 'public'::regnamespace::text, pg_typeof('public'::regnamespace)	text,text,regtype	r|public|regnamespace
+SELECT 'r', 'public'::regnamespace	text,regnamespace	r|public
+SELECT 'r', 'pg_catalog'::regnamespace::oid, 'public'::regnamespace::oid	text,oid,oid	r|11|2200
+SELECT 'r', 's2ns'::regnamespace = 's2ns'::regnamespace, 's2ns'::regnamespace = 'public'::regnamespace		r|t|f
+SELECT 'r', '"S2 Mixed"'::regnamespace::text		r|"S2 Mixed"
+SELECT 'r', 'PUBLIC'::regnamespace::text	text,text	r|public
+SAVEPOINT a		-
+SELECT 'nosuch'::regnamespace	!3F000 schema "nosuch" does not exist
+ROLLBACK TO a		-
+SAVEPOINT b		-
+SELECT 'S2 Mixed'::regnamespace	!42602 invalid name syntax
+ROLLBACK TO b		-
+SAVEPOINT c		-
+SELECT 'a.b'::regnamespace	!42602 invalid name syntax
+ROLLBACK TO c		-
+SELECT 'r', to_regnamespace('nosuch') IS NULL, to_regnamespace('public')::text	text,boolean,text	r|t|public
+# from an oid
+SELECT 'r', (SELECT oid FROM pg_namespace WHERE nspname = 's2ns')::regnamespace::text	text,text	r|s2ns
+SELECT 'r', 99999::regnamespace::text, 0::regnamespace::text	text,text,text	r|99999|-
+SELECT 'r', 'public'::regnamespace::oid = (SELECT oid FROM pg_namespace WHERE nspname = 'public')	text,boolean	r|t
+# against the catalog columns that hold a namespace oid
+CREATE TABLE s2ns.t (id integer PRIMARY KEY, CONSTRAINT t_positive CHECK (id > 0))		-
+SELECT 'r', conname FROM pg_constraint WHERE connamespace::regnamespace = 's2ns'::regnamespace ORDER BY conname		r|t_id_not_null ; r|t_pkey ; r|t_positive
+SELECT 'r', conname FROM pg_constraint WHERE connamespace = 's2ns'::regnamespace ORDER BY conname		r|t_id_not_null ; r|t_pkey ; r|t_positive
+SELECT 'r', relname, relnamespace::regnamespace FROM pg_class WHERE relnamespace = 's2ns'::regnamespace ORDER BY relname		r|t|s2ns ; r|t_pkey|s2ns
+SELECT 'r', relnamespace::regnamespace::text FROM pg_class WHERE relname = 't' AND relnamespace::regnamespace::text = 's2ns'	text,text	r|s2ns
+# arrays, ordering, a column of the type
+SELECT 'r', ARRAY['public', 's2ns']::regnamespace[]::text, pg_typeof(ARRAY['public']::regnamespace[])		r|{public,s2ns}|regnamespace[]
+SELECT 'r', 'pg_catalog'::regnamespace < 'public'::regnamespace	text,boolean	r|t
+CREATE TABLE s2ns.holder (ns regnamespace)		-
+INSERT INTO s2ns.holder VALUES ('s2ns'), ('public'), ('pg_catalog')		-
+SELECT 'r', ns FROM s2ns.holder ORDER BY ns::text		r|pg_catalog ; r|public ; r|s2ns
+# an untyped literal beside a regnamespace is read as an oid, not as a name
+SAVEPOINT d		-
+SELECT 'r', ns FROM s2ns.holder WHERE ns = 'public'	!22P02 invalid input syntax for type oid: "public"
+ROLLBACK TO d		-
+SELECT 'r', ns::oid = 'public'::regnamespace::oid FROM s2ns.holder WHERE ns = 'public'::regnamespace		r|t
+# the census's own UPDATE shape (check_all_foreign_keys_valid!), over a clean foreign key
+CREATE TABLE s2ns.p (id integer PRIMARY KEY)		-
+CREATE TABLE s2ns.c (id integer PRIMARY KEY, p integer REFERENCES s2ns.p)		-
+UPDATE pg_catalog.pg_constraint SET convalidated=false WHERE conname = 'c_p_fkey' AND connamespace::regnamespace = 's2ns'::regnamespace		-
+SELECT 'r', convalidated FROM pg_constraint WHERE conname = 'c_p_fkey'	text,boolean	r|f
+ALTER TABLE s2ns.c VALIDATE CONSTRAINT c_p_fkey		-
+SELECT 'r', convalidated FROM pg_constraint WHERE conname = 'c_p_fkey'	text,boolean	r|t
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname IN ('s2ns', 'S2 Mixed')	bigint	0
+# the second session: the type's pg_type and pg_cast rows, digits, aggregates, and an assignment
+BEGIN		-
+CREATE SCHEMA s2ns2		-
+# the type's own rows
+SAVEPOINT pgt		-
+SELECT 'r', oid, typname, typlen, typbyval, typcategory, typinput::text, typoutput::text, typreceive::text, typsend::text, typelem, typarray FROM pg_type WHERE typname IN ('regnamespace', '_regnamespace') ORDER BY oid	text,oid,name,smallint,boolean,"char",text,text,text,text,oid,oid	r|4089|regnamespace|4|t|N|regnamespacein|regnamespaceout|regnamespacerecv|regnamespacesend|0|4090 ; r|4090|_regnamespace|-1|f|A|array_in|array_out|array_recv|array_send|4089|0
+ROLLBACK TO pgt		-
+SELECT 'r', oid, typname, typlen, typcategory, typinput::text, typelem, typarray FROM pg_type WHERE typname IN ('regnamespace', '_regnamespace') ORDER BY oid	text,oid,name,smallint,"char",text,oid,oid	r|4089|regnamespace|4|N|regnamespacein|0|4090 ; r|4090|_regnamespace|-1|A|array_in|4089|0
+SELECT 'r', oid, proname FROM pg_proc WHERE proname IN ('regnamespacein', 'regnamespaceout', 'regnamespacerecv', 'regnamespacesend', 'to_regnamespace') ORDER BY oid	text,oid,name	r|4084|regnamespacein ; r|4085|regnamespaceout ; r|4086|to_regnamespace ; r|4087|regnamespacerecv ; r|4088|regnamespacesend
+SAVEPOINT pgc		-
+SELECT 'r', castsource::regtype::text, casttarget::regtype::text, castfunc, castcontext, castmethod FROM pg_cast WHERE castsource = 'regnamespace'::regtype OR casttarget = 'regnamespace'::regtype ORDER BY 2, 3	text,text,text,oid,"char","char"	r|bigint|regnamespace|1287|i|f ; r|integer|regnamespace|0|i|b ; r|oid|regnamespace|0|i|b ; r|regnamespace|bigint|1288|a|f ; r|regnamespace|integer|0|a|b ; r|regnamespace|oid|0|i|b ; r|smallint|regnamespace|313|i|f
+ROLLBACK TO pgc		-
+# digits are an oid, whatever schema has it
+SELECT 'r', '11'::regnamespace::text, '2200'::regnamespace::text, '99999'::regnamespace::text	text,text,text,text	r|pg_catalog|public|99999
+SELECT 'r', 'public'::regnamespace::oid::regnamespace::text	text,text	r|public
+SELECT 'r', 11::regnamespace::text, 2200::oid::regnamespace::text	text,text,text	r|pg_catalog|public
+SAVEPOINT a		-
+SELECT ' public'::regnamespace	regnamespace	public
+ROLLBACK TO a		-
+SAVEPOINT b		-
+SELECT ''::regnamespace	!42602 invalid name syntax
+ROLLBACK TO b		-
+SAVEPOINT c		-
+SELECT 'r', '-'::regnamespace	text,regnamespace	r|-
+ROLLBACK TO c		-
+# aggregates and comparisons
+CREATE TABLE s2ns2.holder (ns regnamespace)		-
+INSERT INTO s2ns2.holder VALUES ('s2ns2'), ('public'), ('pg_catalog')		-
+SELECT 'r', pg_typeof(min(ns)), pg_typeof(max(ns)), min(ns)::text = 'pg_catalog'::regnamespace::oid::text FROM s2ns2.holder		r|oid|oid|t
+SELECT 'r', count(*) FROM s2ns2.holder WHERE ns IN ('public'::regnamespace, 'pg_catalog'::regnamespace)		r|2
+SELECT 'r', count(*) FROM s2ns2.holder WHERE ns::text = 'public'		r|1
+SAVEPOINT d		-
+SELECT 'r', ns FROM s2ns2.holder WHERE ns = 11		r|pg_catalog
+ROLLBACK TO d		-
+SELECT 'r', pg_typeof(ARRAY[ns]) FROM s2ns2.holder LIMIT 1		r|regnamespace[]
+# an assignment reads a bare literal as a name
+UPDATE s2ns2.holder SET ns = 's2ns2' WHERE ns = 'public'::regnamespace		-
+SELECT 'r', ns FROM s2ns2.holder ORDER BY ns::text		r|pg_catalog ; r|s2ns2 ; r|s2ns2
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname = 's2ns2'	bigint	0
+# the third session: a value stored in a table, read back after its schema is renamed and after it is dropped
+BEGIN		-
+CREATE SCHEMA s2ns4		-
+CREATE TABLE s2ns4_holder (ns regnamespace)		-
+INSERT INTO s2ns4_holder VALUES ('s2ns4')		-
+SELECT 'r', ns, ns::text FROM s2ns4_holder		r|s2ns4|s2ns4
+ALTER SCHEMA s2ns4 RENAME TO s2ns4b		-
+SELECT 'r', ns, ns::text FROM s2ns4_holder		r|s2ns4b|s2ns4b
+SELECT 'r', ns = 's2ns4b'::regnamespace FROM s2ns4_holder		r|t
+DROP SCHEMA s2ns4b		-
+SELECT 'r', ns::text = ns::oid::text FROM s2ns4_holder		r|t
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname IN ('s2ns4', 's2ns4b')	bigint	0

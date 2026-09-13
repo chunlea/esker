@@ -15,7 +15,17 @@ pub use esker_keys::row::{
 
 use crate::value::Datum;
 
-/// How a stored `regclass` gets its name back: a function from an oid to what it prints as.
+/// A stored number whose printed name a row cannot carry, by the catalog it names.
+#[derive(Debug, Clone, Copy)]
+pub enum StoredOid {
+    /// A `regclass`'s relation id (`debts-v1.1.md` #35).
+    Relation(i64),
+    /// A `regnamespace`'s schema oid (ADR 0115).
+    Schema(u32),
+}
+
+/// How a stored `regclass` or `regnamespace` gets its name back: a function from its number to
+/// what it prints as.
 ///
 /// **The parameter is the rule and not the catalog**, which is the one place this differs from the
 /// shape it was asked for. A `Relations` alone cannot answer it: a relation's printed name is
@@ -23,14 +33,16 @@ use crate::value::Datum;
 /// measured — so producing one needs the session's resolved `search_path` as well as the catalog.
 /// Handing the caller's own rule in keeps that decision where the session is, and keeps this module
 /// free of both.
-pub type NameOfRelation<'a> = &'a dyn Fn(i64) -> Box<str>;
+pub type NameOfOid<'a> = &'a dyn Fn(StoredOid) -> Box<str>;
 
 /// [`esker_keys::row::decode_row`], with the one thing a stored row cannot carry.
 ///
 /// **A `regclass` column holds eight bytes and no name** (`debts-v1.1.md` #35), because a name in a
 /// row goes stale the moment its relation is renamed — measured: a real server prints the *new*
-/// name after `ALTER TABLE … RENAME`, and the oid's digits after the relation is dropped. So the
-/// name is resolved here, on the way out, from a catalog the codec must not have.
+/// name after `ALTER TABLE … RENAME`, and the oid's digits after the relation is dropped. A
+/// `regnamespace` column holds four bytes and no name, for the same reason and measured the same
+/// way after `ALTER SCHEMA … RENAME TO` (ADR 0115). So the name is resolved here, on the way out,
+/// from a catalog the codec must not have.
 ///
 /// **`None` is a decision, not a default.** Every caller in this crate passes one explicitly, and
 /// the ones that pass `None` are the paths where no value is ever printed — a foreign-key check
@@ -42,7 +54,7 @@ pub type NameOfRelation<'a> = &'a dyn Fn(i64) -> Box<str>;
 pub fn decode_row(
     schema: &RowSchema,
     bytes: &[u8],
-    name_of: Option<NameOfRelation<'_>>,
+    name_of: Option<NameOfOid<'_>>,
 ) -> Result<Vec<Datum>, RowError> {
     let mut row = esker_keys::row::decode_row(schema, bytes)?;
     if let Some(name_of) = name_of {
@@ -53,7 +65,7 @@ pub fn decode_row(
     Ok(row)
 }
 
-/// One decoded value's `regclass` names, **including the ones inside an array**.
+/// One decoded value's `regclass` and `regnamespace` names, **including the ones inside an array**.
 ///
 /// The scalar half is `debts-v1.1.md` #35 and the array half is #38, and they are one rule: an
 /// array is a container, so every question about an element is the element type's to answer
@@ -62,14 +74,18 @@ pub fn decode_row(
 /// go back in.
 ///
 /// One level deep is the whole of it: this crate has no array of an array.
-fn resolve(value: &mut Datum, name_of: NameOfRelation<'_>) {
+fn resolve(value: &mut Datum, name_of: NameOfOid<'_>) {
     match value {
-        Datum::RegClass { oid, name } => *name = name_of(*oid),
-        Datum::Array(array) if array.element == crate::value::ColumnType::RegClass => {
+        Datum::RegClass { oid, name } => *name = name_of(StoredOid::Relation(*oid)),
+        Datum::RegNamespace { oid, name } => *name = name_of(StoredOid::Schema(*oid)),
+        Datum::Array(array)
+            if matches!(
+                array.element,
+                crate::value::ColumnType::RegClass | crate::value::ColumnType::RegNamespace
+            ) =>
+        {
             for element in array.values.iter_mut().flatten() {
-                if let Datum::RegClass { oid, name } = element {
-                    *name = name_of(*oid);
-                }
+                resolve(element, name_of);
             }
         }
         _ => {}
@@ -119,6 +135,13 @@ mod tests {
             // with no function prints its digits and the pair is not derivable one from the other.
             ColumnType::RegProc => (any::<u32>(), "[a-z_ ]{0,12}")
                 .prop_map(|(oid, name)| Datum::RegProc {
+                    oid,
+                    name: name.into(),
+                })
+                .boxed(),
+            // And for a `regnamespace`, whose name is carried for the same reason (ADR 0115).
+            ColumnType::RegNamespace => (any::<u32>(), "[a-z_ ]{0,12}")
+                .prop_map(|(oid, name)| Datum::RegNamespace {
                     oid,
                     name: name.into(),
                 })
@@ -174,6 +197,7 @@ mod tests {
             | ColumnType::OidArray
             | ColumnType::RegTypeArray
             | ColumnType::RegProcArray | ColumnType::RegClassArray
+            | ColumnType::RegNamespaceArray
             | ColumnType::CitextArray
             | ColumnType::MoneyArray
             | ColumnType::InetArray
