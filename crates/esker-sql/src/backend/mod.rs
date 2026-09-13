@@ -28,7 +28,9 @@
 //!    own statement if the first committed, nothing if it rolled back. At the two levels that keep
 //!    their snapshot, and between two nodes, both transactions read the key as absent, both
 //!    prewrite it, and write-write conflict detection (`docs/DESIGN.md` §8) lets exactly one
-//!    commit; the loser's `commit` fails, and the executor reports that as `23505` too.
+//!    commit; the loser's `commit` fails, and the executor reports that as `23505` too — or as
+//!    `40001` where PostgreSQL does: at SERIALIZABLE for a key the transaction had read first, and
+//!    at either snapshot level for a key an `ON CONFLICT` arbiter read (ADR 0114 §3).
 //!
 //! The fake below implements the same conflict rule as the real protocol — a commit fails if any
 //! key it wrote gained a version after this transaction's snapshot — so an executor test can

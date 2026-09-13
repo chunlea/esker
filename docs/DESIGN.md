@@ -805,7 +805,11 @@ like a row at `READ COMMITTED`** ([ADR 0114](adr/0114-a-unique-key-being-written
 a second writer of the same value on one node waits for the first and re-reads what it left — a
 `23505` from its own statement if the first committed, nothing if it rolled back — where it used to
 read the key as absent and meet the first writer at commit. At the two levels that keep their
-snapshot, and between two nodes, that meeting is still at prewrite.
+snapshot, and between two nodes, that meeting is still at prewrite, and its loser is told
+PostgreSQL's code: `40001` rather than `23505` at `SERIALIZABLE` when it had read the key before
+writing it, and at `REPEATABLE READ` as well when `ON CONFLICT`'s arbiter had read it
+([ADR 0114](adr/0114-a-unique-key-being-written-waits-at-read-committed.md) §3) — at `COMMIT`, one
+statement later than PostgreSQL.
 
 
 | CF | key | value |
