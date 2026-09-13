@@ -1,0 +1,43 @@
+crates/esker-sql/src/error.rs
+  s_f4b2852b53accb::t_65e47a00cd314a 1067-1078,3285-3286
+crates/esker-sql/src/exec/bind.rs
+  s_f4b2852b53accb::t_5b44f56190c31e 278-281,1030-1032,1280-1288,1420-1422
+crates/esker-sql/src/exec/dml.rs
+  s_f4b2852b53accb::t_3d4a8518e7b32c 332,338-341,619-621,624,626-627,648-649,655,676,678,734-736,757,769,783,798-963
+crates/esker-sql/src/exec/mod.rs
+  s_f4b2852b53accb::t_b8216c56b7ef48 4525-4527
+crates/esker-sql/src/exec/query.rs
+  s_f4b2852b53accb::t_c4135e158094c0 7175-7178
+crates/esker-sql/src/parse/lower.rs
+  s_f4b2852b53accb::t_44b0916fccb1af 3651,3658-3678,3691
+crates/esker-sql/src/plan/dml.rs
+  s_f4b2852b53accb::t_993c35c0b5bd0a 35-42
+crates/esker-sql/tests/assignment_casts.rs
+  s_f4b2852b53accb::t_327b3c552c67bd 188-190
+crates/esker-sql/tests/bare_relation_name.rs
+  s_f4b2852b53accb::t_3508abba229910 170-173
+crates/esker-sql/tests/corpus/pg19_insert_select.txt
+  s_f4b2852b53accb::t_dd3ed14d9c65d7 16,38-40,75-77,81-84,102-105,123
+crates/esker-sql/tests/insert_select.rs
+  s_f4b2852b53accb::t_6b7447e826c46e 15,26-34,38-65,171-178
+crates/esker-sql/tests/slt/unsupported.slt
+  s_f4b2852b53accb::t_992ebe663e1e94 39-41
+docs/DESIGN.md
+  s_f4b2852b53accb::t_6ed318e30c2cef 1179-1185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "56ca733ce19036d068d4671b1ead07fff74b933f",
+  "prompts": {},
+  "sessions": {
+    "s_f4b2852b53accb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc7223c3-8ba0-48df-95c8-ddb365dc093c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
