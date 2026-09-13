@@ -5,8 +5,13 @@ and both of its questions (`esker-coord/QUESTION-s1.md`) wait for the user. Noth
 before they are ruled: §2 (a) is a wire and Raft-log format change (`CLAUDE.md`, "ask before doing"),
 and §3 (ii) is one of three answers to a semantic question.
 
-**Every file, function, line and number below was read in the tree at `b36e5d4f`.** Anything that was
-not is marked **(unverified)**, and is the first thing to read when the unit starts.
+**Every file, function, line and number below was read in the tree at `b36e5d4f`.** Main's `fc8333c8`,
+merged into this branch as `aad1dca3`, moved cited lines only in `exec/mod.rs` and `exec/dml.rs`; those
+are given as they stand at `aad1dca3`, and its other hunks fall after every line cited here.
+
+**Five points were first left unverified**, and unit H settled them on 2026-09-13: four by reading the
+code, one by running this node beside PostgreSQL 19. Two changed the design — when §2's eager lock is
+stamped and when the stamp goes (step 4), and §3's arbiter rule (step 5) — and are marked *(unit H)*.
 
 ---
 
@@ -74,7 +79,7 @@ always `40001`. The fix gives the eager lock's `Check` the statement's read time
 * `StoreTxn::lock` (`crates/esker-sql/src/backend/store.rs` line 322) sends a `Reach::Cluster`
   lock to `Transaction::lock`.
 * `Executor::in_a_transaction` calls `Txn::begin_statement` **only inside
-  `if self.isolation().waits()`** (`crates/esker-sql/src/exec/mod.rs` line 1029). So `statement_ts` is
+  `if self.isolation().waits()`** (`crates/esker-sql/src/exec/mod.rs` line 1035). So `statement_ts` is
   set at READ COMMITTED and never at REPEATABLE READ or SERIALIZABLE — which is what keeps PostgreSQL's
   e3 (`40001` at REPEATABLE READ) true after the change.
 
@@ -100,9 +105,24 @@ always `40001`. The fix gives the eager lock's `Check` the statement's read time
 3. **Store — `txnkv.rs` lines 617–623**: `TxnMutation::Check { read_ts, .. } => read_ts.unwrap_or(start_ts)`,
    and `CheckRange` stays `start_ts`. `op` does not change.
 4. **Client — `txn.rs`**:
-   * `Transaction::lock`: when `self.statement_ts` is `Some(ts)`, record the key before prewriting it —
-     `self.read_ts.entry(key.clone()).or_insert(ts)`. That is `stamp`'s earliest-wins rule, so a
-     statement re-run after a wait keeps the timestamp the lock was actually validated at.
+   * `Transaction::lock` (line 742) **stamps the key before `pin_primary`** — right after its early
+     `Taken` for a key already buffered or locked (lines 744–746) — with `self.stamp(&key)` (line 1051),
+     which records `statement_ts` when there is one. *(unit H)* Before `pin_primary`, and not merely
+     before the `prewrite_once` at the end (line 758): with nothing buffered, the key being locked **is**
+     the primary, and its lock goes out from inside `pin_primary` (line 870). That is Rails' shape — a
+     `FOR UPDATE` that is the transaction's first write — and stamped any later it would still be tag 5,
+     with #91's test still red.
+   * **The stamp stays only if the call answers `Taken`.** *(unit H)* On `Held` or on an error, `lock`
+     removes the stamp it added. A lock that was not taken was validated at nothing, and a leftover stamp
+     would pin every later attempt at that key through `stamp`'s `or_insert`, because nothing else clears
+     it: `restart_statement` (line 1017) drops only the stamps of keys the statement wrote. Later attempts
+     are routine — `esker-sql`'s `wait_for_the_lock` retries a `Held` lock (`exec/mod.rs` lines 457–481),
+     and a transaction can lock the row again after `ROLLBACK TO SAVEPOINT`.
+   * **`release` drops the stamp of each key it gives back** *(unit H)* — beside `self.locked.remove`
+     (lines 816 and 833) — unless the key is still in the buffer, where the stamp is its write's. A
+     statement that locks a released row again must validate at its own snapshot.
+   * A stamp that stays is earliest-wins, as `stamp` already is, so `commit` re-sends a lock with the
+     timestamp it was actually validated at.
    * `mutations_for`, the not-buffered arm:
      `None => TxnMutation::Check { key: key.clone(), read_ts: self.read_ts.get(key).copied() }`.
      A read-set check never has an entry — SERIALIZABLE sets no statement timestamp — so it stays
@@ -179,9 +199,25 @@ always `40001`. The fix gives the eager lock's `Check` the statement's read time
 | `esker-proto` | the golden row, through `golden_txn_prewrite_requests` | tag 7's bytes, both ways |
 | `esker-store` | `txn_command.rs` round trip | kind 7 round-trips |
 | `esker-store` | new, beside `tests/a_lock_is_not_a_version.rs` (which already prewrites `TxnMutation::Check`) | commit `k` at 20; at start_ts 10, `Check { k, read_ts: Some(25) }` is `Ok` and leaves a lock; `read_ts: None` is `Conflict { 20 }` as today; `read_ts: Some(15)` is `Conflict { 20 }` |
-| `esker-client` | an eager lock after `begin_statement(ts)` sends `read_ts: Some(ts)`, `commit` re-sends the same, and with no statement timestamp it is `None` | harness **(unverified)**: `tests/txn.rs` or `tests/store_model.rs` |
+| `esker-client` | `tests/txn.rs`: `begin_statement(ts)`, `lock(k)` with nothing buffered, `commit` | both `TxnPrewrite` calls carry `Check { k, read_ts: Some(ts) }` — the lock's from `pin_primary`, the commit's from `prewrite` (line 1567) |
+| `esker-client` | `tests/txn.rs`: `put(a)`, then `begin_statement(ts)` and `lock(k)`, with `a < k` | `k` goes out from `prewrite_once` as `Check { k, read_ts: Some(ts) }` |
+| `esker-client` | `tests/txn.rs`: `lock(k)` with no statement timestamp | `Check { k, read_ts: None }` — tag 5, today's bytes |
+| `esker-client` | `tests/txn.rs`: `begin_statement(t1)`; the prewrite of `k` answers `TxnStatus::Locked` by an older, live transaction, which is not fatal (`is_fatal`, `esker-proto` `txn.rs` line 196), so `lock` is `Held` with no further call (`wound_or_wait`, line 946); `restart_statement(t2)`; `lock(k)` | the second `Check` carries `Some(t2)` *(unit H)* |
+| `esker-client` | `tests/txn.rs`: `begin_statement(t1)`, `lock(k)`, `release(&[k])` (a scripted `TxnReleaseLock`), `begin_statement(t2)`, `lock(k)` | the second `Check` carries `Some(t2)` *(unit H)* |
 | `esker-sql` | `concurrent_unique_insert.rs`: remove `#[ignore]` from `a_for_update_of_a_row_committed_after_the_transaction_began_takes_the_lock` and `relations_test_s_find_or_create_by_duel_commits_both_sessions` | PostgreSQL's e1 and e2, and the Rails duel |
 | `esker-sql` | new REPEATABLE READ twins, same file | e3 stays `40001`, e4 finds no row |
+
+**The client harness** *(unit H)* is `esker_client::testing::FakeTransport`, which *"records every call
+it was given, so a test can assert on the requests as well as on the result"*
+(`crates/esker-client/src/testing.rs`, module doc). `tests/txn.rs` already makes this kind of claim with
+it: `a_key_written_twice_keeps_the_earlier_statements_read_timestamp` (line 1692) sets a statement
+timestamp and asserts on the prewrite's `read_ts`, over `client` (line 99), `script_a_clean_commit`
+(line 123) and `nth_txn` (line 138). Two things are new to it. **No file that uses `FakeTransport` takes
+an eager lock yet.** And `pin_primary` registers the lease renewal (lines 885–886), whose thread sleeps a
+wall-clock third of `LOCK_TTL_MS` = 3 000 ms (`renew.rs` lines 119–130) and then heartbeats through the
+same router (line 170) — which the fake answers, unscripted, with `fake transport: no rule matched`
+(`testing.rs` line 306). So these tests pick their calls by method, from `calls()` (line 339) filtered on
+`Method::TxnPrewrite`, and not by index.
 
 Regression guards to run: `store_locking` (among them `write_skew_is_refused_against_real_stores` and
 `a_deadlock_inside_a_savepoint_is_recoverable_against_real_stores`), `cross_node_deadlock`,
@@ -199,12 +235,15 @@ keep the wire, the log and the client. The client still sends tag 7, and the sto
 with `a commit at … beat this transaction at …`, and the store test's `read_ts: Some(25)` case answers
 `Conflict`.
 
+Step 4's two stamp rules have counterfactuals of their own *(unit H)*: keep the stamp on `Held`, and the
+`Held` test's second `Check` carries `Some(t1)`; skip `release`'s, and the release test's does.
+
 ### Files
 
 * `esker-proto`: `src/txn.rs`, `tests/messages.rs`, `tests/golden/messages.hex`.
 * `esker-store`: `src/txn_command.rs`, `src/txnkv.rs`, one new or extended test, and the three tests
   above that construct `TxnMutation::Check`.
-* `esker-client`: `src/txn.rs` (`lock`, `mutations_for`), `src/wire.rs` (`txn_payload_size`), a test.
+* `esker-client`: `src/txn.rs` (`lock`, `release`, `mutations_for`), `src/wire.rs` (`txn_payload_size`), tests in `tests/txn.rs`.
 * `esker-txn`: none.
 * `esker-sql`: tests only.
 * Docs: ADR 0114's status; `docs/DESIGN.md` §8, which names the eager lock's "`Check` mutation (tag 5)"
@@ -214,7 +253,11 @@ with `a commit at … beat this transaction at …`, and the store test's `read_
 
 * A new client talking to an old store fails every READ COMMITTED `FOR UPDATE` with `08006`, and a new
   leader costs its old followers their copies of the region (*Old peers*). Stores go first — all of them.
-* One more entry in the client's `read_ts` map per eager lock, for the life of the transaction.
+* One more entry in the client's `read_ts` map per eager lock, until the lock is released or the
+  transaction ends.
+* A stamp that outlived a lock not taken would make every later attempt at that row `40001` — silently,
+  and only after a wait or a savepoint rollback — which is why step 4 keeps a stamp only on `Taken` and
+  `release` drops it *(unit H)*.
 * The read-to-lock window in step 5 still refuses.
 
 ---
@@ -224,7 +267,9 @@ with `a commit at … beat this transaction at …`, and the store test's `read_
 Today a unique conflict at SERIALIZABLE is always renamed `23505` at `COMMIT`. PostgreSQL answers
 `40001` when the transaction had read the key and `23505` when it had not (ADR 0114 cases 06 and 09
 against 07). The answer (ii) needs one bit per unique key, *"was this read before it was written"*,
-and the one moment that bit can be taken.
+and the one moment that bit can be taken. *(unit H)* PostgreSQL gives `ON CONFLICT` the same `40001` at
+REPEATABLE READ too, for a reason of its own; step 5 covers it, and that goes beyond the question as it
+was put to the user.
 
 ### What exists today
 
@@ -241,8 +286,8 @@ and the one moment that bit can be taken.
   `read_keys` line 746) and `record_key` (~line 800), and validates its keys at commit
   (`if self.validating { for key in self.read_keys.borrow().iter()`, line 1131).
 * Recording is switched on by `Txn::validate_reads` (trait, `backend/mod.rs` line 280), which
-  `in_a_transaction` calls with `isolation() == Isolation::Serializable` (`exec/mod.rs` lines 1035 and
-  1075).
+  `in_a_transaction` calls with `isolation() == Isolation::Serializable` (`exec/mod.rs` lines 1041 and
+  1081).
 * A savepoint copies the read set with `Txn::read_set` / `Txn::restore_read_set` (lines 371 and 379;
   `pub struct ReadSet { keys, ranges }`, line 441). `savepoint::Recording` forwards all three
   (`crates/esker-sql/src/exec/savepoint.rs` lines 337, 341, 374).
@@ -259,10 +304,10 @@ and the one moment that bit can be taken.
 
 **Where it becomes `23505`:**
 
-* `Executor::explain_conflict` (`exec/mod.rs` line 2434) renames a `SerializationFailure` whose key is
-  one of `Written::unique_keys` (`Written` line 4312; `Unique { key, constraint, detail }` line 4337).
-* **The block's `commit` (line 4887) runs `end_of_block` (line 1809) first**, and that resets
-  `transaction_isolation` to the session default (lines 1822–1826). By the time `explain_conflict`
+* `Executor::explain_conflict` (`exec/mod.rs` line 2432) renames a `SerializationFailure` whose key is
+  one of `Written::unique_keys` (`Written` line 4310; `Unique { key, constraint, detail }` line 4335).
+* **The block's `commit` (line 4885) runs `end_of_block` (line 1807) first**, and that resets
+  `transaction_isolation` to the session default (lines 1820–1824). By the time `explain_conflict`
   runs, the level can no longer be asked.
 
 **The probes that fill `unique_keys`** — `exec::dml::write_row` (line 1035):
@@ -270,7 +315,8 @@ and the one moment that bit can be taken.
 * the primary key: `if txn.get(&key)?.is_some()` (line 1059), push at line 1078;
 * each by-value unique entry: `if txn.get(&entry.key)?.is_some()` (line 1154), push at line 1160, after
   ADR 0114 §1's lock;
-* `ON CONFLICT`'s `conflicting_row` (line 1607) reads the arbiter's entry before `write_row` does.
+* `ON CONFLICT`'s `conflicting_row` (line 1612) reads the arbiter's entry — its `txn.get`s at lines 1637
+  and 1660 — before `write_row` does.
 
 **How `find_by` reads the key:**
 
@@ -307,6 +353,20 @@ and the one moment that bit can be taken.
    so `end_of_block`'s reset before `explain_conflict` does not matter.
 4. **`explain_conflict`**: a lost key whose `Unique` has `read_first` stays `SerializationFailure`
    (`40001`); any other is renamed `23505` as today. The same filter applies in the no-key second look.
+5. **The arbiter rule** *(unit H)*. PostgreSQL's case 13 is not a read-set answer. Its `40001` comes from
+   `ExecCheckTupleVisible` — the arbiter found a row this transaction's snapshot cannot see — and it is
+   the same at REPEATABLE READ and SERIALIZABLE, with or without an earlier read (cases 13–16 below).
+   Step 3 reaches it at SERIALIZABLE only because `conflicting_row`'s `get` records the key before
+   `write_row` asks `has_read`; REPEATABLE READ keeps no read set, so it would stay `23505`. So:
+   * `conflicting_row` (`exec/dml.rs` line 1612) takes `probed: &mut Vec<Vec<u8>>` and pushes each key it
+     reads: the primary key's (line 1637) and each by-value arbiter entry's (line 1660);
+   * the `INSERT` loop, per row, notes `written.unique_keys.len()` before `write_row` (line 742) and, at
+     REPEATABLE READ and SERIALIZABLE (`!executor.isolation().waits()`), sets `read_first` on each
+     `Unique` that call pushed whose `key` is in `probed`.
+
+   `write_row`'s signature does not change, nor do its six other call sites. READ COMMITTED is left out:
+   there `write_row` waits for the holder (ADR 0114 §1), and a lock taken after a wait restarts the
+   statement (`wait_for_the_lock`, `exec/mod.rs` lines 438–441). Case 11 was not re-measured in unit H.
 
 ### What it answers, against ADR 0114's capture
 
@@ -315,19 +375,35 @@ and the one moment that bit can be taken.
 | 09 — SERIALIZABLE, read first, holder committed before the `INSERT` | `40001` at the `INSERT` | `23505` at `COMMIT` | `40001` at `COMMIT` |
 | 06 — SERIALIZABLE, read first, holder live | waits, `40001` at the `INSERT` | `23505` at `COMMIT` | `40001` at `COMMIT` |
 | 07 — SERIALIZABLE, never read | waits, `23505` at the `INSERT` | `23505` at `COMMIT` | `23505` at `COMMIT` |
-| 13 — SERIALIZABLE `ON CONFLICT DO NOTHING` | waits, `40001` | **(unverified)** | `40001` at `COMMIT` (`conflicting_row` read the arbiter) |
-| REPEATABLE READ, either way | `23505` | `23505` at `COMMIT` | unchanged — `read_first` is false |
+| 13 — SERIALIZABLE `ON CONFLICT DO NOTHING`, read first | waits, `40001` at the `INSERT` | `INSERT 0 1` at once, `23505` at `COMMIT` | `40001` at `COMMIT` (step 3: `conflicting_row` read the arbiter) |
+| 14 — the same, never read | waits, `40001` at the `INSERT` | `INSERT 0 1` at once, `23505` at `COMMIT` | `40001` at `COMMIT` (steps 3 and 5) |
+| 15 — REPEATABLE READ `ON CONFLICT DO NOTHING`, read first | waits, `40001` at the `INSERT` | `INSERT 0 1` at once, `23505` at `COMMIT` | `40001` at `COMMIT` by step 5; `23505` without it |
+| 16 — the same, never read | waits, `40001` at the `INSERT` | `INSERT 0 1` at once, `23505` at `COMMIT` | `40001` at `COMMIT` by step 5; `23505` without it |
+| 04, 10 — REPEATABLE READ, plain `INSERT` | `23505` | `23505` at `COMMIT` | unchanged — `read_first` is false |
 
-The code moves to PostgreSQL's in all four SERIALIZABLE rows. The statement does not: moving the
-refusal to the `INSERT` would need a predicate lock in the store, and that is outside (ii).
+With step 5 the code moves to PostgreSQL's in every row above; without it, rows 15 and 16 keep `23505`.
+The statement does not move: refusing at the `INSERT` would need a predicate lock in the store, and
+PostgreSQL's wait before it would need REPEATABLE READ and SERIALIZABLE to wait (*What neither half does*).
+
+**Rows 13–16, measured** *(unit H)*. PostgreSQL 19beta1, `esker-coord/s1-oracle-2026-09-13/h/` (13 is
+`d/`'s case again, as the control): in all four, B's `INSERT … ON CONFLICT (nick) DO NOTHING` waited about
+1.3 s, until A's `COMMIT`, and was refused `40001 could not serialize access due to concurrent update`
+from `ExecCheckTupleVisible`; one `bob` remained. This node at `aad1dca3`, by one probe run once and never
+committed (`h/node-probe.rs`, output `h/node-probe.out`): the same sequence on real stores (`tests/cluster`,
+three stores) and on `MemoryBackend`, with B's first read as `count(*)`, as `find_by`, or none. In every
+cell and on both, B's `INSERT` answered `INSERT 0 1` at once, A's `COMMIT` succeeded, and B's `COMMIT` was
+`23505 duplicate key value violates unique constraint "index_subscribers_on_nick"`.
 
 ### Tests
 
 * Real stores, `crates/esker-sql/tests/concurrent_unique_insert.rs`:
   * remove `#[ignore]` from `serializable_refuses_a_unique_key_committed_after_it_was_read_with_40001` (case 09);
   * add case 07 → `23505`;
-  * add case 13 → `40001`.
-* In process, `crates/esker-sql/tests/serializable.rs` (`MemoryBackend`): the same three shapes.
+  * add case 13 → `40001`;
+  * add cases 15 and 16, REPEATABLE READ `ON CONFLICT DO NOTHING` → `40001` *(unit H)*.
+* In process (`MemoryBackend`): the same shapes, the SERIALIZABLE ones in
+  `crates/esker-sql/tests/serializable.rs`. The probe found `MemoryBackend` answering rows 13–16 exactly as
+  real stores do today, so each is red before the change.
 * `has_read` on `StoreTxn` and on `MemoryTxn`: key membership, range containment, and a catalog key that
   is never recorded.
 * A savepoint test that `Recording` forwards `has_read`: a read made before `SAVEPOINT` is still seen
@@ -345,6 +421,10 @@ refusal to the `INSERT` would need a predicate lock in the store, and that is ou
 Set `read_first` to `false` unconditionally in `write_row`. Case 09's test answers `23505` again, and
 case 07's stays green — it is the control that shows the bit, and not something else, is deciding.
 
+For step 5 *(unit H)*: skip the marking in the `INSERT` loop. Cases 15 and 16 answer `23505` again, while
+13 and 14 stay `40001` because step 3 still reaches them — the control that shows the arbiter set, and
+not the level, decides at REPEATABLE READ.
+
 ### Files
 
 `esker-sql` only:
@@ -353,7 +433,7 @@ case 07's stays green — it is the control that shows the bit, and not somethin
 * `src/backend/store.rs` — `StoreTxn`'s;
 * `src/exec/savepoint.rs` — `Recording`'s forward;
 * `src/exec/mod.rs` — `Unique::read_first` and `explain_conflict`;
-* `src/exec/dml.rs` — `write_row`'s two probes;
+* `src/exec/dml.rs` — `write_row`'s two probes, and `conflicting_row` and the `INSERT` loop (step 5);
 * the tests above.
 
 No format, no wire.
@@ -363,6 +443,8 @@ No format, no wire.
 * A statement that reads a unique key and inserts it in the same statement — `INSERT … SELECT … WHERE
   nick = …` over the same table — counts as "read first". PostgreSQL's predicate lock would count it too.
 * Nothing new to keep in memory: the read set already exists.
+* Not captured *(unit H)*: `ON CONFLICT DO UPDATE`, and a lost key on a unique index that is not the
+  arbiter. Step 5 marks only what `conflicting_row` read, so the second stays `23505`.
 
 ---
 
@@ -371,5 +453,5 @@ No format, no wire.
 * Build anything before the rulings.
 * Make REPEATABLE READ or SERIALIZABLE **wait** for a live holder of a unique value, as PostgreSQL
   does (ADR 0114, "What stays declared").
-* Move SERIALIZABLE's `40001` from `COMMIT` to the `INSERT`.
+* Move the `40001` from `COMMIT` to the `INSERT`, at SERIALIZABLE or at REPEATABLE READ.
 * Close §2's read-to-lock window (step 5).
