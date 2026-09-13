@@ -18,10 +18,14 @@
 //!                    else 23505
 //! ```
 //!
-//! These are the two deterministic halves of the READ COMMITTED row: the second writer **waits**
-//! for the first, and is then the duplicate PostgreSQL says it is, or goes through. What Rails does
-//! after the duplicate — a `SELECT … FOR UPDATE` of the row the first writer committed — is the
-//! ADR's §2, which is a format question and is not built.
+//! The first two tests are the deterministic halves of the READ COMMITTED row: the second writer
+//! **waits** for the first, and is then the duplicate PostgreSQL says it is, or goes through. What
+//! Rails does after the duplicate — a `SELECT … FOR UPDATE` of the row the first writer committed —
+//! is the ADR's §2, which is a format question and is not built.
+//!
+//! **The last three tests are red, and stay red until the user rules**: §2's `FOR UPDATE` of a row
+//! committed after the transaction began, §3's SERIALIZABLE `40001`, and `relations_test.rb`'s duel
+//! itself, which needs §1 and §2 both.
 //!
 //! Every test here runs against three real stores, and both sessions are on one node: the wait is
 //! ADR 0057's node-local row lock, and one node is the Rails suite's shape.
@@ -113,6 +117,101 @@ fn a_second_insert_of_a_unique_key_waits_and_goes_through_when_the_first_rolls_b
         assert!(answer.is_ok(), "B's {step}: {second:#?}");
     }
     assert_eq!(bobs(&cluster), "1");
+}
+
+/// **§2's red test: a `FOR UPDATE` of a row another transaction committed after this one began takes
+/// the lock, at READ COMMITTED.** PostgreSQL 19 (`esker-coord/s1-oracle-2026-09-13/e/`): a row updated
+/// after the locker's first statement comes back at its new value, `11`, and a row inserted after it
+/// comes back too, `20`.
+///
+/// Here the lock is ADR 0088's eager one, a `Check` prewritten when the statement runs, and a `Check`
+/// is validated at the transaction's `start_ts` — so both are refused `40001 could not serialize
+/// access due to concurrent update: a commit at … beat this transaction at …`. No unique index is in
+/// it, which is why it is a test of its own: this is every `lock!` in a block that began before
+/// somebody else's update of the row.
+#[test]
+fn a_for_update_of_a_row_committed_after_the_transaction_began_takes_the_lock() {
+    let cluster = Cluster::start();
+    let mut setup = cluster.session();
+    setup
+        .run("CREATE TABLE lk (id bigint primary key, n bigint)")
+        .unwrap();
+    setup.run("INSERT INTO lk VALUES (1, 10)").unwrap();
+
+    let mut updater = cluster.session();
+    let mut inserter = cluster.session();
+    for locker in [&mut updater, &mut inserter] {
+        locker.run("BEGIN").unwrap();
+        locker.rows("SELECT count(*) FROM lk");
+    }
+    let mut other = cluster.session();
+    other.run("UPDATE lk SET n = 11 WHERE id = 1").unwrap();
+    other.run("INSERT INTO lk VALUES (2, 20)").unwrap();
+
+    let after_update = updater.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE");
+    let after_insert = inserter.run("SELECT n FROM lk WHERE id = 2 FOR UPDATE");
+    assert_eq!(
+        (first_cell(&after_update), first_cell(&after_insert)),
+        (Some("11".to_owned()), Some("20".to_owned())),
+        "the updated row answered {after_update:?} and the inserted one {after_insert:?}"
+    );
+    for locker in [&mut updater, &mut inserter] {
+        let _ = locker.run("ROLLBACK");
+    }
+}
+
+/// **§3's red test, as the unit was issued: SERIALIZABLE refuses with `40001`.** B reads that there is
+/// no `bob`, A inserts `bob` and commits, and then B inserts `bob`. PostgreSQL 19 answers `40001 could
+/// not serialize access due to read/write dependencies among transactions` at the `INSERT` (case 09),
+/// because what B read has moved under it. This node answers `23505` at `COMMIT`, and which of ADR
+/// 0114 §3's three answers it should give is the user's.
+#[test]
+fn serializable_refuses_a_unique_key_committed_after_it_was_read_with_40001() {
+    let cluster = cluster_with_subscribers();
+    let mut b = cluster.session();
+    b.run("BEGIN").unwrap();
+    b.run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    assert!(!find_by(&mut b, "bob").unwrap(), "there is no bob yet");
+
+    let mut a = cluster.session();
+    a.run("BEGIN").unwrap();
+    a.run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .unwrap();
+    a.run("INSERT INTO subscribers (nick) VALUES ('bob')")
+        .unwrap();
+    a.run("COMMIT").unwrap();
+
+    let refused = b
+        .run("INSERT INTO subscribers (nick) VALUES ('bob')")
+        .and_then(|_| b.run("COMMIT"))
+        .expect_err("B read the key A then committed, so B may not commit");
+    assert_eq!(refused.sqlstate(), "40001", "{refused}");
+    let _ = b.run("ROLLBACK");
+    assert_eq!(bobs(&cluster), "1");
+}
+
+/// **The acceptance: `relations_test.rb`'s two tests, statement for statement.**
+/// `test_multiple_find_or_create_by_within_transactions` and its `_bang_` twin send the same SQL —
+/// PostgreSQL 19's own log of the file shows both — so the duel runs twice on one cluster with the
+/// file's `teardown` between, as the file runs them. Both sessions commit both times, and there is
+/// one `bob`.
+///
+/// The race is Rails' and is not steered: B wakes as soon as A has inserted, while A's `COMMIT` is
+/// still on its way, so whether B meets A's lock or A's commit is the machine's choice. It needs
+/// both halves of ADR 0114: §1's wait and §2's lock.
+#[test]
+fn relations_test_s_find_or_create_by_duel_commits_both_sessions() {
+    let cluster = cluster_with_subscribers();
+    for round in ["find_or_create_by", "find_or_create_by!"] {
+        let (first, second) = duel(&cluster);
+        assert!(
+            first.is_ok() && second.is_ok(),
+            "{round}: A answered {first:?} and B answered {second:?}"
+        );
+        assert_eq!(bobs(&cluster), "1", "{round}");
+        cluster.session().run("DELETE FROM subscribers").unwrap();
+    }
 }
 
 /// What the second session answered, step by step, so that a failure names every one of them.
@@ -254,4 +353,77 @@ fn cluster_with_subscribers() -> Cluster {
         setup.run(statement).unwrap();
     }
     cluster
+}
+
+/// The duel from `relations_test.rb`, with Rails' two `Concurrent::Event`s as channels.
+///
+/// Each thread wakes the other **whatever its own statements answered**: a thread that returned
+/// early would otherwise leave the other waiting out the whole barrier, and a failure that costs a
+/// minute to report is a failure nobody waits for.
+fn duel(cluster: &Cluster) -> (esker_sql::Result<()>, esker_sql::Result<()>) {
+    let (a_wakeup, a_hears) = channel::<()>();
+    let (b_wakeup, b_hears) = channel::<()>();
+    let mut a = cluster.session();
+    let mut b = cluster.session();
+    let first = std::thread::spawn(move || {
+        a_hears.recv_timeout(BARRIER).unwrap();
+        let created = begin_then_find_or_create_by(&mut a);
+        b_wakeup.send(()).unwrap();
+        created.and_then(|()| a.run("COMMIT").map(|_| ()))
+    });
+    let second = std::thread::spawn(move || {
+        // "Read the record prematurely for MySQL REPEATABLE READ to kick in" — the test's own words.
+        let read = b.run("BEGIN").and_then(|_| find_by(&mut b, "bob"));
+        a_wakeup.send(()).unwrap();
+        b_hears.recv_timeout(BARRIER).unwrap();
+        read.and_then(|_| find_or_create_by(&mut b, "bob"))
+            .and_then(|()| b.run("COMMIT").map(|_| ()))
+    });
+    (first.join().unwrap(), second.join().unwrap())
+}
+
+/// The first thread's block up to the point where it wakes the second.
+fn begin_then_find_or_create_by(a: &mut Session) -> esker_sql::Result<()> {
+    a.run("BEGIN")?;
+    find_or_create_by(a, "bob")
+}
+
+/// `find_by(attributes) || create_or_find_by(attributes)`, which is Rails 8.1's
+/// `find_or_create_by`, with `create_or_find_by`'s rescue of `RecordNotUnique`.
+fn find_or_create_by(session: &mut Session, nick: &str) -> esker_sql::Result<()> {
+    if find_by(session, nick)? {
+        return Ok(());
+    }
+    session.run("SAVEPOINT active_record_1")?;
+    match session.run(&format!(
+        "INSERT INTO subscribers (nick) VALUES ('{nick}') RETURNING nick"
+    )) {
+        Ok(_) => session.run("RELEASE SAVEPOINT active_record_1").map(|_| ()),
+        Err(error) if error.sqlstate() == "23505" => {
+            session.run("ROLLBACK TO SAVEPOINT active_record_1")?;
+            let found = session.run(&format!(
+                "SELECT nick FROM subscribers WHERE nick = '{nick}' AND nick = '{nick}' LIMIT 1 \
+                 FOR UPDATE"
+            ))?;
+            assert_eq!(
+                row_count(&found),
+                1,
+                "find_by! found nothing after a duplicate"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The first column of the first row an answer carries, as text.
+fn first_cell(answer: &esker_sql::Result<Outcome>) -> Option<String> {
+    if let Ok(Outcome::Rows { rows, .. }) = answer {
+        rows.first()
+            .and_then(|row| row.first())
+            .and_then(Option::as_ref)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    } else {
+        None
+    }
 }
