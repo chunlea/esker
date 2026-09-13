@@ -116,15 +116,38 @@ always `40001`. The fix gives the eager lock's `Check` the statement's read time
 
 ### Old peers
 
-* **Wire.** An old store decodes tag 7 into `DecodeError::invalid("mutation.tag", "7 is not a mutation kind")`
-  (`txn.rs` line 388), which becomes a `ProtoError` (`impl From<DecodeError> for ProtoError`,
-  `crates/esker-proto/src/error.rs` line 650). What the transport then answers the client
-  (`crates/esker-proto/src/transport/server.rs`, `serve` at line 184) is **(unverified)**.
-* **Log.** An old follower replaying kind 7 fails in `TxnCommand::decode_from` with
-  `ProtoError::corrupt("txn command", "7 is not a write kind")`. What its apply loop does with a corrupt
-  entry is **(unverified)**.
+* **Wire — an old store refuses the request and keeps the connection, and the client surfaces it.**
+  `TxnKvReq`'s decoder reads a `Prewrite`'s mutations one at a time (`crates/esker-proto/src/txn.rs`
+  line 683), and tag 7 is `DecodeError::invalid("mutation.tag", "7 is not a mutation kind")` (line 388).
+  `ConnectionState::on_request` (`crates/esker-proto/src/transport/server.rs` lines 355–365) makes it
+  `ProtoError::InvalidRequest` (`impl From<DecodeError> for ProtoError`, `error.rs` line 650), answers an
+  `Error` frame for that request id and returns `FrameAction::Continue`: *"this is a caller error, not
+  corruption, and the connection survives it."* `InvalidRequest` is not `is_retryable` (`error.rs`
+  lines 446–455), so `esker_client::retry::classify` surfaces it (`retry.rs` line 216) and the router's
+  `terminal` hands it back as `Error::Store`, with no second attempt (`router.rs` line 665). Its
+  `outcome()` is `NotApplied` (`error.rs` line 389), so `Error::changed_nothing` holds. `esker-sql`'s
+  `translate` files `ClientError::Store(_)` as `SqlError::StoreUnavailable`
+  (`crates/esker-sql/src/backend/store.rs` line 656), which is `08006`. A READ COMMITTED `FOR UPDATE`
+  that reaches an old store is `08006`, having locked nothing and misread nothing.
+* **Log — an old follower drops the region, and drops it again after every restart.** Raft appends a
+  kind-7 entry without reading it, and it fails at apply. `PeerCore::apply`
+  (`crates/esker-store/src/peer.rs` line 695) decodes with `Command::decode` (line 708) — `TAG_TXN` is
+  `TxnCommand::decode_from` (`apply.rs` line 268), which answers
+  `ProtoError::corrupt("txn command", "7 is not a write kind")` — and returns before the batch that
+  carries `apply_index` is staged and written (lines 760–772). Its doc gives the reason: *"A payload
+  that cannot be **decoded** cannot be applied at all, and skipping it would leave this peer's state
+  machine differing from every other's, so it stops the driver."* `PeerCore::drive` passes the error up
+  (line 481), and the store's worker logs `the Raft driver failed for a region`, removes that region,
+  fails its outstanding proposals and goes on serving its other regions
+  (`crates/esker-store/src/driver.rs` lines 421–430). `apply_index` has not moved, so a restart replays
+  the same entry and stops at it again, and a columnar copy resuming over it refuses the same way
+  (`crates/esker-store/src/columnar/region.rs` line 705). **Nothing diverges; availability is what is
+  lost** — the old replicas of each region such an entry reaches, and the region itself once they are a
+  majority.
 * The deployment rule is the one `VERB_RELEASE_LOCK`'s doc already states (`txn_command.rs` lines
-  47–52): every store understands the addition before any client sends it.
+  47–52): every store understands the addition before any client sends it. The two paths above are what
+  make it a rule: a client that goes first costs `08006` on every such lock, and a leader that goes first
+  costs its old followers their copies of the region.
 
 ### Goldens
 
@@ -189,7 +212,8 @@ with `a commit at … beat this transaction at …`, and the store test's `read_
 
 ### Risks
 
-* A new client talking to an old store fails every READ COMMITTED `FOR UPDATE`. Stores go first.
+* A new client talking to an old store fails every READ COMMITTED `FOR UPDATE` with `08006`, and a new
+  leader costs its old followers their copies of the region (*Old peers*). Stores go first — all of them.
 * One more entry in the client's `read_ts` map per eager lock, for the life of the transaction.
 * The read-to-lock window in step 5 still refuses.
 
@@ -252,7 +276,19 @@ and the one moment that bit can be taken.
 
 * `WHERE nick = $1 LIMIT 1` over a unique index plans as `Node::IndexLookup` (`exec/query.rs`
   line 2979) and runs as a point access (`exec/cursor.rs` line 524, `Kind::Point`; the arm at line 741).
-* It therefore lands in `read_keys`. The exact `get` call inside that arm is **(unverified)**.
+* The arm calls `point(self.txn, self.tenant, node, Some(&namer))` (line 746). On `Node::IndexLookup`,
+  `point` (line 1208) builds `row::index_key(tenant, *table_id, *index_id, key, None)` (line 1234),
+  reads it with `txn.get(&index_key)` (line 1235), and then reads the row with `txn.get(&key)`
+  (line 1240).
+* Both `get`s record their key. `StoreTxn::get` does it first thing (`backend/store.rs` lines 449–450);
+  `MemoryTxn::get` does it after its buffer, which holds this transaction's own writes and is not a read
+  (`backend/mod.rs` lines 870–887). `record_key` (`store.rs` line 238, `mod.rs` line 801) keeps a key
+  only while `validating`, and never a catalog key.
+* **The entry key it records is the key `write_row` probes.** `exec::index::entry` (`exec/index.rs`
+  line 39) gives a by-value entry no suffix — `row::index_key(tenant, table.id, index.id, &values, None)`
+  (lines 61–65) — which is the call `point` makes, with the same `None`, so one value is one key. An
+  earlier `find_by` of `bob` therefore leaves exactly `entry.key` in `read_keys`, and
+  `has_read(&entry.key)` sees it.
 
 ### The change
 
