@@ -93,6 +93,7 @@ max-threads = 1
 # through the same `mod cluster;`, and was in no group — found by running the census once against
 # the merged tree rather than by waiting for it to redden a gate, which is the whole point of
 # having a census instead of a list of names. Run the grep after every merge that adds a test.
+# The nineteenth, `concurrent_unique_insert` (#90), joined the day it was written.
 #
 # Seventeen before it, all seventeen listed. `view_bind_real_stores` joins in the same pass:
 # it holds the same three stores, was equally invisible, and had no sighting only because it holds
@@ -210,7 +211,7 @@ filter = """
         or binary(derived_name_in_a_schema) or binary(enum_default) or binary(jsonb_concat)
         or binary(psql_smoke) or binary(regtype_user_probe)
         or binary(multi_region_rows) or binary(view_bind_real_stores) or binary(store_locking)
-        or binary(cross_node_deadlock)))
+        or binary(cross_node_deadlock) or binary(concurrent_unique_insert)))
     or (package(esker-store) and (binary(promotion) or binary(balance) or binary(snapshot)
         or binary(cluster) or binary(retire) or binary(pd_wire) or binary(sim_sweep)))
     or (package(esker-cli) and (binary(cluster_start) or binary(cluster_chaos) or binary(columnar_cluster) or binary(pgwire_cluster) or binary(cross_region_scan) or binary(multi_region_differential)))

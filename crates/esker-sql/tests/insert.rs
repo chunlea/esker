@@ -321,6 +321,13 @@ fn a_concurrent_duplicate_is_reported_as_a_duplicate() {
     let (mut left, mut right) = (node.session(), node.session());
     left.begin(false).unwrap();
     right.begin(false).unwrap();
+    // **At REPEATABLE READ, because that is the level this race still happens at** (ADR 0114). At
+    // READ COMMITTED the second insert waits for the first — one thread cannot hold a key and wait
+    // for it, which is the test after this one — and a lost race on a unique entry is exactly as
+    // much a duplicate wherever it does still happen.
+    for session in [&mut left, &mut right] {
+        run(session, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").unwrap();
+    }
 
     // Both read the index key at their own snapshot; neither sees anything.
     run(&mut left, "INSERT INTO t VALUES (1, 'a@b')").unwrap();
@@ -337,6 +344,42 @@ fn a_concurrent_duplicate_is_reported_as_a_duplicate() {
         loser.to_string(),
         "duplicate key value violates unique constraint \"t_email_key\""
     );
+}
+
+/// **At READ COMMITTED a second insert of a unique value waits for the first** (ADR 0114), as a
+/// second insert of a primary key already did. The primary keys differ here, so the only thing the
+/// two rows collide on is `t_email_key` — which is the shape of a table whose row key is an internal
+/// row id, and the one `relations_test.rb` races on.
+///
+/// One thread cannot hold a key and wait for it, so the wait is bounded and the answer is a real
+/// server's for a waiter that runs out of `lock_timeout`; the duplicate is then asserted where it
+/// still happens, after the holder has committed.
+#[test]
+fn a_concurrent_duplicate_of_a_unique_value_waits_at_read_committed() {
+    let node = Node::new();
+    let mut setup = node.session();
+    run(
+        &mut setup,
+        "CREATE TABLE t (id int8 PRIMARY KEY, email text UNIQUE)",
+    )
+    .unwrap();
+
+    let (mut left, mut right) = (node.session(), node.session());
+    left.begin(false).unwrap();
+    right.begin(false).unwrap();
+    run(&mut left, "INSERT INTO t VALUES (1, 'a@b')").unwrap();
+
+    run(&mut right, "SET lock_timeout = '100ms'").unwrap();
+    let waited = run(&mut right, "INSERT INTO t VALUES (2, 'a@b')")
+        .expect_err("a second insert of a unique value another transaction holds must wait");
+    assert_eq!(waited.sqlstate(), "55P03", "{waited}");
+    right.rollback().unwrap();
+    left.commit().unwrap();
+
+    let mut after = node.session();
+    let loser = run(&mut after, "INSERT INTO t VALUES (2, 'a@b')").unwrap_err();
+    assert_eq!(loser.sqlstate(), sqlstate::UNIQUE_VIOLATION);
+    assert!(loser.to_string().contains("t_email_key"), "{loser}");
 }
 
 /// The same race on the *primary key*, which has no index behind it -- the row itself is the entry.

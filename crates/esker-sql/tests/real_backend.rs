@@ -108,6 +108,15 @@ fn a_lost_race_on_a_unique_index_is_a_duplicate_key() {
     // read each does finds the index key absent. Exactly one may commit.
     first.executor.begin(false).unwrap();
     second.executor.begin(false).unwrap();
+    // **At REPEATABLE READ, because that is where this race still happens** (ADR 0114). At READ
+    // COMMITTED the second insert waits for the first, which this one thread could never release;
+    // `tests/concurrent_unique_insert.rs` is that wait, against the same real stores.
+    first
+        .run("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
+    second
+        .run("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
     first.run("INSERT INTO u VALUES (1, 'same@x')").unwrap();
     second.run("INSERT INTO u VALUES (2, 'same@x')").unwrap();
 

@@ -1137,6 +1137,19 @@ pub(super) fn write_row(
         // on one key -- unless a column is NULL, because PostgreSQL admits any number of NULLs in
         // a `UNIQUE` column and those entries need the suffix to stay apart (`crate::row`).
         if entry.by_value {
+            // **The entry's key is locked before it is read, at READ COMMITTED** (ADR 0114). The
+            // row lock above is on the row key, and where that is an internal row id — a table with
+            // no primary key of its own, which is Rails' `id: false` — it collides with nothing: a
+            // second writer of the same value read the key as absent at its own snapshot, buffered
+            // it, and met the first writer only at commit, where `create_or_find_by` cannot rescue
+            // what it is told. Locked, it waits for the first writer as a row's second writer does,
+            // and the re-run after the wait reads what the first one left: its committed entry,
+            // which is the `23505` PostgreSQL answers at the `INSERT`, or nothing, and the insert
+            // goes through. The two levels that keep their snapshot have no re-run to wait for, and
+            // their conflict stays at prewrite.
+            if executor.isolation().waits() {
+                super::wait_for_row(executor, txn, &entry.key, crate::backend::Reach::Node)?;
+            }
             let detail = super::index::render_key(table, &index.keys, &entry.values);
             if txn.get(&entry.key)?.is_some() {
                 return Err(SqlError::UniqueViolation {
