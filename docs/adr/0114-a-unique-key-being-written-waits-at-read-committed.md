@@ -169,7 +169,7 @@ wire (`TxnMutation`) and an additive kind in the Raft log (`TxnWrite`)** — exa
   commit sends keeps tag 5 at `start_ts` (ADR 0062 §3).
 
 **Not built, and not this lane's to build without a yes**: it changes a wire format and a replicated
-log format that both have goldens. What exists is the red test.
+log format that both have goldens. What exists is the red test, and the register's row for it, #91.
 
 ### §3 — SERIALIZABLE (a question)
 
@@ -261,8 +261,9 @@ holder that disappears gives its locks back with its session
   wait beside them, the way ADR 0057 rewrote the primary-key test.
 * **`crate::backend`'s module doc** and `docs/DESIGN.md` §8 say which levels a concurrent duplicate
   still meets at prewrite.
-* **§2 and §3 have red tests, and they are kept off `main`** until the two are ruled on, because a
-  red test cannot land: they are written, run and handed over with s1-sql's handover of 2026-09-13.
+* **§2 and §3 have red tests, `#[ignore]`d until the two are ruled on**, each with a reason naming its
+  section and the question it waits for, so they compile and clippy reads them while the gate does not
+  run them; `--run-ignored only` does. §2 is also debt #91.
 
 ## What stays declared
 
@@ -284,6 +285,6 @@ any wait and would pass a clock. Beside them, the two rewritten tests and the in
 The counterfactual — §1 taken out by the same asserted replace that put it in — turns the three waits
 red again.
 
-**§2 and §3, red until ruled on, and off `main` until then** — for the same file: a `FOR UPDATE` of a
-row committed after the transaction began (e1, e2); `relations_test.rb`'s duel, statement for
-statement, twice, as the acceptance; and SERIALIZABLE's `40001` (case 09).
+**§2 and §3, red and `#[ignore]`d until ruled on** — in the same file: a `FOR UPDATE` of a row
+committed after the transaction began (e1, e2); `relations_test.rb`'s duel, statement for statement,
+twice, as the acceptance; and SERIALIZABLE's `40001` (case 09).
