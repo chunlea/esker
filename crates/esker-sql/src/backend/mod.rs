@@ -20,10 +20,15 @@
 //! 1. **The executor reads the index key inside the transaction and requires it absent.** The read
 //!    is at the transaction's snapshot, so a duplicate that is *already committed* is visible and
 //!    is reported as `23505 unique_violation` before anything is written.
-//! 2. **Then it writes the index entry like any other key.** A *concurrent* duplicate needs no
-//!    further help: both transactions read the key as absent, both prewrite the same key, and
-//!    write-write conflict detection (`docs/DESIGN.md` §8) lets exactly one commit. The loser's
-//!    `commit` fails, and the executor reports that as `23505` too.
+//! 2. **Then it writes the index entry like any other key.** A *concurrent* duplicate is caught one
+//!    of two ways, and the isolation level decides which
+//!    ([ADR 0114](../../../../docs/adr/0114-a-unique-key-being-written-waits-at-read-committed.md)).
+//!    At READ COMMITTED the executor locks the entry's key before the read in step 1, so a second
+//!    writer of the value on this node waits for the first and reads what it left: `23505` from its
+//!    own statement if the first committed, nothing if it rolled back. At the two levels that keep
+//!    their snapshot, and between two nodes, both transactions read the key as absent, both
+//!    prewrite it, and write-write conflict detection (`docs/DESIGN.md` §8) lets exactly one
+//!    commit; the loser's `commit` fails, and the executor reports that as `23505` too.
 //!
 //! The fake below implements the same conflict rule as the real protocol — a commit fails if any
 //! key it wrote gained a version after this transaction's snapshot — so an executor test can

@@ -800,7 +800,12 @@ for the writer in front of it rather than answering `40001`. The three CFs and t
 are the same either way; what the level changes is which snapshot a statement reads at and what a
 conflict does. `SERIALIZABLE` is the third: snapshot isolation **plus a validated read set**, so a
 transaction that read a row another transaction then wrote is refused at `COMMIT` rather than
-committing on a snapshot that never existed as a serial order.
+committing on a snapshot that never existed as a serial order. **A unique index entry is locked
+like a row at `READ COMMITTED`** ([ADR 0114](adr/0114-a-unique-key-being-written-waits-at-read-committed.md)):
+a second writer of the same value on one node waits for the first and re-reads what it left — a
+`23505` from its own statement if the first committed, nothing if it rolled back — where it used to
+read the key as absent and meet the first writer at commit. At the two levels that keep their
+snapshot, and between two nodes, that meeting is still at prewrite.
 
 
 | CF | key | value |
