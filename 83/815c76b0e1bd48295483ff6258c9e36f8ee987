@@ -1,0 +1,41 @@
+crates/esker-sql/src/error.rs
+  s_8d3e4c2902bf64::t_6a58a1a4ff37b7 1338-1382,3212-3213,3249-3250,3273-3274,3304-3306,3344-3345,3426-3427,3482,3668-3673,3856-3858
+crates/esker-sql/src/exec/bind.rs
+  s_8d3e4c2902bf64::t_05a36634cbbe27 349,1095,1346,1463
+crates/esker-sql/src/exec/mod.rs
+  s_8d3e4c2902bf64::t_8b960c14559b56 45,206-208,845,1182,4439
+crates/esker-sql/src/exec/plpgsql.rs
+  s_8d3e4c2902bf64::t_06e304a902bd4f 1-579
+crates/esker-sql/src/parse/lower.rs
+  s_8d3e4c2902bf64::t_33dafc42745971 134-138,9994
+crates/esker-sql/src/parse/mod.rs
+  s_8d3e4c2902bf64::t_91cfef5cb07e52 330,375,377-381,403,516-517,519-520,667-670,725-732,764,1042,1661,1663-1668,1676
+crates/esker-sql/src/plan/mod.rs
+  s_8d3e4c2902bf64::t_db8276443e3cda 73-74,76-82,213-216,308-310,346
+crates/esker-sql/src/sqlstate.rs
+  s_8d3e4c2902bf64::t_c655ca67024b6f 310-312,407-410
+crates/esker-sql/tests/corpus/pg19_plpgsql_do.txt
+  s_8d3e4c2902bf64::t_dcacdb025db8e0 1-260
+crates/esker-sql/tests/do_block.rs
+  s_8d3e4c2902bf64::t_b9412f17472093 10-15,103-104,106-108,110,117,122-125,129-132,144,179-185,242,250
+crates/esker-sql/tests/plpgsql_do.rs
+  s_8d3e4c2902bf64::t_a8f76079c04d06 1-396
+crates/esker-sql/tests/user_decided_divergences.rs
+  s_8d3e4c2902bf64::t_4f3ae16be41893 21,33-36,47-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "83815c76b0e1bd48295483ff6258c9e36f8ee987",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
