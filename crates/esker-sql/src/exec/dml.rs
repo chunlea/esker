@@ -715,12 +715,13 @@ pub(super) fn insert(
             check_partition_bound(executor, txn, &table, &row)?;
         }
         let target = routed.as_ref().unwrap_or(&table);
+        // The keys `ON CONFLICT`'s arbiter reads for this row, which `write_row` cannot see
+        // (ADR 0114 §3).
+        let mut arbitrated = Vec::new();
         // **The conflict is routed first and arbitrated second.** A row no partition takes is
         // `23514` above even under `DO NOTHING` — the clause never gets a chance, because there is
         // no partition whose index could arbitrate. Here the partition is known, and it is *its*
         // indexes the target is inferred against.
-        // The keys `ON CONFLICT`'s arbiter reads for this row, which `write_row` cannot see.
-        let mut arbitrated = Vec::new();
         if let Some(on_conflict) = &insert.on_conflict
             && let Some(existing) =
                 conflicting_row(executor, txn, target, on_conflict, &row, &mut arbitrated)?
@@ -744,11 +745,7 @@ pub(super) fn insert(
         }
         let first_unique = written.unique_keys.len();
         write_row(executor, txn, target, &row, written)?;
-        mark_arbitrated(
-            executor,
-            &mut written.unique_keys[first_unique..],
-            &arbitrated,
-        );
+        mark_arbitrated(executor, written, first_unique, &arbitrated);
         if insert.on_conflict.is_some() {
             touched.push(row_key_of(executor, target, &row)?);
         }
@@ -1720,13 +1717,18 @@ fn conflicting_row(
 /// snapshot cannot see. Here the arbiter reads the key at the snapshot and the race is found at
 /// `COMMIT`, so this mark is what carries the arbiter's read that far. READ COMMITTED is left alone:
 /// there `write_row` waits for a holder on this node and re-runs the statement (ADR 0114 §1).
-/// `pushed` is what `write_row` added for this row, so no other row's key is marked by this row's
-/// arbiter.
-fn mark_arbitrated(executor: &Executor, pushed: &mut [Unique], arbitrated: &[Vec<u8>]) {
+/// `from` is where `written` stood before this row's `write_row`, so no other row's key is marked
+/// by this row's arbiter.
+fn mark_arbitrated(
+    executor: &Executor,
+    written: &mut Written,
+    from: usize,
+    arbitrated: &[Vec<u8>],
+) {
     if executor.isolation().waits() {
         return;
     }
-    for unique in pushed {
+    for unique in written.unique_keys.iter_mut().skip(from) {
         if arbitrated.contains(&unique.key) {
             unique.read_first = true;
         }
