@@ -1294,7 +1294,9 @@ a measurement that refutes its own proposal is the cheapest kind and the easiest
 rather than `bigint` (ADR 0097) and `regproc` (ADR 0098) — b4's three families, all three in the
 tree. `regclass[]` (2210) joined them with the same five-place shape, and with it the correction to
 ADR 0098's second rule: `min`/`max` over a `regtype`, a `regproc` or a `regclass` all decay to an
-`oid`, value included (`crates/esker-sql/tests/reg_class.rs`).
+`oid`, value included (`crates/esker-sql/tests/reg_class.rs`). `regnamespace` (4089) joined them
+as a schema's oid: resolved against the statement's catalog the way `regclass` is, and stored, like
+it, as the number alone ([ADR 0115](adr/0115-regnamespace-is-an-oid-that-prints-as-a-schema.md)).
 
 *Settled since this list was written:* **PD HA timing** — three placement drivers replicated with
 `esker-raft`, phase 15 ([ADR 0059](adr/0059-pd-is-a-raft-group.md), §7 above). **Dynamic PD

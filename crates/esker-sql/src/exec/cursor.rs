@@ -37,7 +37,7 @@ pub(super) const SORT_LIMIT: usize = 1_000_000;
 
 /// A relation name to its oid: the executor's own rule, carried to wherever a value is.
 ///
-/// The mirror of `crate::row::NameOfRelation`, which goes the other way for the same reason —
+/// The mirror of `crate::row::NameOfOid`, which goes the other way for the same reason —
 /// see `Settings::names`.
 pub(super) type OidOfRelation<'a> = &'a dyn Fn(&str) -> Result<i64>;
 
@@ -700,7 +700,7 @@ impl<'a> Cursor<'a> {
                 loop {
                     if let Some((key, value)) = batch.next() {
                         *next = successor(&key);
-                        let row = row::decode_row(columns, &value, Some(&relation_namer(env)))?;
+                        let row = row::decode_row(columns, &value, Some(&stored_oid_namer(env)))?;
                         // **A child's row is decoded as the child and answered as the parent.**
                         // The two layouts differ whenever the child has a row id the parent has
                         // not, or a column of its own, so the values are lifted by position from
@@ -742,7 +742,7 @@ impl<'a> Cursor<'a> {
                 if std::mem::replace(looked, true) {
                     return Ok(None);
                 }
-                let namer = relation_namer(env);
+                let namer = stored_oid_namer(env);
                 point(self.txn, self.tenant, node, Some(&namer))
             }
 
@@ -831,7 +831,7 @@ impl<'a> Cursor<'a> {
                             continue;
                         }
                         let node = probe_node(probe, *inner_table_id, inner_columns, row);
-                        let namer = relation_namer(env);
+                        let namer = stored_oid_namer(env);
                         let mut joined = None;
                         if let Some(inner) = point(self.txn, self.tenant, &node, Some(&namer))? {
                             let mut pair = row.clone();
@@ -1209,7 +1209,7 @@ fn point(
     txn: &dyn Txn,
     tenant: u64,
     node: &Node,
-    name_of: Option<row::NameOfRelation<'_>>,
+    name_of: Option<row::NameOfOid<'_>>,
 ) -> Result<Option<Vec<Datum>>> {
     match node {
         Node::PointGet {
@@ -1445,6 +1445,17 @@ impl Env<'_> {
         cell.get().map(AsRef::as_ref).ok_or_else(|| {
             SqlError::Internal("a catalog snapshot that was just read is gone".to_owned())
         })
+    }
+
+    /// The tenant's schemas as `regnamespace` reads them — every schema a name can resolve in, with
+    /// the number `pg_namespace.oid` shows (ADR 0115) — through the statement's catalog cache.
+    fn schema_names(&self) -> Result<Vec<(String, u64)>> {
+        let Some(txn) = self.txn else {
+            return Err(SqlError::Internal(
+                "a regnamespace reached an evaluator with no transaction to read in".to_owned(),
+            ));
+        };
+        self.settings.catalog.view(txn, self.tenant).schema_names()
     }
 }
 
@@ -2638,6 +2649,43 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
                 };
                 regclass_of(env, names(&name)?)?
             }
+            // **A string to a `regnamespace` is a schema's name**, read by `regnamespacein`'s rules
+            // against the tenant's schemas — the per-row half of what `bound` resolves (ADR 0115).
+            Datum::Text(text) | Datum::Citext(text) if *to == ColumnType::RegNamespace => {
+                crate::value::reg_namespace::from_text(&env.schema_names()?, &text)?
+            }
+            // **And an array of them, element by element**, names and oids alike. A literal's text is
+            // `array_in`'s first, as `regclass[]`'s is, so the array grammar has one reader.
+            Datum::Text(text) if *to == ColumnType::RegNamespaceArray => {
+                let schemas = env.schema_names()?;
+                let mut values = crate::value::array::from_text(&text, ColumnType::Text)?;
+                for element in values.values.iter_mut().flatten() {
+                    let written = element.to_text().unwrap_or_default();
+                    *element = crate::value::reg_namespace::from_text(&schemas, &written)?;
+                }
+                values.element = ColumnType::RegNamespace;
+                Datum::Array(values)
+            }
+            Datum::Array(mut values) if *to == ColumnType::RegNamespaceArray => {
+                let schemas = env.schema_names()?;
+                for element in values.values.iter_mut().flatten() {
+                    *element = match &*element {
+                        Datum::RegNamespace { .. } => element.clone(),
+                        Datum::Text(text) | Datum::Citext(text) => {
+                            crate::value::reg_namespace::from_text(&schemas, text)?
+                        }
+                        Datum::Oid(oid) => crate::value::reg_namespace::of_oid(&schemas, *oid),
+                        other => match oid_argument(Some(other))? {
+                            Some(oid) => {
+                                crate::value::reg_namespace::of_oid(&schemas, oid_of(oid)?)
+                            }
+                            None => Datum::Null,
+                        },
+                    };
+                }
+                values.element = ColumnType::RegNamespace;
+                Datum::Array(values)
+            }
             // **A vector to its array, and only the *plan* knows it is a vector.** An
             // `int2vector` is a `Datum::Text` here — `1 2 3`, space separated, which is its output
             // function's form and not an array literal — so the value cannot say which cast this
@@ -2757,7 +2805,10 @@ pub(super) fn evaluate_in(expr: &Expr, row: &[Datum], env: Env<'_>) -> Result<Da
             Datum::Array(mut values)
                 if matches!(
                     values.element,
-                    ColumnType::RegType | ColumnType::RegProc | ColumnType::RegClass
+                    ColumnType::RegType
+                        | ColumnType::RegProc
+                        | ColumnType::RegClass
+                        | ColumnType::RegNamespace
                 ) && let Some(element) = esker_keys::array::ArrayValue::element_of(*to) =>
             {
                 for datum in values.values.iter_mut().flatten() {
@@ -4268,6 +4319,23 @@ fn catalog_function(
             // path, `information_schema.tables` qualified because that schema is not.
             Some(oid) => regclass_of(env, oid)?,
         },
+        // **`regnamespace` per row** (ADR 0115): a string is a schema's name, read as the cast reads
+        // one, and an oid prints as the schema that has it — its digits when none does, `-` for 0.
+        CatalogFunc::RegNamespaceName => match args.first() {
+            None | Some(Datum::Null) => Datum::Null,
+            Some(Datum::Text(text) | Datum::Citext(text)) => {
+                crate::value::reg_namespace::from_text(&env.schema_names()?, text)?
+            }
+            Some(Datum::Oid(oid) | Datum::RegNamespace { oid, .. }) => {
+                crate::value::reg_namespace::of_oid(&env.schema_names()?, *oid)
+            }
+            other => match oid_argument(other)? {
+                None => Datum::Null,
+                Some(oid) => {
+                    crate::value::reg_namespace::of_oid(&env.schema_names()?, oid_of(oid)?)
+                }
+            },
+        },
         // **The inverse of `'x'::regtype`, and per row**, with the three answers `RegClassName`
         // has and each of them measured: a type's printed name, `-` for oid 0 — which is what
         // every non-array row of `pg_type` holds in `typelem` — and the number back for an oid
@@ -4626,7 +4694,10 @@ fn catalog_function(
         }
         // Resolved before the plan was built (`crate::exec::Executor::bound`). One here means the
         // resolution was skipped, and answering it from the row would be a catalog read per row.
-        CatalogFunc::RegClass | CatalogFunc::ToRegClass => {
+        CatalogFunc::RegClass
+        | CatalogFunc::ToRegClass
+        | CatalogFunc::RegNamespace
+        | CatalogFunc::ToRegNamespace => {
             return Err(SqlError::Internal(format!(
                 "{}() reached the row evaluator unresolved",
                 call.func.name()
@@ -4751,20 +4822,31 @@ fn array_concat(left: Option<&Datum>, right: Option<&Datum>) -> Datum {
 /// `SET search_path = g1_rc, public`. Oid 0 is `-`, PostgreSQL's rendering of `InvalidOid`, and an
 /// oid naming nothing prints its digits: measured, both, and neither is an error — raising here
 /// would break a `LEFT JOIN` that legitimately has no match.
-/// The rule a decoded row's `regclass` columns get their names from.
+/// The rule a decoded row's `regclass` and `regnamespace` columns get their names from.
 ///
 /// **A `regclass` column stores eight bytes and no name** (`debts-v1.1.md` #35) — a name in a row
 /// goes stale the moment its relation is renamed — so the name is put back here, where the session
 /// and the catalog both are. Measured on a real server: after `ALTER TABLE rc_a RENAME TO rc_b` a
 /// stored `regclass` prints `rc_b`, and after the relation is dropped it prints the oid's digits.
+/// A `regnamespace` column stores four bytes by the same rule, and the same two measurements hold
+/// for a schema (ADR 0115).
 ///
 /// **A lookup that fails falls back to the digits**, which is that second measured answer: an oid
 /// naming nothing prints as its number there, so a catalog this cursor cannot read degrades to a
 /// real server's rendering rather than to an error in the middle of a scan.
-fn relation_namer(env: Env<'_>) -> impl Fn(i64) -> Box<str> + '_ {
-    move |oid| match regclass_of(env, oid) {
-        Ok(Datum::RegClass { name, .. }) => name,
-        _ => oid.to_string().into_boxed_str(),
+fn stored_oid_namer(env: Env<'_>) -> impl Fn(row::StoredOid) -> Box<str> + '_ {
+    move |stored| match stored {
+        row::StoredOid::Relation(oid) => match regclass_of(env, oid) {
+            Ok(Datum::RegClass { name, .. }) => name,
+            _ => oid.to_string().into_boxed_str(),
+        },
+        row::StoredOid::Schema(oid) => match env
+            .schema_names()
+            .map(|schemas| crate::value::reg_namespace::of_oid(&schemas, oid))
+        {
+            Ok(Datum::RegNamespace { name, .. }) => name,
+            _ => oid.to_string().into_boxed_str(),
+        },
     }
 }
 
@@ -4888,6 +4970,12 @@ fn regclass_of(env: Env<'_>, oid: i64) -> Result<Datum> {
         oid,
         name: printed.into(),
     })
+}
+
+/// An oid read from a wider integer, for the `regnamespace` that holds four bytes of it.
+fn oid_of(oid: i64) -> Result<u32> {
+    u32::try_from(oid)
+        .map_err(|_| SqlError::DatatypeMismatch(format!("an oid that does not fit: {oid}")))
 }
 
 /// An `oid` argument, which is an integer of whatever width the column it came from has.

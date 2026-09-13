@@ -75,6 +75,8 @@ const BUILT_IN: &[(&str, u32)] = &[
     ("range_in", 3834),
     ("record_in", 2290),
     ("regclassin", 2218),
+    // `regnamespacein`, measured with the same query (ADR 0115).
+    ("regnamespacein", 4084),
     // **`regprocin` is in this list because `regproc` is a type this node has**, and its own
     // `typinput` is itself. `tests/reg_proc.rs::every_typinput_resolves_to_a_function` found it
     // the first time it ran.

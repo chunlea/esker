@@ -91,7 +91,7 @@ pub(super) fn check_references(
         if parent_row(&parent, executor.tenant, txn, key, &values)?.is_none() {
             return Err(SqlError::ForeignKeyViolation {
                 relation: message_name(&table.name).to_owned(),
-                constraint: key.name.clone(),
+                constraint: message_name(&key.name).to_owned(),
                 detail: format!(
                     "Key ({})=({}) is not present in table \"{}\".",
                     column_names(table, &key.columns),
@@ -134,7 +134,7 @@ pub(super) fn validate(
         if parent_row(&parent, executor.tenant, txn, key, &values)?.is_none() {
             return Err(SqlError::ForeignKeyViolation {
                 relation: message_name(&table.name).to_owned(),
-                constraint: key.name.clone(),
+                constraint: message_name(&key.name).to_owned(),
                 detail: format!(
                     "Key ({})=({}) is not present in table \"{}\".",
                     column_names(table, &key.columns),
@@ -411,7 +411,7 @@ fn still_referenced(
 ) -> SqlError {
     SqlError::ForeignKeyStillReferenced {
         relation: message_name(&parent.name).to_owned(),
-        constraint: key.name.clone(),
+        constraint: message_name(&key.name).to_owned(),
         child: message_name(&child.name).to_owned(),
         detail: format!(
             "Key ({})=({}) is still referenced from table \"{}\".",

@@ -186,6 +186,10 @@ fn tag_of(ty: ColumnType) -> u8 {
         ColumnType::LQueryArray => 108,
         ColumnType::Int2VectorArray => 109,
         ColumnType::OidVectorArray => 110,
+        // `regnamespace` and its array, appended for ADR 0115 — 111 and 112 claimed out loud first
+        // (`esker-coord/s2-claims-format-regnamespace.md`), one above the catalog record's 110 and 111.
+        ColumnType::RegNamespace => 111,
+        ColumnType::RegNamespaceArray => 112,
     }
 }
 
@@ -305,6 +309,8 @@ fn type_of(tag: u8) -> Result<ColumnType, RowError> {
         108 => ColumnType::LQueryArray,
         109 => ColumnType::Int2VectorArray,
         110 => ColumnType::OidVectorArray,
+        111 => ColumnType::RegNamespace,
+        112 => ColumnType::RegNamespaceArray,
         other => {
             return Err(RowError::Corrupt(format!(
                 "column type tag {other} is not one of ours"

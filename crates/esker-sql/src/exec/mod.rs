@@ -2665,6 +2665,7 @@ impl Executor {
         self.resolve_advisory(&mut statement)?;
         self.resolve_functional_notation(txn, &mut statement)?;
         self.resolve_regclass(txn, &mut statement)?;
+        self.resolve_regnamespace(txn, &mut statement)?;
         self.resolve_user_cast(txn, &mut statement, false)?;
         self.resolve_user_functions(txn, &mut statement)?;
         self.refuse_unavailable_functions(txn, &statement)?;
@@ -3971,6 +3972,70 @@ impl Executor {
                         oid,
                         name: printed.into(),
                     })));
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        };
+        bind::walk_mut(statement, &mut resolve);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Every `'<name>'::regnamespace` and `to_regnamespace('<name>')` in a statement, answered with
+    /// the schema the name names — [ADR 0115](../../../../docs/adr/0115-regnamespace-is-an-oid-that-prints-as-a-schema.md).
+    ///
+    /// **`regclass`'s pass, for a schema**: one list of the tenant's schemas for the whole
+    /// statement, so a `WHERE connamespace = 's2ns'::regnamespace` reads the catalog once rather than
+    /// once per row. The reading is `value::reg_namespace`'s, which the row evaluator shares.
+    fn resolve_regnamespace(&self, txn: &dyn Txn, statement: &mut Statement) -> Result<()> {
+        use crate::plan::{CatalogFunc, Expr, Literal};
+
+        let mut failure = None;
+        let mut schemas: Option<Vec<(String, u64)>> = None;
+        let mut resolve = |expr: &mut Expr| {
+            let Expr::CatalogFunc(call) = expr else {
+                return;
+            };
+            let asking = match call.func {
+                CatalogFunc::RegNamespace | CatalogFunc::ToRegNamespace => call.func,
+                _ => return,
+            };
+            let Some(Expr::Literal(Literal::String(text))) = call.args.first() else {
+                failure.get_or_insert(SqlError::Internal(format!(
+                    "{}() whose argument is not a name",
+                    asking.name()
+                )));
+                return;
+            };
+            if schemas.is_none() {
+                match self.catalog_view(txn).and_then(|view| view.schema_names()) {
+                    Ok(list) => schemas = Some(list),
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                        return;
+                    }
+                }
+            }
+            let list = schemas.as_deref().unwrap_or_default();
+            let resolved = if asking == CatalogFunc::ToRegNamespace {
+                Ok(crate::value::reg_namespace::try_from_text(list, text))
+            } else {
+                crate::value::reg_namespace::from_text(list, text).map(Some)
+            };
+            match resolved {
+                Ok(Some(datum)) => *expr = Expr::Literal(Literal::typed(Box::new(datum))),
+                // **A typed `NULL`**, for `to_regclass`'s reason: the column is described as a
+                // `regnamespace` whether or not the name was found.
+                Ok(None) => {
+                    *expr = Expr::Cast {
+                        operand: Box::new(Expr::Literal(Literal::Null)),
+                        to: ColumnType::RegNamespace,
+                        typmod: crate::value::NO_TYPMOD,
+                    };
                 }
                 Err(error) => {
                     failure.get_or_insert(error);

@@ -56,6 +56,7 @@ pub mod point;
 /// Random bytes from the OS, and the version-4 UUID built from them.
 pub mod random;
 pub mod range;
+pub mod reg_namespace;
 pub mod reg_proc;
 pub mod regex;
 /// Arithmetic over the date and time types: which pairs have an operator, and what it yields.
@@ -444,11 +445,16 @@ pub fn stored_shape(value: Datum, ty: ColumnType, rendering: Rendering) -> Resul
             Datum::RegClass { oid, .. },
             ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2 | ColumnType::Oid,
         ) => assignment_cast(Datum::Int8(oid), ty, rendering),
-        (Datum::RegType { oid, .. } | Datum::RegProc { oid, .. }, ColumnType::Oid) => {
-            Ok(Datum::Oid(oid))
-        }
         (
-            Datum::RegType { oid, .. } | Datum::RegProc { oid, .. },
+            Datum::RegType { oid, .. }
+            | Datum::RegProc { oid, .. }
+            | Datum::RegNamespace { oid, .. },
+            ColumnType::Oid,
+        ) => Ok(Datum::Oid(oid)),
+        (
+            Datum::RegType { oid, .. }
+            | Datum::RegProc { oid, .. }
+            | Datum::RegNamespace { oid, .. },
             ColumnType::Int8 | ColumnType::Int4 | ColumnType::Int2,
         ) => assignment_cast(Datum::Int8(i64::from(oid)), ty, rendering),
         (value, _) => Ok(value),
@@ -495,7 +501,12 @@ pub fn assignment_cast(value: Datum, ty: ColumnType, rendering: Rendering) -> Re
     // to `oidin`, which is `22P02 invalid input syntax for type oid: "boolin"` for a statement a
     // real server answers with 1242 (ADR 0098).
     match (&value, ty) {
-        (Datum::RegType { oid, .. } | Datum::RegProc { oid, .. }, ColumnType::Oid) => {
+        (
+            Datum::RegType { oid, .. }
+            | Datum::RegProc { oid, .. }
+            | Datum::RegNamespace { oid, .. },
+            ColumnType::Oid,
+        ) => {
             return Ok(Datum::Oid(*oid));
         }
         (Datum::Oid(oid), ColumnType::RegProc) => {
@@ -505,6 +516,9 @@ pub fn assignment_cast(value: Datum, ty: ColumnType, rendering: Rendering) -> Re
             });
         }
         (Datum::Oid(oid), ColumnType::RegType) => return Ok(regtype_of_oid(*oid)),
+        // An `oid` into a `regnamespace` is the same number, printed as its digits until something
+        // with the tenant's schemas names it (`exec::cursor`, ADR 0115).
+        (Datum::Oid(oid), ColumnType::RegNamespace) => return Ok(reg_namespace::unnamed(*oid)),
         _ => {}
     }
     // **Which calendar day an instant falls on is a question about a place**, so a `timestamptz`
@@ -711,7 +725,7 @@ pub fn has_assignment_cast(from: Option<ColumnType>, to: ColumnType) -> bool {
             // the integers and `'i'` for `oid` on a real server; `stored_shape` is what makes the
             // value (the number, its name gone).
             | (
-                ColumnType::RegClass | ColumnType::RegType,
+                ColumnType::RegClass | ColumnType::RegType | ColumnType::RegNamespace,
                 ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Oid
             )
             // **An instant into a `date` column**, which a real server takes at `castcontext = 'a'`
@@ -1060,9 +1074,12 @@ pub fn convert_without_text(value: &Datum, to: ColumnType) -> Option<Result<Datu
         // `int4in`: `22P02 invalid input syntax for type integer: "int4in"` for a statement a real
         // server answers `42`. The evaluator had an arm of its own for this and the fold had
         // nothing, which is the split this table exists to close.
-        (Datum::RegType { oid, .. } | Datum::RegProc { oid, .. }, _)
-            if integer(to) || to == ColumnType::Oid =>
-        {
+        (
+            Datum::RegType { oid, .. }
+            | Datum::RegProc { oid, .. }
+            | Datum::RegNamespace { oid, .. },
+            _,
+        ) if integer(to) || to == ColumnType::Oid => {
             Some(assignment_cast(Datum::Oid(*oid), to, Rendering::default()))
         }
         // **A `uuid` is sixteen bytes and its `bytea` is those bytes**, not the thirty-six
@@ -1715,6 +1732,8 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         // And `regproc` is 24 with `_regproc` 1008 — measured, and not adjacent the way the
         // `regtype` pair is: `regproc` is one of the oldest oids and its array is a later one.
         ColumnType::RegProc => 1008,
+        // And `regnamespace` is 4089, with `_regnamespace` 4090 beside it — measured (ADR 0115).
+        ColumnType::RegNamespace => 4090,
         // **`_name` is 1003**, measured. It arrived when run 106 lost ten tests to its absence:
         // `array_agg(enum.enumlabel)` over a `name` column is a `name[]` on a real server, and
         // without the type this node answered a scalar `text` and `ActiveRecord` kept the literal
@@ -1762,7 +1781,7 @@ pub fn array_oid(ty: ColumnType) -> u32 {
         | ColumnType::JsonbArray
         | ColumnType::OidArray
         | ColumnType::RegTypeArray
-        | ColumnType::RegProcArray | ColumnType::RegClassArray
+        | ColumnType::RegProcArray | ColumnType::RegNamespaceArray | ColumnType::RegClassArray
         | ColumnType::CitextArray
         | ColumnType::TstzRangeArray
         | ColumnType::Int4RangeArray
@@ -1988,6 +2007,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
         // A `regtype` takes none either: `pg_type.typmodin` is `-` for it.
         | ColumnType::RegType
         | ColumnType::RegProc
+        | ColumnType::RegNamespace
         | ColumnType::Date
         // Unreachable: every array type is answered above, from its element's answer. Kept as
         // arms rather than a `_` so that the next type added here has to answer the question.
@@ -2014,7 +2034,7 @@ fn takes_typmod(ty: ColumnType) -> bool {
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::BitArray | ColumnType::VarBitArray
         | ColumnType::Point
-        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::Void | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
+        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegNamespaceArray | ColumnType::RegClassArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::RegClass | ColumnType::Void | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray => false,
     }
 }
 
@@ -2135,6 +2155,8 @@ impl PgType for ColumnType {
             // the first initdb because `pg_type.typinput` needs it.
             ColumnType::RegProc => 24,
             ColumnType::RegClass => 2205,
+            // **4089**, measured, with its array 4090 beside it (ADR 0115).
+            ColumnType::RegNamespace => 4089,
             ColumnType::Int2Vector => 22,
             ColumnType::OidVector => 30,
             ColumnType::Int2 => 21,
@@ -2232,6 +2254,7 @@ impl PgType for ColumnType {
             | ColumnType::RegTypeArray
             | ColumnType::RegProcArray
             | ColumnType::RegClassArray
+            | ColumnType::RegNamespaceArray
             | ColumnType::CitextArray
             | ColumnType::XmlArray
             | ColumnType::LtreeArray
@@ -2342,6 +2365,7 @@ impl PgType for ColumnType {
             ColumnType::RegTypeArray => "regtype[]",
             ColumnType::RegProcArray => "regproc[]",
             ColumnType::RegClassArray => "regclass[]",
+            ColumnType::RegNamespaceArray => "regnamespace[]",
             ColumnType::CitextArray => "citext[]",
             ColumnType::Xml => "xml",
             ColumnType::XmlArray => "xml[]",
@@ -2379,6 +2403,7 @@ impl PgType for ColumnType {
             ColumnType::RegType => "regtype",
             ColumnType::RegProc => "regproc",
             ColumnType::RegClass => "regclass",
+            ColumnType::RegNamespace => "regnamespace",
             ColumnType::Int2Vector => "int2vector",
             ColumnType::OidVector => "oidvector",
         }
@@ -2401,6 +2426,7 @@ impl PgType for ColumnType {
             | ColumnType::RegType
             | ColumnType::RegProc
             | ColumnType::RegClass
+            | ColumnType::RegNamespace
             // **And a `void`, positive and four**, which reasoning would make -1 or 0 for a value
             // that is nothing — measured beside its `typtype = 'p'`.
             | ColumnType::Void => 4,
@@ -2442,7 +2468,7 @@ impl PgType for ColumnType {
             | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
-            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray
+            | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegNamespaceArray | ColumnType::RegClassArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray | ColumnType::XmlArray | ColumnType::LtreeArray
             | ColumnType::Text
             | ColumnType::Varchar
             | ColumnType::Bpchar
@@ -2531,7 +2557,8 @@ impl PgDatum for Datum {
             // real server prints for one.
             Datum::RegType { name, .. }
             | Datum::RegProc { name, .. }
-            | Datum::RegClass { name, .. } => name.to_string(),
+            | Datum::RegClass { name, .. }
+            | Datum::RegNamespace { name, .. } => name.to_string(),
             Datum::Array(value) => array::to_text(value),
             Datum::Point { x, y } => point::to_text(*x, *y),
             Datum::Money(cents) => money::to_text(*cents),
@@ -2656,6 +2683,10 @@ impl PgDatum for Datum {
                     SqlError::unsupported("a relation name read as a regclass without a catalog")
                 });
             }
+            // **Digits are an oid, and a name needs the tenant's schemas** (ADR 0115), which this layer
+            // does not have: the name half is answered where they are (`exec::Executor::bound`,
+            // `exec::cursor`), and a name arriving here is refused rather than guessed.
+            ColumnType::RegNamespace => return reg_namespace::without_a_catalog(text),
             // **Digits are an oid and a name is resolved**, which is `regprocin`'s whole rule:
             // `24::regproc` round-trips as `24` because no function has that oid, and a name
             // nothing has is `42883` rather than a syntax error.
@@ -2762,6 +2793,7 @@ impl PgDatum for Datum {
             | ColumnType::RegTypeArray
             | ColumnType::RegProcArray
             | ColumnType::RegClassArray
+            | ColumnType::RegNamespaceArray
             | ColumnType::CitextArray
             | ColumnType::XmlArray
             | ColumnType::LtreeArray
@@ -2867,7 +2899,9 @@ impl PgDatum for Datum {
             Datum::Oid(v) => v.to_be_bytes().to_vec(),
             // The oid, four bytes: a binary `regtype` is `oidsend`'s output on a real server, and
             // the name is the *text* format's business alone.
-            Datum::RegType { oid, .. } | Datum::RegProc { oid, .. } => oid.to_be_bytes().to_vec(),
+            Datum::RegType { oid, .. } | Datum::RegProc { oid, .. } | Datum::RegNamespace { oid, .. } => {
+                oid.to_be_bytes().to_vec()
+            }
             Datum::RegClass { oid, .. } => oid.to_be_bytes().to_vec(),
             Datum::Uuid(v) => v.to_vec(),
             // `interval_send` writes microseconds, days and months in that order, big-endian.
@@ -2965,6 +2999,11 @@ impl PgDatum for Datum {
             }
             // The same four bytes, and the name is looked up here because a function's name comes
             // from a fixed table rather than from the catalog (`value::reg_proc`).
+            // The same four bytes; a schema's name is put on where the tenant's schemas are (ADR 0115).
+            ColumnType::RegNamespace => {
+                let head = fixed(4)?;
+                reg_namespace::unnamed(u32::from_be_bytes(head.try_into().unwrap_or([0; 4])))
+            }
             ColumnType::RegProc => {
                 let head = fixed(4)?;
                 let oid = u32::from_be_bytes(head.try_into().unwrap_or([0; 4]));
@@ -3054,6 +3093,7 @@ impl PgDatum for Datum {
             | ColumnType::RegTypeArray
             | ColumnType::RegProcArray
             | ColumnType::RegClassArray
+            | ColumnType::RegNamespaceArray
             | ColumnType::CitextArray
             | ColumnType::XmlArray
             | ColumnType::LtreeArray
@@ -3330,16 +3370,16 @@ impl PgDatum for Datum {
             // names, and `'text'::regtype = 25` is true against an uncast integer. That is the
             // whole model (ADR 0077), and it is why the pairs are shared rather than repeated.
             (
-                Datum::Oid(a) | Datum::RegType { oid: a, .. } | Datum::RegProc { oid: a, .. },
-                Datum::Oid(b) | Datum::RegType { oid: b, .. } | Datum::RegProc { oid: b, .. },
+                Datum::Oid(a) | Datum::RegType { oid: a, .. } | Datum::RegProc { oid: a, .. } | Datum::RegNamespace { oid: a, .. },
+                Datum::Oid(b) | Datum::RegType { oid: b, .. } | Datum::RegProc { oid: b, .. } | Datum::RegNamespace { oid: b, .. },
             ) => a.cmp(b),
             (
-                Datum::Oid(a) | Datum::RegType { oid: a, .. } | Datum::RegProc { oid: a, .. },
+                Datum::Oid(a) | Datum::RegType { oid: a, .. } | Datum::RegProc { oid: a, .. } | Datum::RegNamespace { oid: a, .. },
                 Datum::Int8(b),
             ) => i64::from(*a).cmp(b),
             (
                 Datum::Int8(a),
-                Datum::Oid(b) | Datum::RegType { oid: b, .. } | Datum::RegProc { oid: b, .. },
+                Datum::Oid(b) | Datum::RegType { oid: b, .. } | Datum::RegProc { oid: b, .. } | Datum::RegNamespace { oid: b, .. },
             ) => a.cmp(&i64::from(*b)),
             (Datum::RegClass { oid: a, .. }, Datum::Oid(b)) => a.cmp(&i64::from(*b)),
             (Datum::Oid(a), Datum::RegClass { oid: b, .. }) => i64::from(*a).cmp(b),
@@ -3504,9 +3544,10 @@ impl PgDatum for Datum {
 /// wants one reader rather than one arm per pairing.
 fn oid_ish_number(value: &Datum) -> Option<i64> {
     match value {
-        Datum::Oid(oid) | Datum::RegType { oid, .. } | Datum::RegProc { oid, .. } => {
-            Some(i64::from(*oid))
-        }
+        Datum::Oid(oid)
+        | Datum::RegType { oid, .. }
+        | Datum::RegProc { oid, .. }
+        | Datum::RegNamespace { oid, .. } => Some(i64::from(*oid)),
         Datum::RegClass { oid, .. } => Some(*oid),
         _ => None,
     }
@@ -3532,9 +3573,10 @@ fn variant_rank(value: &Datum) -> u8 {
     match value {
         // The rank an `Oid` has, because the value **is** an oid and the two must not sort into
         // separate blocks: `'text'::regtype = 25` is true, so they are one family.
-        Datum::RegType { .. } | Datum::RegProc { .. } | Datum::RegClass { .. } => {
-            variant_rank(&Datum::Oid(0))
-        }
+        Datum::RegType { .. }
+        | Datum::RegProc { .. }
+        | Datum::RegClass { .. }
+        | Datum::RegNamespace { .. } => variant_rank(&Datum::Oid(0)),
         // Above every scalar, which only decides the order between two values of *different*
         // types — a comparison SQL does not have and this crate's total order still needs.
         // **Ranked, and neither is a SQL order.** An array's rank decides only the order
@@ -3908,7 +3950,7 @@ mod tests {
                         | ColumnType::Int4Range | ColumnType::DateRange | ColumnType::NumRange | ColumnType::Int8Range
                         | ColumnType::FloatRange | ColumnType::VarcharRange | ColumnType::MoneyArray
                         | ColumnType::Inet | ColumnType::Cidr | ColumnType::InetArray | ColumnType::CidrArray | ColumnType::MacAddrArray | ColumnType::Bit | ColumnType::VarBit | ColumnType::BitArray | ColumnType::VarBitArray | ColumnType::Path | ColumnType::Polygon
-                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegClassArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray
+                        | ColumnType::TsRangeArray | ColumnType::TstzRangeArray | ColumnType::Int4RangeArray | ColumnType::DateRangeArray | ColumnType::NumRangeArray | ColumnType::Int8RangeArray | ColumnType::PointArray | ColumnType::BoxArray | ColumnType::LsegArray | ColumnType::PathArray | ColumnType::PolygonArray | ColumnType::CircleArray | ColumnType::LineArray | ColumnType::BoolArray | ColumnType::ByteaArray | ColumnType::BpcharArray | ColumnType::VarcharArray | ColumnType::NameArray | ColumnType::CharArray | ColumnType::DateArray | ColumnType::TimeArray | ColumnType::TimestampArray | ColumnType::TimestampTzArray | ColumnType::IntervalArray | ColumnType::RealArray | ColumnType::DoubleArray | ColumnType::UuidArray | ColumnType::JsonArray | ColumnType::JsonbArray | ColumnType::OidArray | ColumnType::RegTypeArray | ColumnType::RegProcArray | ColumnType::RegNamespaceArray | ColumnType::RegClassArray | ColumnType::Int2Vector | ColumnType::OidVector | ColumnType::CitextArray
                         | ColumnType::XmlArray
                         | ColumnType::LtreeArray
                         | ColumnType::LQueryArray

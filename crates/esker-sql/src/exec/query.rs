@@ -4260,8 +4260,12 @@ fn resolve_in_list(
     // rule, arriving one step too early.
     if !any
         && items.len() >= 2
-        && let Ok(reg @ (ColumnType::RegClass | ColumnType::RegProc | ColumnType::RegType)) =
-            expr_type(&operand, scope)
+        && let Ok(
+            reg @ (ColumnType::RegClass
+            | ColumnType::RegProc
+            | ColumnType::RegType
+            | ColumnType::RegNamespace),
+        ) = expr_type(&operand, scope)
     {
         let mut cast = Vec::with_capacity(items.len());
         for item in items {
@@ -4640,7 +4644,10 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             // A `regclass` is in the numbers' family with them, and it is what makes
             // `WHERE attrelid = 'iv'::regclass` compare at all: measured,
             // `'pg_class'::regclass = 1259` is true against an uncast integer.
-            ColumnType::RegType | ColumnType::RegProc | ColumnType::RegClass => family(ColumnType::Oid),
+            ColumnType::RegType
+            | ColumnType::RegProc
+            | ColumnType::RegClass
+            | ColumnType::RegNamespace => family(ColumnType::Oid),
             // **Text's family, because text is what they are here.** They compare as the
             // strings they print as, which is what `attnum = ANY(indkey)` already relies on.
             // **They share `text`'s representation and compare with nothing but themselves.**
@@ -4651,6 +4658,7 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
             ColumnType::RegTypeArray => 200,
             ColumnType::RegProcArray => 201,
             ColumnType::RegClassArray => 202,
+            ColumnType::RegNamespaceArray => 203,
             // **A family of one each.** `'{1}'::int[] = '{1}'::int8[]` is `42883` on a real
             // server — an array's comparison is its element type's, and two element types are two
             // operators — so no two of these share a family and none shares one with a scalar.
@@ -4862,7 +4870,11 @@ pub(crate) fn same_family(left: ColumnType, right: ColumnType) -> bool {
     let oid_ish = |ty| {
         matches!(
             ty,
-            ColumnType::Oid | ColumnType::RegType | ColumnType::RegProc | ColumnType::RegClass
+            ColumnType::Oid
+                | ColumnType::RegType
+                | ColumnType::RegProc
+                | ColumnType::RegClass
+                | ColumnType::RegNamespace
         )
     };
     let integer = |ty| matches!(ty, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8);
@@ -5614,6 +5626,17 @@ fn retype(
         let oid = crate::value::oid::from_text(text)?;
         return Ok(Literal::typed(Box::new(crate::value::regtype_of_oid(oid))));
     }
+    // **And a `regnamespace`, measured the same way** (ADR 0115): `ns = 'public'` is `22P02 invalid
+    // input syntax for type oid: "public"` on 19beta1, because `=` over one is `oideq` — while an
+    // assignment of the same literal resolves the name.
+    if matches!(ty, ColumnType::RegNamespace)
+        && let Literal::String(text) = literal
+    {
+        let oid = crate::value::oid::from_text(text)?;
+        return Ok(Literal::typed(Box::new(
+            crate::value::reg_namespace::unnamed(oid),
+        )));
+    }
     match literal.assign(ty, "?column?") {
         // Reduced to a value of the column's own type, so the comparison is between two of them.
         Ok(value) => Ok(match value {
@@ -5853,6 +5876,12 @@ fn figure_column_name(expr: &Expr) -> String {
             if matches!(**datum, Datum::RegClass { .. }) =>
         {
             "regclass".to_owned()
+        }
+        // The same for a `regnamespace`, which only that cast produces.
+        Expr::Literal(Literal::Typed { value: datum, .. })
+            if matches!(**datum, Datum::RegNamespace { .. }) =>
+        {
+            "regnamespace".to_owned()
         }
         _ => "?column?".to_owned(),
     }

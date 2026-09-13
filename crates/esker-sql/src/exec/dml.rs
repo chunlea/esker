@@ -833,6 +833,16 @@ fn value_for_column(
             return Ok(value);
         }
     }
+    // **And a `regnamespace` column takes a schema's name the same way** (ADR 0115): an assignment
+    // goes through `regnamespacein`, where a comparison reads the literal as an oid.
+    if column.ty == ColumnType::RegNamespace
+        && let crate::plan::Expr::Literal(crate::plan::Literal::String(text)) = expr
+    {
+        return crate::value::reg_namespace::from_text(
+            &executor.catalog_view(txn)?.schema_names()?,
+            text,
+        );
+    }
     // **An enum column takes a label, not an `int2`.** The value is read as *text* whatever the
     // column's storage is and then turned into the label's ordinal, because `'sad'` in a column of
     // `mood` is a label the same way `'2020-01-01'` in a `date` column is a date — one rule, one
@@ -965,6 +975,17 @@ fn assigned_value(
         if let Some(resolved) = regclass_array_from_names(text, &rule)? {
             return Ok((resolved, None, None));
         }
+    }
+    // The `UPDATE` half of the same rule, for a `regnamespace` column (ADR 0115).
+    if at.column.ty == ColumnType::RegNamespace
+        && let crate::plan::Expr::Literal(crate::plan::Literal::String(text)) = value
+    {
+        let schemas = at.executor.catalog_view(at.txn)?.schema_names()?;
+        return Ok((
+            crate::value::reg_namespace::from_text(&schemas, text)?,
+            None,
+            None,
+        ));
     }
     match value {
         // `SET a = DEFAULT` is the column's own default, which for a sequence column is the next
@@ -2531,9 +2552,11 @@ fn check_constraints(table: &TableDef, row: &[Datum]) -> Result<()> {
         let resolved = query::resolve(&parsed, &scope)?;
         // Only `false` violates. NULL is unknown and passes, which is PostgreSQL's rule.
         if matches!(cursor::evaluate(&resolved, row)?, Datum::Bool(false)) {
+            // Both names bare, as the `23502` and `23505` print theirs: a derived check on `s.t` is
+            // stored `s\0t_id_check` and measured as `t_id_check` on the wire.
             return Err(SqlError::CheckViolation {
-                constraint: check.name.clone(),
-                relation: table.name.clone(),
+                constraint: super::foreign_key::message_name(&check.name).to_owned(),
+                relation: super::foreign_key::message_name(&table.name).to_owned(),
                 row: failing_row(table, row),
             });
         }

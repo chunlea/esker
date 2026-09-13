@@ -680,11 +680,12 @@ fn add_check(
     updated: &mut TableDef,
     check: &CheckDef,
 ) -> Result<()> {
-    if updated.checks.iter().any(|seen| seen.name == check.name) {
-        return Err(SqlError::DuplicateConstraint {
-            constraint: check.name.clone(),
-            relation: updated.name.clone(),
-        });
+    if updated
+        .checks
+        .iter()
+        .any(|seen| same_constraint(&seen.name, &check.name))
+    {
+        return Err(duplicate_constraint(&check.name, updated));
     }
     updated.checks.push(check.clone());
     validate_checks(updated)?;
@@ -768,13 +769,13 @@ fn add_exclude(
     if updated
         .excludes
         .iter()
-        .any(|seen| seen.name == exclude.name)
-        || updated.checks.iter().any(|seen| seen.name == exclude.name)
+        .any(|seen| same_constraint(&seen.name, &exclude.name))
+        || updated
+            .checks
+            .iter()
+            .any(|seen| same_constraint(&seen.name, &exclude.name))
     {
-        return Err(SqlError::DuplicateConstraint {
-            constraint: exclude.name.clone(),
-            relation: updated.name.clone(),
-        });
+        return Err(duplicate_constraint(&exclude.name, updated));
     }
     validate_exclude_rows(txn, executor, updated, exclude)?;
     // The seventh reader, at the statement that writes one — the same rule the `CHECK` and the
@@ -891,16 +892,16 @@ fn add_foreign_key(
     updated: &mut TableDef,
     key: &plan::ForeignKey,
 ) -> Result<()> {
-    if updated.checks.iter().any(|seen| seen.name == key.name)
+    if updated
+        .checks
+        .iter()
+        .any(|seen| same_constraint(&seen.name, &key.name))
         || updated
             .foreign_keys
             .iter()
-            .any(|seen| seen.name == key.name)
+            .any(|seen| same_constraint(&seen.name, &key.name))
     {
-        return Err(SqlError::DuplicateConstraint {
-            constraint: key.name.clone(),
-            relation: updated.name.clone(),
-        });
+        return Err(duplicate_constraint(&key.name, updated));
     }
     let resolved = resolve_foreign_key(txn, executor, updated, key)?;
     let parent_id = resolved.parent;
@@ -1557,7 +1558,11 @@ fn validate_constraint(
     // **A check is validated by name too**, and it is looked for first because the two namespaces
     // are one: `ALTER TABLE … VALIDATE CONSTRAINT` takes any constraint's name and a table cannot
     // hold two of one name.
-    if let Some(at) = updated.checks.iter().position(|check| check.name == name) {
+    if let Some(at) = updated
+        .checks
+        .iter()
+        .position(|check| same_constraint(&check.name, name))
+    {
         if updated.checks[at].validated {
             return Ok(());
         }
@@ -1569,10 +1574,10 @@ fn validate_constraint(
     let at = updated
         .foreign_keys
         .iter()
-        .position(|key| key.name == name)
+        .position(|key| same_constraint(&key.name, name))
         .ok_or_else(|| SqlError::UndefinedConstraint {
             constraint: name.to_owned(),
-            relation: updated.name.clone(),
+            relation: catalog::split_qualified(&updated.name).1.to_owned(),
         })?;
     if updated.foreign_keys[at].validated {
         return Ok(());
@@ -2990,14 +2995,20 @@ fn promote_index_to_constraint(
     // The name has to be free unless it is the index's own — promoting `ui` to a constraint called
     // `ui` is a rename to where it already is.
     if name != promote.index
-        && (updated.indexes.iter().any(|index| index.name == name)
-            || updated.checks.iter().any(|check| check.name == name)
-            || updated.foreign_keys.iter().any(|key| key.name == name))
+        && (updated
+            .indexes
+            .iter()
+            .any(|index| same_constraint(&index.name, &name))
+            || updated
+                .checks
+                .iter()
+                .any(|check| same_constraint(&check.name, &name))
+            || updated
+                .foreign_keys
+                .iter()
+                .any(|key| same_constraint(&key.name, &name)))
     {
-        return Err(SqlError::DuplicateConstraint {
-            constraint: name,
-            relation: updated.name.clone(),
-        });
+        return Err(duplicate_constraint(&name, updated));
     }
     let kind = match (promote.deferrable, promote.deferred) {
         (_, true) => catalog::UniqueKind::Deferred,
@@ -3038,14 +3049,20 @@ fn add_unique_constraint(
         .name
         .clone()
         .unwrap_or_else(|| plan::unique_constraint_name(&updated.name, &constraint.columns));
-    if updated.indexes.iter().any(|index| index.name == name)
-        || updated.checks.iter().any(|check| check.name == name)
-        || updated.foreign_keys.iter().any(|key| key.name == name)
+    if updated
+        .indexes
+        .iter()
+        .any(|index| same_constraint(&index.name, &name))
+        || updated
+            .checks
+            .iter()
+            .any(|check| same_constraint(&check.name, &name))
+        || updated
+            .foreign_keys
+            .iter()
+            .any(|key| same_constraint(&key.name, &name))
     {
-        return Err(SqlError::DuplicateConstraint {
-            constraint: name,
-            relation: updated.name.clone(),
-        });
+        return Err(duplicate_constraint(&name, updated));
     }
     let ordinals = constraint
         .columns
@@ -3321,7 +3338,11 @@ fn drop_constraint(
     cascade: bool,
 ) -> Result<bool> {
     // A `CHECK`, the plain case: nothing owns it and nothing depends on it.
-    if let Some(at) = updated.checks.iter().position(|check| check.name == name) {
+    if let Some(at) = updated
+        .checks
+        .iter()
+        .position(|check| same_constraint(&check.name, name))
+    {
         updated.checks.remove(at);
         return Ok(true);
     }
@@ -3329,7 +3350,7 @@ fn drop_constraint(
     if let Some(at) = updated
         .excludes
         .iter()
-        .position(|exclude| exclude.name == name)
+        .position(|exclude| same_constraint(&exclude.name, name))
     {
         updated.excludes.remove(at);
         return Ok(true);
@@ -3337,7 +3358,11 @@ fn drop_constraint(
     // A `FOREIGN KEY` — what `remove_foreign_key` sends. **Its back-reference goes with it**, and
     // only once nothing else of this table's points at that parent: the key is per
     // `(parent, child)` pair, which is the rule run 50's regression established.
-    if let Some(at) = updated.foreign_keys.iter().position(|key| key.name == name) {
+    if let Some(at) = updated
+        .foreign_keys
+        .iter()
+        .position(|key| same_constraint(&key.name, name))
+    {
         let parent = updated.foreign_keys[at].parent;
         updated.foreign_keys.remove(at);
         forget_backref_if_last(txn, executor.tenant, updated, parent);
@@ -3348,20 +3373,22 @@ fn drop_constraint(
     if let Some(at) = updated
         .indexes
         .iter()
-        .position(|index| index.name == name && index.constraint.is_some())
+        .position(|index| same_constraint(&index.name, name) && index.constraint.is_some())
     {
         updated.indexes.remove(at);
         return Ok(true);
     }
     // The `PRIMARY KEY`, which another table's foreign key can depend on — the one kind here with
     // a dependent outside its own table, and so the only one `CASCADE` means anything for.
-    if !updated.primary_key_name.is_empty() && updated.primary_key_name == name {
+    if !updated.primary_key_name.is_empty() && same_constraint(&updated.primary_key_name, name) {
         refuse_keys_on_the_primary(txn, executor, updated, name, cascade)?;
         updated.primary_key.clear();
         updated.primary_key_name.clear();
         updated.primary_key_comment = None;
         // The index behind it goes too, the way a `UNIQUE` constraint's does.
-        updated.indexes.retain(|index| index.name != name);
+        updated
+            .indexes
+            .retain(|index| !same_constraint(&index.name, name));
         return Ok(true);
     }
     // `NOT NULL`, which **is** a droppable constraint in PostgreSQL 19: every such column has its
@@ -3369,13 +3396,18 @@ fn drop_constraint(
     // `attnotnull` exactly as `ALTER COLUMN … DROP NOT NULL` does.
     let not_null_at = updated
         .live_columns()
-        .find(|(_, column)| column.not_null && not_null_constraint_name(updated, column) == name)
+        .find(|(_, column)| {
+            column.not_null && same_constraint(&not_null_constraint_name(updated, column), name)
+        })
         .map(|(at, _)| at);
     if let Some(at) = not_null_at {
         updated.columns[at].not_null = false;
         return Ok(true);
     }
 
+    // The relation **bare**, as every constraint sentence spells it: `of relation "c"` for `s.c`,
+    // measured.
+    let relation = catalog::split_qualified(relation).1;
     if if_exists {
         executor.notice(SqlError::UndefinedConstraintSkipping {
             constraint: name.to_owned(),
@@ -3393,6 +3425,28 @@ fn drop_constraint(
 /// derivation and the one `crate::catalog::pg_constraint` reports.
 fn not_null_constraint_name(table: &TableDef, column: &ColumnDef) -> String {
     format!("{}_{}_not_null", table.name, column.name)
+}
+
+/// Whether the constraint stored as `stored` is the one a statement calls `name` — **compared
+/// bare**.
+///
+/// A derived name is stored qualified (`plan::make_object_name` re-qualifies, so `s.c`'s foreign
+/// key is `s\0c_p_fkey`) and a given one as written, and every constraint on one table lives in
+/// that table's schema — so the bare halves are the names SQL sees. Comparing the stored forms was
+/// invisible in `public`, where the two are one string, and elsewhere made
+/// `ALTER TABLE s.c VALIDATE CONSTRAINT c_p_fkey` a `42704` for a key `pg_constraint` lists.
+/// Measured against PostgreSQL 19: `tests/corpus/pg19_constraint_name_in_a_schema.txt`.
+fn same_constraint(stored: &str, name: &str) -> bool {
+    catalog::split_qualified(stored).1 == catalog::split_qualified(name).1
+}
+
+/// `42710`, naming the constraint and its relation **bare** — `constraint "c_p_fkey" for relation
+/// "c" already exists` for a table in a schema, measured.
+fn duplicate_constraint(name: &str, table: &TableDef) -> SqlError {
+    SqlError::DuplicateConstraint {
+        constraint: catalog::split_qualified(name).1.to_owned(),
+        relation: catalog::split_qualified(&table.name).1.to_owned(),
+    }
 }
 
 /// `2BP01` when another table's foreign key depends on this table's primary key, unless `CASCADE`.
@@ -3424,12 +3478,17 @@ fn refuse_keys_on_the_primary(
             continue;
         }
         if !cascade {
+            // **Constraints bare, relations dotted**: `on table s.p`, `depends on index s.p_pkey`,
+            // and `constraint c_p_fkey` with no schema in front of it — measured. The index is
+            // named the way its name record is keyed, in its table's schema.
             return Err(SqlError::DependentConstraint {
-                constraint: name.to_owned(),
-                relation: table.name.clone(),
+                constraint: catalog::split_qualified(name).1.to_owned(),
+                relation: catalog::display_name(&table.name),
                 detail: format!(
-                    "constraint {} on table {} depends on index {name}",
-                    depends[0], child.name
+                    "constraint {} on table {} depends on index {}",
+                    catalog::split_qualified(&depends[0]).1,
+                    catalog::display_name(&child.name),
+                    catalog::display_name(&catalog::owned_name(table, name))
                 ),
             });
         }

@@ -177,8 +177,13 @@ pub(super) fn substitute(
         // along because `cast_target` makes it a `CatalogFunc::RegClass` over a `text` parameter
         // and the lookup happens one pass later, in `resolve_regclass` — this puts the array on
         // the same footing by handing the text to the cast rather than to `from_text`.
-        if matches!(ty, ColumnType::RegClass | ColumnType::RegClassArray)
-            && let Some(Some(bytes)) = params.values.get(at)
+        if matches!(
+            ty,
+            ColumnType::RegClass
+                | ColumnType::RegClassArray
+                | ColumnType::RegNamespace
+                | ColumnType::RegNamespaceArray
+        ) && let Some(Some(bytes)) = params.values.get(at)
             && params.format(at) == 0
             && let Ok(text) = std::str::from_utf8(bytes)
         {
@@ -1621,6 +1626,12 @@ fn placeholder(ty: ColumnType) -> Datum {
             name: "0".into(),
         },
         ColumnType::RegClass => crate::value::regclass_of_oid(0),
+        ColumnType::RegNamespace => crate::value::reg_namespace::unnamed(0),
+        ColumnType::RegNamespaceArray => Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
+            ColumnType::RegNamespace,
+            1,
+            Vec::new(),
+        )),
         ColumnType::RegTypeArray => Datum::Array(esker_keys::array::ArrayValue::one_dimensional(
             ColumnType::RegType,
             1,

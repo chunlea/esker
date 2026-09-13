@@ -277,7 +277,7 @@ fn columnar_type(ty: StoredType) -> Option<esker_columnar::ColumnType> {
         | StoredType::NumRangeArray
         | StoredType::Int8RangeArray
         | StoredType::Point
-        | StoredType::PointArray | StoredType::BoxArray | StoredType::BoolArray | StoredType::ByteaArray | StoredType::BpcharArray | StoredType::VarcharArray | StoredType::DateArray | StoredType::TimeArray | StoredType::TimestampArray | StoredType::TimestampTzArray | StoredType::IntervalArray | StoredType::RealArray | StoredType::DoubleArray | StoredType::UuidArray | StoredType::JsonArray | StoredType::JsonbArray | StoredType::OidArray | StoredType::CitextArray | StoredType::RegType | StoredType::RegTypeArray | StoredType::RegProc | StoredType::RegProcArray | StoredType::RegClassArray | StoredType::RegClass | StoredType::Int2Vector | StoredType::OidVector => return None,
+        | StoredType::PointArray | StoredType::BoxArray | StoredType::BoolArray | StoredType::ByteaArray | StoredType::BpcharArray | StoredType::VarcharArray | StoredType::DateArray | StoredType::TimeArray | StoredType::TimestampArray | StoredType::TimestampTzArray | StoredType::IntervalArray | StoredType::RealArray | StoredType::DoubleArray | StoredType::UuidArray | StoredType::JsonArray | StoredType::JsonbArray | StoredType::OidArray | StoredType::CitextArray | StoredType::RegType | StoredType::RegTypeArray | StoredType::RegProc | StoredType::RegProcArray | StoredType::RegNamespace | StoredType::RegNamespaceArray | StoredType::RegClassArray | StoredType::RegClass | StoredType::Int2Vector | StoredType::OidVector => return None,
     })
 }
 
@@ -295,6 +295,7 @@ fn value_of(datum: &Datum) -> Value {
         Datum::RegType { .. }
         | Datum::RegProc { .. }
         | Datum::RegClass { .. }
+        | Datum::RegNamespace { .. }
         | Datum::Point { .. }
         | Datum::Money(_)
         | Datum::Inet { .. }

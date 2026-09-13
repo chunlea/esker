@@ -477,6 +477,10 @@ pub enum ColumnType {
     /// `42::regproc` is `int4in` — and `min`/`max` over one **decay to `oid`**, where a `regtype`
     /// keeps its type.
     RegProc,
+    /// `regnamespace`: an oid that prints as a **schema's** name — ADR 0115, the second of ADR 0098's
+    /// kind. It follows `regproc` everywhere but in where the name comes from: a schema is a catalog
+    /// object, so the name is resolved where the catalog is, as a `regclass`'s is.
+    RegNamespace,
     /// `regclass`: an oid that prints as a **relation's** name, the type
     /// [ADR 0077](../../../docs/adr/0077-regtype-is-an-oid-that-prints-as-a-name.md)'s shape one
     /// letter along.
@@ -607,6 +611,8 @@ pub enum ColumnType {
     RegTypeArray,
     /// `regproc[]`, oid 1008 — what `array_agg(typinput)` is.
     RegProcArray,
+    /// `regnamespace[]`, oid 4090.
+    RegNamespaceArray,
     /// `regclass[]`, oid 2210 — what `array_agg(c::regclass)` is.
     RegClassArray,
 }
@@ -624,7 +630,7 @@ impl ColumnType {
     /// Not quite "every variant": see [`ColumnType::USER_RANGES`] for the two that are
     /// representations of a user-defined type rather than types, and whose `pg_type` row is
     /// written by the `CREATE TYPE` that made them.
-    pub const ALL: [ColumnType; 107] = [
+    pub const ALL: [ColumnType; 109] = [
         ColumnType::Int8,
         ColumnType::Int4,
         ColumnType::Int2,
@@ -660,6 +666,7 @@ impl ColumnType {
         ColumnType::RegType,
         ColumnType::RegProc,
         ColumnType::RegClass,
+        ColumnType::RegNamespace,
         ColumnType::Int2Vector,
         ColumnType::Int2VectorArray,
         ColumnType::OidVectorArray,
@@ -697,6 +704,7 @@ impl ColumnType {
         ColumnType::RegTypeArray,
         ColumnType::RegProcArray,
         ColumnType::RegClassArray,
+        ColumnType::RegNamespaceArray,
         ColumnType::DateRange,
         ColumnType::NumRange,
         ColumnType::Int8Range,
@@ -937,6 +945,17 @@ pub enum Datum {
         /// What it prints as: the function's name, or the oid's digits when none has it.
         name: Box<str>,
     },
+    /// [`ColumnType::RegNamespace`]: the same, for a **schema** (ADR 0115).
+    ///
+    /// Compared by the oid. The name rides along for the reason a `regproc`'s does — this crate has
+    /// no catalog to print one from — and it is the schema's name as `quote_ident` quotes it, the
+    /// oid's digits when no schema has it, or `-` for oid 0. Measured, all three.
+    RegNamespace {
+        /// The oid, which is the value: this node's schema id, four bytes like `pg_namespace.oid`.
+        oid: u32,
+        /// What it prints as.
+        name: Box<str>,
+    },
     /// [`ColumnType::RegClass`]: the same, for a **relation**.
     ///
     /// The name rides along for the reason a `regtype`'s does — deriving it needs the catalog and
@@ -1050,7 +1069,8 @@ impl PartialEq for Datum {
             // a row holding a `regtype`.
             (Datum::Oid(a), Datum::Oid(b))
             | (Datum::RegType { oid: a, .. }, Datum::RegType { oid: b, .. })
-            | (Datum::RegProc { oid: a, .. }, Datum::RegProc { oid: b, .. }) => a == b,
+            | (Datum::RegProc { oid: a, .. }, Datum::RegProc { oid: b, .. })
+            | (Datum::RegNamespace { oid: a, .. }, Datum::RegNamespace { oid: b, .. }) => a == b,
             // Representation equality, element by element: two arrays that print the same are
             // the same row. What `1.0` and `1.00` are to a `numeric`, `{1.0}` and `{1.00}` are
             // to a `numeric[]`, and `pg_cmp` is again where the *values* are compared.
@@ -1168,6 +1188,7 @@ impl Datum {
             Datum::Oid(_) => ColumnType::Oid,
             Datum::RegType { .. } => ColumnType::RegType,
             Datum::RegProc { .. } => ColumnType::RegProc,
+            Datum::RegNamespace { .. } => ColumnType::RegNamespace,
             Datum::RegClass { .. } => ColumnType::RegClass,
             Datum::Numeric(_) => ColumnType::Numeric,
             // The array's own element type decides which of the four it is, so a value always
@@ -1251,11 +1272,11 @@ fn one_representation(held: ColumnType, wanted: ColumnType) -> bool {
         // full: the two share a representation *and* a comparison — the oid, in both directions —
         // and differ only in the output function. That is what makes
         // `castsource = 'character varying'::regtype` the comparison a real server makes.
-        | (
-            ColumnType::RegType,
-            ColumnType::Oid
-        )
-        | (ColumnType::Oid, ColumnType::RegType)
+        | (ColumnType::RegType | ColumnType::RegNamespace, ColumnType::Oid)
+        // **And a `regnamespace` beside an `oid`**, the same pair and the same measurement: `pg_cast`
+        // has `oid <-> regnamespace` implicit both ways and by reinterpretation (ADR 0115), which is
+        // what `connamespace = 's2ns'::regnamespace` compares through.
+        | (ColumnType::Oid, ColumnType::RegType | ColumnType::RegNamespace)
         // **A `citext` is `text`'s representation, in both directions.** This match is directional
         // — `(RegType, Oid)` and `(Oid, RegType)` are both written out below for that reason — and
         // a `citext` datum carries `Citext` as its own type, so the pair that matters here is
