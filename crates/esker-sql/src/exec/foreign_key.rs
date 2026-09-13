@@ -27,6 +27,7 @@ use crate::backend::Txn;
 use crate::catalog::{self, ForeignKeyDef, TableDef};
 use crate::error::{Result, SqlError};
 use crate::exec::Executor;
+use crate::exec::trigger::{AfterRows, Event};
 use crate::row;
 use crate::value::{Datum, PgDatum};
 
@@ -48,8 +49,10 @@ const MAX_CASCADE_DEPTH: usize = 32;
 /// looks like it should be symmetric and is not: with the parent disabled, an `INSERT` into the
 /// child naming a missing parent is still `23503`.
 ///
-/// `DISABLE TRIGGER USER` sets nothing, because it covers only triggers a user created and this
-/// clause is about PostgreSQL's internal ones (`crate::parse::lower::lower_trigger_state`).
+/// `DISABLE TRIGGER USER` leaves this alone: it covers only the triggers a user created
+/// ([`crate::catalog::TriggerDef::enabled`]), and this is PostgreSQL's internal ones. Measured the
+/// other way round too — `ENABLE TRIGGER USER` after `DISABLE TRIGGER ALL` still lets a row with no
+/// parent in.
 fn enforcing(table: &TableDef) -> bool {
     !table.triggers_disabled
 }
@@ -150,15 +153,16 @@ pub(super) fn validate(
 /// have children of their own — the walk is what makes a chain work and is bounded by
 /// [`MAX_CASCADE_DEPTH`].
 pub(super) fn on_parent_removed(
-    executor: &Executor,
+    executor: &mut Executor,
     txn: &mut dyn Txn,
     table: &TableDef,
     row: &[Datum],
+    written: &mut super::Written,
 ) -> Result<()> {
     if !enforcing(table) {
         return Ok(());
     }
-    cascade_delete(executor, txn, table, row, 0)
+    cascade_delete(executor, txn, table, row, 0, written)
 }
 
 /// The refusing half of an `UPDATE` on a parent row, run **before** the row moves.
@@ -197,7 +201,7 @@ pub(super) fn refuse_if_referenced(
 /// A real server does the same thing in the same order, and an implementation that cascades first
 /// fails on its own constraint. Measured: `UPDATE fxq SET id = 5` moves both children to `5`.
 pub(super) fn cascade_update(
-    executor: &Executor,
+    executor: &mut Executor,
     txn: &mut dyn Txn,
     table: &TableDef,
     old: &[Datum],
@@ -220,6 +224,7 @@ pub(super) fn cascade_update(
             Some(values) => values,
             None => referenced_values(&key, new).unwrap_or_default(),
         };
+        let mut queued = AfterRows::new(Event::Update);
         for old_child in referencing_rows(executor, txn, &child, &key, &before)? {
             let mut new_child = old_child.clone();
             // **Into the child's type, not the parent's.** `CASCADE` carries the parent's new
@@ -230,8 +235,24 @@ pub(super) fn cascade_update(
             for (at, value) in key.columns.iter().zip(after.iter()) {
                 new_child[*at] = super::dml::assign_default(value.clone(), child.columns[*at].ty)?;
             }
+            // **The child's row triggers fire**: PostgreSQL's cascade is an `UPDATE` of the child —
+            // measured, and a `BEFORE` trigger that points the key elsewhere is the `23503` the
+            // rewrite below checks for.
+            let Some(new_child) = executor.before_row(
+                txn,
+                written,
+                &child,
+                Event::Update,
+                Some(&old_child),
+                new_child,
+            )?
+            else {
+                continue;
+            };
             super::dml::rewrite_row(executor, txn, &child, &old_child, &new_child, written)?;
+            queued.remember(&child, Some(old_child), Some(new_child));
         }
+        executor.after_rows(txn, written, queued)?;
     }
     Ok(())
 }
@@ -248,11 +269,12 @@ fn moved(key: &ForeignKeyDef, old: &[Datum], new: &[Datum]) -> Option<Vec<Datum>
 
 /// One level of the delete walk.
 fn cascade_delete(
-    executor: &Executor,
+    executor: &mut Executor,
     txn: &mut dyn Txn,
     table: &TableDef,
     row: &[Datum],
     depth: usize,
+    written: &mut super::Written,
 ) -> Result<()> {
     if depth > MAX_CASCADE_DEPTH {
         return Err(SqlError::Internal(format!(
@@ -275,29 +297,47 @@ fn cascade_delete(
         // Nothing recurses: the child's **own** key is untouched, so its children still point at
         // a row that is exactly where it was.
         if let Some(values) = written_by(txn, executor.tenant, &child, &key, key.on_delete)? {
-            let mut written = super::Written::default();
+            let mut queued = AfterRows::new(Event::Update);
             for old_child in referencing {
                 let mut new_child = old_child.clone();
                 for (at, value) in key.columns.iter().zip(values.iter()) {
                     new_child[*at] = value.clone();
                 }
-                super::dml::rewrite_row(
-                    executor,
+                // **An `UPDATE` of the child, so its row triggers fire** — measured for `SET NULL`.
+                // Into the statement's own `Written`, which is what `rewrite_row` asks for.
+                let Some(new_child) = executor.before_row(
                     txn,
+                    written,
                     &child,
-                    &old_child,
-                    &new_child,
-                    &mut written,
-                )?;
+                    Event::Update,
+                    Some(&old_child),
+                    new_child,
+                )?
+                else {
+                    continue;
+                };
+                super::dml::rewrite_row(executor, txn, &child, &old_child, &new_child, written)?;
+                queued.remember(&child, Some(old_child), Some(new_child));
             }
+            executor.after_rows(txn, written, queued)?;
             continue;
         }
+        let mut queued = AfterRows::new(Event::Delete);
         for child_row in referencing {
+            // **A `DELETE` of the child, so its row triggers fire**: a `BEFORE DELETE` answering
+            // `RETURN NULL` keeps the child row, and PostgreSQL raises nothing for it — measured.
+            let Some(child_row) =
+                executor.before_row(txn, written, &child, Event::Delete, None, child_row)?
+            else {
+                continue;
+            };
             // Depth-first: the grandchildren go before the child, so no row is ever removed while
             // something still points at it.
-            cascade_delete(executor, txn, &child, &child_row, depth + 1)?;
+            cascade_delete(executor, txn, &child, &child_row, depth + 1, written)?;
             super::dml::remove_row(executor, txn, &child, &child_row)?;
+            queued.remember(&child, Some(child_row), None);
         }
+        executor.after_rows(txn, written, queued)?;
     }
     Ok(())
 }

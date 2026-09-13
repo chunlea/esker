@@ -135,7 +135,7 @@ impl Check {
                 // only two keeps a widely duplicated key from costing a scan of all of it.
                 if txn.scan(&start, &end, 2)?.len() > 1 {
                     return Err(SqlError::UniqueViolation {
-                        constraint: index.name.clone(),
+                        constraint: super::foreign_key::message_name(&index.name).to_owned(),
                         key: Some(super::index::render_key(table, &index.keys, values)),
                     });
                 }

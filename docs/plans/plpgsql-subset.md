@@ -292,6 +292,17 @@ event fire in name order.
   per result relation. An `INSERT` fires the triggers of the table it names. T1 is exactly this: the
   insert into the parent fires T1, and T1's `INSERT INTO postgresql_partitioned_table` fires the
   child's (none).
+* **A foreign key's `CASCADE`, `SET NULL` and `SET DEFAULT` fire the child's row triggers**, because
+  PostgreSQL's referential actions are statements on the child. Decided by reading
+  `foreign_key::cascade_*`, which reach the same hooks for the cost of a call, and measured
+  (`pg19_plpgsql_trigger.txt`, third session): `ON UPDATE CASCADE` and `SET NULL` fire `UPDATE`
+  triggers, a child's `BEFORE DELETE` answering `RETURN NULL` keeps the child with no error, and a
+  child's `BEFORE UPDATE` that points the key elsewhere is `23503`.
+* **What a body sees and what it may answer**, all measured: `OLD` in an `INSERT` trigger and `NEW`
+  in a `DELETE` one read `NULL`, and returned as they are they are `RETURN NULL`; assigning one of
+  their fields makes a row. A generated column reads `NULL` in a `BEFORE` trigger, on `UPDATE` too.
+  `RETURN` of a `NULL` value is `RETURN NULL`, of any other value that is not a row `42804`, and a
+  body that ends without `RETURN` is `2F005`, an `AFTER` trigger's included.
 
 ### Refused rather than half-fired (`0A000`, naming it)
 
@@ -305,34 +316,33 @@ event fire in name order.
   after `CHECK`, so the order would be a new one to build.
 * **`INSERT … ON CONFLICT` into a table with an enabled row trigger.** PostgreSQL fires
   `BEFORE INSERT` and then, on the conflict path, `BEFORE UPDATE` — a second ordering.
-* **A foreign key's `CASCADE`, `SET NULL` or `SET DEFAULT` reaching a table with an enabled row
-  trigger.** PostgreSQL's referential actions are statements that fire the child's triggers;
-  `foreign_key::cascade_*` writes rows directly. If those helpers can route through the same hook
-  for the cost of a call, C fires them instead — decided by reading them, and said in C's handover.
 * Already refused where the statement is lowered, unchanged: `WHEN`, `UPDATE OF <columns>`,
   `TRUNCATE`, `INSTEAD OF`, `CREATE CONSTRAINT TRIGGER`, `CREATE OR REPLACE TRIGGER`.
 
 ### Enabling and disabling
 
-* **`ALL`** today sets `TableDef::triggers_disabled`, which suspends the foreign-key checks
-  (`exec/foreign_key.rs::enforcing`). From C it also flips every user trigger's
-  `TriggerDef::enabled` — PostgreSQL's `ALL` covers both, and `pg_trigger.tgenabled` shows `D`.
-  **This is the statement Rails wraps every fixture load in**, so a disabled trigger must not fire.
-* **`USER`** records nothing today ("there are no user triggers", `lower_trigger_state`); from C it
-  flips the user triggers and leaves the foreign keys alone.
-* **A trigger's name** is `42704` today for every name; from C an existing trigger is flipped —
-  `pg19_trigger_function.txt:116` (`23502` while disabled) and `:119` (`4` once enabled) captured it.
+* **`ALL`** sets `TableDef::triggers_disabled`, which suspends the foreign-key checks
+  (`exec/foreign_key.rs::enforcing`), and flips every user trigger's `TriggerDef::enabled` —
+  PostgreSQL's `ALL` covers both, and `pg_trigger.tgenabled` shows `D`. **This is the statement
+  Rails wraps every fixture load in**, so a disabled trigger does not fire.
+* **`USER`** flips the user triggers and leaves the foreign key's alone — measured both ways:
+  `ENABLE TRIGGER USER` after `DISABLE TRIGGER ALL` still lets a row with no parent in.
+* **A trigger's name** flips that trigger, and a name the table does not have is `42704` from the
+  executor, naming the relation bare — `pg19_trigger_function.txt` captured `23502` while the
+  trigger is disabled and `4` once it is enabled again.
+* A trigger's own flag moves the table's schema version, as `CREATE TRIGGER` does; `ALL`'s
+  referential flag alone does not, as before.
 * `DROP TRIGGER`, `pg_trigger`, `pg_get_triggerdef` and `DROP FUNCTION`'s `2BP01` exist
   (`tests/trigger_function.rs`) and do not change.
 
 ### A trigger function that is not one
 
 `CREATE FUNCTION f() RETURNS integer … LANGUAGE plpgsql` is stored without its return type —
-`FunctionDef` has none — so `CREATE TRIGGER … EXECUTE FUNCTION f()` cannot give PostgreSQL's refusal
+`FunctionDef` has none — so `CREATE TRIGGER … EXECUTE FUNCTION f()` cannot give PostgreSQL's `42P17`
 for a function that does not return `trigger`. Storing the return type is a field in the function
-record, which is a format change, and no suite statement needs it: declared, not built. What the
-node does with a stored non-`plpgsql` trigger function when it fires is decided against a capture
-in C.
+record, which is a format change, and no suite statement needs it: declared, not built.
+`LANGUAGE sql` returning `trigger` is refused where it is lowered, with PostgreSQL's `42P13`; no
+other language is stored (`42704`), so every function a trigger can name is PL/pgSQL.
 
 ## 8. Catalog records
 
@@ -343,8 +353,8 @@ in C.
 * **The `pg_constraint` write, if ruled (b)**: `ForeignKeyDef::validated` and `CheckDef::validated`,
   stored today.
 
-**No new record kind, no new field, no format version.** A parsed body is cached in memory, keyed
-by the function's name and body, and never stored.
+**No new record kind, no new field, no format version.** A body is read each time its trigger fires,
+and nothing parsed is stored or cached.
 
 ## 9. Assertions that change, and the ruling that changes each
 
@@ -356,8 +366,9 @@ by the function's name and body, and never stored.
 | `do_block.rs::a_body_that_is_not_the_template_is_refused_by_name` | five bodies → `0A000` | each as `pg19_do_block.txt` answers it; the by-name half moves to constructs outside the subset | 2026-09-13 |
 | `do_block.rs::the_forms_around_the_templates_answer_as_postgresql_does` | three bodies → `0A000 DO` | the capture's answers | 2026-09-13 |
 | `do_block.rs::raise_notice_and_warning_reach_the_client` | `RAISE INFO`, `LOG`, `WARNING 'a', 'b'` → `0A000` | unchanged: outside the subset | — |
-| `trigger_function.rs::a_stored_trigger_does_not_fire` | `23502` | the trigger fires | 2026-09-13 |
-| `trigger_function.rs::every_trigger_function_answer_is_postgresql_19_s` | the replay aborts at line 80 | the replay reaches the firing rows, re-captured with a savepoint per statement if the abort remains | 2026-09-13 |
+| `trigger_function.rs::a_stored_trigger_does_not_fire`, now `::a_stored_trigger_fires` | `23502` | the trigger's value is written | 2026-09-13 |
+| `trigger_function.rs::every_trigger_function_answer_is_postgresql_19_s` | the replay aborts at line 80 | that line re-captured in a savepoint of its own, so the replay reaches the firing rows | 2026-09-13 |
+| `ddl_cascade_fk_trigger.rs::a_named_trigger_does_not_exist` | `42704` from the lowering, for every name | `42704` from the executor, which knows the table's triggers — the same answers | — |
 
 None is deleted or skipped; each moves to the oracle's answer. `docs/acceptance/v1.1.md` is the
 record of a tag and is not edited; the new state lives here and in ADR 0113.
@@ -427,14 +438,16 @@ suite does not send them, and the brief's scope is the census: no more, no less.
 1. **T1 fires the moment triggers do** (fact 6). Four passing tests depend on `NEW.*`, an insert into
    an inheritance child from inside a trigger, `INSERT 0 0`, a `RETURNING` with no row, and
    `max(id)` over the parent reaching the child. C1 tests that sequence before a pass can see it.
+   Built, and pinned by `plpgsql_trigger.rs::statement_762s_trigger_moves_each_row_into_the_child`.
 2. **D1 runs 40 times a pass** and moves from a template to the interpreter; a regression there is
    `enum_test.rb`. `pg19_do_create_enum.txt`'s replay is the check.
 3. **The catalog-write ruling** (§6): under (a), B moves no suite test.
 4. **Values out of a query inside the executor.** `Outcome::Rows` is rendered bytes; if the query
    path cannot hand back `Datum`s without a new seam, B2 grows by that seam.
-5. **The hot path.** Every `INSERT`, `UPDATE` and `DELETE` asks whether its table has an enabled row
-   trigger — a `Vec` on the cached `TableDef`, one `is_empty` for a table with none. A body is
-   parsed once per function, not once per row.
+5. **The hot path.** Every row an `INSERT`, `UPDATE` or `DELETE` writes asks whether its table has an
+   enabled row trigger — a walk of `TableDef::triggers`, empty for a table with none — and nothing is
+   copied for `AFTER` triggers a table does not have. A body is read, and its SQL parsed, each time a
+   trigger fires: a table with a trigger pays that per row, which the suite's two tables do not notice.
 6. **A restart re-runs a body** (§5), so a notice can repeat.
 7. **Wire: none. Format: none (§8). Dependencies: none.**
 
@@ -446,5 +459,6 @@ suite does not send them, and the brief's scope is the census: no more, no less.
 | B1 | `ea72350d` | the reader: tokenizer, grammar, PostgreSQL's sentences for a malformed body |
 | B2 + B3 | `83815c76` | the interpreter and `Statement::Do` — `FOR` and `EXECUTE` landed with it rather than after; the templates removed; `pg19_plpgsql_do.txt` |
 | B4 | `5cae182d` | `format()`, widths included; `pg19_format.txt` |
-| B6 | — | the `pg_constraint.convalidated` write, and the census block with its schema predicate left out |
-| B5 | — | `regnamespace`: a type with additive tags, waiting on `esker-coord/QUESTION-s2-regnamespace.md` for an ADR number |
+| B6 | `b5f47544` | the `pg_constraint.convalidated` write, and the census block with its schema predicate left out; B landed in main as `fc8333c8` |
+| C | — | row triggers: `BEFORE` and `AFTER` on every event, `NEW.*`, `ENABLE`/`DISABLE TRIGGER ALL`, `USER` or a name, a foreign key's actions firing the child's triggers, the §7 refusals; `pg19_plpgsql_trigger.txt`, and `pg19_trigger_function.txt`'s abort contained |
+| B5 | — | `regnamespace`: ruled (a), in an ADR of its own, 0115 — after C |

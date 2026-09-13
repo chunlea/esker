@@ -25,6 +25,7 @@
 use crate::backend::Txn;
 use crate::catalog::TableDef;
 use crate::error::{Result, SqlError};
+use crate::exec::trigger::{self, AfterRows, Event};
 use crate::exec::{Executor, Unique, Written};
 use crate::exec::{cursor, query};
 use crate::pgwire::message::FieldDescription;
@@ -160,7 +161,7 @@ fn finish(returned: Option<Returned>, tag: String) -> Outcome {
 /// three of the four and forgetting the fourth would store a `char(3)` holding `x` beside one
 /// holding `x  `, which compare equal to PostgreSQL and not to a byte comparison, and the row key
 /// built from them would be two different keys for one value.
-fn fit_typmods(table: &TableDef, row: &mut [Datum]) -> Result<()> {
+pub(super) fn fit_typmods(table: &TableDef, row: &mut [Datum]) -> Result<()> {
     for (value, column) in row.iter_mut().zip(&table.columns) {
         if column.typmod == crate::value::NO_TYPMOD {
             continue;
@@ -612,7 +613,12 @@ pub(super) fn insert(
     // found it, and a node that validated later would report ids three higher for every row after.
     if let Some(on_conflict) = &insert.on_conflict {
         validate_on_conflict(&table, on_conflict)?;
+        trigger::refuse_on_conflict(&table)?;
     }
+    // The rows the `AFTER INSERT` triggers will see, and the rows a `BEFORE` trigger took out of the
+    // statement, which its tag does not count.
+    let mut after = AfterRows::new(Event::Insert);
+    let mut skipped = 0;
 
     for values in &insert.rows {
         if values.len() > targets.len() {
@@ -665,34 +671,7 @@ pub(super) fn insert(
             }
             row[*target] = value_for_column(expr, column, &table, &*txn, &*executor)?;
         }
-        // A sequence fills its column when the statement did not name it, or named it and wrote
-        // `DEFAULT`. It runs **after** the values, so a `bigserial` the user did write keeps their
-        // number and does not consume one — which is what a real server does, and the reason the
-        // next insert can collide with it.
-        for sequence in &table.derived()?.sequences {
-            // **Only a sequence that fills a column writes one.** A table may own a sequence that
-            // fills nothing — `CREATE SEQUENCE s OWNED BY t.c` makes one — and it has no column
-            // to put a value in.
-            let Some(fills) = sequence.column else {
-                continue;
-            };
-            if targets
-                .iter()
-                .take(values.len())
-                .position(|at| *at == fills)
-                .is_some_and(|at| !matches!(values[at], crate::plan::Expr::Default))
-            {
-                continue;
-            }
-            // Narrowed to the column's own width. A sequence counts in `i64` whatever it fills,
-            // so an `integer` identity column has to be told — and running past 2^31 is the same
-            // `22003` a constant that far out gets, which is what a real server answers when a
-            // `serial` runs out.
-            row[fills] = sequence_datum(
-                table.columns[fills].ty,
-                executor.next_sequence_value(sequence.id)?,
-            )?;
-        }
+        fill_sequences(executor, &table, &targets, values, &mut row)?;
         // A table with no declared key carries an internal row id the user cannot write, so the
         // executor fills it (`crate::catalog::TableDef::row_id`).
         if let Some(at) = table.row_id() {
@@ -700,6 +679,14 @@ pub(super) fn insert(
         }
 
         fit_typmods(&table, &mut row)?;
+        // **The `BEFORE INSERT` triggers, here**: after defaults, sequences and the row id, and
+        // before generated columns and every check — PostgreSQL's order, measured. `RETURN NULL`
+        // takes the row out of the statement: not written, not returned, not counted.
+        let Some(mut row) = executor.before_row(txn, written, &table, Event::Insert, None, row)?
+        else {
+            skipped += 1;
+            continue;
+        };
         fill_generated(&table, &mut row)?;
         check_not_null(&table, &row)?;
         check_domain_constraints(&table, &row)?;
@@ -748,11 +735,51 @@ pub(super) fn insert(
         if let Some(returned) = &mut returned {
             returned.push(&row)?;
         }
+        after.remember(&table, None, Some(row));
     }
+    executor.after_rows(txn, written, after)?;
 
     // The leading zero is the OID of the inserted row, which PostgreSQL stopped assigning in 8.1
     // and still reports as 0. A client that parses the tag expects three fields.
-    Ok(finish(returned, format!("INSERT 0 {}", insert.rows.len())))
+    let counted = insert.rows.len() - skipped;
+    Ok(finish(returned, format!("INSERT 0 {counted}")))
+}
+
+/// The sequences of `table` into `row`. A sequence fills its column when the statement did not
+/// name it, or named it and wrote `DEFAULT`. It runs **after** the values, so a `bigserial` the
+/// user did write keeps their number and does not consume one — which is what a real server does,
+/// and the reason the next insert can collide with it.
+fn fill_sequences(
+    executor: &mut Executor,
+    table: &TableDef,
+    targets: &[usize],
+    values: &[crate::plan::Expr],
+    row: &mut [Datum],
+) -> Result<()> {
+    for sequence in &table.derived()?.sequences {
+        // **Only a sequence that fills a column writes one.** A table may own a sequence that
+        // fills nothing — `CREATE SEQUENCE s OWNED BY t.c` makes one — and it has no column to put
+        // a value in.
+        let Some(fills) = sequence.column else {
+            continue;
+        };
+        if targets
+            .iter()
+            .take(values.len())
+            .position(|at| *at == fills)
+            .is_some_and(|at| !matches!(values[at], crate::plan::Expr::Default))
+        {
+            continue;
+        }
+        // Narrowed to the column's own width. A sequence counts in `i64` whatever it fills, so an
+        // `integer` identity column has to be told — and running past 2^31 is the same `22003` a
+        // constant that far out gets, which is what a real server answers when a `serial` runs out.
+        row[fills] = sequence_datum(
+            table.columns[fills].ty,
+            executor.next_sequence_value(sequence.id)?,
+        )?;
+    }
+    Ok(())
 }
 
 /// One `VALUES` expression, as the column's own value.
@@ -1067,8 +1094,10 @@ pub(super) fn write_row(
                 table.name
             )));
         }
+        // **A constraint is quoted by its bare name**, whatever schema its table is in — measured,
+        // `"s2t_u_pkey"` for a table in `s2t_schema` — where the stored name carries the schema.
         return Err(SqlError::UniqueViolation {
-            constraint: table.primary_key_name.clone(),
+            constraint: super::foreign_key::message_name(&table.primary_key_name).to_owned(),
             key: Some(detail.clone()),
         });
     }
@@ -1077,7 +1106,7 @@ pub(super) fn write_row(
     if table.row_id().is_none() {
         written.unique_keys.push(Unique {
             key: key.clone(),
-            constraint: table.primary_key_name.clone(),
+            constraint: super::foreign_key::message_name(&table.primary_key_name).to_owned(),
             detail,
         });
     }
@@ -1153,13 +1182,13 @@ pub(super) fn write_row(
             let detail = super::index::render_key(table, &index.keys, &entry.values);
             if txn.get(&entry.key)?.is_some() {
                 return Err(SqlError::UniqueViolation {
-                    constraint: index.name.clone(),
+                    constraint: super::foreign_key::message_name(&index.name).to_owned(),
                     key: Some(detail),
                 });
             }
             written.unique_keys.push(Unique {
                 key: entry.key.clone(),
-                constraint: index.name.clone(),
+                constraint: super::foreign_key::message_name(&index.name).to_owned(),
                 detail,
             });
         }
@@ -1220,6 +1249,25 @@ fn update_returning(
     )
 }
 
+/// The relations an `UPDATE`'s `FROM` chain names, resolved once and **before the first row is
+/// read**, so a `FROM` naming nothing is `42P01` with nothing written. The same lookup a `SELECT`'s
+/// `FROM` entry gets, which is what makes a derived table, a `VALUES` list and a set-returning
+/// function relations here too.
+fn chain_sources(
+    executor: &Executor,
+    txn: &dyn Txn,
+    chain: &[crate::plan::Join],
+) -> Result<Vec<std::sync::Arc<TableDef>>> {
+    let catalogued = super::Catalogued {
+        exec: executor,
+        txn,
+    };
+    chain
+        .iter()
+        .map(|join| super::subquery::relation_of(&join.table, &catalogued))
+        .collect()
+}
+
 pub(super) fn update(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -1240,23 +1288,12 @@ pub(super) fn update(
     let named = executor.require_table(txn, &update.table)?;
     refuse_matview_write(&named, &update.table)?;
     let chain = update.chain();
-    // Resolved once and **before the first row is read**, so a `FROM` naming nothing is `42P01`
-    // with nothing written. The same lookup a `SELECT`'s `FROM` entry gets, which is what makes a
-    // derived table, a `VALUES` list and a set-returning function relations here too.
-    let sources = {
-        let catalogued = super::Catalogued {
-            exec: executor,
-            txn: &*txn,
-        };
-        chain
-            .iter()
-            .map(|join| super::subquery::relation_of(&join.table, &catalogued))
-            .collect::<Result<Vec<_>>>()?
-    };
+    let sources = chain_sources(executor, txn, &chain)?;
     let target_name = target_name(update, &named);
     let mut returned = update_returning(executor, update, &named, &target_name, &chain, &sources)?;
     let targets = inheritance_targets(executor, txn, &named)?;
     let mut count = 0;
+    let mut after = AfterRows::new(Event::Update);
 
     for (table, project) in targets {
         // Per relation, because a child's ordinals are its own — but under the name the statement
@@ -1313,6 +1350,14 @@ pub(super) fn update(
                 )?;
             }
             fit_typmods(&table, &mut new)?;
+            // **The `BEFORE UPDATE` triggers**, with the stored row as `OLD` — through an
+            // inheritance parent, the child's, measured. `RETURN NULL` leaves the row as it is and
+            // out of the count, and the row a trigger returns is the one written.
+            let Some(mut new) =
+                executor.before_row(txn, written, &table, Event::Update, Some(&old), new)?
+            else {
+                continue;
+            };
             // The column is a function of the row, so an `UPDATE` that moved its source moves it too
             // — and a `SET generated = DEFAULT` recomputes rather than storing NULL.
             fill_generated(&table, &mut new)?;
@@ -1328,16 +1373,15 @@ pub(super) fn update(
             // arrives in the one the new key selects, with no error raised. Routed from the
             // *parent*, because a partition's own bound is one list and the destination may be
             // any sibling.
-            let destination = match parent_of_partition(executor, txn, &table)? {
-                Some(parent) => route_to_partition(executor, txn, &parent, &new)?,
-                None => None,
-            }
-            .filter(|target| target.id != table.id);
+            let destination = moved_partition(executor, txn, &table, &new)?;
             remove_for_rewrite(executor, txn, &table, &old, written)?;
-            match &destination {
-                Some(target) => write_row(executor, txn, target, &new, written)?,
-                None => write_row(executor, txn, &table, &new, written)?,
-            }
+            write_row(
+                executor,
+                txn,
+                destination.as_ref().unwrap_or(&table),
+                &new,
+                written,
+            )?;
             super::foreign_key::cascade_update(executor, txn, &table, &old, &new, written)?;
             // The row **after** the assignments: `UPDATE t SET n = n + 1 RETURNING n` answers with
             // the new value, which is the whole reason a client writes it.
@@ -1349,9 +1393,27 @@ pub(super) fn update(
                 returned.push(&row)?;
             }
             count += 1;
+            after.remember(&table, Some(old), Some(new));
         }
     }
+    executor.after_rows(txn, written, after)?;
     Ok(finish(returned, format!("UPDATE {count}")))
+}
+
+/// The sibling partition an `UPDATE`'s new row belongs in, or `None` when the row stays where it
+/// is — routed from the *parent*, because a partition's own bound is one list and the destination
+/// may be any sibling.
+fn moved_partition(
+    executor: &Executor,
+    txn: &dyn Txn,
+    table: &TableDef,
+    new: &[Datum],
+) -> Result<Option<std::sync::Arc<TableDef>>> {
+    let destination = match parent_of_partition(executor, txn, table)? {
+        Some(parent) => route_to_partition(executor, txn, &parent, new)?,
+        None => None,
+    };
+    Ok(destination.filter(|target| target.id != table.id))
 }
 
 /// `DELETE`: the row and every index entry that points at it.
@@ -1359,6 +1421,7 @@ pub(super) fn delete(
     executor: &mut Executor,
     txn: &mut dyn Txn,
     delete: &Delete,
+    written: &mut Written,
 ) -> Result<Outcome> {
     crate::catalog::pg_catalog::refuse_write(&delete.table)?;
     if let Some(view) = updatable(executor, txn, &delete.table, Verb::Delete)? {
@@ -1369,14 +1432,15 @@ pub(super) fn delete(
         }
         // A `DELETE` with no `WHERE` deletes what the **view** shows, not the table.
         rewritten.filter = both(rewritten.filter, view.filter);
-        return self::delete(executor, txn, &rewritten);
+        return self::delete(executor, txn, &rewritten, written);
     }
     let named = executor.require_table(txn, &delete.table)?;
     refuse_matview_write(&named, &delete.table)?;
     let mut returned = Returned::open(delete.returning.as_ref(), &named, executor.rendering())?;
     let mut count = 0;
+    let mut after = AfterRows::new(Event::Delete);
     // Itself and everything that inherits from it: `DELETE FROM parent` removes a child's rows,
-    // measured, and each row has to go through its own table's keys and indexes.
+    // measured, and each row has to go through its own table's keys, indexes and triggers.
     for (table, project) in inheritance_targets(executor, txn, &named)? {
         // `Delete` has no alias, so the name it is referred to by is always the implicit
         // one — the relation's, without its schema.
@@ -1387,8 +1451,13 @@ pub(super) fn delete(
             &table,
             crate::catalog::split_qualified(&table.name).1,
         )?;
-        count += rows.len();
         for row in rows {
+            // **The `BEFORE DELETE` triggers**, with the row as `OLD`: `RETURN NULL` keeps it — not
+            // removed, not returned, not counted. Measured.
+            let Some(row) = executor.before_row(txn, written, &table, Event::Delete, None, row)?
+            else {
+                continue;
+            };
             // The row as it was, gathered before it goes: after `remove_row` there is nothing to
             // read.
             if let Some(returned) = &mut returned {
@@ -1396,10 +1465,13 @@ pub(super) fn delete(
             }
             // Anything pointing at this row: refused, or cascaded into first. Before the row goes,
             // so a refusal leaves the table as it was.
-            super::foreign_key::on_parent_removed(executor, txn, &table, &row)?;
+            super::foreign_key::on_parent_removed(executor, txn, &table, &row, written)?;
             remove_row(executor, txn, &table, &row)?;
+            count += 1;
+            after.remember(&table, Some(row), None);
         }
     }
+    executor.after_rows(txn, written, after)?;
     Ok(finish(returned, format!("DELETE {count}")))
 }
 
@@ -2516,7 +2588,9 @@ fn check_not_null(table: &TableDef, row: &[Datum]) -> Result<()> {
         if column.not_null {
             return Err(SqlError::NotNullViolationInRelation {
                 column: column.name.clone(),
-                relation: table.name.clone(),
+                // **Bare, whatever schema the table is in**: measured, `of relation "t"` for
+                // `s2t3.t`, where the stored name would put its separator inside the quotes.
+                relation: super::foreign_key::message_name(&table.name).to_owned(),
                 row: Some(failing_row(table, row)),
             });
         }

@@ -5,10 +5,10 @@
 //! block embeds a `CREATE OR REPLACE FUNCTION` of its own — before 790 is ever read. The two are
 //! one unit.
 //!
-//! The capture settles the scope: the load only *defines* them and inserts nothing, so what is
-//! wanted is a node that can store a dollar-quoted body and register a trigger, **not** one that
-//! can execute plpgsql. Exactly one test in the suite fires a trigger
-//! (`persistence_test.rb:1708`), and that stays out of scope.
+//! The capture settled that unit's scope: the load only *defines* them and inserts nothing, so what
+//! was wanted is a node that can store a dollar-quoted body and register a trigger. Exactly one
+//! test in the suite fires a trigger (`persistence_test.rb:1708`); ADR 0113 brought firing into
+//! scope, and `plpgsql_trigger.rs` is where it is tested.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -23,21 +23,49 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `lanname` is a `name` on a real server and `text` here, with identical characters — the
     // standing trade every `pg_catalog` column makes.
     types: &[],
-    answers: &[(
-        "SELECT 'r', proname, prokind, prorettype::regtype::text, l.lanname, pronargs, \
+    answers: &[
+        (
+            "SELECT 'r', proname, prokind, prorettype::regtype::text, l.lanname, pronargs, \
          provolatile FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE proname = \
          'populate_column'",
-        "**`oid::regtype` is not implemented** — contract C2, and the *forward* direction of the \
+            "**`oid::regtype` is not implemented** — contract C2, and the *forward* direction of the \
          cast: `'integer'::regtype::oid` runs here because `ActiveRecord` sends it, and reading an \
          oid back as a type name does not. `prorettype` is not a column this node's `pg_proc` \
          has, for the same reason: it would hold the oid of `trigger`, a pseudo-type this node \
          does not carry in `pg_type`. Every other column on this line agrees, and the test below \
-         reads them without the cast.\n\n**This line is also the one that aborts the capture's \
-         transaction**, and forty-one statements after it come back `25P02`. The harness counts \
-         those as a cascade rather than as divergences of their own, because declaring forty \
-         consequences would bury the one cause.",
-        "pg19_trigger_function.txt:80",
-    )],
+         reads them without the cast.\n\nThis line used to abort the capture's transaction and \
+         hide the forty-one statements after it; the re-capture holds it in a savepoint of its own, \
+         so the trigger firing after it is replayed.",
+            "pg19_trigger_function.txt:89",
+        ),
+        (
+            "SELECT 'r', pg_get_functiondef('populate_column'::regproc) LIKE '%LANGUAGE plpgsql%', \
+         length(prosrc) FROM pg_proc WHERE proname = 'populate_column'",
+            "**`::regproc` resolves only the functions this node knows by a fixed oid** — ADR 0098's \
+         table — and a function a user created has none, so the cast is `42883` before \
+         `pg_get_functiondef` is reached. A gap older than triggers, held in a savepoint of its \
+         own; the rows around it, which the trigger fills, agree.",
+            "pg19_trigger_function.txt:94",
+        ),
+        (
+            "SELECT populate_column()",
+            "**Calling a stored function is refused either way, and the sentence differs**: a real \
+         server knows the function is there and that `trigger` is not a callable return type, \
+         and this node refuses the call where the statement is lowered, before any catalog is in \
+         reach, so it names the function instead. Both are `0A000`, and the suite never calls \
+         one (`the_refusals_are_postgresqls`).",
+            "pg19_trigger_function.txt:108",
+        ),
+        (
+            "CREATE FUNCTION tf_badbody() RETURNS TRIGGER AS $$ BEGIN RETURN NEW END; $$ LANGUAGE \
+         plpgsql",
+            "**PostgreSQL reads a PL/pgSQL body when the function is created**, and refuses this one \
+         there; this node stores the body and reads it when a trigger fires it \
+         (`docs/plans/plpgsql-subset.md` §11, validation at `CREATE FUNCTION`). The capture holds \
+         it in a savepoint, so the stored function goes with it.",
+            "pg19_trigger_function.txt:114",
+        ),
+    ],
 };
 
 #[test]
@@ -222,18 +250,18 @@ fn a_trigger_holds_its_function_until_it_is_dropped() {
     );
 }
 
-/// **A trigger this node stores never fires**, and that is named rather than hidden.
+/// **A trigger this node stores fires** (ADR 0113). Until then this test pinned that it did not:
+/// the column has no default, and the `NULL` below was `23502` because nothing filled it.
 #[test]
-fn a_stored_trigger_does_not_fire() {
+fn a_stored_trigger_fires() {
     let mut node = parity::Node::new(&[
         "CREATE TABLE t (id integer NOT NULL)",
-        "CREATE FUNCTION f() RETURNS TRIGGER AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+        "CREATE FUNCTION f() RETURNS TRIGGER AS $$ BEGIN NEW.id = 42; RETURN NEW; END; $$ LANGUAGE \
+         plpgsql",
         "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
     ]);
-    // The column has no default and the trigger does not run, so nothing fills it.
-    let error = node.run("INSERT INTO t (id) VALUES (NULL)").unwrap_err();
-    assert_eq!(error.sqlstate(), "23502");
-    // An ordinary insert is untouched by the trigger's existence.
+    node.run("INSERT INTO t (id) VALUES (NULL)").unwrap();
+    // A value the statement wrote is the trigger's to replace too.
     node.run("INSERT INTO t (id) VALUES (7)").unwrap();
-    assert_eq!(node.rows("SELECT id FROM t"), [["7"]]);
+    assert_eq!(node.rows("SELECT id FROM t"), [["42"], ["42"]]);
 }

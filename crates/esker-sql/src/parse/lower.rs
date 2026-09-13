@@ -2326,10 +2326,11 @@ fn unique_deferrable(
 
 /// `CREATE [OR REPLACE] FUNCTION f() RETURNS TRIGGER AS $$…$$ LANGUAGE plpgsql`.
 ///
-/// **The body is taken verbatim and never parsed.** PostgreSQL validates a plpgsql body when the
-/// function is created — a missing semicolon is `42601` from the `CREATE` itself — and this node
-/// does not, which is a declared divergence rather than the thing the schema load needs. What the
-/// load needs is that the definition survives, semicolons and all.
+/// **The body is taken verbatim, and read only when a trigger fires it** (`crate::exec::trigger`).
+/// PostgreSQL validates a plpgsql body when the function is created — a missing semicolon is
+/// `42601` from the `CREATE` itself — and this node does not, which is a declared divergence rather
+/// than the thing the schema load needs. What the load needs is that the definition survives,
+/// semicolons and all.
 fn lower_create_function(create: &sqlparser::ast::CreateFunction) -> Result<plan::CreateFunction> {
     use sqlparser::ast::CreateFunctionBody;
     refuse_if(create.temporary, "CREATE TEMPORARY FUNCTION")?;
@@ -2344,6 +2345,18 @@ fn lower_create_function(create: &sqlparser::ast::CreateFunction) -> Result<plan
         .as_ref()
         .map(|ident| fold_identifier(&ident.value, ident.quote_style.is_some()).0)
         .ok_or_else(|| SqlError::unsupported("CREATE FUNCTION with no LANGUAGE"))?;
+    // **`LANGUAGE sql` cannot return `trigger`**: PostgreSQL's `42P13`, from the `CREATE` itself —
+    // measured. Asked here, because a function's return type is not stored to be asked later.
+    if language == "sql"
+        && matches!(
+            create.return_type,
+            Some(sqlparser::ast::FunctionReturnType::DataType(
+                DataType::Trigger
+            ))
+        )
+    {
+        return Err(SqlError::SqlFunctionReturnsTrigger);
+    }
     let body = match &create.function_body {
         // `AS $$…$$` before the options or after them: PostgreSQL takes both orders and
         // `ActiveRecord` writes the second.
@@ -2403,6 +2416,25 @@ fn lower_create_trigger(create: &sqlparser::ast::CreateTrigger) -> Result<plan::
             }
         };
     }
+    // **Refused rather than stored to never fire** (ADR 0113): a statement-level trigger — which is
+    // also what one with no `FOR EACH` is, where `FOR ROW` is `FOR EACH ROW` — and arguments, which a
+    // stored trigger has no place for.
+    let for_each_row = matches!(
+        create.trigger_object,
+        Some(
+            TriggerObjectKind::For(TriggerObject::Row)
+                | TriggerObjectKind::ForEach(TriggerObject::Row)
+        )
+    );
+    refuse_if(!for_each_row, "CREATE TRIGGER ... FOR EACH STATEMENT")?;
+    refuse_if(
+        create
+            .exec_body
+            .as_ref()
+            .and_then(|body| body.func_desc.args.as_ref())
+            .is_some_and(|args| !args.is_empty()),
+        "CREATE TRIGGER ... EXECUTE FUNCTION with arguments",
+    )?;
     let function = create
         .exec_body
         .as_ref()
@@ -2420,14 +2452,7 @@ fn lower_create_trigger(create: &sqlparser::ast::CreateTrigger) -> Result<plan::
         table: relation_name(&create.table_name)?,
         before,
         events,
-        // `FOR EACH ROW` and `FOR ROW` are the same thing; `STATEMENT` is the other object.
-        for_each_row: matches!(
-            create.trigger_object,
-            Some(
-                TriggerObjectKind::For(TriggerObject::Row)
-                    | TriggerObjectKind::ForEach(TriggerObject::Row)
-            )
-        ),
+        for_each_row,
         function,
     })
 }
@@ -2911,7 +2936,7 @@ fn lower_alter_table(
         | AlterTableOperation::EnableTrigger { name } = operation
         {
             let disabled = matches!(operation, AlterTableOperation::DisableTrigger { .. });
-            actions.push(lower_trigger_state(&table_name, name, disabled)?);
+            actions.push(lower_trigger_state(name, disabled));
             continue;
         }
         if let AlterTableOperation::ValidateConstraint { name } = operation {
@@ -3251,35 +3276,26 @@ fn lower_table_constraints(
 ///
 /// `sqlparser` hands all three spellings back as an `Ident`, because `ALL` and `USER` are keywords
 /// only in this position. Unquoted is what makes them keywords here, exactly as it does for
-/// `DEFAULT` and `current_schema` above: `"ALL"` in quotes is a trigger called `ALL` and is
-/// `42704` with the rest.
+/// `DEFAULT` and `current_schema` above: `"ALL"` in quotes is a trigger called `ALL`.
 ///
-/// * **`ALL`** is the one that does something. It covers the internal foreign-key triggers, so it
+/// * **`ALL`** covers the user's triggers **and** the internal foreign-key ones, so it also
 ///   suspends this table's referential checks until it is enabled again — measured, and the whole
 ///   reason `ActiveRecord` writes it ([`plan::AlterTableAction::SetTriggersDisabled`]).
-/// * **`USER`** covers only triggers a user created, of which this node has none, so it is
-///   accepted and records nothing. Measured: an `INSERT` under it is still `23503` on a real
-///   server, so accepting it and suspending the checks would be a **wrong answer** rather than a
-///   generous one.
-/// * **A name** is `42704`, naming the trigger and the table the way PostgreSQL does. There are no
-///   triggers here to name, so every name is missing.
-fn lower_trigger_state(
-    table: &str,
-    name: &Ident,
-    disabled: bool,
-) -> Result<plan::AlterTableAction> {
+/// * **`USER`** covers only triggers a user created. Measured: an `INSERT` under
+///   `DISABLE TRIGGER USER` is still `23503` on a real server, and `ENABLE TRIGGER USER` after
+///   `DISABLE TRIGGER ALL` leaves the checks off — so it moves no check either way.
+/// * **A name** is one of the table's triggers. A name the table does not have is `42704` from the
+///   executor, which is where the table's triggers are known.
+fn lower_trigger_state(name: &Ident, disabled: bool) -> plan::AlterTableAction {
     let keyword = |word: &str| name.quote_style.is_none() && name.value.eq_ignore_ascii_case(word);
-    if keyword("all") {
-        return Ok(plan::AlterTableAction::SetTriggersDisabled { disabled });
-    }
-    if keyword("user") {
-        // Accepted, and it records nothing: there are no user triggers to enable or disable.
-        return Ok(plan::AlterTableAction::SetTriggersDisabled { disabled: false });
-    }
-    Err(SqlError::UndefinedTrigger {
-        trigger: ident(name),
-        table: table.to_owned(),
-    })
+    let which = if keyword("all") {
+        plan::TriggerSelection::All
+    } else if keyword("user") {
+        plan::TriggerSelection::User
+    } else {
+        plan::TriggerSelection::Named(ident(name))
+    };
+    plan::AlterTableAction::SetTriggersDisabled { which, disabled }
 }
 
 /// The advisory-lock function of that name, or `None`.

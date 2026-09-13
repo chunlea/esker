@@ -28,6 +28,14 @@
 #
 # Captured in one session with `scratchpad/sesscap.py` and replayed the same way.
 #
+# **Re-captured 2026-09-13 with the `prorettype` line in a savepoint of its own** (lane s2-plpgsql,
+# `esker-coord/s2-tf.stmts` and `s2-tf.out`): that line is a cast this node does not have, and the
+# abort it caused hid every statement after it — the trigger firing among them. The re-capture's
+# rows are the first capture's, every one; two things differ and are kept from the first capture.
+# The oracle's `public` has since been given this very table and function by a schema load, so the
+# `\gdesc` pass, which runs on a connection of its own, now describes these statements, and the
+# two closing counts see those objects — both about the oracle's state, not this session's.
+#
 # **The whole capture runs inside `BEGIN … ROLLBACK`**, error probes in `SAVEPOINT` / `ROLLBACK TO`.
 # The two `SELECT count(*)` lines at the end prove it left nothing behind — no function, no table.
 # The `\gdesc` pass runs after the rollback, so statements naming the table or the function have an
@@ -77,10 +85,14 @@ DROP TABLE IF EXISTS "pk_autopopulated_by_a_trigger_records"		-
 CREATE TABLE "pk_autopopulated_by_a_trigger_records" ("id" integer NOT NULL)		-
 CREATE OR REPLACE FUNCTION populate_column() RETURNS TRIGGER AS $$ DECLARE max_value INTEGER; BEGIN SELECT MAX(id) INTO max_value FROM pk_autopopulated_by_a_trigger_records; NEW.id = COALESCE(max_value, 0) + 1; RETURN NEW; END; $$ LANGUAGE plpgsql; CREATE TRIGGER before_insert_trigger BEFORE INSERT ON pk_autopopulated_by_a_trigger_records FOR EACH ROW EXECUTE FUNCTION populate_column();		-
 SELECT 'r', count(*) FROM "pk_autopopulated_by_a_trigger_records"		r|0
+SAVEPOINT s0		-
 SELECT 'r', proname, prokind, prorettype::regtype::text, l.lanname, pronargs, provolatile FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE proname = 'populate_column'	text,name,"char",text,name,smallint,"char"	r|populate_column|f|trigger|plpgsql|0|v
+ROLLBACK TO s0		-
 SELECT 'r', tgname, tgenabled, tgtype, tgnargs, tgisinternal FROM pg_trigger WHERE tgrelid = 'pk_autopopulated_by_a_trigger_records'::regclass AND NOT tgisinternal		r|before_insert_trigger|O|7|0|f
 SELECT 'r', pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'before_insert_trigger'	text,text	r|CREATE TRIGGER before_insert_trigger BEFORE INSERT ON public.pk_autopopulated_by_a_trigger_records FOR EACH ROW EXECUTE FUNCTION populate_column()
+SAVEPOINT s0b		-
 SELECT 'r', pg_get_functiondef('populate_column'::regproc) LIKE '%LANGUAGE plpgsql%', length(prosrc) FROM pg_proc WHERE proname = 'populate_column'		r|t|162
+ROLLBACK TO s0b		-
 INSERT INTO "pk_autopopulated_by_a_trigger_records" DEFAULT VALUES RETURNING "id"		1
 SELECT 'r', id FROM "pk_autopopulated_by_a_trigger_records" ORDER BY id		r|1
 INSERT INTO "pk_autopopulated_by_a_trigger_records" DEFAULT VALUES RETURNING "id"		2

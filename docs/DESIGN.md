@@ -1167,8 +1167,12 @@ is in its first sentence.
   PostgreSQL refuses. `exec::plpgsql` runs it **inside the statement that reached it**: every SQL
   statement goes through `run_recording` with that statement's transaction and savepoint, a
   variable reaches SQL as a typed literal put into the lowered tree rather than as text, and a name
-  that is both a variable and a column is `42702`. Nesting is bounded (`54001`). The one write to a
-  system catalog lives beside it: `UPDATE pg_catalog.pg_constraint SET convalidated = …` writes the
+  that is both a variable and a column is `42702`. Nesting is bounded (`54001`). **A row trigger
+  fires from `exec::trigger`**: every enabled `BEFORE ROW` trigger in name order, after defaults and
+  before generated columns and checks, `RETURN NULL` taking the row out of the statement; the
+  `AFTER ROW` triggers once the statement has written its rows; a foreign key's actions firing the
+  child's. A statement-level trigger, arguments, a partitioned table and `ON CONFLICT` into a table
+  with a trigger are refused by name. The one write to a system catalog lives beside it: `UPDATE pg_catalog.pg_constraint SET convalidated = …` writes the
   `NOT VALID` flag a foreign key or a `CHECK` already stores (`exec::catalog_write`), because
   `check_all_foreign_keys_valid!` cannot work without it, and every other catalog write is `42501`.
   **The catalog record is a versioned on-disk format** like every other byte this system writes

@@ -310,6 +310,9 @@ pub const RAISE_EXCEPTION: &str = "P0001";
 /// `0Z002` — `RAISE;` with no exception being handled. PostgreSQL's class `0Z` is "Diagnostics
 /// Exception", and this is its second member.
 pub const STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER: &str = "0Z002";
+/// `2F005` — a function whose body ran off its end without `RETURN`. PostgreSQL's class `2F` is
+/// "SQL Routine Exception", and a trigger function is where this node meets it.
+pub const FUNCTION_EXECUTED_NO_RETURN_STATEMENT: &str = "2F005";
 /// A name that exists and is the wrong kind of thing — `DROP TABLE` naming an index. Not
 /// `42P01`: the object is there, it is just not what the statement can act on. Captured, because
 /// collapsing the two would tell a user their index does not exist.
@@ -367,6 +370,8 @@ pub const UNDEFINED_PARAMETER: &str = "42P02";
 /// of the row alone. PostgreSQL's `invalid_object_definition`, and the code it gives for
 /// `CREATE INDEX ON t ((now()))`.
 pub const INVALID_OBJECT_DEFINITION: &str = "42P17";
+/// A function definition PostgreSQL refuses to store: `LANGUAGE sql` returning `trigger`.
+pub const INVALID_FUNCTION_DEFINITION: &str = "42P13";
 /// A table definition that cannot be built — no primary key, in our case.
 pub const INVALID_TABLE_DEFINITION: &str = "42P16";
 /// An identifier longer than 63 bytes. A *notice*, not an error: PostgreSQL truncates and carries
@@ -407,6 +412,10 @@ mod tests {
         (
             "STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER",
             super::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER,
+        ),
+        (
+            "FUNCTION_EXECUTED_NO_RETURN_STATEMENT",
+            super::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
         ),
         (
             "INVALID_TEXT_REPRESENTATION",
@@ -515,6 +524,10 @@ mod tests {
         ("INVALID_COLUMN_REFERENCE", super::INVALID_COLUMN_REFERENCE),
         ("INVALID_RECURSION", super::INVALID_RECURSION),
         ("INVALID_TABLE_DEFINITION", super::INVALID_TABLE_DEFINITION),
+        (
+            "INVALID_FUNCTION_DEFINITION",
+            super::INVALID_FUNCTION_DEFINITION,
+        ),
         ("NAME_TOO_LONG", super::NAME_TOO_LONG),
         ("UNDEFINED_PARAMETER", super::UNDEFINED_PARAMETER),
         ("SUCCESSFUL_COMPLETION", super::SUCCESSFUL_COMPLETION),

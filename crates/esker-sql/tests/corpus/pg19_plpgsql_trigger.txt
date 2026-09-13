@@ -1,0 +1,362 @@
+# Row triggers and their PL/pgSQL functions — the subset ADR 0113 builds, and the shapes just
+# outside it — as a real PostgreSQL 19beta1 answers them.
+#
+# Captured 2026-09-13 by lane s2-plpgsql with `sesscap.py`, in **three sessions**, each inside
+# `BEGIN … ROLLBACK` with every refusal in its own `SAVEPOINT` / `ROLLBACK TO`. The second runs in
+# a schema of its own: the oracle's `public` already holds the suite's
+# `pk_autopopulated_by_a_trigger_records` and `postgresql_partitioned_table_parent` from a schema
+# load, and the census's statements are captured here verbatim, so they need names nobody has.
+# The third, in a schema of its own too, asks what the first two left open: `NEW` and `OLD` where
+# the event leaves them null, generated columns, and the foreign-key actions that are not a
+# `CASCADE` of a delete. Each session's last line proves it left nothing behind. The two schema
+# sessions set `search_path` with a plain `SET`, which the `ROLLBACK` undoes on both servers:
+# `SET LOCAL` is refused here by name, and the abort it caused swallowed everything after it.
+#
+#!escaped
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`BEFORE` triggers on one event fire in name order, and each sees the NEW the one before it
+#     returned**: `s2t_a_upper` then `s2t_b_skip`, so the skipped row was upper-cased first.
+#   * **`RETURN NULL` from a `BEFORE` trigger removes the row from the statement** — not written,
+#     not in `RETURNING`, not counted: statement 762's inserts answer `INSERT 0 0` and no row.
+#   * **An `AFTER` trigger sees every row its statement wrote**: both of a two-row insert count five
+#     rows, not four and five.
+#   * **`DISABLE TRIGGER USER` and `ALL` both flip every user trigger's `tgenabled` to `D`**, and
+#     `ENABLE TRIGGER USER` after `DISABLE TRIGGER ALL` turns them all back on.
+#   * **A foreign key's `ON DELETE CASCADE` fires the child's row triggers**, and an `UPDATE` through
+#     an inheritance parent fires the triggers of the child the row is in.
+#   * **A trigger body's errors are PostgreSQL's**: `2F005` for a body that ends without `RETURN`,
+#     `42804` for `RETURN 1`, `42703 record "new" has no field "nosuch"`, `54001` with its HINT for a
+#     trigger that fires itself — and `42P13` for a `LANGUAGE sql` function returning `trigger`,
+#     `42P17` for a trigger naming a function that does not return one.
+#   * **A trigger's writes are its statement's**: the audit row a trigger wrote for a statement that
+#     then failed on a duplicate key is not there.
+#   * **`OLD` in an `INSERT` trigger and `NEW` in a `DELETE` one read `NULL`, and returned as they
+#     are they are `RETURN NULL`**: the insert writes nothing and the delete keeps its row. Assigning
+#     one of its fields makes it a row — `NEW.id = 7; RETURN NEW` in a `DELETE` trigger deletes.
+#   * **A generated column reads `NULL` in a `BEFORE UPDATE` trigger too**, not the value stored:
+#     it is computed after the triggers, from the row they leave.
+#   * **`SET NULL` and `ON UPDATE CASCADE` fire the child's `UPDATE` triggers.** A child's
+#     `BEFORE DELETE` answering `RETURN NULL` under `ON DELETE CASCADE` keeps the child row, with no
+#     error; a child's `BEFORE UPDATE` that points the key somewhere else is `23503`.
+#   * **`ENABLE TRIGGER USER` after `DISABLE TRIGGER ALL` leaves the foreign key's own triggers
+#     off**: a row with no parent still goes in.
+BEGIN		-
+CREATE TABLE s2t_audit (seq serial PRIMARY KEY, note text)		-
+CREATE TABLE s2t (id integer PRIMARY KEY, name text, touched integer DEFAULT 0)		-
+# BEFORE INSERT changes NEW; two BEFORE triggers fire in name order; RETURN NULL skips the row
+CREATE FUNCTION s2t_upper() RETURNS trigger AS $$ BEGIN NEW.name = upper(NEW.name); RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER s2t_a_upper BEFORE INSERT ON s2t FOR EACH ROW EXECUTE FUNCTION s2t_upper()		-
+INSERT INTO s2t (id, name) VALUES (1, 'one'), (2, 'two') RETURNING id, name		1|ONE ; 2|TWO
+CREATE FUNCTION s2t_skip_odd() RETURNS trigger AS $$ BEGIN IF NEW.id % 2 = 1 THEN RETURN NULL; END IF; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER s2t_b_skip BEFORE INSERT ON s2t FOR EACH ROW EXECUTE FUNCTION s2t_skip_odd()		-
+INSERT INTO s2t (id, name) VALUES (3, 'three'), (4, 'four') RETURNING id, name		4|FOUR
+SELECT 'r', id, name FROM s2t ORDER BY id		r|1|ONE ; r|2|TWO ; r|4|FOUR
+# AFTER INSERT sees every row the statement wrote
+CREATE FUNCTION s2t_audit_insert() RETURNS trigger AS $$ DECLARE n integer; BEGIN SELECT count(*) INTO n FROM s2t; INSERT INTO s2t_audit (note) VALUES ('after insert ' || NEW.id || ' sees ' || n); RETURN NULL; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER s2t_c_audit AFTER INSERT ON s2t FOR EACH ROW EXECUTE FUNCTION s2t_audit_insert()		-
+INSERT INTO s2t (id, name) VALUES (6, 'six'), (8, 'eight')		-
+SELECT 'r', note FROM s2t_audit ORDER BY seq		r|after insert 6 sees 5 ; r|after insert 8 sees 5
+# BEFORE UPDATE reads OLD and changes NEW; RETURN NULL skips the update
+CREATE FUNCTION s2t_touch() RETURNS trigger AS $$ BEGIN NEW.touched = OLD.touched + 1; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER s2t_d_touch BEFORE UPDATE ON s2t FOR EACH ROW EXECUTE FUNCTION s2t_touch()		-
+UPDATE s2t SET name = 'TWO!' WHERE id = 2 RETURNING id, name, touched		2|TWO!|1
+CREATE FUNCTION s2t_freeze() RETURNS trigger AS $$ BEGIN IF OLD.id = 4 THEN RETURN NULL; END IF; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER s2t_e_freeze BEFORE UPDATE ON s2t FOR EACH ROW EXECUTE FUNCTION s2t_freeze()		-
+UPDATE s2t SET name = 'changed' WHERE id IN (2, 4)		-
+SELECT 'r', id, name, touched FROM s2t ORDER BY id		r|1|ONE|0 ; r|2|changed|2 ; r|4|FOUR|0 ; r|6|SIX|0 ; r|8|EIGHT|0
+# BEFORE DELETE reads OLD; RETURN NULL keeps the row; AFTER DELETE sees OLD
+CREATE FUNCTION s2t_keep() RETURNS trigger AS $$ BEGIN IF OLD.name = 'SIX' THEN RETURN NULL; END IF; RETURN OLD; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER s2t_f_keep BEFORE DELETE ON s2t FOR EACH ROW EXECUTE FUNCTION s2t_keep()		-
+DELETE FROM s2t WHERE id IN (6, 8)		-
+SELECT 'r', id FROM s2t ORDER BY id		r|1 ; r|2 ; r|4 ; r|6
+CREATE FUNCTION s2t_audit_delete() RETURNS trigger AS $$ BEGIN INSERT INTO s2t_audit (note) VALUES ('deleted ' || OLD.id); RETURN NULL; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER s2t_g_audit AFTER DELETE ON s2t FOR EACH ROW EXECUTE FUNCTION s2t_audit_delete()		-
+DELETE FROM s2t WHERE id = 2		-
+SELECT 'r', note FROM s2t_audit ORDER BY seq		r|after insert 6 sees 5 ; r|after insert 8 sees 5 ; r|deleted 2
+# errors inside a trigger
+CREATE FUNCTION s2t_refuse() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$ LANGUAGE plpgsql		-
+CREATE TABLE s2t_locked (id integer)		-
+CREATE TRIGGER s2t_refuse_t BEFORE INSERT ON s2t_locked FOR EACH ROW EXECUTE FUNCTION s2t_refuse()		-
+SAVEPOINT t1		-
+INSERT INTO s2t_locked VALUES (1)	!P0001 refused
+ROLLBACK TO t1		-
+CREATE FUNCTION s2t_bad_return() RETURNS trigger AS $$ BEGIN RETURN 1; END $$ LANGUAGE plpgsql		-
+CREATE TABLE s2t_bad (id integer)		-
+CREATE TRIGGER s2t_bad_t BEFORE INSERT ON s2t_bad FOR EACH ROW EXECUTE FUNCTION s2t_bad_return()		-
+SAVEPOINT t2		-
+INSERT INTO s2t_bad VALUES (1)	!42804 cannot return non-composite value from function returning composite type
+ROLLBACK TO t2		-
+CREATE FUNCTION s2t_no_field() RETURNS trigger AS $$ BEGIN NEW.nosuch = 1; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TABLE s2t_nf (id integer)		-
+CREATE TRIGGER s2t_nf_t BEFORE INSERT ON s2t_nf FOR EACH ROW EXECUTE FUNCTION s2t_no_field()		-
+SAVEPOINT t3		-
+INSERT INTO s2t_nf VALUES (1)	!42703 record "new" has no field "nosuch"
+ROLLBACK TO t3		-
+CREATE FUNCTION s2t_no_return() RETURNS trigger AS $$ BEGIN NULL; END $$ LANGUAGE plpgsql		-
+CREATE TABLE s2t_nr (id integer)		-
+CREATE TRIGGER s2t_nr_t BEFORE INSERT ON s2t_nr FOR EACH ROW EXECUTE FUNCTION s2t_no_return()		-
+SAVEPOINT t3b		-
+INSERT INTO s2t_nr VALUES (1)	!2F005 control reached end of trigger procedure without RETURN
+ROLLBACK TO t3b		-
+# enabling and disabling
+ALTER TABLE s2t DISABLE TRIGGER s2t_a_upper		-
+SELECT 'r', tgname, tgenabled FROM pg_trigger WHERE tgrelid = 's2t'::regclass ORDER BY tgname		r|s2t_a_upper|D ; r|s2t_b_skip|O ; r|s2t_c_audit|O ; r|s2t_d_touch|O ; r|s2t_e_freeze|O ; r|s2t_f_keep|O ; r|s2t_g_audit|O
+INSERT INTO s2t (id, name) VALUES (10, 'ten')		-
+ALTER TABLE s2t DISABLE TRIGGER USER		-
+SELECT 'r', tgname, tgenabled FROM pg_trigger WHERE tgrelid = 's2t'::regclass ORDER BY tgname		r|s2t_a_upper|D ; r|s2t_b_skip|D ; r|s2t_c_audit|D ; r|s2t_d_touch|D ; r|s2t_e_freeze|D ; r|s2t_f_keep|D ; r|s2t_g_audit|D
+INSERT INTO s2t (id, name) VALUES (11, 'eleven')		-
+ALTER TABLE s2t ENABLE TRIGGER ALL		-
+SELECT 'r', tgname, tgenabled FROM pg_trigger WHERE tgrelid = 's2t'::regclass ORDER BY tgname		r|s2t_a_upper|O ; r|s2t_b_skip|O ; r|s2t_c_audit|O ; r|s2t_d_touch|O ; r|s2t_e_freeze|O ; r|s2t_f_keep|O ; r|s2t_g_audit|O
+ALTER TABLE s2t DISABLE TRIGGER ALL		-
+SELECT 'r', tgname, tgenabled FROM pg_trigger WHERE tgrelid = 's2t'::regclass ORDER BY tgname		r|s2t_a_upper|D ; r|s2t_b_skip|D ; r|s2t_c_audit|D ; r|s2t_d_touch|D ; r|s2t_e_freeze|D ; r|s2t_f_keep|D ; r|s2t_g_audit|D
+INSERT INTO s2t (id, name) VALUES (13, 'thirteen')		-
+ALTER TABLE s2t ENABLE TRIGGER USER		-
+SELECT 'r', id, name FROM s2t WHERE id >= 10 ORDER BY id		r|10|ten ; r|11|eleven ; r|13|thirteen
+SAVEPOINT t4		-
+ALTER TABLE s2t DISABLE TRIGGER nosuch	!42704 trigger "nosuch" for table "s2t" does not exist
+ROLLBACK TO t4		-
+DROP TRIGGER s2t_a_upper ON s2t		-
+INSERT INTO s2t (id, name) VALUES (14, 'fourteen')		-
+SELECT 'r', name FROM s2t WHERE id = 14		r|fourteen
+# a trigger that fires itself
+CREATE TABLE s2t_rec (id integer)		-
+CREATE FUNCTION s2t_recurse() RETURNS trigger AS $$ BEGIN INSERT INTO s2t_rec VALUES (NEW.id + 1); RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER s2t_rec_t BEFORE INSERT ON s2t_rec FOR EACH ROW EXECUTE FUNCTION s2t_recurse()		-
+SAVEPOINT t5		-
+INSERT INTO s2t_rec VALUES (1)	!54001 stack depth limit exceeded HINT: Increase the configuration parameter "max_stack_depth" (currently 2048kB), after ensuring the platform's stack depth limit is adequate.
+ROLLBACK TO t5		-
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 's2t%'	bigint	0
+BEGIN		-
+CREATE SCHEMA s2t_schema		-
+SET search_path = s2t_schema		-
+CREATE TABLE s2t_audit (seq serial PRIMARY KEY, note text)		-
+# the census's two shapes, statement for statement
+CREATE TABLE "pk_autopopulated_by_a_trigger_records" ("id" integer NOT NULL)		-
+CREATE OR REPLACE FUNCTION populate_column() RETURNS TRIGGER AS $$ DECLARE max_value INTEGER; BEGIN SELECT MAX(id) INTO max_value FROM pk_autopopulated_by_a_trigger_records; NEW.id = COALESCE(max_value, 0) + 1; RETURN NEW; END; $$ LANGUAGE plpgsql		-
+CREATE TRIGGER before_insert_trigger BEFORE INSERT ON pk_autopopulated_by_a_trigger_records FOR EACH ROW EXECUTE FUNCTION populate_column()		-
+INSERT INTO "pk_autopopulated_by_a_trigger_records" DEFAULT VALUES RETURNING "id"		1
+INSERT INTO "pk_autopopulated_by_a_trigger_records" DEFAULT VALUES RETURNING "id"		2
+INSERT INTO "pk_autopopulated_by_a_trigger_records" ("id") VALUES (NULL) RETURNING "id"		3
+CREATE TABLE postgresql_partitioned_table_parent ( id SERIAL PRIMARY KEY, number integer )		-
+CREATE TABLE postgresql_partitioned_table ( ) INHERITS (postgresql_partitioned_table_parent)		-
+CREATE OR REPLACE FUNCTION partitioned_insert_trigger() RETURNS TRIGGER AS $$ BEGIN INSERT INTO postgresql_partitioned_table VALUES (NEW.*); RETURN NULL; END; $$ LANGUAGE plpgsql		-
+CREATE TRIGGER insert_partitioning_trigger BEFORE INSERT ON postgresql_partitioned_table_parent FOR EACH ROW EXECUTE PROCEDURE partitioned_insert_trigger()		-
+insert into postgresql_partitioned_table_parent (number) VALUES (1)		-
+insert into postgresql_partitioned_table_parent (number) VALUES (1) RETURNING id		-
+insert into postgresql_partitioned_table_parent DEFAULT VALUES		-
+insert into "s2t_schema"."postgresql_partitioned_table_parent" DEFAULT VALUES		-
+select 'r', max(id) from postgresql_partitioned_table_parent	text,integer	r|4
+SAVEPOINT only_t		-
+select 'r', count(*) from only postgresql_partitioned_table_parent	text,bigint	r|0
+ROLLBACK TO only_t		-
+select 'r', id, number from postgresql_partitioned_table order by id	text,integer,integer	r|1|1 ; r|2|1 ; r|3|\\N ; r|4|\\N
+SELECT 'r', currval('postgresql_partitioned_table_parent_id_seq')	text,bigint	r|4
+# shapes outside the subset, which PostgreSQL runs
+CREATE TABLE s2t (id integer PRIMARY KEY, name text)		-
+CREATE FUNCTION s2t_stmt() RETURNS trigger AS $$ BEGIN RETURN NULL; END $$ LANGUAGE plpgsql		-
+CREATE FUNCTION s2t_upper() RETURNS trigger AS $$ BEGIN NEW.name = upper(NEW.name); RETURN NEW; END $$ LANGUAGE plpgsql		-
+SAVEPOINT t6		-
+CREATE TRIGGER s2t_stmt_t AFTER INSERT ON s2t FOR EACH STATEMENT EXECUTE FUNCTION s2t_stmt()		-
+ROLLBACK TO t6		-
+SAVEPOINT t7		-
+CREATE TRIGGER s2t_args_t BEFORE INSERT ON s2t FOR EACH ROW EXECUTE FUNCTION s2t_upper('x')		-
+ROLLBACK TO t7		-
+CREATE TABLE s2t_parted (id integer, kind text) PARTITION BY LIST (kind)		-
+CREATE TABLE s2t_parted_a PARTITION OF s2t_parted FOR VALUES IN ('a')		-
+SAVEPOINT t8		-
+CREATE TRIGGER s2t_parted_t BEFORE INSERT ON s2t_parted FOR EACH ROW EXECUTE FUNCTION s2t_stmt()		-
+ROLLBACK TO t8		-
+SAVEPOINT t8b		-
+CREATE TRIGGER s2t_parted_a_t BEFORE INSERT ON s2t_parted_a FOR EACH ROW EXECUTE FUNCTION s2t_stmt()		-
+ROLLBACK TO t8b		-
+CREATE TRIGGER s2t_upper_t BEFORE INSERT ON s2t FOR EACH ROW EXECUTE FUNCTION s2t_upper()		-
+INSERT INTO s2t VALUES (4, 'four')		-
+SAVEPOINT t9		-
+INSERT INTO s2t (id, name) VALUES (4, 'conflict') ON CONFLICT (id) DO UPDATE SET name = 'updated'		-
+ROLLBACK TO t9		-
+# a foreign key's cascade reaches a child with a trigger
+CREATE TABLE s2t_p (id integer PRIMARY KEY)		-
+CREATE TABLE s2t_c (id integer PRIMARY KEY, p integer REFERENCES s2t_p ON DELETE CASCADE ON UPDATE CASCADE)		-
+CREATE FUNCTION s2t_c_audit() RETURNS trigger AS $$ BEGIN INSERT INTO s2t_audit (note) VALUES ('child ' || OLD.id || ' saw ' || TG_OP); RETURN NULL; END $$ LANGUAGE plpgsql		-
+CREATE FUNCTION s2t_c_keep() RETURNS trigger AS $$ BEGIN INSERT INTO s2t_audit (note) VALUES ('child ' || OLD.id || ' before'); RETURN OLD; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER s2t_c_t BEFORE DELETE ON s2t_c FOR EACH ROW EXECUTE FUNCTION s2t_c_keep()		-
+INSERT INTO s2t_p VALUES (1), (2)		-
+INSERT INTO s2t_c VALUES (10, 1), (20, 2)		-
+DELETE FROM s2t_p WHERE id = 1		-
+SELECT 'r', note FROM s2t_audit ORDER BY seq		r|child 10 before
+SELECT 'r', id FROM s2t_c ORDER BY id		r|20
+# a function that is not a trigger function
+SAVEPOINT t10		-
+CREATE FUNCTION s2t_sqlfn() RETURNS trigger AS 'SELECT NULL' LANGUAGE sql	!42P13 SQL functions cannot return type trigger
+ROLLBACK TO t10		-
+CREATE FUNCTION s2t_int() RETURNS integer AS $$ BEGIN RETURN 1; END $$ LANGUAGE plpgsql		-
+SAVEPOINT t11		-
+CREATE TRIGGER s2t_int_t BEFORE INSERT ON s2t FOR EACH ROW EXECUTE FUNCTION s2t_int()	!42P17 function s2t_int must return type trigger
+ROLLBACK TO t11		-
+# an UPDATE through an inheritance parent fires the child's triggers, and an INSERT fires only its own table's
+CREATE TABLE s2t_ip (id integer, v text)		-
+CREATE TABLE s2t_ic () INHERITS (s2t_ip)		-
+CREATE FUNCTION s2t_ic_touch() RETURNS trigger AS $$ BEGIN NEW.v = NEW.v || '+child'; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER s2t_ic_t BEFORE UPDATE ON s2t_ic FOR EACH ROW EXECUTE FUNCTION s2t_ic_touch()		-
+INSERT INTO s2t_ic VALUES (1, 'x')		-
+INSERT INTO s2t_ip VALUES (2, 'y')		-
+UPDATE s2t_ip SET v = v || '!'		-
+SELECT 'r', id, v FROM s2t_ip ORDER BY id		r|1|x!+child ; r|2|y!
+# a trigger's writes are the statement's: a failure after the trigger undoes them
+CREATE TABLE s2t_u (id integer PRIMARY KEY)		-
+CREATE FUNCTION s2t_u_audit() RETURNS trigger AS $$ BEGIN INSERT INTO s2t_audit (note) VALUES ('u ' || NEW.id); RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER s2t_u_t BEFORE INSERT ON s2t_u FOR EACH ROW EXECUTE FUNCTION s2t_u_audit()		-
+INSERT INTO s2t_u VALUES (1)		-
+SAVEPOINT t12		-
+INSERT INTO s2t_u VALUES (2), (1)	!23505 duplicate key value violates unique constraint "s2t_u_pkey" DETAIL: Key (id)=(1) already exists.
+ROLLBACK TO t12		-
+SELECT 'r', note FROM s2t_audit WHERE note LIKE 'u %' ORDER BY seq		r|u 1
+SELECT 'r', tgname, tgtype, tgenabled FROM pg_trigger WHERE tgrelid = 's2t_u'::regclass		r|s2t_u_t|7|O
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname = 's2t_schema'	bigint	0
+# the third session: NEW and OLD left null, generated columns, the other foreign-key actions
+BEGIN		-
+CREATE SCHEMA s2t3		-
+SET search_path = s2t3		-
+CREATE TABLE a (seq serial PRIMARY KEY, note text)		-
+CREATE TABLE t (id integer PRIMARY KEY, name text)		-
+# OLD in an INSERT trigger reads NULL, and RETURN OLD there is RETURN NULL
+CREATE FUNCTION old_in_insert() RETURNS trigger AS $$ BEGIN INSERT INTO a (note) VALUES ('old id ' || coalesce(OLD.id::text, 'null')); RETURN OLD; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t1 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION old_in_insert()		-
+INSERT INTO t VALUES (1, 'one') RETURNING id		-
+SELECT 'r', count(*) FROM t		r|0
+SELECT 'r', note FROM a ORDER BY seq		r|old id null
+DROP TRIGGER t1 ON t		-
+INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')		-
+# NEW in a DELETE trigger: returned unassigned it keeps the row; a field assigned makes it a row
+CREATE FUNCTION new_in_delete() RETURNS trigger AS $$ BEGIN IF OLD.id = 1 THEN RETURN NEW; END IF; NEW.id = 7; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t2 BEFORE DELETE ON t FOR EACH ROW EXECUTE FUNCTION new_in_delete()		-
+DELETE FROM t WHERE id IN (1, 2) RETURNING id, name		2|two
+SELECT 'r', id FROM t ORDER BY id		r|1 ; r|3
+DROP TRIGGER t2 ON t		-
+# RETURN OLD from BEFORE UPDATE writes the stored row back, and counts it
+CREATE FUNCTION old_in_update() RETURNS trigger AS $$ BEGIN RETURN OLD; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t3 BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION old_in_update()		-
+UPDATE t SET name = 'changed' RETURNING id, name		1|one ; 3|three
+SELECT 'r', id, name FROM t ORDER BY id		r|1|one ; r|3|three
+DROP TRIGGER t3 ON t		-
+# a value the column's type refuses, assigned in the trigger
+CREATE FUNCTION bad_value() RETURNS trigger AS $$ BEGIN NEW.id = 'abc'; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t4 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION bad_value()		-
+SAVEPOINT p1		-
+INSERT INTO t VALUES (9, 'nine')	!22P02 invalid input syntax for type integer: "abc"
+ROLLBACK TO p1		-
+DROP TRIGGER t4 ON t		-
+# NOT NULL is checked after the trigger
+CREATE FUNCTION null_id() RETURNS trigger AS $$ BEGIN NEW.id = NULL; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t5 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION null_id()		-
+SAVEPOINT p2		-
+INSERT INTO t VALUES (9, 'nine')	!23502 null value in column "id" of relation "t" violates not-null constraint DETAIL: Failing row contains (null, nine).
+ROLLBACK TO p2		-
+DROP TRIGGER t5 ON t		-
+# an AFTER trigger that ends without RETURN is 2F005 too; its changes to NEW go nowhere
+CREATE FUNCTION after_no_return() RETURNS trigger AS $$ BEGIN NULL; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t6 AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION after_no_return()		-
+SAVEPOINT p3		-
+INSERT INTO t VALUES (9, 'nine')	!2F005 control reached end of trigger procedure without RETURN
+ROLLBACK TO p3		-
+DROP TRIGGER t6 ON t		-
+CREATE FUNCTION after_changes() RETURNS trigger AS $$ BEGIN NEW.name = 'after'; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t7 AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION after_changes()		-
+INSERT INTO t VALUES (9, 'nine') RETURNING name		nine
+SELECT 'r', name FROM t WHERE id = 9		r|nine
+DROP TRIGGER t7 ON t		-
+# RETURN of a NULL scalar is RETURN NULL; RETURN of a non-NULL scalar variable is 42804
+CREATE FUNCTION null_scalar() RETURNS trigger AS $$ DECLARE n integer; BEGIN RETURN n; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t8 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION null_scalar()		-
+INSERT INTO t VALUES (10, 'ten')		-
+SELECT 'r', count(*) FROM t WHERE id = 10		r|0
+DROP TRIGGER t8 ON t		-
+CREATE FUNCTION scalar_var() RETURNS trigger AS $$ DECLARE n integer; BEGIN n = 1; RETURN n; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t9 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION scalar_var()		-
+SAVEPOINT p4		-
+INSERT INTO t VALUES (10, 'ten')	!42804 cannot return non-composite value from function returning composite type
+ROLLBACK TO p4		-
+DROP TRIGGER t9 ON t		-
+# INSERT ... SELECT fires a BEFORE trigger per row
+CREATE FUNCTION t_mark() RETURNS trigger AS $$ BEGIN NEW.name = NEW.name || '*'; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t11 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION t_mark()		-
+SAVEPOINT p8		-
+INSERT INTO t SELECT n, 'sel' FROM generate_series(20, 21) n RETURNING id, name		20|sel* ; 21|sel*
+ROLLBACK TO p8		-
+DROP TRIGGER t11 ON t		-
+# generated columns are computed after BEFORE triggers
+CREATE TABLE g (id integer, doubled integer GENERATED ALWAYS AS (id * 2) STORED)		-
+CREATE FUNCTION g_see() RETURNS trigger AS $$ BEGIN INSERT INTO a (note) VALUES ('g sees ' || coalesce(NEW.doubled::text, 'null')); NEW.id = NEW.id + 1; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER g_t BEFORE INSERT OR UPDATE ON g FOR EACH ROW EXECUTE FUNCTION g_see()		-
+INSERT INTO g (id) VALUES (1) RETURNING id, doubled		2|4
+UPDATE g SET id = 10 RETURNING id, doubled		11|22
+SELECT 'r', note FROM a WHERE note LIKE 'g %' ORDER BY seq		r|g sees null ; r|g sees null
+# a typmod the trigger's value breaks
+CREATE TABLE v (id integer, code varchar(3))		-
+CREATE FUNCTION v_long() RETURNS trigger AS $$ BEGIN NEW.code = 'toolong'; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER v_t BEFORE INSERT ON v FOR EACH ROW EXECUTE FUNCTION v_long()		-
+SAVEPOINT p5		-
+INSERT INTO v VALUES (1, 'ok')	!22001 value too long for type character varying(3)
+ROLLBACK TO p5		-
+# a DELETE through an inheritance parent fires the child's triggers
+CREATE TABLE ip (id integer)		-
+CREATE TABLE ic () INHERITS (ip)		-
+CREATE FUNCTION ic_keep() RETURNS trigger AS $$ BEGIN INSERT INTO a (note) VALUES ('ic delete ' || OLD.id); RETURN NULL; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER ic_t BEFORE DELETE ON ic FOR EACH ROW EXECUTE FUNCTION ic_keep()		-
+INSERT INTO ic VALUES (1)		-
+INSERT INTO ip VALUES (2)		-
+DELETE FROM ip		-
+SELECT 'r', id FROM ip ORDER BY id		r|1
+SELECT 'r', note FROM a WHERE note LIKE 'ic %' ORDER BY seq		r|ic delete 1
+# ON UPDATE CASCADE and ON DELETE SET NULL fire the child's UPDATE triggers
+CREATE TABLE p (id integer PRIMARY KEY)		-
+CREATE TABLE c (id integer PRIMARY KEY, p integer REFERENCES p ON DELETE SET NULL ON UPDATE CASCADE)		-
+CREATE FUNCTION c_touch() RETURNS trigger AS $$ BEGIN INSERT INTO a (note) VALUES ('c update ' || OLD.id || ' ' || coalesce(OLD.p::text, 'null') || ' to ' || coalesce(NEW.p::text, 'null')); RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER c_t BEFORE UPDATE ON c FOR EACH ROW EXECUTE FUNCTION c_touch()		-
+INSERT INTO p VALUES (1), (2)		-
+INSERT INTO c VALUES (10, 1), (20, 2)		-
+UPDATE p SET id = 3 WHERE id = 2		-
+DELETE FROM p WHERE id = 1		-
+SELECT 'r', id, p FROM c ORDER BY id		r|10|\\N ; r|20|3
+SELECT 'r', note FROM a WHERE note LIKE 'c %' ORDER BY seq		r|c update 20 2 to 3 ; r|c update 10 1 to null
+# a child's BEFORE UPDATE trigger that sends ON UPDATE CASCADE somewhere else
+CREATE FUNCTION c_elsewhere() RETURNS trigger AS $$ BEGIN NEW.p = 99; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER c_u BEFORE UPDATE ON c FOR EACH ROW EXECUTE FUNCTION c_elsewhere()		-
+SAVEPOINT p6		-
+UPDATE p SET id = 4 WHERE id = 3	!23503 insert or update on table "c" violates foreign key constraint "c_p_fkey" DETAIL: Key (p)=(99) is not present in table "p".
+ROLLBACK TO p6		-
+# a child's BEFORE DELETE trigger keeping its row under ON DELETE CASCADE
+CREATE TABLE p2 (id integer PRIMARY KEY)		-
+CREATE TABLE c2 (id integer PRIMARY KEY, p integer REFERENCES p2 ON DELETE CASCADE)		-
+CREATE FUNCTION c2_keep() RETURNS trigger AS $$ BEGIN RETURN NULL; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER c2_t BEFORE DELETE ON c2 FOR EACH ROW EXECUTE FUNCTION c2_keep()		-
+INSERT INTO p2 VALUES (1)		-
+INSERT INTO c2 VALUES (10, 1)		-
+SAVEPOINT p7		-
+DELETE FROM p2		-
+SELECT 'r', id, p FROM c2		r|10|1
+ROLLBACK TO p7		-
+# DISABLE TRIGGER ALL then ENABLE TRIGGER USER leaves the foreign key's own triggers off
+CREATE TABLE fp (id integer PRIMARY KEY)		-
+CREATE TABLE fc (id integer, p integer REFERENCES fp)		-
+ALTER TABLE fc DISABLE TRIGGER ALL		-
+ALTER TABLE fc ENABLE TRIGGER USER		-
+INSERT INTO fc VALUES (1, 99)		-
+SELECT 'r', count(*) FROM fc		r|1
+# the row a BEFORE trigger returns is the one the foreign key checks
+ALTER TABLE fc ENABLE TRIGGER ALL		-
+CREATE FUNCTION fc_fix() RETURNS trigger AS $$ BEGIN NEW.p = 1; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER fc_t BEFORE INSERT ON fc FOR EACH ROW EXECUTE FUNCTION fc_fix()		-
+INSERT INTO fp VALUES (1)		-
+INSERT INTO fc VALUES (2, 98)		-
+SELECT 'r', id, p FROM fc ORDER BY id		r|1|99 ; r|2|1
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname = 's2t3'	bigint	0

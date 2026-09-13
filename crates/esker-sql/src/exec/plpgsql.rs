@@ -6,21 +6,24 @@
 //! transaction and its own [`Written`]: a write lands in the same buffer, a catalog write marks the
 //! transaction exactly as top-level DDL does, and an error anywhere is the `DO`'s error — undone by
 //! the implicit savepoint the statement already runs under. There is no second transaction and no
-//! write that outlives a failure.
+//! write that outlives a failure. A trigger function runs the same way, inside the `INSERT`,
+//! `UPDATE` or `DELETE` that fired it (`crate::exec::trigger`).
 //!
 //! **A variable reaches SQL as a value, never as text.** Each fragment is parsed and lowered on its
-//! own, and every column reference that names a variable — `max_value`, `r.constraint_check` — is
-//! replaced in the lowered tree by a typed literal before the statement is bound. Printing the value
-//! into the SQL and reading it back is the round trip that loses a type; PostgreSQL binds a variable
-//! as a parameter for the same reason.
+//! own, and every column reference that names a variable — `max_value`, `r.constraint_check`,
+//! `NEW.id` — is replaced in the lowered tree by a typed literal before the statement is bound.
+//! Printing the value into the SQL and reading it back is the round trip that loses a type;
+//! PostgreSQL binds a variable as a parameter for the same reason.
 //!
 //! **What PostgreSQL refuses while a body runs is refused in its words**, each one measured:
 //! `22004 query string argument of EXECUTE is null`, `42601 query has no destination for result
-//! data`, `42702 column reference "id" is ambiguous`, `55000 record "r" is not assigned yet`.
+//! data`, `42702 column reference "id" is ambiguous`, `55000 record "r" is not assigned yet`,
+//! `2F005 control reached end of trigger procedure without RETURN`.
 
 use super::query::OutputColumn;
 use super::{Executor, Written, bind, cancel};
 use crate::backend::Txn;
+use crate::catalog::TableDef;
 use crate::error::{Result, Severity, SqlError};
 use crate::parse::StatementClass;
 use crate::pgwire::session::{Outcome, Params};
@@ -32,21 +35,27 @@ use crate::value::{ColumnType, Datum, PgDatum as _};
 ///
 /// PostgreSQL's bound is `max_stack_depth`, and past it the answer is `54001 stack depth limit
 /// exceeded` — the same one [`SqlError::StatementTooComplex`] carries. A body that `EXECUTE`s a
-/// `DO` that `EXECUTE`s a `DO` is a stack of this executor's own frames, several per level, and
-/// this is sized so that the stack an executor thread has is never the thing that stops it.
+/// `DO` that `EXECUTE`s a `DO`, or a trigger whose body writes a row that fires it again, is a stack
+/// of this executor's own frames, several per level, and this is sized so that the stack an
+/// executor thread has is never the thing that stops it.
 const MAX_DEPTH: usize = 16;
 
 /// A value a record variable holds: one row, its fields named.
 #[derive(Debug, Clone)]
 pub(super) struct Row {
     pub(super) fields: Vec<Field>,
+    /// **A record the event leaves `NULL`** — `OLD` in an `INSERT` trigger, `NEW` in a `DELETE`
+    /// one. Its fields read `NULL`, assigning one of them makes it a row, and returned as it is it
+    /// is `RETURN NULL`. Measured, all three.
+    pub(super) null: bool,
 }
 
 /// One field of a [`Row`].
 #[derive(Debug, Clone)]
 pub(super) struct Field {
-    /// The column's name, folded.
-    pub(super) name: String,
+    /// The column's name, folded — or `None` for a slot the row carries and no statement may name:
+    /// a table's internal row id, and a dropped column's slot.
+    pub(super) name: Option<String>,
     /// What the value physically is.
     pub(super) ty: ColumnType,
     /// The user-defined type it was declared as, when a `ColumnType` cannot say — an enum's
@@ -64,17 +73,51 @@ impl Row {
                 .iter()
                 .zip(values)
                 .map(|(column, value)| Field {
-                    name: column.name.clone(),
+                    name: Some(column.name.clone()),
                     ty: column.ty,
                     user: column.user_type.clone(),
                     value,
                 })
                 .collect(),
+            null: false,
+        }
+    }
+
+    /// A table's row in the table's own positions — the shape `NEW` and `OLD` have, so that the row
+    /// a trigger hands back is written as it stands. `None` is the row an event leaves `NULL`.
+    fn of_table(table: &TableDef, values: Option<&[Datum]>) -> Row {
+        let row_id = table.row_id();
+        Row {
+            fields: table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(at, column)| Field {
+                    name: (!column.dropped && row_id != Some(at)).then(|| column.name.clone()),
+                    ty: column.ty,
+                    user: super::assign::user_type_of(table, column).cloned(),
+                    value: values
+                        .and_then(|values| values.get(at))
+                        .cloned()
+                        .unwrap_or(Datum::Null),
+                })
+                .collect(),
+            null: values.is_none(),
         }
     }
 
     fn position(&self, name: &str) -> Option<usize> {
-        self.fields.iter().position(|field| field.name == name)
+        self.fields
+            .iter()
+            .position(|field| field.name.as_deref() == Some(name))
+    }
+
+    /// The names a `<record>.*` is written out as, in order.
+    fn names(&self) -> Vec<String> {
+        self.fields
+            .iter()
+            .filter_map(|field| field.name.clone())
+            .collect()
     }
 }
 
@@ -149,6 +192,29 @@ impl Frame {
             },
         }
     }
+
+    /// `sql` with every `<record>.*` written out as the record's fields: `VALUES (NEW.*)` is the
+    /// whole of statement 762's trigger (`crate::plpgsql::expand_record_stars`).
+    fn expand_stars(&self, sql: &str) -> String {
+        if !sql.contains('*') {
+            return sql.to_owned();
+        }
+        // Innermost first, so the record a later declaration names is the one written out.
+        let records: Vec<(&str, Vec<String>)> = self
+            .variables
+            .iter()
+            .rev()
+            .filter_map(|(name, value)| match value {
+                Value::Record(Some(row)) => Some((name.as_str(), row.names())),
+                _ => None,
+            })
+            .collect();
+        let records: Vec<(&str, &[String])> = records
+            .iter()
+            .map(|(name, fields)| (*name, fields.as_slice()))
+            .collect();
+        crate::plpgsql::expand_record_stars(sql, &records)
+    }
 }
 
 /// The literal a variable's value stands for in a fragment: typed, so that `COALESCE(max_value, 0)`
@@ -213,7 +279,7 @@ enum Flow {
     /// Go on to the next statement.
     Next,
     /// `RETURN`, with the expression it named.
-    Return,
+    Return(Option<String>),
 }
 
 impl Executor {
@@ -230,11 +296,52 @@ impl Executor {
     ) -> Result<Outcome> {
         let block = crate::plpgsql::parse(body, Context::Do)?;
         self.within_a_body(|executor| {
-            let mut frame = executor.declare(txn, &block)?;
+            let mut frame = executor.declare(txn, Frame::default(), &block)?;
             executor.run_statements(txn, &mut frame, &block.statements, written)?;
             Ok(())
         })?;
         Ok(Outcome::done("DO"))
+    }
+
+    /// A trigger function's body over one row, inside the statement that fired it: the row a
+    /// `BEFORE` trigger hands back, or `None` for `RETURN NULL`.
+    ///
+    /// `NEW` and `OLD` are rows of `table` in its own positions, and `NULL` where the event leaves
+    /// them so. **A body that ends without `RETURN` is PostgreSQL's `2F005`**, an `AFTER` trigger's
+    /// too — measured, both.
+    pub(super) fn run_trigger_function(
+        &mut self,
+        txn: &mut dyn Txn,
+        written: &mut Written,
+        body: &str,
+        table: &TableDef,
+        old: Option<&[Datum]>,
+        new: Option<&[Datum]>,
+    ) -> Result<Option<Vec<Datum>>> {
+        let block = crate::plpgsql::parse(body, Context::Trigger)?;
+        self.within_a_body(|executor| {
+            let records = Frame {
+                variables: vec![
+                    (
+                        "new".to_owned(),
+                        Value::Record(Some(Row::of_table(table, new))),
+                    ),
+                    (
+                        "old".to_owned(),
+                        Value::Record(Some(Row::of_table(table, old))),
+                    ),
+                ],
+            };
+            let mut frame = executor.declare(txn, records, &block)?;
+            match executor.run_statements(txn, &mut frame, &block.statements, written)? {
+                Flow::Return(Some(expression)) => executor.returned_row(txn, &frame, &expression),
+                // The reader refuses a bare `RETURN;` in a trigger function.
+                Flow::Return(None) => Err(SqlError::Internal(
+                    "a trigger function's RETURN named nothing".to_owned(),
+                )),
+                Flow::Next => Err(SqlError::TriggerEndedWithoutReturn),
+            }
+        })
     }
 
     /// Runs `run` one body deeper, and refuses the statement past [`MAX_DEPTH`].
@@ -248,13 +355,14 @@ impl Executor {
         result
     }
 
-    /// The frame a block starts with: every declared variable, `NULL`, with its type resolved.
+    /// The frame a block starts with: what `frame` already holds — a trigger's `NEW` and `OLD` —
+    /// then every declared variable, `NULL`, with its type resolved.
     ///
     /// **Resolved before the first statement runs**, which is where PostgreSQL resolves one too: a
     /// name that is no type is `42704 type "nosuchtype" does not exist` with nothing of the body
     /// done.
-    fn declare(&mut self, txn: &mut dyn Txn, block: &Block) -> Result<Frame> {
-        let mut frame = Frame::default();
+    fn declare(&mut self, txn: &mut dyn Txn, frame: Frame, block: &Block) -> Result<Frame> {
+        let mut frame = frame;
         for declaration in &block.declarations {
             let value = match &declaration.ty {
                 VariableType::Record => Value::Record(None),
@@ -300,8 +408,8 @@ impl Executor {
     ) -> Result<Flow> {
         for statement in statements {
             cancel::check()?;
-            if let Flow::Return = self.run_statement(txn, frame, statement, written)? {
-                return Ok(Flow::Return);
+            if let flow @ Flow::Return(_) = self.run_statement(txn, frame, statement, written)? {
+                return Ok(flow);
             }
         }
         Ok(Flow::Next)
@@ -357,21 +465,56 @@ impl Executor {
                     if let Some(Value::Record(slot)) = frame.get_mut(record) {
                         *slot = Some(Row::of(&columns, row));
                     }
-                    if let Flow::Return = self.run_statements(txn, frame, body, written)? {
-                        return Ok(Flow::Return);
+                    if let flow @ Flow::Return(_) =
+                        self.run_statements(txn, frame, body, written)?
+                    {
+                        return Ok(flow);
                     }
                 }
             }
             Statement::Execute { command } => self.execute_dynamic(txn, frame, command, written)?,
-            Statement::Return { .. } => return Ok(Flow::Return),
+            Statement::Return { expression } => return Ok(Flow::Return(expression.clone())),
             Statement::Sql { text } => self.run_sql(txn, frame, text, written)?,
         }
         Ok(Flow::Next)
     }
 
+    /// What a trigger function's `RETURN` hands back: `NEW` or `OLD` as the row it now is, `None`
+    /// for a record the event left `NULL` and for any `NULL` value, and PostgreSQL's `42804` for a
+    /// value that is not a row. Measured, each.
+    fn returned_row(
+        &mut self,
+        txn: &mut dyn Txn,
+        frame: &Frame,
+        expression: &str,
+    ) -> Result<Option<Vec<Datum>>> {
+        let name = expression.trim();
+        if name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            let folded = name.to_ascii_lowercase();
+            if let Some(Value::Record(record)) = frame.get(&folded) {
+                // A record a query filled has the query's shape, not the table's.
+                if folded != "new" && folded != "old" {
+                    return Err(unsupported("RETURN of a record other than NEW or OLD"));
+                }
+                return Ok(record
+                    .as_ref()
+                    .filter(|row| !row.null)
+                    .map(|row| row.fields.iter().map(|field| field.value.clone()).collect()));
+            }
+        }
+        let (_, rows) = self.query(txn, frame, &format!("SELECT {expression}"))?;
+        match first_value(rows) {
+            Datum::Null => Ok(None),
+            _ => Err(SqlError::TriggerReturnedNonComposite),
+        }
+    }
+
     /// One fragment, parsed, lowered, with the frame's variables put in, and bound.
     fn prepare(&mut self, txn: &mut dyn Txn, frame: &Frame, sql: &str) -> Result<Plan> {
-        let parsed = crate::parse::parse_statements(sql)?;
+        let parsed = crate::parse::parse_statements(&frame.expand_stars(sql))?;
         let [parsed] = parsed.as_slice() else {
             return Err(SqlError::Internal(format!(
                 "a PL/pgSQL fragment held {} statements",
@@ -519,6 +662,9 @@ impl Executor {
                 let ty = row.fields[at].ty;
                 let converted = self.convert(value, ty)?;
                 row.fields[at].value = converted;
+                // A field assigned makes a record the event left `NULL` a row: `NEW.id = 7;
+                // RETURN NEW` in a `DELETE` trigger deletes, measured.
+                row.null = false;
                 Ok(())
             }
         }
