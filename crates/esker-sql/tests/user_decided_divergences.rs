@@ -10,17 +10,14 @@
 //! connects as:
 //!
 //! ```text
-//! DO $$ DECLARE r record; BEGIN FOR r IN (SELECT 1 AS x) LOOP EXECUTE 'SELECT 1'; END LOOP; END $$
-//!                                                                        -> DO
 //! DELETE FROM pg_depend WHERE objid = 0                                  -> DELETE 0
-//! UPDATE pg_catalog.pg_constraint SET convalidated = false WHERE …       -> UPDATE 0
 //! SELECT 'pg_class'::regclass::integer                                   -> 1259
 //! ```
 //!
 //! So these are divergences in the strict sense — a real server answers and this one refuses —
 //! and each refusal is the *answer the user chose*, not an accident of the parser.
 //!
-//! **Two sources, and they are not the same kind of ruling.** The first three come from the Rails
+//! **Two sources, and they are not the same kind of ruling.** The first two come from the Rails
 //! plan, where the user weighed a suite's failures against what the feature would cost. The
 //! fourth comes from an **accepted ADR's own consequences**: it was decided once, as a
 //! consequence of keeping `u64` relation ids, and the rows below are that decision arriving at a
@@ -32,53 +29,10 @@
 #[path = "parity_harness/mod.rs"]
 mod parity;
 
-/// **`DO $$ … $$` with a body: the "DO minimal" ruling.**
-///
-/// `fixtures_test.rb` sends one to unvalidate every foreign key in the schema —
-/// `FOR r IN (SELECT FORMAT('UPDATE pg_catalog.pg_constraint SET convalidated=false …')) LOOP
-/// EXECUTE …` — and it costs two tests, `test_does_not_raise_if_no_fk_violations` and
-/// `test_raises_fk_violations`. Running it needs a procedural language: a loop, a record variable,
-/// dynamic `EXECUTE`, and a write to a system catalog that the *next* test would read back.
-///
-/// The user's ruling was **minimal**: the one `DO` shape the suite depends on structurally —
-/// `create_enum`'s `IF NOT EXISTS` guard — is read and turned into the `CREATE TYPE` it guards
-/// (`parse::strip_do_create_enum`), and every other body is refused **by name** rather than
-/// half-run. `0A000` naming the construct is contract C2, and it is the answer here.
-#[test]
-fn a_do_block_with_a_loop_is_refused_by_name() {
-    let mut node = parity::Node::new(&[]);
-    assert_eq!(
-        node.answer(
-            "DO $$ DECLARE r record; BEGIN FOR r IN (SELECT 1 AS x) LOOP EXECUTE 'SELECT 1'; \
-             END LOOP; END $$"
-        )
-        .to_string(),
-        "!0A000 DO is not supported"
-    );
-}
-
-/// And the one shape that is **not** refused, so that "minimal" has a lower bound as well as an
-/// upper one: `create_enum`'s guard still becomes the `CREATE TYPE` inside it.
-///
-/// **Verbatim, because the shim matches the client's shape and not a generalisation of it.** A
-/// hand-shortened guard — the same `IF NOT EXISTS` without the `pg_namespace` join — is refused
-/// like any other body, which is the shim being narrow on purpose: it reads the one statement
-/// `postgresql_adapter.rb:556` builds, and anything else is a `DO` nobody measured.
-#[test]
-fn the_create_enum_guard_is_still_read() {
-    let mut node = parity::Node::new(&[]);
-    node.run(
-        "DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON \
-         t.typnamespace = n.oid WHERE t.typname = 'g1d_mood' AND n.nspname = ANY \
-         (current_schemas(false)) ) THEN CREATE TYPE \"g1d_mood\" AS ENUM ('sad', 'ok'); \
-         END IF; END $$;",
-    )
-    .unwrap();
-    assert_eq!(
-        node.rows("SELECT typname FROM pg_type WHERE typname = 'g1d_mood'"),
-        [["g1d_mood"]]
-    );
-}
+// **The "DO minimal" ruling was reversed by the user on 2026-09-13** (ADR 0113): a `DO` body in
+// the PL/pgSQL subset runs, and the two tests that pinned it as refused moved to where a running
+// block is tested — `tests/plpgsql_do.rs::a_loop_that_executes_a_field_runs` holds the loop this
+// file refused, and `tests/do_block.rs` holds `create_enum`'s guard.
 
 /// **A write to a system catalog: `42501`, whatever the writer's rights.**
 ///
@@ -89,16 +43,19 @@ fn the_create_enum_guard_is_still_read() {
 /// no honest way to pretend there is. Refusing is the ADR 0031 call: a wrong answer where a
 /// refusal is available is the worse of the two.
 ///
-/// The same guard is what the `DO` block above would have hit had it run, which is why the two
-/// records sit together: `UPDATE pg_catalog.pg_constraint SET convalidated = false` is refused for
-/// this reason and not for the `DO` one.
+/// **One write to one column is taken, by the user's ruling of 2026-09-13** (ADR 0113 §6, option
+/// (b)): `UPDATE pg_catalog.pg_constraint SET convalidated = …` writes the `NOT VALID` flag a foreign
+/// key or a `CHECK` already stores, because `check_all_foreign_keys_valid!` cannot work without it.
+/// It is pinned in `tests/pg_constraint_convalidated.rs`; the rows below are the rest of the ruling,
+/// and they stay refused.
 #[test]
 fn a_write_to_a_system_catalog_is_refused() {
     let mut node = parity::Node::new(&[]);
     for (sql, relation) in [
         ("DELETE FROM pg_depend WHERE objid = 1", "pg_depend"),
+        // Another column of the one catalog that takes a write is still the refusal.
         (
-            "UPDATE pg_catalog.pg_constraint SET convalidated = false WHERE conname = 'x'",
+            "UPDATE pg_catalog.pg_constraint SET conname = 'y' WHERE conname = 'x'",
             "pg_constraint",
         ),
         ("INSERT INTO pg_class (relname) VALUES ('x')", "pg_class"),

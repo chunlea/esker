@@ -1226,6 +1226,11 @@ pub(super) fn update(
     update: &Update,
     written: &mut Written,
 ) -> Result<Outcome> {
+    // **The one write to a catalog this node takes** (ADR 0113): `pg_constraint.convalidated`, and
+    // only that shape. Every other write to a catalog is refused on the next line.
+    if let Some(outcome) = super::catalog_write::update_convalidated(executor, txn, update)? {
+        return Ok(outcome);
+    }
     crate::catalog::pg_catalog::refuse_write(&update.table)?;
     // **A write on a simple view goes to the table underneath.** Before `require_table`, which
     // knows only tables and answered `42P01` for a view that is right there.

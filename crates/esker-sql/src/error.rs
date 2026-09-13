@@ -1324,6 +1324,82 @@ pub enum SqlError {
     /// a transaction block a real server aborts here. `P0001`, measured.
     #[error("{0}")]
     RaisedException(String),
+
+    /// A PL/pgSQL body PostgreSQL itself refuses to read: `42601` with PostgreSQL's own sentence,
+    /// which is never `syntax error: …` — `missing "THEN" at end of SQL expression`,
+    /// `"x" is not a known variable`, `syntax error at end of input`. Each is measured
+    /// (`crate::plpgsql`).
+    #[error("{0}")]
+    PlpgsqlSyntax(String),
+
+    /// `RETURN <expression>` in a `DO` block, which returns nothing: `42804`, measured.
+    #[error("RETURN cannot have a parameter in function returning void")]
+    ReturnParameterInVoid,
+
+    /// `RAISE;` with no exception being handled — which is everywhere the subset can hold one,
+    /// because it has no `EXCEPTION` clause: `0Z002`, PostgreSQL's own, measured.
+    #[error("RAISE without parameters cannot be used outside an exception handler")]
+    RaiseWithoutActiveHandler,
+
+    /// Rows a PL/pgSQL statement produced with nowhere to put them: `42601`. A `SELECT` carries the
+    /// `HINT` naming `PERFORM` and a `RETURNING` does not — measured, both.
+    #[error("query has no destination for result data")]
+    QueryHasNoDestination {
+        /// Whether the statement was a `SELECT`, which is what the `HINT` is about.
+        select: bool,
+    },
+
+    /// A PL/pgSQL assignment whose expression has more than one column: `42601`, measured.
+    #[error("assignment source returned {0} columns")]
+    AssignmentSourceColumns(usize),
+
+    /// A field read from a PL/pgSQL `record` no row has been assigned to: `55000`, with
+    /// PostgreSQL's `DETAIL`, measured.
+    #[error("record \"{0}\" is not assigned yet")]
+    RecordNotAssigned(String),
+
+    /// A field a PL/pgSQL record's row does not have: `42703`, measured.
+    #[error("record \"{record}\" has no field \"{field}\"")]
+    RecordHasNoField {
+        /// The record's name.
+        record: String,
+        /// The field that is not there.
+        field: String,
+    },
+
+    /// `EXECUTE` of an expression that is `NULL`: `22004`, measured.
+    #[error("query string argument of EXECUTE is null")]
+    ExecuteQueryIsNull,
+
+    /// `EXECUTE 'BEGIN'` and the other transaction commands: PostgreSQL's own `0A000`, measured.
+    #[error("EXECUTE of transaction commands is not implemented")]
+    ExecuteOfTransactionCommands,
+
+    /// A name in a PL/pgSQL statement that is both a variable and a column of the statement's
+    /// relation: `42702`, the refusal PostgreSQL's default `plpgsql.variable_conflict = error`
+    /// makes, with the `DETAIL` naming the two — measured.
+    #[error("column reference \"{0}\" is ambiguous")]
+    PlpgsqlAmbiguousColumn(String),
+
+    /// `format()` asked for an argument it was not given: `22023`, measured.
+    #[error("too few arguments for format()")]
+    FormatTooFewArguments,
+
+    /// A `format()` conversion that is not `s`, `I` or `L`: `22023`, with PostgreSQL's `HINT`.
+    #[error("unrecognized format() type specifier \"{0}\"")]
+    FormatUnrecognizedSpecifier(char),
+
+    /// A `format()` string that ends inside a conversion: `22023`, with the same `HINT`.
+    #[error("unterminated format() type specifier")]
+    FormatUnterminatedSpecifier,
+
+    /// `%0$s`: `22023`, measured.
+    #[error("format specifies argument 0, but arguments are numbered from 1")]
+    FormatArgumentZero,
+
+    /// `%I` of a `NULL`: `22004`, measured.
+    #[error("null values cannot be formatted as an SQL identifier")]
+    FormatNullIdentifier,
     /// `libpq` prints `WARNING:  foo`, and `ActiveRecord`'s `db_warnings_action` reads that line.
     /// `RAISE EXCEPTION` is not this: it is an error, and carries `P0001`.
     #[error("{message}")]
@@ -3153,7 +3229,8 @@ impl SqlError {
             | SqlError::CachedPlanMustNotChangeResultType
             // A circle with no radius has no twelve vertices, and a real server spends `0A000` on
             // it rather than the `22023` its neighbour in the same conversion gets.
-            | SqlError::CircleWithRadiusZeroIsNotAPolygon => sqlstate::FEATURE_NOT_SUPPORTED,
+            | SqlError::CircleWithRadiusZeroIsNotAPolygon
+            | SqlError::ExecuteOfTransactionCommands => sqlstate::FEATURE_NOT_SUPPORTED,
             SqlError::InvalidRegex(_) => sqlstate::INVALID_REGULAR_EXPRESSION,
             SqlError::DuplicateSchema(_) => sqlstate::DUPLICATE_SCHEMA,
             SqlError::UndefinedSchema(_) => sqlstate::INVALID_SCHEMA_NAME,
@@ -3188,6 +3265,9 @@ impl SqlError {
             | SqlError::LtreeSyntax(_)
             | SqlError::LQuerySyntax(_)
             | SqlError::SyntaxAtOrNear(_)
+            | SqlError::PlpgsqlSyntax(_)
+            | SqlError::QueryHasNoDestination { .. }
+            | SqlError::AssignmentSourceColumns(_)
             | SqlError::UnrecognizedExplainOption(_)
             | SqlError::NonBooleanOption(_)
             | SqlError::OptionRequiresParameter(_)
@@ -3210,7 +3290,8 @@ impl SqlError {
             SqlError::DuplicateTableName(_) | SqlError::DuplicateCteName(_) => {
                 sqlstate::DUPLICATE_ALIAS
             }
-            SqlError::AmbiguousColumn(_) | SqlError::AmbiguousOrderBy(_) => {
+            SqlError::AmbiguousColumn(_) | SqlError::AmbiguousOrderBy(_)
+            | SqlError::PlpgsqlAmbiguousColumn(_) => {
                 sqlstate::AMBIGUOUS_COLUMN
             }
             SqlError::AmbiguousTableReference(_) => sqlstate::AMBIGUOUS_ALIAS,
@@ -3240,6 +3321,9 @@ impl SqlError {
             | SqlError::UndefinedTextSearchConfig(_)
             | SqlError::NoArrayType(_) => sqlstate::UNDEFINED_OBJECT,
             SqlError::RaisedException(_) => sqlstate::RAISE_EXCEPTION,
+            SqlError::RaiseWithoutActiveHandler => {
+                sqlstate::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER
+            }
             SqlError::SystemCatalog(_) | SqlError::CreateInSystemSchema(_) => {
                 sqlstate::INSUFFICIENT_PRIVILEGE
             }
@@ -3277,8 +3361,10 @@ impl SqlError {
             | SqlError::UsingColumnMissing { .. }
             | SqlError::UndefinedExcludedColumn(_)
             | SqlError::UndefinedColumnInRelation { .. }
-            | SqlError::QualifiedSetTarget { .. } => sqlstate::UNDEFINED_COLUMN,
+            | SqlError::QualifiedSetTarget { .. }
+            | SqlError::RecordHasNoField { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::ColumnTypeConflict { .. }
+            | SqlError::ReturnParameterInVoid
             | SqlError::CannotCastColumnAutomatically { .. }
             | SqlError::UsingResultCannotBeCast { .. }
             | SqlError::CannotCastDefaultAutomatically { .. }
@@ -3357,7 +3443,9 @@ impl SqlError {
             | SqlError::ArrayAccumulateDimensions
             | SqlError::ArrayAccumulateEmpty
             | SqlError::HstoreArrayOddLength => sqlstate::ARRAY_SUBSCRIPT_ERROR,
-            SqlError::ArrayAccumulateNull | SqlError::HstoreNullKey => {
+            SqlError::ArrayAccumulateNull | SqlError::HstoreNullKey
+            | SqlError::ExecuteQueryIsNull
+            | SqlError::FormatNullIdentifier => {
                 sqlstate::NULL_VALUE_NOT_ALLOWED
             }
             SqlError::EmptyArrayType | SqlError::IndeterminateParameterType(_) => {
@@ -3412,6 +3500,7 @@ impl SqlError {
             | SqlError::GeneratedColumnUpdate { .. } => sqlstate::GENERATED_ALWAYS,
             SqlError::SequenceNotYetDefined(_)
             | SqlError::MatviewNotPopulated(_)
+            | SqlError::RecordNotAssigned(_)
             | SqlError::CannotRefreshConcurrently(_) => {
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
             }
@@ -3530,7 +3619,11 @@ impl SqlError {
             // does not resolve. Both measured beside their `0A000` neighbour, which is the unit
             // the table *does* hold and this function will not apply.
             | SqlError::DateTruncUnitNotRecognized { .. }
-            | SqlError::TimeZoneNotRecognized(_) => sqlstate::INVALID_PARAMETER_VALUE,
+            | SqlError::TimeZoneNotRecognized(_)
+            | SqlError::FormatTooFewArguments
+            | SqlError::FormatUnrecognizedSpecifier(_)
+            | SqlError::FormatUnterminatedSpecifier
+            | SqlError::FormatArgumentZero => sqlstate::INVALID_PARAMETER_VALUE,
             SqlError::CannotChangeParameter(_) => sqlstate::CANT_CHANGE_RUNTIME_PARAM,
             SqlError::SnapshotDoesNotExist(_) | SqlError::UnrecognizedParameter(_) => {
                 sqlstate::UNDEFINED_OBJECT
@@ -3597,6 +3690,12 @@ impl SqlError {
     #[allow(clippy::too_many_lines)]
     pub fn detail(&self) -> Option<String> {
         match self {
+            SqlError::RecordNotAssigned(_) => Some(
+                "The tuple structure of a not-yet-assigned record is indeterminate.".to_owned(),
+            ),
+            SqlError::PlpgsqlAmbiguousColumn(_) => Some(
+                "It could refer to either a PL/pgSQL variable or a table column.".to_owned(),
+            ),
             SqlError::CreateInSystemSchema(_) => {
                 Some("System catalog modifications are currently disallowed.".to_owned())
             }
@@ -3779,6 +3878,12 @@ impl SqlError {
     )]
     pub fn hint(&self) -> Option<String> {
         match self {
+            SqlError::QueryHasNoDestination { select: true } => Some(
+                "If you want to discard the results of a SELECT, use PERFORM instead.".to_owned(),
+            ),
+            SqlError::FormatUnrecognizedSpecifier(_) | SqlError::FormatUnterminatedSpecifier => {
+                Some("For a single \"%\" use \"%%\".".to_owned())
+            }
             // PostgreSQL's own, and it names the statement that *does* rename a view column.
             SqlError::CannotRenameViewColumn { .. } => Some(
                 "Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead."

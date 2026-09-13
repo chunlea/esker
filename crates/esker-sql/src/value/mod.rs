@@ -42,6 +42,7 @@ pub mod date;
 /// PostgreSQL's character-set names, for the two errors `convert_to` tells apart.
 pub mod encoding;
 pub(crate) mod float;
+pub mod format;
 pub mod geometric;
 pub mod hstore;
 pub mod inet;

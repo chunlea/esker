@@ -49,13 +49,6 @@ pub(super) fn create(
     // **One namespace for types and relations**, which is what makes the shared oid space honest:
     // a name that is already a table is `42710` here exactly as a duplicate type is.
     if catalog::type_by_name(txn, executor.tenant, &stored)?.is_some() {
-        // **The `DO` block's guard, and the whole of what it does.** `create_enum` asks `pg_type`
-        // first and skips the `CREATE` when the type is there, so the second run is a success that
-        // changes nothing — the labels of the *first* run survive even when the second names
-        // different ones, which is measured (`pg19_do_create_enum.txt`).
-        if create.if_not_exists {
-            return Ok(Outcome::done("DO"));
-        }
         // **The bare name, though the statement may have written a schema.** Measured:
         // `CREATE TYPE g1e_a.g1e_mood` over an existing one is `42710 type "g1e_mood" already
         // exists`, with the schema outside the quotes.

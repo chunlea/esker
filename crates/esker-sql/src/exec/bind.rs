@@ -346,7 +346,7 @@ fn walk(
         | Statement::DropIndex(_)
         | Statement::Comment(_)
         | Statement::CreateType(_)
-        | Statement::Raise { .. }
+        | Statement::Do { .. }
         | Statement::Truncate(_)
         | Statement::DropType(_)
         | Statement::AlterType(_)
@@ -1092,7 +1092,7 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
         | Statement::DropIndex(_)
         | Statement::Comment(_)
         | Statement::CreateType(_)
-        | Statement::Raise { .. }
+        | Statement::Do { .. }
         | Statement::Truncate(_)
         | Statement::DropType(_)
         | Statement::AlterType(_)
@@ -1343,7 +1343,7 @@ pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
         | Statement::DropIndex(_)
         | Statement::Comment(_)
         | Statement::CreateType(_)
-        | Statement::Raise { .. }
+        | Statement::Do { .. }
         | Statement::Truncate(_)
         | Statement::DropType(_)
         | Statement::AlterType(_)
@@ -1460,7 +1460,7 @@ pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut
         | Statement::DropIndex(_)
         | Statement::Comment(_)
         | Statement::CreateType(_)
-        | Statement::Raise { .. }
+        | Statement::Do { .. }
         | Statement::Truncate(_)
         | Statement::DropType(_)
         | Statement::AlterType(_)
