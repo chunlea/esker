@@ -1,0 +1,19 @@
+docs/plans/0114-implementation.md
+  s_8d3e4c2902bf64::t_967909318b4406 8-14,82,108-125,202-206,210-221,238-240,246,256-260,270-272,289-290,307-310,318-319,356-369,378-395,402-406,424-427,436,446-447,456
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ecf66b90220b9e5daec8ea6154559104d5107a65",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
