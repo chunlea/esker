@@ -2158,9 +2158,9 @@ pub(super) fn create_function(
 
 /// `CREATE TRIGGER t BEFORE|AFTER … ON tbl FOR EACH ROW EXECUTE FUNCTION|PROCEDURE f()`.
 ///
-/// Registered on the table and **never fired**. The function must already exist — a real server
-/// resolves it here, and a name that is nothing is `42883` from the `CREATE TRIGGER` rather than
-/// from a later insert.
+/// Registered on the table, and fired by `crate::exec::trigger` from the next row written. The
+/// function must already exist — a real server resolves it here, and a name that is nothing is
+/// `42883` from the `CREATE TRIGGER` rather than from a later insert.
 pub(super) fn create_trigger(
     executor: &mut Executor,
     txn: &mut dyn Txn,
@@ -2168,8 +2168,16 @@ pub(super) fn create_trigger(
 ) -> Result<Outcome> {
     catalog::pg_catalog::refuse_write(&create.table)?;
     let table = executor.require_table(txn, &create.table)?;
+    // **A partitioned table and a partition are refused by name** (ADR 0113): PostgreSQL clones a
+    // partitioned table's row triggers onto its partitions and fires a partition's after the row is
+    // routed, and this node routes after `CHECK` — an order that would be a new one to build.
+    if table.partition_by.is_some() || table.partition_bound.is_some() {
+        return Err(SqlError::unsupported(
+            "CREATE TRIGGER on a partitioned table or a partition",
+        ));
+    }
     if catalog::function(txn, executor.tenant, &create.function)?.is_none() {
-        return Err(SqlError::UndefinedFunction(format!(
+        return Err(SqlError::TriggerFunctionNotFound(format!(
             "{}()",
             create.function
         )));
@@ -2593,12 +2601,19 @@ pub(super) fn drop_sequence(
     Ok(Outcome::done("DROP SEQUENCE"))
 }
 
-/// `ALTER TABLE … ENABLE`/`DISABLE TRIGGER ALL`.
+/// `ALTER TABLE … ENABLE`/`DISABLE TRIGGER ALL | USER | <name>`.
 ///
-/// One flag on the table, written the way every other constraint change is written — and it
-/// **does not bump the schema version**, for the reason retention does not: no row is written or
-/// read differently because of it, so no node's cached row schema is stale. What it changes is
-/// which checks run, and those are read from the table record each statement asks for.
+/// `ALL`'s referential half is one flag on the table, written the way every other constraint change
+/// is written — and that flag **does not bump the schema version**, for the reason retention does
+/// not: no row is written or read differently because of it, so no node's cached row schema is
+/// stale. What it changes is which checks run, and those are read from the table record each
+/// statement asks for.
+///
+/// **A user trigger's own flag does move the version**, as creating or dropping one does: the
+/// triggers a statement fires are the ones its `TableDef` lists as enabled, and a node holding the
+/// old one would fire a trigger that was turned off. `ALL` and `USER` flip every user trigger and a
+/// name flips one; a name the table does not have is PostgreSQL's `42704`, naming the relation
+/// bare.
 ///
 /// `ENABLE` on a table that was never disabled is a write of the value it already has. That is
 /// what a real server does too — `ALTER TABLE … ENABLE TRIGGER ALL` on an untouched table is a
@@ -2609,9 +2624,36 @@ fn set_triggers_disabled(
     executor: &Executor,
     table: &TableDef,
     updated: &mut TableDef,
+    which: &plan::TriggerSelection,
     disabled: bool,
 ) -> Result<()> {
-    updated.triggers_disabled = disabled;
+    use crate::plan::TriggerSelection;
+    let named = match which {
+        TriggerSelection::All => {
+            updated.triggers_disabled = disabled;
+            None
+        }
+        TriggerSelection::User => None,
+        TriggerSelection::Named(name) => {
+            if !updated.triggers.iter().any(|trigger| trigger.name == *name) {
+                return Err(SqlError::UndefinedTrigger {
+                    trigger: name.clone(),
+                    table: catalog::split_qualified(&table.name).1.to_owned(),
+                });
+            }
+            Some(name)
+        }
+    };
+    let mut moved = false;
+    for trigger in &mut updated.triggers {
+        if named.is_none_or(|name| trigger.name == *name) && trigger.enabled == disabled {
+            trigger.enabled = !disabled;
+            moved = true;
+        }
+    }
+    if moved {
+        updated.schema_version += 1;
+    }
     catalog::replace_table(txn, executor.tenant, table, updated)
 }
 
@@ -7239,8 +7281,8 @@ pub(super) fn alter_table(
             changed = true;
             continue;
         }
-        if let AlterTableAction::SetTriggersDisabled { disabled } = action {
-            set_triggers_disabled(txn, executor, &table, &mut updated, *disabled)?;
+        if let AlterTableAction::SetTriggersDisabled { which, disabled } = action {
+            set_triggers_disabled(txn, executor, &table, &mut updated, which, *disabled)?;
             continue;
         }
         if let AlterTableAction::SetColumnType {

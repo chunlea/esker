@@ -1296,7 +1296,8 @@ pub struct TableDef {
     pub excludes: Vec<ExcludeDef>,
     /// The triggers registered on this table, in creation order.
     ///
-    /// **Stored and never fired.** `ALTER TABLE … DISABLE TRIGGER ALL` is a separate flag
+    /// **Fired by `crate::exec::trigger`**, in name order. `ALTER TABLE … DISABLE TRIGGER ALL` flips
+    /// each one's [`TriggerDef::enabled`], and also a separate flag
     /// ([`TableDef::triggers_disabled`]) that predates these and means something else: it turns
     /// off the *internal* triggers a foreign key is made of.
     pub triggers: Vec<TriggerDef>,
@@ -1397,12 +1398,12 @@ impl Persistence {
     }
 }
 
-/// A stored function — **defined and never executed**.
+/// A stored function — **run only by a trigger** (`crate::exec::trigger`, ADR 0113).
 ///
 /// The schema load reaches `CREATE OR REPLACE FUNCTION … LANGUAGE plpgsql` twice (statements 762
 /// and 790) and inserts nothing through it; the capture proves the table is empty immediately
-/// after. So what a suite needs from this node is a catalog that can *hold* a function, not a
-/// procedural-language runtime — and exactly one test in the whole suite ever fires a trigger.
+/// after. What runs one is a row written into a table whose trigger names it, which the suite does
+/// from `persistence_test.rb` and `postgresql_adapter_test.rb`.
 /// Calling one is refused where the statement is lowered — before any catalog is in reach, so the
 /// message names the function rather than saying what a real server says, which is that trigger
 /// functions can only be called as triggers. A declared divergence, and the load never calls one.
@@ -1420,7 +1421,7 @@ pub struct FunctionDef {
     pub language: String,
 }
 
-/// One trigger on a table — **registered and never fired**.
+/// One row trigger on a table, fired by `crate::exec::trigger`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriggerDef {
     /// Its name, unique per table rather than per database: `pg_trigger` is keyed by both, and

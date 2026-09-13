@@ -50,6 +50,7 @@ pub mod redrive;
 mod savepoint;
 mod subquery;
 mod table_function;
+mod trigger;
 mod typedef;
 mod values;
 mod verbs;
@@ -1220,7 +1221,7 @@ impl Executor {
             Statement::Insert(insert) => dml::insert(self, txn, insert, written),
             Statement::Select(select) => self.select(txn, select),
             Statement::Update(update) => dml::update(self, txn, update, written),
-            Statement::Delete(delete) => dml::delete(self, txn, delete),
+            Statement::Delete(delete) => dml::delete(self, txn, delete, written),
             Statement::Explain(explain) => self.explain(txn, explain),
             Statement::TimeMachine(verb) => verbs::run(self, txn, verb),
             Statement::Cursor(cursor) => declared_cursor::run(self, txn, cursor),

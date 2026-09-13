@@ -1238,6 +1238,18 @@ pub struct AlterTable {
     pub actions: Vec<AlterTableAction>,
 }
 
+/// The triggers an `ENABLE` or `DISABLE TRIGGER` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerSelection {
+    /// `ALL`: every trigger a user created, and the internal ones a foreign key is made of — the
+    /// table's referential checks ([`crate::catalog::TableDef::triggers_disabled`]).
+    All,
+    /// `USER`: every trigger a user created, and none of the foreign key's.
+    User,
+    /// One trigger, by its folded name.
+    Named(String),
+}
+
 /// One action of an `ALTER TABLE`.
 ///
 /// `ADD COLUMN` and `DROP COLUMN` are here. Every other action parses and comes back `0A000`
@@ -1416,7 +1428,8 @@ pub enum AlterTableAction {
     /// The parent is named rather than resolved: nothing can turn `author_addresses` into a table
     /// id until the catalog has been read, and the executor is where that happens once.
     AddForeignKey(ForeignKey),
-    /// `ENABLE`/`DISABLE TRIGGER ALL` — and it is **not** a no-op on a node with no triggers.
+    /// `ENABLE`/`DISABLE TRIGGER ALL | USER | <name>` — and `ALL` is **not** a no-op on a table
+    /// with no triggers of its own.
     ///
     /// `ALL` includes PostgreSQL's *internal* foreign-key triggers, which is why a real server
     /// requires superuser for it and why `ActiveRecord` writes it around every fixture load:
@@ -1431,12 +1444,15 @@ pub enum AlterTableAction {
     ///   triggers live on different tables;
     /// * `USER` suspends none of it — an `INSERT` under `DISABLE TRIGGER USER` is still `23503`.
     ///
-    /// So this carries whether it was `ALL`, and `USER` is accepted with nothing to record. A
-    /// named trigger is `42704` where it is lowered: this node has none to name.
+    /// So this carries which triggers the statement named: `ALL` moves the referential checks and
+    /// every user trigger, `USER` only the user triggers, and a name only that one
+    /// ([`crate::catalog::TriggerDef::enabled`]).
     SetTriggersDisabled {
-        /// Whether the table's checks are suspended from here on. Stored on the table, because
-        /// PostgreSQL's is stored too — `pg_trigger.tgenabled` outlives the transaction that set
-        /// it and every session sees it.
+        /// Which triggers.
+        which: TriggerSelection,
+        /// Whether they are disabled from here on. Stored on the table, because PostgreSQL's is
+        /// stored too — `pg_trigger.tgenabled` outlives the transaction that set it and every
+        /// session sees it.
         disabled: bool,
     },
     /// `SET (retention = '7d' | 'forever' | DEFAULT)` — how far back this table can be read.

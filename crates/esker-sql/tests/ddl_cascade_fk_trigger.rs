@@ -196,7 +196,8 @@ fn the_disabled_state_is_a_catalog_write() {
 /// A named trigger is `42704`, and the name is not a keyword.
 ///
 /// `ALL` and `USER` are keywords only in this position, so a **quoted** `"ALL"` is a trigger
-/// called `ALL` and joins every other name in the refusal. This node has no triggers to name.
+/// called `ALL` and joins every other name in the refusal. The table has no trigger of any of these
+/// names.
 #[test]
 fn a_named_trigger_does_not_exist() {
     let mut node = parity::Node::new(&[]);

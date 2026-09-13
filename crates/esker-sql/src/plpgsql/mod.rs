@@ -15,9 +15,11 @@
 
 mod grammar;
 mod lex;
+mod star;
 #[cfg(test)]
 mod tests;
 
 pub use grammar::{
     Block, Context, Declaration, RaiseLevel, Statement, Target, VariableType, parse,
 };
+pub use star::expand_record_stars;

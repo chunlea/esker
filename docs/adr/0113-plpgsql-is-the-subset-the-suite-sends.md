@@ -94,11 +94,13 @@ a `BEFORE` trigger that returns `NULL` makes an `INSERT` answer `INSERT 0 0` wit
 * `insert_partitioning_trigger` fires too. Four `postgresql_adapter_test.rb` tests that pass today,
   because the row lands in the parent, must pass with the row in the inheritance child — `NEW.*`, an
   insert from inside a trigger, `INSERT 0 0`, and `max(id)` through inheritance. That sequence is the
-  trigger unit's acceptance.
+  trigger unit's acceptance, pinned by `tests/plpgsql_trigger.rs`.
 * Tests that pinned the old rulings change their assertions to the oracle's answer (plan §9). None
   is deleted or skipped.
-* Every `INSERT`, `UPDATE` and `DELETE` asks its cached `TableDef` whether it has an enabled row
-  trigger; a table with none pays an `is_empty`.
+* Every row an `INSERT`, `UPDATE` or `DELETE` writes asks its cached `TableDef` whether it has an
+  enabled row trigger; a table with none pays a walk of an empty list. A foreign key's `CASCADE`,
+  `SET NULL` and `SET DEFAULT` fire the child's row triggers too, as PostgreSQL's referential actions
+  do — measured.
 * A statement restart (ADR 0057) re-runs a body, so a notice raised before a lock wait can be sent
   twice. An error raised inside a body carries no `CONTEXT` line.
 * ADR 0058 becomes *Superseded by 0113* on acceptance; `docs/plans/do-blocks.md` §2's closed

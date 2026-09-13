@@ -39,9 +39,9 @@ pub use ddl::{
     CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView,
     DropDatabase, DropExtension, DropFunction, DropIndex, DropMaterializedView, DropRole,
     DropSchema, DropSequence, DropTable, DropTrigger, DropType, DropView, ForeignKey, IndexKeyPart,
-    KeyPartName, PartitionSpec, RangeEnd, RefreshMaterializedView, Truncate, UniqueConstraint,
-    UniqueUsingIndex, choose_relation_name, foreign_key_name, index_name, index_name_addition,
-    make_object_name, primary_key_name, sequence_name, unique_constraint_name,
+    KeyPartName, PartitionSpec, RangeEnd, RefreshMaterializedView, TriggerSelection, Truncate,
+    UniqueConstraint, UniqueUsingIndex, choose_relation_name, foreign_key_name, index_name,
+    index_name_addition, make_object_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{ConflictAction, ConflictKey, Delete, Insert, OnConflict, Returning, Update};
 pub use explain::{Explain, ExplainFormat, PlanNode};

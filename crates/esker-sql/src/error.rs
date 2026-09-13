@@ -1375,6 +1375,20 @@ pub enum SqlError {
     #[error("EXECUTE of transaction commands is not implemented")]
     ExecuteOfTransactionCommands,
 
+    /// A trigger function whose body ran off its end without `RETURN`: `2F005`, an `AFTER`
+    /// trigger's as much as a `BEFORE` one's — measured, both.
+    #[error("control reached end of trigger procedure without RETURN")]
+    TriggerEndedWithoutReturn,
+
+    /// A trigger function's `RETURN` of a value that is neither a row nor `NULL`: `42804`, measured
+    /// for a constant and for a variable.
+    #[error("cannot return non-composite value from function returning composite type")]
+    TriggerReturnedNonComposite,
+
+    /// `CREATE FUNCTION … RETURNS trigger … LANGUAGE sql`: `42P13`, from the `CREATE`, measured.
+    #[error("SQL functions cannot return type trigger")]
+    SqlFunctionReturnsTrigger,
+
     /// A name in a PL/pgSQL statement that is both a variable and a column of the statement's
     /// relation: `42702`, the refusal PostgreSQL's default `plpgsql.variable_conflict = error`
     /// makes, with the `DETAIL` naming the two — measured.
@@ -2126,6 +2140,13 @@ pub enum SqlError {
     /// Measured: `public.obj_description('x'::regclass)` is one line and no more.
     #[error("function {0} does not exist")]
     UndefinedQualifiedFunction(String),
+
+    /// The function a `CREATE TRIGGER` names, when no function has that name: `42883`, with **no
+    /// `DETAIL`**. The statement resolves the function by its name and an empty argument list, so
+    /// there are no near candidates to describe — PostgreSQL's one line and no more, measured
+    /// (`pg19_trigger_function.txt`, `t_nofunc`).
+    #[error("function {0} does not exist")]
+    TriggerFunctionNotFound(String),
 
     /// A `CREATE TABLE … INHERITS` whose own column redeclares an inherited one at another type.
     ///
@@ -3324,6 +3345,8 @@ impl SqlError {
             SqlError::RaiseWithoutActiveHandler => {
                 sqlstate::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER
             }
+            SqlError::TriggerEndedWithoutReturn => sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
+            SqlError::SqlFunctionReturnsTrigger => sqlstate::INVALID_FUNCTION_DEFINITION,
             SqlError::SystemCatalog(_) | SqlError::CreateInSystemSchema(_) => {
                 sqlstate::INSUFFICIENT_PRIVILEGE
             }
@@ -3365,6 +3388,7 @@ impl SqlError {
             | SqlError::RecordHasNoField { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::ColumnTypeConflict { .. }
             | SqlError::ReturnParameterInVoid
+            | SqlError::TriggerReturnedNonComposite
             | SqlError::CannotCastColumnAutomatically { .. }
             | SqlError::UsingResultCannotBeCast { .. }
             | SqlError::CannotCastDefaultAutomatically { .. }
@@ -3492,6 +3516,7 @@ impl SqlError {
             | SqlError::UnnamedFunctionNotFound(_)
             | SqlError::FunctionToDropNotFound(_)
             | SqlError::UndefinedQualifiedFunction(_)
+            | SqlError::TriggerFunctionNotFound(_)
             | SqlError::UndefinedFunctionTypes(_)
             | SqlError::UndefinedFunctionName(_)
             | SqlError::UndefinedAggregateArity { .. } => sqlstate::UNDEFINED_FUNCTION,
