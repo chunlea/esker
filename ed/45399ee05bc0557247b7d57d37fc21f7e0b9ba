@@ -1,0 +1,19 @@
+docs/acceptance/v1.1.md
+  s_dc640bf0df4adb::t_d70621902b120e 475-480,484-491
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ed45399ee05bc0557247b7d57d37fc21f7e0b9ba",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
