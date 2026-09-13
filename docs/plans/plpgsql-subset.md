@@ -228,7 +228,10 @@ passing with the row in the child. That is part of C's acceptance, not an aftert
 D3 needs five things. One of them is PL/pgSQL.
 
 1. **`format()`** — `%s`, `%I`, `%L`, `%%` and the positional `%n$` form (fact 7). Not implemented:
-   `plan/expr.rs` has `format_type` and no `format`. Width and `-` flags are not in the census.
+   `plan/expr.rs` has `format_type` and no `format`. Width and `-` flags are not in the census,
+   and they are built anyway: the capture of `format()` pins them (`pg19_format.txt`) and they are
+   a few lines, where a declared divergence would have been a sentence per row. Only a positional
+   width, `%*2$s`, is refused by name.
 2. **`regnamespace`** — text → `regnamespace`, `oid` → `regnamespace`, and `=` between two
    (fact 8). Not implemented; built the way `regclass` and `regproc` are
    ([ADR 0098](../adr/0098-regproc-is-an-oid-that-prints-as-a-function.md)).
@@ -407,8 +410,9 @@ Refused by name with `0A000`, or left as it is:
   other than `trigger` taking effect, procedures.
 * **Validation at `CREATE FUNCTION`**: PostgreSQL parses the body there; this node stores it, as it
   has since the define-only unit (`pg19_trigger_function.txt`'s `tf_badbody` row).
-* **`plpgsql.variable_conflict`'s `42702`** for a name that is both a variable and a column: the
-  variable is substituted.
+* **`plpgsql.variable_conflict`'s other settings.** Its default, `error`, **is** built — a name that
+  is both a variable and a column of the statement's relation is `42702` with PostgreSQL's `DETAIL`,
+  measured — so this line is only `use_variable` and `use_column`.
 * **A `CONTEXT` line** on an error raised inside a body.
 * **Triggers**: statement-level, `WHEN`, `UPDATE OF`, arguments, `TRUNCATE`, `INSTEAD OF`,
   constraint triggers, transition tables (`REFERENCING`), on partitioned tables or partitions, event
@@ -433,3 +437,14 @@ suite does not send them, and the brief's scope is the census: no more, no less.
    parsed once per function, not once per row.
 6. **A restart re-runs a body** (§5), so a notice can repeat.
 7. **Wire: none. Format: none (§8). Dependencies: none.**
+
+## 13. Progress
+
+| slice | commit | what |
+|---|---|---|
+| A | `bd0f9c83`, `4a2d70e2` | this plan and ADR 0113; the ADR accepted and §6 ruled (b) |
+| B1 | `ea72350d` | the reader: tokenizer, grammar, PostgreSQL's sentences for a malformed body |
+| B2 + B3 | `83815c76` | the interpreter and `Statement::Do` — `FOR` and `EXECUTE` landed with it rather than after; the templates removed; `pg19_plpgsql_do.txt` |
+| B4 | `5cae182d` | `format()`, widths included; `pg19_format.txt` |
+| B6 | — | the `pg_constraint.convalidated` write, and the census block with its schema predicate left out |
+| B5 | — | `regnamespace`: a type with additive tags, waiting on `esker-coord/QUESTION-s2-regnamespace.md` for an ADR number |

@@ -11,7 +11,6 @@
 //!
 //! ```text
 //! DELETE FROM pg_depend WHERE objid = 0                                  -> DELETE 0
-//! UPDATE pg_catalog.pg_constraint SET convalidated = false WHERE …       -> UPDATE 0
 //! SELECT 'pg_class'::regclass::integer                                   -> 1259
 //! ```
 //!
@@ -44,16 +43,19 @@ mod parity;
 /// no honest way to pretend there is. Refusing is the ADR 0031 call: a wrong answer where a
 /// refusal is available is the worse of the two.
 ///
-/// The same guard is what `check_all_foreign_keys_valid!`'s `DO` block reaches now that it runs:
-/// `UPDATE pg_catalog.pg_constraint SET convalidated = false` is refused for this reason and not for
-/// the `DO` one (ADR 0113, `docs/plans/plpgsql-subset.md` §6).
+/// **One write to one column is taken, by the user's ruling of 2026-09-13** (ADR 0113 §6, option
+/// (b)): `UPDATE pg_catalog.pg_constraint SET convalidated = …` writes the `NOT VALID` flag a foreign
+/// key or a `CHECK` already stores, because `check_all_foreign_keys_valid!` cannot work without it.
+/// It is pinned in `tests/pg_constraint_convalidated.rs`; the rows below are the rest of the ruling,
+/// and they stay refused.
 #[test]
 fn a_write_to_a_system_catalog_is_refused() {
     let mut node = parity::Node::new(&[]);
     for (sql, relation) in [
         ("DELETE FROM pg_depend WHERE objid = 1", "pg_depend"),
+        // Another column of the one catalog that takes a write is still the refusal.
         (
-            "UPDATE pg_catalog.pg_constraint SET convalidated = false WHERE conname = 'x'",
+            "UPDATE pg_catalog.pg_constraint SET conname = 'y' WHERE conname = 'x'",
             "pg_constraint",
         ),
         ("INSERT INTO pg_class (relname) VALUES ('x')", "pg_class"),

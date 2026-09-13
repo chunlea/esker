@@ -28,6 +28,7 @@ pub(crate) mod aggregate;
 mod assign;
 pub(crate) mod bind;
 pub(crate) mod cancel;
+mod catalog_write;
 mod comment;
 mod cursor;
 mod ddl;

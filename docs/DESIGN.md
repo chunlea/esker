@@ -1150,10 +1150,22 @@ is in its first sentence.
   a primary-key constraint and a `NOT NULL`, derive theirs reversibly from the table and the column.
   A `pg_catalog` function is resolved where its argument allows: `'x'::regclass` before the plan is
   built, `pg_get_indexdef(d.indexrelid)` per row against a snapshot the cursor holds. Every write is
-  `42501`, and a type this node has no value for is provided where the client reads it as text
+  `42501` but one — `pg_constraint.convalidated`, below — and a type this node has no value for is provided where the client reads it as text
   (`pg_index.indkey`, an `int2vector` there and text here, printed the same and subscripted from
   zero). `pg_constraint.conkey` was the refusal beside it and is a `smallint[]` now, which is what
   it is on a real server.
+  **A `DO` block and a trigger function are PL/pgSQL, and the subset is a census**
+  ([ADR 0113](adr/0113-plpgsql-is-the-subset-the-suite-sends.md)): `crate::plpgsql` reads a body
+  whole — declarations, `IF`, `RAISE` of a literal, `SELECT … INTO`, assignment,
+  `FOR <record> IN <query> LOOP`, `EXECUTE`, `RETURN` and any SQL statement — refuses every other
+  construct by name before any of it runs, and answers PostgreSQL's own sentence for a body
+  PostgreSQL refuses. `exec::plpgsql` runs it **inside the statement that reached it**: every SQL
+  statement goes through `run_recording` with that statement's transaction and savepoint, a
+  variable reaches SQL as a typed literal put into the lowered tree rather than as text, and a name
+  that is both a variable and a column is `42702`. Nesting is bounded (`54001`). The one write to a
+  system catalog lives beside it: `UPDATE pg_catalog.pg_constraint SET convalidated = …` writes the
+  `NOT VALID` flag a foreign key or a `CHECK` already stores (`exec::catalog_write`), because
+  `check_all_foreign_keys_valid!` cannot work without it, and every other catalog write is `42501`.
   **The catalog record is a versioned on-disk format** like every other byte this system writes
   (invariant 2): `catalog::record::CATALOG_FORMAT_VERSION` is **36**, a record carries it in its
   first byte, and every field added since version 2 is read behind a `reader.version >= N` guard so
