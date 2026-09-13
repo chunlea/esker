@@ -1,0 +1,20 @@
+crates/esker-sql/tests/corpus/pg19_regnamespace.txt
+  h_44076b318daf9c 1-119
+crates/esker-sql/tests/regnamespace.rs
+  h_44076b318daf9c 1-248
+docs/plans/plpgsql-subset.md
+  h_44076b318daf9c 463
+docs/adr/0115-regnamespace-is-an-oid-that-prints-as-a-schema.md
+  h_44076b318daf9c 1-88
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ed35b06179b924ed430f7e50b712a5fdcb8bd072",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
