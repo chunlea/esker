@@ -1,6 +1,7 @@
 # 0113 — PL/pgSQL is the subset the suite sends, run inside the statement
 
-**Status:** Proposed · **Date:** 2026-09-13 · Number reserved for lane s2-plpgsql by the coordinator.
+**Status:** Accepted, 2026-09-13 — by the user, with the catalog-write question below ruled
+**(b)**. Proposed the same day · Number reserved for lane s2-plpgsql by the coordinator.
 Supersedes the decision of [ADR 0058](0058-a-do-block-is-two-templates-not-a-language.md) when
 accepted; 0058's measurement stays true. The census and the order of work are
 [`docs/plans/plpgsql-subset.md`](../plans/plpgsql-subset.md).
@@ -87,7 +88,9 @@ a `BEFORE` trigger that returns `NULL` makes an `INSERT` answer `INSERT 0 0` wit
   refuses with `42501` (`tests/user_decided_divergences.rs`). With that ruling standing, the
   interpreter moves `fixtures_test.rb` and `referential_integrity_test.rb` from `0A000` to `42501`
   and no further; the narrow write that would finish them is put to the user as a question
-  (plan §6), with no format change either way.
+  (plan §6), with no format change either way. **Ruled (b), 2026-09-13**: `UPDATE
+  pg_catalog.pg_constraint SET convalidated = …` writes the `validated` flag a foreign key or a
+  `CHECK` already stores, and every other write to a system catalog stays `42501`.
 * `insert_partitioning_trigger` fires too. Four `postgresql_adapter_test.rb` tests that pass today,
   because the row lands in the parent, must pass with the row in the inheritance child — `NEW.*`, an
   insert from inside a trigger, `INSERT 0 0`, and `max(id)` through inheritance. That sequence is the
