@@ -1,5 +1,12 @@
 # Plan — `DO` blocks, the non-template forms
 
+> **Reopened 2026-09-13.** The user ruled that the node's remaining capability gaps are to be
+> closed, which reopens §2's closed question. The census of every `DO` body, trigger function and
+> trigger the suite sends, and the plan that follows from it, are
+> [`plpgsql-subset.md`](plpgsql-subset.md) and
+> [ADR 0113](../adr/0113-plpgsql-is-the-subset-the-suite-sends.md). This file is kept as the record
+> of the 2026-09-04 measurement.
+
 Status: **census first, and the census changes the unit.** The brief was "DO non-template forms,
 34 tests on the v1 deferral sheet". Measured, the row is **2 tests**, and it has been 2 since run
 70. What is actually worth doing here is a different and smaller thing, described in §3.
