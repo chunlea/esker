@@ -22,8 +22,7 @@ always `40001`. The fix gives the eager lock's `Check` the statement's read time
 
 * `pub enum TxnMutation` (line 251): `Put { key, value, read_ts: Option<u64> }`,
   `Delete { key, read_ts: Option<u64> }`, `Check { key }`, `CheckRange { start, end }`.
-* `TxnMutation::tag` (lines 200
-322–331): `Put { read_ts: None }` = **1**, `Delete { read_ts: None }` =
+* `TxnMutation::tag` (lines 322–331): `Put { read_ts: None }` = **1**, `Delete { read_ts: None }` =
   **2**, `Put` with a timestamp = **3**, `Delete` with one = **4**, `Check` = **5**, `CheckRange` = **6**.
 * `TxnMutation::encode` (line 333): `u8 tag`, then — `Put`: `bytes key, bytes value[, varint read_ts]`;
   `Delete`: `bytes key[, varint read_ts]`; `Check`: `bytes key`; `CheckRange`: `bytes start, bytes end`.
