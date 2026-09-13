@@ -5,6 +5,11 @@ and both of its questions (`esker-coord/QUESTION-s1.md`) wait for the user. Noth
 before they are ruled: §2 (a) is a wire and Raft-log format change (`CLAUDE.md`, "ask before doing"),
 and §3 (ii) is one of three answers to a semantic question.
 
+**§3 is built** (unit I, 2026-09-13). The coordinator ruled question 2 — (ii), with step 5's arbiter
+rule — under the mandate to close the gaps, and the user may overrule it. It was built as §3 below
+describes, under two names this plan did not have: the arbiter's list is `arbitrated`, marked by
+`mark_arbitrated`, and step 3's test is `read_before_writing`. §2 (a) still waits.
+
 **Every file, function, line and number below was read in the tree at `b36e5d4f`.** Main's `fc8333c8`,
 merged into this branch as `aad1dca3`, moved cited lines only in `exec/mod.rs` and `exec/dml.rs`; those
 are given as they stand at `aad1dca3`, and its other hunks fall after every line cited here.
@@ -262,7 +267,7 @@ Step 4's two stamp rules have counterfactuals of their own *(unit H)*: keep the 
 
 ---
 
-## §3 (ii) — `40001` at SERIALIZABLE when the lost key had been read by an earlier statement
+## §3 (ii) — `40001` at SERIALIZABLE when the lost key had been read by an earlier statement (built)
 
 Today a unique conflict at SERIALIZABLE is always renamed `23505` at `COMMIT`. PostgreSQL answers
 `40001` when the transaction had read the key and `23505` when it had not (ADR 0114 cases 06 and 09
@@ -291,8 +296,9 @@ was put to the user.
 * A savepoint copies the read set with `Txn::read_set` / `Txn::restore_read_set` (lines 371 and 379;
   `pub struct ReadSet { keys, ranges }`, line 441). `savepoint::Recording` forwards all three
   (`crates/esker-sql/src/exec/savepoint.rs` lines 337, 341, 374).
-* **The `Txn` trait has three implementors**: `StoreTxn` (`store.rs` line 271), `MemoryTxn` (`mod.rs`
-  line 848), `Recording` (`savepoint.rs` line 268).
+* **The `Txn` trait has four implementors**: `StoreTxn` (`store.rs` line 271), `MemoryTxn` (`mod.rs`
+  line 848), `Recording` (`savepoint.rs` line 268), and a test's `GatedTxn` (`tests/redrive.rs`
+  line 354) — the trait's own doc says four, and unit I found the one this line had missed.
 
 **Where the checks go out:**
 
@@ -338,7 +344,7 @@ was put to the user.
 
 ### The change
 
-1. **A required `Txn` method** — no default, implemented by all three:
+1. **A required `Txn` method** — no default, implemented by all four:
    `fn has_read(&self, key: &[u8]) -> bool`, true when `key` is in the read set's keys or inside one of
    its ranges (`start <= key < end`). `Recording` forwards to its inner transaction. A default here
    would be the silent opt-out the trait's own docs refuse for `lock`, `locks` and

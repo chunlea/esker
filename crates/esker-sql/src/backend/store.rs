@@ -539,6 +539,10 @@ impl Txn for StoreTxn {
         *self.read_ranges.borrow_mut() = set.ranges;
     }
 
+    fn has_read(&self, key: &[u8]) -> bool {
+        crate::backend::read_set_covers(&self.read_keys.borrow(), &self.read_ranges.borrow(), key)
+    }
+
     fn commit(mut self: Box<Self>) -> Result<Option<u64>> {
         // **The read set is handed over here, at the last moment**, because a transaction records
         // right up to its commit and the client only needs it once (ADR 0062 §1).

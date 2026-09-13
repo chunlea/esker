@@ -23,10 +23,14 @@
 //! Rails does after the duplicate — a `SELECT … FOR UPDATE` of the row the first writer committed —
 //! is the ADR's §2, which is a format question and is not built.
 //!
-//! **The last three tests are red, and are `#[ignore]`d until the user rules**: §2's `FOR UPDATE` of a
-//! row committed after the transaction began (debt #91), §3's SERIALIZABLE `40001`, and
-//! `relations_test.rb`'s duel itself, which needs §1 and §2 both. Each reason names the section and
-//! the question it waits for; they still compile and clippy still reads them, and
+//! **§3's tests** — ruled 2026-09-13, (ii) with the arbiter rule — are SERIALIZABLE's `40001` for a
+//! key read before it was inserted (case 09) and the rest of §3's table: the sequences
+//! `unique_race` shares with `serializable.rs`, which runs them against `MemoryBackend`.
+//!
+//! **Two tests are red, and are `#[ignore]`d until the user rules**: §2's `FOR UPDATE` of a row
+//! committed after the transaction began (debt #91), and `relations_test.rb`'s duel itself, which
+//! needs §1 and §2 both. Each reason names the section and the question it waits for; they still
+//! compile and clippy still reads them, and
 //! `cargo nextest run -p esker-sql --test concurrent_unique_insert --run-ignored only` runs them.
 //!
 //! Every test here runs against three real stores, and both sessions are on one node: the wait is
@@ -43,24 +47,18 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod cluster;
+mod unique_race;
 
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use cluster::{Cluster, Session};
 use esker_sql::pgwire::session::Outcome;
+use unique_race::SUBSCRIBERS;
 
 /// How long a barrier may take to be reached, sized for the worst machine this runs on. It is a
 /// readiness bound: running out of it is a failure with a message, never a hang.
 const BARRIER: Duration = Duration::from_secs(60);
-
-/// Rails' `subscribers`, as `activerecord/test/schema/schema.rb` declares it: `id: false`, so the
-/// row key is an internal row id and the only thing two rows can collide on is the index.
-const SUBSCRIBERS: [&str; 2] = [
-    "CREATE TABLE subscribers (nick character varying NOT NULL, name character varying, \
-     id integer, books_count integer NOT NULL DEFAULT 0, update_count integer NOT NULL DEFAULT 0)",
-    "CREATE UNIQUE INDEX index_subscribers_on_nick ON subscribers (nick)",
-];
 
 /// **The red test for #90's first half.** A holds `bob`; B's `INSERT` of `bob` must wait for A, and
 /// when A commits it is the duplicate PostgreSQL says it is — **from the `INSERT`**, where Rails'
@@ -166,16 +164,12 @@ fn a_for_update_of_a_row_committed_after_the_transaction_began_takes_the_lock() 
     }
 }
 
-/// **§3's red test, as the unit was issued: SERIALIZABLE refuses with `40001`.** B reads that there is
-/// no `bob`, A inserts `bob` and commits, and then B inserts `bob`. PostgreSQL 19 answers `40001 could
-/// not serialize access due to read/write dependencies among transactions` at the `INSERT` (case 09),
-/// because what B read has moved under it. This node answers `23505` at `COMMIT`, and which of ADR
-/// 0114 §3's three answers it should give is the user's.
-///
-/// `#[ignore]`d rather than left red until that choice is made: it asserts the answer the unit was
-/// issued with, which may not be the one ruled.
+/// **ADR 0114 §3: SERIALIZABLE refuses a key it had read with `40001`.** B reads that there is no
+/// `bob`, A inserts `bob` and commits, and then B inserts `bob`. PostgreSQL 19 answers `40001 could not
+/// serialize access due to read/write dependencies among transactions` at the `INSERT` (case 09),
+/// because what B read has moved under it. This node is to answer the same code, at `COMMIT`, where
+/// it answered `23505` before §3.
 #[test]
-#[ignore = "red until ruled on — ADR 0114 §3; QUESTION-s1 question 2"]
 fn serializable_refuses_a_unique_key_committed_after_it_was_read_with_40001() {
     let cluster = cluster_with_subscribers();
     let mut b = cluster.session();
@@ -199,6 +193,77 @@ fn serializable_refuses_a_unique_key_committed_after_it_was_read_with_40001() {
     assert_eq!(refused.sqlstate(), "40001", "{refused}");
     let _ = b.run("ROLLBACK");
     assert_eq!(bobs(&cluster), "1");
+}
+
+impl unique_race::Sql for Session {
+    fn sql(&mut self, sql: &str) -> esker_sql::Result<Outcome> {
+        self.run(sql)
+    }
+}
+
+/// One of ADR 0114 §3's races on a fresh cluster: three sessions of one node, over three real stores.
+fn run_race(race: unique_race::Race) {
+    let cluster = cluster_with_subscribers();
+    unique_race::assert_refused_as_postgres(
+        &mut cluster.session(),
+        &mut cluster.session(),
+        &mut cluster.session(),
+        race,
+    );
+}
+
+/// **Case 07: SERIALIZABLE, and B never read `bob`** — `23505`. Nothing B read has moved; it only
+/// collided. The control for case 09.
+#[test]
+fn serializable_after_no_read_is_a_duplicate_key() {
+    run_race(unique_race::CASE_07);
+}
+
+/// **Case 13: SERIALIZABLE `ON CONFLICT DO NOTHING`, after reading `bob`** — `40001`, which
+/// PostgreSQL raises from `ExecCheckTupleVisible`: the arbiter found a row B's snapshot cannot see.
+#[test]
+fn serializable_on_conflict_do_nothing_after_a_count_is_refused_with_40001() {
+    run_race(unique_race::CASE_13);
+}
+
+/// **Case 13b: the same, with Rails' `find_by` as the read** — case 13's answer, because what decides
+/// it is the arbiter's read and not B's (case 14).
+#[test]
+fn serializable_on_conflict_do_nothing_after_a_find_by_is_refused_with_40001() {
+    run_race(unique_race::CASE_13B);
+}
+
+/// **Case 14: SERIALIZABLE `ON CONFLICT DO NOTHING`, and B never read `bob`** — still `40001`: the
+/// arbiter read it.
+#[test]
+fn serializable_on_conflict_do_nothing_after_no_read_is_refused_with_40001() {
+    run_race(unique_race::CASE_14);
+}
+
+/// **Case 15: REPEATABLE READ `ON CONFLICT DO NOTHING`, after reading `bob`** — `40001`: the arbiter
+/// rule, at the level that keeps no read set.
+#[test]
+fn repeatable_read_on_conflict_do_nothing_after_a_count_is_refused_with_40001() {
+    run_race(unique_race::CASE_15);
+}
+
+/// **Case 16: REPEATABLE READ `ON CONFLICT DO NOTHING`, and B never read `bob`** — `40001`.
+#[test]
+fn repeatable_read_on_conflict_do_nothing_after_no_read_is_refused_with_40001() {
+    run_race(unique_race::CASE_16);
+}
+
+/// **Case 04: REPEATABLE READ, a plain `INSERT` after reading `bob`, while A is live** — `23505`. The
+/// guard from the other side: at this level a read is not a read set, and only an arbiter's counts.
+#[test]
+fn repeatable_read_insert_after_a_read_is_a_duplicate_key_while_the_holder_is_live() {
+    run_race(unique_race::CASE_04);
+}
+
+/// **Case 10: the same, with A committed before B's `INSERT`** — `23505`.
+#[test]
+fn repeatable_read_insert_after_a_read_is_a_duplicate_key_when_the_holder_committed_first() {
+    run_race(unique_race::CASE_10);
 }
 
 /// **The acceptance: `relations_test.rb`'s two tests, statement for statement.**

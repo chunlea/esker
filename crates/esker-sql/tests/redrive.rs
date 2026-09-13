@@ -432,6 +432,9 @@ impl Txn for GatedTxn {
     fn restore_read_set(&mut self, set: esker_sql::backend::ReadSet) {
         self.inner.restore_read_set(set);
     }
+    fn has_read(&self, key: &[u8]) -> bool {
+        self.inner.has_read(key)
+    }
     fn start_ts(&self) -> u64 {
         self.inner.start_ts()
     }

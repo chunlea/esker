@@ -7,6 +7,13 @@
 //! that has — one over rows that exist, one over a row that does not exist yet — plus the case that
 //! must **not** become a conflict, because a level that refuses everything is not serializable, it
 //! is broken.
+//!
+//! **And a lost race on a unique key**
+//! ([ADR 0114](../../../docs/adr/0114-a-unique-key-being-written-waits-at-read-committed.md) §3): the
+//! code a transaction that loses one is refused with — `40001` where what it read has moved under it,
+//! `23505` where it only collided — at SERIALIZABLE, and for an `ON CONFLICT` arbiter's key at
+//! REPEATABLE READ as well. The sequences are `unique_race`'s, shared with
+//! `concurrent_unique_insert.rs`, which runs the same ones against three real stores.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -15,6 +22,7 @@ use std::time::Duration;
 
 #[path = "parity_harness/mod.rs"]
 mod parity;
+mod unique_race;
 
 use parity::{Pair, edge, reached};
 
@@ -275,4 +283,77 @@ fn a_repeatable_read_write_over_a_newer_commit_fails_at_the_statement() {
         .expect("READ COMMITTED re-reads rather than refusing");
     fresh.run("COMMIT").unwrap();
     assert_eq!(fresh.rows("SELECT n FROM snap WHERE id = 1"), [["4"]]);
+}
+
+impl unique_race::Sql for parity::Node {
+    fn sql(&mut self, sql: &str) -> esker_sql::Result<esker_sql::pgwire::session::Outcome> {
+        self.run(sql)
+    }
+}
+
+/// One of ADR 0114 §3's races on a fresh `MemoryBackend`: three sessions of one node.
+fn run_race(race: unique_race::Race) {
+    let pair = Pair::new(&unique_race::SUBSCRIBERS);
+    unique_race::assert_refused_as_postgres(
+        &mut pair.session(),
+        &mut pair.session(),
+        &mut pair.session(),
+        race,
+    );
+}
+
+/// **Case 09: SERIALIZABLE, B read `bob`, and A committed it before B's `INSERT`** — `40001`, because
+/// what B read has moved under it. The rows of `unique_race`'s table, one test each, as
+/// `concurrent_unique_insert.rs` has them against real stores.
+#[test]
+fn serializable_refuses_a_unique_key_committed_after_it_was_read_with_40001() {
+    run_race(unique_race::CASE_09);
+}
+
+/// Case 07: SERIALIZABLE, B never read `bob` — `23505`, the control for case 09.
+#[test]
+fn serializable_after_no_read_is_a_duplicate_key() {
+    run_race(unique_race::CASE_07);
+}
+
+/// Case 13: SERIALIZABLE `ON CONFLICT DO NOTHING` after a `count(*)` of `bob` — `40001`.
+#[test]
+fn serializable_on_conflict_do_nothing_after_a_count_is_refused_with_40001() {
+    run_race(unique_race::CASE_13);
+}
+
+/// Case 13b: the same after Rails' `find_by` — `40001`.
+#[test]
+fn serializable_on_conflict_do_nothing_after_a_find_by_is_refused_with_40001() {
+    run_race(unique_race::CASE_13B);
+}
+
+/// Case 14: SERIALIZABLE `ON CONFLICT DO NOTHING`, B never read `bob` — `40001`: the arbiter read it.
+#[test]
+fn serializable_on_conflict_do_nothing_after_no_read_is_refused_with_40001() {
+    run_race(unique_race::CASE_14);
+}
+
+/// Case 15: REPEATABLE READ `ON CONFLICT DO NOTHING` after a `count(*)` of `bob` — `40001`.
+#[test]
+fn repeatable_read_on_conflict_do_nothing_after_a_count_is_refused_with_40001() {
+    run_race(unique_race::CASE_15);
+}
+
+/// Case 16: REPEATABLE READ `ON CONFLICT DO NOTHING`, B never read `bob` — `40001`.
+#[test]
+fn repeatable_read_on_conflict_do_nothing_after_no_read_is_refused_with_40001() {
+    run_race(unique_race::CASE_16);
+}
+
+/// Case 04: REPEATABLE READ, a plain `INSERT` after a read, while A is live — `23505`.
+#[test]
+fn repeatable_read_insert_after_a_read_is_a_duplicate_key_while_the_holder_is_live() {
+    run_race(unique_race::CASE_04);
+}
+
+/// Case 10: the same with A committed before B's `INSERT` — `23505`.
+#[test]
+fn repeatable_read_insert_after_a_read_is_a_duplicate_key_when_the_holder_committed_first() {
+    run_race(unique_race::CASE_10);
 }

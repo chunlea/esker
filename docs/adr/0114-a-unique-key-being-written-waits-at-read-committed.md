@@ -2,8 +2,10 @@
 
 Status: **Proposed**, 2026-09-13 — debt #90, the number reserved for the s1-sql lane. **§1 is built**
 on `sql-gaps`. **§2 is a wire and Raft-log format change** and waits for the user (`CLAUDE.md`,
-"ask before doing"). **§3 is a question**, because the premise it was issued with did not survive the
-measurement. Builds on [ADR 0057](0057-read-committed-waits-for-the-writer-in-front-of-it.md) (the
+"ask before doing"). **§3 is decided and built**: answer (2), with the arbiter rule the measurement
+added — ruled 2026-09-13 by the coordinator under the mandate to close the gaps, which the user may
+overrule — so the status stays Proposed until the user has ruled on the whole. Builds on
+[ADR 0057](0057-read-committed-waits-for-the-writer-in-front-of-it.md) (the
 wait, the statement re-run, the per-key read timestamp) and
 [ADR 0088](0088-a-row-lock-across-nodes.md) (the eager row lock), beside
 [ADR 0062](0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md) and
@@ -36,7 +38,8 @@ thread committed **takes its lock**.
 ### What PostgreSQL does with the second insert, measured
 
 Two `psql` sessions on 19beta1, interleaved by `pg_sleep`, one table shaped like `subscribers`
-(`esker-coord/s1-oracle-2026-09-13/d/`). A inserts `bob` and holds it for 2.0 s; B has read that
+(`esker-coord/s1-oracle-2026-09-13/d/`, and `h/` for cases 14–16, with 13 rerun there as the
+control). A inserts `bob` and holds it for 2.0 s; B has read that
 there is no `bob` and then inserts it. *Waited* is from B's `INSERT` being sent to its answer, and
 every answer that waited arrived within 10 ms of A's `COMMIT` or `ROLLBACK`.
 
@@ -55,6 +58,9 @@ every answer that waited arrived within 10 ms of A's `COMMIT` or `ROLLBACK`.
 | 11 | READ COMMITTED, `ON CONFLICT (nick) DO NOTHING` | commits | `INSERT 0 0` | 1.31 s |
 | 12 | READ COMMITTED, `ON CONFLICT (nick) DO UPDATE` | commits | `INSERT 0 1`, the update lands on A's row | 1.32 s |
 | 13 | SERIALIZABLE, `ON CONFLICT (nick) DO NOTHING` | commits | `40001 could not serialize access due to concurrent update` | 1.33 s |
+| 14 | SERIALIZABLE, `ON CONFLICT (nick) DO NOTHING`, **B never read `bob`** | commits | `40001 could not serialize access due to concurrent update` | 1.30 s |
+| 15 | REPEATABLE READ, `ON CONFLICT (nick) DO NOTHING` | commits | `40001 could not serialize access due to concurrent update` | 1.30 s |
+| 16 | REPEATABLE READ, `ON CONFLICT (nick) DO NOTHING`, **B never read `bob`** | commits | `40001 could not serialize access due to concurrent update` | 1.31 s |
 
 * **The wait is every level's.** A uniqueness check is not a snapshot read on PostgreSQL: it sees an
   in-progress insert of the same key and waits for that transaction to end, whatever the level.
@@ -62,6 +68,10 @@ every answer that waited arrived within 10 ms of A's `COMMIT` or `ROLLBACK`.
   goes through at all three. A holder that committed is `23505` at READ COMMITTED and REPEATABLE
   READ; at SERIALIZABLE it is `40001` when B had read the key and `23505` when it had not (06
   against 07).
+* **`ON CONFLICT` has a rule of its own.** Cases 13–16 are all `40001`, and all four name
+  `ExecCheckTupleVisible` as the place: the arbiter found a row the transaction's snapshot cannot
+  see. That is the same at REPEATABLE READ as at SERIALIZABLE, and the same whether or not B had read
+  the key.
 
 ### What PostgreSQL does with the `FOR UPDATE`, measured
 
@@ -93,6 +103,10 @@ Under READ COMMITTED a commit that landed before the locking statement began is 
   `COMMIT`.
 * **SERIALIZABLE, B having read the key, A committed before B's `INSERT`**: `23505` at `COMMIT`.
 * In process, `tests/insert.rs`: a second insert of a held unique value went straight through.
+* **`ON CONFLICT DO NOTHING` at REPEATABLE READ and SERIALIZABLE** (cases 13–16, one probe on the
+  tree after §1, against three real stores and against `MemoryBackend`; `h/node-probe.out`): B's
+  `INSERT` answered `INSERT 0 1` at once and its `COMMIT` was refused `23505`, in every case and on
+  both.
 
 The cause of the first three is in `exec::dml::write_row`: it takes ADR 0057's row lock on the **row
 key** and then, for each by-value unique entry, reads the entry's key at the statement's snapshot,
@@ -173,12 +187,12 @@ log format that both have goldens. What exists is the red test, and the register
 How it would be built — tag and kind 7, their byte layouts, the golden row, the old-peer paths, the
 tests and the counterfactual — is [`docs/plans/0114-implementation.md`](../plans/0114-implementation.md) §2 (a).
 
-### §3 — SERIALIZABLE (a question)
+### §3 — SERIALIZABLE, and `ON CONFLICT` at REPEATABLE READ (decided: (2) and the arbiter rule; built)
 
 The unit was issued as *"SERIALIZABLE keeps its `40001`"*. The node never gave one: a unique conflict
-at SERIALIZABLE is `23505`, at `COMMIT`. PostgreSQL gives `40001` at the `INSERT` when the
-transaction had read the key and `23505` when it had not (06, 09 against 07). Three answers are
-available and none is built:
+at SERIALIZABLE was `23505`, at `COMMIT`. PostgreSQL gives `40001` at the `INSERT` when the
+transaction had read the key and `23505` when it had not (06, 09 against 07). Three answers were
+put to the user:
 
 1. **Declare it** as it stands: the right code for case 07, the wrong one for 06 and 09, and at
    `COMMIT` rather than the `INSERT` for all three.
@@ -188,9 +202,26 @@ available and none is built:
 3. **`40001` for every unique conflict found at `COMMIT` under SERIALIZABLE** — simplest, and wrong
    for case 07.
 
-(2) is the recommendation; the red test asserts case 09. How (2) would be built — the one bit per
-unique key, taken before the probe rather than after, and why the level has to be captured at the
-`INSERT` — is [`docs/plans/0114-implementation.md`](../plans/0114-implementation.md) §3 (ii).
+**Decided, 2026-09-13: (2), with the arbiter rule** — ruled by the coordinator under the mandate to
+close the gaps, and the user may overrule it. The arbiter rule is what cases 13–16 added: PostgreSQL's
+`40001` for `ON CONFLICT` is not a read-set answer, and (2) alone would have reached it at
+SERIALIZABLE only by accident and missed REPEATABLE READ. What is built, in the SQL layer alone:
+
+* **A lost race on a unique key is `40001` when the key was read before this transaction wrote it**,
+  and `23505` otherwise. *Read before* means one of two things. At SERIALIZABLE, any earlier read:
+  `Txn::has_read` asks the read set about the one key, immediately before `write_row`'s probe, so
+  the probe's own read never counts. At REPEATABLE READ or SERIALIZABLE, a read by `ON CONFLICT`'s
+  arbiter: `conflicting_row` collects the keys it reads, and the `INSERT` marks the entries that row
+  then wrote (`mark_arbitrated`).
+* **`Unique::read_first` carries the bit to `Executor::explain_conflict`**, which keeps the `40001`
+  for such a key in its keyed look and in its second look alike.
+* **`Txn::has_read` is required**, with no default, on all four implementors: `StoreTxn`,
+  `MemoryTxn`, `savepoint::Recording`, and a test's `GatedTxn` (`tests/redrive.rs`).
+* **No format, no wire, nothing below the SQL layer.**
+
+It answers PostgreSQL's code in cases 04, 07, 09, 10 and 13–16 — **at `COMMIT`**, where PostgreSQL
+answers at the `INSERT` (*What stays declared*). The design, with its file and line references, is
+[`docs/plans/0114-implementation.md`](../plans/0114-implementation.md) §3 (ii).
 
 ## Options
 
@@ -265,9 +296,12 @@ holder that disappears gives its locks back with its session
   wait beside them, the way ADR 0057 rewrote the primary-key test.
 * **`crate::backend`'s module doc** and `docs/DESIGN.md` §8 say which levels a concurrent duplicate
   still meets at prewrite.
-* **§2 and §3 have red tests, `#[ignore]`d until the two are ruled on**, each with a reason naming its
-  section and the question it waits for, so they compile and clippy reads them while the gate does not
-  run them; `--run-ignored only` does. §2 is also debt #91.
+* **§2 has red tests, `#[ignore]`d until it is ruled on**, each with a reason naming the section and
+  the question it waits for, so they compile and clippy reads them while the gate does not run them;
+  `--run-ignored only` does. §2 is also debt #91. **§3's red test is green**, and has lost its
+  attribute.
+* **§3 adds nothing to keep**: the read set already exists, `has_read` asks it about one key per
+  written unique entry at SERIALIZABLE, and the arbiter's keys are one list per row of an `INSERT`.
 
 ## What stays declared
 
@@ -278,6 +312,11 @@ holder that disappears gives its locks back with its session
   once, where PostgreSQL waits for the deleter and inserts if it commits.
 * **A deferrable unique constraint is checked by a scan**, not by one key, and takes no lock here.
 * **Two nodes** meet at prewrite, as every write-write conflict between nodes does (ADR 0057 unit 7).
+* **§3's `40001` is at `COMMIT`**, where PostgreSQL raises it at the `INSERT` (cases 09 and 13–16).
+  Moving it would need a predicate lock in the store, or the two snapshot levels to wait.
+* **Not captured**: `ON CONFLICT DO UPDATE` at the two snapshot levels, and a lost key on a unique
+  index that is not the arbiter. The arbiter rule marks only what the arbiter read, so the second
+  stays `23505`.
 
 ## Tests
 
@@ -289,6 +328,17 @@ any wait and would pass a clock. Beside them, the two rewritten tests and the in
 The counterfactual — §1 taken out by the same asserted replace that put it in — turns the three waits
 red again.
 
-**§2 and §3, red and `#[ignore]`d until ruled on** — in the same file: a `FOR UPDATE` of a row
-committed after the transaction began (e1, e2); `relations_test.rb`'s duel, statement for statement,
-twice, as the acceptance; and SERIALIZABLE's `40001` (case 09).
+**§2, red and `#[ignore]`d until ruled on** — in the same file: a `FOR UPDATE` of a row committed
+after the transaction began (e1, e2), and `relations_test.rb`'s duel, statement for statement, twice,
+as the acceptance.
+
+**§3, green** — cases 04, 07, 09, 10, 13, 13b, 14, 15 and 16: one shared sequence (`tests/unique_race`)
+run against three real stores in `concurrent_unique_insert.rs`, where case 09 is the red test that
+was ignored, and against `MemoryBackend` in `serializable.rs`. Beside them, `Txn::has_read` on
+`MemoryTxn` (`backend::tests`), on `StoreTxn` (`real_backend.rs`) and through `Recording`
+(`savepoint::tests`). Before the build, cases 09, 13, 13b, 14, 15 and 16 were red on both backends,
+each `23505` where `40001` was asserted. Two counterfactuals, each applied by an asserted
+replacement and undone by its inverse: with `read_first` never set by `write_row`, case 09 is
+`23505` again on both backends and case 07 is unchanged (18 run, 16 passed, 2 failed); with the
+arbiter marking skipped, cases 15 and 16 are `23505` again on both while 13, 13b and 14 stay `40001`
+(18 run, 14 passed, 4 failed).

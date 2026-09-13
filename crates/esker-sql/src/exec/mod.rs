@@ -2424,7 +2424,8 @@ impl Executor {
     }
 
     /// Turns a `40001` from `commit` into the `23505` it is, when the key that lost was a unique
-    /// index entry.
+    /// index entry — **unless the transaction had read that key first** (`Unique::read_first`), where
+    /// the `40001` is the answer, as it is on PostgreSQL (ADR 0114 §3).
     ///
     /// The store now **names the key that lost** (`docs/txn-spec.md` §6.1), so the common case is
     /// a lookup in what this transaction wrote and costs nothing. The second look is what is left
@@ -2449,6 +2450,8 @@ impl Executor {
                 .filter(|it| added(it))
                 .find(|it| &it.key == lost)
             {
+                // What the transaction read moved under it: the race it looks like.
+                Some(unique) if unique.read_first => error,
                 Some(unique) => SqlError::UniqueViolation {
                     constraint: unique.constraint.clone(),
                     key: Some(unique.detail.clone()),
@@ -2466,6 +2469,9 @@ impl Executor {
         };
         for unique in written.unique_keys.iter().filter(|it| added(it)) {
             if matches!(txn.get(&unique.key), Ok(Some(_))) {
+                if unique.read_first {
+                    return error;
+                }
                 return SqlError::UniqueViolation {
                     constraint: unique.constraint.clone(),
                     key: Some(unique.detail.clone()),
@@ -4405,6 +4411,12 @@ pub(crate) struct Unique {
     pub(crate) constraint: String,
     /// `Key (id)=(1)`, for the `DETAIL` field.
     pub(crate) detail: String,
+    /// **Whether losing this key is `40001` rather than `23505`** (ADR 0114 §3): the key was read
+    /// before this transaction wrote it. Under SERIALIZABLE by an earlier read, which the lost race
+    /// then invalidated; under either level that keeps its snapshot by an `ON CONFLICT` arbiter,
+    /// which is PostgreSQL's `ExecCheckTupleVisible` refusal. Taken at the write, while the level is
+    /// still the statement's.
+    pub(crate) read_first: bool,
 }
 
 /// A `SELECT` that either was left alone or had its sequence calls run.
