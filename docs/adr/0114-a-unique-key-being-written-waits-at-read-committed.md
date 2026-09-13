@@ -170,6 +170,8 @@ wire (`TxnMutation`) and an additive kind in the Raft log (`TxnWrite`)** — exa
 
 **Not built, and not this lane's to build without a yes**: it changes a wire format and a replicated
 log format that both have goldens. What exists is the red test, and the register's row for it, #91.
+How it would be built — tag and kind 7, their byte layouts, the golden row, the old-peer paths, the
+tests and the counterfactual — is [`docs/plans/0114-implementation.md`](../plans/0114-implementation.md) §2 (a).
 
 ### §3 — SERIALIZABLE (a question)
 
@@ -186,7 +188,9 @@ available and none is built:
 3. **`40001` for every unique conflict found at `COMMIT` under SERIALIZABLE** — simplest, and wrong
    for case 07.
 
-(2) is the recommendation; the red test asserts case 09.
+(2) is the recommendation; the red test asserts case 09. How (2) would be built — the one bit per
+unique key, taken before the probe rather than after, and why the level has to be captured at the
+`INSERT` — is [`docs/plans/0114-implementation.md`](../plans/0114-implementation.md) §3 (ii).
 
 ## Options
 
