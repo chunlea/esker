@@ -1,0 +1,27 @@
+crates/esker-sql/src/backend/mod.rs
+  s_8d3e4c2902bf64::t_cd5e0cdf480b9e 31-33
+docs/DESIGN.md
+  s_8d3e4c2902bf64::t_457065068532f0 808-812
+docs/adr/0114-a-unique-key-being-written-waits-at-read-committed.md
+  s_8d3e4c2902bf64::t_167875336e3fb0 5-8,41-42,61-63,71-74,106-109,190,193-195,205-224,299-304,315-319,331-344
+docs/plans/0114-implementation.md
+  s_8d3e4c2902bf64::t_e677518bcc16e2 8-12,270,299-301,347
+docs/plans/debts-v1.1.md
+  s_8d3e4c2902bf64::t_c61560cb7c9418 112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b843485a3fa885c05485ca450fe182dde7783bbf",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
