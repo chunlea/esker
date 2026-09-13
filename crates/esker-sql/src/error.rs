@@ -1324,6 +1324,17 @@ pub enum SqlError {
     /// a transaction block a real server aborts here. `P0001`, measured.
     #[error("{0}")]
     RaisedException(String),
+
+    /// A PL/pgSQL body PostgreSQL itself refuses to read: `42601` with PostgreSQL's own sentence,
+    /// which is never `syntax error: …` — `missing "THEN" at end of SQL expression`,
+    /// `"x" is not a known variable`, `syntax error at end of input`. Each is measured
+    /// (`crate::plpgsql`).
+    #[error("{0}")]
+    PlpgsqlSyntax(String),
+
+    /// `RETURN <expression>` in a `DO` block, which returns nothing: `42804`, measured.
+    #[error("RETURN cannot have a parameter in function returning void")]
+    ReturnParameterInVoid,
     /// `libpq` prints `WARNING:  foo`, and `ActiveRecord`'s `db_warnings_action` reads that line.
     /// `RAISE EXCEPTION` is not this: it is an error, and carries `P0001`.
     #[error("{message}")]
@@ -3188,6 +3199,7 @@ impl SqlError {
             | SqlError::LtreeSyntax(_)
             | SqlError::LQuerySyntax(_)
             | SqlError::SyntaxAtOrNear(_)
+            | SqlError::PlpgsqlSyntax(_)
             | SqlError::UnrecognizedExplainOption(_)
             | SqlError::NonBooleanOption(_)
             | SqlError::OptionRequiresParameter(_)
@@ -3279,6 +3291,7 @@ impl SqlError {
             | SqlError::UndefinedColumnInRelation { .. }
             | SqlError::QualifiedSetTarget { .. } => sqlstate::UNDEFINED_COLUMN,
             SqlError::ColumnTypeConflict { .. }
+            | SqlError::ReturnParameterInVoid
             | SqlError::CannotCastColumnAutomatically { .. }
             | SqlError::UsingResultCannotBeCast { .. }
             | SqlError::CannotCastDefaultAutomatically { .. }

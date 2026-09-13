@@ -55,6 +55,7 @@ pub mod parse;
 pub mod pd;
 pub mod pgwire;
 pub mod plan;
+pub mod plpgsql;
 pub mod row;
 pub mod sequence;
 pub mod session;
