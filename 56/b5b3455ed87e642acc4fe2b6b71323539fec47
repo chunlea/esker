@@ -1,0 +1,21 @@
+docs/adr/0114-a-unique-key-being-written-waits-at-read-committed.md
+  s_8d3e4c2902bf64::t_d0602a29ba7d17 173-174,191-193
+docs/plans/0114-implementation.md
+  s_8d3e4c2902bf64::t_06a4cae5a08703 1-340
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "56b5b3455ed87e642acc4fe2b6b71323539fec47",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
