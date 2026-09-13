@@ -378,6 +378,19 @@ pub trait Txn: fmt::Debug + Send {
     /// outer transaction after a `SerializationFailure` inside a savepoint, and so must we.
     fn restore_read_set(&mut self, set: ReadSet);
 
+    /// Whether `key` is in what this transaction has recorded reading: one of its keys, or inside one
+    /// of its ranges (ADR 0062). Never for a catalog key, which is not recorded, and never for a
+    /// transaction that is not validating its reads.
+    ///
+    /// **The one bit ADR 0114 §3 asks of the read set**: whether a unique key was read *before* the
+    /// probe that writes it. A SERIALIZABLE transaction that loses a key it had read lost a race on
+    /// something it depended on, which is `40001`; one that never read it only collided, which is
+    /// `23505`. The executor asks immediately before its probe, so the probe's own read never counts.
+    ///
+    /// **No default**, for the reason none of these has one: a wrapper that answered `false` would
+    /// turn every `40001` it swallowed into a `23505`, silently, inside a savepoint.
+    fn has_read(&self, key: &[u8]) -> bool;
+
     /// The snapshot this transaction reads at.
     ///
     /// What `pg_export_snapshot()` hands out, and it must be **this** transaction's rather than a
@@ -441,6 +454,21 @@ pub type Buffered = Option<Option<Bytes>>;
 pub struct ReadSet {
     keys: std::collections::BTreeSet<Vec<u8>>,
     ranges: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Whether a read set holds `key`: the key itself, or a range it falls inside.
+///
+/// One rule for both backends, and the rule their commits validate by: a range is a scan's own
+/// bounds, `[start, end)` (`Txn::scan`).
+fn read_set_covers(
+    keys: &std::collections::BTreeSet<Vec<u8>>,
+    ranges: &[(Vec<u8>, Vec<u8>)],
+    key: &[u8],
+) -> bool {
+    keys.contains(key)
+        || ranges
+            .iter()
+            .any(|(start, end)| start.as_slice() <= key && key < end.as_slice())
 }
 
 /// A buffered write.
@@ -1079,6 +1107,10 @@ impl Txn for MemoryTxn {
         *self.read_ranges.borrow_mut() = set.ranges;
     }
 
+    fn has_read(&self, key: &[u8]) -> bool {
+        read_set_covers(&self.read_keys.borrow(), &self.read_ranges.borrow(), key)
+    }
+
     fn is_read_only(&self) -> bool {
         self.read_only
     }
@@ -1237,6 +1269,45 @@ mod tests {
         assert!(
             loaded < control * 50 + std::time::Duration::from_millis(500),
             "a scan of the same eight keys took {loaded:?} in a store of 200_008 and {control:?}              in a store of 16: the scan is walking the store rather than its range"
+        );
+    }
+
+    /// **`has_read` is the read set, asked about one key** (ADR 0114 §3): a key it read, or a key
+    /// inside a range it scanned, end excluded — the rule its commit validates by.
+    #[test]
+    fn has_read_is_a_recorded_key_or_a_key_inside_a_scanned_range() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        txn.validate_reads(true);
+        txn.get(b"k").unwrap();
+        txn.scan(b"r/a", b"r/m", 0).unwrap();
+
+        assert!(txn.has_read(b"k"), "a key it read");
+        assert!(!txn.has_read(b"j"), "a key nobody read");
+        assert!(txn.has_read(b"r/a"), "a range holds its start");
+        assert!(txn.has_read(b"r/c"), "and what lies inside it");
+        assert!(!txn.has_read(b"r/m"), "and not its end");
+    }
+
+    /// And what is never recorded is never read: a catalog key, and every read of a transaction
+    /// that does not validate — which is every read at the two levels below SERIALIZABLE.
+    #[test]
+    fn has_read_skips_the_catalog_and_a_transaction_that_does_not_validate() {
+        let backend = MemoryBackend::new();
+        let mut serializable = backend.begin().unwrap();
+        serializable.validate_reads(true);
+        let catalog = [esker_keys::prefix::META, 1];
+        serializable.get(&catalog).unwrap();
+        assert!(
+            !serializable.has_read(&catalog),
+            "the catalog is in no read set"
+        );
+
+        let snapshot = backend.begin().unwrap();
+        snapshot.get(b"k").unwrap();
+        assert!(
+            !snapshot.has_read(b"k"),
+            "a transaction that does not validate records nothing"
         );
     }
 

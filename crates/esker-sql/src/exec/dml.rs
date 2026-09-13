@@ -719,8 +719,11 @@ pub(super) fn insert(
         // `23514` above even under `DO NOTHING` — the clause never gets a chance, because there is
         // no partition whose index could arbitrate. Here the partition is known, and it is *its*
         // indexes the target is inferred against.
+        // The keys `ON CONFLICT`'s arbiter reads for this row, which `write_row` cannot see.
+        let mut arbitrated = Vec::new();
         if let Some(on_conflict) = &insert.on_conflict
-            && let Some(existing) = conflicting_row(executor, txn, target, on_conflict, &row)?
+            && let Some(existing) =
+                conflicting_row(executor, txn, target, on_conflict, &row, &mut arbitrated)?
         {
             if let Some(updated) = resolve_conflict(
                 executor,
@@ -739,7 +742,13 @@ pub(super) fn insert(
             }
             continue;
         }
+        let first_unique = written.unique_keys.len();
         write_row(executor, txn, target, &row, written)?;
+        mark_arbitrated(
+            executor,
+            &mut written.unique_keys[first_unique..],
+            &arbitrated,
+        );
         if insert.on_conflict.is_some() {
             touched.push(row_key_of(executor, target, &row)?);
         }
@@ -1031,6 +1040,18 @@ fn target_columns(table: &TableDef, insert: &Insert) -> Result<Vec<usize>> {
         .collect()
 }
 
+/// **Whether a unique key was read before this statement's own probe of it**
+/// ([ADR 0114](../../../../docs/adr/0114-a-unique-key-being-written-waits-at-read-committed.md) §3):
+/// by an earlier statement, or by `ON CONFLICT`'s arbiter in this one.
+///
+/// **SERIALIZABLE only**, because it is the only level that records what it reads; at REPEATABLE
+/// READ the `INSERT` marks its arbiter's read itself (`mark_arbitrated`). Asked immediately before
+/// the probe, which records the key a moment later — so an `INSERT` can never count its own probe
+/// as the read that came first.
+fn read_before_writing(executor: &Executor, txn: &dyn Txn, key: &[u8]) -> bool {
+    executor.isolation() == crate::parameter::Isolation::Serializable && txn.has_read(key)
+}
+
 /// Writes one row and its index entries, checking every uniqueness constraint on the way.
 pub(super) fn write_row(
     executor: &Executor,
@@ -1056,6 +1077,7 @@ pub(super) fn write_row(
 
     // The primary key is a unique index whose entry is the row itself.
     let detail = render_key(table, &table.primary_key, &primary_key);
+    let read_first = read_before_writing(executor, txn, &key);
     if txn.get(&key)?.is_some() {
         // An internal row id is handed out once and never reused, so a taken key here is not a
         // user's duplicate -- it is this crate having lost track of the sequence, and reporting it
@@ -1079,6 +1101,7 @@ pub(super) fn write_row(
             key: key.clone(),
             constraint: table.primary_key_name.clone(),
             detail,
+            read_first,
         });
     }
 
@@ -1151,6 +1174,7 @@ pub(super) fn write_row(
                 super::wait_for_row(executor, txn, &entry.key, crate::backend::Reach::Node)?;
             }
             let detail = super::index::render_key(table, &index.keys, &entry.values);
+            let read_first = read_before_writing(executor, txn, &entry.key);
             if txn.get(&entry.key)?.is_some() {
                 return Err(SqlError::UniqueViolation {
                     constraint: index.name.clone(),
@@ -1161,6 +1185,7 @@ pub(super) fn write_row(
                 key: entry.key.clone(),
                 constraint: index.name.clone(),
                 detail,
+                read_first,
             });
         }
         // The value is the primary key, which is what an index lookup follows back to the row.
@@ -1609,12 +1634,16 @@ struct Conflicting {
 /// which reaches the plan through `parse::strip_on_conflict_predicate`. A bare target over a
 /// partial index stays the `42P10` a real server gives it, which is what
 /// `upsert_all_does_not_perform_an_upsert_if_a_partial_index_doesnt_apply` is about.
+///
+/// **Every key it reads goes into `arbitrated`**, found or not (ADR 0114 §3): a key the arbiter found
+/// free and the `INSERT` then wrote is one whose lost race is `40001` (`mark_arbitrated`).
 fn conflicting_row(
     executor: &Executor,
     txn: &dyn Txn,
     table: &TableDef,
     on_conflict: &crate::plan::OnConflict,
     row: &[Datum],
+    arbitrated: &mut Vec<Vec<u8>>,
 ) -> Result<Option<Conflicting>> {
     let wanted = column_target(table, &on_conflict.target)?;
     let mut inferred = 0;
@@ -1634,6 +1663,7 @@ fn conflicting_row(
             .map(|&at| row[at].clone())
             .collect();
         let key = row::row_key(executor.tenant, table.id, &values)?;
+        arbitrated.push(key.clone());
         if let Some(bytes) = txn.get(&key)? {
             return Ok(Some(Conflicting {
                 row: row::decode_row(&table.row_schema(), &bytes, None)?,
@@ -1657,6 +1687,7 @@ fn conflicting_row(
         if !entry.by_value {
             continue;
         }
+        arbitrated.push(entry.key.clone());
         let Some(bytes) = txn.get(&entry.key)? else {
             continue;
         };
@@ -1679,6 +1710,27 @@ fn conflicting_row(
         return Err(SqlError::NoUniqueForOnConflict);
     }
     Ok(None)
+}
+
+/// **ADR 0114 §3's arbiter rule.** A unique key `ON CONFLICT`'s arbiter read and found free, and this
+/// row's `INSERT` then wrote, is `40001` if its race is lost — at REPEATABLE READ and SERIALIZABLE
+/// alike, whether or not anything read it earlier.
+///
+/// PostgreSQL raises that from `ExecCheckTupleVisible`: the arbiter meets a row the transaction's
+/// snapshot cannot see. Here the arbiter reads the key at the snapshot and the race is found at
+/// `COMMIT`, so this mark is what carries the arbiter's read that far. READ COMMITTED is left alone:
+/// there `write_row` waits for a holder on this node and re-runs the statement (ADR 0114 §1).
+/// `pushed` is what `write_row` added for this row, so no other row's key is marked by this row's
+/// arbiter.
+fn mark_arbitrated(executor: &Executor, pushed: &mut [Unique], arbitrated: &[Vec<u8>]) {
+    if executor.isolation().waits() {
+        return;
+    }
+    for unique in pushed {
+        if arbitrated.contains(&unique.key) {
+            unique.read_first = true;
+        }
+    }
 }
 
 /// The target as column positions, or `None` when any entry is an **expression** — which only an

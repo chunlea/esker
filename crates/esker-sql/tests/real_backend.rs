@@ -137,6 +137,36 @@ fn a_lost_race_on_a_unique_index_is_a_duplicate_key() {
     );
 }
 
+/// **`has_read` on the store's transaction** (ADR 0114 §3): the rule `MemoryBackend` has — a key it
+/// read, a key inside a range it scanned with the end excluded, never a catalog key, and nothing at
+/// all for a transaction that is not validating its reads.
+#[test]
+fn a_store_transaction_has_read_what_its_read_set_holds() {
+    let cluster = Cluster::start();
+    let mut txn = cluster.backend.begin().unwrap();
+    txn.validate_reads(true);
+    txn.get(b"k").unwrap();
+    txn.scan(b"r/a", b"r/m", 0).unwrap();
+    let catalog = [esker_keys::prefix::META, 1];
+    txn.get(&catalog).unwrap();
+
+    assert!(txn.has_read(b"k"), "a key it read");
+    assert!(!txn.has_read(b"j"), "a key nobody read");
+    assert!(txn.has_read(b"r/a"), "a range holds its start");
+    assert!(txn.has_read(b"r/c"), "and what lies inside it");
+    assert!(!txn.has_read(b"r/m"), "and not its end");
+    assert!(!txn.has_read(&catalog), "the catalog is in no read set");
+    txn.rollback().unwrap();
+
+    let snapshot = cluster.backend.begin().unwrap();
+    snapshot.get(b"k").unwrap();
+    assert!(
+        !snapshot.has_read(b"k"),
+        "a transaction that does not validate records nothing"
+    );
+    snapshot.rollback().unwrap();
+}
+
 /// A committed duplicate is caught by the read, before anything is written — the other half of the
 /// unique-index ruling, over the real store.
 #[test]

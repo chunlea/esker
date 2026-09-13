@@ -342,6 +342,11 @@ impl Txn for Recording<'_> {
         self.inner.restore_read_set(set);
     }
 
+    /// Forwarded: the read set is the transaction's, and a savepoint holds only a copy of it.
+    fn has_read(&self, key: &[u8]) -> bool {
+        self.inner.has_read(key)
+    }
+
     fn changed_since_statement(&self, key: &[u8]) -> Result<bool> {
         self.inner.changed_since_statement(key)
     }
@@ -506,6 +511,40 @@ mod tests {
 
         assert!(txn.holds(b"before"), "the outer block's row is untouched");
         assert!(!txn.holds(b"inside"), "the savepoint's row goes back");
+    }
+
+    /// **`has_read` is the transaction's, seen through a savepoint** (ADR 0114 §3).
+    ///
+    /// A read made before `SAVEPOINT` is still a read inside it — Rails opens a savepoint for every
+    /// nested `transaction do`, and a `find_by` outside one is exactly the read that makes a lost
+    /// `INSERT` inside it `40001` — and `ROLLBACK TO` puts the read set back as it was at the mark,
+    /// so a read the rollback discarded is no longer one.
+    #[test]
+    fn a_recording_answers_has_read_for_the_transaction_under_it() {
+        let backend = MemoryBackend::new();
+        let mut txn = backend.begin().unwrap();
+        txn.validate_reads(true);
+        txn.get(b"before").unwrap();
+
+        let mut savepoints = Savepoints::default();
+        savepoints.savepoint("sp", txn.read_set(), None, Parameters::new());
+        {
+            let recording = Recording::new(&mut *txn, &mut savepoints);
+            assert!(
+                recording.has_read(b"before"),
+                "a read made before the savepoint is seen inside it"
+            );
+            recording.get(b"inside").unwrap();
+            assert!(recording.has_read(b"inside"), "and one made inside it");
+            assert!(!recording.has_read(b"never"), "and not one nobody made");
+        }
+        savepoints.rollback_to("sp", &mut *txn).unwrap();
+
+        assert!(txn.has_read(b"before"), "the read before the mark stays");
+        assert!(
+            !txn.has_read(b"inside"),
+            "the read the rollback discarded goes with it"
+        );
     }
 
     /// A `ROLLBACK TO` **after** the deadlock has already given the savepoint's locks back asks for
