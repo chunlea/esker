@@ -3884,6 +3884,7 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
                     if matches!(
                         call.func,
                         CatalogFunc::Concat
+                            | CatalogFunc::Format
                             | CatalogFunc::NullIf
                             | CatalogFunc::Greatest
                             | CatalogFunc::Least

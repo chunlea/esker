@@ -1405,6 +1405,10 @@ pub enum CatalogFunc {
     /// `concat(NULL, NULL)` is the empty string. Each argument is rendered by its own output
     /// function, so `concat('n=', 42, ' t=', true)` is `n=42 t=t` and a `numeric` keeps its scale.
     Concat,
+    /// `format(formatstr, …)`: `%s`, `%I`, `%L`, positions and widths, as PostgreSQL's
+    /// `text_format` reads them (`crate::value::format`). Variadic, and its arguments are rendered by
+    /// their own output functions, as `concat`'s are.
+    Format,
     /// `split_part(text, sep, n)`: the `n`th field, counting from 1 — or from the **end** when
     /// `n` is negative.
     ///
@@ -1602,6 +1606,7 @@ impl CatalogFunc {
             () if name.eq_ignore_ascii_case("current_date") => Some(CatalogFunc::CurrentDate),
             () if name.eq_ignore_ascii_case("random") => Some(CatalogFunc::Random),
             () if name.eq_ignore_ascii_case("concat") => Some(CatalogFunc::Concat),
+            () if name.eq_ignore_ascii_case("format") => Some(CatalogFunc::Format),
             () if name.eq_ignore_ascii_case("split_part") => Some(CatalogFunc::SplitPart),
             () if name.eq_ignore_ascii_case("string_to_array") => Some(CatalogFunc::StringToArray),
             () if name.eq_ignore_ascii_case("strpos") => Some(CatalogFunc::StrPos),
@@ -1737,6 +1742,7 @@ impl CatalogFunc {
             CatalogFunc::ClockTimestamp => "clock_timestamp",
             CatalogFunc::Random => "random",
             CatalogFunc::Concat => "concat",
+            CatalogFunc::Format => "format",
             CatalogFunc::SplitPart => "split_part",
             CatalogFunc::StringToArray => "string_to_array",
             CatalogFunc::StrPos => "strpos",
@@ -1880,7 +1886,10 @@ impl CatalogFunc {
             // Variadic: every arity from one up. `concat()` is the `42883` about the *number* of
             // arguments that a real server raises, so zero is not in the set.
             // Variadic, and one argument is legal: `GREATEST(1)` is `1`.
-            CatalogFunc::Concat | CatalogFunc::Greatest | CatalogFunc::Least => &CONCAT_ARITIES,
+            CatalogFunc::Concat
+            | CatalogFunc::Format
+            | CatalogFunc::Greatest
+            | CatalogFunc::Least => &CONCAT_ARITIES,
             CatalogFunc::SplitPart | CatalogFunc::Replace => &[3],
         }
     }
@@ -1922,6 +1931,7 @@ impl CatalogFunc {
             | CatalogFunc::JsonFetchText
             // `concat` answers `text` for the ordinary reason: it builds a string.
             | CatalogFunc::Concat
+            | CatalogFunc::Format
             | CatalogFunc::SplitPart
             | CatalogFunc::Substr
             | CatalogFunc::Substring

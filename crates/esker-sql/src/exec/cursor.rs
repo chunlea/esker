@@ -4095,6 +4095,7 @@ fn catalog_function(
                 .filter_map(PgDatum::to_text)
                 .collect::<String>(),
         ),
+        CatalogFunc::Format => crate::value::format::format(&args)?,
         CatalogFunc::ConvertTo => convert_to(args.first(), args.get(1))?,
         // The value's own type. An untyped NULL has none and is `text`, which is what it is
         // everywhere else in this crate.
