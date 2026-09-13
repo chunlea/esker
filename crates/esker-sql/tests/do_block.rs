@@ -7,9 +7,12 @@
 //! textual variants differ only in the type name, the labels, whether the created name is
 //! schema-qualified, and which of two schema predicates the guard uses.
 //!
-//! So this is not a PL/pgSQL engine and does not pretend to be. It runs that template and refuses
-//! everything else by name — which is contract C2's rule, and what ADR 0031 means by implementing
-//! what the capture shows.
+//! It was a template until 2026-09-13, and every other body was refused by name. [ADR 0113] made
+//! the block an ordinary body of the one PL/pgSQL interpreter, so these tests are now the check
+//! that the interpreter reads what the template read — forty of these a pass, in `enum_test.rb`
+//! and its neighbours. The subset itself is `tests/plpgsql_do.rs`.
+//!
+//! [ADR 0113]: ../../../docs/adr/0113-plpgsql-is-the-subset-the-suite-sends.md
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -97,38 +100,36 @@ fn the_guard_is_what_makes_a_second_run_a_no_op() {
     assert_eq!(error.sqlstate(), "22P02");
 }
 
-/// **Every other `DO` body is refused by name**, which is the honest half of a minimal interpreter.
+/// **A body that is not one of the old templates runs**, and so does the template's shape with a
+/// different verb inside it — the reading ADR 0058 refused and ADR 0113 builds.
 ///
-/// A node that ran the template and quietly *ignored* anything else would turn a missing feature
-/// into a wrong answer: `DO $$ BEGIN CREATE TABLE t (a int); END $$` really creates a table on a
-/// real server, and a silent no-op would leave the next statement to fail on the absence.
+/// ADR 0058's warning still stands behind it: a node that ran the template and *ignored* anything
+/// else would turn a missing feature into a wrong answer. `DO $$ BEGIN CREATE TABLE t (a int); END
+/// $$` really creates a table, and now it does here too.
 #[test]
-fn a_body_that_is_not_the_template_is_refused_by_name() {
+fn a_body_that_is_not_a_template_runs() {
     let mut node = parity::Node::new(&[]);
     for written in [
-        // Effects a no-op would swallow.
         "DO $$ BEGIN CREATE TABLE do_made_this (a int); END $$",
-        // `RAISE EXCEPTION` **left this list**: it is `P0001` now, through the error path, and
-        // `the_forms_around_the_templates_answer_as_postgresql_does` asserts it there.
         "DO $$ DECLARE n integer; BEGIN SELECT count(*) INTO n FROM pg_class; END $$",
         "DO $$ BEGIN NULL; END $$",
         "DO LANGUAGE plpgsql $$ BEGIN NULL; END $$",
-        // The template's shape with the wrong verb inside it: still not the template.
+        // The template's shape with a different verb inside it.
         "DO $$ BEGIN IF NOT EXISTS ( SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace \
          = n.oid WHERE t.typname = 'x' AND n.nspname = ANY (current_schemas(false)) ) THEN CREATE \
          TABLE \"x\" (a int); END IF; END $$",
     ] {
-        let error = node.run(written).unwrap_err();
-        assert_eq!(error.sqlstate(), "0A000", "for {written}");
-        assert!(
-            error.to_string().contains("DO"),
-            "the refusal names the construct: {error}"
+        assert_eq!(
+            node.answer(written).to_string(),
+            "(a command, no result set)",
+            "for {written}"
         );
     }
-    // And nothing was quietly created on the way through.
     assert_eq!(
-        node.rows("SELECT count(*) FROM pg_class WHERE relname = 'do_made_this'"),
-        [["0"]]
+        node.rows(
+            "SELECT relname FROM pg_class WHERE relname IN ('do_made_this', 'x') ORDER BY relname"
+        ),
+        [["do_made_this"], ["x"]]
     );
 }
 
@@ -140,8 +141,7 @@ fn a_body_that_is_not_the_template_is_refused_by_name() {
 /// blocks and none of these.
 ///
 /// What the tests read is the line `libpq` prints, so what matters is the severity word and the
-/// message. `INFO` and `EXCEPTION` are **not** implemented and are refused by name: the first has
-/// no severity token on this wire, and the second is an error rather than a notice.
+/// message. `INFO` and `LOG` are refused by name: there is no severity token for them on this wire.
 #[test]
 fn raise_notice_and_warning_reach_the_client() {
     let mut node = parity::Node::new(&[]);
@@ -172,13 +172,17 @@ fn raise_notice_and_warning_reach_the_client() {
     for written in [
         "do $$ BEGIN RAISE INFO 'i'; END; $$",
         "do $$ BEGIN RAISE LOG 'l'; END; $$",
-        // `EXCEPTION` is **not** in this list any more: it is not a severity this wire lacks, it
-        // is an error, and it answers `P0001`.
-        "do $$ BEGIN RAISE WARNING 'a', 'b'; END; $$",
     ] {
         let error = node.run(written).unwrap_err();
         assert_eq!(error.sqlstate(), "0A000", "for {written}");
     }
+    // **An argument with no `%` for it is PostgreSQL's own refusal**, measured, and it is decided
+    // before the subset's: `'a', 'b'` is `42601`, where `'a %', 'b'` would run on a real server.
+    assert_eq!(
+        node.answer("do $$ BEGIN RAISE WARNING 'a', 'b'; END; $$")
+            .to_string(),
+        "!42601 too many parameters specified for RAISE"
+    );
 }
 
 /// The forms around the two templates, with the capture's own answers.
@@ -235,7 +239,7 @@ fn the_forms_around_the_templates_answer_as_postgresql_does() {
         "!P0001 boom"
     );
 
-    // And what stays refused, by the ruling rather than by an absence: a body that is a program.
+    // And what ran only on a real server until ADR 0113: a body that is a program.
     for sql in [
         "DO $$ DECLARE n integer; BEGIN SELECT count(*) INTO n FROM pg_class; END $$",
         "DO $$ BEGIN CREATE TABLE do_made_this (a int); END $$",
@@ -243,7 +247,7 @@ fn the_forms_around_the_templates_answer_as_postgresql_does() {
     ] {
         assert_eq!(
             node.answer(sql).to_string(),
-            "!0A000 DO is not supported",
+            "(a command, no result set)",
             "{sql}"
         );
     }

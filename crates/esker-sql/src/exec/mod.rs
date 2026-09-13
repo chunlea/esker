@@ -42,6 +42,7 @@ mod index;
 mod job;
 
 pub use job::BATCH_ROWS;
+mod plpgsql;
 pub(crate) mod query;
 mod recursive;
 pub mod redrive;
@@ -202,6 +203,9 @@ pub struct Executor {
     /// rather than from the shared cache: they answer with its own uncommitted definitions, which
     /// must not reach the other sessions on this node (`crate::catalog`).
     catalog_written: bool,
+    /// How many PL/pgSQL bodies are running inside one another in this statement — a `DO` that
+    /// `EXECUTE`s a `DO` (`exec::plpgsql`).
+    plpgsql_depth: usize,
     /// The catalog version this transaction has already read, if it has read one.
     ///
     /// A `Cell` because `catalog_view` takes `&self` — it hands out a view that borrows the
@@ -838,6 +842,7 @@ impl Executor {
             last_sequence: None,
             savepoints: savepoint::Savepoints::default(),
             catalog_written: false,
+            plpgsql_depth: 0,
             catalog_version: std::cell::Cell::new(None),
             concurrent_build: None,
             read_as_of: None,
@@ -1174,15 +1179,7 @@ impl Executor {
         self.catalog_written |= statement.writes_catalog();
         self.forget_the_catalog_version();
         match statement {
-            // The `DO` block's whole effect: the message reaches the client at the severity that
-            // was written, and the statement's tag is `DO`.
-            Statement::Raise { message, severity } => {
-                self.notice(SqlError::Raised {
-                    message: message.clone(),
-                    severity: *severity,
-                });
-                Ok(Outcome::done("DO"))
-            }
+            Statement::Do { body } => self.run_do(txn, body, written),
             Statement::Truncate(truncate) => ddl::truncate(self, txn, truncate),
             Statement::CreateTable(create) => ddl::create_table(self, txn, create),
             Statement::CreateExtension(create) => ddl::create_extension(self, txn, create),
@@ -4439,7 +4436,7 @@ impl ExplainSubject {
 fn explain_lines(statement: &Statement) -> Vec<String> {
     match statement {
         Statement::Cursor(cursor) => vec![cursor.tag().to_owned()],
-        Statement::Raise { severity, .. } => vec![format!("Raise {}", severity.as_str())],
+        Statement::Do { .. } => vec!["Do".to_owned()],
         Statement::Truncate(truncate) => vec![format!("Truncate on {}", truncate.names.join(", "))],
         Statement::CreateTable(create) => vec![format!("Create Table on {}", create.name)],
         Statement::CreateExtension(create) => {

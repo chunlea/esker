@@ -131,18 +131,11 @@ impl Parsed {
         if let Some(cursor) = &self.cursor {
             return lower_cursor(cursor);
         }
-        // A `RAISE` block's tree is a placeholder (`crate::parse::strip_do_raise`): there is no
-        // statement it is a disguised form of, so the whole lowering is this.
-        if let Some((message, severity)) = self.raised() {
-            // **`RAISE EXCEPTION` is a failure, not a message about one.** It leaves here as an
-            // error so that the statement fails, the transaction aborts inside a block, and the
-            // client reads `P0001` — none of which a notice does.
-            if *severity == crate::error::Severity::Error {
-                return Err(SqlError::RaisedException(message.clone()));
-            }
-            return Ok(plan::Statement::Raise {
-                message: message.clone(),
-                severity: *severity,
+        // A `DO` block's tree is a placeholder (`crate::parse::read_do`): `sqlparser` has no `DO`,
+        // and the body is PL/pgSQL, read by `crate::plpgsql` when the statement runs.
+        if let Some(body) = self.do_block() {
+            return Ok(plan::Statement::Do {
+                body: body.to_owned(),
             });
         }
         // `REFRESH MATERIALIZED VIEW`'s tree is a placeholder too (`crate::parse::read_refresh`):
@@ -226,10 +219,7 @@ impl Parsed {
             }
             _ => {}
         }
-        // `create_enum`'s `DO` block is a guard around a `CREATE TYPE`, and the guard is the one
-        // thing the rewritten source cannot carry (`crate::parse::strip_do_create_enum`).
         if let plan::Statement::CreateType(create) = &mut lowered {
-            create.if_not_exists = self.is_do_guarded();
             // `NOT NULL` on a `CREATE DOMAIN` was cut out of the source so the statement would
             // parse (`crate::parse::strip_domain_not_null`).
             if let TypeKind::Domain { not_null, .. } = &mut create.kind {
@@ -996,7 +986,6 @@ fn lower_statement(
                     default: create.default.as_ref().map(ToString::to_string),
                     check,
                 },
-                if_not_exists: false,
             }))
         }
         Statement::DropDomain(drop) => Ok(plan::Statement::DropType(plan::DropType {
@@ -10002,12 +9991,7 @@ fn lower_create_type(
         // C function. There is nothing this node could put in one.
         None => return Err(SqlError::unsupported("CREATE TYPE with no definition")),
     };
-    Ok(plan::Statement::CreateType(plan::CreateType {
-        name,
-        kind,
-        // Set by the caller that can see the `DO` block this came out of, if it came out of one.
-        if_not_exists: false,
-    }))
+    Ok(plan::Statement::CreateType(plan::CreateType { name, kind }))
 }
 
 /// `COMMENT ON TABLE | COLUMN | INDEX <name> IS '…' | NULL`.

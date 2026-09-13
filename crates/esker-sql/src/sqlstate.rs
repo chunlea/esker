@@ -307,6 +307,9 @@ pub const UNDEFINED_OBJECT: &str = "42704";
 /// as the whole message. PostgreSQL's own class `P0` is "PL/pgSQL Error", and this is its first
 /// member.
 pub const RAISE_EXCEPTION: &str = "P0001";
+/// `0Z002` — `RAISE;` with no exception being handled. PostgreSQL's class `0Z` is "Diagnostics
+/// Exception", and this is its second member.
+pub const STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER: &str = "0Z002";
 /// A name that exists and is the wrong kind of thing — `DROP TABLE` naming an index. Not
 /// `42P01`: the object is there, it is just not what the statement can act on. Captured, because
 /// collapsing the two would tell a user their index does not exist.
@@ -401,6 +404,10 @@ mod tests {
         ("PROTOCOL_VIOLATION", super::PROTOCOL_VIOLATION),
         ("FEATURE_NOT_SUPPORTED", super::FEATURE_NOT_SUPPORTED),
         ("RAISE_EXCEPTION", super::RAISE_EXCEPTION),
+        (
+            "STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER",
+            super::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER,
+        ),
         (
             "INVALID_TEXT_REPRESENTATION",
             super::INVALID_TEXT_REPRESENTATION,
