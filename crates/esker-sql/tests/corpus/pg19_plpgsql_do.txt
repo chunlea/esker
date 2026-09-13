@@ -1,0 +1,260 @@
+# PL/pgSQL `DO` blocks — the subset ADR 0113 builds, and the forms just outside it — as a real
+# PostgreSQL 19beta1 answers them.
+#
+# Captured 2026-09-13 by lane s2-plpgsql with `sesscap.py`, in one session. The whole file runs
+# inside `BEGIN … ROLLBACK`, and **every statement PostgreSQL refuses, and every one this node
+# refuses by name, sits in its own `SAVEPOINT` / `ROLLBACK TO`** — ADR 0058's amendment is what a
+# capture without them costs: one refusal aborts the transaction and hides the rest of the file.
+# The last line proves the session left nothing behind.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`SELECT … INTO n` takes the first column of the first row and ignores the rest**: a
+#     three-row `SELECT … INTO n` and `SELECT 1, 2 INTO n` both answer `DO`, and no row assigns
+#     NULL.
+#   * **An assignment converts the way PL/pgSQL does**: `n = 7.6` stores 8, `n = '7'` stores 7
+#     through the text, and `n = 'abc'` is `22P02` for the integer. A `bigint` count into an
+#     integer is an ordinary assignment.
+#   * **`IF 1 THEN` is true**: a condition that is not a boolean is read through its text.
+#   * **`EXECUTE` of one string holding two statements runs both**, a `SELECT` it runs is thrown
+#     away, `EXECUTE NULL` is `22004`, and `EXECUTE 'BEGIN'` is PostgreSQL's own `0A000`.
+#   * **Rows with nowhere to go are `42601`**: a `SELECT` gets a HINT naming `PERFORM`, an
+#     `INSERT … RETURNING` gets the same sentence without one.
+#   * **A name that is both a variable and a column is `42702`**, not silently the variable.
+#   * **A malformed body answers sentences no SQL parser writes**: `missing "THEN" at end of SQL
+#     expression` when a `;` comes first and `syntax error at end of input` when the body ends
+#     first; `unexpected end of function definition at end of input` for a statement cut off.
+#   * **`RAISE WARNING 'a', 'b'` is `42601 too many parameters specified for RAISE`**, while
+#     `RAISE WARNING 'a %', 'b'` runs.
+#   * **An error part-way through a block undoes the block**: the row inserted before a duplicate
+#     key is not there afterwards.
+BEGIN		-
+CREATE TABLE s2p_t (id integer PRIMARY KEY, name text)		-
+DO $$ BEGIN NULL; END $$		-
+DO $$ DECLARE n integer; BEGIN SELECT count(*) INTO n FROM s2p_t; IF n = 0 THEN INSERT INTO s2p_t VALUES (1, 'empty'); END IF; END $$		-
+SELECT 'r', id, name FROM s2p_t ORDER BY id		r|1|empty
+DO $$ BEGIN IF false THEN INSERT INTO s2p_t VALUES (2, 'false'); END IF; END $$		-
+DO $$ BEGIN IF NULL THEN INSERT INTO s2p_t VALUES (3, 'null'); END IF; END $$		-
+DO $$ DECLARE n integer; BEGIN SELECT id INTO n FROM s2p_t WHERE id = 99; IF n IS NULL THEN INSERT INTO s2p_t VALUES (4, 'no row assigns null'); END IF; END $$		-
+DO $$ DECLARE n integer; BEGIN n = 5; INSERT INTO s2p_t VALUES (n, 'equals'); END $$		-
+DO $$ DECLARE n integer; BEGIN n := 6; INSERT INTO s2p_t VALUES (n, 'colon equals'); END $$		-
+DO $$ DECLARE n integer; BEGIN n = 7.6; INSERT INTO s2p_t VALUES (n, 'numeric rounds'); END $$		-
+DO $$ DECLARE n integer; t text; BEGIN t = 'empty'; SELECT id INTO n FROM s2p_t WHERE name = t; INSERT INTO s2p_t VALUES (n + 10, t || ' again'); END $$		-
+SELECT 'r', id, name FROM s2p_t ORDER BY id		r|1|empty ; r|4|no row assigns null ; r|5|equals ; r|6|colon equals ; r|8|numeric rounds ; r|11|empty again
+SAVEPOINT s1		-
+DO $$ DECLARE n integer; BEGIN n = 'abc'; END $$	!22P02 invalid input syntax for type integer: "abc"
+ROLLBACK TO s1		-
+DO $$ DECLARE r record; BEGIN FOR r IN (SELECT id, name FROM s2p_t WHERE id < 10 ORDER BY id) LOOP INSERT INTO s2p_t VALUES (r.id + 100, r.name || '!'); END LOOP; END $$		-
+DO $$ DECLARE r record; BEGIN FOR r IN SELECT id FROM s2p_t WHERE id = 1 LOOP UPDATE s2p_t SET name = 'looped' WHERE id = r.id; END LOOP; END $$		-
+DO $$ DECLARE r record; BEGIN FOR r IN SELECT id FROM s2p_t WHERE id < 0 LOOP INSERT INTO s2p_t VALUES (999, 'never'); END LOOP; END $$		-
+SELECT 'r', id, name FROM s2p_t ORDER BY id		r|1|looped ; r|4|no row assigns null ; r|5|equals ; r|6|colon equals ; r|8|numeric rounds ; r|11|empty again ; r|101|empty! ; r|104|no row assigns null! ; r|105|equals! ; r|106|colon equals! ; r|108|numeric rounds!
+DO $$ BEGIN EXECUTE 'INSERT INTO s2p_t VALUES (20, ''executed'')'; END $$		-
+DO $$ DECLARE r record; BEGIN FOR r IN (SELECT 'INSERT INTO s2p_t VALUES (21, ''from a row'')' AS stmt) LOOP EXECUTE (r.stmt); END LOOP; END $$		-
+DO $$ BEGIN EXECUTE 'INSERT INTO s2p_t VALUES (22, ''first of two''); INSERT INTO s2p_t VALUES (23, ''second of two'')'; END $$		-
+DO $$ BEGIN EXECUTE 'SELECT 1'; END $$		-
+DO $$ DECLARE tbl text; BEGIN tbl = 's2p_t'; EXECUTE 'DELETE FROM ' || tbl || ' WHERE id = 23'; END $$		-
+SELECT 'r', id, name FROM s2p_t WHERE id >= 20 ORDER BY id		r|20|executed ; r|21|from a row ; r|22|first of two ; r|101|empty! ; r|104|no row assigns null! ; r|105|equals! ; r|106|colon equals! ; r|108|numeric rounds!
+SAVEPOINT s2		-
+DO $$ BEGIN EXECUTE NULL; END $$	!22004 query string argument of EXECUTE is null
+ROLLBACK TO s2		-
+DO $$ BEGIN CREATE TABLE s2p_made (a int); END $$		-
+SELECT 'r', count(*) FROM pg_class WHERE relname = 's2p_made'	text,bigint	r|1
+SAVEPOINT s3		-
+DO $$ BEGIN INSERT INTO s2p_t VALUES (30, 'before the failure'); INSERT INTO s2p_t VALUES (1, 'duplicate'); END $$	!23505 duplicate key value violates unique constraint "s2p_t_pkey" DETAIL: Key (id)=(1) already exists.
+ROLLBACK TO s3		-
+SELECT 'r', count(*) FROM s2p_t WHERE id = 30		r|0
+SAVEPOINT s4		-
+DO $$ BEGIN RAISE EXCEPTION 'it''s bad'; END $$	!P0001 it's bad
+ROLLBACK TO s4		-
+SAVEPOINT s5		-
+DO $$ BEGIN SELECT 1; END $$	!42601 query has no destination for result data HINT: If you want to discard the results of a SELECT, use PERFORM instead.
+ROLLBACK TO s5		-
+SAVEPOINT s6		-
+DO $$ BEGIN nosuch = 1; END $$	!42601 "nosuch" is not a known variable
+ROLLBACK TO s6		-
+SAVEPOINT s7		-
+DO $$ DECLARE r record; BEGIN IF r.id = 1 THEN NULL; END IF; END $$	!55000 record "r" is not assigned yet DETAIL: The tuple structure of a not-yet-assigned record is indeterminate.
+ROLLBACK TO s7		-
+SAVEPOINT s8		-
+DO $$ DECLARE r record; BEGIN FOR r IN SELECT 1 AS a LOOP IF r.b = 1 THEN NULL; END IF; END LOOP; END $$	!42703 record "r" has no field "b"
+ROLLBACK TO s8		-
+SAVEPOINT s9		-
+DO $$ BEGIN IF true THEN NULL; END $$	!42601 syntax error at end of input
+ROLLBACK TO s9		-
+SAVEPOINT s10		-
+DO $$ BEGIN NULL END $$	!42601 syntax error at or near "END"
+ROLLBACK TO s10		-
+SAVEPOINT s11		-
+DO $$ DECLARE n integer BEGIN NULL; END $$	!42601 syntax error at or near "BEGIN"
+ROLLBACK TO s11		-
+SAVEPOINT s12		-
+DO $$ BEGIN SELECT 1 INTO nosuch; END $$	!42601 "nosuch" is not a known variable
+ROLLBACK TO s12		-
+SAVEPOINT s13		-
+DO $$ DECLARE n integer := 1; BEGIN IF n = 1 THEN NULL; ELSE NULL; END IF; END $$		-
+ROLLBACK TO s13		-
+SAVEPOINT s14		-
+DO $$ BEGIN PERFORM 1; END $$		-
+ROLLBACK TO s14		-
+SAVEPOINT s15		-
+DO $$ BEGIN RETURN; END $$		-
+ROLLBACK TO s15		-
+SAVEPOINT s16		-
+DO $$ BEGIN RETURN 1; END $$	!42804 RETURN cannot have a parameter in function returning void
+ROLLBACK TO s16		-
+SAVEPOINT s17		-
+DO $$ BEGIN WHILE false LOOP NULL; END LOOP; END $$		-
+ROLLBACK TO s17		-
+SAVEPOINT s18		-
+DO $$ BEGIN BEGIN NULL; END; END $$		-
+ROLLBACK TO s18		-
+SAVEPOINT s19		-
+DO $$ BEGIN NULL; EXCEPTION WHEN others THEN NULL; END $$		-
+ROLLBACK TO s19		-
+SELECT 'r', conname, convalidated FROM pg_constraint WHERE conname = 's2p_fk'	text,name,boolean	-
+SAVEPOINT a1		-
+DO $$ BEGIN IF true NULL; END IF; END $$	!42601 missing "THEN" at end of SQL expression
+ROLLBACK TO a1		-
+SAVEPOINT a2		-
+DO $$ BEGIN IF true $$	!42601 syntax error at end of input
+ROLLBACK TO a2		-
+SAVEPOINT a3		-
+DO $$ DECLARE n integer; BEGIN n = 1 $$	!42601 syntax error at end of input
+ROLLBACK TO a3		-
+SAVEPOINT a4		-
+DO $$ DECLARE r record; BEGIN FOR r IN SELECT 1 NULL; END LOOP; END $$	!42601 missing "LOOP" at end of SQL expression
+ROLLBACK TO a4		-
+SAVEPOINT a5		-
+DO $$ BEGIN RAISE WARNING 'a', 'b'; END $$	!42601 too many parameters specified for RAISE
+ROLLBACK TO a5		-
+SAVEPOINT a6		-
+DO $$ BEGIN RAISE NOTICE '100%'; END $$	!42601 too few parameters specified for RAISE
+ROLLBACK TO a6		-
+SAVEPOINT a7		-
+DO $$ BEGIN RAISE NOTICE '100%%'; END $$		-
+ROLLBACK TO a7		-
+SAVEPOINT a8		-
+DO $$ DECLARE n integer $$	!42601 incomplete data type declaration at end of input
+ROLLBACK TO a8		-
+SAVEPOINT a9		-
+DO $$ BEGIN RAISE NOTICE 'unterminated; END $$	!42601 unterminated quoted string at or near "'unterminated; END "
+ROLLBACK TO a9		-
+SAVEPOINT a10		-
+DO $$ DECLARE n integer; n integer; BEGIN NULL; END $$	!42601 duplicate declaration at or near "n"
+ROLLBACK TO a10		-
+SAVEPOINT a11		-
+DO $$ BEGIN NULL; END lbl $$	!42601 end label "lbl" specified for unlabeled block
+ROLLBACK TO a11		-
+SAVEPOINT a12		-
+DO $$ BEGIN ; END $$	!42601 syntax error at or near ";"
+ROLLBACK TO a12		-
+SAVEPOINT a13		-
+DO $$ BEGIN FOR n IN SELECT 1 LOOP NULL; END LOOP; END $$	!42601 loop variable of loop over rows must be a record variable or list of scalar variables
+ROLLBACK TO a13		-
+SAVEPOINT a14		-
+DO $$ BEGIN EXECUTE ; END $$	!42601 missing expression at or near ";"
+ROLLBACK TO a14		-
+SAVEPOINT a15		-
+DO $$ BEGIN IF THEN NULL; END IF; END $$	!42601 missing expression at or near "THEN"
+ROLLBACK TO a15		-
+SAVEPOINT a16		-
+DO $$ BEGIN NULL; $$	!42601 syntax error at end of input
+ROLLBACK TO a16		-
+SAVEPOINT a17		-
+DO $$ NULL; $$	!42601 syntax error at or near "NULL"
+ROLLBACK TO a17		-
+SAVEPOINT a18		-
+DO $$ BEGIN RAISE WARNING 'a %', 'b'; END $$		-
+ROLLBACK TO a18		-
+SAVEPOINT a19		-
+DO $$ BEGIN RAISE; END $$	!0Z002 RAISE without parameters cannot be used outside an exception handler
+ROLLBACK TO a19		-
+SAVEPOINT a20		-
+DO $$ BEGIN RAISE 'no level'; END $$	!P0001 no level
+ROLLBACK TO a20		-
+SAVEPOINT a21		-
+DO $$ BEGIN x.y = 1; END $$	!42601 "x.y" is not a known variable
+ROLLBACK TO a21		-
+SAVEPOINT a22		-
+DO $$ DECLARE n integer; BEGIN FOR n IN SELECT 1 LOOP NULL; END LOOP; END $$		-
+ROLLBACK TO a22		-
+SAVEPOINT a23		-
+DO $$ BEGIN FOR i IN 1..3 LOOP NULL; END LOOP; END $$		-
+ROLLBACK TO a23		-
+SAVEPOINT a24		-
+DO $$ DECLARE r record; BEGIN r = NULL; END $$		-
+ROLLBACK TO a24		-
+SAVEPOINT a25		-
+DO $$ BEGIN INSERT INTO nosuch_t VALUES (1) $$	!42601 unexpected end of function definition at end of input
+ROLLBACK TO a25		-
+SAVEPOINT a26		-
+DO $$ DECLARE n nosuchtype; BEGIN NULL; END $$	!42704 type "nosuchtype" does not exist
+ROLLBACK TO a26		-
+SAVEPOINT a27		-
+DO $$ BEGIN RAISE WARNING 'x' USING HINT = 'y'; END $$		-
+ROLLBACK TO a27		-
+SAVEPOINT a28		-
+DO $$ BEGIN RAISE INFO 'i'; END $$		-
+ROLLBACK TO a28		-
+SAVEPOINT a29		-
+DO $$ DECLARE found integer; BEGIN NULL; END $$		-
+ROLLBACK TO a29		-
+SAVEPOINT a30		-
+DO $$ BEGIN IF found THEN NULL; END IF; END $$		-
+ROLLBACK TO a30		-
+SAVEPOINT a31		-
+DO $$ BEGIN EXECUTE 'SELECT 1' INTO STRICT; END $$	!42601 syntax error at or near ";"
+ROLLBACK TO a31		-
+SAVEPOINT a32		-
+DO $$ DECLARE n integer; BEGIN SELECT 1, 2 INTO n; END $$		-
+ROLLBACK TO a32		-
+SAVEPOINT a33		-
+DO $$ DECLARE n integer; m integer; BEGIN SELECT 1, 2 INTO n, m; END $$		-
+ROLLBACK TO a33		-
+SAVEPOINT a34		-
+DO $$ DECLARE r record; BEGIN SELECT 1 AS a INTO r; END $$		-
+ROLLBACK TO a34		-
+SAVEPOINT a35		-
+DO $$ DECLARE n integer; BEGIN INSERT INTO nosuch_t VALUES (1) RETURNING 1 INTO n; END $$	!42P01 relation "nosuch_t" does not exist
+ROLLBACK TO a35		-
+SAVEPOINT a36		-
+DO $$ BEGIN RAISE EXCEPTION 'x' USING ERRCODE = 'P0002'; END $$	!P0002 x
+ROLLBACK TO a36		-
+SAVEPOINT a37		-
+DO $$ DECLARE n integer; BEGIN SELECT 1 INTO n FROM generate_series(1, 3); RAISE NOTICE 'n'; END $$		-
+ROLLBACK TO a37		-
+SAVEPOINT a38		-
+DO $$ BEGIN RAISE NOTICE '%%%'; END $$	!42601 too few parameters specified for RAISE
+ROLLBACK TO a38		-
+SAVEPOINT r1		-
+DO $$ BEGIN IF 1 THEN RAISE NOTICE 'one is true'; END IF; END $$		-
+ROLLBACK TO r1		-
+SAVEPOINT r2		-
+DO $$ DECLARE n integer; BEGIN n = 1, 2; END $$	!42601 assignment source returned 2 columns
+ROLLBACK TO r2		-
+SAVEPOINT r3		-
+DO $$ BEGIN EXECUTE 'BEGIN'; END $$	!0A000 EXECUTE of transaction commands is not implemented
+ROLLBACK TO r3		-
+DO $$ BEGIN EXECUTE 'DO $x$ BEGIN INSERT INTO s2p_t VALUES (41, ''nested''); END $x$'; END $$		-
+SAVEPOINT r4		-
+DO $$ DECLARE id integer; BEGIN SELECT name INTO id FROM s2p_t WHERE id = 1; END $$	!42702 column reference "id" is ambiguous DETAIL: It could refer to either a PL/pgSQL variable or a table column.
+ROLLBACK TO r4		-
+DO $$ DECLARE n integer; BEGIN INSERT INTO s2p_t VALUES (40, n::text); END $$		-
+SELECT 'r', id, name IS NULL FROM s2p_t WHERE id IN (40, 41) ORDER BY id		r|40|t ; r|41|f
+SAVEPOINT r5		-
+DO $$ DECLARE r record; BEGIN FOR r IN INSERT INTO s2p_t VALUES (42, 'returned') RETURNING id LOOP NULL; END LOOP; END $$		-
+ROLLBACK TO r5		-
+SAVEPOINT r6		-
+DO $$ BEGIN INSERT INTO s2p_t VALUES (43, 'x') RETURNING id; END $$	!42601 query has no destination for result data
+ROLLBACK TO r6		-
+SAVEPOINT r7		-
+DO $$ BEGIN SET LOCAL search_path = public; END $$		-
+ROLLBACK TO r7		-
+DO $$ DECLARE n bigint; BEGIN SELECT count(*) INTO n FROM s2p_t; INSERT INTO s2p_t VALUES (44, n::text); END $$		-
+SELECT 'r', name FROM s2p_t WHERE id = 44		r|16
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('s2p_t', 's2p_made')	bigint	0

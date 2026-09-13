@@ -1,0 +1,56 @@
+# `format()` — the function `check_all_foreign_keys_valid!` builds every statement it `EXECUTE`s
+# with — as a real PostgreSQL 19beta1 answers it.
+#
+# Captured 2026-09-13 by lane s2-plpgsql with `sesscap.py`, in one session inside `BEGIN … ROLLBACK`,
+# every refusal in its own `SAVEPOINT` / `ROLLBACK TO`.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A position moves the next argument**: `format('%2$s %s', 'a', 'b', 'c')` is `b c`, and
+#     `format('%2$s %s %s', …)` over three arguments is `too few arguments`.
+#   * **`%L` of a backslash is an escape string** — `E'back\\slash'` — and of a number is quoted:
+#     `'42'`. `%L` of NULL is the bare word `NULL`; `%s` of NULL is the empty string; `%I` of NULL
+#     is `22004`.
+#   * **A negative `*` width pads on the right**, like `-`.
+#   * **Arguments past the last one asked for are ignored**, and a NULL format string is NULL.
+#!escaped
+BEGIN		-
+SELECT 'r', format('%s|%s', true, 12.50)	text,text	r|t\|12.50
+SELECT 'r', format('%5s|%-5s|', 'a', 'b')	text,text	r|    a\|b    \|
+SELECT 'r', format('%*s|', 4, 'x')	text,text	r|   x\|
+SELECT 'r', format('%-*s|', 4, 'x')	text,text	r|x   \|
+SELECT 'r', format('%*s|', -4, 'x')	text,text	r|x   \|
+SAVEPOINT f0		-
+SELECT 'r', format('%2$s %s %s', 'a', 'b', 'c')	!22023 too few arguments for format()
+ROLLBACK TO f0		-
+SELECT 'r', format('%2$s %s', 'a', 'b', 'c')	text,text	r|b c
+SELECT 'r', format('%L', 'back\slash')	text,text	r|E'back\\\\slash'
+SELECT 'r', format('%L %L', 42, true)	text,text	r|'42' 't'
+SELECT 'r', format('%I', 'Mixed')	text,text	r|"Mixed"
+SELECT 'r', format('only text')	text,text	r|only text
+SELECT 'r', format('%s', 'extra', 'ignored')	text,text	r|extra
+SELECT 'r', format(NULL) IS NULL	text,boolean	r|t
+SELECT 'r', format('%s', ARRAY[1,2])	text,text	r|{1,2}
+SELECT 'r', format('%s', NULL::integer) = ''	text,boolean	r|t
+SELECT 'r', format('%I', 'a"b')	text,text	r|"a""b"
+SELECT 'r', format('%3$s', 'a', 'b', 'c')	text,text	r|c
+SAVEPOINT f1		-
+SELECT format('%')	!22023 unterminated format() type specifier HINT: For a single "%" use "%%".
+ROLLBACK TO f1		-
+SAVEPOINT f2		-
+SELECT format('%0$s', 'a')	!22023 format specifies argument 0, but arguments are numbered from 1
+ROLLBACK TO f2		-
+SAVEPOINT f3		-
+SELECT format('%1$s %2$s', 'a')	!22023 too few arguments for format()
+ROLLBACK TO f3		-
+SAVEPOINT f4		-
+SELECT format()	!42883 function format() does not exist DETAIL: No function of that name accepts the given number of arguments.
+ROLLBACK TO f4		-
+SAVEPOINT f5		-
+SELECT format('%5')	!22023 unterminated format() type specifier HINT: For a single "%" use "%%".
+ROLLBACK TO f5		-
+ROLLBACK		-

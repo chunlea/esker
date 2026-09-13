@@ -87,6 +87,38 @@ fn foreign_key_of(oid: i64) -> Option<(u64, usize)> {
     Some((below >> FOREIGN_KEY_INDEX_BITS, at))
 }
 
+/// Which stored `validated` flag a `pg_constraint` row names — the `NOT VALID` state.
+///
+/// **Only a `FOREIGN KEY` and a table's `CHECK` store one**, and they are the only two kinds the one
+/// write to this catalog the node takes may change (`crate::exec`'s `catalog_write`, ADR 0113).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidatedFlag {
+    /// A foreign key.
+    ForeignKey {
+        /// The table it is on.
+        table: u64,
+        /// Its position among the table's foreign keys.
+        at: usize,
+    },
+    /// A `CHECK`.
+    Check {
+        /// The table it is on.
+        table: u64,
+        /// Its position among the table's checks.
+        at: usize,
+    },
+}
+
+/// The flag a `pg_constraint` oid names, or `None` for a constraint that stores none — a primary
+/// key, a `UNIQUE`, a `NOT NULL`, an exclusion, a domain's.
+#[must_use]
+pub fn validated_flag_of(oid: i64) -> Option<ValidatedFlag> {
+    if let Some((table, at)) = foreign_key_of(oid) {
+        return Some(ValidatedFlag::ForeignKey { table, at });
+    }
+    check_of(oid).map(|(table, at)| ValidatedFlag::Check { table, at })
+}
+
 /// `{2}` / `{1,3}` — attribute numbers as an `int2vector` prints them.
 pub(super) fn attnum_vector(table: &TableDef, ordinals: &[usize]) -> String {
     let numbers: Vec<String> = ordinals

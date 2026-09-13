@@ -70,18 +70,16 @@ pub use time_machine::TimeMachineVerb;
 /// equals itself.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    /// `DO $$ BEGIN RAISE NOTICE | WARNING '<text>'; END $$` — the suite's *other* `DO` body.
+    /// `DO $$ … $$` — an anonymous PL/pgSQL block
+    /// ([ADR 0113](../../../../docs/adr/0113-plpgsql-is-the-subset-the-suite-sends.md)).
     ///
-    /// `postgresql_adapter_test.rb` raises one to exercise `db_warnings_action`, so what the test
-    /// needs is the message reaching the client at the severity that was written. There is no
-    /// PL/pgSQL here: one `RAISE` of a literal is a statement, and every other body is refused by
-    /// name (`crate::parse::strip_do_raise`).
-    Raise {
-        /// The text between the quotes, with `''` already unescaped.
-        message: String,
-        /// `NOTICE` or `WARNING`. `INFO`, `LOG` and `DEBUG` have no severity on this wire and are
-        /// refused by name rather than downgraded into one that would print the wrong word.
-        severity: crate::error::Severity,
+    /// The body travels as written and is read when the statement runs, inside the statement's own
+    /// transaction (`crate::exec`'s interpreter). A `DO` is one statement to the session: its tag is
+    /// `DO`, it returns no rows, and the statements its body runs say for themselves what they
+    /// write.
+    Do {
+        /// The text between the dollar quotes.
+        body: String,
     },
     /// `CREATE TABLE`.
     CreateTable(CreateTable),
@@ -212,9 +210,10 @@ impl Statement {
                 | Statement::Delete(_)
                 // Runs nothing.
                 | Statement::Explain(..)
-                // A message to the client, and `SET`/`SHOW`, which are session state and not
-                // catalog state — `crate::parameter` owns them and no cache reads them.
-                | Statement::Raise { .. }
+                // `SET`/`SHOW`, which are session state and not catalog state —
+                // `crate::parameter` owns them and no cache reads them — and a `DO`, whose body's
+                // statements each say for themselves, as they run, whether they write it.
+                | Statement::Do { .. }
                 | Statement::Session(_)
                 // A cursor reads; `DECLARE` runs its query and the rest walk the rows it read.
                 | Statement::Cursor(_)
@@ -306,9 +305,9 @@ impl Statement {
             // snapshot it is refused like any other. Flashing back while reading the past would be
             // writing the present from a transaction that may not write.
             Statement::TimeMachine(TimeMachineVerb::Flashback { .. }) => Some("esker_flashback"),
-            // A `RAISE` writes nothing: it is allowed in a read-only transaction and against the
-            // past, exactly as `SELECT` is.
-            Statement::Raise { .. }
+            // A `DO` is allowed wherever its body's statements are, and each of them is refused by
+            // its own rule as it runs.
+            Statement::Do { .. }
             | Statement::TimeMachine(_)
             | Statement::Select(_)
             | Statement::Explain(..)
@@ -344,7 +343,7 @@ impl Statement {
     pub fn tag(&self) -> &'static str {
         match self {
             // The tag is the outer statement's, not the body's: a real server answers `DO`.
-            Statement::Raise { .. } => "DO",
+            Statement::Do { .. } => "DO",
             Statement::Truncate(_) => "TRUNCATE TABLE",
             Statement::CreateTable(_) => "CREATE TABLE",
             Statement::CreateMaterializedView(_) => "CREATE MATERIALIZED VIEW",

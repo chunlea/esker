@@ -1,8 +1,9 @@
 # Plan — the PL/pgSQL subset: `DO` blocks and row triggers
 
 Status: **written before any code** (lane s2-plpgsql, 2026-09-13, branch `plpgsql` from `2177e244`).
-[ADR 0113](../adr/0113-plpgsql-is-the-subset-the-suite-sends.md) is the decision and is Proposed;
-this file is the census it rests on and the order of work.
+[ADR 0113](../adr/0113-plpgsql-is-the-subset-the-suite-sends.md) is the decision, **accepted by
+the user on 2026-09-13** together with option (b) of §6; this file is the census it rests on and
+the order of work.
 
 **Authority.** The user ruled on 2026-09-13 that the node's remaining capability gaps are to be
 closed. That reopens two standing rulings this file would otherwise have to obey:
@@ -155,8 +156,10 @@ passing with the row in the child. That is part of C's acceptance, not an aftert
   the way an `INSERT` into a column of that type does. A `record` has no shape until a `FOR`
   assigns a row; a field is the column of that name in the query's result.
 * **`SELECT <expr> INTO <variable> …`**: the `INTO <variable>` is cut out of the fragment, the
-  `SELECT` runs, and the first row's only column is assigned. **No row assigns `NULL`** (not
-  `STRICT`, PostgreSQL's default). One target and one column; anything else is §11.
+  `SELECT` runs, and the first row's first column is assigned. **No row assigns `NULL`** (not
+  `STRICT`, PostgreSQL's default), and **columns and rows past the first are ignored** —
+  `SELECT 1, 2 INTO n` and a three-row `SELECT … INTO n` both answer `DO`, measured. One target;
+  a list of targets or a record target is §11.
 * **A `SELECT` with no `INTO`** is PostgreSQL's `42601 query has no destination for result data`
   (captured in B before it is asserted).
 * **`IF`**: the condition runs as a `SELECT` of it; `NULL` is false.
@@ -166,9 +169,21 @@ passing with the row in the child. That is part of C's acceptance, not an aftert
 * **`EXECUTE <expr>`**: the expression is evaluated to text, parsed as one or more statements, and
   each runs in turn; rows are discarded (fact 4).
 * **`RAISE`**: `NOTICE` and `WARNING` through `Executor::notice`, the path ADR 0058's template uses;
-  `EXCEPTION` is `P0001` with the literal as the whole message.
-* **`RETURN NEW | OLD | NULL`** in a trigger function: a `BEFORE` trigger's returned row replaces
-  the row being written, `NULL` skips it; an `AFTER` trigger's is ignored.
+  `EXCEPTION` — and a `RAISE` with no level, which means it — is `P0001` with the literal as the
+  whole message. `%%` in the literal is `%`, and a lone `%` with no argument is PostgreSQL's
+  `42601 too few parameters specified for RAISE` (`'100%'` and `'%%%'`, measured). A bare
+  `RAISE;` is PostgreSQL's own `0Z002 RAISE without parameters cannot be used outside an exception
+  handler`, which is every place it can appear in the subset.
+* **`RETURN`**: in a trigger function `RETURN NEW | OLD | NULL` — a `BEFORE` trigger's returned row
+  replaces the row being written, `NULL` skips it, an `AFTER` trigger's is ignored. In a `DO`,
+  `RETURN;` ends the block and `RETURN <expr>` is PostgreSQL's
+  `42804 RETURN cannot have a parameter in function returning void`.
+* **A malformed body answers PostgreSQL's sentence**, all measured: an expression cut off by `;`
+  is `missing "THEN" | "LOOP" at end of SQL expression`, one cut off by the end of the body is
+  `syntax error at end of input`, an SQL statement cut off by it is `unexpected end of function
+  definition at end of input`, an empty one is `missing expression at or near "<token>"`, an
+  unknown target is `"x" is not a known variable`, and a declaration's own are
+  `incomplete data type declaration at end of input` and `duplicate declaration at or near "n"`.
 
 ## 5. Execution model
 
@@ -213,7 +228,10 @@ passing with the row in the child. That is part of C's acceptance, not an aftert
 D3 needs five things. One of them is PL/pgSQL.
 
 1. **`format()`** — `%s`, `%I`, `%L`, `%%` and the positional `%n$` form (fact 7). Not implemented:
-   `plan/expr.rs` has `format_type` and no `format`. Width and `-` flags are not in the census.
+   `plan/expr.rs` has `format_type` and no `format`. Width and `-` flags are not in the census,
+   and they are built anyway: the capture of `format()` pins them (`pg19_format.txt`) and they are
+   a few lines, where a declared divergence would have been a sentence per row. Only a positional
+   width, `%*2$s`, is refused by name.
 2. **`regnamespace`** — text → `regnamespace`, `oid` → `regnamespace`, and `=` between two
    (fact 8). Not implemented; built the way `regclass` and `regproc` are
    ([ADR 0098](../adr/0098-regproc-is-an-oid-that-prints-as-a-function.md)).
@@ -238,7 +256,11 @@ D3 needs five things. One of them is PL/pgSQL.
   write stays `42501`. No record kind, no field, no format change.
 
 Recommended: **(b)** — it is the last obstacle for those three tests, and what it writes is a state
-the catalog already represents. B builds everything else first; its last slice follows the answer.
+the catalog already represents.
+
+**Ruled (b) by the user, 2026-09-13.** Only `convalidated`, only on the flag a foreign key or a
+`CHECK` already stores; every other write to a system catalog stays `42501`; no format change. B's
+last slice builds it.
 
 ## 7. Triggers
 
@@ -330,7 +352,7 @@ by the function's name and body, and never stored.
 |---|---|---|---|
 | `user_decided_divergences.rs::a_do_block_with_a_loop_is_refused_by_name` | `!0A000 DO is not supported` | PostgreSQL's `DO` | 2026-09-13 |
 | `user_decided_divergences.rs::the_create_enum_guard_is_still_read` | the template | the same answer, through the interpreter | — |
-| `user_decided_divergences.rs::a_write_to_a_system_catalog_is_refused` | three statements → `42501` | **unchanged unless ruled (b)**; then the `pg_constraint` row answers and the other two stay | §6 |
+| `user_decided_divergences.rs::a_write_to_a_system_catalog_is_refused` | three statements → `42501` | the `pg_constraint` row answers PostgreSQL's `UPDATE 0`; the `pg_depend` and `pg_class` rows stay `42501` | §6, ruled (b) |
 | `do_block.rs::a_body_that_is_not_the_template_is_refused_by_name` | five bodies → `0A000` | each as `pg19_do_block.txt` answers it; the by-name half moves to constructs outside the subset | 2026-09-13 |
 | `do_block.rs::the_forms_around_the_templates_answer_as_postgresql_does` | three bodies → `0A000 DO` | the capture's answers | 2026-09-13 |
 | `do_block.rs::raise_notice_and_warning_reach_the_client` | `RAISE INFO`, `LOG`, `WARNING 'a', 'b'` → `0A000` | unchanged: outside the subset | — |
@@ -354,8 +376,8 @@ record of a tag and is not edited; the new state lives here and in ADR 0113.
 3. `FOR … IN <query> LOOP`, record fields, `EXECUTE` of one and of two statements.
 4. `format()`.
 5. `regnamespace`.
-6. D3 end to end — to `42501` at the `UPDATE` under (a); under (b), the narrow write and the three
-   suite shapes: clean → `DO`, a violation → `23503` naming the table, two schemas → `DO`.
+6. D3 end to end, as ruled (b): the narrow `pg_constraint` write and the three suite shapes —
+   clean → `DO`, a violation → `23503` naming the table, two schemas → `DO`.
 
 Capture `tests/corpus/pg19_plpgsql_do.txt` in one session, `BEGIN … ROLLBACK`, **a savepoint around
 every statement** — ADR 0058's amendment is what a capture without them costs. Handover.
@@ -381,15 +403,16 @@ Refused by name with `0A000`, or left as it is:
   subtransaction), `GET DIAGNOSTICS`, `PERFORM`, `ASSERT`, `CALL`, `COMMIT` or `ROLLBACK` in a body,
   `RETURN NEXT`, `RETURN QUERY`, `RETURN <expr>` outside a trigger, cursors (`OPEN`, `FETCH`,
   `MOVE`, `CLOSE`, `refcursor`, a `CURSOR` declaration), `EXECUTE … INTO` and `… USING`,
-  `SELECT … INTO STRICT`, `SELECT` into more than one target or of more than one column, `%TYPE`,
+  `SELECT … INTO STRICT`, `SELECT` into more than one target or into a record, `%TYPE`,
   `%ROWTYPE`, `ALIAS`, `CONSTANT`, `NOT NULL` or `:= <default>` in a declaration, `RAISE` with
   format arguments, with `USING`, or at `INFO`, `LOG` or `DEBUG`, the `TG_*` variables.
 * **Functions**: a function called from SQL (`SELECT f()` stays `0A000`), arguments, a return type
   other than `trigger` taking effect, procedures.
 * **Validation at `CREATE FUNCTION`**: PostgreSQL parses the body there; this node stores it, as it
   has since the define-only unit (`pg19_trigger_function.txt`'s `tf_badbody` row).
-* **`plpgsql.variable_conflict`'s `42702`** for a name that is both a variable and a column: the
-  variable is substituted.
+* **`plpgsql.variable_conflict`'s other settings.** Its default, `error`, **is** built — a name that
+  is both a variable and a column of the statement's relation is `42702` with PostgreSQL's `DETAIL`,
+  measured — so this line is only `use_variable` and `use_column`.
 * **A `CONTEXT` line** on an error raised inside a body.
 * **Triggers**: statement-level, `WHEN`, `UPDATE OF`, arguments, `TRUNCATE`, `INSTEAD OF`,
   constraint triggers, transition tables (`REFERENCING`), on partitioned tables or partitions, event
@@ -414,3 +437,14 @@ suite does not send them, and the brief's scope is the census: no more, no less.
    parsed once per function, not once per row.
 6. **A restart re-runs a body** (§5), so a notice can repeat.
 7. **Wire: none. Format: none (§8). Dependencies: none.**
+
+## 13. Progress
+
+| slice | commit | what |
+|---|---|---|
+| A | `bd0f9c83`, `4a2d70e2` | this plan and ADR 0113; the ADR accepted and §6 ruled (b) |
+| B1 | `ea72350d` | the reader: tokenizer, grammar, PostgreSQL's sentences for a malformed body |
+| B2 + B3 | `83815c76` | the interpreter and `Statement::Do` — `FOR` and `EXECUTE` landed with it rather than after; the templates removed; `pg19_plpgsql_do.txt` |
+| B4 | `5cae182d` | `format()`, widths included; `pg19_format.txt` |
+| B6 | — | the `pg_constraint.convalidated` write, and the census block with its schema predicate left out |
+| B5 | — | `regnamespace`: a type with additive tags, waiting on `esker-coord/QUESTION-s2-regnamespace.md` for an ADR number |
