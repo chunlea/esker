@@ -63,9 +63,9 @@ pub enum TxnWrite {
         /// **The snapshot this value was computed from**, or `None` for "the transaction's own"
         /// (ADR 0057 §4).
         ///
-        /// `None` in the log today: this is a **replicated** command, so carrying it is a log
-        /// format change as well as a wire one, and both wait for the human's ruling. The field is
-        /// here so that everything above it is built and tested; the encoding is untouched.
+        /// `None` is kind 1 and `Some` is kind 3. This is a **replicated** command, so a kind a
+        /// peer does not know stops that peer's apply rather than being skipped — which is why
+        /// every store understands an addition before any client sends it (`VERB_RELEASE_LOCK`).
         read_ts: Option<u64>,
     },
     /// Remove `key`.
@@ -78,8 +78,12 @@ pub enum TxnWrite {
     /// **A key a SERIALIZABLE transaction read**, verified and locked but never written
     /// ([ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
     Check {
-        /// The user key that was read.
+        /// The user key that was read or locked.
         key: Bytes,
+        /// As [`TxnMutation::Check::read_ts`]: `None` is kind 5, and `Some` is kind 7 — the eager
+        /// row lock at a statement's snapshot
+        /// ([ADR 0114](../../../docs/adr/0114-a-unique-key-being-written-waits-at-read-committed.md) §2).
+        read_ts: Option<u64>,
     },
     /// **A range a SERIALIZABLE transaction scanned.** The phantom half: a row that did not exist
     /// when the scan ran is in no read set, and only the range can name it.
@@ -96,7 +100,7 @@ impl TxnWrite {
     #[must_use]
     pub fn key(&self) -> &Bytes {
         match self {
-            Self::Put { key, .. } | Self::Delete { key, .. } | Self::Check { key } => key,
+            Self::Put { key, .. } | Self::Delete { key, .. } | Self::Check { key, .. } => key,
             // A range is addressed by its lower bound, as every range request is.
             Self::CheckRange { start, .. } => start,
         }
@@ -119,7 +123,10 @@ impl TxnWrite {
                 key: key.clone(),
                 read_ts: *read_ts,
             },
-            Self::Check { key } => TxnMutation::Check { key: key.clone() },
+            Self::Check { key, read_ts } => TxnMutation::Check {
+                key: key.clone(),
+                read_ts: *read_ts,
+            },
             Self::CheckRange { start, end } => TxnMutation::CheckRange {
                 start: start.clone(),
                 end: end.clone(),
@@ -232,7 +239,10 @@ impl TxnCommand {
                             key: key.clone(),
                             read_ts: *read_ts,
                         },
-                        TxnMutation::Check { key } => TxnWrite::Check { key: key.clone() },
+                        TxnMutation::Check { key, read_ts } => TxnWrite::Check {
+                            key: key.clone(),
+                            read_ts: *read_ts,
+                        },
                         TxnMutation::CheckRange { start, end } => TxnWrite::CheckRange {
                             start: start.clone(),
                             end: end.clone(),
@@ -360,9 +370,19 @@ impl TxnCommand {
                         }
                         // Kinds 5 and 6, beside the four: a check carries no value and a range
                         // carries two keys (ADR 0067 §1).
-                        TxnWrite::Check { key } => {
+                        TxnWrite::Check { key, read_ts: None } => {
                             out.put_u8(5);
                             out.put_bytes(key);
+                        }
+                        // Kind 7: a check at a statement's snapshot, the timestamp after the key —
+                        // the shape kinds 3 and 4 gave a put and a delete (ADR 0114 §2).
+                        TxnWrite::Check {
+                            key,
+                            read_ts: Some(read_ts),
+                        } => {
+                            out.put_u8(7);
+                            out.put_bytes(key);
+                            out.put_varint(*read_ts);
                         }
                         TxnWrite::CheckRange { start, end } => {
                             out.put_u8(6);
@@ -454,10 +474,15 @@ impl TxnCommand {
                         },
                         5 => TxnWrite::Check {
                             key: bytes(input, "txn.write.key")?,
+                            read_ts: None,
                         },
                         6 => TxnWrite::CheckRange {
                             start: bytes(input, "txn.write.start")?,
                             end: bytes(input, "txn.write.end")?,
+                        },
+                        7 => TxnWrite::Check {
+                            key: bytes(input, "txn.write.key")?,
+                            read_ts: Some(varint(input, "txn.write.read_ts")?),
                         },
                         other => {
                             return Err(ProtoError::corrupt(
@@ -595,6 +620,36 @@ mod tests {
                 start_ts: 10,
                 primary: Bytes::from_static(b"p"),
                 ttl_ms: 60_000,
+            },
+            // Every kind that carries more than the first two do: a read timestamp on a put and a
+            // delete (3, 4), a check with none and with one (5, 7), and a range (6).
+            TxnCommand::Prewrite {
+                start_ts: 10,
+                primary: Bytes::from_static(b"a"),
+                ttl_ms: 3_000,
+                writes: vec![
+                    TxnWrite::Put {
+                        key: Bytes::from_static(b"a"),
+                        value: Bytes::from_static(b"1"),
+                        read_ts: Some(15),
+                    },
+                    TxnWrite::Delete {
+                        key: Bytes::from_static(b"b"),
+                        read_ts: Some(1 << 41),
+                    },
+                    TxnWrite::Check {
+                        key: Bytes::from_static(b"c"),
+                        read_ts: None,
+                    },
+                    TxnWrite::CheckRange {
+                        start: Bytes::from_static(b"d"),
+                        end: Bytes::from_static(b"e"),
+                    },
+                    TxnWrite::Check {
+                        key: Bytes::from_static(b"f"),
+                        read_ts: Some(15),
+                    },
+                ],
             },
         ]
     }

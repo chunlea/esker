@@ -618,9 +618,12 @@ pub fn prewrite(
                 TxnMutation::Put { read_ts, .. } | TxnMutation::Delete { read_ts, .. } => {
                     read_ts.unwrap_or(start_ts)
                 }
-                // A check validates against the transaction's own snapshot: what it asserts is
-                // that the key it *read* has not moved since.
-                TxnMutation::Check { .. } | TxnMutation::CheckRange { .. } => start_ts,
+                // A read-set check validates against the transaction's own snapshot: what it
+                // asserts is that the key it *read* has not moved since. An eager row lock says
+                // which statement's snapshot it read the row at, and is validated there
+                // (ADR 0114 §2).
+                TxnMutation::Check { read_ts, .. } => read_ts.unwrap_or(start_ts),
+                TxnMutation::CheckRange { .. } => start_ts,
             },
             ttl_ms,
             op: match mutation {

@@ -159,6 +159,7 @@ fn a_key_held_by_a_read_keeps_its_value_through_a_collection() {
         21,
         TxnMutation::Check {
             key: Bytes::from_static(KEY),
+            read_ts: None,
         },
     );
     assert_eq!(

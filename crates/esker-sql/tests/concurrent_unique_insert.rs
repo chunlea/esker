@@ -21,17 +21,17 @@
 //! The first two tests are the deterministic halves of the READ COMMITTED row: the second writer
 //! **waits** for the first, and is then the duplicate PostgreSQL says it is, or goes through. What
 //! Rails does after the duplicate — a `SELECT … FOR UPDATE` of the row the first writer committed —
-//! is the ADR's §2, which is a format question and is not built.
+//! is the ADR's §2: the eager lock validated at the statement's snapshot, ruled and built on
+//! 2026-09-13.
 //!
 //! **§3's tests** — ruled 2026-09-13, (ii) with the arbiter rule — are SERIALIZABLE's `40001` for a
 //! key read before it was inserted (case 09) and the rest of §3's table: the sequences
 //! `unique_race` shares with `serializable.rs`, which runs them against `MemoryBackend`.
 //!
-//! **Two tests are red, and are `#[ignore]`d until the user rules**: §2's `FOR UPDATE` of a row
-//! committed after the transaction began (debt #91), and `relations_test.rb`'s duel itself, which
-//! needs §1 and §2 both. Each reason names the section and the question it waits for; they still
-//! compile and clippy still reads them, and
-//! `cargo nextest run -p esker-sql --test concurrent_unique_insert --run-ignored only` runs them.
+//! **§2's tests** — ruled 2026-09-13, a `Check` that carries the statement's read timestamp — are a
+//! `FOR UPDATE` of a row committed after the transaction began (debt #91), its REPEATABLE READ twin,
+//! which §2 must not move, and `relations_test.rb`'s duel itself, which needs §1 and §2 both. The
+//! first and the duel were red and `#[ignore]`d while the ruling waited.
 //!
 //! Every test here runs against three real stores, and both sessions are on one node: the wait is
 //! ADR 0057's node-local row lock, and one node is the Rails suite's shape.
@@ -119,21 +119,18 @@ fn a_second_insert_of_a_unique_key_waits_and_goes_through_when_the_first_rolls_b
     assert_eq!(bobs(&cluster), "1");
 }
 
-/// **§2's red test: a `FOR UPDATE` of a row another transaction committed after this one began takes
-/// the lock, at READ COMMITTED.** PostgreSQL 19 (`esker-coord/s1-oracle-2026-09-13/e/`): a row updated
+/// **§2: a `FOR UPDATE` of a row another transaction committed after this one began takes the lock,
+/// at READ COMMITTED.** PostgreSQL 19 (`esker-coord/s1-oracle-2026-09-13/e/`): a row updated
 /// after the locker's first statement comes back at its new value, `11`, and a row inserted after it
 /// comes back too, `20`.
 ///
-/// Here the lock is ADR 0088's eager one, a `Check` prewritten when the statement runs, and a `Check`
-/// is validated at the transaction's `start_ts` — so both are refused `40001 could not serialize
-/// access due to concurrent update: a commit at … beat this transaction at …`. No unique index is in
-/// it, which is why it is a test of its own: this is every `lock!` in a block that began before
-/// somebody else's update of the row.
-///
-/// `#[ignore]`d rather than left red, because the fix is a wire and log format change that waits for a
-/// ruling (debt #91) and a red test cannot land.
+/// Here the lock is ADR 0088's eager one, a `Check` prewritten when the statement runs. A `Check` was
+/// validated at the transaction's `start_ts`, so both were refused `40001 could not serialize access
+/// due to concurrent update: a commit at … beat this transaction at …` (debt #91); it now carries the
+/// statement's read timestamp and is validated there. No unique index is in it, which is why it is a
+/// test of its own: this is every `lock!` in a block that began before somebody else's update of the
+/// row.
 #[test]
-#[ignore = "red until ruled on — ADR 0114 §2, debt #91; QUESTION-s1 question 1"]
 fn a_for_update_of_a_row_committed_after_the_transaction_began_takes_the_lock() {
     let cluster = Cluster::start();
     let mut setup = cluster.session();
@@ -162,6 +159,46 @@ fn a_for_update_of_a_row_committed_after_the_transaction_began_takes_the_lock() 
     for locker in [&mut updater, &mut inserter] {
         let _ = locker.run("ROLLBACK");
     }
+}
+
+/// **§2's REPEATABLE READ twin stays what it was.** PostgreSQL 19 (`e3` and `e4` in
+/// `esker-coord/s1-oracle-2026-09-13/e/`): a transaction snapshot sees neither commit, so a `FOR
+/// UPDATE` of the row updated after it is `40001 could not serialize access due to concurrent update`,
+/// and one of the row inserted after it finds no row and commits. REPEATABLE READ sets no statement
+/// timestamp, so its lock is still tag 5 at `start_ts`: this is the guard that §2 did not reach it.
+#[test]
+fn a_for_update_at_repeatable_read_keeps_the_transaction_s_snapshot() {
+    let cluster = Cluster::start();
+    let mut setup = cluster.session();
+    setup
+        .run("CREATE TABLE lk (id bigint primary key, n bigint)")
+        .unwrap();
+    setup.run("INSERT INTO lk VALUES (1, 10)").unwrap();
+
+    let mut updater = cluster.session();
+    let mut inserter = cluster.session();
+    for locker in [&mut updater, &mut inserter] {
+        locker.run("BEGIN").unwrap();
+        locker
+            .run("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .unwrap();
+        locker.rows("SELECT count(*) FROM lk");
+    }
+    let mut other = cluster.session();
+    other.run("UPDATE lk SET n = 11 WHERE id = 1").unwrap();
+    other.run("INSERT INTO lk VALUES (2, 20)").unwrap();
+
+    let refused = updater
+        .run("SELECT n FROM lk WHERE id = 1 FOR UPDATE")
+        .expect_err("e3: the row changed after the snapshot, so it cannot be locked");
+    assert_eq!(refused.sqlstate(), "40001", "e3: {refused}");
+    let _ = updater.run("ROLLBACK");
+
+    let inserted = inserter
+        .run("SELECT n FROM lk WHERE id = 2 FOR UPDATE")
+        .expect("e4: a row the snapshot does not see is not an error");
+    assert_eq!(row_count(&inserted), 0, "e4: {inserted:?}");
+    inserter.run("COMMIT").expect("e4 commits");
 }
 
 /// **ADR 0114 §3: SERIALIZABLE refuses a key it had read with `40001`.** B reads that there is no
@@ -274,12 +311,9 @@ fn repeatable_read_insert_after_a_read_is_a_duplicate_key_when_the_holder_commit
 ///
 /// The race is Rails' and is not steered: B wakes as soon as A has inserted, while A's `COMMIT` is
 /// still on its way, so whether B meets A's lock or A's commit is the machine's choice. It needs
-/// both halves of ADR 0114: §1's wait and §2's lock.
-///
-/// `#[ignore]`d rather than left red while §2 waits for its ruling; with §2 built it is #90's
-/// acceptance and loses the attribute.
+/// both halves of ADR 0114: §1's wait and §2's lock. It was red and `#[ignore]`d while §2 waited for
+/// its ruling, and it is #90's acceptance.
 #[test]
-#[ignore = "red until ruled on — needs ADR 0114 §2 (debt #91) as well as §1; QUESTION-s1 question 1"]
 fn relations_test_s_find_or_create_by_duel_commits_both_sessions() {
     let cluster = cluster_with_subscribers();
     for round in ["find_or_create_by", "find_or_create_by!"] {

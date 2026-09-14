@@ -251,7 +251,10 @@ fn write_a_round(
                     store,
                     state,
                     start_ts,
-                    vec![TxnMutation::Check { key: key.clone() }],
+                    vec![TxnMutation::Check {
+                        key: key.clone(),
+                        read_ts: None,
+                    }],
                 ) {
                     commit(store, state, start_ts, start_ts + 1, key);
                 }

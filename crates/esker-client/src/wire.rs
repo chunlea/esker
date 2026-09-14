@@ -101,6 +101,7 @@ impl From<TxnKvReq> for Body {
 pub fn txn_payload_size(request: &TxnKvReq) -> usize {
     /// Varint length prefix plus a little slack, per field.
     const PER_FIELD: usize = 6;
+    let stamp = |read_ts: Option<u64>| read_ts.map_or(0, |_| PER_FIELD);
     let keys =
         |keys: &[Bytes]| keys.iter().map(|key| key.len() + PER_FIELD).sum::<usize>() + PER_FIELD;
     match request {
@@ -114,11 +115,15 @@ pub fn txn_payload_size(request: &TxnKvReq) -> usize {
                 + mutations
                     .iter()
                     .map(|mutation| match mutation {
-                        TxnMutation::Put { key, value, .. } => {
-                            key.len() + value.len() + 2 * PER_FIELD
-                        }
-                        TxnMutation::Delete { key, .. } | TxnMutation::Check { key } => {
-                            key.len() + PER_FIELD
+                        // A read timestamp is one more varint, on the three that can carry one.
+                        TxnMutation::Put {
+                            key,
+                            value,
+                            read_ts,
+                        } => key.len() + value.len() + 2 * PER_FIELD + stamp(*read_ts),
+                        TxnMutation::Delete { key, read_ts }
+                        | TxnMutation::Check { key, read_ts } => {
+                            key.len() + PER_FIELD + stamp(*read_ts)
                         }
                         // A range is two keys, and a read set of wide ranges is exactly what makes
                         // a prewrite large enough for this estimate to matter (ADR 0062).

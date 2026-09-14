@@ -20,7 +20,7 @@ use esker_client::wire::{
     Epoch, LockInfo, Method, Peer, ProtoError, RawKvReq, RawKvResp, Region, TxnKvReq, TxnKvResp,
     TxnMutation, TxnStatus,
 };
-use esker_client::{CountingOracle, Error, TxnClient};
+use esker_client::{Acquired, CountingOracle, Error, TxnClient};
 
 /// A timestamp shaped the way the oracle mints them: `ts = physical_ms << 18 | logical`
 /// (`docs/txn-spec.md` §5.5). A lease is judged in the physical half alone, so a fixture that
@@ -1714,4 +1714,179 @@ fn a_key_written_twice_keeps_the_earlier_statements_read_timestamp() {
         ),
         other => panic!("{other:?}"),
     }
+}
+
+// -- an eager lock at a statement's snapshot (ADR 0114 §2) -----------------------------------
+
+/// A statement's read timestamp, after the transaction began at [`START_TS`].
+const STATEMENT_TS: u64 = at_ms(100_500);
+
+/// A later statement's, or the same statement's re-run.
+const LATER_STATEMENT_TS: u64 = at_ms(100_800);
+
+/// The mutations of every `Prewrite` that went out, in order.
+///
+/// **By method, never by index**: a lock that pins the primary starts its renewal, whose heartbeat
+/// goes through the same transport on a clock of its own, so a call's position is not the test's.
+fn prewrites(transport: &FakeTransport) -> Vec<Vec<TxnMutation>> {
+    calls_of(transport, Method::TxnPrewrite)
+        .into_iter()
+        .map(|request| match request {
+            TxnKvReq::Prewrite { mutations, .. } => mutations,
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+fn check_at(on: &'static [u8], read_ts: Option<u64>) -> TxnMutation {
+    TxnMutation::Check {
+        key: key(on),
+        read_ts,
+    }
+}
+
+fn answering_every_prewrite(transport: &FakeTransport) {
+    transport
+        .script(Rule::new(Matcher::Method(Method::TxnPrewrite), Outcome::PrewriteOk).forever());
+}
+
+/// **The lock and the commit both carry the statement's snapshot.** With nothing buffered, the key
+/// being locked is the primary, so its lock goes out from inside `pin_primary` — Rails' shape, a
+/// `FOR UPDATE` that is the transaction's first write — and `commit` prewrites it again. Stamped any
+/// later than `pin_primary`, the first would be tag 5 and validated at `start_ts`, which is debt #91.
+#[test]
+fn an_eager_lock_carries_its_statement_s_snapshot_when_taken_and_when_committed() {
+    let transport = Arc::new(FakeTransport::new());
+    script_a_clean_commit(&transport);
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+
+    txn.begin_statement(STATEMENT_TS);
+    assert_eq!(txn.lock(b"k").unwrap(), Acquired::Taken);
+    txn.commit().unwrap();
+
+    assert_eq!(
+        prewrites(&transport),
+        vec![
+            vec![check_at(b"k", Some(STATEMENT_TS))],
+            vec![check_at(b"k", Some(STATEMENT_TS))],
+        ],
+        "the lock's prewrite, from pin_primary, and the commit's"
+    );
+}
+
+/// **A lock that is not the primary** goes out from `prewrite_once`, behind a buffered write that
+/// became the primary, and carries the statement's snapshot too. The write was buffered before any
+/// statement set one, so it carries none.
+#[test]
+fn an_eager_lock_behind_a_buffered_primary_carries_its_statement_s_snapshot() {
+    let transport = Arc::new(FakeTransport::new());
+    answering_every_prewrite(&transport);
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+
+    txn.put(b"a", b"1");
+    txn.begin_statement(STATEMENT_TS);
+    assert_eq!(txn.lock(b"k").unwrap(), Acquired::Taken);
+
+    assert_eq!(
+        prewrites(&transport),
+        vec![
+            vec![TxnMutation::Put {
+                key: key(b"a"),
+                value: key(b"1"),
+                read_ts: None,
+            }],
+            vec![check_at(b"k", Some(STATEMENT_TS))],
+        ],
+        "the buffered primary first, then the lock behind it"
+    );
+}
+
+/// **No statement snapshot, no timestamp**: the lock is tag 5 with the bytes it always had,
+/// validated at the transaction's own snapshot — what REPEATABLE READ and SERIALIZABLE send, because
+/// only READ COMMITTED sets a statement's read timestamp.
+#[test]
+fn an_eager_lock_with_no_statement_snapshot_is_the_check_it_always_was() {
+    let transport = Arc::new(FakeTransport::new());
+    answering_every_prewrite(&transport);
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+
+    assert_eq!(txn.lock(b"k").unwrap(), Acquired::Taken);
+
+    assert_eq!(prewrites(&transport), vec![vec![check_at(b"k", None)]]);
+}
+
+/// **A lock that was not taken leaves no stamp.** The first attempt meets an older, live
+/// transaction's lock — not fatal, so `lock` answers `Held` with no further call and the caller
+/// waits — and the statement is re-run at a fresh snapshot. The second attempt is validated at the
+/// re-run's: a stamp kept from the first would pin it there through `stamp`'s earliest-wins, at a
+/// snapshot that never locked anything.
+#[test]
+fn a_lock_that_was_held_is_asked_again_at_the_re_run_s_snapshot() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.script(Rule::new(
+        Matcher::Method(Method::TxnPrewrite),
+        Outcome::TxnReply(TxnKvResp::Prewrite {
+            keys: vec![TxnStatus::Locked(a_lock(b"k", b"k", LIVE_TS))],
+        }),
+    ));
+    answering_every_prewrite(&transport);
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+
+    txn.begin_statement(STATEMENT_TS);
+    let first = txn.lock(b"k").unwrap();
+    assert!(
+        matches!(first, Acquired::Held { by: LIVE_TS, .. }),
+        "an older live holder is waited for: {first:?}"
+    );
+    txn.restart_statement(LATER_STATEMENT_TS);
+    assert_eq!(txn.lock(b"k").unwrap(), Acquired::Taken);
+
+    assert_eq!(
+        prewrites(&transport),
+        vec![
+            vec![check_at(b"k", Some(STATEMENT_TS))],
+            vec![check_at(b"k", Some(LATER_STATEMENT_TS))],
+        ]
+    );
+}
+
+/// **A released lock gives its stamp back.** `ROLLBACK TO SAVEPOINT` releases the row, and a later
+/// statement that locks it again validates at its own snapshot rather than at the one the released
+/// lock was taken at.
+#[test]
+fn a_released_lock_is_taken_again_at_the_next_statement_s_snapshot() {
+    let transport = Arc::new(FakeTransport::new());
+    answering_every_prewrite(&transport);
+    transport.script(
+        Rule::new(
+            Matcher::Method(Method::TxnReleaseLock),
+            Outcome::TxnReply(TxnKvResp::ReleaseLock { released: 1 }),
+        )
+        .forever(),
+    );
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+
+    txn.begin_statement(STATEMENT_TS);
+    assert_eq!(txn.lock(b"k").unwrap(), Acquired::Taken);
+    txn.release(&[key(b"k")]).unwrap();
+    assert_eq!(
+        calls_of(&transport, Method::TxnReleaseLock).len(),
+        1,
+        "the lock went back to the store"
+    );
+    txn.begin_statement(LATER_STATEMENT_TS);
+    assert_eq!(txn.lock(b"k").unwrap(), Acquired::Taken);
+
+    assert_eq!(
+        prewrites(&transport),
+        vec![
+            vec![check_at(b"k", Some(STATEMENT_TS))],
+            vec![check_at(b"k", Some(LATER_STATEMENT_TS))],
+        ]
+    );
 }
