@@ -150,6 +150,25 @@ always `40001`. The fix gives the eager lock's `Check` the statement's read time
    statement's snapshot and the lock still refuses. Restarting the statement there, as
    `changed_since_statement` does for writes, is the follow-on, to be measured first.
 
+**Step 5's window, measured (unit L, 2026-09-13).** Two sessions interleaved by `pg_sleep`: PostgreSQL 19 in
+`esker-coord/s1-oracle-2026-09-13/g/`, this node in a throwaway probe against three real stores
+(`esker-coord/s1-unit-l/l3-probe.log`, with the probe's source beside it). A `pg_sleep` in the locking query's
+target list holds the statement between reading the row and locking it — PostgreSQL's `LockRows` sits above the
+scan that projects, and `lock_rows` here runs on rows the query has already produced.
+
+| case | PostgreSQL 19 | this node |
+|---|---|---|
+| g1 — READ COMMITTED; another transaction commits the row after the statement's snapshot and before its lock | the new row, `11` | `40001 could not serialize access due to concurrent update: a commit at 1008 beat this transaction at 1004` |
+| g2 — the same at REPEATABLE READ | `40001 could not serialize access due to concurrent update` | `40001` |
+| g3 — READ COMMITTED; the lock waits for a holder, which then commits | the new row, `11` | `40001 … a commit at 1008 beat this transaction at 1006`, after a one-second wait |
+
+g1 is the window as step 5 writes it. **g3 is the same window reached through the wait**, and it is the shape
+Rails meets: a `lock!` behind another transaction's update. `lock_rows`' own doc says a held row is waited for and
+then the statement runs again (ADR 0057's mechanism); what the probe measured after the wait is still `40001`, so
+the doc and the node disagree on that path. At READ COMMITTED both diverge from PostgreSQL, which re-reads the
+newest version of the row before locking it; REPEATABLE READ agrees. Not built in unit L, which measured only: they
+are a new debt, and its number is the coordinator's to give.
+
 ### Old peers
 
 * **Wire — an old store refuses the request and keeps the connection, and the client surfaces it.**
@@ -274,7 +293,8 @@ Step 4's two stamp rules have counterfactuals of their own *(unit H)*: keep the 
 * A stamp that outlived a lock not taken would make every later attempt at that row `40001` — silently,
   and only after a wait or a savepoint rollback — which is why step 4 keeps a stamp only on `Taken` and
   `release` drops it *(unit H)*.
-* The read-to-lock window in step 5 still refuses.
+* The read-to-lock window in step 5 still refuses. Measured in unit L: at READ COMMITTED a commit inside the window,
+  and a commit the lock waited for, both answer `40001` where PostgreSQL 19 answers the new row (step 5).
 
 ---
 
