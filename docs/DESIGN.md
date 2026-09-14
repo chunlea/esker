@@ -836,13 +836,18 @@ dropped. So a **live** holder keeps its rows however long it holds them, and a *
 outlives its lock by at most one TTL, which is what the short lease is for. Before that sender
 existed the handler had nobody calling it, and a `SELECT … FOR UPDATE` held past three seconds lost
 its row to the next session that wanted it.
-**A row lock is not one of these yet** ([ADR 0088](adr/0088-a-row-lock-across-nodes.md), accepted
-2026-09-09): `SELECT … FOR UPDATE` takes a lock in the `esker-sql` node's own table, so today it
-excludes other sessions of the same node and **not** sessions of another node — two nodes given the
-crossed sequence that deadlocks one node both commit, measured. The accepted fix is (a'): the row
-lock becomes a Percolator lock, acquired by an ordinary prewrite of a `Check` mutation (tag 5) sent
-when the statement runs rather than at `COMMIT`, which is why it costs no new tag and no new
-method. GC: PD publishes a safepoint
+**A row lock is one of these** ([ADR 0088](adr/0088-a-row-lock-across-nodes.md), (a')):
+`SELECT … FOR UPDATE` takes the `esker-sql` node's own lock, which queues that node's sessions, and
+then a Percolator lock, which is what excludes every other node's — an ordinary prewrite of a `Check`
+mutation, sent when the statement runs rather than at `COMMIT`, with no new method. The check is
+**tag 5** when it is validated at the transaction's `start_ts`, as a SERIALIZABLE read set's is, and
+**tag 7** when it carries a READ COMMITTED statement's read timestamp and is validated there
+([ADR 0114](adr/0114-a-unique-key-being-written-waits-at-read-committed.md) §2), so a row committed
+after `BEGIN` and before the statement is locked rather than refused. **Stores are upgraded before
+`esker-sql` nodes**: an old store refuses tag 7 as an invalid request, which the node reports as
+`08006` having locked nothing, and an old follower that meets kind 7 in the log stops applying that
+region rather than skip the entry — nothing diverges, and the replica is lost until it is upgraded.
+GC: PD publishes a safepoint
 ([ADR 0110](adr/0110-who-publishes-the-garbage-collection-safepoint.md)); a rising one makes a store
 go and compact (§4.7); a `CompactionFilter` drops versions below it, keeping the newest visible one
 — **including when that newest one is a delete**, which is what

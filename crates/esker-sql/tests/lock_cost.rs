@@ -13,7 +13,8 @@
 //!   The difference is what the in-process hash table costs, which is the thing being replaced.
 //! * **batched, one region** — a transaction that prewrites one key and *checks* a hundred, minus
 //!   the same transaction checking none. `TxnMutation::Check` is the lock ADR 0088 uses (tag 5,
-//!   ADR 0067), and `commit` groups the checked keys by region exactly as it groups writes, so a
+//!   ADR 0067 — or tag 7, carrying a READ COMMITTED statement's read timestamp, since ADR 0114 §2),
+//!   and `commit` groups the checked keys by region exactly as it groups writes, so a
 //!   hundred keys of one table are one request.
 //! * **batched, three regions** — the same hundred keys spread across all three, which is what a
 //!   split table looks like. It is the same measurement with the group count changed, and it is
