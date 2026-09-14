@@ -201,6 +201,135 @@ fn a_for_update_at_repeatable_read_keeps_the_transaction_s_snapshot() {
     inserter.run("COMMIT").expect("e4 commits");
 }
 
+/// **#96: a row committed inside a READ COMMITTED `FOR UPDATE`'s window is locked at its new version.**
+/// PostgreSQL 19 (`esker-coord/s1-oracle-2026-09-13/g/`, g1): B's statement reads the row, a `pg_sleep`
+/// in its target list holds it before the lock, A commits an update in between — and B answers `11`,
+/// because `LockRows` locks the row's newest version. Here that commit refuses the lock, and the
+/// statement runs again at a fresh snapshot (ADR 0057), where it used to answer `40001 … a commit at
+/// 1008 beat this transaction at 1004`.
+///
+/// A commits only once a third session has seen B's locking statement running, and a moment after,
+/// well inside the second the `pg_sleep` holds it: a commit before B's snapshot would pass this test
+/// without reaching the window, which is what its counterfactual rules out.
+#[test]
+fn a_for_update_whose_row_commits_inside_its_window_locks_the_new_row() {
+    let (answer, end) = commit_inside_a_for_update_window(None);
+    assert_eq!(
+        first_cell(&answer),
+        Some("11".to_owned()),
+        "B's FOR UPDATE answered {answer:?}"
+    );
+    assert!(end.is_ok(), "B's COMMIT: {end:?}");
+}
+
+/// **#96's REPEATABLE READ guard (g2)**: the same window at the level that keeps one snapshot is still
+/// `40001 could not serialize access due to concurrent update`, as PostgreSQL 19 answers it.
+#[test]
+fn a_for_update_at_repeatable_read_whose_row_commits_inside_its_window_is_refused_with_40001() {
+    let (answer, _) = commit_inside_a_for_update_window(Some("REPEATABLE READ"));
+    let refused =
+        answer.expect_err("g2: the row moved after the snapshot, and there is no re-read to take");
+    assert_eq!(refused.sqlstate(), "40001", "g2: {refused}");
+}
+
+/// **#96, the shape Rails meets (g3)**: B's `FOR UPDATE` waits for A, who updated the row, and A
+/// commits — and B locks and answers A's version, `11`, as PostgreSQL 19 does. Here the wait used to
+/// end and the lock still be refused at the snapshot B's statement began with.
+#[test]
+fn a_for_update_that_waited_for_the_committer_locks_the_new_row() {
+    let cluster = Cluster::start();
+    locked_row_table(&cluster);
+    let mut a = cluster.session();
+    a.run("BEGIN").unwrap();
+    a.run("UPDATE lk SET n = 11 WHERE id = 1").unwrap();
+
+    let (about_to_lock, hears_about_to_lock) = channel();
+    let (done_locking, hears_done_locking) = channel();
+    let mut b = cluster.session();
+    let second = std::thread::spawn(move || {
+        b.run("BEGIN").unwrap();
+        about_to_lock.send(()).unwrap();
+        let answer = b.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE");
+        done_locking.send(()).unwrap();
+        let end = b.run("COMMIT");
+        (answer, end)
+    });
+    hears_about_to_lock.recv_timeout(BARRIER).unwrap();
+    assert!(
+        seen_waiting(&cluster, &hears_done_locking),
+        "B's FOR UPDATE answered without waiting for A"
+    );
+    a.run("COMMIT").unwrap();
+    let (answer, end) = second.join().unwrap();
+    assert_eq!(
+        first_cell(&answer),
+        Some("11".to_owned()),
+        "B's FOR UPDATE answered {answer:?}"
+    );
+    assert!(end.is_ok(), "B's COMMIT: {end:?}");
+}
+
+/// The one row #96's tests lock.
+fn locked_row_table(cluster: &Cluster) {
+    let mut setup = cluster.session();
+    setup
+        .run("CREATE TABLE lk (id bigint primary key, n bigint)")
+        .unwrap();
+    setup.run("INSERT INTO lk VALUES (1, 10)").unwrap();
+}
+
+/// g1 and g2's sequence: B reads the row, then locks it slowly; A's autocommit `UPDATE` lands once a
+/// third session has seen B's locking statement running. Answers B's `FOR UPDATE` and how its block
+/// ended.
+fn commit_inside_a_for_update_window(
+    level: Option<&'static str>,
+) -> (esker_sql::Result<Outcome>, esker_sql::Result<Outcome>) {
+    let cluster = Cluster::start();
+    locked_row_table(&cluster);
+    let (about_to_lock, hears_about_to_lock) = channel();
+    let mut b = cluster.session();
+    let second = std::thread::spawn(move || {
+        b.run("BEGIN").unwrap();
+        if let Some(level) = level {
+            b.run(&format!("SET TRANSACTION ISOLATION LEVEL {level}"))
+                .unwrap();
+        }
+        b.rows("SELECT n FROM lk WHERE id = 1");
+        about_to_lock.send(()).unwrap();
+        let answer = b.run("SELECT n, pg_sleep(1.0) FROM lk WHERE id = 1 FOR UPDATE");
+        let end = if answer.is_ok() {
+            b.run("COMMIT")
+        } else {
+            b.run("ROLLBACK")
+        };
+        (answer, end)
+    });
+    hears_about_to_lock.recv_timeout(BARRIER).unwrap();
+    let mut watcher = cluster.session();
+    let began = Instant::now();
+    while watcher
+        .rows(
+            "SELECT pid FROM pg_stat_activity WHERE state = 'active' AND pid <> pg_backend_pid() \
+             AND query LIKE '%pg_sleep(1.0)%'",
+        )
+        .is_empty()
+    {
+        assert!(
+            began.elapsed() < BARRIER,
+            "B's locking statement never showed as running"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // `active` is set as the statement starts and its snapshot a moment later; the lock is a second
+    // away, behind the `pg_sleep`.
+    std::thread::sleep(Duration::from_millis(200));
+    cluster
+        .session()
+        .run("UPDATE lk SET n = 11 WHERE id = 1")
+        .unwrap();
+    second.join().unwrap()
+}
+
 /// **ADR 0114 §3: SERIALIZABLE refuses a key it had read with `40001`.** B reads that there is no
 /// `bob`, A inserts `bob` and commits, and then B inserts `bob`. PostgreSQL 19 answers `40001 could not
 /// serialize access due to read/write dependencies among transactions` at the `INSERT` (case 09),

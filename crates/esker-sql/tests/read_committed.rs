@@ -21,11 +21,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::mpsc::channel;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[path = "parity_harness/mod.rs"]
 mod parity;
 
+use esker_sql::pgwire::session::Outcome;
 use parity::{Pair, edge, reached};
 
 /// **The red test for the whole unit.** A holds the row, B blocks, A commits, B proceeds on A's
@@ -427,4 +428,142 @@ fn a_transaction_dropped_without_rollback_gives_its_locks_back() {
     next.run("UPDATE rc SET n = 99 WHERE id = 1")
         .expect("the lock died with the session that took it");
     assert_eq!(next.rows("SELECT n FROM rc WHERE id = 1"), [["99"]]);
+}
+
+/// How long a barrier below may take to be reached; running out of it is a failure with a message,
+/// never a hang.
+const BARRIER: Duration = Duration::from_secs(30);
+
+/// The one row #96's tests lock.
+fn locked_row_pair() -> Pair {
+    Pair::new(&[
+        "CREATE TABLE lk (id bigint primary key, n bigint)",
+        "INSERT INTO lk (id, n) VALUES (1, 10)",
+    ])
+}
+
+/// The first cell of an answer, as text; `None` for a refusal or a command.
+fn first_cell(answer: &esker_sql::Result<Outcome>) -> Option<String> {
+    match answer {
+        Ok(Outcome::Rows { rows, .. }) => rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(Option::as_ref)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
+        _ => None,
+    }
+}
+
+/// g1 and g2's sequence on this backend, as `concurrent_unique_insert.rs` runs it against real stores:
+/// B reads the row and locks it slowly, and A's autocommit `UPDATE` lands once another session has
+/// seen B's locking statement running.
+fn commit_inside_a_for_update_window(
+    level: Option<&'static str>,
+) -> (esker_sql::Result<Outcome>, esker_sql::Result<Outcome>) {
+    let pair = locked_row_pair();
+    let (b_says, hears_b) = channel();
+    let mut b = pair.session();
+    let second = std::thread::spawn(move || {
+        b.run("BEGIN").unwrap();
+        if let Some(level) = level {
+            b.run(&format!("SET TRANSACTION ISOLATION LEVEL {level}"))
+                .unwrap();
+        }
+        b.rows("SELECT n FROM lk WHERE id = 1");
+        reached(&b_says, "B is about to lock");
+        let answer = b.run("SELECT n, pg_sleep(1.0) FROM lk WHERE id = 1 FOR UPDATE");
+        let end = if answer.is_ok() {
+            b.run("COMMIT")
+        } else {
+            b.run("ROLLBACK")
+        };
+        (answer, end)
+    });
+    edge(&hears_b, "B is about to lock");
+    let mut watcher = pair.session();
+    let began = Instant::now();
+    while watcher
+        .rows(
+            "SELECT pid FROM pg_stat_activity WHERE state = 'active' AND pid <> pg_backend_pid() \
+             AND query LIKE '%pg_sleep(1.0)%'",
+        )
+        .is_empty()
+    {
+        assert!(
+            began.elapsed() < BARRIER,
+            "B's locking statement never showed as running"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // `active` is set as the statement starts and its snapshot a moment later; the lock is a second
+    // away, behind the `pg_sleep`.
+    std::thread::sleep(Duration::from_millis(200));
+    pair.session()
+        .run("UPDATE lk SET n = 11 WHERE id = 1")
+        .unwrap();
+    second.join().unwrap()
+}
+
+/// **#96 on the in-memory backend (g1)**: a row committed inside a READ COMMITTED `FOR UPDATE`'s window
+/// is locked at its new version, `11`, as PostgreSQL 19 answers it. This backend used to lock what it
+/// had read and answer `10` — a row no level of PostgreSQL returns — because its cluster lock
+/// validated nothing; it now refuses a moved row as a store's does, and the statement runs again.
+#[test]
+fn a_for_update_whose_row_commits_inside_its_window_locks_the_new_row() {
+    let (answer, end) = commit_inside_a_for_update_window(None);
+    assert_eq!(
+        first_cell(&answer),
+        Some("11".to_owned()),
+        "B's FOR UPDATE answered {answer:?}"
+    );
+    assert!(end.is_ok(), "B's COMMIT: {end:?}");
+}
+
+/// **g2 on the in-memory backend**: `40001` at REPEATABLE READ, where it used to answer the stale `10`.
+#[test]
+fn a_for_update_at_repeatable_read_whose_row_commits_inside_its_window_is_refused_with_40001() {
+    let (answer, _) = commit_inside_a_for_update_window(Some("REPEATABLE READ"));
+    let refused =
+        answer.expect_err("g2: the row moved after the snapshot, and there is no re-read to take");
+    assert_eq!(refused.sqlstate(), "40001", "g2: {refused}");
+}
+
+/// **g3 on the in-memory backend**: B's `FOR UPDATE` waits for A, A commits, and B locks and answers
+/// `11`. The guard that the cluster lock's new validation leaves the wait's re-run standing.
+#[test]
+fn a_for_update_that_waited_for_the_committer_locks_the_new_row() {
+    let pair = locked_row_pair();
+    let mut a = pair.session();
+    a.run("BEGIN").unwrap();
+    a.run("UPDATE lk SET n = 11 WHERE id = 1").unwrap();
+    let (b_says, hears_b) = channel();
+    let mut b = pair.session();
+    let second = std::thread::spawn(move || {
+        b.run("BEGIN").unwrap();
+        reached(&b_says, "B is about to lock");
+        let answer = b.run("SELECT n FROM lk WHERE id = 1 FOR UPDATE");
+        let end = b.run("COMMIT");
+        (answer, end)
+    });
+    edge(&hears_b, "B is about to lock");
+    let mut watcher = pair.session();
+    let began = Instant::now();
+    while watcher
+        .rows("SELECT pid FROM pg_locks WHERE granted = false")
+        .is_empty()
+    {
+        assert!(
+            began.elapsed() < BARRIER,
+            "B's FOR UPDATE never waited for A"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    a.run("COMMIT").unwrap();
+    let (answer, end) = second.join().unwrap();
+    assert_eq!(
+        first_cell(&answer),
+        Some("11".to_owned()),
+        "B's FOR UPDATE answered {answer:?}"
+    );
+    assert!(end.is_ok(), "B's COMMIT: {end:?}");
 }
