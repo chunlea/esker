@@ -1987,6 +1987,8 @@ impl Executor {
     /// * bare — wait for the holder, then re-run the statement, which is ADR 0057's mechanism and
     ///   not a second one. The row this statement read may have changed while it waited, so
     ///   answering the version it already has would be answering a row that no longer exists.
+    ///   A lock **refused** because the row moved after the statement's snapshot — while it read, or
+    ///   while it waited — re-runs the statement too, at READ COMMITTED (`lock_or_restart`, #96).
     /// * `NOWAIT` — `55P03` at once, naming the relation.
     /// * `SKIP LOCKED` — the row leaves the answer and nothing is said about it.
     ///

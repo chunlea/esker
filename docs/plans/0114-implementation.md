@@ -169,6 +169,17 @@ the doc and the node disagree on that path. At READ COMMITTED both diverge from 
 newest version of the row before locking it; REPEATABLE READ agrees. Not built in unit L, which measured only: they
 are a new debt, and its number is the coordinator's to give.
 
+**Built, unit M (2026-09-13) — #96.** A lock refused because its row moved after the statement's snapshot is, at
+READ COMMITTED, the statement running again at a fresh snapshot rather than a `40001`: `exec::lock_or_restart`,
+which both `lock_rows`' first attempt and `wait_for_the_lock`'s retry go through, asks `changed_since_statement`
+after a refusal and, when the row explains it, restarts the statement the way a write that waited already did
+(ADR 0057). The client needed nothing: a lock it did not take already leaves no stamp, and the re-run stamps its
+lock at the new snapshot (pinned by `a_lock_refused_by_a_newer_commit_is_asked_again_at_the_re_run_s_snapshot`). The
+in-memory backend's cluster lock now validates as the store's does, so it refuses a moved row instead of locking the
+version it read — which had answered g1 with the stale `10` and REPEATABLE READ's g2 with a row. Tests, against
+three real stores in `concurrent_unique_insert.rs` and on `MemoryBackend` in `read_committed.rs`: g1 and g3 lock
+and answer `11`, g2 stays `40001`. Two counterfactuals, each an asserted replace undone by its inverse (`esker-coord/s1-unit-m/m-fix.py`): with `lock_or_restart`'s re-run taken out, g1 and g3 are refused again on both backends — `a commit at 1009 beat this transaction at 1004`, and `… at 1006` after the wait, against the real stores — while g2 stays `40001` (38 run, 34 passed, 4 failed); with the in-memory cluster lock's validation taken out, only that backend's g1 and g2 go red again — the stale `10`, and a row where `40001` belongs — while every real-store test and its own g3 stay green (38 run, 36 passed, 2 failed).
+
 ### Old peers
 
 * **Wire — an old store refuses the request and keeps the connection, and the client surfaces it.**
@@ -293,8 +304,9 @@ Step 4's two stamp rules have counterfactuals of their own *(unit H)*: keep the 
 * A stamp that outlived a lock not taken would make every later attempt at that row `40001` — silently,
   and only after a wait or a savepoint rollback — which is why step 4 keeps a stamp only on `Taken` and
   `release` drops it *(unit H)*.
-* The read-to-lock window in step 5 still refuses. Measured in unit L: at READ COMMITTED a commit inside the window,
-  and a commit the lock waited for, both answer `40001` where PostgreSQL 19 answers the new row (step 5).
+* ~~The read-to-lock window in step 5 still refuses.~~ Measured in unit L — at READ COMMITTED a commit inside the
+  window, and a commit the lock waited for, both answered `40001` where PostgreSQL 19 answers the new row — and closed
+  by unit M (#96, step 5).
 
 ---
 
@@ -491,4 +503,4 @@ No format, no wire.
 * Make REPEATABLE READ or SERIALIZABLE **wait** for a live holder of a unique value, as PostgreSQL
   does (ADR 0114, "What stays declared").
 * Move the `40001` from `COMMIT` to the `INSERT`, at SERIALIZABLE or at REPEATABLE READ.
-* Close §2's read-to-lock window (step 5).
+* ~~Close §2's read-to-lock window (step 5).~~ Unit M closed it afterwards (#96).
