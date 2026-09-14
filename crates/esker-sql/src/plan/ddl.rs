@@ -56,9 +56,8 @@ pub struct CreateTable {
     pub inherits: Vec<String>,
     /// Every `UNIQUE` constraint, from a column option or a table constraint.
     pub unique: Vec<UniqueConstraint>,
-    /// Every `CHECK`, named the way PostgreSQL names one: as written, or
-    /// `<table>_<column>_check` for a column constraint with no name of its own.
-    pub checks: Vec<crate::catalog::CheckDef>,
+    /// Every `CHECK`, in the order written — which is the order a derived name is numbered in.
+    pub checks: Vec<CheckConstraint>,
     /// Every `FOREIGN KEY`, from a column option (`p int8 REFERENCES t`) or a table constraint.
     ///
     /// Resolved by the executor rather than here, for the reason a `CREATE INDEX`'s key parts are:
@@ -704,8 +703,9 @@ pub struct CreateIndex {
 /// A `FOREIGN KEY` as written, before the parent has been looked up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeignKey {
-    /// Its name — given, or derived as `<table>_<column>_fkey`.
-    pub name: String,
+    /// Its name if it was given one. `None` is derived where the table is — `<table>_<column>_fkey`,
+    /// numbered past every constraint name the schema already holds (`crate::exec::ddl`).
+    pub name: Option<String>,
     /// This table's columns, by name, folded.
     pub columns: Vec<String>,
     /// The referenced table, folded.
@@ -723,6 +723,23 @@ pub struct ForeignKey {
     pub deferrable: bool,
     /// `INITIALLY DEFERRED`: it starts there.
     pub initially_deferred: bool,
+}
+
+/// One `CHECK`, as written: its expression, and its name **if it was given one**.
+///
+/// **The name is not derived here**, because PostgreSQL's derivation needs what lowering cannot
+/// see: the column the expression reads, which is known once the expression is parsed, and every
+/// constraint name the schema already holds, which a derived name is numbered past — measured,
+/// `nsq_x_check1` beside another table's `nsq_x_check`. `crate::exec::ddl` names it where the
+/// catalog is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckConstraint {
+    /// Given, or `None` for a name derived where the constraint is made.
+    pub name: Option<String>,
+    /// The expression, as the text that is stored.
+    pub expr: String,
+    /// Cleared by `NOT VALID`: the rows already there are not scanned.
+    pub validated: bool,
 }
 
 /// `CREATE TYPE <name> AS RANGE (…) | AS (…) | AS ENUM (…)`.
@@ -906,6 +923,13 @@ pub fn foreign_key_name(table: &str, columns: &[String]) -> String {
         Some(&name_addition(columns.iter().map(String::as_str))),
         "fkey",
     )
+}
+
+/// The column half of a derived constraint name — `a_b` for `(a, b)` — for a caller that numbers
+/// the name itself: [`choose_relation_name`] takes the parts unjoined.
+#[must_use]
+pub fn column_name_addition(columns: &[String]) -> String {
+    name_addition(columns.iter().map(String::as_str))
 }
 
 /// `<table>_<column>…_idx`, PostgreSQL's name for an unnamed index.
@@ -1422,7 +1446,7 @@ pub enum AlterTableAction {
     /// same `42P01` for a missing table and the same schema-version bump.
     SetPersistence(crate::catalog::Persistence),
     /// `ALTER TABLE … ADD CONSTRAINT … CHECK (…)`.
-    AddCheck(crate::catalog::CheckDef),
+    AddCheck(CheckConstraint),
     /// `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY (…) REFERENCES … (…)`.
     ///
     /// The parent is named rather than resolved: nothing can turn `author_addresses` into a table

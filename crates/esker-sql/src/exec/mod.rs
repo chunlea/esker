@@ -615,9 +615,20 @@ impl Executor {
         Arc::new(table.clone())
     }
 
-    /// Whether `name` is deferred in this transaction, given how it was declared.
-    pub(crate) fn constraint_is_deferred(&self, name: &str, initially_deferred: bool) -> bool {
-        self.constraints.borrow().deferred(name, initially_deferred)
+    /// Whether the constraint `name` on `table` is deferred in this transaction, given how it was
+    /// declared — asked **by the table's schema and the bare name**, which is what a
+    /// `SET CONSTRAINTS` name reaches (#92).
+    pub(crate) fn constraint_is_deferred(
+        &self,
+        table: &crate::catalog::TableDef,
+        name: &str,
+        initially_deferred: bool,
+    ) -> bool {
+        self.constraints.borrow().deferred(
+            crate::catalog::split_qualified(&table.name).0,
+            crate::catalog::split_qualified(name).1,
+            initially_deferred,
+        )
     }
 
     /// Registers a check to run at `COMMIT`, or at the next `SET CONSTRAINTS … IMMEDIATE`.
@@ -630,7 +641,11 @@ impl Executor {
     /// **It needs one even outside a block**: the names are checked against the catalog whether or
     /// not there is anything to defer, so `SET CONSTRAINTS nosuch IMMEDIATE` is `42704` on its own
     /// as it is inside a transaction. Measured.
-    fn set_constraints_statement(&mut self, names: &[String], deferred: bool) -> Result<Outcome> {
+    fn set_constraints_statement(
+        &mut self,
+        names: &[crate::parse::ConstraintName],
+        deferred: bool,
+    ) -> Result<Outcome> {
         if let Some(txn) = self.open.take() {
             let outcome = self.set_constraints(names, deferred, &*txn);
             self.open = Some(txn);
@@ -652,51 +667,37 @@ impl Executor {
         Ok(Outcome::done("SET CONSTRAINTS"))
     }
 
-    /// Whether a constraint of this name exists and may be deferred.
+    /// The schema a `SET CONSTRAINTS` name is found in, and whether each constraint of that name
+    /// there may be deferred — nothing when it is found nowhere, which is the caller's `42704`,
+    /// raised before `42809` because a real server checks that a constraint exists first.
     ///
-    /// `42704` when nothing has the name — a real server checks that a constraint exists before
-    /// it checks whether it is deferrable, and the two errors are different SQLSTATEs.
-    ///
-    /// `UNIQUE` and `EXCLUDE` answer, which are the two kinds this node can defer. A third
-    /// registers here as it registers in `crate::exec::deferred`: one more place to look, in the
-    /// same order.
-    fn constraint_deferrable(&self, txn: &dyn Txn, name: &str) -> Result<bool> {
-        let relations = self.catalog_view(txn)?.relations()?;
-        for table in relations.rows().filter_map(|row| relations.table(row)) {
-            for index in &table.indexes {
-                if index.name == name {
-                    return Ok(index.deferrable());
-                }
-            }
-            if table.primary_key_name == name {
-                // A primary key is never deferrable here; PostgreSQL's may be, and declaring one
-                // that way is refused where it is lowered.
-                return Ok(false);
-            }
-            for check in &table.checks {
-                if check.name == name {
-                    return Ok(false);
-                }
-            }
-            for exclude in &table.excludes {
-                if exclude.name == name {
-                    return Ok(exclude.deferrable);
-                }
-            }
-            for key in &table.foreign_keys {
-                if key.name == name {
-                    // **This said `false` with a comment explaining that `DEFERRABLE` on a
-                    // foreign key was recorded and did nothing yet.** It does something now — a
-                    // deferred key's check is registered and run at `COMMIT` — and `ALL` had
-                    // already been reaching it for as long as that was true, so the refusal was
-                    // only ever raised for the *named* form. Three of the five tests in
-                    // `deferred_constraints_test.rb` are that difference: Rails declares its
-                    // foreign keys `deferrable: :immediate` and names them.
-                    return Ok(key.deferrable);
-                }
+    /// **Found the way a relation is found** (#92): a qualified name in its own schema (`3F000` for
+    /// one that is not there), a bare one in the first schema on the search path that has a
+    /// constraint of that name — and then every constraint of that name in it, of any kind
+    /// ([`crate::catalog::pg_constraint::deferrable_named`]). Measured,
+    /// `tests/corpus/pg19_constraint_names.txt`. This used to take the first constraint of the name
+    /// in any schema at all, so a bare name no schema on the path holds was deferred, and `s.x` was
+    /// read as two names.
+    fn constraints_named(
+        &self,
+        txn: &dyn Txn,
+        written: &crate::parse::ConstraintName,
+    ) -> Result<(String, Vec<bool>)> {
+        let view = self.catalog_view(txn)?;
+        let schemas = match &written.schema {
+            Some(schema) if view.schema_exists(schema)? => vec![schema.clone()],
+            Some(schema) => return Err(SqlError::UndefinedSchema(schema.clone())),
+            None => self.resolution_path(txn)?,
+        };
+        let relations = view.relations()?;
+        for schema in schemas {
+            let found =
+                crate::catalog::pg_constraint::deferrable_named(&relations, &schema, &written.name);
+            if !found.is_empty() {
+                return Ok((schema, found));
             }
         }
-        Err(SqlError::ConstraintDoesNotExist(name.to_owned()))
+        Ok((String::new(), Vec::new()))
     }
 
     /// The deferred checks, then the commit — the pair every transaction ends with.
@@ -754,7 +755,7 @@ impl Executor {
     /// statement that names it (`42809`). Measured, all three.
     pub(crate) fn set_constraints(
         &mut self,
-        names: &[String],
+        names: &[crate::parse::ConstraintName],
         deferred: bool,
         txn: &dyn Txn,
     ) -> Result<()> {
@@ -768,7 +769,12 @@ impl Executor {
             }
             return Ok(());
         }
-        for name in names {
+        let mut reached = Vec::with_capacity(names.len());
+        for written in names {
+            let (schema, deferrable) = self.constraints_named(txn, written)?;
+            if deferrable.is_empty() {
+                return Err(SqlError::ConstraintDoesNotExist(written.name.clone()));
+            }
             // **`DEFERRED` on a non-deferrable constraint is an error; `IMMEDIATE` is not.**
             //
             // This refused both, with a comment saying PostgreSQL refuses either way and the word
@@ -783,24 +789,25 @@ impl Executor {
             //
             // Which follows from what the statement asks: a constraint that cannot be deferred is
             // already immediate, so asking for immediate is asking for what is already true. The
-            // name must still **exist** either way, and `constraint_deferrable` raises `42704`
-            // for one that does not before this decides anything.
-            let deferrable = self.constraint_deferrable(txn, name)?;
-            if deferred && !deferrable {
-                return Err(SqlError::ConstraintNotDeferrable(name.clone()));
+            // name must still **exist** either way, and that `42704` is raised above, before this
+            // decides anything. One constraint of the name that cannot be deferred refuses the
+            // `DEFERRED` for all of them, as PostgreSQL's loop over them does.
+            if deferred && deferrable.contains(&false) {
+                return Err(SqlError::ConstraintNotDeferrable(written.name.clone()));
             }
             self.constraints
                 .borrow_mut()
-                .set_one(name.clone(), deferred);
+                .set_one(&schema, &written.name, deferred);
+            reached.push((schema, written.name.clone()));
         }
         if deferred {
             return Ok(());
         }
         // **The transaction handed in, not `self.open`** — which the caller took out before
         // calling, so reading it here found `None` and skipped every check it was asked to run.
-        let owed: Vec<deferred::Check> = names
+        let owed: Vec<deferred::Check> = reached
             .iter()
-            .flat_map(|name| self.constraints.borrow_mut().take_named(name))
+            .flat_map(|(schema, name)| self.constraints.borrow_mut().take_named(schema, name))
             .collect();
         for check in &owed {
             check.verify(txn, self.tenant)?;

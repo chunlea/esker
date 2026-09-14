@@ -1363,7 +1363,7 @@ pub(super) fn write_row(
                 index: index.id,
                 values: entry.values.clone(),
             };
-            if executor.constraint_is_deferred(&index.name, index.initially_deferred()) {
+            if executor.constraint_is_deferred(table, &index.name, index.initially_deferred()) {
                 executor.defer_check(check);
             } else {
                 // Written first, then checked: the scan has to see this row, or the second of two
@@ -2621,7 +2621,9 @@ fn check_exclusions(
         let Some(error) = exclusion_conflict(&*txn, executor.tenant, table, exclude, row)? else {
             continue;
         };
-        if exclude.deferrable && executor.constraint_is_deferred(&exclude.name, exclude.deferred) {
+        if exclude.deferrable
+            && executor.constraint_is_deferred(table, &exclude.name, exclude.deferred)
+        {
             // **Queued only because it conflicts**, which is what a real server does: it queues a
             // recheck for a deferred index tuple whose insert did *not* pass, and none for one
             // that did. Two consequences, both measured — a row that conflicts with nothing costs

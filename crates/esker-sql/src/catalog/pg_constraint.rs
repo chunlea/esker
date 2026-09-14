@@ -498,6 +498,79 @@ fn not_null_declared_by<'a>(relations: &'a Relations, table: &'a TableDef) -> &'
         .map_or(table.name.as_str(), |parent| parent.name.as_str())
 }
 
+/// Every constraint name one table holds, of every kind, as `conname` prints it — the one name space
+/// a new constraint's name is checked against (`crate::exec::ddl`).
+pub(crate) fn constraint_names(relations: &Relations, table: &TableDef) -> Vec<String> {
+    constraints_of(relations, table, 0)
+        .into_iter()
+        .map(|constraint| constraint.name)
+        .collect()
+}
+
+/// Every constraint name in one schema but for the table `except` — what a derived name is
+/// numbered past, measured: `nsq_x_check1`, because another table in the schema holds
+/// `nsq_x_check`. A domain's `CHECK` is one of them, as it is one of this view's rows.
+pub(crate) fn constraint_names_in_schema(
+    relations: &Relations,
+    schema: &str,
+    except: Option<u64>,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for relation in relations.of_kind(RelKind::Table) {
+        let Some(table) = relations.table(relation) else {
+            continue;
+        };
+        if Some(table.id) == except || super::split_qualified(&table.name).0 != schema {
+            continue;
+        }
+        names.extend(constraint_names(relations, table));
+    }
+    for def in relations.user_types() {
+        let super::TypeKind::Domain { check: Some(_), .. } = &def.kind else {
+            continue;
+        };
+        let (held, bare) = super::split_qualified(&def.name);
+        if held == schema {
+            names.push(format!("{bare}_check"));
+        }
+    }
+    names
+}
+
+/// Whether each constraint called `name` in one schema may be deferred — one entry a constraint,
+/// and none when the schema has no constraint of that name.
+///
+/// What `SET CONSTRAINTS` reads, because a name reaches **every** constraint of it in the schema it
+/// is found in, of any kind: two tables' foreign keys called `kf` are both deferred by one
+/// statement, and a `CHECK` or a `NOT NULL` of the name is found and is not deferrable (#92).
+pub(crate) fn deferrable_named(relations: &Relations, schema: &str, name: &str) -> Vec<bool> {
+    let mut found = Vec::new();
+    for relation in relations.of_kind(RelKind::Table) {
+        let Some(table) = relations.table(relation) else {
+            continue;
+        };
+        if super::split_qualified(&table.name).0 != schema {
+            continue;
+        }
+        found.extend(
+            constraints_of(relations, table, relation.oid)
+                .into_iter()
+                .filter(|constraint| constraint.name == name)
+                .map(|constraint| constraint.condeferrable),
+        );
+    }
+    for def in relations.user_types() {
+        let super::TypeKind::Domain { check: Some(_), .. } = &def.kind else {
+            continue;
+        };
+        let (held, bare) = super::split_qualified(&def.name);
+        if held == schema && format!("{bare}_check") == name {
+            found.push(false);
+        }
+    }
+    found
+}
+
 /// Every constraint one table has, in name order — which is the order `pg_constraint` is read in.
 #[allow(
     clippy::too_many_lines,

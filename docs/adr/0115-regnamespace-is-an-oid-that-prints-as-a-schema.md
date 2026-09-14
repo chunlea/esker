@@ -1,7 +1,8 @@
 # ADR 0115: `regnamespace` is an oid that prints as a schema
 
-**Status:** Proposed — the type ruled (a) by the user, 2026-09-13; its tags and the format version approved by the
-coordinator the same day
+**Status:** Accepted, 2026-09-13 — (a) ruled by the coordinator under the standing type-surface directive, reported
+to the user and not vetoed; its tags and the format version approved by the coordinator the same day. Proposed the
+same day
 **Date:** 2026-09-13
 **Deciders:** lane s2-plpgsql
 **Relates to:** [ADR 0098](0098-regproc-is-an-oid-that-prints-as-a-function.md) (the kind),
@@ -89,10 +90,16 @@ Option 1, as ruled.
   planned: the census selects a foreign key by `conname` in a schema, and a derived name is stored qualified
   (`plan::make_object_name` re-qualifies), so `pg_constraint` printed `s2ns\0t_pkey`, `VALIDATE CONSTRAINT` could not
   find the key it listed, and the `42704`, `42710`, `23514` and `23503` sentences carried the NUL. Fixed where names are
-  shown and matched, not where they are stored; `tests/constraint_name_in_a_schema.rs` holds it to PostgreSQL's answers
-  and declares the three older gaps its capture also found — a table `CHECK`'s derived name, a `CHECK` named like a
-  foreign key, and `UNIQUE`'s `42P07`.
-* Not an index key, like `regproc` and `regtype`: the number alone would allow one, and nothing the suite sends needs it.
+  shown and matched, not where they are stored; `tests/constraint_name_in_a_schema.rs` holds it to PostgreSQL's answers.
+  Its capture also found three older gaps that are not about schemas at all — a table `CHECK`'s derived name, a `CHECK`
+  named like a foreign key, `UNIQUE`'s `42P07` — declared there first and closed since as debt #92
+  (`tests/constraint_names.rs`).
+* **Not an index key — declared.** PostgreSQL 19 builds a primary key and an index over a `regnamespace` column
+  (`oid_ops`; `esker-coord/s2-d92c.out`). This node refuses all three by name — `0A000 an index on a column of type
+  regnamespace is not supported`, and `a primary key` or `a unique constraint` in the same sentence — because the row
+  codec writes no key bytes for the type, as for `regproc` and `regtype`, and a key that writes nothing would give every
+  row of the table the same key. The number alone would allow one; nothing the suite sends needs it
+  (`tests/regnamespace.rs::a_regnamespace_column_is_not_an_index_key`).
 * `ColumnType::ALL` grows from 107 to 109, so every test that loops over it covers the new type without being edited.
 * No wire change beyond the type's own oid, no dependency, no format version.
 

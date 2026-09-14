@@ -2598,6 +2598,11 @@ pub enum SqlError {
     #[error("extension \"{0}\" is not available")]
     ExtensionNotAvailable(String),
 
+    /// Two `CHECK`s of one given name in one `CREATE TABLE`: `42710`, in a sentence of its own —
+    /// there is no relation in it, where every other constraint collision names one. Measured.
+    #[error("check constraint \"{0}\" already exists")]
+    DuplicateCheckConstraint(String),
+
     /// A constraint name the relation already has: `42710`.
     #[error("constraint \"{constraint}\" for relation \"{relation}\" already exists")]
     DuplicateConstraint {
@@ -3615,6 +3620,7 @@ impl SqlError {
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST
             }
             SqlError::DuplicateConstraint { .. }
+            | SqlError::DuplicateCheckConstraint(_)
             | SqlError::DuplicateType(_)
             | SqlError::DuplicateExtension(_) => {
                 sqlstate::DUPLICATE_OBJECT

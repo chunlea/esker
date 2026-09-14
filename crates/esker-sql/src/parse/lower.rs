@@ -2684,7 +2684,7 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
     let mut primary_key = Vec::new();
     let mut primary_key_name = None;
     let mut unique = Vec::new();
-    let mut checks: Vec<catalog::CheckDef> = Vec::new();
+    let mut checks: Vec<plan::CheckConstraint> = Vec::new();
     let mut foreign_keys: Vec<plan::ForeignKey> = Vec::new();
 
     for column in &create.columns {
@@ -2702,8 +2702,9 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
         for option in &column.options {
             match &option.option {
                 // A column `CHECK`, named the way PostgreSQL names one when nothing else does:
-                // `<table>_<column>_check`. Measured — `q text CHECK (q <> '')` on table `ck` is
-                // `ck_q_check`.
+                // Named where the table is made, for the one column the expression reads —
+                // `ck_q_check` for `q text CHECK (q <> '')` on `ck`, measured, and `ck_check` for a
+                // column constraint that reads two (`crate::exec::ddl`).
                 // `constraint.expr`, not the constraint: a `CheckConstraint`'s own `Display`
                 // renders `CHECK (…)`, and storing that would make the stored text a call to a
                 // function named `CHECK` when it is read back.
@@ -2712,17 +2713,23 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
                         constraint.enforced.is_some(),
                         "CHECK ... ENFORCED, which is MySQL's",
                     )?;
-                    checks.push(catalog::CheckDef {
+                    // **The name a column constraint was given is the option's**, as it is for a
+                    // column `PRIMARY KEY` and `UNIQUE` above: `CONSTRAINT nd CHECK (…)` puts `nd` on
+                    // the option and nothing on the check. Reading only the check's own name stored
+                    // a derived one instead, so `SET CONSTRAINTS nd` found nothing (#92).
+                    checks.push(plan::CheckConstraint {
                         validated: true,
-                        name: constraint
-                            .name
-                            .as_ref()
-                            .map_or_else(|| format!("{name}_{column_name}_check"), ident),
+                        name: option.name.as_ref().or(constraint.name.as_ref()).map(ident),
                         expr: unwrap_nested(&constraint.expr).to_string(),
                     });
                 }
                 ColumnOption::ForeignKey(constraint) => {
-                    foreign_keys.push(lower_column_foreign_key(&name, &column_name, constraint)?);
+                    let mut lowered = lower_column_foreign_key(&column_name, constraint)?;
+                    // The same for a column `REFERENCES`: `b integer CONSTRAINT dup2 REFERENCES p`.
+                    if let Some(given) = &option.name {
+                        lowered.name = Some(ident(given));
+                    }
+                    foreign_keys.push(lowered);
                 }
                 ColumnOption::NotNull => not_null = true,
                 ColumnOption::Null => {}
@@ -2824,7 +2831,6 @@ fn lower_create_table(create: &sqlparser::ast::CreateTable) -> Result<plan::Crea
 
     lower_table_constraints(
         create,
-        &name,
         &mut primary_key,
         &mut primary_key_name,
         &mut unique,
@@ -2905,7 +2911,6 @@ fn lower_alter_table(
     refuse_if(alter.table_type.is_some(), "ALTER of a table of that type")?;
 
     // The table's own name, for deriving a constraint name PostgreSQL would derive.
-    let table_name = relation_name(&alter.name)?;
     let mut actions = Vec::with_capacity(alter.operations.len());
     for operation in &alter.operations {
         if let AlterTableOperation::SetOptionsParens { options } = operation {
@@ -2917,7 +2922,7 @@ fn lower_alter_table(
             not_valid,
         } = operation
         {
-            let mut lowered = lower_added_constraint(&table_name, constraint)?;
+            let mut lowered = lower_added_constraint(constraint)?;
             // **A foreign key's and a check's**, which are the two PostgreSQL takes it on. What
             // it skips is the scan of the rows already there; the constraint is enforced for every
             // row written afterwards either way — measured, an `INSERT` violating a `NOT VALID`
@@ -3217,11 +3222,10 @@ fn lower_alter_table(
 /// holds, not because the constraints are separable — they all write into the same statement.
 fn lower_table_constraints(
     create: &sqlparser::ast::CreateTable,
-    name: &str,
     primary_key: &mut Vec<String>,
     primary_key_name: &mut Option<String>,
     unique: &mut Vec<plan::UniqueConstraint>,
-    checks: &mut Vec<catalog::CheckDef>,
+    checks: &mut Vec<plan::CheckConstraint>,
     foreign_keys: &mut Vec<plan::ForeignKey>,
 ) -> Result<()> {
     for constraint in &create.constraints {
@@ -3244,21 +3248,19 @@ fn lower_table_constraints(
                 });
             }
             TableConstraint::ForeignKey(constraint) => {
-                foreign_keys.push(lower_foreign_key(name, constraint)?);
+                foreign_keys.push(lower_foreign_key(constraint)?);
             }
-            // A named table `CHECK`, or an unnamed one, which PostgreSQL names
-            // `<table>_check` — the same derivation a column constraint gets without the column.
+            // A named table `CHECK`, or an unnamed one, whose name is derived where the table is
+            // made and by the rule a column constraint's is — PostgreSQL's cannot tell the two
+            // apart: the one column the expression reads, or none.
             TableConstraint::Check(check) => {
                 refuse_if(
                     check.enforced.is_some(),
                     "CHECK ... ENFORCED, which is MySQL's",
                 )?;
-                checks.push(catalog::CheckDef {
+                checks.push(plan::CheckConstraint {
                     validated: true,
-                    name: check
-                        .name
-                        .as_ref()
-                        .map_or_else(|| format!("{name}_check"), ident),
+                    name: check.name.as_ref().map(ident),
                     expr: unwrap_nested(&check.expr).to_string(),
                 });
             }
@@ -3362,13 +3364,9 @@ fn alter_action_name(operation: &AlterTableOperation) -> String {
 /// A `UNIQUE` or `PRIMARY KEY` added after the fact is `0A000` naming itself — recording a
 /// constraint that does not constrain would let a schema load and then accept the rows it forbids,
 /// which ADR 0031 calls a wrong answer rather than a gap.
-fn lower_added_constraint(
-    table: &str,
-    constraint: &TableConstraint,
-) -> Result<plan::AlterTableAction> {
+fn lower_added_constraint(constraint: &TableConstraint) -> Result<plan::AlterTableAction> {
     if let TableConstraint::ForeignKey(foreign_key) = constraint {
         return Ok(plan::AlterTableAction::AddForeignKey(lower_foreign_key(
-            table,
             foreign_key,
         )?));
     }
@@ -3420,12 +3418,9 @@ fn lower_added_constraint(
         check.enforced.is_some(),
         "CHECK ... ENFORCED, which is MySQL's",
     )?;
-    Ok(plan::AlterTableAction::AddCheck(catalog::CheckDef {
+    Ok(plan::AlterTableAction::AddCheck(plan::CheckConstraint {
         validated: true,
-        name: check
-            .name
-            .as_ref()
-            .map_or_else(|| format!("{table}_check"), ident),
+        name: check.name.as_ref().map(ident),
         expr: unwrap_nested(&check.expr).to_string(),
     }))
 }
@@ -3433,19 +3428,15 @@ fn lower_added_constraint(
 /// `p int8 REFERENCES t` — a column constraint that is the same thing as the table constraint.
 ///
 /// The form `t.references :parrot, foreign_key: true` writes, and the one whose referencing column
-/// is not in its own text: it is the column it is written on, and the derived name is the table's
-/// plus that column's (`fxe_p_fkey`, measured).
+/// is not in its own text: it is the column it is written on, and the name derived for it where the
+/// table is made is the table's plus that column's (`fxe_p_fkey`, measured).
 fn lower_column_foreign_key(
-    table: &str,
     column: &str,
     constraint: &sqlparser::ast::ForeignKeyConstraint,
 ) -> Result<plan::ForeignKey> {
-    let mut lowered = lower_foreign_key(table, constraint)?;
+    let mut lowered = lower_foreign_key(constraint)?;
     if lowered.columns.is_empty() {
         lowered.columns = vec![column.to_owned()];
-        if constraint.name.is_none() {
-            lowered.name = plan::foreign_key_name(table, &lowered.columns);
-        }
     }
     Ok(lowered)
 }
@@ -3455,10 +3446,7 @@ fn lower_column_foreign_key(
 /// **`MATCH` is refused unless it is `SIMPLE`**, which is the default and the only one this node
 /// implements: `MATCH FULL` refuses a row with *some* of its key NULL where `SIMPLE` admits it,
 /// so accepting the word and behaving as `SIMPLE` would admit rows a real server rejects.
-fn lower_foreign_key(
-    table: &str,
-    key: &sqlparser::ast::ForeignKeyConstraint,
-) -> Result<plan::ForeignKey> {
+fn lower_foreign_key(key: &sqlparser::ast::ForeignKeyConstraint) -> Result<plan::ForeignKey> {
     refuse_if(key.index_name.is_some(), "an index name on a FOREIGN KEY")?;
     if let Some(kind) = &key.match_kind {
         refuse_if(
@@ -3487,10 +3475,7 @@ fn lower_foreign_key(
     };
     let columns: Vec<String> = key.columns.iter().map(ident).collect();
     Ok(plan::ForeignKey {
-        name: key
-            .name
-            .as_ref()
-            .map_or_else(|| plan::foreign_key_name(table, &columns), ident),
+        name: key.name.as_ref().map(ident),
         columns,
         parent: relation_name(&key.foreign_table)?,
         parent_columns: key.referred_columns.iter().map(ident).collect(),

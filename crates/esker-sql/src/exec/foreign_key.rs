@@ -79,7 +79,9 @@ pub(super) fn check_references(
         let parent = executor.table_by_id(txn, key.parent)?;
         // **Deferred: the question is asked at `COMMIT` instead**, against the transaction as it
         // stands then — which is what lets a child be written before its parent and both commit.
-        if key.deferrable && executor.constraint_is_deferred(&key.name, key.initially_deferred) {
+        if key.deferrable
+            && executor.constraint_is_deferred(table, &key.name, key.initially_deferred)
+        {
             executor.defer_check(super::deferred::Check::ForeignKey {
                 table: Executor::table_arc(table),
                 at,
