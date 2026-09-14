@@ -1,0 +1,53 @@
+crates/esker-sql/src/catalog/pg_constraint.rs
+  s_f4b2852b53accb::t_260454f55852eb 501-573
+crates/esker-sql/src/error.rs
+  s_f4b2852b53accb::t_e72fda5dd39093 2589-2593,3609
+crates/esker-sql/src/exec/ddl.rs
+  s_f4b2852b53accb::t_5b98dfdb223ffc 160,189,199,238-246,619-644,717,719-732,749-755,769-777,791-795,803,826-828,946-954,1035,2752,2800,3098-3106,3116-3118,3495-3648,7513
+crates/esker-sql/src/exec/deferred.rs
+  s_f4b2852b53accb::t_26014f7017a266 112-120,200-202,212-216,235-237,248-249,252-255
+crates/esker-sql/src/exec/dml.rs
+  s_f4b2852b53accb::t_b1e50f7364d0b5 1193,2451-2453
+crates/esker-sql/src/exec/foreign_key.rs
+  s_f4b2852b53accb::t_371866b191eb7a 82-84
+crates/esker-sql/src/exec/mod.rs
+  s_f4b2852b53accb::t_5be7cbdef30146 618-631,644-648,670-672,674-697,700,758,772-777,792-796,800-801,808,810
+crates/esker-sql/src/parse/lower.rs
+  s_f4b2852b53accb::t_11a6e66777ada7 2687,2705-2707,2716-2720,2722,2727-2732,2925,3228,3251,3253-3255,3261,3263,3367,3421,3423,3431-3432,3437,3449,3478
+crates/esker-sql/src/parse/mod.rs
+  s_f4b2852b53accb::t_204d43dfefdfc3 242,3332,3335-3338,3422-3489
+crates/esker-sql/src/plan/ddl.rs
+  s_f4b2852b53accb::t_e818ae8e32382f 59-60,706-708,728-744,928-934,1449
+crates/esker-sql/src/plan/mod.rs
+  s_f4b2852b53accb::t_a7ddc7d9084fbe 37-45
+crates/esker-sql/tests/constraint_name_in_a_schema.rs
+  s_f4b2852b53accb::t_0f32e2e8e5272a 25
+crates/esker-sql/tests/constraint_names.rs
+  s_f4b2852b53accb::t_7baa73ecaac87f 1-299
+crates/esker-sql/tests/corpus/pg19_constraint_names.txt
+  s_f4b2852b53accb::t_81f09a80f16ef3 1-192
+crates/esker-sql/tests/regnamespace.rs
+  s_f4b2852b53accb::t_79228df46befc5 359-385
+docs/adr/0115-regnamespace-is-an-oid-that-prints-as-a-schema.md
+  s_f4b2852b53accb::t_1bb8db17f639d3 3-5,93-102
+docs/plans/debts-v1.1.md
+  s_f4b2852b53accb::t_8a5b8f2b06011b 24,126
+docs/plans/plpgsql-subset.md
+  s_f4b2852b53accb::t_7fbfb053c154a6 464
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b81c20984673829b8486942d084c211decbeab32",
+  "prompts": {},
+  "sessions": {
+    "s_f4b2852b53accb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc7223c3-8ba0-48df-95c8-ddb365dc093c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
