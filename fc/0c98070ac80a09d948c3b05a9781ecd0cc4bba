@@ -1,0 +1,43 @@
+crates/esker-client/src/txn.rs
+  s_8d3e4c2902bf64::t_7d6888cf6d62a3 725-736,757-769,776-777,780,782,785,839,857,863-872,1668,1677-1684
+crates/esker-client/src/wire.rs
+  s_8d3e4c2902bf64::t_2a5246be549285 104,118-126
+crates/esker-client/tests/txn.rs
+  s_8d3e4c2902bf64::t_d870cca9b9a943 23,1718-1892
+crates/esker-proto/src/txn.rs
+  s_8d3e4c2902bf64::t_9f045895610af1 262-265,275,279-283,285,287-296,316,332-335,342,344,368-373,403,409-412
+crates/esker-proto/tests/golden/messages.hex
+  s_8d3e4c2902bf64::t_5b386d9108d83b 125-128
+crates/esker-proto/tests/messages.rs
+  s_8d3e4c2902bf64::t_c4030512528233 60-62,595,605-646
+crates/esker-sql/tests/concurrent_unique_insert.rs
+  s_8d3e4c2902bf64::t_740835239912fd 24-25,31-34,122-123,127-132,164-203,314-315
+crates/esker-store/src/txn_command.rs
+  s_8d3e4c2902bf64::t_a5d86c74eeb3fb 66-68,81,83-86,103,126-129,242-245,373,377-386,477,483-486,624-653
+crates/esker-store/src/txnkv.rs
+  s_8d3e4c2902bf64::t_a56b8ff7ce88bf 621-626
+crates/esker-store/tests/a_collection_under_many_keys.rs
+  s_8d3e4c2902bf64::t_4ab7042185fae6 254-257
+crates/esker-store/tests/a_deleted_key_goes_whole.rs
+  s_8d3e4c2902bf64::t_44d613929fa2b7 200
+crates/esker-store/tests/a_lock_is_not_a_version.rs
+  s_8d3e4c2902bf64::t_c8c3defa331509 162
+crates/esker-store/tests/a_lock_is_validated_at_its_statement.rs
+  s_8d3e4c2902bf64::t_ddb1ba372a6abc 1-141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fc0c98070ac80a09d948c3b05a9781ecd0cc4bba",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
