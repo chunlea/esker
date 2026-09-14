@@ -157,6 +157,7 @@ pub(super) fn create_table(
         // orderable because the word `PRIMARY` was used.
         for &at in &primary_key {
             refuse_unindexable_type(columns[at].ty, catalog::BTREE_ACCESS_METHOD)?;
+            refuse_empty_key(columns[at].ty, "a primary key")?;
         }
         // **`<partition>_pkey`, not the parent's name.** A partition's key is its own relation and
         // its own `pg_index` row, and it is that name a duplicate row quotes back — measured,
@@ -185,6 +186,7 @@ pub(super) fn create_table(
 
     let table_id = catalog::allocate_id(txn, executor.tenant)?;
     let sequences = sequences_for(executor, txn, create, table_id)?;
+    let checks = named_checks(executor, &*txn, &create.name, &create.checks)?;
     let table = TableDef {
         matview: None,
         on_commit: create.on_commit,
@@ -194,7 +196,7 @@ pub(super) fn create_table(
         columns,
         primary_key,
         indexes,
-        checks: create.checks.clone(),
+        checks,
         // Filled below: resolving one needs the table it is on, which is this value. A new
         // table's checks are on; `DISABLE TRIGGER` is a statement of its own.
         foreign_keys: Vec::new(),
@@ -233,7 +235,15 @@ pub(super) fn create_table(
     let mut table = table;
     let mut backrefs = Vec::new();
     for key in &create.foreign_keys {
-        let resolved = resolve_foreign_key(txn, executor, &table, key)?;
+        let name = constraint_name(
+            executor,
+            &*txn,
+            &table,
+            key.name.as_deref(),
+            Some(&plan::column_name_addition(&key.columns)),
+            "fkey",
+        )?;
+        let resolved = resolve_foreign_key(txn, executor, &table, key, name)?;
         backrefs.push((resolved.parent, table.id));
         table.foreign_keys.push(resolved);
     }
@@ -606,6 +616,32 @@ fn refuse_unindexable_type(ty: ColumnType, method: &str) -> Result<bool> {
     Ok(false)
 }
 
+/// **A key over a column whose key would be empty is refused by name.**
+///
+/// A `regtype`, `regproc` or `regnamespace` datum — and an array of one — is an oid the row codec
+/// writes **no key bytes** for (`esker_keys::row`'s `encode_key_column`), so every row of a table
+/// keyed on one would have the same key and the second insert would take the first one's place.
+/// PostgreSQL builds the key (`oid_ops`, measured for `regnamespace` in `esker-coord/s2-d92c.out`);
+/// this node answers that it cannot, which ADR 0115 declares, rather than accept a table it would
+/// answer wrongly for. `CREATE INDEX` reaches the same refusal through `is_index_key`.
+fn refuse_empty_key(ty: ColumnType, construct: &str) -> Result<()> {
+    if matches!(
+        ty,
+        ColumnType::RegType
+            | ColumnType::RegTypeArray
+            | ColumnType::RegProc
+            | ColumnType::RegProcArray
+            | ColumnType::RegNamespace
+            | ColumnType::RegNamespaceArray
+    ) {
+        return Err(SqlError::unsupported(format!(
+            "{construct} on a column of type {}",
+            ty.name()
+        )));
+    }
+    Ok(())
+}
+
 /// **`json` and `point` cannot be indexed on a real server**, and they are the only two —
 /// measured, one type at a time: `jsonb`, every range, `hstore` and every array all have a default
 /// btree operator class there and index fine.
@@ -678,16 +714,22 @@ fn add_check(
     executor: &Executor,
     table: &TableDef,
     updated: &mut TableDef,
-    check: &CheckDef,
+    check: &plan::CheckConstraint,
 ) -> Result<()> {
-    if updated
-        .checks
-        .iter()
-        .any(|seen| same_constraint(&seen.name, &check.name))
-    {
-        return Err(duplicate_constraint(&check.name, updated));
-    }
-    updated.checks.push(check.clone());
+    let column = only_column_read(&check.expr);
+    let name = constraint_name(
+        executor,
+        &*txn,
+        updated,
+        check.name.as_deref(),
+        column.as_deref(),
+        "check",
+    )?;
+    updated.checks.push(CheckDef {
+        name,
+        expr: check.expr.clone(),
+        validated: check.validated,
+    });
     validate_checks(updated)?;
     // The fifth reader, at the statement that writes one: `pg_get_constraintdef` prints what is
     // stored, so the deparsed form is what has to be stored. Only the check this statement adds
@@ -704,7 +746,13 @@ fn add_check(
     // advertises as validated. Measured: `23514 check constraint "q_plain" of relation "nv_t" is
     // violated by some row`, a different sentence from the one an `INSERT` gets.
     if check.validated {
-        validate_check_rows(txn, executor, updated, check)?;
+        // The check **as stored** — its derived name is the one the `23514` quotes, and its text is
+        // the deparsed form the rows are read through.
+        let stored =
+            updated.checks.last().cloned().ok_or_else(|| {
+                SqlError::Internal("the check just pushed is not there".to_owned())
+            })?;
+        validate_check_rows(txn, executor, updated, &stored)?;
     }
     updated.schema_version += 1;
     catalog::replace_table(txn, executor.tenant, table, updated)
@@ -718,8 +766,15 @@ fn add_check(
 /// a primary key away.
 ///
 /// The derived name is `<table>_pkey` on the **unqualified** relation, measured:
-/// `g1_apk3_pkey` for `g1_apk3` (`tests/captures/pg19_add_column_primary_key.txt`).
-fn add_primary_key(updated: &mut TableDef, name: Option<&str>, columns: &[String]) -> Result<()> {
+/// `g1_apk3_pkey` for `g1_apk3` (`tests/captures/pg19_add_column_primary_key.txt`) — and numbered when
+/// a relation already holds it, `q_pkey1` beside a table called `q_pkey` (#92).
+fn add_primary_key(
+    executor: &Executor,
+    txn: &dyn Txn,
+    updated: &mut TableDef,
+    name: Option<&str>,
+    columns: &[String],
+) -> Result<()> {
     if !updated.primary_key_name.is_empty() {
         return Err(SqlError::MultiplePrimaryKeys(updated.name.clone()));
     }
@@ -733,6 +788,11 @@ fn add_primary_key(updated: &mut TableDef, name: Option<&str>, columns: &[String
             })?;
         positions.push(at);
     }
+    for &at in &positions {
+        refuse_empty_key(updated.columns[at].ty, "a primary key")?;
+    }
+    let bare = catalog::split_qualified(&updated.name).1.to_owned();
+    let chosen = index_constraint_name(executor, txn, updated, &bare, name, None, "pkey")?;
     // A key column is `NOT NULL` on a real server whether or not the word was written.
     for &at in &positions {
         if let Some(column) = updated.columns.get_mut(at) {
@@ -740,10 +800,7 @@ fn add_primary_key(updated: &mut TableDef, name: Option<&str>, columns: &[String
         }
     }
     updated.primary_key = positions;
-    updated.primary_key_name = name.map_or_else(
-        || format!("{}_pkey", catalog::split_qualified(&updated.name).1),
-        ToOwned::to_owned,
-    );
+    updated.primary_key_name = chosen;
     updated.schema_version += 1;
     Ok(())
 }
@@ -766,15 +823,9 @@ fn add_exclude(
     updated: &mut TableDef,
     exclude: &catalog::ExcludeDef,
 ) -> Result<()> {
-    if updated
-        .excludes
-        .iter()
-        .any(|seen| same_constraint(&seen.name, &exclude.name))
-        || updated
-            .checks
-            .iter()
-            .any(|seen| same_constraint(&seen.name, &exclude.name))
-    {
+    // One name space for a table's constraints, of every kind — measured, `42710` for an `EXCLUDE`
+    // named like a `CHECK`. The clause arrives named, given or derived, so it is only checked.
+    if has_constraint_named(executor, &*txn, updated, &exclude.name)? {
         return Err(duplicate_constraint(&exclude.name, updated));
     }
     validate_exclude_rows(txn, executor, updated, exclude)?;
@@ -892,18 +943,15 @@ fn add_foreign_key(
     updated: &mut TableDef,
     key: &plan::ForeignKey,
 ) -> Result<()> {
-    if updated
-        .checks
-        .iter()
-        .any(|seen| same_constraint(&seen.name, &key.name))
-        || updated
-            .foreign_keys
-            .iter()
-            .any(|seen| same_constraint(&seen.name, &key.name))
-    {
-        return Err(duplicate_constraint(&key.name, updated));
-    }
-    let resolved = resolve_foreign_key(txn, executor, updated, key)?;
+    let name = constraint_name(
+        executor,
+        &*txn,
+        updated,
+        key.name.as_deref(),
+        Some(&plan::column_name_addition(&key.columns)),
+        "fkey",
+    )?;
+    let resolved = resolve_foreign_key(txn, executor, updated, key, name)?;
     let parent_id = resolved.parent;
     // **The rows already there are checked, unless `NOT VALID` says not to.** A real server scans
     // here, and skipping it left a table whose rows contradict a constraint it advertises as
@@ -984,6 +1032,7 @@ fn unique_indexes(
         // A constraint's key is an index, so it asks the same question `CREATE INDEX` asks.
         for &at in &ordinals {
             refuse_unindexable_type(columns[at].ty, catalog::BTREE_ACCESS_METHOD)?;
+            refuse_empty_key(columns[at].ty, "a unique constraint")?;
         }
         indexes.push(IndexDef {
             id: catalog::allocate_id(txn, executor.tenant)?,
@@ -2700,6 +2749,7 @@ fn resolve_foreign_key(
     executor: &Executor,
     child: &TableDef,
     key: &plan::ForeignKey,
+    name: String,
 ) -> Result<catalog::ForeignKeyDef> {
     let columns = key
         .columns
@@ -2747,7 +2797,7 @@ fn resolve_foreign_key(
         return Err(SqlError::PermanentReferencesUnlogged);
     }
     Ok(catalog::ForeignKeyDef {
-        name: key.name.clone(),
+        name,
         columns,
         parent: parent_def.id,
         parent_columns,
@@ -3045,25 +3095,15 @@ fn add_unique_constraint(
     updated: &mut TableDef,
     constraint: &plan::UniqueConstraint,
 ) -> Result<()> {
-    let name = constraint
-        .name
-        .clone()
-        .unwrap_or_else(|| plan::unique_constraint_name(&updated.name, &constraint.columns));
-    if updated
-        .indexes
-        .iter()
-        .any(|index| same_constraint(&index.name, &name))
-        || updated
-            .checks
-            .iter()
-            .any(|check| same_constraint(&check.name, &name))
-        || updated
-            .foreign_keys
-            .iter()
-            .any(|key| same_constraint(&key.name, &name))
-    {
-        return Err(duplicate_constraint(&name, updated));
-    }
+    let name = index_constraint_name(
+        executor,
+        &*txn,
+        updated,
+        &updated.name,
+        constraint.name.as_deref(),
+        Some(&plan::column_name_addition(&constraint.columns)),
+        "key",
+    )?;
     let ordinals = constraint
         .columns
         .iter()
@@ -3073,6 +3113,9 @@ fn add_unique_constraint(
                 .ok_or_else(|| SqlError::UndefinedColumnInKey(column.clone()))
         })
         .collect::<Result<Vec<_>>>()?;
+    for &at in &ordinals {
+        refuse_empty_key(updated.columns[at].ty, "a unique constraint")?;
+    }
     updated.indexes.push(IndexDef {
         id: catalog::allocate_id(txn, executor.tenant)?,
         name,
@@ -3446,6 +3489,160 @@ fn duplicate_constraint(name: &str, table: &TableDef) -> SqlError {
     SqlError::DuplicateConstraint {
         constraint: catalog::split_qualified(name).1.to_owned(),
         relation: catalog::split_qualified(&table.name).1.to_owned(),
+    }
+}
+
+/// Whether the table already holds a constraint called `name`, of any kind — the one name space a
+/// table's constraints share, read from the rows `pg_constraint` prints for it. A `CHECK` named like
+/// the primary key, a `UNIQUE`, a `NOT NULL` or a foreign key is `42710`, measured one each (#92).
+fn has_constraint_named(
+    executor: &Executor,
+    txn: &dyn Txn,
+    table: &TableDef,
+    name: &str,
+) -> Result<bool> {
+    let relations = executor.catalog_view(txn)?.relations()?;
+    Ok(catalog::pg_constraint::constraint_names(&relations, table)
+        .iter()
+        .any(|held| same_constraint(held, name)))
+}
+
+/// The name a constraint that is not an index is stored under — a `CHECK`'s or a `FOREIGN KEY`'s.
+///
+/// **A given name is refused when the table already holds it** ([`has_constraint_named`]). **A
+/// derived one is numbered instead**, and past every constraint in the schema, not only the
+/// table's: `nsq_x_check1` because another table holds `nsq_x_check`, `k_a_fkey1` beside a `CHECK`
+/// called `k_a_fkey` — both measured. The number goes on the label, which is PostgreSQL's
+/// `ChooseConstraintName` and the rule [`plan::choose_relation_name`] already follows; the name is
+/// built from the bare table, because a constraint that is no index is no relation either.
+fn constraint_name(
+    executor: &Executor,
+    txn: &dyn Txn,
+    table: &TableDef,
+    given: Option<&str>,
+    name2: Option<&str>,
+    label: &str,
+) -> Result<String> {
+    if let Some(given) = given {
+        if has_constraint_named(executor, txn, table, given)? {
+            return Err(duplicate_constraint(given, table));
+        }
+        return Ok(given.to_owned());
+    }
+    let relations = executor.catalog_view(txn)?.relations()?;
+    let (schema, bare) = catalog::split_qualified(&table.name);
+    let mut taken =
+        catalog::pg_constraint::constraint_names_in_schema(&relations, schema, Some(table.id));
+    taken.extend(catalog::pg_constraint::constraint_names(&relations, table));
+    let Ok(name) = plan::choose_relation_name(bare, name2, label, |candidate| {
+        Ok::<_, std::convert::Infallible>(taken.iter().any(|held| same_constraint(held, candidate)))
+    });
+    Ok(name)
+}
+
+/// The name a constraint that **is** an index is stored under — a `UNIQUE`'s or a `PRIMARY KEY`'s.
+///
+/// Its name is its index's, so a given one meets **a relation** of that name first — `42P07
+/// relation "c_u_key" already exists`, for an index and for a table alike — and a constraint that
+/// is no relation second, `42710`: measured, in that order. A derived one is numbered past every
+/// relation the schema holds, `t_b_key1` and `q_pkey1`, which is `ChooseRelationName`. `name1` is
+/// the table as that kind's derived name has always spelled it.
+fn index_constraint_name(
+    executor: &Executor,
+    txn: &dyn Txn,
+    table: &TableDef,
+    name1: &str,
+    given: Option<&str>,
+    name2: Option<&str>,
+    label: &str,
+) -> Result<String> {
+    let relation_taken = |candidate: &str| -> Result<bool> {
+        Ok(
+            catalog::name_exists(txn, executor.tenant, &catalog::owned_name(table, candidate))?
+                || table
+                    .indexes
+                    .iter()
+                    .any(|index| same_constraint(&index.name, candidate)),
+        )
+    };
+    let Some(given) = given else {
+        return plan::choose_relation_name(name1, name2, label, relation_taken);
+    };
+    if relation_taken(given)? {
+        return Err(SqlError::DuplicateTable(given.to_owned()));
+    }
+    if has_constraint_named(executor, txn, table, given)? {
+        return Err(duplicate_constraint(given, table));
+    }
+    Ok(given.to_owned())
+}
+
+/// Every `CHECK` of a `CREATE TABLE`, named, in the order written.
+///
+/// A given name a `CHECK` before it in this statement holds is `42710 check constraint "dup" already
+/// exists` — a sentence with no relation in it, measured, and not the one an `ALTER TABLE` gets. A
+/// derived one is named for [`only_column_read`] and numbered past the names chosen before it here
+/// and every constraint name the schema already holds, which is what `ck_a_check1` and
+/// `nsq_x_check1` measure.
+fn named_checks(
+    executor: &Executor,
+    txn: &dyn Txn,
+    table: &str,
+    checks: &[plan::CheckConstraint],
+) -> Result<Vec<CheckDef>> {
+    let relations = executor.catalog_view(txn)?.relations()?;
+    let (schema, bare) = catalog::split_qualified(table);
+    let in_schema = catalog::pg_constraint::constraint_names_in_schema(&relations, schema, None);
+    let mut named: Vec<CheckDef> = Vec::with_capacity(checks.len());
+    for check in checks {
+        let name = if let Some(given) = &check.name {
+            if named.iter().any(|seen| seen.name == *given) {
+                return Err(SqlError::DuplicateCheckConstraint(given.clone()));
+            }
+            given.clone()
+        } else {
+            let column = only_column_read(&check.expr);
+            let Ok(name) =
+                plan::choose_relation_name(bare, column.as_deref(), "check", |candidate| {
+                    Ok::<_, std::convert::Infallible>(
+                        named.iter().any(|seen| seen.name == candidate)
+                            || in_schema
+                                .iter()
+                                .any(|held| same_constraint(held, candidate)),
+                    )
+                });
+            name
+        };
+        named.push(CheckDef {
+            name,
+            expr: check.expr.clone(),
+            validated: check.validated,
+        });
+    }
+    Ok(named)
+}
+
+/// The column a `CHECK` is named for: **the one its expression reads**, or `None` when it reads
+/// none or more than one.
+///
+/// PostgreSQL's own rule — `AddRelationNewConstraints` counts the expression's distinct columns —
+/// and it cannot see where the constraint was written: `CHECK (b > 0)` at the end of a table is
+/// `ck_b_check`, and a column constraint on `b` that reads `a < b` is `ck_check`. Measured both
+/// ways. An expression that does not parse names nothing, and `validate_checks` refuses it with its
+/// own sentence.
+fn only_column_read(expr: &str) -> Option<String> {
+    let parsed = crate::parse::parse_stored_expr(expr).ok()?;
+    let mut read: Vec<String> = Vec::new();
+    super::bind::descend(&parsed, &mut |expr| {
+        if let plan::Expr::Column { name, .. } = expr
+            && !read.iter().any(|seen| seen == name)
+        {
+            read.push(name.clone());
+        }
+    });
+    match read.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
     }
 }
 
@@ -7313,7 +7510,7 @@ pub(super) fn alter_table(
             continue;
         }
         if let AlterTableAction::AddPrimaryKey { name, columns } = action {
-            add_primary_key(&mut updated, name.as_deref(), columns)?;
+            add_primary_key(executor, &*txn, &mut updated, name.as_deref(), columns)?;
             changed = true;
             continue;
         }

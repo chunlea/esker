@@ -34,14 +34,15 @@ pub use crate::catalog::Identity;
 pub use crate::catalog::pg_catalog::CatalogView;
 pub use ddl::{
     AddValuePosition, AlterIndexRename, AlterSchemaRename, AlterTable, AlterTableAction, AlterType,
-    AlterTypeAction, Column, ColumnDefault, Comment, CommentObject, CreateDatabase,
-    CreateExtension, CreateFunction, CreateIndex, CreateMaterializedView, CreateRole, CreateSchema,
-    CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView,
-    DropDatabase, DropExtension, DropFunction, DropIndex, DropMaterializedView, DropRole,
-    DropSchema, DropSequence, DropTable, DropTrigger, DropType, DropView, ForeignKey, IndexKeyPart,
-    KeyPartName, PartitionSpec, RangeEnd, RefreshMaterializedView, TriggerSelection, Truncate,
-    UniqueConstraint, UniqueUsingIndex, choose_relation_name, foreign_key_name, index_name,
-    index_name_addition, make_object_name, primary_key_name, sequence_name, unique_constraint_name,
+    AlterTypeAction, CheckConstraint, Column, ColumnDefault, Comment, CommentObject,
+    CreateDatabase, CreateExtension, CreateFunction, CreateIndex, CreateMaterializedView,
+    CreateRole, CreateSchema, CreateSequence, CreateTable, CreateTableAs, CreateTrigger,
+    CreateType, CreateView, DropDatabase, DropExtension, DropFunction, DropIndex,
+    DropMaterializedView, DropRole, DropSchema, DropSequence, DropTable, DropTrigger, DropType,
+    DropView, ForeignKey, IndexKeyPart, KeyPartName, PartitionSpec, RangeEnd,
+    RefreshMaterializedView, TriggerSelection, Truncate, UniqueConstraint, UniqueUsingIndex,
+    choose_relation_name, column_name_addition, foreign_key_name, index_name, index_name_addition,
+    make_object_name, primary_key_name, sequence_name, unique_constraint_name,
 };
 pub use dml::{ConflictAction, ConflictKey, Delete, Insert, OnConflict, Returning, Update};
 pub use explain::{Explain, ExplainFormat, PlanNode};

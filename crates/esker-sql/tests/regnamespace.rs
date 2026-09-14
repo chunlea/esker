@@ -356,3 +356,30 @@ fn a_stored_value_follows_its_schema_through_a_rename_and_a_drop() {
         [["t"]]
     );
 }
+
+/// **Not an index key**, like `regproc` and `regtype`: PostgreSQL 19 builds a primary key and an
+/// index over one (`esker-coord/s2-d92c.out`), and this node refuses both by name rather than build
+/// a key its row codec cannot encode. ADR 0115 declares it.
+#[test]
+fn a_regnamespace_column_is_not_an_index_key() {
+    let mut node = parity::Node::new(&["CREATE TABLE ix (ns regnamespace)"]);
+    assert_eq!(
+        node.answer("CREATE INDEX ix_ns ON ix (ns)").to_string(),
+        "!0A000 an index on a column of type regnamespace is not supported"
+    );
+    assert_eq!(
+        node.answer("CREATE TABLE pk (ns regnamespace PRIMARY KEY)")
+            .to_string(),
+        "!0A000 a primary key on a column of type regnamespace is not supported"
+    );
+    assert_eq!(
+        node.answer("CREATE TABLE uq (ns regnamespace UNIQUE)")
+            .to_string(),
+        "!0A000 a unique constraint on a column of type regnamespace is not supported"
+    );
+    assert_eq!(
+        node.answer("ALTER TABLE ix ADD PRIMARY KEY (ns)")
+            .to_string(),
+        "!0A000 a primary key on a column of type regnamespace is not supported"
+    );
+}

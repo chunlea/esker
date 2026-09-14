@@ -239,7 +239,7 @@ pub enum StatementClass {
         /// The constraints named, or **empty for `ALL`** — which is not "no constraints" but
         /// "every deferrable one", and the two are told apart by the mode's own rules rather than
         /// by a flag (`crate::exec::deferred`).
-        names: Vec<String>,
+        names: Vec<ConstraintName>,
         /// `DEFERRED`, as against `IMMEDIATE`.
         deferred: bool,
     },
@@ -3329,10 +3329,13 @@ fn set_constraints(sql: &str, scanned: &Scan<'_>) -> Option<StatementClass> {
     // which is `ALL`. That deferred every deferrable constraint where the user named one, and
     // answered "done" where a non-deferrable name is `42809`.
     let body = sql.get(sql.to_ascii_uppercase().find("CONSTRAINTS")? + "CONSTRAINTS".len()..)?;
-    let names = constraint_names(body);
+    let names = written_constraint_names(body);
     // `ALL` is the empty list: every deferrable constraint, which is not the same question as a
     // list of none.
-    if names.len() == 1 && names[0].eq_ignore_ascii_case("ALL") {
+    if let [only] = names.as_slice()
+        && only.schema.is_none()
+        && only.name.eq_ignore_ascii_case("ALL")
+    {
         return Some(StatementClass::SetConstraints {
             names: Vec::new(),
             deferred,
@@ -3414,6 +3417,74 @@ fn constraint_names(body: &str) -> Vec<String> {
     // The trailing `DEFERRED` or `IMMEDIATE` is a word like any other here, and is not a name.
     names.pop();
     names
+}
+
+/// One name a `SET CONSTRAINTS` lists: `name`, or `schema.name`, each part folded or quoted the way
+/// an identifier is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintName {
+    /// The schema written in front of it, if one was.
+    pub schema: Option<String>,
+    /// The constraint's own name.
+    pub name: String,
+}
+
+/// The names a `SET CONSTRAINTS` lists, **qualified or not**: `a, s.b, "S".c`.
+///
+/// [`constraint_names`] reads a list of bare words, and reading this one with it split `s2e2.uq` at
+/// the dot into two names — `42704 constraint "s2e2" does not exist` for a statement PostgreSQL
+/// runs (#92). A part joins the name before it when a `.` stands between them and starts a new name
+/// otherwise; the trailing mode is the last name read, and is dropped.
+fn written_constraint_names(body: &str) -> Vec<ConstraintName> {
+    let mut names: Vec<Vec<String>> = Vec::new();
+    let mut joined = false;
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        let part = if c == '"' {
+            let mut part = String::new();
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    // `""` inside a quoted identifier is one quote.
+                    if chars.next_if_eq(&'"').is_some() {
+                        part.push('"');
+                        continue;
+                    }
+                    break;
+                }
+                part.push(c);
+            }
+            part
+        } else if c.is_alphanumeric() || c == '_' {
+            let mut part = String::from(c);
+            while let Some(c) = chars.next_if(|c| c.is_alphanumeric() || *c == '_') {
+                part.push(c);
+            }
+            part.to_ascii_lowercase()
+        } else {
+            match c {
+                '.' => joined = true,
+                ',' => joined = false,
+                _ => {}
+            }
+            continue;
+        };
+        match names.last_mut() {
+            Some(name) if joined => name.push(part),
+            _ => names.push(vec![part]),
+        }
+        joined = false;
+    }
+    names.pop();
+    names
+        .into_iter()
+        .map(|mut parts| {
+            let name = parts.pop().unwrap_or_default();
+            ConstraintName {
+                schema: parts.pop(),
+                name,
+            }
+        })
+        .collect()
 }
 
 fn rewrite_synonym(sql: &str, scanned: &Scan<'_>) -> Option<String> {

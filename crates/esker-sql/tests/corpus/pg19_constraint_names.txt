@@ -1,0 +1,192 @@
+# The name a constraint is given, found and refused by, beyond the schema it lives in — debt #92 —
+# as a real PostgreSQL 19beta1 answers it.
+#
+# Captured 2026-09-13 by lane s2-plpgsql with `sesscap.py`, in three sessions, each inside
+# `BEGIN … ROLLBACK`, every refusal in its own `SAVEPOINT` / `ROLLBACK TO`, in schemas of their own; each
+# session's last line proves it left nothing behind: `esker-coord/s2-d92a.stmts` (a `CHECK`'s derived
+# name, the one name space a table's constraints share, a `UNIQUE` or `PRIMARY KEY` whose name a relation
+# has), `s2-d92d.stmts` (a derived `FOREIGN KEY`, `UNIQUE` and `PRIMARY KEY` name already taken) and
+# `s2-d92b.stmts` (`SET CONSTRAINTS` by search path). The `\gdesc` pass runs on a connection of its own,
+# where those schemas do not exist, so a statement naming one of them has an empty declared-types column.
+#
+#!escaped
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A `CHECK` is named for the one column its expression reads, not for where it is written**: the
+#     column constraint on `b` that reads `a < b` is `ck_check`, and the table constraint `CHECK (b > 0)`
+#     is `ck_b_check`. No column, or more than one, is `<table>_check`.
+#   * **A derived name that is taken is numbered, and the numbering is against the whole schema**:
+#     `nsq_x_check1`, because another table's constraint holds `nsq_x_check`. The same for a derived
+#     foreign key (`t_a_fkey1`, and `k_a_fkey1` beside a `CHECK` called `k_a_fkey`), `UNIQUE`
+#     (`t_b_key1`) and primary key (`q_pkey1` beside a table called `q_pkey`). A *given* name that is
+#     taken is refused instead.
+#   * **A table's constraints share one name space, of every kind**: a name the primary key, a `UNIQUE`,
+#     a `NOT NULL` or a foreign key holds is `42710` for a `CHECK`, and the other way round. Two given
+#     `CHECK`s of one name in one `CREATE TABLE` are a sentence of their own: `check constraint "dup"
+#     already exists`, with no relation in it. Another table may hold the same name.
+#   * **A `UNIQUE` or `PRIMARY KEY` meets a relation of its name first and a constraint second**:
+#     `42P07` for an index or a table of that name, `42710` for a `CHECK` — its name is its index's. A
+#     `CREATE UNIQUE INDEX` with a `CHECK`'s name builds, because an index is not a constraint.
+#   * **`SET CONSTRAINTS <name>` finds its constraint the way a relation is found**: a qualified name in
+#     its own schema (`3F000` for one that is not there), a bare one in the first schema on the search
+#     path that has a constraint of that name, and only there — and every constraint of that name in
+#     that schema at once.
+#
+BEGIN		-
+CREATE SCHEMA s2d		-
+SET search_path = s2d, public		-
+# (1) a CHECK is named for the one column its expression reads, and for none when it reads none or several
+CREATE TABLE ck (a integer CHECK (a > 0), b integer CHECK (a < b), c integer CHECK (true), CHECK (b > 0), CHECK (a <> b), CHECK (c > 0 AND c < 100), CHECK (a > 1))		-
+SELECT 'r', conname FROM pg_constraint WHERE conrelid = 'ck'::regclass AND contype = 'c' ORDER BY conname		r|ck_a_check ; r|ck_a_check1 ; r|ck_b_check ; r|ck_c_check ; r|ck_check ; r|ck_check1 ; r|ck_check2
+SELECT 'r', conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'ck'::regclass AND contype = 'c' ORDER BY conname		r|ck_a_check|CHECK ((a > 0)) ; r|ck_a_check1|CHECK ((a > 1)) ; r|ck_b_check|CHECK ((b > 0)) ; r|ck_c_check|CHECK (((c > 0) AND (c < 100))) ; r|ck_check|CHECK ((a < b)) ; r|ck_check1|CHECK (true) ; r|ck_check2|CHECK ((a <> b))
+ALTER TABLE ck ADD CHECK (b < 1000)		-
+ALTER TABLE ck ADD CHECK (a < 1000)		-
+ALTER TABLE ck ADD CHECK (a + b < 5000)		-
+SELECT 'r', conname FROM pg_constraint WHERE conrelid = 'ck'::regclass AND contype = 'c' ORDER BY conname		r|ck_a_check ; r|ck_a_check1 ; r|ck_a_check2 ; r|ck_b_check ; r|ck_b_check1 ; r|ck_c_check ; r|ck_check ; r|ck_check1 ; r|ck_check2 ; r|ck_check3
+# a derived name another table's constraint already has is numbered: it is chosen against the schema
+CREATE TABLE other (x integer CONSTRAINT nsq_x_check CHECK (x > 0))		-
+CREATE TABLE nsq (x integer CHECK (x > 0))		-
+SELECT 'r', conname FROM pg_constraint WHERE conrelid = 'nsq'::regclass AND contype = 'c'		r|nsq_x_check1
+# a long column: the budget is spent on the identifier
+CREATE TABLE lng (c_long_column_name_for_the_check_derivation_budget_xxxxxxxxx integer CHECK (c_long_column_name_for_the_check_derivation_budget_xxxxxxxxx > 0))		-
+SELECT 'r', conname, length(conname) FROM pg_constraint WHERE conrelid = 'lng'::regclass AND contype = 'c'		r|lng_c_long_column_name_for_the_check_derivation_budget_xx_check|63
+# (2) a table's constraints share one name space, of every kind
+CREATE TABLE p (id integer PRIMARY KEY)		-
+CREATE TABLE c (id integer PRIMARY KEY, p integer REFERENCES p, q integer NOT NULL, u integer UNIQUE, CONSTRAINT c_positive CHECK (id > 0))		-
+SAVEPOINT a1		-
+ALTER TABLE c ADD CONSTRAINT c_p_fkey CHECK (id > 1)	!42710 constraint "c_p_fkey" for relation "c" already exists
+ROLLBACK TO a1		-
+SAVEPOINT a2		-
+ALTER TABLE c ADD CONSTRAINT c_positive FOREIGN KEY (p) REFERENCES p	!42710 constraint "c_positive" for relation "c" already exists
+ROLLBACK TO a2		-
+SAVEPOINT a3		-
+ALTER TABLE c ADD CONSTRAINT c_pkey CHECK (id > 1)	!42710 constraint "c_pkey" for relation "c" already exists
+ROLLBACK TO a3		-
+SAVEPOINT a4		-
+ALTER TABLE c ADD CONSTRAINT c_u_key CHECK (id > 1)	!42710 constraint "c_u_key" for relation "c" already exists
+ROLLBACK TO a4		-
+SAVEPOINT a5		-
+ALTER TABLE c ADD CONSTRAINT c_q_not_null CHECK (id > 1)	!42710 constraint "c_q_not_null" for relation "c" already exists
+ROLLBACK TO a5		-
+SAVEPOINT a6		-
+ALTER TABLE c ADD CONSTRAINT c_positive CHECK (id > 1)	!42710 constraint "c_positive" for relation "c" already exists
+ROLLBACK TO a6		-
+SAVEPOINT a7		-
+ALTER TABLE c ADD CONSTRAINT c_p_fkey FOREIGN KEY (p) REFERENCES p	!42710 constraint "c_p_fkey" for relation "c" already exists
+ROLLBACK TO a7		-
+SAVEPOINT a8		-
+CREATE TABLE twice (a integer, CONSTRAINT dup CHECK (a > 0), CONSTRAINT dup CHECK (a < 10))	!42710 check constraint "dup" already exists
+ROLLBACK TO a8		-
+SAVEPOINT a9		-
+CREATE TABLE twice2 (a integer CONSTRAINT dup2 CHECK (a > 0), b integer CONSTRAINT dup2 REFERENCES p)	!42710 constraint "dup2" for relation "twice2" already exists
+ROLLBACK TO a9		-
+CREATE TABLE ex (r daterange, CONSTRAINT ex_r CHECK (r IS NOT NULL))		-
+SAVEPOINT a10		-
+ALTER TABLE ex ADD CONSTRAINT ex_r EXCLUDE USING gist (r WITH &&)	!42710 constraint "ex_r" for relation "ex" already exists
+ROLLBACK TO a10		-
+# another table may use the same name
+CREATE TABLE c2 (id integer, CONSTRAINT c_positive CHECK (id > 0))		-
+SELECT 'r', conrelid::regclass::text, conname FROM pg_constraint WHERE conname = 'c_positive' ORDER BY 2	text,text,name	r|c|c_positive ; r|c2|c_positive
+# (3) a UNIQUE or PRIMARY KEY whose name a relation has: the relation answers first, a constraint second
+SAVEPOINT d1		-
+ALTER TABLE c ADD CONSTRAINT c_u_key UNIQUE (q)	!42P07 relation "c_u_key" already exists
+ROLLBACK TO d1		-
+SAVEPOINT d2		-
+ALTER TABLE c ADD CONSTRAINT c2 UNIQUE (q)	!42P07 relation "c2" already exists
+ROLLBACK TO d2		-
+SAVEPOINT d3		-
+ALTER TABLE c ADD CONSTRAINT c_positive UNIQUE (q)	!42710 constraint "c_positive" for relation "c" already exists
+ROLLBACK TO d3		-
+SAVEPOINT d4		-
+ALTER TABLE c2 ADD CONSTRAINT c_pkey PRIMARY KEY (id)	!42P07 relation "c_pkey" already exists
+ROLLBACK TO d4		-
+SAVEPOINT d5		-
+ALTER TABLE c2 ADD CONSTRAINT c_positive PRIMARY KEY (id)	!42710 constraint "c_positive" for relation "c2" already exists
+ROLLBACK TO d5		-
+SAVEPOINT d6		-
+CREATE UNIQUE INDEX c_positive ON c (q)		-
+ROLLBACK TO d6		-
+SELECT 'r', count(*) FROM pg_constraint WHERE conrelid = 'c'::regclass		r|6
+RESET search_path		-
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname = 's2d'	bigint	0
+# the second session: a derived FOREIGN KEY, UNIQUE and PRIMARY KEY name that is already taken
+BEGIN		-
+CREATE SCHEMA s2dd		-
+SET search_path = s2dd, public		-
+CREATE TABLE p (id integer PRIMARY KEY)		-
+CREATE TABLE t (a integer REFERENCES p, b integer)		-
+ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES p		-
+SELECT 'r', conname FROM pg_constraint WHERE conrelid = 't'::regclass AND contype = 'f' ORDER BY conname		r|t_a_fkey ; r|t_a_fkey1
+ALTER TABLE t ADD UNIQUE (b)		-
+ALTER TABLE t ADD UNIQUE (b)		-
+SELECT 'r', conname FROM pg_constraint WHERE conrelid = 't'::regclass AND contype = 'u' ORDER BY conname		r|t_b_key ; r|t_b_key1
+CREATE TABLE q (id integer)		-
+CREATE TABLE q_pkey (x integer)		-
+ALTER TABLE q ADD PRIMARY KEY (id)		-
+SELECT 'r', conname FROM pg_constraint WHERE conrelid = 'q'::regclass AND contype = 'p'		r|q_pkey1
+CREATE TABLE k (a integer, CONSTRAINT k_a_fkey CHECK (a > 0))		-
+ALTER TABLE k ADD FOREIGN KEY (a) REFERENCES p		-
+SELECT 'r', conname, contype FROM pg_constraint WHERE conrelid = 'k'::regclass AND contype IN ('c', 'f') ORDER BY conname		r|k_a_fkey|c ; r|k_a_fkey1|f
+RESET search_path		-
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname = 's2dd'	bigint	0
+# the third session: SET CONSTRAINTS by search path
+BEGIN		-
+CREATE SCHEMA s2e1		-
+CREATE SCHEMA s2e2		-
+CREATE TABLE s2e1.u (a integer, CONSTRAINT uq UNIQUE (a) DEFERRABLE INITIALLY IMMEDIATE)		-
+CREATE TABLE s2e2.u (a integer, CONSTRAINT uq UNIQUE (a) DEFERRABLE INITIALLY IMMEDIATE)		-
+INSERT INTO s2e1.u VALUES (1)		-
+INSERT INTO s2e2.u VALUES (1)		-
+# a bare name no schema on the search path has
+SAVEPOINT a		-
+SET CONSTRAINTS uq DEFERRED	!42704 constraint "uq" does not exist
+ROLLBACK TO a		-
+# a qualified name, found in its own schema and nowhere else
+SAVEPOINT b		-
+SET CONSTRAINTS s2e2.uq DEFERRED		-
+INSERT INTO s2e2.u VALUES (1)		-
+SAVEPOINT b1		-
+INSERT INTO s2e1.u VALUES (1)	!23505 duplicate key value violates unique constraint "uq" DETAIL: Key (a)=(1) already exists.
+ROLLBACK TO b1		-
+SET CONSTRAINTS s2e2.uq IMMEDIATE	!23505 duplicate key value violates unique constraint "uq" DETAIL: Key (a)=(1) already exists.
+ROLLBACK TO b		-
+# a bare name is the first schema on the path that has one, and only that schema
+SET search_path = s2e1, s2e2, public		-
+SAVEPOINT c		-
+SET CONSTRAINTS uq DEFERRED		-
+INSERT INTO s2e1.u VALUES (1)		-
+SAVEPOINT c1		-
+INSERT INTO s2e2.u VALUES (1)	!23505 duplicate key value violates unique constraint "uq" DETAIL: Key (a)=(1) already exists.
+ROLLBACK TO c1		-
+SET CONSTRAINTS ALL IMMEDIATE	!23505 duplicate key value violates unique constraint "uq" DETAIL: Key (a)=(1) already exists.
+ROLLBACK TO c		-
+# a schema that does not exist
+SAVEPOINT d		-
+SET CONSTRAINTS nosuch.uq DEFERRED	!3F000 schema "nosuch" does not exist
+ROLLBACK TO d		-
+# a constraint on the path that cannot be deferred
+CREATE TABLE s2e2.n (a integer CONSTRAINT nd CHECK (a > 0))		-
+SAVEPOINT e		-
+SET CONSTRAINTS nd DEFERRED	!42809 constraint "nd" is not deferrable
+ROLLBACK TO e		-
+SET CONSTRAINTS nd IMMEDIATE		-
+# two tables in one schema with a deferrable foreign key of one name: the name reaches both
+CREATE TABLE s2e1.parent (id integer PRIMARY KEY)		-
+CREATE TABLE s2e1.k1 (p integer, CONSTRAINT kf FOREIGN KEY (p) REFERENCES s2e1.parent DEFERRABLE)		-
+CREATE TABLE s2e1.k2 (p integer, CONSTRAINT kf FOREIGN KEY (p) REFERENCES s2e1.parent DEFERRABLE)		-
+SAVEPOINT f		-
+SET CONSTRAINTS kf DEFERRED		-
+INSERT INTO s2e1.k1 VALUES (7)		-
+INSERT INTO s2e1.k2 VALUES (7)		-
+SET CONSTRAINTS kf IMMEDIATE	!23503 insert or update on table "k1" violates foreign key constraint "kf" DETAIL: Key (p)=(7) is not present in table "parent".
+ROLLBACK TO f		-
+RESET search_path		-
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname IN ('s2e1', 's2e2')	bigint	0

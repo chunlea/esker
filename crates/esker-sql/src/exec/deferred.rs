@@ -109,6 +109,15 @@ impl Check {
         }
     }
 
+    /// The schema of the table the constraint is on — the other half of what a `SET CONSTRAINTS`
+    /// name reaches.
+    pub(crate) fn schema(&self) -> &str {
+        let (Check::Unique { table, .. }
+        | Check::Exclude { table, .. }
+        | Check::ForeignKey { table, .. }) = self;
+        crate::catalog::split_qualified(&table.name).0
+    }
+
     /// Runs the check against the transaction as it stands now.
     ///
     /// **Re-examined, never replayed**: the key is looked at again, so a duplicate that has since
@@ -188,8 +197,9 @@ impl Check {
 pub(crate) struct Constraints {
     /// `SET CONSTRAINTS ALL { DEFERRED | IMMEDIATE }`, or `None` if the transaction has not said.
     all: Option<bool>,
-    /// `SET CONSTRAINTS <name> …`, which beats the `ALL` above it.
-    by_name: BTreeMap<String, bool>,
+    /// `SET CONSTRAINTS <name> …`, which beats the `ALL` above it — **by schema and bare name**,
+    /// because a name reaches every constraint of it in the one schema it was found in (#92).
+    by_name: BTreeMap<(String, String), bool>,
     /// The checks owed, in the order they were registered.
     pending: Vec<Check>,
 }
@@ -199,11 +209,11 @@ impl Constraints {
     ///
     /// A name set explicitly wins over `ALL`, and `ALL` wins over the declaration — which is
     /// PostgreSQL's precedence and the reason both are kept rather than one flattened setting.
-    pub(crate) fn deferred(&self, name: &str, initially_deferred: bool) -> bool {
-        if let Some(set) = self.by_name.get(name) {
-            return *set;
-        }
-        self.all.unwrap_or(initially_deferred)
+    pub(crate) fn deferred(&self, schema: &str, name: &str, initially_deferred: bool) -> bool {
+        let named = self.by_name.iter().find_map(|((held_schema, held), set)| {
+            (held_schema == schema && held == name).then_some(*set)
+        });
+        named.unwrap_or_else(|| self.all.unwrap_or(initially_deferred))
     }
 
     /// Records a check to run later.
@@ -222,8 +232,9 @@ impl Constraints {
     }
 
     /// `SET CONSTRAINTS <name> …`.
-    pub(crate) fn set_one(&mut self, name: String, deferred: bool) {
-        self.by_name.insert(name, deferred);
+    pub(crate) fn set_one(&mut self, schema: &str, name: &str, deferred: bool) {
+        self.by_name
+            .insert((schema.to_owned(), name.to_owned()), deferred);
     }
 
     /// The checks owed, taken out of the list.
@@ -234,11 +245,14 @@ impl Constraints {
         std::mem::take(&mut self.pending)
     }
 
-    /// The checks owed for one constraint, taken out; the rest stay.
-    pub(crate) fn take_named(&mut self, name: &str) -> Vec<Check> {
+    /// The checks owed for the constraints of one name in one schema, taken out; the rest stay.
+    pub(crate) fn take_named(&mut self, schema: &str, name: &str) -> Vec<Check> {
         let (named, rest) = std::mem::take(&mut self.pending)
             .into_iter()
-            .partition(|check| check.constraint() == name);
+            .partition(|check| {
+                check.schema() == schema
+                    && crate::catalog::split_qualified(check.constraint()).1 == name
+            });
         self.pending = rest;
         named
     }
