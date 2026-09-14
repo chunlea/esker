@@ -1,0 +1,23 @@
+crates/esker-sql/tests/concurrent_unique_insert.rs
+  s_8d3e4c2902bf64::t_a770c5dd6e279f 306-360
+crates/esker-sql/tests/serializable.rs
+  s_8d3e4c2902bf64::t_c36bd61d94a592 360-414
+crates/esker-sql/tests/unique_race/mod.rs
+  s_8d3e4c2902bf64::t_346a29343f2df5 61-73,176-258
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "554a930b38113d33a484e5924af8866e8abece9f",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
