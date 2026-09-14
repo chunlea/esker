@@ -273,6 +273,7 @@ pub(super) fn create_table(
     }
     for sequence in &table.derived()?.sequences {
         catalog::create_sequence(txn, executor.tenant, sequence)?;
+        executor.created_sequence(sequence.id);
     }
     Ok(Outcome::done("CREATE TABLE"))
 }
@@ -2520,6 +2521,7 @@ pub(super) fn create_sequence(
         increment: create.increment,
     };
     catalog::create_sequence(txn, executor.tenant, &sequence)?;
+    executor.created_sequence(sequence.id);
     // The counter starts **at** the start value, because `START n` hands out `n` first — measured,
     // `START 101` answers `101` and then `102`. Storing `n - 1` and stepping would be one short
     // for every sequence anyone gave a `START`.
@@ -7832,6 +7834,7 @@ pub(super) fn alter_table(
                 increment: 1,
             };
             catalog::create_sequence(txn, executor.tenant, &sequence)?;
+            executor.created_sequence(sequence.id);
             updated.hydrated_mut().sequences.push(sequence);
             // A `serial` is `NOT NULL` on a real server whether or not the word was written.
             if let Some(added) = updated.columns.last_mut() {

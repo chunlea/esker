@@ -16,47 +16,17 @@
 #[path = "parity_harness/mod.rs"]
 mod parity;
 
-/// A sequence created after a rolled-back one — the same finding on two rows.
-const CONTINUES: &str = "the numbers, not the column: `id` takes one here as it should, but this \
-                       session's new sequence continues the rolled-back first session's — `6` \
-                       where PostgreSQL starts at `1`. A sequence created after a rolled-back one \
-                       that handed out numbers continues them; probed alone, a table's two inserts \
-                       rolled back and a new table's first insert is `3`. A finding of its own, \
-                       reported with #93 and not its mechanism";
-
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[
-        (
-            "ALTER TABLE later ADD COLUMN id serial",
-            "`ADD COLUMN … serial` on a table that already holds rows is refused by name — the \
+    answers: &[(
+        "ALTER TABLE later ADD COLUMN id serial",
+        "`ADD COLUMN … serial` on a table that already holds rows is refused by name — the \
              rewrite that fills them from the sequence is not built (`crate::exec::ddl`, measured \
              in `captures/pg19_add_column_primary_key.txt`) — and it is not about a key; the next \
              statements read the column it would have added, and go with it",
-            "pg19_serial_without_a_key.txt:54",
-        ),
-        (
-            "SELECT 'r', column_name, column_default, is_nullable FROM information_schema.columns \
-             WHERE table_name = 'ser' ORDER BY ordinal_position",
-            "a sequence outside `public` prints qualified whatever the search path is — \
-             `nextval('s2sq2.ser_id_seq'::regclass)`, where PostgreSQL's `regclass` output leaves \
-             off a schema the path reaches (`catalog::pg_attribute`, measured with the schema off \
-             the path). A rendering gap older than #93, hidden until now behind the `42P01` it \
-             fixed",
-            "pg19_serial_without_a_key.txt:65",
-        ),
-        (
-            "INSERT INTO ser (v, w) VALUES ('a', 'b') RETURNING v, id, w",
-            CONTINUES,
-            "pg19_serial_without_a_key.txt:70",
-        ),
-        (
-            "SELECT 'r', nextval('ser_id_seq')",
-            CONTINUES,
-            "pg19_serial_without_a_key.txt:71",
-        ),
-    ],
+        "pg19_serial_without_a_key.txt:54",
+    )],
 };
 
 #[test]

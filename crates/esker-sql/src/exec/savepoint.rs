@@ -59,6 +59,9 @@ struct Mark {
     /// mark is undone by a `ROLLBACK TO` as well as by the transaction ending.
     authorization: Option<String>,
     parameters: Parameters,
+    /// How many sequences the block had created when the mark was taken: the ones after it are
+    /// the ones a `ROLLBACK TO` gives back (debt #94).
+    sequences_at: usize,
 }
 
 /// The session's parameters, as [`crate::exec::Executor`] holds them.
@@ -98,6 +101,7 @@ impl Savepoints {
         reads: crate::backend::ReadSet,
         authorization: Option<String>,
         parameters: Parameters,
+        sequences_at: usize,
     ) {
         self.marks.push(Mark {
             name: name.to_owned(),
@@ -106,6 +110,7 @@ impl Savepoints {
             reads,
             authorization,
             parameters,
+            sequences_at,
         });
     }
 
@@ -134,11 +139,13 @@ impl Savepoints {
     /// never be reached.
     /// Answers with the session parameters as they stood at the mark, which the caller puts back:
     /// a `SET` inside the savepoint is undone with the writes, exactly as a real server does it.
+    /// And with how many sequences the block had created at the mark, so that the caller can give
+    /// back the ones made after it.
     pub(super) fn rollback_to(
         &mut self,
         name: &str,
         txn: &mut dyn Txn,
-    ) -> Result<(Parameters, Option<String>)> {
+    ) -> Result<(Parameters, Option<String>, usize)> {
         let at = self.find(name)?;
         let undo_at = self.marks[at].undo_at;
         // Backwards, so that a key written more than once lands on the value it had at the mark
@@ -163,6 +170,7 @@ impl Savepoints {
         Ok((
             self.marks[at].parameters.clone(),
             self.marks[at].authorization.clone(),
+            self.marks[at].sequences_at,
         ))
     }
 
@@ -460,7 +468,7 @@ mod tests {
         ));
 
         let mut savepoints = Savepoints::default();
-        savepoints.savepoint("sp", txn.read_set(), None, Parameters::new());
+        savepoints.savepoint("sp", txn.read_set(), None, Parameters::new(), 0);
 
         {
             // Which is what the executor hands every statement while a savepoint is open.
@@ -497,7 +505,7 @@ mod tests {
         ));
 
         let mut savepoints = Savepoints::default();
-        savepoints.savepoint("sp", txn.read_set(), None, Parameters::new());
+        savepoints.savepoint("sp", txn.read_set(), None, Parameters::new(), 0);
         {
             let mut recording = Recording::new(&mut *txn, &mut savepoints);
             assert!(matches!(
@@ -527,7 +535,7 @@ mod tests {
         txn.get(b"before").unwrap();
 
         let mut savepoints = Savepoints::default();
-        savepoints.savepoint("sp", txn.read_set(), None, Parameters::new());
+        savepoints.savepoint("sp", txn.read_set(), None, Parameters::new(), 0);
         {
             let recording = Recording::new(&mut *txn, &mut savepoints);
             assert!(
@@ -562,7 +570,7 @@ mod tests {
         ));
 
         let mut savepoints = Savepoints::default();
-        savepoints.savepoint("sp", txn.read_set(), None, Parameters::new());
+        savepoints.savepoint("sp", txn.read_set(), None, Parameters::new(), 0);
         {
             let mut recording = Recording::new(&mut *txn, &mut savepoints);
             assert!(matches!(

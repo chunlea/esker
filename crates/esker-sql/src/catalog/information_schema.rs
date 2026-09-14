@@ -33,6 +33,7 @@
 //!   keys, so there is nothing referential to constrain.
 
 use super::NO_LENGTH;
+use super::pg_attribute::default_expression;
 use crate::catalog::pg_relations::RelKind;
 use crate::catalog::{ColumnDef, Identity};
 use crate::error::Result;
@@ -211,7 +212,11 @@ pub fn views(view: &crate::catalog::View<'_>) -> Result<Vec<Vec<Datum>>> {
 }
 
 /// Every `information_schema.columns` row: one per column of a table, in declaration order.
-pub fn columns(view: &crate::catalog::View<'_>, rendering: Rendering) -> Result<Vec<Vec<Datum>>> {
+pub fn columns(
+    view: &crate::catalog::View<'_>,
+    rendering: Rendering,
+    search_path: &[String],
+) -> Result<Vec<Vec<Datum>>> {
     let relations = view.relations()?;
     // One read for the whole view rather than a lookup per column, the trade `Relations` already
     // makes for user types: a schema dump asks this of every column of every table.
@@ -250,7 +255,7 @@ pub fn columns(view: &crate::catalog::View<'_>, rendering: Rendering) -> Result<
                 // a generated column has no *default*, and this is the column that says so. The
                 // two views read one `pg_attrdef` row and disagree about what it is; measured, and
                 // a reader that looked here for a generation expression would find nothing.
-                match super::pg_attribute::default_expression(column, table, at, rendering) {
+                match default_expression(column, table, at, rendering, search_path) {
                     _ if column.generated.is_some() => Datum::Null,
                     Some(expression) => Datum::Text(expression),
                     None => Datum::Null,

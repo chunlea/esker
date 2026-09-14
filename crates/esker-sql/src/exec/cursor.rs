@@ -388,6 +388,7 @@ fn inner_side(
         return view.rows_of(
             &settings.catalog.view(txn, tenant),
             settings.rendering,
+            settings.search_path,
             settings.prepared,
             settings.advisory,
             inner_only,
@@ -453,6 +454,7 @@ impl<'a> Cursor<'a> {
                 view.rows_of(
                     &settings.catalog.view(txn, tenant),
                     settings.rendering,
+                    settings.search_path,
                     settings.prepared,
                     settings.advisory,
                     *only,
@@ -1286,7 +1288,7 @@ fn qualified_for(
     settings: Settings<'_>,
     relation: &crate::catalog::pg_relations::RelationRow,
 ) -> String {
-    if visible_schema(settings, &relation.schema) {
+    if crate::catalog::schema_on_path(settings.search_path, &relation.schema) {
         return relation.name.clone();
     }
     crate::catalog::display_name(&crate::catalog::qualify(&relation.schema, &relation.name))
@@ -1310,22 +1312,10 @@ fn qualified_for(
 /// `create_enum` line above it, built from a different query, stays qualified.
 fn type_qualified_for(settings: Settings<'_>, stored: &str) -> String {
     let (schema, bare) = crate::catalog::split_qualified(stored);
-    if visible_schema(settings, schema) {
+    if crate::catalog::schema_on_path(settings.search_path, schema) {
         return bare.to_owned();
     }
     crate::catalog::display_name(stored)
-}
-
-/// Whether a schema is one this session resolves a bare name in.
-///
-/// An **unknown** path is the default one, on which `public` sits — so a caller with no session
-/// behind it prints an ordinary name bare and a schema-qualified one qualified, which is what
-/// every statement outside a session wants.
-fn visible_schema(settings: Settings<'_>, schema: &str) -> bool {
-    if settings.search_path.is_empty() {
-        return schema == crate::catalog::PUBLIC_SCHEMA;
-    }
-    settings.search_path.iter().any(|on_path| on_path == schema)
 }
 
 pub(super) fn compare_values(keys: &[SortKey], left: &[Datum], right: &[Datum]) -> Ordering {

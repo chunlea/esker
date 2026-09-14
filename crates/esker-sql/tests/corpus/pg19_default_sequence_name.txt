@@ -1,0 +1,45 @@
+# How a column default names its sequence — debt #95 — as a real PostgreSQL 19beta1 answers it.
+#
+# Captured 2026-09-13 by lane s2-plpgsql with `sesscap.py` (`esker-coord/s2-f95.stmts`): one session inside
+# `BEGIN … ROLLBACK`, a schema of its own; the last line proves it left nothing behind. The `\gdesc` pass runs on a
+# connection of its own, where that schema does not exist, so a statement naming it has an empty declared-types
+# column.
+#
+#!escaped
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The sequence is named the way `::regclass` prints a relation**: bare when its schema is on the search path,
+#     qualified when it is not — `nextval('s2fq.t_id_seq'::regclass)` by default, `nextval('t_id_seq'::regclass)` once
+#     `s2fq` is on the path. `pg_get_expr` and `information_schema.columns.column_default` agree.
+#   * **`public` is no exception**: with `SET search_path = s2fq`, a public table's default is
+#     `nextval('public.s2f_pub_id_seq'::regclass)`.
+#   * **A quoted name keeps its quotes either way**: `nextval('"Mixed_Id_seq"'::regclass)` on the path.
+#
+BEGIN		-
+CREATE SCHEMA s2fq		-
+CREATE TABLE s2fq.t (id serial, v text)		-
+CREATE TABLE s2f_pub (id serial, v text)		-
+CREATE TABLE s2fq."Mixed" ("Id" serial)		-
+# the default search path: the schema is off it, public is on it
+SELECT 'r', pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 's2fq.t'::regclass		r|nextval('s2fq.t_id_seq'::regclass)
+SELECT 'r', column_default FROM information_schema.columns WHERE table_schema = 's2fq' AND table_name = 't' AND column_name = 'id'	text,character varying	r|nextval('s2fq.t_id_seq'::regclass)
+SELECT 'r', pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 's2f_pub'::regclass		r|nextval('s2f_pub_id_seq'::regclass)
+SELECT 'r', pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 's2fq."Mixed"'::regclass		r|nextval('s2fq."Mixed_Id_seq"'::regclass)
+# the schema on the path
+SET search_path = s2fq, public		-
+SELECT 'r', pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 's2fq.t'::regclass		r|nextval('t_id_seq'::regclass)
+SELECT 'r', column_default FROM information_schema.columns WHERE table_schema = 's2fq' AND table_name = 't' AND column_name = 'id'	text,character varying	r|nextval('t_id_seq'::regclass)
+SELECT 'r', pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'public.s2f_pub'::regclass		r|nextval('s2f_pub_id_seq'::regclass)
+SELECT 'r', pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 's2fq."Mixed"'::regclass		r|nextval('"Mixed_Id_seq"'::regclass)
+# public off the path
+SET search_path = s2fq		-
+SELECT 'r', pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'public.s2f_pub'::regclass		r|nextval('public.s2f_pub_id_seq'::regclass)
+SELECT 'r', column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 's2f_pub' AND column_name = 'id'	text,character varying	r|nextval('public.s2f_pub_id_seq'::regclass)
+RESET search_path		-
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname = 's2fq'	bigint	0

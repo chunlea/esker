@@ -229,6 +229,7 @@ fn catalog_rows() -> Vec<Vec<Datum>> {
 pub fn default_rows(
     view: &crate::catalog::View<'_>,
     rendering: crate::value::Rendering,
+    search_path: &[String],
     only: Option<i64>,
 ) -> Result<Vec<Vec<Datum>>> {
     let relations = view.relations()?;
@@ -242,7 +243,9 @@ pub fn default_rows(
         };
         let table = table.as_ref();
         for (attnum, (position, column)) in table.user_columns().enumerate() {
-            let Some(expression) = default_expression(column, table, position, rendering) else {
+            let Some(expression) =
+                default_expression(column, table, position, rendering, search_path)
+            else {
                 continue;
             };
             rows.push(vec![
@@ -408,11 +411,11 @@ fn attribute(
     };
     let has_default = own
         && !column.dropped
-        // **The boot rendering, deliberately** — the default style and UTC: this asks only
-        // *whether* there is a default, and
+        // **The boot rendering and no search path, deliberately** — the default style and UTC:
+        // this asks only *whether* there is a default, and
         // whether one exists cannot depend on how it prints.
         && position.is_some_and(|at| {
-            default_expression(column, table, at, crate::value::Rendering::default()).is_some()
+            default_expression(column, table, at, crate::value::Rendering::default(), &[]).is_some()
         })
         && identity == NOT_IDENTITY;
     // **A tombstone answers about itself, not about the column it was.** Measured on 19beta1:
@@ -523,17 +526,24 @@ pub(crate) fn collatable(ty: ColumnType) -> bool {
     typcollation(ty) != NO_COLLATION
 }
 
-/// A stored relation name as it goes **inside a string literal**: `schema.name`, each part
-/// delimited only if it would not read back as itself.
+/// A stored relation name as it goes **inside a string literal**, as `::regclass` prints it for
+/// this session: bare when its schema is on the search path and `schema.name` when it is not, each
+/// part delimited only if it would not read back as itself.
 ///
 /// `catalog::display_name` joins the two with a dot and stops there, which is right everywhere the
 /// name is prose and wrong where it is SQL a client re-parses — and a `nextval` default is the
 /// second kind. Measured on 19beta1: `"g1nv_mixed_monkeyID_seq"` quoted, `g1nv_plain_id_seq` and
 /// `g1nv_s.t_id_seq` bare.
-fn quoted_display_name(stored: &str) -> String {
+///
+/// **Qualified by the path, not by the schema** (#95). The default is a `regclass` constant and
+/// prints as one: `nextval('t_id_seq'::regclass)` once `s` is on the path, and
+/// `nextval('public.p_id_seq'::regclass)` once `public` is not — measured,
+/// `tests/corpus/pg19_default_sequence_name.txt`. This printed every sequence outside `public`
+/// qualified and every one in it bare, whatever the path was.
+fn quoted_display_name(stored: &str, search_path: &[String]) -> String {
     let (schema, bare) = super::split_qualified(stored);
     let bare = super::quote_identifier(bare);
-    if schema == super::PUBLIC_SCHEMA && !stored.contains(super::SCHEMA_SEPARATOR) {
+    if super::schema_on_path(search_path, schema) {
         return bare;
     }
     format!("{}.{bare}", super::quote_identifier(schema))
@@ -545,11 +555,15 @@ fn quoted_display_name(stored: &str) -> String {
 /// Three sources, and the order matters: an **identity** column has no default expression at all
 /// (measured — no `pg_attrdef` row and `atthasdef` `f`), a **`bigserial`** column's default is the
 /// `nextval` its sequence makes, and everything else is the stored constant.
+///
+/// `search_path` is the session's, and decides whether that sequence is named bare or qualified
+/// (#95).
 pub fn default_expression(
     column: &ColumnDef,
     table: &TableDef,
     at: usize,
     rendering: crate::value::Rendering,
+    search_path: &[String],
 ) -> Option<String> {
     // A **volatile** default, which catalog record v5 records as a flag rather than a value
     // (`ColumnDef::default_now`) because a constant cannot express it. It prints unparenthesised,
@@ -592,7 +606,7 @@ pub fn default_expression(
             // — so the rule is `quote_identifier` per part and not a blanket pair.
             Identity::Default => Some(format!(
                 "nextval('{}'::regclass)",
-                quoted_display_name(&sequence.name)
+                quoted_display_name(&sequence.name, search_path)
             )),
             Identity::ByDefault | Identity::Always => None,
         };
