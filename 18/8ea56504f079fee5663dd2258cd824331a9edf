@@ -1,0 +1,27 @@
+crates/esker-sql/tests/lock_cost.rs
+  s_f4b2852b53accb::t_3c85831ce3ba7a 16-17
+docs/DESIGN.md
+  s_f4b2852b53accb::t_000e346fb7cf38 839-850
+docs/adr/0114-a-unique-key-being-written-waits-at-read-committed.md
+  s_f4b2852b53accb::t_8f681471df814d 3-8,157,178-179,186-190,301-306,335-353
+docs/plans/0114-implementation.md
+  s_f4b2852b53accb::t_c96ac143379d53 11-22,34
+docs/plans/debts-v1.1.md
+  s_f4b2852b53accb::t_cda34d9104889c 24,124-125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "188ea56504f079fee5663dd2258cd824331a9edf",
+  "prompts": {},
+  "sessions": {
+    "s_f4b2852b53accb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc7223c3-8ba0-48df-95c8-ddb365dc093c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
