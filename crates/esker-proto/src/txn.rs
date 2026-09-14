@@ -359,13 +359,8 @@ impl TxnMutation {
                     out.put_varint(*read_ts);
                 }
             }
-            Self::Delete { key, read_ts } => {
-                out.put_bytes(key);
-                if let Some(read_ts) = read_ts {
-                    out.put_varint(*read_ts);
-                }
-            }
-            Self::Check { key, read_ts } => {
+            // A delete and a check have the same layout: the key, and the timestamp when there is one.
+            Self::Delete { key, read_ts } | Self::Check { key, read_ts } => {
                 out.put_bytes(key);
                 if let Some(read_ts) = read_ts {
                     out.put_varint(*read_ts);

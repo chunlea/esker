@@ -133,6 +133,71 @@ impl TxnWrite {
             },
         }
     }
+
+    /// One write's bytes inside a prewrite: its kind, then its fields, which
+    /// `TxnCommand::decode_from` reads back in the same order.
+    fn encode_to(&self, out: &mut Encoder) {
+        match self {
+            // **Four kinds, and the first two are unchanged.** A write whose value
+            // came from the transaction's own snapshot encodes exactly the bytes it
+            // always did, so every log entry ever written still decodes and every
+            // golden is byte-identical. A write that says which snapshot it read at
+            // takes a kind of its own, which an older node refuses as unknown rather
+            // than misreading as a shorter entry (ADR 0057 §4).
+            Self::Put {
+                key,
+                value,
+                read_ts: None,
+            } => {
+                out.put_u8(1);
+                out.put_bytes(key);
+                out.put_bytes(value);
+            }
+            Self::Delete { key, read_ts: None } => {
+                out.put_u8(2);
+                out.put_bytes(key);
+            }
+            Self::Put {
+                key,
+                value,
+                read_ts: Some(read_ts),
+            } => {
+                out.put_u8(3);
+                out.put_bytes(key);
+                out.put_bytes(value);
+                out.put_varint(*read_ts);
+            }
+            Self::Delete {
+                key,
+                read_ts: Some(read_ts),
+            } => {
+                out.put_u8(4);
+                out.put_bytes(key);
+                out.put_varint(*read_ts);
+            }
+            // Kinds 5 and 6, beside the four: a check carries no value and a range
+            // carries two keys (ADR 0067 §1).
+            Self::Check { key, read_ts: None } => {
+                out.put_u8(5);
+                out.put_bytes(key);
+            }
+            // Kind 7: a check at a statement's snapshot, the timestamp after the key —
+            // the shape kinds 3 and 4 gave a put and a delete (ADR 0114 §2).
+            Self::Check {
+                key,
+                read_ts: Some(read_ts),
+            } => {
+                out.put_u8(7);
+                out.put_bytes(key);
+                out.put_varint(*read_ts);
+            }
+            Self::CheckRange { start, end } => {
+                out.put_u8(6);
+                out.put_bytes(start);
+                out.put_bytes(end);
+            }
+        }
+    }
 }
 
 /// A transactional write, as the log carries it.
@@ -330,66 +395,7 @@ impl TxnCommand {
                 out.put_varint(*ttl_ms);
                 out.put_varint(writes.len() as u64);
                 for write in writes {
-                    match write {
-                        // **Four kinds, and the first two are unchanged.** A write whose value
-                        // came from the transaction's own snapshot encodes exactly the bytes it
-                        // always did, so every log entry ever written still decodes and every
-                        // golden is byte-identical. A write that says which snapshot it read at
-                        // takes a kind of its own, which an older node refuses as unknown rather
-                        // than misreading as a shorter entry (ADR 0057 §4).
-                        TxnWrite::Put {
-                            key,
-                            value,
-                            read_ts: None,
-                        } => {
-                            out.put_u8(1);
-                            out.put_bytes(key);
-                            out.put_bytes(value);
-                        }
-                        TxnWrite::Delete { key, read_ts: None } => {
-                            out.put_u8(2);
-                            out.put_bytes(key);
-                        }
-                        TxnWrite::Put {
-                            key,
-                            value,
-                            read_ts: Some(read_ts),
-                        } => {
-                            out.put_u8(3);
-                            out.put_bytes(key);
-                            out.put_bytes(value);
-                            out.put_varint(*read_ts);
-                        }
-                        TxnWrite::Delete {
-                            key,
-                            read_ts: Some(read_ts),
-                        } => {
-                            out.put_u8(4);
-                            out.put_bytes(key);
-                            out.put_varint(*read_ts);
-                        }
-                        // Kinds 5 and 6, beside the four: a check carries no value and a range
-                        // carries two keys (ADR 0067 §1).
-                        TxnWrite::Check { key, read_ts: None } => {
-                            out.put_u8(5);
-                            out.put_bytes(key);
-                        }
-                        // Kind 7: a check at a statement's snapshot, the timestamp after the key —
-                        // the shape kinds 3 and 4 gave a put and a delete (ADR 0114 §2).
-                        TxnWrite::Check {
-                            key,
-                            read_ts: Some(read_ts),
-                        } => {
-                            out.put_u8(7);
-                            out.put_bytes(key);
-                            out.put_varint(*read_ts);
-                        }
-                        TxnWrite::CheckRange { start, end } => {
-                            out.put_u8(6);
-                            out.put_bytes(start);
-                            out.put_bytes(end);
-                        }
-                    }
+                    write.encode_to(out);
                 }
             }
             Self::Commit {
