@@ -194,10 +194,10 @@ fn a_for_update_at_repeatable_read_keeps_the_transaction_s_snapshot() {
     assert_eq!(refused.sqlstate(), "40001", "e3: {refused}");
     let _ = updater.run("ROLLBACK");
 
-    let inserted = inserter
+    let after_insert = inserter
         .run("SELECT n FROM lk WHERE id = 2 FOR UPDATE")
         .expect("e4: a row the snapshot does not see is not an error");
-    assert_eq!(row_count(&inserted), 0, "e4: {inserted:?}");
+    assert_eq!(row_count(&after_insert), 0, "e4: {after_insert:?}");
     inserter.run("COMMIT").expect("e4 commits");
 }
 
