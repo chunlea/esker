@@ -57,6 +57,9 @@ fn golden(kind: &str, name: &str) -> Vec<u8> {
 const TXN_TS: u64 = 42;
 /// The commit timestamp of the transaction goldens; above [`TXN_TS`], as every commit is.
 const TXN_COMMIT_TS: u64 = 50;
+/// A statement's read timestamp in the transaction goldens: above [`TXN_TS`], because a statement
+/// reads after its transaction began, and below [`TXN_COMMIT_TS`].
+const TXN_STATEMENT_TS: u64 = 45;
 /// The lock TTL of the transaction goldens: the default of `docs/DESIGN.md` §14.
 const TXN_TTL_MS: u64 = 3_000;
 /// A safepoint big enough that its varint is not one byte.
@@ -589,12 +592,55 @@ fn golden_txn_prewrite_requests() -> Vec<(&'static str, Request)> {
                     mutations: vec![
                         TxnMutation::Check {
                             key: Bytes::from_static(b"c"),
+                            read_ts: None,
                         },
                         TxnMutation::CheckRange {
                             start: Bytes::from_static(b"a"),
                             end: Bytes::from_static(b"z"),
                         },
                     ],
+                },
+            ),
+        ),
+        (
+            // **Tags 3 and 4**: a put and a delete that say which snapshot their value was computed
+            // from (ADR 0057 §4). They were on the wire with no row of their own until ADR 0114 §2
+            // put tag 7 beside them.
+            "txn-prewrite-read-ts",
+            Request::txn_kv(
+                h,
+                TxnKvReq::Prewrite {
+                    start_ts: TXN_TS,
+                    primary: Bytes::from_static(b"p"),
+                    ttl_ms: TXN_TTL_MS,
+                    mutations: vec![
+                        TxnMutation::Put {
+                            key: Bytes::from_static(b"a"),
+                            value: Bytes::from_static(b"1"),
+                            read_ts: Some(TXN_STATEMENT_TS),
+                        },
+                        TxnMutation::Delete {
+                            key: Bytes::from_static(b"b"),
+                            read_ts: Some(TXN_STATEMENT_TS),
+                        },
+                    ],
+                },
+            ),
+        ),
+        (
+            // **Tag 7**: the eager row lock at a statement's snapshot (ADR 0114 §2). The check in
+            // `txn-prewrite-checks` is tag 5, the same mutation with no timestamp, and keeps its bytes.
+            "txn-prewrite-check-at",
+            Request::txn_kv(
+                h,
+                TxnKvReq::Prewrite {
+                    start_ts: TXN_TS,
+                    primary: Bytes::from_static(b"p"),
+                    ttl_ms: TXN_TTL_MS,
+                    mutations: vec![TxnMutation::Check {
+                        key: Bytes::from_static(b"c"),
+                        read_ts: Some(TXN_STATEMENT_TS),
+                    }],
                 },
             ),
         ),

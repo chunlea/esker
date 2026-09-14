@@ -8,7 +8,18 @@ and §3 (ii) is one of three answers to a semantic question.
 **§3 is built** (unit I, 2026-09-13). The coordinator ruled question 2 — (ii), with step 5's arbiter
 rule — under the mandate to close the gaps, and the user may overrule it. It was built as §3 below
 describes, under two names this plan did not have: the arbiter's list is `arbitrated`, marked by
-`mark_arbitrated`, and step 3's test is `read_before_writing`. §2 (a) still waits.
+`mark_arbitrated`, and step 3's test is `read_before_writing`.
+
+**§2 (a) is built** (unit K, 2026-09-13), after the user approved the format change and answered
+question 1 (a). It was built as §2 below describes, and differs from the text in five places: the
+goldens' statement timestamp is a constant of its own, `TXN_STATEMENT_TS` = 45, so the new row is
+`request txn-prewrite-check-at 0302010203042a0170b817010701632d` rather than the `…32` written below,
+and `txn-prewrite-read-ts` pins tags 3 and 4 beside it; `lock`'s round trips moved into
+`Transaction::acquire`, so that the stamp is kept or dropped in one place around them;
+`txn_payload_size` counts a timestamp on all three mutations that carry one, not only on `Check`;
+`every_command()` gained one prewrite holding kinds 3 to 7, which had no round trip of their own; and
+the store test is a file of its own, `tests/a_lock_is_validated_at_its_statement.rs`, with REPEATABLE
+READ's e3 and e4 one test, `a_for_update_at_repeatable_read_keeps_the_transaction_s_snapshot`.
 
 **Every file, function, line and number below was read in the tree at `b36e5d4f`.** Main's `fc8333c8`,
 merged into this branch as `aad1dca3`, moved cited lines only in `exec/mod.rs` and `exec/dml.rs`; those
@@ -20,7 +31,7 @@ stamped and when the stamp goes (step 4), and §3's arbiter rule (step 5) — an
 
 ---
 
-## §2 (a) — a `Check` that carries the statement's read timestamp
+## §2 (a) — a `Check` that carries the statement's read timestamp (built)
 
 The defect is debt #91: at READ COMMITTED, `SELECT … FOR UPDATE`'s eager lock is a `Check` mutation
 validated at the transaction's `start_ts`, so a row another transaction committed after `BEGIN` is

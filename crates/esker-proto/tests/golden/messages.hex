@@ -122,6 +122,10 @@ request txn-scan 0202010203040161017a642a00
 request txn-scan-reverse 0202010203040161017a642a01
 request txn-prewrite 0302010203042a0170b817020101610131020162
 request txn-prewrite-checks 0302010203042a0170b81702050163060161017a
+# Mutation tags: Put 1, Delete 2, the same two with a statement's read timestamp as a trailing
+# varint 3 and 4, Check 5, CheckRange 6, and Check with a read timestamp 7 (ADR 0114 section 2).
+request txn-prewrite-read-ts 0302010203042a0170b8170203016101312d0401622d
+request txn-prewrite-check-at 0302010203042a0170b817010701632d
 request txn-commit 0402010203042a320201610162
 request txn-rollback 0502010203042a010161
 request txn-resolve-commit 0602010203042a3200

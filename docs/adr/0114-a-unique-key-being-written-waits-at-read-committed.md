@@ -1,10 +1,11 @@
 # 0114 — A unique key being written waits at READ COMMITTED
 
-Status: **Proposed**, 2026-09-13 — debt #90, the number reserved for the s1-sql lane. **§1 is built**
-on `sql-gaps`. **§2 is a wire and Raft-log format change** and waits for the user (`CLAUDE.md`,
-"ask before doing"). **§3 is decided and built**: answer (2), with the arbiter rule the measurement
-added — ruled 2026-09-13 by the coordinator under the mandate to close the gaps, which the user may
-overrule — so the status stays Proposed until the user has ruled on the whole. Builds on
+Status: **Accepted**, 2026-09-13 — debt #90, the number reserved for the s1-sql lane, and #91, its
+second half. **§1 is built.** **§2 is built**: a wire and Raft-log format change, approved by the user
+on 2026-09-13 with question 1 answered (a) — a `Check` that carries the statement's read timestamp,
+tag 7 on the wire and kind 7 in the log. **§3 is built**: answer (2), with the arbiter rule the
+measurement added, ruled by the coordinator under the mandate to close the gaps and accepted with the
+rest. Builds on
 [ADR 0057](0057-read-committed-waits-for-the-writer-in-front-of-it.md) (the
 wait, the statement re-run, the per-key read timestamp) and
 [ADR 0088](0088-a-row-lock-across-nodes.md) (the eager row lock), beside
@@ -153,7 +154,7 @@ The paths it reaches are every caller of `write_row`: `INSERT`, the insert arm o
 its `DO UPDATE` rewrite (so cases 11 and 12 now wait, re-run, and find the row to skip or update), an
 `UPDATE` through `rewrite_row`, a cascade, and a backfill.
 
-### §2 — the eager row lock is taken at the statement's snapshot (proposed — a format change)
+### §2 — the eager row lock is taken at the statement's snapshot (built — a format change, approved 2026-09-13)
 
 `SELECT … FOR UPDATE` takes ADR 0088's eager lock: `esker_client::Transaction::lock` prewrites the
 key at once, and a key that is not in the write buffer goes out as `TxnMutation::Check { key }`
@@ -174,18 +175,19 @@ wire (`TxnMutation`) and an additive kind in the Raft log (`TxnWrite`)** — exa
 §4 took for `Put` and `Delete` with tags 3 and 4:
 
 * every existing golden stays byte-identical, and an older peer refuses the new tag rather than
-  misreading it; the wire golden (`esker-proto/tests/golden/messages.hex`) and the log golden gain
-  their lines;
+  misreading it; the wire golden (`esker-proto/tests/golden/messages.hex`) gains its row, and the
+  log, which has round trips rather than a byte golden, gains kind 7 in them;
 * the store validates it as it validates a `Put` with a read timestamp: no commit on the key after
   **that** timestamp;
 * the client sends it for an eager lock when a statement timestamp is set — which READ COMMITTED sets
   and the other two levels do not, so e3 stays `40001` — and the read-set `Check` a SERIALIZABLE
   commit sends keeps tag 5 at `start_ts` (ADR 0062 §3).
 
-**Not built, and not this lane's to build without a yes**: it changes a wire format and a replicated
-log format that both have goldens. What exists is the red test, and the register's row for it, #91.
-How it would be built — tag and kind 7, their byte layouts, the golden row, the old-peer paths, the
-tests and the counterfactual — is [`docs/plans/0114-implementation.md`](../plans/0114-implementation.md) §2 (a).
+**Built on 2026-09-13, after the user's yes**, as [`docs/plans/0114-implementation.md`](../plans/0114-implementation.md)
+§2 (a) lays it out — tag and kind 7, their byte layouts, the old-peer paths, the tests — with the two
+corrections unit H measured: the stamp goes on before `pin_primary`, stays only when the lock is
+taken, and `release` drops it. The wire golden gained `txn-prewrite-check-at`, and
+`txn-prewrite-read-ts` for tags 3 and 4, which had been on the wire with no row of their own.
 
 ### §3 — SERIALIZABLE, and `ON CONFLICT` at REPEATABLE READ (decided: (2) and the arbiter rule; built)
 
@@ -296,10 +298,12 @@ holder that disappears gives its locks back with its session
   wait beside them, the way ADR 0057 rewrote the primary-key test.
 * **`crate::backend`'s module doc** and `docs/DESIGN.md` §8 say which levels a concurrent duplicate
   still meets at prewrite.
-* **§2 has red tests, `#[ignore]`d until it is ruled on**, each with a reason naming the section and
-  the question it waits for, so they compile and clippy reads them while the gate does not run them;
-  `--run-ignored only` does. §2 is also debt #91. **§3's red test is green**, and has lost its
-  attribute.
+* **§2's red tests are green** and have lost their `#[ignore]`: the `FOR UPDATE` of a row committed
+  after the transaction began, and the duel. §2 was debt #91. **§3's red test is green** too.
+* **Every store is upgraded before any `esker-sql` node**, the rule `VERB_RELEASE_LOCK`'s doc already
+  states for the log. A node that goes first costs `08006` on every READ COMMITTED `FOR UPDATE` that
+  reaches an old store, having locked nothing; a leader that goes first costs its old followers their
+  copies of the region — they stop at the entry rather than skip it, so nothing diverges.
 * **§3 adds nothing to keep**: the read set already exists, `has_read` asks it about one key per
   written unique entry at SERIALIZABLE, and the arbiter's keys are one list per row of an `INSERT`.
 
@@ -328,9 +332,25 @@ any wait and would pass a clock. Beside them, the two rewritten tests and the in
 The counterfactual — §1 taken out by the same asserted replace that put it in — turns the three waits
 red again.
 
-**§2, red and `#[ignore]`d until ruled on** — in the same file: a `FOR UPDATE` of a row committed
-after the transaction began (e1, e2), and `relations_test.rb`'s duel, statement for statement, twice,
-as the acceptance.
+**§2, green** — in the same file: a `FOR UPDATE` of a row committed after the transaction began (e1,
+e2), its REPEATABLE READ twin (e3 `40001`, e4 no row), and `relations_test.rb`'s duel, statement for
+statement, twice, as the acceptance. Beneath them: the wire golden's rows for tags 3, 4 and 7; kind 7
+in the log's round trip; `esker-store/tests/a_lock_is_validated_at_its_statement.rs`, where a row
+committed at 20 is locked by a transaction that began at 10 — refused with no timestamp and at 15,
+taken at 25 and held against the next writer; and five client tests over `FakeTransport`: a lock and
+its commit both stamped, a lock behind a buffered primary, a lock with no statement at tag 5, a `Held`
+lock asked again at the re-run's snapshot, and a released lock taken again at the next statement's.
+The minimal counterfactual takes the store's decision alone back to `start_ts`, by an asserted
+replace and its inverse, and keeps the wire, the log and the client as built: the store test answers
+`Conflict { commit_ts: 20 }` where a statement that read the commit may lock it, and in
+`concurrent_unique_insert.rs` the `FOR UPDATE` test and the duel are red again — `a commit at 1009
+beat this transaction at 1004`, and `a commit at 1015 beat this transaction at 1004` — while the
+REPEATABLE READ twin stays green (14 run, 12 passed, 2 failed). The client's stamp has
+counterfactuals of its own, over `esker-client`'s 43 `txn.rs` tests: stamped after the round trips
+rather than before `pin_primary`, the lock `pin_primary` sends is tag 5 again and four of the five
+new tests fail — all but the one with no statement snapshot (39 passed, 4 failed); with the stamp
+kept on `Held` and not dropped by `release`, exactly the two tests of those rules fail, each
+re-sending the first statement's timestamp (41 passed, 2 failed).
 
 **§3, green** — cases 04, 07, 09, 10, 13, 13b, 14, 15 and 16: one shared sequence (`tests/unique_race`)
 run against three real stores in `concurrent_unique_insert.rs`, where case 09 is the red test that

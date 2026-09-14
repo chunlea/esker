@@ -722,8 +722,18 @@ impl Transaction {
     /// This is `SELECT … FOR UPDATE`'s lock. It prewrites a `Check` mutation — the lock-only
     /// mutation ADR 0067 added as tag 5 — so the store holds a lock record on the key from this
     /// moment rather than from the commit, which is the difference between a lock another
-    /// `esker-sql` process is excluded by and one it never sees. No new method and no new tag: the
-    /// request is the `Prewrite` a commit sends, sent earlier.
+    /// `esker-sql` process is excluded by and one it never sees. No new method: the request is the
+    /// `Prewrite` a commit sends, sent earlier.
+    ///
+    /// **The lock is validated at the statement's snapshot** when a statement set one
+    /// ([ADR 0114](../../../docs/adr/0114-a-unique-key-being-written-waits-at-read-committed.md) §2).
+    /// A READ COMMITTED statement reads the newest committed row, so a commit after `BEGIN` is what
+    /// it read and not a conflict: the `Check` carries the statement's read timestamp (tag 7), and
+    /// `commit` sends it again with the same one. The stamp goes on before the first prewrite that
+    /// can carry it — `pin_primary`'s, when nothing is buffered and this key is the primary — and it
+    /// stays only if the lock is taken: a lock that was not taken was validated at nothing, and a
+    /// stamp left behind would pin every later attempt at the key to this statement's snapshot,
+    /// because the earliest stamp wins.
     ///
     /// Idempotent for the holder, like the node-local table it replaces: a key this transaction
     /// already wrote or already locked answers [`Acquired::Taken`] without a round trip.
@@ -744,23 +754,35 @@ impl Transaction {
         if self.buffer.contains_key(&key) || self.locked.contains(&key) {
             return Ok(Acquired::Taken);
         }
-        if let Some(held) = self.pin_primary(&key)? {
+        let stamped = self.statement_ts.is_some() && !self.read_ts.contains_key(&key);
+        self.stamp(&key);
+        let acquired = self.acquire(&key);
+        if stamped && !matches!(acquired, Ok(Acquired::Taken)) {
+            self.read_ts.remove(&key);
+        }
+        acquired
+    }
+
+    /// [`Transaction::lock`]'s round trips, for a key this transaction has neither written nor
+    /// locked.
+    fn acquire(&mut self, key: &Bytes) -> Result<Acquired> {
+        if let Some(held) = self.pin_primary(key)? {
             return Ok(held);
         }
         let primary = self
             .pinned
             .clone()
             .ok_or_else(|| Error::Internal("an eager lock left no primary".to_owned()))?;
-        if primary == key {
-            self.locked.insert(key);
+        if primary == *key {
+            self.locked.insert(key.clone());
             return Ok(Acquired::Taken);
         }
-        match self.prewrite_once(&primary, &key)? {
+        match self.prewrite_once(&primary, key)? {
             None => {
-                self.locked.insert(key);
+                self.locked.insert(key.clone());
                 Ok(Acquired::Taken)
             }
-            Some(lock) => self.wound_or_wait(&lock, &key),
+            Some(lock) => self.wound_or_wait(&lock, key),
         }
     }
 
@@ -814,6 +836,7 @@ impl Transaction {
             self.release_keys(&others)?;
             for key in &others {
                 self.locked.remove(key);
+                self.forget_lock_stamp(key);
             }
         }
 
@@ -831,9 +854,20 @@ impl Transaction {
         }
         self.release_keys(std::slice::from_ref(&primary))?;
         self.locked.remove(&primary);
+        self.forget_lock_stamp(&primary);
         self.pinned = None;
         self.renewals.forget(self.start_ts);
         Ok(())
+    }
+
+    /// Drops the read timestamp a released lock was validated at
+    /// ([ADR 0114](../../../docs/adr/0114-a-unique-key-being-written-waits-at-read-committed.md) §2),
+    /// unless the key is in the buffer, where the timestamp is its write's. A statement that locks
+    /// the row again validates at its own snapshot.
+    fn forget_lock_stamp(&mut self, key: &Bytes) {
+        if !self.buffer.contains_key(key) {
+            self.read_ts.remove(key);
+        }
     }
 
     /// One `ReleaseLock` per region the keys fall in.
@@ -1631,7 +1665,7 @@ impl Transaction {
                     value: value.clone(),
                     // **The snapshot this value was computed from** (ADR 0057 §4). `None` means
                     // the transaction's own, which is every write a statement that never waited
-                    // makes — and every write at all until the framing change lands.
+                    // makes.
                     read_ts: self.read_ts.get(key).copied(),
                 },
                 Some(Write::Delete) => TxnMutation::Delete {
@@ -1640,8 +1674,14 @@ impl Transaction {
                 },
                 // Not in the buffer: a key this transaction **read** and is asking the store to
                 // verify and hold. `Check` writes no value; what it leaves is the lock that makes
-                // the validation and the commit atomic (ADR 0067 §1).
-                None => TxnMutation::Check { key: key.clone() },
+                // the validation and the commit atomic (ADR 0067 §1). An eager lock carries the
+                // snapshot of the statement that took it, when it is taken and when `commit` sends
+                // it again; a read-set check has no stamp, and is tag 5 at the transaction's own
+                // snapshot (ADR 0114 §2).
+                None => TxnMutation::Check {
+                    key: key.clone(),
+                    read_ts: self.read_ts.get(key).copied(),
+                },
             })
             .collect()
     }

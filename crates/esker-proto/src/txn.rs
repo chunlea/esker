@@ -259,11 +259,10 @@ pub enum TxnMutation {
         /// ([ADR 0057](../../../docs/adr/0057-read-committed-waits-for-the-writer-in-front-of-it.md)
         /// §4).
         ///
-        /// `None` on the wire today: the encoding is unchanged until the human rules on it, so
-        /// every golden stays byte-identical and this field is carried in memory only. What it is
-        /// *for* is a READ COMMITTED waiter — a statement that waited for another transaction and
-        /// re-read at a fresh timestamp computed its value from that transaction's commit, so that
-        /// commit is its input rather than its conflict.
+        /// `None` is tag 1's bytes and `Some` is tag 3's (see `tag`). What it is *for* is a READ
+        /// COMMITTED waiter — a statement that waited for another transaction and re-read at a
+        /// fresh timestamp computed its value from that transaction's commit, so that commit is its
+        /// input rather than its conflict.
         read_ts: Option<u64>,
     },
     /// Remove `key`.
@@ -273,17 +272,28 @@ pub enum TxnMutation {
         /// As [`TxnMutation::Put::read_ts`].
         read_ts: Option<u64>,
     },
-    /// **Verify that `key` has not been committed since this transaction's snapshot, and hold it**
+    /// **Verify that `key` has not been committed since the snapshot it names, and hold it**
     /// ([ADR 0062](../../../docs/adr/0062-serializable-is-snapshot-isolation-plus-a-validated-read-set.md),
     /// [ADR 0067](../../../docs/adr/0067-the-check-mutation-and-the-latest-commit-question.md)).
     ///
-    /// A key a SERIALIZABLE transaction **read**. It writes no value: what it leaves is the lock
-    /// record, which is what makes the validation and the commit atomic against another
-    /// transaction's — a check that left nothing behind would let a commit land between the check
-    /// and this transaction's own.
+    /// A key a SERIALIZABLE transaction **read**, or a row a `SELECT … FOR UPDATE` locked
+    /// ([ADR 0088](../../../docs/adr/0088-a-row-lock-across-nodes.md)). It writes no value: what it
+    /// leaves is the lock record, which is what makes the validation and the commit atomic against
+    /// another transaction's — a check that left nothing behind would let a commit land between the
+    /// check and this transaction's own.
     Check {
-        /// The user key that was read.
+        /// The user key that was read or locked.
         key: Bytes,
+        /// **The snapshot to validate at**, or `None` for the transaction's own
+        /// ([ADR 0114](../../../docs/adr/0114-a-unique-key-being-written-waits-at-read-committed.md)
+        /// §2).
+        ///
+        /// A read-set check is `None`: SERIALIZABLE validates what it read against the snapshot it
+        /// read at, its `start_ts`. The eager lock a READ COMMITTED statement takes carries the
+        /// statement's read timestamp, because that statement reads the newest committed version
+        /// and locks that one — a commit after `BEGIN` and before the statement is what it read,
+        /// not a conflict. `None` is tag 5's bytes and `Some` is tag 7's.
+        read_ts: Option<u64>,
     },
     /// The same for a **range** a SERIALIZABLE transaction scanned.
     ///
@@ -303,7 +313,7 @@ impl TxnMutation {
     #[must_use]
     pub fn key(&self) -> &Bytes {
         match self {
-            Self::Put { key, .. } | Self::Delete { key, .. } | Self::Check { key } => key,
+            Self::Put { key, .. } | Self::Delete { key, .. } | Self::Check { key, .. } => key,
             // A range routes by its lower bound, which is the only part of it a single-region
             // request can be addressed by — the same rule `RawKvReq::Scan` follows.
             Self::CheckRange { start, .. } => start,
@@ -319,14 +329,19 @@ impl TxnMutation {
     /// reads them. A mutation that says which snapshot it read at takes a tag of its own, which an
     /// older peer refuses as unknown rather than misreading as a shorter message: the one thing a
     /// framing change must never do is decode wrongly.
+    ///
+    /// **A check follows the same rule** (ADR 0114 §2): tag 5 is a check at the transaction's own
+    /// snapshot and keeps its bytes, and tag 7 is one at a statement's, with the timestamp after
+    /// the key.
     fn tag(&self) -> u8 {
         match self {
             Self::Put { read_ts: None, .. } => 1,
             Self::Delete { read_ts: None, .. } => 2,
             Self::Put { .. } => 3,
             Self::Delete { .. } => 4,
-            Self::Check { .. } => 5,
+            Self::Check { read_ts: None, .. } => 5,
             Self::CheckRange { .. } => 6,
+            Self::Check { .. } => 7,
         }
     }
 
@@ -344,13 +359,13 @@ impl TxnMutation {
                     out.put_varint(*read_ts);
                 }
             }
-            Self::Delete { key, read_ts } => {
+            // A delete and a check have the same layout: the key, and the timestamp when there is one.
+            Self::Delete { key, read_ts } | Self::Check { key, read_ts } => {
                 out.put_bytes(key);
                 if let Some(read_ts) = read_ts {
                     out.put_varint(*read_ts);
                 }
             }
-            Self::Check { key } => out.put_bytes(key),
             Self::CheckRange { start, end } => {
                 out.put_bytes(start);
                 out.put_bytes(end);
@@ -380,10 +395,15 @@ impl TxnMutation {
             }),
             5 => Ok(Self::Check {
                 key: take(input, "mutation.key")?,
+                read_ts: None,
             }),
             6 => Ok(Self::CheckRange {
                 start: take(input, "mutation.start")?,
                 end: take(input, "mutation.end")?,
+            }),
+            7 => Ok(Self::Check {
+                key: take(input, "mutation.key")?,
+                read_ts: Some(input.get_varint("mutation.read_ts")?),
             }),
             tag => Err(DecodeError::invalid(
                 "mutation.tag",

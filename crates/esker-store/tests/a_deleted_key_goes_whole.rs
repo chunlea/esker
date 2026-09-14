@@ -197,6 +197,7 @@ fn a_lock_above_a_delete_does_not_save_the_segment() {
         31,
         TxnMutation::Check {
             key: Bytes::from_static(KEY),
+            read_ts: None,
         },
     );
     assert_eq!(
