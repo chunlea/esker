@@ -36,8 +36,9 @@ SELECT count(*) FILTER (WHERE a > 0) FROM t
 statement error (0A000)
 INSERT INTO t VALUES (1, 2, 'x') ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE t.b > 0
 
-statement error (0A000)
-INSERT INTO t SELECT * FROM t
+# **`INSERT … SELECT` left this file** (`tests/insert_select.rs`). Its query is read to the end
+# before the first row is written, and every row takes the one `INSERT` loop a `VALUES` list takes,
+# against PostgreSQL 19's answers in `tests/corpus/pg19_insert_select.txt`.
 
 # **`CREATE TEMPORARY TABLE` left this file** with ADR 0054: a temp table is an ordinary relation
 # in a schema that belongs to one session, and the search path does the rest. What is still refused

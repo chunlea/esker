@@ -1176,7 +1176,13 @@ is in its first sentence.
   before generated columns and checks, `RETURN NULL` taking the row out of the statement; the
   `AFTER ROW` triggers once the statement has written its rows; a foreign key's actions firing the
   child's. A statement-level trigger, arguments, a partitioned table and `ON CONFLICT` into a table
-  with a trigger are refused by name. The one write to a system catalog lives beside it: `UPDATE pg_catalog.pg_constraint SET convalidated = …` writes the
+  with a trigger are refused by name. **`INSERT … SELECT` reads its query to the end before it writes
+  a row** (`exec::dml::Source`) and sends every row through the one `INSERT` loop a `VALUES` list
+  takes — defaults, identities, generated columns, triggers, `ON CONFLICT`, uniqueness — so a query
+  over the table being written reads it as the statement found it, which is PostgreSQL's answer
+  (`tests/corpus/pg19_insert_select.txt`); a bare string literal in the query is read as its column's
+  type, as in `VALUES`, and the cost is the query's rows held for the statement. The one write to a
+  system catalog lives beside it: `UPDATE pg_catalog.pg_constraint SET convalidated = …` writes the
   `NOT VALID` flag a foreign key or a `CHECK` already stores (`exec::catalog_write`), because
   `check_all_foreign_keys_valid!` cannot work without it, and every other catalog write is `42501`.
   **The catalog record is a versioned on-disk format** like every other byte this system writes

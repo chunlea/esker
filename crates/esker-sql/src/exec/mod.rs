@@ -4594,6 +4594,9 @@ fn explain_lines(statement: &Statement) -> Vec<String> {
         Statement::Select(_) => vec!["Select".to_owned()],
         Statement::Update(update) => vec![format!("Update on {}", update.table)],
         Statement::Delete(delete) => vec![format!("Delete on {}", delete.table)],
+        Statement::Insert(insert) if insert.query.is_some() => {
+            vec![format!("Insert on {} (from a query)", insert.table)]
+        }
         Statement::Insert(insert) => vec![format!(
             "Insert on {} ({} row{})",
             insert.table,

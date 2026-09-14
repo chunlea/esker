@@ -1,0 +1,140 @@
+# `INSERT … SELECT` — every shape of it the node has to take, as a real PostgreSQL 19beta1 answers.
+#
+# Lane s1-sql, unit J, 2026-09-13. The node refused the statement outright where it is lowered
+# (`crates/esker-sql/src/parse/lower.rs`, `unsupported("INSERT ... SELECT")`), and s2's trigger capture
+# declared the one row of it that file holds (`pg19_plpgsql_trigger.txt:292`). This file is the
+# statement's own: a column list and none; an omitted column's default, a generated column and an
+# identity; `RETURNING`; no rows; a source query with `ORDER BY`, `LIMIT`, `OFFSET`, a derived table,
+# `UNION ALL`, `generate_series`, `WITH`, the parenthesised form Arel writes and a `VALUES` that is a
+# query; a source that reads the table it writes, which reads it as the statement found it;
+# `ON CONFLICT` with a query as its source; the arity and type refusals; and row triggers, with s2's
+# statement verbatim on s2's table shape.
+#
+# One session, inside `BEGIN … ROLLBACK`, in a schema of its own — the oracle's `public` holds a
+# schema load — with every refusal in its own `SAVEPOINT` / `ROLLBACK TO`. The last line proves the
+# `ROLLBACK` left nothing. Command tags are not in this file (psql -q prints none); they are captured
+# beside it, in `esker-coord/s1-unit-j/tags-2.out`.
+#!escaped
+BEGIN		-
+CREATE SCHEMA s1j		-
+SET search_path = s1j		-
+CREATE TABLE s (id integer, name text)		-
+INSERT INTO s VALUES (1, 'one'), (2, 'two'), (3, 'three')		-
+CREATE TABLE ti (id integer PRIMARY KEY, name text DEFAULT 'dflt', note text, tenfold integer GENERATED ALWAYS AS (id * 10) STORED)		-
+# A column list, and none: without one the query's columns fill the table's from the left.
+INSERT INTO ti (id, name) SELECT id, name FROM s WHERE id = 1		-
+INSERT INTO ti SELECT 2, 'two'		-
+# An omitted column takes its default, and a generated one is computed.
+INSERT INTO ti (id) SELECT 3		-
+SELECT id, name, note, tenfold FROM ti ORDER BY id		1|one|\\N|10 ; 2|two|\\N|20 ; 3|dflt|\\N|30
+# A generated column refuses a selected value as it refuses a written one.
+SAVEPOINT p1		-
+INSERT INTO ti (id, tenfold) SELECT 4, 40	!428C9 cannot insert a non-DEFAULT value into column "tenfold" DETAIL: Column "tenfold" is a generated column.
+ROLLBACK TO p1		-
+# DEFAULT is not something a query can produce.
+SAVEPOINT p2		-
+INSERT INTO ti (id, name) SELECT 5, DEFAULT	!42601 DEFAULT is not allowed in this context
+ROLLBACK TO p2		-
+# An identity draws its number per row, and refuses a selected one. Keyed: on the node a key-less
+# identity or serial draws nothing through VALUES either, a gap older than this statement.
+CREATE TABLE ident (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text)		-
+INSERT INTO ident (v) SELECT 'a' UNION ALL SELECT 'b' RETURNING id, v		1|a ; 2|b
+SAVEPOINT p3		-
+INSERT INTO ident (id, v) SELECT 5, 'c'	!428C9 cannot insert a non-DEFAULT value into column "id" DETAIL: Column "id" is an identity column defined as GENERATED ALWAYS. HINT: Use OVERRIDING SYSTEM VALUE to override.
+ROLLBACK TO p3		-
+# RETURNING, over the rows as stored.
+INSERT INTO ti (id, name) SELECT id + 10, upper(name) FROM s ORDER BY id RETURNING id, name, tenfold		11|ONE|110 ; 12|TWO|120 ; 13|THREE|130
+# No rows: nothing written, nothing returned.
+INSERT INTO ti (id) SELECT id FROM s WHERE false		-
+INSERT INTO ti (id) SELECT 100 WHERE false RETURNING id		-
+# The source query's own clauses.
+INSERT INTO ti (id, name) SELECT id + 20, name FROM s ORDER BY id DESC LIMIT 2 RETURNING id, name		23|three ; 22|two
+INSERT INTO ti (id, name) SELECT id + 30, name FROM s ORDER BY id OFFSET 1 RETURNING id		32 ; 33
+INSERT INTO ti (id, name) SELECT x.id + 40, x.name FROM (SELECT * FROM s WHERE id > 1) x ORDER BY x.id RETURNING id		42 ; 43
+INSERT INTO ti (id, name) SELECT 51, 'u' UNION ALL SELECT 52, 'v' RETURNING id, name		51|u ; 52|v
+INSERT INTO ti (id) SELECT n FROM generate_series(60, 62) n RETURNING id		60 ; 61 ; 62
+INSERT INTO ti (id, name) WITH w AS (SELECT 70 AS id, 'w' AS name) SELECT * FROM w RETURNING id, name		70|w
+INSERT INTO ti (id, name) (SELECT 71, 'paren') RETURNING id, name		71|paren
+INSERT INTO "ti" ("id", "name") (SELECT 72, 'arel') RETURNING id, name		72|arel
+INSERT INTO ti (id) VALUES (73), (74) LIMIT 1 RETURNING id		73
+SELECT count(*) FROM ti		21
+# A query over the table the statement writes reads it as the statement found it.
+CREATE TABLE r (n integer)		-
+INSERT INTO r VALUES (1)		-
+INSERT INTO r SELECT n + 1 FROM r		-
+INSERT INTO r SELECT n + 10 FROM r		-
+SELECT n FROM r ORDER BY n		1 ; 2 ; 11 ; 12
+INSERT INTO r SELECT n + 100 FROM r WHERE n < 1000		-
+SELECT count(*), max(n) FROM r		8|112
+INSERT INTO r SELECT n FROM r ORDER BY n RETURNING n		1 ; 2 ; 11 ; 12 ; 101 ; 102 ; 111 ; 112
+SELECT count(*) FROM r		16
+# ON CONFLICT with a query as the source.
+INSERT INTO ti (id, name) SELECT id, 'again' FROM s ORDER BY id ON CONFLICT (id) DO NOTHING RETURNING id		-
+INSERT INTO ti (id, name) SELECT id + 80, name FROM s ORDER BY id ON CONFLICT DO NOTHING RETURNING id		81 ; 82 ; 83
+INSERT INTO ti (id, name) SELECT id, name || '!' FROM s ORDER BY id ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name RETURNING id, name		1|one! ; 2|two! ; 3|three!
+# A proposal DO NOTHING leaves is not counted, from VALUES as from a query: the tag is the rows written.
+INSERT INTO ti VALUES (1, 'v'), (200, 'v') ON CONFLICT (id) DO NOTHING		-
+INSERT INTO ti VALUES (1, 'v') ON CONFLICT (id) DO NOTHING RETURNING id		-
+SAVEPOINT p4		-
+INSERT INTO ti (id, name) SELECT 1, 'x' UNION ALL SELECT 1, 'y' ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name	!21000 ON CONFLICT DO UPDATE command cannot affect row a second time HINT: Ensure that no rows proposed for insertion within the same command have duplicate constrained values.
+ROLLBACK TO p4		-
+# The same set operation, parenthesised.
+SAVEPOINT p4b		-
+INSERT INTO ti (id, name) (SELECT 1, 'x' UNION ALL SELECT 1, 'y') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name	!21000 ON CONFLICT DO UPDATE command cannot affect row a second time HINT: Ensure that no rows proposed for insertion within the same command have duplicate constrained values.
+ROLLBACK TO p4b		-
+# A duplicate the query brings, without ON CONFLICT.
+SAVEPOINT p5		-
+INSERT INTO ti (id) SELECT id FROM s	!23505 duplicate key value violates unique constraint "ti_pkey" DETAIL: Key (id)=(1) already exists.
+ROLLBACK TO p5		-
+# Arity is the query's columns against the target's, before any row — so no rows is not a way out.
+SAVEPOINT p6		-
+INSERT INTO ti (id) SELECT 1, 2	!42601 INSERT has more expressions than target columns
+ROLLBACK TO p6		-
+SAVEPOINT p7		-
+INSERT INTO ti SELECT 1, 'a', 'b', 4, 5	!42601 INSERT has more expressions than target columns
+ROLLBACK TO p7		-
+SAVEPOINT p8		-
+INSERT INTO ti (id, name) SELECT 1	!42601 INSERT has more target columns than expressions
+ROLLBACK TO p8		-
+SAVEPOINT p9		-
+INSERT INTO ti (id, name) SELECT 1 WHERE false	!42601 INSERT has more target columns than expressions
+ROLLBACK TO p9		-
+# A row that would refuse on its own does not get the chance: arity comes first.
+SAVEPOINT p9b		-
+INSERT INTO ti (id) SELECT 1 / 0, 2	!42601 INSERT has more expressions than target columns
+ROLLBACK TO p9b		-
+# Types: an assignment cast, a missing one, an unknown literal, a literal a set operation typed,
+# a cast that exists and refuses the value, and a NULL where the key cannot take one.
+INSERT INTO ti (id, name) SELECT 90, 91 RETURNING id, name		90|91
+SAVEPOINT p10		-
+INSERT INTO ti (id) SELECT 'x'::text	!42804 column "id" is of type integer but expression is of type text HINT: You will need to rewrite or cast the expression.
+ROLLBACK TO p10		-
+INSERT INTO ti (id) SELECT '92' RETURNING id		92
+SAVEPOINT p11		-
+INSERT INTO ti (id) SELECT '93' UNION ALL SELECT '94'	!42804 column "id" is of type integer but expression is of type text HINT: You will need to rewrite or cast the expression.
+ROLLBACK TO p11		-
+INSERT INTO ti (id) SELECT 95::bigint RETURNING id		95
+SAVEPOINT p12		-
+INSERT INTO ti (id) SELECT 5000000000::bigint	!22003 integer out of range
+ROLLBACK TO p12		-
+SAVEPOINT p13		-
+INSERT INTO ti (id) SELECT NULL::integer	!23502 null value in column "id" of relation "ti" violates not-null constraint DETAIL: Failing row contains (null, dflt, null, null).
+ROLLBACK TO p13		-
+SELECT count(*) FROM ti		28
+# Row triggers fire once per selected row: s2's statement, verbatim, on s2's table shape.
+CREATE TABLE t (id integer PRIMARY KEY, name text)		-
+CREATE TABLE audit (note text)		-
+CREATE FUNCTION t_mark() RETURNS trigger AS $$ BEGIN NEW.name = NEW.name || '*'; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t11 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION t_mark()		-
+CREATE FUNCTION t_audit() RETURNS trigger AS $$ BEGIN INSERT INTO audit VALUES ('after ' || NEW.id::text || ' ' || NEW.name); RETURN NULL; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t12 AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION t_audit()		-
+INSERT INTO t SELECT n, 'sel' FROM generate_series(20, 21) n RETURNING id, name		20|sel* ; 21|sel*
+SELECT note FROM audit ORDER BY note		after 20 sel* ; after 21 sel*
+# A BEFORE trigger that returns NULL takes its row out: not written, not returned, not counted.
+CREATE FUNCTION t_skip_odd() RETURNS trigger AS $$ BEGIN IF NEW.id % 2 = 1 THEN RETURN NULL; END IF; RETURN NEW; END $$ LANGUAGE plpgsql		-
+CREATE TRIGGER t13 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION t_skip_odd()		-
+INSERT INTO t SELECT n, 'k' FROM generate_series(30, 33) n RETURNING id, name		30|k* ; 32|k*
+SELECT id, name FROM t ORDER BY id		20|sel* ; 21|sel* ; 30|k* ; 32|k*
+SELECT note FROM audit ORDER BY note		after 20 sel* ; after 21 sel* ; after 30 k* ; after 32 k*
+ROLLBACK		-
+SELECT count(*) FROM pg_namespace WHERE nspname = 's1j'	bigint	0

@@ -7201,13 +7201,10 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
             aggregate::Aggregation::result_type(call.func, arg)?
         }
         // `DEFAULT` has the type of the column it is written into, and reaching here means it was
-        // written somewhere with no column to take one from -- which PostgreSQL answers as a
-        // syntax error and this node answers by name.
-        Expr::Default => {
-            return Err(SqlError::unsupported(
-                "DEFAULT outside an INSERT value or an UPDATE assignment",
-            ));
-        }
+        // written somewhere with no column to take one from — which PostgreSQL answers as a
+        // syntax error, with one sentence wherever it is: `SELECT DEFAULT`, `WHERE DEFAULT`, an
+        // `INSERT … SELECT`'s query.
+        Expr::Default => return Err(SqlError::DefaultNotAllowed),
     })
 }
 

@@ -32,6 +32,14 @@ pub struct Insert {
     /// different statement. An empty `rows` is a different thing again and never happens: it would
     /// be an `INSERT` that writes nothing at all.
     pub rows: Vec<Vec<Expr>>,
+    /// **`INSERT … SELECT`'s query**, whose rows are the statement's rows — `None` for `VALUES` and
+    /// `DEFAULT VALUES`. When it is set, `rows` is empty.
+    ///
+    /// Any source but a bare `VALUES` list lowers to one: a `SELECT`, a set operation, a
+    /// parenthesised query, and a `VALUES` carrying a query's own clauses, which is why
+    /// `INSERT INTO t VALUES (1), (2) LIMIT 1` inserts one row on PostgreSQL 19. The executor reads
+    /// it to the end before it writes the first row (`crate::exec::dml`).
+    pub query: Option<Box<crate::plan::Select>>,
     /// `RETURNING`, over the rows as stored.
     pub returning: Option<Returning>,
     /// `ON CONFLICT …`, which is what `insert_all` and `upsert_all` compile to.

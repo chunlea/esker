@@ -280,6 +280,10 @@ fn walk(
                     }
                 }
             }
+            // An `INSERT … SELECT`'s query binds as the query it is, over the tables it reads.
+            if let Some(query) = &insert.query {
+                walk_select(query, tables.get(1..).unwrap_or_default(), seen);
+            }
         }
         // **A `DECLARE`'s query is a query.** A `$1` inside one is typed and bound exactly as it
         // would be in the bare `SELECT`, which is what delegating here buys — and the alternative,
@@ -1028,6 +1032,9 @@ pub(super) fn walk_mut(statement: &mut Statement, visit: &mut impl FnMut(&mut Ex
                     walk_expr_mut(expr, visit);
                 }
             }
+            if let Some(query) = &mut insert.query {
+                walk_select_mut(query, visit);
+            }
             // `ON CONFLICT … DO UPDATE SET c = $1` — `upsert_all`'s shape, and a parameter here is
             // as ordinary as one in an `UPDATE`'s assignments.
             if let Some(crate::plan::OnConflict {
@@ -1275,7 +1282,15 @@ pub(super) fn walk_expr_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr)) 
 /// The table a statement is about, by name, so the inference has column types to work from.
 pub(super) fn table_names(statement: &Statement) -> Vec<&str> {
     match statement {
-        Statement::Insert(insert) => vec![insert.table.as_str()],
+        // The table written first — the inference reads its columns for `VALUES` — and then the
+        // tables an `INSERT … SELECT`'s query reads.
+        Statement::Insert(insert) => {
+            let mut names = vec![insert.table.as_str()];
+            if let Some(query) = &insert.query {
+                collect_table_names(query, &mut names);
+            }
+            names
+        }
         // A join's two tables, outer first, which is the order their columns appear in a row.
         Statement::Cursor(crate::plan::CursorStatement::Declare { query, .. }) => {
             let mut names = Vec::new();
@@ -1406,6 +1421,9 @@ pub(super) fn for_each_expr<'a>(statement: &'a Statement, visit: &mut impl FnMut
         Statement::Insert(insert) => {
             for row in &insert.rows {
                 row.iter().for_each(&mut each);
+            }
+            if let Some(query) = &insert.query {
+                for_each_in_select(query, &mut each);
             }
             if let Some(crate::plan::OnConflict {
                 action: crate::plan::ConflictAction::DoUpdate(assignments),

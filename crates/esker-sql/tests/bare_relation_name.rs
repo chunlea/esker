@@ -167,8 +167,8 @@ fn every_statement_with_a_from_item_gets_the_implicit_alias() {
         [["1".to_owned()]]
     );
 
-    // `INSERT … SELECT` would be the seventh shape and is out of reach for a reason of its own:
-    // this node refuses the construct entirely (`0A000 INSERT ... SELECT`), so there is no scope
-    // for an implicit alias to be missing from. Left out rather than asserted, because a test that
-    // stops on a different gap says nothing about this one.
+    // `INSERT … SELECT` would be the seventh shape. It was out of reach while this node refused the
+    // construct outright (`0A000 INSERT ... SELECT`); its query is now lowered by the same
+    // `lower_query` as a plain `SELECT` (`tests/insert_select.rs`), and it is still left out here,
+    // unasserted.
 }
