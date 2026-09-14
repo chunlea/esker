@@ -371,6 +371,40 @@ pub(super) fn wait_for_row(
     answer
 }
 
+/// **A lock refused because its row moved after this statement's snapshot is a re-run at READ
+/// COMMITTED, not a `40001`** (`debts-v1.1.md` #96; ADR 0114's plan, §2 step 5).
+///
+/// The eager lock a `SELECT … FOR UPDATE` takes is validated at the statement's snapshot
+/// ([ADR 0114](../../../../docs/adr/0114-a-unique-key-being-written-waits-at-read-committed.md) §2), so a
+/// commit that landed between that snapshot and the lock refuses it — whether it landed while the
+/// statement was still reading, or while the statement waited for the transaction that made it.
+/// PostgreSQL's `LockRows` answers that moment by reading the row's newest version and locking that
+/// one; this node's way to read again is ADR 0057's, the statement once more at a fresh snapshot,
+/// where the client stamps the lock anew. Measured before this existed: `40001 … a commit at 1008
+/// beat this transaction at 1004` for both shapes, where PostgreSQL 19 answered the new row.
+///
+/// **Asked only after a refusal**, so a lock that is taken spends nothing more; and only a refusal
+/// the row itself explains re-runs — a lock that could not be cleared, or a question that could not
+/// be answered, keeps the answer it had. REPEATABLE READ and SERIALIZABLE keep one snapshot for
+/// their whole life, so there is no newer read to re-run into and the refusal stands, as it does on
+/// PostgreSQL.
+fn lock_or_restart(
+    txn: &mut dyn Txn,
+    key: &[u8],
+    reach: crate::backend::Reach,
+    waits: bool,
+) -> Result<crate::backend::Lock> {
+    let answer = txn.lock(key, reach);
+    if waits
+        && matches!(answer, Err(SqlError::SerializationFailure { .. }))
+        && matches!(txn.changed_since_statement(key), Ok(true))
+    {
+        txn.restart_statement()?;
+        return Err(SqlError::StatementMustRestart);
+    }
+    answer
+}
+
 /// The wait itself: poll until the lock is ours, the level says not to wait, or something ends
 /// it. Split out so that [`wait_for_row`] has **one** exit to tidy the wait-for graph at.
 fn wait_for_the_lock(
@@ -409,7 +443,7 @@ fn wait_for_the_lock(
         // the store — and a retry that quietly asked for the cheaper one answered `Taken` at once
         // for a row another node was holding. That is not a slower lock, it is no lock: the
         // waiter walks straight through the wait it was sent here to do.
-        match txn.lock(key, reach)? {
+        match lock_or_restart(txn, key, reach, waits)? {
             // **A lock taken at once is not proof that nothing moved.** The writer in front may
             // have committed and released between this statement's read and this lock, in which
             // case there was nothing to wait for and the value in hand is stale anyway. Asking is
@@ -1969,6 +2003,7 @@ impl Executor {
             return Ok(rows);
         }
         let mut kept = Vec::with_capacity(rows.len());
+        let waits = self.isolation().waits();
         'row: for row in rows {
             for target in &planned.locks {
                 let key: Vec<Datum> = target.key_at.iter().map(|&at| row[at].clone()).collect();
@@ -1979,7 +2014,7 @@ impl Executor {
                     continue;
                 }
                 let key = crate::row::row_key(self.tenant, target.table_id, &key)?;
-                match txn.lock(&key, crate::backend::Reach::Cluster)? {
+                match lock_or_restart(txn, &key, crate::backend::Reach::Cluster, waits)? {
                     crate::backend::Lock::Taken => {}
                     crate::backend::Lock::Deadlock => return Err(SqlError::Deadlock),
                     // **`NOWAIT` and `SKIP LOCKED` ask and leave, so neither may stay in the
