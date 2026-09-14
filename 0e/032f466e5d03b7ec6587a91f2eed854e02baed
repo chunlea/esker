@@ -1,0 +1,48 @@
+crates/esker-sql/src/catalog/pg_constraint.rs
+  h_44076b318daf9c 501-573
+crates/esker-sql/src/error.rs
+  h_44076b318daf9c 2601-2605,3623
+crates/esker-sql/src/exec/ddl.rs
+  h_44076b318daf9c 160,189,199,238-246,619-644,717,719-732,749-755,769-777,791-795,803,826-828,946-954,1035,2752,2800,3098-3106,3116-3118,3495-3648,7513
+crates/esker-sql/src/exec/deferred.rs
+  h_44076b318daf9c 112-120,200-202,212-216,235-237,248-249,252-255
+crates/esker-sql/src/exec/dml.rs
+  h_44076b318daf9c 1366,2624-2626
+crates/esker-sql/src/exec/foreign_key.rs
+  h_44076b318daf9c 82-84
+crates/esker-sql/src/exec/mod.rs
+  h_44076b318daf9c 618-631,644-648,670-672,674-697,700,758,772-777,792-796,800-801,808,810
+crates/esker-sql/src/parse/lower.rs
+  h_44076b318daf9c 2687,2705-2707,2716-2720,2722,2727-2732,2925,3228,3251,3253-3255,3261,3263,3367,3421,3423,3431-3432,3437,3449,3478
+crates/esker-sql/src/parse/mod.rs
+  h_44076b318daf9c 242,3332,3335-3338,3422-3489
+crates/esker-sql/src/plan/ddl.rs
+  h_44076b318daf9c 59-60,706-708,728-744,928-934,1449
+crates/esker-sql/src/plan/mod.rs
+  h_44076b318daf9c 37-45
+crates/esker-sql/tests/constraint_name_in_a_schema.rs
+  h_44076b318daf9c 25
+crates/esker-sql/tests/constraint_names.rs
+  h_44076b318daf9c 1-299
+crates/esker-sql/tests/corpus/pg19_constraint_names.txt
+  h_44076b318daf9c 1-192
+crates/esker-sql/tests/regnamespace.rs
+  h_44076b318daf9c 359-385
+docs/adr/0115-regnamespace-is-an-oid-that-prints-as-a-schema.md
+  h_44076b318daf9c 3-5,93-102
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,126
+docs/plans/plpgsql-subset.md
+  h_44076b318daf9c 464
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0e032f466e5d03b7ec6587a91f2eed854e02baed",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
