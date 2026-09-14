@@ -95,13 +95,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
              and stores the trigger",
             "pg19_plpgsql_trigger.txt:201",
         ),
-        (
-            "INSERT INTO t SELECT n, 'sel' FROM generate_series(20, 21) n RETURNING id, name",
-            "`INSERT … SELECT` is refused where the statement is lowered, before any trigger could \
-             fire — a gap older than triggers and not about them. The per-row firing this row \
-             shows is the `VALUES` path's, which every other insert here measures",
-            "pg19_plpgsql_trigger.txt:292",
-        ),
     ],
 };
 
