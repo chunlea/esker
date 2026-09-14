@@ -1,0 +1,23 @@
+crates/esker-proto/src/txn.rs
+  s_dc640bf0df4adb::t_39dc4d038fcf2d 362-363
+crates/esker-store/src/txn_command.rs
+  s_dc640bf0df4adb::t_49352895618eb4 136-200,398
+crates/esker-store/src/txnkv.rs
+  s_dc640bf0df4adb::t_2433ba92a33c8f 618-624
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "662e0104a26d2d4684d6459f437e92208ef907ac",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
