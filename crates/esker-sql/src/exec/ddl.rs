@@ -185,7 +185,7 @@ pub(super) fn create_table(
     refuse_uncovered_primary_key(create, partition_by.as_ref(), &primary_key, &columns)?;
 
     let table_id = catalog::allocate_id(txn, executor.tenant)?;
-    let sequences = sequences_for(executor, txn, create, table_id)?;
+    let sequences = sequences_for(executor, txn, create, table_id, &columns)?;
     let checks = named_checks(executor, &*txn, &create.name, &create.checks)?;
     let table = TableDef {
         matview: None,
@@ -3802,10 +3802,26 @@ fn sequences_for(
     txn: &mut dyn Txn,
     create: &CreateTable,
     table_id: u64,
+    columns: &[ColumnDef],
 ) -> Result<Vec<catalog::SequenceDef>> {
     let mut sequences: Vec<catalog::SequenceDef> = Vec::new();
-    for (ordinal, column) in create.columns.iter().enumerate() {
+    for column in &create.columns {
         if let Some(identity) = column.sequence {
+            // **The column a sequence fills is found by name, in the columns the table will
+            // have** (#93). A table with no primary key carries an internal row id at position 0,
+            // so every column the statement declared sits one later in the row than in the
+            // statement — and recording the statement's position made the sequence fill the row
+            // id's slot, leaving `id` NULL and the insert `23502`, while the same table with a key
+            // was fine. The rule `catalog::inherited_sequences` and `ADD COLUMN` already follow.
+            let ordinal = columns
+                .iter()
+                .position(|candidate| candidate.name == column.name)
+                .ok_or_else(|| {
+                    SqlError::Internal(format!(
+                        "the serial column {} is not among the table's columns",
+                        column.name
+                    ))
+                })?;
             // **A derived sequence name that is taken is numbered, not refused** — this is
             // `CollidedSequenceNameTest`, where `foo_bar (baz_id serial)` and
             // `foo (bar_baz_id bigserial)` both derive `foo_bar_baz_id_seq` and the second gets
