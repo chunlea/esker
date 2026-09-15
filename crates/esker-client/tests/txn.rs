@@ -1890,3 +1890,42 @@ fn a_released_lock_is_taken_again_at_the_next_statement_s_snapshot() {
         ]
     );
 }
+
+/// **A lock the store refused leaves no stamp either** (debt #96). At READ COMMITTED a commit that
+/// landed after the statement's snapshot refuses the eager lock with a conflict, and the SQL layer
+/// answers it the way PostgreSQL does — the statement runs again, at a fresh snapshot, and locks the
+/// row's new version. That re-run's lock has to be validated at the re-run's snapshot: a stamp kept
+/// from the refused attempt would be the earliest and win, and the re-run would be refused by the
+/// very commit it was re-run to see.
+#[test]
+fn a_lock_refused_by_a_newer_commit_is_asked_again_at_the_re_run_s_snapshot() {
+    let transport = Arc::new(FakeTransport::new());
+    transport.script(Rule::new(
+        Matcher::Method(Method::TxnPrewrite),
+        Outcome::TxnReply(TxnKvResp::Prewrite {
+            keys: vec![TxnStatus::Conflict {
+                commit_ts: at_ms(100_600),
+            }],
+        }),
+    ));
+    answering_every_prewrite(&transport);
+    let client = client(&transport);
+    let mut txn = client.begin().unwrap();
+
+    txn.begin_statement(STATEMENT_TS);
+    let refused = txn.lock(b"k");
+    assert!(
+        matches!(refused, Err(Error::TxnConflict { .. })),
+        "a commit after the statement's snapshot refuses the lock: {refused:?}"
+    );
+    txn.restart_statement(LATER_STATEMENT_TS);
+    assert_eq!(txn.lock(b"k").unwrap(), Acquired::Taken);
+
+    assert_eq!(
+        prewrites(&transport),
+        vec![
+            vec![check_at(b"k", Some(STATEMENT_TS))],
+            vec![check_at(b"k", Some(LATER_STATEMENT_TS))],
+        ]
+    );
+}

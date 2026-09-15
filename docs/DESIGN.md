@@ -843,7 +843,9 @@ mutation, sent when the statement runs rather than at `COMMIT`, with no new meth
 **tag 5** when it is validated at the transaction's `start_ts`, as a SERIALIZABLE read set's is, and
 **tag 7** when it carries a READ COMMITTED statement's read timestamp and is validated there
 ([ADR 0114](adr/0114-a-unique-key-being-written-waits-at-read-committed.md) §2), so a row committed
-after `BEGIN` and before the statement is locked rather than refused. **Stores are upgraded before
+after `BEGIN` and before the statement is locked rather than refused, and one that lands after the
+statement's snapshot — while it reads, or while it waits for the committer — makes the statement run
+again at a fresh snapshot and lock the row's new version, as PostgreSQL does (#96). **Stores are upgraded before
 `esker-sql` nodes**: an old store refuses tag 7 as an invalid request, which the node reports as
 `08006` having locked nothing, and an old follower that meets kind 7 in the log stops applying that
 region rather than skip the entry — nothing diverges, and the replica is lost until it is upgraded.

@@ -1019,7 +1019,7 @@ impl Txn for MemoryTxn {
 
     /// Takes the row lock, or names the holder. See [`Txn::lock`] for why it is here and not in
     /// [`Txn::put`].
-    fn lock(&mut self, key: &[u8], _reach: Reach) -> Result<Lock> {
+    fn lock(&mut self, key: &[u8], reach: Reach) -> Result<Lock> {
         if self.read_only {
             // A time-machine transaction writes nothing, so it needs nothing and must not take a
             // lock a live writer would then wait behind.
@@ -1031,6 +1031,30 @@ impl Txn for MemoryTxn {
             .take(key, self.id, self.start_ts, self.session);
         if matches!(taken, Lock::Taken) && !self.held.iter().any(|held| held == key) {
             self.held.push(key.to_vec());
+        }
+        // **A cluster lock is validated as the store validates one** (ADR 0114 §2): refused when the
+        // key has a commit newer than the snapshot it was read at — the statement's under READ
+        // COMMITTED, the transaction's under the other two, which is what `statement_ts` holds at
+        // each. Without it a `SELECT … FOR UPDATE` whose row moved answered the version it had read,
+        // a stale row no level of PostgreSQL returns (#96), and this backend could not show the
+        // re-run a real store's refusal leads to.
+        if reach == Reach::Cluster && matches!(taken, Lock::Taken) {
+            let newest = self.versions().keys.get(key).and_then(|versions| {
+                versions
+                    .iter()
+                    .map(|(commit_ts, _)| *commit_ts)
+                    .filter(|commit_ts| *commit_ts > self.statement_ts)
+                    .max()
+            });
+            if let Some(newest) = newest {
+                return Err(SqlError::SerializationFailure {
+                    message: format!(
+                        "a commit at {newest} beat this transaction at {}",
+                        self.start_ts
+                    ),
+                    key: Some(key.to_vec()),
+                });
+            }
         }
         Ok(taken)
     }

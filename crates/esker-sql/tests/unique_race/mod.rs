@@ -58,6 +58,19 @@ const NO_TABLE: &str = "SELECT 1";
 const PLAIN: &str = "INSERT INTO subscribers (nick) VALUES ('bob')";
 const DO_NOTHING: &str =
     "INSERT INTO subscribers (nick) VALUES ('bob') ON CONFLICT (nick) DO NOTHING";
+/// B's `INSERT … SELECT` reads the key itself: ADR 0114 §3's plan named this as the risk, and
+/// `esker-coord/s1-oracle-2026-09-13/f/` measured it — PostgreSQL 19 counts a read in the statement that
+/// writes the key exactly as a read before it.
+const READS_IN_ITS_QUERY: &str = "INSERT INTO subscribers (nick) SELECT 'bob' WHERE NOT EXISTS \
+                                  (SELECT 1 FROM subscribers WHERE nick = 'bob')";
+/// The same read as a `count(*)` in a derived table.
+const COUNTS_IN_ITS_QUERY: &str = "INSERT INTO subscribers (nick) SELECT 'bob' FROM (SELECT count(*) \
+                                   AS n FROM subscribers WHERE nick = 'bob') c WHERE c.n = 0";
+/// The same read at the top of the `INSERT`'s own query, over the table it writes.
+const READS_AT_THE_TOP: &str = "INSERT INTO subscribers (nick) SELECT 'bob' FROM subscribers WHERE \
+                                nick = 'bob' HAVING count(*) = 0";
+/// An `INSERT … SELECT` whose query reads no table: the control for the three above.
+const SELECTS_NO_TABLE: &str = "INSERT INTO subscribers (nick) SELECT 'bob'";
 
 /// A session of whichever node the including binary runs.
 pub(crate) trait Sql {
@@ -158,6 +171,89 @@ pub(crate) const CASE_16: Race = Race {
     insert: DO_NOTHING,
     committed_first: false,
     postgres: "40001",
+};
+
+// Unit L: one statement that reads the key and inserts it (`esker-coord/s1-oracle-2026-09-13/f/`). B's
+// first statement reads no table, so the only read of `bob` is inside B's `INSERT`.
+pub(crate) const CASE_F1: Race = Race {
+    name: "case f1",
+    level: "SERIALIZABLE",
+    first: NO_TABLE,
+    insert: READS_IN_ITS_QUERY,
+    committed_first: true,
+    postgres: "40001",
+};
+
+pub(crate) const CASE_F2: Race = Race {
+    name: "case f2",
+    level: "SERIALIZABLE",
+    first: NO_TABLE,
+    insert: READS_IN_ITS_QUERY,
+    committed_first: false,
+    postgres: "40001",
+};
+
+pub(crate) const CASE_F3: Race = Race {
+    name: "case f3",
+    level: "SERIALIZABLE",
+    first: NO_TABLE,
+    insert: COUNTS_IN_ITS_QUERY,
+    committed_first: true,
+    postgres: "40001",
+};
+
+pub(crate) const CASE_F4: Race = Race {
+    name: "case f4",
+    level: "SERIALIZABLE",
+    first: NO_TABLE,
+    insert: SELECTS_NO_TABLE,
+    committed_first: true,
+    postgres: "23505",
+};
+
+pub(crate) const CASE_F5: Race = Race {
+    name: "case f5",
+    level: "REPEATABLE READ",
+    first: NO_TABLE,
+    insert: READS_IN_ITS_QUERY,
+    committed_first: true,
+    postgres: "23505",
+};
+
+pub(crate) const CASE_F6: Race = Race {
+    name: "case f6",
+    level: "REPEATABLE READ",
+    first: NO_TABLE,
+    insert: READS_IN_ITS_QUERY,
+    committed_first: false,
+    postgres: "23505",
+};
+
+pub(crate) const CASE_F8: Race = Race {
+    name: "case f8",
+    level: "SERIALIZABLE",
+    first: NO_TABLE,
+    insert: READS_AT_THE_TOP,
+    committed_first: true,
+    postgres: "40001",
+};
+
+pub(crate) const CASE_F9: Race = Race {
+    name: "case f9",
+    level: "SERIALIZABLE",
+    first: NO_TABLE,
+    insert: READS_AT_THE_TOP,
+    committed_first: false,
+    postgres: "40001",
+};
+
+pub(crate) const CASE_F10: Race = Race {
+    name: "case f10",
+    level: "REPEATABLE READ",
+    first: NO_TABLE,
+    insert: READS_AT_THE_TOP,
+    committed_first: true,
+    postgres: "23505",
 };
 
 /// Runs `race` with three sessions of one node, and asserts that B is refused with PostgreSQL's

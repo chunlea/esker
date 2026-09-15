@@ -42,12 +42,18 @@ const DRIVERS: u64 = 3;
 /// measures progress, not this; this is only ever spent on a run that is already wrong.
 const CEILING: Duration = Duration::from_secs(240);
 
-/// A run of consecutive free ports for this file's processes, one port per node plus the driver.
+/// A run of consecutive free ports for this file's processes: one per store, then one per driver.
+///
+/// **Every port the command binds, and no fewer.** `esker cluster start` puts store `id` at
+/// `base + id - 1` and driver `member` at `base + nodes + member - 1`, so `--nodes 1 --pd-nodes 3`
+/// binds four. The run used to be `NODES + 1` — one driver's worth — and left drivers two and three
+/// outside it, where the next two-port slot another process reserves begins: the gate of `16272e03`
+/// failed on exactly those two, `Address already in use`, while driver one inside the run listened.
 ///
 /// This file used to scan a fixed band of its own — see `tests/port_band/mod.rs` for why that
 /// collided with the other tests in this same binary.
 fn free_port_run() -> u16 {
-    port_band::reserve(u16::try_from(NODES).expect("a small node count") + 1).into_base()
+    port_band::reserve(u16::try_from(NODES + DRIVERS).expect("a small cluster")).into_base()
 }
 
 /// The supervisor, stopped however the test ends.

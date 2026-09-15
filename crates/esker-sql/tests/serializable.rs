@@ -357,3 +357,58 @@ fn repeatable_read_insert_after_a_read_is_a_duplicate_key_while_the_holder_is_li
 fn repeatable_read_insert_after_a_read_is_a_duplicate_key_when_the_holder_committed_first() {
     run_race(unique_race::CASE_10);
 }
+
+/// Case f1: SERIALIZABLE, B's `INSERT … SELECT` reads `bob` itself — `WHERE NOT EXISTS (…)` — and A committed it first — `40001`.
+#[test]
+fn serializable_insert_select_that_reads_the_key_is_refused_with_40001() {
+    run_race(unique_race::CASE_F1);
+}
+
+/// Case f2: the same, while A is live — `40001`.
+#[test]
+fn serializable_insert_select_that_reads_the_key_is_refused_with_40001_while_the_holder_is_live() {
+    run_race(unique_race::CASE_F2);
+}
+
+/// Case f3: the read as a `count(*)` in a derived table — `40001`.
+#[test]
+fn serializable_insert_select_that_counts_the_key_is_refused_with_40001() {
+    run_race(unique_race::CASE_F3);
+}
+
+/// Case f4: SERIALIZABLE, an `INSERT … SELECT` that reads no table — the control — `23505`.
+#[test]
+fn serializable_insert_select_that_reads_no_table_is_a_duplicate_key() {
+    run_race(unique_race::CASE_F4);
+}
+
+/// Case f5: REPEATABLE READ, the read in the `INSERT`'s query, A committed first — `23505`.
+#[test]
+fn repeatable_read_insert_select_that_reads_the_key_is_a_duplicate_key() {
+    run_race(unique_race::CASE_F5);
+}
+
+/// Case f6: the same, while A is live — `23505`.
+#[test]
+fn repeatable_read_insert_select_that_reads_the_key_is_a_duplicate_key_while_the_holder_is_live() {
+    run_race(unique_race::CASE_F6);
+}
+
+/// Case f8: SERIALIZABLE, the read at the top of the `INSERT`'s own query — `SELECT 'bob' FROM subscribers WHERE nick = 'bob' HAVING count(*) = 0` — A committed first — `40001`.
+#[test]
+fn serializable_insert_select_from_the_table_it_writes_is_refused_with_40001() {
+    run_race(unique_race::CASE_F8);
+}
+
+/// Case f9: the same, while A is live — `40001`.
+#[test]
+fn serializable_insert_select_from_the_table_it_writes_is_refused_with_40001_while_the_holder_is_live()
+ {
+    run_race(unique_race::CASE_F9);
+}
+
+/// Case f10: REPEATABLE READ, the read at the top of the query — `23505`.
+#[test]
+fn repeatable_read_insert_select_from_the_table_it_writes_is_a_duplicate_key() {
+    run_race(unique_race::CASE_F10);
+}
