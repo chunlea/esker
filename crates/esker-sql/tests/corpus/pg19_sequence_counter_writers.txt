@@ -40,9 +40,9 @@ SELECT count(*) FROM pg_class WHERE relname IN ('s2f_c', 's2f_rr', 's2f_rr_id_se
 # last_value in the creating transaction, REPEATABLE READ drops, RESTART IDENTITY, DO, and drops made again or rolled back
 BEGIN		-
 CREATE SEQUENCE s2g_a START 7		-
-SELECT 'r', last_value, is_called FROM s2g_a		r|7|f
+SELECT 'before', last_value, is_called FROM s2g_a		before|7|f
 SELECT 'r', nextval('s2g_a'), nextval('s2g_a')		r|7|8
-SELECT 'r', last_value, is_called FROM s2g_a		r|8|t
+SELECT 'after', last_value, is_called FROM s2g_a		after|8|t
 ROLLBACK		-
 BEGIN ISOLATION LEVEL REPEATABLE READ		-
 CREATE SEQUENCE s2g_b		-

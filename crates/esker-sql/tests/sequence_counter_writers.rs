@@ -31,7 +31,7 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
         (
-            "SELECT 'r', last_value, is_called FROM s2g_a",
+            "SELECT 'after', last_value, is_called FROM s2g_a",
             BLOCK_END,
             "pg19_sequence_counter_writers.txt:45",
         ),
