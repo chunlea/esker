@@ -1,0 +1,35 @@
+crates/esker-sql/src/catalog/mod.rs
+  s_b249f065cef854::t_e9e9f56629b69a 966,985-996,3103-3109,3328,4884-4891,4939-4940,4956-4959,4964,4970-4972,5006-5014,5018
+crates/esker-sql/src/exec/ddl.rs
+  s_b249f065cef854::t_b61f15490cad8a 2508-2509,2527-2534,2645
+crates/esker-sql/src/exec/dml.rs
+  s_b249f065cef854::t_79ba204c1778cd 792,1177
+crates/esker-sql/src/exec/mod.rs
+  s_b249f065cef854::t_2330b5fa7ed084 2160,2279-2283,2725-2726,2737,4576-4582
+crates/esker-sql/src/exec/query.rs
+  s_b249f065cef854::t_514b0660f50e4e 2929-2939,2942
+crates/esker-sql/src/plan/query.rs
+  s_b249f065cef854::t_3fd902b0974ae0 591-592
+crates/esker-sql/tests/corpus/pg19_sequence_counter_writers.txt
+  s_b249f065cef854::t_e2fd50861c4b12 1-88
+crates/esker-sql/tests/sequence_after_rollback.rs
+  s_b249f065cef854::t_56cb7579e903ce 28
+crates/esker-sql/tests/sequence_counter_writers.rs
+  s_b249f065cef854::t_40cb3466e60eb8 1-160
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bd9f9e15aef91a58867953c9d8324b1319ddb51f",
+  "prompts": {},
+  "sessions": {
+    "s_b249f065cef854": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7c1a94ab-56c5-4769-8981-7863defc92e8",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
