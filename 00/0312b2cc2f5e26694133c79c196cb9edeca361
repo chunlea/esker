@@ -1,0 +1,39 @@
+crates/esker-cli/tests/cluster_pd_group.rs
+  s_74ad1368f0aa85::t_4e48648057af55 45-51,56
+crates/esker-client/tests/txn.rs
+  s_74ad1368f0aa85::t_95acc347f83fb0 1893-1931
+crates/esker-sql/src/backend/mod.rs
+  s_74ad1368f0aa85::t_33d4a192c0bac9 1022,1035-1058
+crates/esker-sql/src/exec/mod.rs
+  s_74ad1368f0aa85::t_1effe647961519 377-410,449,2005-2006,2023,2034
+crates/esker-sql/tests/concurrent_unique_insert.rs
+  s_74ad1368f0aa85::t_207f1dbf1f6e12 204-332,435-489
+crates/esker-sql/tests/read_committed.rs
+  s_74ad1368f0aa85::t_a9301fa056e3c2 24,29,432-569
+crates/esker-sql/tests/serializable.rs
+  s_74ad1368f0aa85::t_c09c1eb14a04ea 360-414
+crates/esker-sql/tests/unique_race/mod.rs
+  s_74ad1368f0aa85::t_3d05d7a8c467af 61-73,176-258
+docs/DESIGN.md
+  s_74ad1368f0aa85::t_7850c83cb2958d 846-848
+docs/plans/0114-implementation.md
+  s_74ad1368f0aa85::t_e033e5bc77a18e 153-182,307-309,506
+docs/plans/debts-v1.1.md
+  s_74ad1368f0aa85::t_9e2492ce9872fb 24,125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "000312b2cc2f5e26694133c79c196cb9edeca361",
+  "prompts": {},
+  "sessions": {
+    "s_74ad1368f0aa85": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8b2fe66f-6f53-4eb8-865d-21176c1c5856",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
