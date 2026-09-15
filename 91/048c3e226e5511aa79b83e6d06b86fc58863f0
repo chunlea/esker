@@ -1,0 +1,21 @@
+crates/esker-sql/tests/corpus/pg19_sequence_counter_writers.txt
+  s_8d3e4c2902bf64::t_370a44f392b92f 43,45
+crates/esker-sql/tests/sequence_counter_writers.rs
+  s_8d3e4c2902bf64::t_a7a638810fe7de 34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "91048c3e226e5511aa79b83e6d06b86fc58863f0",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
