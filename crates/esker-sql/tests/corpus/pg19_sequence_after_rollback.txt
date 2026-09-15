@@ -1,0 +1,121 @@
+# A sequence created after a rolled-back one — debt #94 — as a real PostgreSQL 19beta1 answers it.
+#
+# Captured 2026-09-13 by lane s2-plpgsql with `sesscap.py`: `esker-coord/s2-f94.stmts` (a serial and an explicit
+# sequence created again after a rolled-back one, and the two things a rollback does not give back), `s2-f94b.stmts`
+# (`currval` of a sequence created again, and `START` in the transaction that made it), `s2-f94c.stmts` (the same
+# inside a savepoint that is rolled back to, and a `DO` block whose own implicit transaction is), `s2-f94e.stmts` (a
+# `REPEATABLE READ` block that rolls a serial back to a savepoint before drawing from it, makes another, drops it and
+# commits) and `s2-f94f.stmts` (a serial added by `ALTER TABLE` inside a savepoint that is rolled back to, and added
+# again). Ten sessions inside `BEGIN … ROLLBACK`, one refused `DO` outside any block and one block that commits what it
+# then drops, every refusal inside a block in its own `SAVEPOINT` / `ROLLBACK TO`; the last line of each capture proves
+# nothing was left behind.
+#
+#!escaped
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **A sequence that was rolled back is gone, numbers and all**: the next one — a serial of another table, or a
+#     sequence of the very same name — starts at `1`, and its `currval` is not defined until this session draws
+#     from it (`55000`). A `ROLLBACK TO` a savepoint taken before it takes it back the same way, whether `CREATE TABLE`
+#     or `ALTER TABLE … ADD COLUMN` made it, and so does the implicit transaction of a `DO` block that raised.
+#   * **A rollback still gives no number back to a sequence that survives it**: `nextval` is not transactional, so
+#     after `ROLLBACK TO` a sequence goes on from `3` and a serial from `2`.
+#   * **`START` holds in the transaction that made the sequence**: `101`, then `102`.
+#
+BEGIN		-
+CREATE TABLE s2f_a (id serial, v text)		-
+INSERT INTO s2f_a (v) VALUES ('x'), ('y') RETURNING id		1 ; 2
+ROLLBACK		-
+# the second session: a new table's serial after the rolled-back one
+BEGIN		-
+CREATE TABLE s2f_b (id serial, v text)		-
+INSERT INTO s2f_b (v) VALUES ('z') RETURNING id		1
+ROLLBACK		-
+# the third session: an explicit sequence that hands out three numbers and is rolled back
+BEGIN		-
+CREATE SEQUENCE s2f_s		-
+SELECT 'r', nextval('s2f_s'), nextval('s2f_s'), nextval('s2f_s')		r|1|2|3
+ROLLBACK		-
+# the fourth session: the same name again
+BEGIN		-
+CREATE SEQUENCE s2f_s		-
+SELECT 'r', nextval('s2f_s'), currval('s2f_s')		r|1|1
+ROLLBACK		-
+# the fifth session: a savepoint's rollback does not give numbers back, to a sequence or to a serial
+BEGIN		-
+CREATE SEQUENCE s2f_k		-
+SAVEPOINT a		-
+SELECT 'r', nextval('s2f_k'), nextval('s2f_k')		r|1|2
+ROLLBACK TO a		-
+SELECT 'r', nextval('s2f_k')		r|3
+CREATE TABLE s2f_c (id serial, v text)		-
+SAVEPOINT b		-
+INSERT INTO s2f_c (v) VALUES ('p') RETURNING id		1
+ROLLBACK TO b		-
+INSERT INTO s2f_c (v) VALUES ('q') RETURNING id		2
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('s2f_a', 's2f_b', 's2f_c', 's2f_s', 's2f_k', 's2f_a_id_seq', 's2f_b_id_seq', 's2f_c_id_seq')	bigint	0
+# the currval of a sequence made again, and START in the transaction that made it
+BEGIN		-
+CREATE SEQUENCE s2f_u		-
+SELECT 'r', nextval('s2f_u'), currval('s2f_u')		r|1|1
+ROLLBACK		-
+# the second session: the same name again, and currval before any nextval
+BEGIN		-
+CREATE SEQUENCE s2f_u		-
+SAVEPOINT a		-
+SELECT 'r', currval('s2f_u')	!55000 currval of sequence "s2f_u" is not yet defined in this session
+ROLLBACK TO a		-
+SELECT 'r', nextval('s2f_u'), currval('s2f_u')		r|1|1
+CREATE SEQUENCE s2f_w START 101		-
+SELECT 'r', nextval('s2f_w'), nextval('s2f_w')		r|101|102
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('s2f_u', 's2f_w')	bigint	0
+# a savepoint rolled back to takes its sequences back, and so does a DO block's implicit transaction
+BEGIN		-
+SAVEPOINT a		-
+CREATE TABLE s2f_d (id serial, v text)		-
+INSERT INTO s2f_d (v) VALUES ('x'), ('y') RETURNING id		1 ; 2
+ROLLBACK TO a		-
+CREATE TABLE s2f_e (id serial, v text)		-
+INSERT INTO s2f_e (v) VALUES ('z') RETURNING id		1
+SAVEPOINT b		-
+CREATE SEQUENCE s2f_g		-
+SELECT 'r', nextval('s2f_g'), nextval('s2f_g')		r|1|2
+ROLLBACK TO b		-
+CREATE SEQUENCE s2f_g		-
+SAVEPOINT c		-
+SELECT 'r', currval('s2f_g')	!55000 currval of sequence "s2f_g" is not yet defined in this session
+ROLLBACK TO c		-
+SELECT 'r', nextval('s2f_g'), currval('s2f_g')		r|1|1
+ROLLBACK		-
+DO $$ BEGIN CREATE TABLE s2f_do (id serial, v text); INSERT INTO s2f_do (v) VALUES ('x'), ('y'); RAISE EXCEPTION 'boom'; END $$	!P0001 boom
+BEGIN		-
+CREATE TABLE s2f_do2 (id serial, v text)		-
+INSERT INTO s2f_do2 (v) VALUES ('z') RETURNING id		1
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('s2f_d', 's2f_e', 's2f_g', 's2f_do', 's2f_do2', 's2f_d_id_seq', 's2f_e_id_seq', 's2f_do_id_seq', 's2f_do2_id_seq')	bigint	0
+# a REPEATABLE READ block that rolls a serial back to a savepoint before drawing, makes another on the same id, drops it and commits
+BEGIN ISOLATION LEVEL REPEATABLE READ		-
+SAVEPOINT a		-
+CREATE TABLE s2f_ra (id serial, v text)		-
+ROLLBACK TO a		-
+CREATE TABLE s2f_rb (id serial, v text)		-
+DROP TABLE s2f_rb		-
+COMMIT		-
+SELECT count(*) FROM pg_class WHERE relname IN ('s2f_ra', 's2f_rb', 's2f_ra_id_seq', 's2f_rb_id_seq')	bigint	0
+# a serial added by ALTER TABLE inside a savepoint that is rolled back to, and added again
+BEGIN		-
+CREATE TABLE s2f_t (v text)		-
+SAVEPOINT a		-
+ALTER TABLE s2f_t ADD COLUMN id serial		-
+INSERT INTO s2f_t (v) VALUES ('x'), ('y') RETURNING id		1 ; 2
+ROLLBACK TO a		-
+ALTER TABLE s2f_t ADD COLUMN id serial		-
+INSERT INTO s2f_t (v) VALUES ('z') RETURNING id		1
+ROLLBACK		-
+SELECT count(*) FROM pg_class WHERE relname IN ('s2f_t', 's2f_t_id_seq')	bigint	0

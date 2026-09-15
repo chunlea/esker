@@ -91,8 +91,11 @@ impl Blocks {
     ///
     /// `TRUNCATE … RESTART IDENTITY` needs it — resetting the key while a block is in memory would
     /// hand out values from inside a run that no longer means anything — and so does `DROP TABLE`,
-    /// which is a leak rather than a wrong value: a relation id is never reused, so a re-created
-    /// sequence is a different sequence. At node scope the leak would be shared by every session.
+    /// which is a leak rather than a wrong value: a dropped sequence's creation committed, so its id
+    /// is never taken again and a re-created sequence is a different sequence. At node scope the
+    /// leak would be shared by every session. A creation that **rolls back** gives its id back, and
+    /// there a held block is a wrong value — the next sequence on the id would carry on from it —
+    /// so the executor forgets that one at the rollback (debt #94).
     pub fn forget(&self, tenant: u64, sequence_id: u64) {
         self.held
             .lock()

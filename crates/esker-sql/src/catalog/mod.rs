@@ -4480,6 +4480,23 @@ pub fn display_name(stored: &str) -> String {
     }
 }
 
+/// Whether `schema` is on a session's search path — the one rule that decides whether a name is
+/// printed bare or qualified: by `::regclass` and `format_type`, and for the sequence a column's
+/// default names.
+///
+/// PostgreSQL prints a relation or a type bare exactly when its schema is on the path, and
+/// `public` is no exception: with `SET search_path = s`, a table in `public` prints `public.t`. An
+/// **empty** path is a caller with no session behind it and is read as the default one, on which
+/// `public` sits — so an ordinary name prints bare and a schema-qualified one qualified, which is
+/// what every statement outside a session wants.
+#[must_use]
+pub fn schema_on_path(search_path: &[String], schema: &str) -> bool {
+    if search_path.is_empty() {
+        return schema == PUBLIC_SCHEMA;
+    }
+    search_path.iter().any(|on_path| on_path == schema)
+}
+
 /// A name **as a user wrote it** — `schema.relation` — turned into the stored form.
 ///
 /// This is `::regclass`'s input and nothing else: everywhere else a qualified name arrives already
@@ -4883,6 +4900,22 @@ pub fn restart_sequence(txn: &mut dyn Txn, tenant: u64, sequence_id: u64) {
     txn.delete(&record::sequence_value_key(tenant, sequence_id));
 }
 
+/// Deletes the counter of a sequence whose creation was rolled back, **if it has one**, and says
+/// whether it did.
+///
+/// A sequence nothing drew from has no counter, and deleting one anyway would still write, because
+/// a delete is a version of the key: a `REPEATABLE READ` block that went on to make a sequence on
+/// the same id and drop it would be refused at `COMMIT` for a write nobody needed
+/// (`tests/corpus/pg19_sequence_after_rollback.txt`, its `REPEATABLE READ` block).
+pub fn delete_sequence_counter(txn: &mut dyn Txn, tenant: u64, sequence_id: u64) -> Result<bool> {
+    let key = record::sequence_value_key(tenant, sequence_id);
+    if txn.get(&key)?.is_none() {
+        return Ok(false);
+    }
+    txn.delete(&key);
+    Ok(true)
+}
+
 /// Removes one table's sequences: their records, their names and their counters.
 fn drop_sequences(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()> {
     for sequence in &table.derived()?.sequences {
@@ -5003,6 +5036,11 @@ pub const FIRST_USER_ID: u64 = 16_384;
 
 /// Takes the next relation id for a tenant. Ids start at [`FIRST_USER_ID`], so 0 is never a real
 /// relation and no id can be mistaken for a built-in's oid.
+///
+/// **In the creating transaction**, so a creation that rolls back gives its id back and the next
+/// one takes it. Anything keyed by an id and written *outside* that transaction outlives the
+/// rollback and has to be given back with it — a sequence's counter and the block reserved from it
+/// are both (debt #94, `Executor::forget_the_created_sequences`).
 pub fn allocate_id(txn: &mut dyn Txn, tenant: u64) -> Result<u64> {
     let key = record::next_id_key(tenant);
     let next = match txn.get(&key)? {

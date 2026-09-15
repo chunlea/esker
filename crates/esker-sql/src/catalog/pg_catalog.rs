@@ -980,13 +980,14 @@ impl CatalogView {
         which: CatalogView,
         view: &crate::catalog::View<'_>,
         rendering: crate::value::Rendering,
+        search_path: &[String],
     ) -> Result<Vec<Vec<Datum>>> {
         match which {
             CatalogView::InformationSchemaTables => super::information_schema::tables(view),
             CatalogView::InformationSchemaViews => super::information_schema::views(view),
             CatalogView::InformationSchemaDomains => super::information_schema::domains(view),
             CatalogView::InformationSchemaColumns => {
-                super::information_schema::columns(view, rendering)
+                super::information_schema::columns(view, rendering, search_path)
             }
             CatalogView::InformationSchemaTableConstraints => {
                 super::information_schema::table_constraints(view)
@@ -1013,6 +1014,10 @@ impl CatalogView {
     /// default reads `'3 years'::interval` under the boot style and `'P3Y'::interval` under the one
     /// `ActiveRecord` sets. Measured; it is the whole of `test_schema_dump_with_default_value`.
     ///
+    /// `search_path` goes where `rendering` goes, for the default's sequence rather than its
+    /// constant: a `serial`'s default names its sequence the way a `regclass` constant prints, bare
+    /// when its schema is on the path and qualified when it is not (#95).
+    ///
     /// `only` is the relation the predicate pinned, when the planner found one — see
     /// [`CatalogView::relation_column`]. Every view but the two that read it ignores it, and those
     /// two answer the same rows either way: it decides how many relations they build rows for, not
@@ -1021,11 +1026,12 @@ impl CatalogView {
         self,
         view: &crate::catalog::View<'_>,
         rendering: crate::value::Rendering,
+        search_path: &[String],
         prepared: &[crate::session::PreparedStatement],
         advisory: Option<&crate::advisory::Locks>,
         only: Option<i64>,
     ) -> Result<Vec<Vec<Datum>>> {
-        let mut rows = self.built_rows(view, rendering, prepared, advisory, only)?;
+        let mut rows = self.built_rows(view, rendering, search_path, prepared, advisory, only)?;
         self.as_declared(&mut rows);
         Ok(rows)
     }
@@ -1080,6 +1086,7 @@ impl CatalogView {
         self,
         view: &crate::catalog::View<'_>,
         rendering: crate::value::Rendering,
+        search_path: &[String],
         prepared: &[crate::session::PreparedStatement],
         advisory: Option<&crate::advisory::Locks>,
         only: Option<i64>,
@@ -1093,7 +1100,9 @@ impl CatalogView {
             CatalogView::PgSequence => pg_sequence_rows(view),
             CatalogView::PgClass => pg_class_rows(view),
             CatalogView::PgAttribute => super::pg_attribute::rows(view, only),
-            CatalogView::PgAttrdef => super::pg_attribute::default_rows(view, rendering, only),
+            CatalogView::PgAttrdef => {
+                super::pg_attribute::default_rows(view, rendering, search_path, only)
+            }
             CatalogView::PgIndex => super::pg_index::rows(view),
             CatalogView::PgInherits => inherits_rows(view),
             CatalogView::PgProc => proc_rows(txn, tenant),
@@ -1112,7 +1121,7 @@ impl CatalogView {
             // arms that all call one module, and keeping them here is what pushed `rows_of` past
             // the size lint when the sixth arrived (ADR 0065's `information_schema.domains`).
             which if which.schema() == super::INFORMATION_SCHEMA => {
-                Self::information_schema_rows(which, view, rendering)
+                Self::information_schema_rows(which, view, rendering, search_path)
             }
             // **The four a real server has**, measured: `c`, `internal`, `plpgsql` and `sql`,
             // with only the last two `lanpltrusted` — a non-superuser may write a function in

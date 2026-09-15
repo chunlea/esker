@@ -388,6 +388,7 @@ fn inner_side(
         return view.rows_of(
             &settings.catalog.view(txn, tenant),
             settings.rendering,
+            settings.search_path,
             settings.prepared,
             settings.advisory,
             inner_only,
@@ -453,6 +454,7 @@ impl<'a> Cursor<'a> {
                 view.rows_of(
                     &settings.catalog.view(txn, tenant),
                     settings.rendering,
+                    settings.search_path,
                     settings.prepared,
                     settings.advisory,
                     *only,
@@ -1286,7 +1288,7 @@ fn qualified_for(
     settings: Settings<'_>,
     relation: &crate::catalog::pg_relations::RelationRow,
 ) -> String {
-    if visible_schema(settings, &relation.schema) {
+    if crate::catalog::schema_on_path(settings.search_path, &relation.schema) {
         return relation.name.clone();
     }
     crate::catalog::display_name(&crate::catalog::qualify(&relation.schema, &relation.name))
@@ -1310,22 +1312,10 @@ fn qualified_for(
 /// `create_enum` line above it, built from a different query, stays qualified.
 fn type_qualified_for(settings: Settings<'_>, stored: &str) -> String {
     let (schema, bare) = crate::catalog::split_qualified(stored);
-    if visible_schema(settings, schema) {
+    if crate::catalog::schema_on_path(settings.search_path, schema) {
         return bare.to_owned();
     }
     crate::catalog::display_name(stored)
-}
-
-/// Whether a schema is one this session resolves a bare name in.
-///
-/// An **unknown** path is the default one, on which `public` sits — so a caller with no session
-/// behind it prints an ordinary name bare and a schema-qualified one qualified, which is what
-/// every statement outside a session wants.
-fn visible_schema(settings: Settings<'_>, schema: &str) -> bool {
-    if settings.search_path.is_empty() {
-        return schema == crate::catalog::PUBLIC_SCHEMA;
-    }
-    settings.search_path.iter().any(|on_path| on_path == schema)
 }
 
 pub(super) fn compare_values(keys: &[SortKey], left: &[Datum], right: &[Datum]) -> Ordering {
@@ -4468,18 +4458,25 @@ fn catalog_function(
                 return Ok(Datum::Null);
             };
             let relations = env.relations()?;
-            // **Its argument is a name inside a string**, so `pg_get_serial_sequence('s.t', 'id')`
-            // has to be split the way `::regclass`'s argument is — the table it names may be in
-            // any schema, and looking the whole string up finds nothing.
-            let stored = crate::catalog::parse_qualified(table);
+            // **Its argument is a name inside a string, read the way `::regclass` reads one** —
+            // split on its dot, its quoting undone, and a bare name found **along the search
+            // path**: with `SET search_path = s, public`, `pg_get_serial_sequence('t', 'id')` is
+            // `s.t_id_seq`, measured (#93's capture), where looking the bare name up in `public`
+            // answered `42P01` for a table the statement's own `INSERT` could see. The executor's
+            // rule is the one `'t'::regclass` resolves by, and it raises the same `42P01` for a name
+            // that is nowhere; an evaluator given no rule reads the name as written, which is all
+            // it ever could.
+            let row = match env.settings.names {
+                Some(names) => relations.by_oid(names(table)?),
+                None => relations.by_name(&crate::catalog::parse_qualified(table)),
+            };
             // **A table that is not there RAISES**, and so does a column that is not — measured on
             // 19beta1, `relation "zomg" does not exist` and `column "nosuch" of relation "g1z"
             // does not exist`. Answering NULL for either is what `ActiveRecord` cannot tell from
             // "this column owns no sequence", which is the real NULL: `default_sequence_name`
             // rescues the exception and falls back to `<table>_<pk>_seq`, so a node that never
             // raises never produces the fallback.
-            let Some(def) = relations
-                .by_name(&stored)
+            let Some(def) = row
                 .map(|row| row.table_id)
                 .map(|id| env.hydrated_table(id))
                 .transpose()?
@@ -4506,7 +4503,7 @@ fn catalog_function(
                 // there, and the qualified text is what goes back out to `setval`.
                 Some(sequence) => Datum::Text(format!(
                     "{}.{}",
-                    crate::catalog::split_qualified(&stored).0,
+                    crate::catalog::split_qualified(&def.name).0,
                     crate::catalog::split_qualified(&sequence.name).1
                 )),
                 None => Datum::Null,

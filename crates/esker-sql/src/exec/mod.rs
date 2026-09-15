@@ -113,6 +113,9 @@ pub struct Executor {
     prepared: Vec<crate::session::PreparedStatement>,
     /// Blocks of sequences this transaction dropped, to forget **if** it commits.
     forget_on_commit: Vec<u64>,
+    /// Sequences this transaction created, to give back **unless** it commits — see
+    /// `Executor::forget_the_created_sequences`.
+    created_sequences: Vec<u64>,
     /// The role this session authenticated as, which `serving_user` sets.
     user: String,
     /// The role `SET SESSION AUTHORIZATION` put it in, or `None` for the one it connected as.
@@ -868,6 +871,7 @@ impl Executor {
             cursors: std::collections::BTreeMap::new(),
             prepared: Vec::new(),
             forget_on_commit: Vec::new(),
+            created_sequences: Vec::new(),
             tenant,
             database: crate::parse::DATABASE_NAME.to_owned(),
             user: crate::parse::DATABASE_NAME.to_owned(),
@@ -1023,6 +1027,7 @@ impl Executor {
         // unreachable until the sweeper takes it, so that one is worth reporting.
         if let Some(txn) = self.open.take() {
             let _ = txn.rollback();
+            self.forget_the_created_sequences(0);
         }
         let Some(schema) = self.temp_schema.take() else {
             return Ok(());
@@ -1068,6 +1073,7 @@ impl Executor {
                 // is the machinery an explicit `SAVEPOINT` already uses, under a name no user can
                 // type — an unquoted identifier cannot contain a space.
                 for attempt in 0..=MAX_STATEMENT_RESTARTS {
+                    let sequences_at = self.created_sequences.len();
                     // **A statement-level snapshot, which is what READ COMMITTED *is*.** Measured:
                     // two `SELECT`s in one transaction across another's commit answer `10` then
                     // `99` under READ COMMITTED and `10` then `10` under REPEATABLE READ. It also
@@ -1097,6 +1103,9 @@ impl Executor {
                         // back to what it was before this statement, which is what a re-read needs
                         // and what a savepoint's value-restore would have shadowed.
                         Err(SqlError::StatementMustRestart) if attempt < MAX_STATEMENT_RESTARTS => {
+                            // The undo gave back the ids this attempt took, and the re-run takes
+                            // them again, so what they were lent goes now.
+                            self.forget_the_created_sequences(sequences_at);
                             // **A cancelled statement is not re-run.** The restart is this node's
                             // own machinery — nobody asked for it — so retrying one that has been
                             // told to stop is a cancel that never lands, however many times the
@@ -1149,6 +1158,7 @@ impl Executor {
                 Ok(outcome) => {
                     break match self.checked_and_committed(txn, &written) {
                         Ok(()) => {
+                            self.created_sequences.clear();
                             // After the commit, and only after it.
                             self.report_columnar();
                             // **And the concurrent build after that**, because a job step is a
@@ -1158,12 +1168,16 @@ impl Executor {
                             // what a real server does (`crate::exec::ddl`).
                             ddl::finish_concurrent_build(self).and(Ok(outcome))
                         }
-                        Err(error) => Err(error),
+                        Err(error) => {
+                            self.forget_the_created_sequences(0);
+                            Err(error)
+                        }
                     };
                 }
                 Err(SqlError::StatementMustRestart) if attempt < MAX_STATEMENT_RESTARTS => {
                     attempt += 1;
                     let _ = txn.rollback();
+                    self.forget_the_created_sequences(0);
                     txn = self.open_txn()?;
                     self.catalog_written = false;
                     self.forget_the_catalog_version();
@@ -1175,6 +1189,7 @@ impl Executor {
                     // The rollback's own failure is not what the client asked about; the
                     // statement's error is. Reporting the second would hide the first.
                     let _ = txn.rollback();
+                    self.forget_the_created_sequences(0);
                     // A statement that restarted this many times is waiting behind a queue that
                     // keeps refilling, which is a livelock rather than a wait — and the signal is
                     // never what a client is told.
@@ -2590,11 +2605,74 @@ impl Executor {
     /// on — `1, 33, 65, 97 …`, one `sequence_id` for the whole file, which is what run 88's
     /// instrumented pass recorded from inside the allocator.
     ///
-    /// Deferring costs nothing when the drop does commit: a relation id is never reused
-    /// (`catalog::allocate_id`), so a block belonging to a dropped sequence is unreachable either
-    /// way and forgetting it is only about the memory it holds.
+    /// Deferring costs nothing when the drop does commit: a dropped sequence's creation committed,
+    /// so its id is never taken again (`catalog::allocate_id`) and a block belonging to it is
+    /// unreachable either way — forgetting it is only about the memory it holds. A creation that
+    /// does **not** commit gives its id back, and that is the other half of this pair:
+    /// `Executor::forget_the_created_sequences`.
     pub(super) fn forget_sequence_block_on_commit(&mut self, sequence_id: u64) {
         self.forget_on_commit.push(sequence_id);
+    }
+
+    /// Records a sequence this transaction created, which a rollback gives back — see
+    /// `Executor::forget_the_created_sequences`.
+    pub(super) fn created_sequence(&mut self, sequence_id: u64) {
+        self.created_sequences.push(sequence_id);
+    }
+
+    /// Gives back what the sequences created after the first `since` were lent, because what
+    /// created them — the transaction, a savepoint or a statement — is not committing.
+    ///
+    /// **A rolled-back creation gives its id back**: `catalog::allocate_id` is a counter in the
+    /// creating transaction, so the next `CREATE` takes the same id. A sequence's reserved block and
+    /// its stored counter are keyed by that id and are not transactional — the counter is advanced
+    /// in a transaction of its own, which is what makes `nextval` non-transactional — so both
+    /// outlived the rollback, and a sequence made on the reused id carried on from the rolled-back
+    /// one's numbers: `3` after two, where PostgreSQL starts again at `1`, with a `currval` for a
+    /// sequence this session had never drawn from (debt #94, `tests/sequence_after_rollback.rs`).
+    /// So all three go with the id: the node's block, this session's `currval`, and the counter,
+    /// deleted in a transaction of its own because that is where it was written.
+    ///
+    /// **Nothing else can be holding them.** A sequence no transaction has committed is visible to
+    /// the session that made it and to nobody else, and that session draws on this node. A node
+    /// that dies inside the transaction never gets here, and what it leaves is the counter alone:
+    /// its block died with it, so the next sequence on the id starts past the numbers drawn — a
+    /// gap, and never a number handed out twice.
+    fn forget_the_created_sequences(&mut self, since: usize) {
+        if self.created_sequences.len() <= since {
+            return;
+        }
+        let rolled_back = self.created_sequences.split_off(since);
+        for &sequence_id in &rolled_back {
+            self.forget_sequence_block(sequence_id);
+        }
+        // Best effort, like the rollback it follows: the statement already has its answer, and a
+        // counter left behind costs the next sequence on the id a gap rather than a wrong number.
+        if let Err(error) = self.delete_sequence_counters(&rolled_back) {
+            tracing::warn!(
+                %error,
+                pid = self.identity.pid,
+                sequences = ?rolled_back,
+                "a rolled-back sequence kept its counter; the next sequence on its id starts past it"
+            );
+        }
+    }
+
+    /// The counters of sequences whose creation was rolled back, deleted in a transaction of their
+    /// own — which writes nothing when none of them was drawn from.
+    fn delete_sequence_counters(&self, sequence_ids: &[u64]) -> Result<()> {
+        let mut txn = self.begin_txn()?;
+        let mut deleted = false;
+        for &sequence_id in sequence_ids {
+            deleted |=
+                crate::catalog::delete_sequence_counter(&mut *txn, self.tenant, sequence_id)?;
+        }
+        if deleted {
+            txn.commit()?;
+        } else {
+            let _ = txn.rollback();
+        }
+        Ok(())
     }
 
     /// Applies the deferred forgets — which both commit paths do and neither rollback path does.
@@ -2616,9 +2694,9 @@ impl Executor {
     ///
     /// For `tests/real_backend.rs`, which asserts that a dropped table's sequence takes its block
     /// with it: a connection that creates and drops tables for its whole life would otherwise
-    /// collect one entry per drop. It cannot hand out a wrong value — a relation id is never
-    /// reused, so a re-created sequence is a different sequence — which is why the leak needs a
-    /// count to be visible at all.
+    /// collect one entry per drop. It cannot hand out a wrong value — a dropped sequence's creation
+    /// committed, so its id is never taken again and a re-created sequence is a different sequence
+    /// — which is why the leak needs a count to be visible at all.
     #[must_use]
     pub fn held_sequence_blocks(&self) -> usize {
         self.sequences.held_for(self.tenant)
@@ -4977,6 +5055,7 @@ impl Execute for Executor {
             reads,
             self.authorization.clone(),
             self.parameters.clone(),
+            self.created_sequences.len(),
         );
         Ok(())
     }
@@ -4994,11 +5073,13 @@ impl Execute for Executor {
         self.open = Some(txn);
         // The parameters go back with the writes: a `SET` inside the savepoint is undone too.
         // Only on success — a `3B001` rolled nothing back and must change nothing.
-        let (parameters, authorization) = result?;
+        let (parameters, authorization, sequences_at) = result?;
         self.parameters = parameters;
         // The session authorization goes back with them: a `SET LOCAL SESSION AUTHORIZATION`
         // inside the mark is undone by a `ROLLBACK TO`, as every other `SET` in there is.
         self.authorization = authorization;
+        // And the sequences made since the mark, whose ids the undo has just given back.
+        self.forget_the_created_sequences(sequences_at);
         Ok(())
     }
 
@@ -5047,6 +5128,8 @@ impl Execute for Executor {
         };
         match txn.commit() {
             Ok(_) => {
+                // What the block created is kept, so there is nothing left to give back.
+                self.created_sequences.clear();
                 // The block's commit is where an `ALTER` inside one becomes visible, so it is
                 // where the report belongs.
                 self.report_columnar();
@@ -5054,7 +5137,11 @@ impl Execute for Executor {
             }
             // The same translation the autocommit path does. A block's commit is where a client
             // that wrote several rows finds out it lost, and it deserves the same answer.
-            Err(error) => Err(self.explain_conflict(error, &written)),
+            Err(error) => {
+                // A commit that failed rolled the block back, and gave its ids back with it.
+                self.forget_the_created_sequences(0);
+                Err(self.explain_conflict(error, &written))
+            }
         }
     }
 
@@ -5078,7 +5165,10 @@ impl Execute for Executor {
         let Some(txn) = self.open.take() else {
             return Ok(());
         };
-        txn.rollback()
+        let rolled_back = txn.rollback();
+        // After the rollback, which is what gives the ids back.
+        self.forget_the_created_sequences(0);
+        rolled_back
     }
 }
 
