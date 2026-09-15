@@ -963,7 +963,7 @@ pub const SEQUENCE_RELATION_ID_BASE: u64 = u64::MAX - 1_048_576;
 /// implementation detail of *its* crash safety, which this node reaches differently — and it
 /// reports **0**, which is what a freshly written sequence shows there too.
 #[must_use]
-pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
+pub fn sequence_relation_def(name: &str, sequence: &SequenceDef) -> Arc<TableDef> {
     let column = |name: &str, ty: ColumnType| ColumnDef {
         collation: None,
         name: name.to_owned(),
@@ -982,9 +982,18 @@ pub fn sequence_relation_def(name: &str, sequence_id: u64) -> Arc<TableDef> {
     Arc::new(TableDef {
         matview: None,
         on_commit: OnCommit::default(),
-        // Synthetic — a sequence read as a three-column relation, with nothing derived.
-        hydrated: Some(Hydrated::default()),
-        id: SEQUENCE_RELATION_ID_BASE.wrapping_add(sequence_id),
+        // Synthetic — a sequence read as a three-column relation. Its one derived sequence is the
+        // sequence itself, filling no column: that is how the planner learns the `START` a
+        // sequence with no counter reports (#97).
+        hydrated: Some(Hydrated {
+            sequences: vec![SequenceDef {
+                column: None,
+                owner_column: None,
+                ..sequence.clone()
+            }],
+            ..Hydrated::default()
+        }),
+        id: SEQUENCE_RELATION_ID_BASE.wrapping_add(sequence.id),
         name: name.to_owned(),
         columns: vec![
             column("last_value", ColumnType::Int8),
@@ -3091,8 +3100,13 @@ impl<'a> View<'a> {
         // the relation *is* the sequence — there is no table behind it. The def carries the
         // sequence's id in its own so that the planner can read the counter rather than seek a key
         // range that does not exist (`sequence_relation_def`).
-        if let Some(Relation::Sequence { sequence_id, .. }) = self.relation(name)? {
-            return Ok(sequence_relation_def(name, sequence_id));
+        if let Some(Relation::Sequence {
+            table_id,
+            sequence_id,
+        }) = self.relation(name)?
+            && let Some(sequence) = sequence_by_id(self.txn, self.tenant, table_id, sequence_id)?
+        {
+            return Ok(sequence_relation_def(name, &sequence));
         }
         Err(SqlError::UndefinedTable(name.to_owned()))
     }
@@ -3311,7 +3325,7 @@ pub fn replace_table(
         {
             txn.delete(&record::sequence_key(tenant, previous.id, sequence.id));
             txn.delete(&record::name_key(tenant, &sequence.name));
-            txn.delete(&record::sequence_value_key(tenant, sequence.id));
+            // Not its counter, which a drop leaves behind (`drop_sequence`, #97).
         }
     }
     // **And the table's own name**, which `ALTER TABLE … RENAME TO` changes. Same rule, same
@@ -4867,7 +4881,14 @@ pub fn table_sequences(txn: &dyn Txn, tenant: u64, table_id: u64) -> Result<Vec<
     Ok(out)
 }
 
-/// Removes **one** sequence: its record, its name and its counter.
+/// Removes **one** sequence: its record and its name — **not its counter** (#97).
+///
+/// The counter is the one key a sequence has that transactions of their own write — `nextval`
+/// reserves in one and commits at once — so deleting it here, in the statement's transaction, is a
+/// write to a key another transaction may have written since this one's snapshot, and a
+/// `REPEATABLE READ` block that drew and then dropped was refused at `COMMIT` where PostgreSQL
+/// commits. It is left behind for the reason [`drop_table`] leaves the row-id allocator's key: a
+/// dropped sequence's creation committed, so its id is never taken again and nothing reads the key.
 ///
 /// The column's default goes with it and nothing else does, because the default *is* the sequence
 /// — `pg_attrdef` reports one for a column that owns a `nextval` and nothing for a column that
@@ -4882,7 +4903,6 @@ pub fn drop_sequence(
 ) -> Result<()> {
     txn.delete(&record::sequence_key(tenant, table_id, sequence.id));
     txn.delete(&record::name_key(tenant, &sequence.name));
-    txn.delete(&record::sequence_value_key(tenant, sequence.id));
     // **A name record was just deleted**, so every reader holding this tenant's relations is
     // holding one that has it. A sequence a column owns is followed by `replace_table`, which
     // bumps; a **standalone** one was followed by nothing, and its name stayed resolvable in the
@@ -4916,12 +4936,12 @@ pub fn delete_sequence_counter(txn: &mut dyn Txn, tenant: u64, sequence_id: u64)
     Ok(true)
 }
 
-/// Removes one table's sequences: their records, their names and their counters.
+/// Removes one table's sequences: their records and their names, and **not their counters** — see
+/// [`drop_sequence`].
 fn drop_sequences(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()> {
     for sequence in &table.derived()?.sequences {
         txn.delete(&record::sequence_key(tenant, table.id, sequence.id));
         txn.delete(&record::name_key(tenant, &sequence.name));
-        txn.delete(&record::sequence_value_key(tenant, sequence.id));
     }
     Ok(())
 }
@@ -4933,17 +4953,23 @@ fn drop_sequences(txn: &mut dyn Txn, tenant: u64, table: &TableDef) -> Result<()
 /// [`SEQUENCE_BATCH`] rather than merely tolerated. Called in a transaction of its own, which is
 /// also what makes `nextval` **non-transactional**: a rolled-back `INSERT` has still consumed its
 /// value, here as there, measured on both.
+///
+/// `start` is the sequence's `START`, which is where a sequence with **no counter** begins: nothing
+/// writes one until something draws or sets it — not `CREATE SEQUENCE`, whose transaction must not
+/// write a key this function's transaction writes (#97) — and a restart deletes it.
 pub fn allocate_sequence_values(
     txn: &mut dyn Txn,
     tenant: u64,
     sequence_id: u64,
+    start: i64,
     count: u64,
 ) -> Result<i64> {
     let key = record::sequence_value_key(tenant, sequence_id);
     let next = match txn.get(&key)? {
         Some(bytes) => record::decode_sequence_counter(&bytes)?.0,
-        // A sequence starts at 1, which is PostgreSQL's `START WITH` default.
-        None => 1,
+        // A `START` below zero is refused at `CREATE SEQUENCE`, so this cannot fail on a sequence
+        // this node made; it is an error rather than a wrap if a record ever says otherwise.
+        None => u64::try_from(start).map_err(|_| SqlError::BigintOutOfRange)?,
     };
     let after = next.checked_add(count).ok_or(SqlError::BigintOutOfRange)?;
     // Handing a value out is what `is_called` means, so it is true from here on whatever it was.
@@ -4977,11 +5003,19 @@ pub fn set_sequence_value(
 /// counter itself. That is the whole of the difference between `setval(s, 5, true)` and
 /// `setval(s, 5, false)` — the first reports 5 and hands out 6, the second reports 5 and hands out
 /// 5 — and it is why the flag is stored rather than derived.
-pub fn sequence_state(txn: &dyn Txn, tenant: u64, sequence_id: u64) -> Result<(i64, bool)> {
+///
+/// A sequence with **no counter** has handed nothing out, and reports its `START` with `is_called`
+/// false — measured, `7 | f` for `START 7` in the transaction that made it (#97).
+pub fn sequence_state(
+    txn: &dyn Txn,
+    tenant: u64,
+    sequence_id: u64,
+    start: i64,
+) -> Result<(i64, bool)> {
     let key = record::sequence_value_key(tenant, sequence_id);
     let (next, is_called) = match txn.get(&key)? {
         Some(bytes) => record::decode_sequence_counter(&bytes)?,
-        None => (1, false),
+        None => return Ok((start, false)),
     };
     let last = if is_called {
         next.saturating_sub(1)

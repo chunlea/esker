@@ -2926,8 +2926,20 @@ fn access_path(filter: Option<(&Expr, &str)>, tenant: u64, table: &TableDef) -> 
     }
     // A sequence's relation has no rows of its own: its one row is the counter, read at open.
     if let Some(sequence_id) = crate::catalog::sequence_of_relation(table.id) {
+        // The relation's one derived sequence is the sequence itself
+        // (`crate::catalog::sequence_relation_def`), and its `START` is what a read of a sequence
+        // with no counter answers.
+        let start = table
+            .derived()?
+            .sequences
+            .first()
+            .ok_or_else(|| {
+                SqlError::Internal("a sequence relation arrived without its sequence".to_owned())
+            })?
+            .start;
         return Ok(Node::SequenceRead {
             sequence_id,
+            start,
             state: None,
             columns,
         });

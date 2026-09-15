@@ -789,7 +789,7 @@ fn fill_sequences(
         // constant that far out gets, which is what a real server answers when a `serial` runs out.
         row[fills] = sequence_datum(
             table.columns[fills].ty,
-            executor.next_sequence_value(sequence.id)?,
+            executor.next_sequence_value(sequence)?,
         )?;
     }
     Ok(())
@@ -1174,7 +1174,7 @@ fn assigned_value(
         crate::plan::Expr::Default => match at.table.sequence_for(at.ordinal) {
             Some(sequence) => sequence_datum(
                 at.table.columns[at.ordinal].ty,
-                at.executor.next_sequence_value(sequence.id)?,
+                at.executor.next_sequence_value(sequence)?,
             ),
             None => column_default_value(at.table, at.column, at.txn, at.executor.tenant),
         }

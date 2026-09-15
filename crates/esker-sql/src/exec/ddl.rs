@@ -2505,6 +2505,8 @@ pub(super) fn create_sequence(
         }
         None => None,
     };
+    // A negative `START` is refused by name before anything is written (`sequence_start`).
+    sequence_start(create.start)?;
     let sequence = catalog::SequenceDef {
         id: catalog::allocate_id(txn, executor.tenant)?,
         name: create.name.clone(),
@@ -2522,18 +2524,14 @@ pub(super) fn create_sequence(
     };
     catalog::create_sequence(txn, executor.tenant, &sequence)?;
     executor.created_sequence(sequence.id);
-    // The counter starts **at** the start value, because `START n` hands out `n` first — measured,
-    // `START 101` answers `101` and then `102`. Storing `n - 1` and stepping would be one short
-    // for every sequence anyone gave a `START`.
-    catalog::set_sequence_value(
-        txn,
-        executor.tenant,
-        sequence.id,
-        sequence_start(create.start)?,
-        // Nothing has been handed out yet, which is what a fresh sequence reports: `last_value` is
-        // the start value and `is_called` is false, so the first `nextval` answers the start.
-        false,
-    );
+    // **No counter is written here** (#97). The counter is the key `nextval`, `setval` and
+    // `TRUNCATE … RESTART IDENTITY` write in transactions of their own, and writing it in this
+    // statement's transaction as well gave it writers on both sides of the snapshot: a `nextval`
+    // later in the same transaction could not see the `START` and began at `1`, and its commit
+    // moved the key under this transaction, which was then refused at `COMMIT` — `40001`, where
+    // PostgreSQL answers `7` and commits. With no counter, the record's `START` is the answer: a
+    // sequence nothing has drawn from hands it out first and reports it
+    // (`catalog::allocate_sequence_values`, `catalog::sequence_state`).
     if let Some((table, _)) = owner {
         // The owning table's cached definition now has one more sequence in it.
         let mut updated = (*table).clone();
@@ -2644,7 +2642,7 @@ pub(super) fn drop_sequence(
         // drop is invisible: a `TableDef` is cached per node and keyed by this version, the
         // sequence records live beside the table rather than in it, and deleting them left every
         // reader still holding a definition that says the column has a sequence. The next `INSERT`
-        // then filled the column from a counter that had been dropped — reported success, and the
+        // then filled the column from a sequence that had been dropped — reported success, and the
         // corpus caught it on the `23502` that should have followed.
         let mut updated = (*table).clone();
         updated.schema_version += 1;

@@ -25,15 +25,7 @@ mod parity;
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[(
-        "SELECT 'r', nextval('s2f_w'), nextval('s2f_w')",
-        "`START` in the transaction that made the sequence: `1` and `2`, where PostgreSQL answers \
-         `101` and `102`. `CREATE SEQUENCE` writes its counter in the statement's transaction and \
-         `nextval` reserves in a transaction of its own, which cannot see that write; once it has \
-         drawn, the creating transaction cannot commit either. No rollback is involved, so it is \
-         not what this file measures — a finding of its own, reported with #94",
-        "pg19_sequence_after_rollback.txt:75",
-    )],
+    answers: &[],
 };
 
 #[test]

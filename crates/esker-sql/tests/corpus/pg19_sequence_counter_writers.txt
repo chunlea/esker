@@ -1,0 +1,88 @@
+# A sequence's counter and the transactions that write it — debt #97 — as a real PostgreSQL 19beta1 answers it.
+#
+# Captured 2026-09-13 and 2026-09-15 by lane s2-plpgsql with `sesscap.py`: `esker-coord/s2-f94d.stmts` (a sequence
+# with a `START` made and drawn from in the transaction that commits it; a `REPEATABLE READ` block that makes a serial,
+# draws, drops the table and commits) and `s2-g97.stmts` (`last_value` in the creating transaction; `REPEATABLE READ`
+# blocks that draw and then drop the sequence or the column that owns it; `TRUNCATE … RESTART IDENTITY` on a sequence
+# with a `START`; a `DO` block that makes and draws; a committed drop followed by a sequence of the same name; a
+# rolled-back drop). What commits is dropped by the capture itself; the last line of each proves nothing was left.
+#
+#!escaped
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`START` holds in the transaction that made the sequence, before anything is drawn and after**: `last_value` is
+#     `7` with `is_called` false, and `nextval` answers `7` and then `8`.
+#   * **A transaction that makes a sequence and draws from it commits**, and the next value carries on — `7`, `COMMIT`,
+#     `8` — in a block and in a `DO` block alike.
+#   * **A `REPEATABLE READ` block that draws and then drops what it drew from commits**, whether it drops the sequence,
+#     the table that owns it, or the column.
+#   * **`TRUNCATE … RESTART IDENTITY` goes back to the sequence's `START`**: `50`, not `1`.
+#   * **A dropped sequence's numbers go with it** — one made again under the same name starts at `1` — **and a
+#     rolled-back drop keeps them**: the next is `2`.
+#
+BEGIN		-
+CREATE SEQUENCE s2f_c START 7		-
+SELECT 'r', nextval('s2f_c')		r|7
+COMMIT		-
+SELECT 'r', nextval('s2f_c')		r|8
+DROP SEQUENCE s2f_c		-
+BEGIN ISOLATION LEVEL REPEATABLE READ		-
+CREATE TABLE s2f_rr (id serial, v text)		-
+INSERT INTO s2f_rr (v) VALUES ('x') RETURNING id		1
+DROP TABLE s2f_rr		-
+COMMIT		-
+SELECT count(*) FROM pg_class WHERE relname IN ('s2f_c', 's2f_rr', 's2f_rr_id_seq')	bigint	0
+# last_value in the creating transaction, REPEATABLE READ drops, RESTART IDENTITY, DO, and drops made again or rolled back
+BEGIN		-
+CREATE SEQUENCE s2g_a START 7		-
+SELECT 'r', last_value, is_called FROM s2g_a		r|7|f
+SELECT 'r', nextval('s2g_a'), nextval('s2g_a')		r|7|8
+SELECT 'r', last_value, is_called FROM s2g_a		r|8|t
+ROLLBACK		-
+BEGIN ISOLATION LEVEL REPEATABLE READ		-
+CREATE SEQUENCE s2g_b		-
+SELECT 'r', nextval('s2g_b')		r|1
+DROP SEQUENCE s2g_b		-
+COMMIT		-
+BEGIN ISOLATION LEVEL REPEATABLE READ		-
+CREATE TABLE s2g_c (id serial, v text)		-
+INSERT INTO s2g_c (v) VALUES ('x') RETURNING id		1
+ALTER TABLE s2g_c DROP COLUMN id		-
+COMMIT		-
+DROP TABLE s2g_c		-
+BEGIN		-
+CREATE TABLE s2g_d (id int, v text)		-
+CREATE SEQUENCE s2g_d_seq START 50 OWNED BY s2g_d.id		-
+ALTER TABLE s2g_d ALTER COLUMN id SET DEFAULT nextval('s2g_d_seq')		-
+INSERT INTO s2g_d (v) VALUES ('a'), ('b') RETURNING id		50 ; 51
+TRUNCATE s2g_d RESTART IDENTITY		-
+INSERT INTO s2g_d (v) VALUES ('c') RETURNING id		50
+ROLLBACK		-
+DO $$ DECLARE n bigint; BEGIN CREATE SEQUENCE s2g_e START 5; n := nextval('s2g_e'); END $$		-
+SELECT 'r', nextval('s2g_e')		r|6
+DROP SEQUENCE s2g_e		-
+BEGIN		-
+CREATE SEQUENCE s2g_f START 3		-
+SELECT 'r', nextval('s2g_f')		r|3
+COMMIT		-
+SELECT 'r', nextval('s2g_f'), last_value, is_called FROM s2g_f		r|4|3|t
+DROP SEQUENCE s2g_f		-
+CREATE SEQUENCE s2g_g		-
+SELECT 'r', nextval('s2g_g'), nextval('s2g_g')		r|1|2
+DROP SEQUENCE s2g_g		-
+CREATE SEQUENCE s2g_g		-
+SELECT 'r', nextval('s2g_g')		r|1
+DROP SEQUENCE s2g_g		-
+CREATE SEQUENCE s2g_h		-
+SELECT 'r', nextval('s2g_h')		r|1
+BEGIN		-
+DROP SEQUENCE s2g_h		-
+ROLLBACK		-
+SELECT 'r', nextval('s2g_h')		r|2
+DROP SEQUENCE s2g_h		-
+SELECT count(*) FROM pg_class WHERE relname IN ('s2g_a', 's2g_b', 's2g_c', 's2g_c_id_seq', 's2g_d', 's2g_d_seq', 's2g_e', 's2g_f', 's2g_g', 's2g_h')	bigint	0

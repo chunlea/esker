@@ -2157,7 +2157,7 @@ impl Executor {
             let name = call.name.as_deref().unwrap_or_default();
             let sequence = self.require_sequence(txn, name)?;
             return match call.func {
-                SequenceFunc::NextVal => self.next_sequence_value(sequence.id),
+                SequenceFunc::NextVal => self.next_sequence_value(&sequence),
                 SequenceFunc::CurrVal => self
                     .currval_defined
                     .contains(&sequence.id)
@@ -2276,8 +2276,11 @@ impl Executor {
         }
         let txn = self.begin_txn()?;
         let mut states = std::collections::BTreeMap::new();
-        for id in ids {
-            states.insert(id, crate::catalog::sequence_state(&*txn, self.tenant, id)?);
+        for (id, start) in ids {
+            states.insert(
+                id,
+                crate::catalog::sequence_state(&*txn, self.tenant, id, start)?,
+            );
         }
         let _ = txn.rollback();
         fill_sequence_reads_in(node, &states);
@@ -2719,7 +2722,8 @@ impl Executor {
     }
 
     /// has with exactly this behaviour, and neither server offers gap-freeness.
-    fn next_sequence_value(&mut self, sequence_id: u64) -> Result<i64> {
+    fn next_sequence_value(&mut self, sequence: &crate::catalog::SequenceDef) -> Result<i64> {
+        let (sequence_id, start) = (sequence.id, sequence.start);
         let backend = Arc::clone(&self.backend);
         let tenant = self.tenant;
         let value =
@@ -2730,6 +2734,7 @@ impl Executor {
                         &mut *txn,
                         tenant,
                         sequence_id,
+                        start,
                         crate::catalog::SEQUENCE_BATCH,
                     ) {
                         Ok(first) => {
@@ -4568,10 +4573,13 @@ fn has_sequence_call(expr: &crate::plan::Expr) -> bool {
     found
 }
 
-/// Every sequence a plan reads, so their values can be taken in one transaction.
-fn collect_sequence_reads(node: &mut crate::plan::Node, into: &mut Vec<u64>) {
-    if let crate::plan::Node::SequenceRead { sequence_id, .. } = node {
-        into.push(*sequence_id);
+/// Every sequence a plan reads, with its `START`, so their values can be taken in one transaction.
+fn collect_sequence_reads(node: &mut crate::plan::Node, into: &mut Vec<(u64, i64)>) {
+    if let crate::plan::Node::SequenceRead {
+        sequence_id, start, ..
+    } = node
+    {
+        into.push((*sequence_id, *start));
     }
     for child in node.children_mut() {
         collect_sequence_reads(child, into);

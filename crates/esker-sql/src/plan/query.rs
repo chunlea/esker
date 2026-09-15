@@ -588,6 +588,8 @@ pub enum Node {
     SequenceRead {
         /// Which sequence's counter to read.
         sequence_id: u64,
+        /// The sequence's `START`, which is what it reports while it has no counter (#97).
+        start: i64,
         /// `(last_value, is_called)`, filled by the executor **outside the statement's
         /// transaction**.
         ///
