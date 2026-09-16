@@ -1,0 +1,19 @@
+docs/adr/0116-a-single-node-oracle-needs-a-physical-half.md
+  s_dc640bf0df4adb::t_4a3e714cec28df 58,60-70,75-81,108-112,127
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "572cfb97445561dce5ad42b9b3d63f8b030649e1",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
