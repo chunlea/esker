@@ -3157,7 +3157,6 @@ fn spawn_planter(
     first_id: i64,
     ttl_ms: u64,
     commit_primary: bool,
-    every: Duration,
     planting: &Arc<AtomicBool>,
     planted: &Arc<std::sync::Mutex<Vec<u64>>>,
 ) -> std::thread::JoinHandle<()> {
@@ -3183,7 +3182,10 @@ fn spawn_planter(
                 seen.push(start_ts);
             }
             next_id += 2;
-            std::thread::sleep(every);
+            // **Half a lease between plantings**, derived rather than passed: the interval is only
+            // ever meaningful against the lease it is planting, and a caller free to choose both
+            // could set an interval longer than the lease and quietly plant one lock at a time.
+            std::thread::sleep(Duration::from_millis(ttl_ms / 2));
         }
     })
 }
@@ -4070,13 +4072,12 @@ async fn what_share_of_met_locks_are_already_finished() {
     // is what changes — nothing about what is being measured moves.
     let planting = Arc::new(AtomicBool::new(true));
     let planted = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let planter = spawn_planter(
+    let planting_thread = spawn_planter(
         &gate,
         table_id,
         RATIO_ROWS + 1,
         STRANDED_TTL_MS,
         true,
-        Duration::from_millis(STRANDED_TTL_MS / 2),
         &planting,
         &planted,
     );
@@ -4096,7 +4097,7 @@ async fn what_share_of_met_locks_are_already_finished() {
             &mut met_at,
         );
         planting.store(false, Ordering::Relaxed);
-        let seen = planted.lock().map(|seen| seen.clone()).unwrap_or_default();
+        let seen = planted.lock().map_or_else(|_| Vec::new(), |s| s.clone());
         classify_planted(
             &gate,
             "t",
@@ -4107,11 +4108,9 @@ async fn what_share_of_met_locks_are_already_finished() {
             met_at.as_deref().unwrap_or(&[]),
         );
     });
-    planter.join().expect("the planting thread ends");
-    println!(
-        "  stranded arm planted {} pairs",
-        planted.lock().map(|seen| seen.len()).unwrap_or(0)
-    );
+    let pairs = planted.lock().map_or(0, |seen| seen.len());
+    planting_thread.join().expect("the planting thread ends");
+    println!("  stranded arm planted {pairs} pairs");
     print_verdicts("stranded", &stranded);
 
     // **The control.** A long lease and no commit at all, read well inside it.
