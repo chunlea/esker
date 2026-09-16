@@ -4547,25 +4547,6 @@ fn resolve_case(
         .chain(resolved.iter().map(|branch| &branch.then))
         .filter_map(|expr| branch_type(expr, scope))
         .collect();
-    // **The identity the storage cannot carry, asked before the storage is** (#81): an enum's
-    // branches settle on the enum, an `unknown` among them is read as one of its labels, and a
-    // branch of another enum or another category is the refusal `unify_user_type` writes with this
-    // construct's word.
-    //
-    // **First, because an enum is an `int2` in the row.** With [`common_of`] ahead of it the
-    // storage pass refused the pair on its own and its `?` won, so an enum beside a `text` was
-    // `CASE types text and smallint` — naming the ordinal's type, which is the one thing a client
-    // is never told about an enum (ADR 0050). 19beta1 says `CASE types text and h_mood`, measured.
-    // `GREATEST` and `LEAST` ask in this order against their own gate for the same reason.
-    let user = settled_branch_user_type(
-        otherwise
-            .iter()
-            .map(AsRef::as_ref)
-            .chain(resolved.iter().map(|branch| &branch.then)),
-        Unifying::Case,
-        scope,
-    )?;
-    let enum_def = user.filter(is_enum_def);
     // **`select_common_type` over the results, the `ELSE` first**, which is [`common_of`] and is
     // the same function a `COALESCE` and a set operation ask.
     //
@@ -4576,12 +4557,23 @@ fn resolve_case(
     // one category with no cast between them got the `42804` that belongs to two categories.
     // What it got right is the order: the `ELSE` is the head of the list, which is why
     // `THEN id ELSE name` is `CASE types text and bigint`.
-    // **Skipped when the branches settled on an enum**, whose storage they all already share.
-    let common = if enum_def.is_some() || types.is_empty() {
+    let common = if types.is_empty() {
         None
     } else {
         Some(common_of(&types, Unifying::Case)?)
     };
+    // **And the identity the storage cannot carry** (#81): an enum's branches settle on the enum,
+    // an `unknown` among them is read as one of its labels, and a branch of another enum or
+    // another category is the refusal `unify_user_type` writes with this construct's word.
+    let user = settled_branch_user_type(
+        otherwise
+            .iter()
+            .map(AsRef::as_ref)
+            .chain(resolved.iter().map(|branch| &branch.then)),
+        Unifying::Case,
+        scope,
+    )?;
+    let enum_def = user.filter(is_enum_def);
     if let Some(def) = &enum_def {
         if let Some(expr) = &mut otherwise {
             give_branch_enum(expr, def)?;
@@ -4631,16 +4623,14 @@ fn resolve_coalesce(args: &[Expr], scope: &Scope<'_>) -> Result<Expr> {
         .iter()
         .filter_map(|arg| branch_type(arg, scope))
         .collect();
-    // The same question a `CASE` asks and in the same place — **before** [`common_of`], because
-    // an enum is an `int2` in the row and the storage pass would otherwise refuse the pair first
-    // and name that `smallint` (#81). With this construct's word in the refusals.
-    let user = settled_branch_user_type(resolved.iter(), Unifying::Coalesce, scope)?;
-    let enum_def = user.filter(is_enum_def);
-    let common = if enum_def.is_some() || types.is_empty() {
+    let common = if types.is_empty() {
         None
     } else {
         Some(common_of(&types, Unifying::Coalesce)?)
     };
+    // The same second question a `CASE` asks, with this construct's word in the refusals (#81).
+    let user = settled_branch_user_type(resolved.iter(), Unifying::Coalesce, scope)?;
+    let enum_def = user.filter(is_enum_def);
     if let Some(def) = &enum_def {
         for arg in &mut resolved {
             give_branch_enum(arg, def)?;
