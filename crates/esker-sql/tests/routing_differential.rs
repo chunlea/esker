@@ -3937,7 +3937,13 @@ async fn what_an_insert_spends_its_time_on_as_the_table_grows() {
 /// about locks, and every second spent filling is a second not spent meeting them.
 const RATIO_ROWS: i64 = 2_000;
 /// Scans per arm.
-const RATIO_SCANS: usize = 60;
+///
+/// **Twenty, and sixty was the mistake.** With the planter running, every scan meets a lock — the
+/// first run with it measured 60 encounters in 60 scans — so sixty scans took ten minutes, and a
+/// ten-minute arm outlives any lease a fixture is willing to plant: the control's own lock, given
+/// six hundred seconds, was read `expired 17 ms ago`. Twenty scans still clears the floor of twenty
+/// encounters the reading was pre-registered against, and keeps an arm inside its lease.
+const RATIO_SCANS: usize = 20;
 /// The stranded arm's lease, `joint_gate.rs`'s number. Short, because the arm waits it out.
 const STRANDED_TTL_MS: u64 = 300;
 /// The control arm's lease. Long enough that every read in this test lands **inside** it, which is
@@ -4103,7 +4109,12 @@ async fn what_share_of_met_locks_are_already_finished() {
             "t",
             table_id,
             &seen,
-            Duration::from_millis(STRANDED_TTL_MS),
+            // **Shorter than the lease, not longer.** At a gap of a whole lease every planted lock
+            // is guaranteed to be gone or expired by the second look, which is exactly what the
+            // first run produced: `gone` for all of them and no other verdict. A third of a lease
+            // still lets an expired lock be seen as expired, without giving the row path time to
+            // roll every one of them forward first.
+            Duration::from_millis(STRANDED_TTL_MS / 3),
             &mut stranded,
             met_at.as_deref().unwrap_or(&[]),
         );
