@@ -544,6 +544,14 @@ pub(super) struct OutputColumn {
     /// type instead of contributing its `text` to the unification (`debts-v1.1.md` #75). Everywhere
     /// else it is `false` and unread.
     pub(super) unknown: bool,
+    /// The **text** that unknown literal holds, when it holds one: a quoted string does and a bare
+    /// `NULL` does not.
+    ///
+    /// Carried for the one rule that has to *read* the literal rather than retype it — an unknown
+    /// arm beside an enum takes the enum, and reading `'sad'` as a `mood` means looking the label
+    /// up (`debts-v1.1.md` #81). By the time [`append`] unifies the arms they are planned, so the
+    /// literal's own text is gone from everything but this.
+    pub(super) unknown_text: Option<String>,
 }
 
 pub(super) struct Planned {
@@ -674,6 +682,14 @@ pub(super) fn append(
     // still have to be told apart afterwards: an unknown one is *parsed* as the settled type and
     // a typed one has to *reach* it (`debts-v1.1.md` #75).
     let mut arm_unknown = vec![first.columns.iter().map(|c| c.unknown).collect::<Vec<_>>()];
+    // And the text of each unknown literal, which is what an enum's label is looked up from.
+    let mut arm_unknown_text = vec![
+        first
+            .columns
+            .iter()
+            .map(|c| c.unknown_text.clone())
+            .collect::<Vec<_>>(),
+    ];
     let mut nodes = vec![first.node];
     for arm in arms {
         if arm.columns.len() != columns.len() {
@@ -690,23 +706,20 @@ pub(super) fn append(
             //
             // When *every* arm is unknown the column stays unknown and stays `text`, which is
             // 19beta1's answer for `SELECT NULL UNION ALL SELECT NULL` and already this node's.
-            // **Not where a user-defined type is on either side**, and that is a boundary rather
-            // than an oversight. Reading `'sad'` as a `mood` means looking its label up in the
-            // catalog, and this function has no view — a set operation's arms are already planned
-            // by the time they get here. So `SELECT m FROM t UNION SELECT 'sad'` keeps the
-            // `42804` this node writes, where 19beta1 answers the labels; it is pinned as a
-            // divergence in `tests/set_operation_enum.rs` with that answer beside it, and it is
-            // #75's remaining half rather than a second row.
-            let typed_name = columns[at].user_type.is_some() || column.user_type.is_some();
-            match (
-                columns[at].unknown && !typed_name,
-                column.unknown && !typed_name,
-            ) {
+            //
+            // **An enum is no exception** (`debts-v1.1.md` #81). It was one while reading `'sad'`
+            // as a `mood` meant a catalog view this function does not have — the arms are planned
+            // by the time they get here — so `SELECT m FROM t UNION SELECT 'sad'` was the `42804`
+            // this node wrote where 19beta1 answers the labels. The label is looked up below, from
+            // the `TypeDef` the *other* arm carries: the identity is already in this function, and
+            // the text of the literal travels beside it (`OutputColumn::unknown_text`).
+            match (columns[at].unknown, column.unknown) {
                 (true, false) => {
                     columns[at].ty = column.ty;
                     columns[at].typmod = column.typmod;
                     columns[at].user_type.clone_from(&column.user_type);
                     columns[at].unknown = false;
+                    columns[at].unknown_text = None;
                     continue;
                 }
                 (false, true) => continue,
@@ -722,6 +735,7 @@ pub(super) fn append(
                 column.user_type.as_ref(),
                 columns[at].ty,
                 column.ty,
+                Unifying::SetOperation,
             )?;
             // **The same `select_common_type` a `COALESCE` and a `CASE` ask** — this path had
             // both of its passes and the right two sentences first, and `common_of` is that rule
@@ -735,8 +749,12 @@ pub(super) fn append(
         }
         arm_types.push(arm.columns.iter().map(|c| c.ty).collect());
         arm_unknown.push(arm.columns.iter().map(|c| c.unknown).collect());
+        arm_unknown_text.push(arm.columns.iter().map(|c| c.unknown_text.clone()).collect());
         nodes.push(arm.node);
     }
+    // **An unknown arm beside an enum is read as one of its labels** (#81), resolved here because
+    // this is where the set's `user_type` says which enum, and projected below.
+    let constants = unknown_arms_as_labels(&columns, &arm_types, &arm_unknown, &arm_unknown_text)?;
     // **Every arm has to reach the type the set settled on, by an implicit cast**: agreeing on a
     // category is not enough. `money` beside `numeric` is one category with no implicit cast either
     // way, which a real server refuses as `42846 UNION could not convert type numeric to money` —
@@ -765,8 +783,9 @@ pub(super) fn append(
     // that need it in a projection of casts and leaves the rest untouched.
     let nodes: Vec<Node> = nodes
         .into_iter()
-        .zip(arm_types)
-        .map(|(node, types)| coerce_arm(node, &types, &columns))
+        .zip(&arm_types)
+        .zip(&constants)
+        .map(|((node, types), constants)| coerce_arm(node, types, &columns, constants))
         .collect();
     let mut node = combine(nodes, &ops);
     // **The set's own clauses, over the set's own row.** An `ORDER BY` after the last arm sorts
@@ -912,6 +931,7 @@ fn unify_user_type(
     arm: Option<&crate::catalog::TypeDef>,
     running_ty: ColumnType,
     arm_ty: ColumnType,
+    kind: Unifying,
 ) -> Result<Option<crate::catalog::TypeDef>> {
     let is_enum =
         |def: &crate::catalog::TypeDef| matches!(def.kind, crate::catalog::TypeKind::Enum { .. });
@@ -924,10 +944,7 @@ fn unify_user_type(
     match (running, arm) {
         (Some(left), Some(right)) if left.oid == right.oid => Ok(Some(left.clone())),
         (Some(left), Some(right)) if is_enum(left) && is_enum(right) => {
-            Err(SqlError::SetOperationCannotConvert {
-                from: right.name.clone(),
-                to: left.name.clone(),
-            })
+            Err(kind.cannot_convert_named(&right.name, &left.name))
         }
         // **Exactly one enum is two categories, and a real server never tries the conversion**
         // (`debts-v1.1.md` #57). It reaches `42804` and not the `42846` above, and the sentence
@@ -942,10 +959,7 @@ fn unify_user_type(
         // every set operation in the statement is resolved, so an absent type means *not a user
         // type* and this is the one line that comment promised.
         (Some(one), other) | (other, Some(one)) if is_enum(one) && !other.is_some_and(is_enum) => {
-            Err(SqlError::SetOperationTypes {
-                left: named(running, running_ty),
-                right: named(arm, arm_ty),
-            })
+            Err(kind.mismatch_named(&named(running, running_ty), &named(arm, arm_ty)))
         }
         // A domain, a range, or anything else with a user-defined type beside a plain column:
         // both are their storage here and `common_of` decides, exactly as before.
@@ -953,13 +967,65 @@ fn unify_user_type(
     }
 }
 
+/// Each unknown arm's literal read as a **label** of the enum its column settled on (#81).
+///
+/// The one conversion a cast cannot do: `'sad'` reaching an `int2` is `22P02 invalid input syntax
+/// for type smallint`, and a label is a lookup rather than a parse. So it is resolved here, where
+/// [`append`] has just settled which enum each column is, and the ordinal is projected in place of
+/// the arm's own column by [`coerce_arm`] — the value in the row is the literal's text and the
+/// set's is the number. A literal that is no label of that enum is
+/// `22P02 invalid input value for enum h_mood: "nope"`, which is the sentence an `INSERT` of the
+/// same value gives, because the literal is **read as** the enum rather than compared with it.
+///
+/// A bare `NULL` arm needs no lookup: it is a NULL of that enum, and is left alone. The answer is
+/// one `Option` per arm per column, `None` wherever the arm's own column already carries the value.
+fn unknown_arms_as_labels(
+    columns: &[OutputColumn],
+    arm_types: &[Vec<ColumnType>],
+    arm_unknown: &[Vec<bool>],
+    arm_unknown_text: &[Vec<Option<String>>],
+) -> Result<Vec<Vec<Option<Datum>>>> {
+    let mut constants: Vec<Vec<Option<Datum>>> = arm_types
+        .iter()
+        .map(|types| vec![None; types.len()])
+        .collect();
+    for (at, settled) in columns.iter().enumerate() {
+        let Some(def) = settled.user_type.as_ref().filter(|def| is_enum_def(def)) else {
+            continue;
+        };
+        for (arm, unknown) in arm_unknown.iter().enumerate() {
+            if !unknown.get(at).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(text) = arm_unknown_text[arm].get(at).and_then(Option::as_ref) else {
+                continue;
+            };
+            let Some(ordinal) = crate::catalog::enum_ordinal(enum_labels(def)?, text) else {
+                return Err(SqlError::InvalidEnumValue {
+                    ty: def.name.clone(),
+                    value: text.clone(),
+                });
+            };
+            constants[arm][at] = Some(Datum::Int2(ordinal));
+        }
+    }
+    Ok(constants)
+}
+
 /// One arm's rows as the set's types, or the arm unchanged when it already produces them.
 ///
 /// A projection of casts, which is what PostgreSQL puts in each arm's target list. The `Ordinal`
 /// carries the arm's *own* type, because that is what the value in the row is; the cast is what
 /// makes it the set's.
-fn coerce_arm(node: Node, arm: &[ColumnType], columns: &[OutputColumn]) -> Node {
-    if arm.iter().zip(columns).all(|(from, to)| *from == to.ty) {
+fn coerce_arm(
+    node: Node,
+    arm: &[ColumnType],
+    columns: &[OutputColumn],
+    constants: &[Option<Datum>],
+) -> Node {
+    if constants.iter().all(Option::is_none)
+        && arm.iter().zip(columns).all(|(from, to)| *from == to.ty)
+    {
         return node;
     }
     let exprs = arm
@@ -967,6 +1033,12 @@ fn coerce_arm(node: Node, arm: &[ColumnType], columns: &[OutputColumn]) -> Node 
         .zip(columns)
         .enumerate()
         .map(|(at, (from, to))| {
+            // **An unknown literal read as an enum's label is a constant**, resolved in `append`
+            // where the enum is known, and it replaces the arm's own column rather than casting
+            // it: the value in the row is the literal's text and the set's is the ordinal (#81).
+            if let Some(value) = constants.get(at).and_then(Option::as_ref) {
+                return Expr::Literal(Literal::typed(Box::new(value.clone())));
+            }
             let operand = Expr::Ordinal {
                 at,
                 ty: *from,
@@ -1021,25 +1093,48 @@ pub(super) enum Unifying {
     Coalesce,
     /// A `CASE`'s results, whose list starts at the `ELSE`.
     Case,
+    /// `GREATEST`, whose arguments are walked left to right as a `COALESCE`'s are.
+    Greatest,
+    /// `LEAST`, which says its own name in both sentences — measured,
+    /// `LEAST could not convert type h_other to h_mood`.
+    Least,
+}
+
+/// Which construct's words a `GREATEST` or a `LEAST` writes its refusals in.
+fn unifying_of(func: CatalogFunc) -> Unifying {
+    match func {
+        CatalogFunc::Least => Unifying::Least,
+        _ => Unifying::Greatest,
+    }
 }
 
 impl Unifying {
     /// `42804`, for a pair whose `typcategory` letters differ.
     fn mismatch(self, left: ColumnType, right: ColumnType) -> SqlError {
+        self.mismatch_named(left.name(), right.name())
+    }
+
+    /// The same `42804` for a pair a [`ColumnType`] cannot name: an **enum is named by itself**,
+    /// where its storage is an `int2` (ADR 0050). Measured on 19beta1, each construct's own word
+    /// and its own order — `CASE types text and h_mood cannot be matched` (a `CASE`'s list starts
+    /// at its `ELSE`) beside `COALESCE types h_mood and text cannot be matched` (left to right).
+    fn mismatch_named(self, left: &str, right: &str) -> SqlError {
         match self {
             Unifying::SetOperation => SqlError::SetOperationTypes {
-                left: left.name().to_owned(),
-                right: right.name().to_owned(),
+                left: left.to_owned(),
+                right: right.to_owned(),
             },
             Unifying::Coalesce => SqlError::DatatypeMismatch(format!(
-                "COALESCE types {} and {} cannot be matched",
-                left.name(),
-                right.name()
+                "COALESCE types {left} and {right} cannot be matched"
             )),
             Unifying::Case => SqlError::DatatypeMismatch(format!(
-                "CASE types {} and {} cannot be matched",
-                left.name(),
-                right.name()
+                "CASE types {left} and {right} cannot be matched"
+            )),
+            Unifying::Greatest => SqlError::DatatypeMismatch(format!(
+                "GREATEST types {left} and {right} cannot be matched"
+            )),
+            Unifying::Least => SqlError::DatatypeMismatch(format!(
+                "LEAST types {left} and {right} cannot be matched"
             )),
         }
     }
@@ -1049,20 +1144,36 @@ impl Unifying {
     /// **`CASE/WHEN` where the other two say their own name**, measured:
     /// `CASE/WHEN could not convert type character to citext`.
     fn cannot_convert(self, from: ColumnType, to: ColumnType) -> SqlError {
+        self.cannot_convert_named(from.name(), to.name())
+    }
+
+    /// The same `42846`, named — two enums are one category with no cast between them, and the
+    /// sentence spells both: `COALESCE could not convert type h_other to h_mood`, measured.
+    fn cannot_convert_named(self, from: &str, to: &str) -> SqlError {
         match self {
             Unifying::SetOperation => SqlError::SetOperationCannotConvert {
-                from: from.name().to_owned(),
-                to: to.name().to_owned(),
+                from: from.to_owned(),
+                to: to.to_owned(),
             },
             Unifying::Coalesce => SqlError::CannotConvertBranch {
                 kind: "COALESCE",
-                from: from.name(),
-                to: to.name(),
+                from: from.to_owned(),
+                to: to.to_owned(),
             },
             Unifying::Case => SqlError::CannotConvertBranch {
                 kind: "CASE/WHEN",
-                from: from.name(),
-                to: to.name(),
+                from: from.to_owned(),
+                to: to.to_owned(),
+            },
+            Unifying::Greatest => SqlError::CannotConvertBranch {
+                kind: "GREATEST",
+                from: from.to_owned(),
+                to: to.to_owned(),
+            },
+            Unifying::Least => SqlError::CannotConvertBranch {
+                kind: "LEAST",
+                from: from.to_owned(),
+                to: to.to_owned(),
             },
         }
     }
@@ -4053,6 +4164,24 @@ pub(super) fn resolve(expr: &Expr, scope: &Scope<'_>) -> Result<Expr> {
             // than extended a type at a time, which is how the arm above it came to carry a
             // scalar's rule on its array (`debts-v1.1.md`, wire v3 families F1b and F2).
             if matches!(call.func, CatalogFunc::Greatest | CatalogFunc::Least) {
+                // **The rule a `CASE` and a `COALESCE` follow, in this construct's words** (#81):
+                // the arguments settle a user-defined type, an `unknown` among them is read as one
+                // of its labels — `GREATEST(m, 'sad')` is `ok`, and `'nope'` is
+                // `22P02 invalid input value for enum h_mood: "nope"` — and a second enum or
+                // another category is `LEAST could not convert type h_other to h_mood` or
+                // `LEAST types h_mood and integer cannot be matched`, both measured.
+                //
+                // **Before the `btree` gate below**: an enum's arguments become its ordinals here,
+                // and an `int2` has a comparison function, so the gate would otherwise refuse a
+                // pair a real server answers for.
+                let kind = unifying_of(call.func);
+                if let Some(def) =
+                    settled_branch_user_type(args.iter(), kind, scope)?.filter(is_enum_def)
+                {
+                    for arg in &mut args {
+                        give_branch_enum(arg, &def)?;
+                    }
+                }
                 for arg in &args {
                     let ty = expr_type(arg, scope)?;
                     if !comparable_by_btree(ty) {
@@ -4433,7 +4562,26 @@ fn resolve_case(
     } else {
         Some(common_of(&types, Unifying::Case)?)
     };
-    if let Some(ty) = common {
+    // **And the identity the storage cannot carry** (#81): an enum's branches settle on the enum,
+    // an `unknown` among them is read as one of its labels, and a branch of another enum or
+    // another category is the refusal `unify_user_type` writes with this construct's word.
+    let user = settled_branch_user_type(
+        otherwise
+            .iter()
+            .map(AsRef::as_ref)
+            .chain(resolved.iter().map(|branch| &branch.then)),
+        Unifying::Case,
+        scope,
+    )?;
+    let enum_def = user.filter(is_enum_def);
+    if let Some(def) = &enum_def {
+        if let Some(expr) = &mut otherwise {
+            give_branch_enum(expr, def)?;
+        }
+        for branch in &mut resolved {
+            give_branch_enum(&mut branch.then, def)?;
+        }
+    } else if let Some(ty) = common {
         if let Some(expr) = &mut otherwise {
             give_branch_type(expr, ty)?;
         }
@@ -4480,7 +4628,14 @@ fn resolve_coalesce(args: &[Expr], scope: &Scope<'_>) -> Result<Expr> {
     } else {
         Some(common_of(&types, Unifying::Coalesce)?)
     };
-    if let Some(ty) = common {
+    // The same second question a `CASE` asks, with this construct's word in the refusals (#81).
+    let user = settled_branch_user_type(resolved.iter(), Unifying::Coalesce, scope)?;
+    let enum_def = user.filter(is_enum_def);
+    if let Some(def) = &enum_def {
+        for arg in &mut resolved {
+            give_branch_enum(arg, def)?;
+        }
+    } else if let Some(ty) = common {
         for arg in &mut resolved {
             give_branch_type(arg, ty)?;
         }
@@ -4623,6 +4778,17 @@ fn quantified_element_type(array: &Expr, scope: &Scope<'_>) -> Option<ColumnType
 /// against the operand rather than checked against it.
 fn is_unknown_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Literal(Literal::Null | Literal::String(_)))
+}
+
+/// The text an `unknown` literal holds, or `None` for the bare `NULL`, which holds none.
+///
+/// The one reader is a set operation's arm beside an enum, where the label has to be looked up
+/// after the arms are planned (`OutputColumn::unknown_text`, `debts-v1.1.md` #81).
+fn unknown_text_of(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Literal(Literal::String(text)) => Some(text.clone()),
+        _ => None,
+    }
 }
 
 /// Whether an operator exists between two types, as coarsely as this node's type surface allows.
@@ -5420,6 +5586,132 @@ pub(super) fn give_branch_type(expr: &mut Expr, ty: ColumnType) -> Result<()> {
     Ok(())
 }
 
+/// The **user-defined type** one branch carries, for the rule [`unify_user_type`] applies to a set
+/// operation's arms — a `CASE`'s results and a `COALESCE`'s arguments follow it too
+/// (`debts-v1.1.md` #81).
+///
+/// An enum is its label's ordinal in the row (ADR 0050), so without this a `CASE` over one settles
+/// on the storage and answers the **ordinal**: `CASE WHEN true THEN m ELSE m END` was `2` where
+/// 19beta1 answers `ok`. The spellings that carry the identity are the ones [`output_columns`]
+/// already reads — a column reference before or after resolution, a literal that was cast
+/// (`'sad'::mood` folds to an ordinal that says which enum), an aggregate that keeps its
+/// argument's type — and a `CASE` or a `COALESCE` of them, which is what makes the rule compose.
+fn branch_user_type(expr: &Expr, scope: &Scope<'_>) -> Option<crate::catalog::TypeDef> {
+    match expr {
+        Expr::Ordinal { at, .. } => scope.user_type_at(*at).cloned(),
+        Expr::Column { table, name } => scope
+            .resolve_column(table.as_deref(), name)
+            .ok()
+            .and_then(|(at, _)| scope.user_type_at(at))
+            .cloned(),
+        Expr::Literal(Literal::Typed {
+            user: Some(user), ..
+        }) => Some((**user).clone()),
+        // **`min` and `max` hand back an enum and not a domain** — measured, and the two are not
+        // alike here. `pg_typeof(table_name)` over an `information_schema` column is
+        // `information_schema.sql_identifier` and `pg_typeof(min(table_name))` is **`text`**: the
+        // aggregate is resolved to the base type's operator family, so what comes back is the base.
+        // An enum has no base to fall to and stays itself, which is what makes `min(current_mood)`
+        // a `mood` (ADR 0050). `array_agg` keeps the domain and is not in this family.
+        Expr::Aggregate(call) if call.func.keeps_its_argument_type() => call
+            .arg()
+            .and_then(|arg| branch_user_type(arg, scope))
+            .filter(is_enum_def),
+        // **A `CASE` of enums is that enum**, so one inside another — or inside a `COALESCE` —
+        // keeps it. A pair that does not unify is not reported here: the refusal belongs to the
+        // resolution, which asks the same question and can raise it.
+        Expr::Case {
+            branches,
+            otherwise,
+            ..
+        } => settled_branch_user_type(
+            otherwise
+                .iter()
+                .map(AsRef::as_ref)
+                .chain(branches.iter().map(|branch| &branch.then)),
+            Unifying::Case,
+            scope,
+        )
+        .ok()
+        .flatten(),
+        Expr::Coalesce(args) => settled_branch_user_type(args.iter(), Unifying::Coalesce, scope)
+            .ok()
+            .flatten(),
+        // **`GREATEST` and `LEAST` pick one of their arguments**, so the answer is an argument's
+        // type — an enum included, where `pg_typeof(GREATEST(m, 'sad'))` is `h_mood` (#81).
+        Expr::CatalogFunc(call)
+            if matches!(call.func, CatalogFunc::Greatest | CatalogFunc::Least) =>
+        {
+            settled_branch_user_type(call.args.iter(), unifying_of(call.func), scope)
+                .ok()
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// The one user-defined type a list of branches settles on, by the rule a set operation's arms
+/// follow — or the refusal that says they have none in common (#81).
+fn settled_branch_user_type<'a>(
+    branches: impl Iterator<Item = &'a Expr>,
+    kind: Unifying,
+    scope: &Scope<'_>,
+) -> Result<Option<crate::catalog::TypeDef>> {
+    // **Seeded by the first branch that has a type, unified from the second on** — the shape
+    // `append` uses for a set operation's arms, and the reason it is not a fold from `None`: one
+    // side missing is what `unify_user_type` reads as "an enum beside something that is not one",
+    // so seeding with `None` made `CASE WHEN true THEN m ELSE m END` a `42804` against itself.
+    let mut settled: Option<(Option<crate::catalog::TypeDef>, ColumnType)> = None;
+    for expr in branches {
+        // An `unknown` contributes nothing and takes what the others settle on, which is the same
+        // rule `branch_type` applies to the storage type beside this one (#75).
+        if is_unknown_literal(expr) {
+            continue;
+        }
+        let user = branch_user_type(expr, scope);
+        let ty = branch_type(expr, scope).unwrap_or(ColumnType::Text);
+        settled = Some(match settled {
+            None => (user, ty),
+            Some((running, running_ty)) => (
+                unify_user_type(running.as_ref(), user.as_ref(), running_ty, ty, kind)?,
+                running_ty,
+            ),
+        });
+    }
+    Ok(settled.and_then(|(user, _)| user))
+}
+
+/// Reads an `unknown` branch as a **label of `def`**, in place — the enum half of
+/// [`give_branch_type`] (#81).
+///
+/// `'sad'` beside a `mood` is that mood's ordinal and carries the type with it, the way a written
+/// `'sad'::mood` does; a string that is no label of it is
+/// `22P02 invalid input value for enum h_mood: "nope"`, which is the sentence an `INSERT` of the
+/// same value gives, because the literal is **read as** the enum rather than compared with it.
+/// A bare NULL is a NULL of that type and is left alone.
+fn give_branch_enum(expr: &mut Expr, def: &crate::catalog::TypeDef) -> Result<()> {
+    let Expr::Literal(Literal::String(text)) = expr else {
+        return Ok(());
+    };
+    let labels = enum_labels(def)?;
+    let Some(ordinal) = crate::catalog::enum_ordinal(labels, text) else {
+        return Err(SqlError::InvalidEnumValue {
+            ty: def.name.clone(),
+            value: text.clone(),
+        });
+    };
+    *expr = Expr::Literal(Literal::Typed {
+        value: Box::new(Datum::Int2(ordinal)),
+        user: Some(Box::new(def.clone())),
+    });
+    Ok(())
+}
+
+/// Whether a user-defined type is an enum — the one kind whose values are not their storage.
+fn is_enum_def(def: &crate::catalog::TypeDef) -> bool {
+    matches!(def.kind, crate::catalog::TypeKind::Enum { .. })
+}
+
 /// The type one `CASE` branch already has, or `None` for the two spellings that have none.
 ///
 /// `unknown` is the point: a quoted string and a bare NULL take their type from the branch that
@@ -5936,6 +6228,7 @@ fn output_columns(
                         // A `*` expands to columns, and a column's type is one the catalog holds.
                         pseudo: None,
                         unknown: false,
+                        unknown_text: None,
                     }
                 }));
             }
@@ -6000,6 +6293,15 @@ fn output_columns(
                             _ => None,
                         }
                     }
+                    // **A `CASE` and a `COALESCE` over an enum are that enum** (#81), which is
+                    // what makes their value a label rather than the `int2` it is stored as — and
+                    // so are `GREATEST` and `LEAST`, which pick one of their arguments.
+                    Expr::Case { .. } | Expr::Coalesce(_) => branch_user_type(expr, scope),
+                    Expr::CatalogFunc(call)
+                        if matches!(call.func, CatalogFunc::Greatest | CatalogFunc::Least) =>
+                    {
+                        branch_user_type(expr, scope)
+                    }
                     _ => None,
                 };
                 columns.push(OutputColumn {
@@ -6010,6 +6312,7 @@ fn output_columns(
                     pseudo: *pseudo,
                     // The one thing about this column that cannot be read back off its type.
                     unknown: is_unknown_literal(expr),
+                    unknown_text: unknown_text_of(expr),
                 });
             }
         }
@@ -6871,9 +7174,10 @@ fn concat_operand_name(expr: Option<&Expr>, scope: &Scope<'_>) -> String {
 /// `OutputColumn::user_type` uses, so this function and the `RowDescription` beside it cannot
 /// disagree — which is the property the datum-reading version could not have.
 fn pg_typeof_of(expr: &Expr, scope: &Scope<'_>) -> Result<Datum> {
-    if let Expr::Ordinal { at, .. } = expr
-        && let Some(def) = scope.user_type_at(*at)
-    {
+    // **The same question `OutputColumn::user_type` answers**, asked of the expression and not only
+    // of a position: a `CASE` or a `COALESCE` over an enum is that enum here too (#81), and the two
+    // readers cannot disagree because they are one function.
+    if let Some(def) = branch_user_type(expr, scope) {
         return Ok(Datum::RegType {
             oid: u32::try_from(def.oid).unwrap_or(0),
             // **The stored name as a sentence spells it**, which is a NUL apart from what it
@@ -7005,7 +7309,27 @@ fn branch_result_type<'a>(
     kind: Unifying,
     scope: &Scope<'_>,
 ) -> Result<ColumnType> {
-    let types: Vec<ColumnType> = results
+    let branches: Vec<&Expr> = results.collect();
+    // **The identity settles before the storage does, here too** (#81).
+    //
+    // This is the third reader of `select_common_type` — the resolution and `branch_common_type`
+    // are the other two, and the comment above `Expr::Coalesce` in [`expr_type`] is what the last
+    // disagreement between them cost. A reader that asks only the storage half answers with the
+    // storage's words: an enum beside a `text` arrived here as the `int2` an enum is stored in and
+    // was `CASE types text and smallint`, whatever the resolution had already settled, because the
+    // resolution was never asked. 19beta1 names the enum, and one pair must not get two sentences.
+    if let Some(def) =
+        settled_branch_user_type(branches.iter().copied(), kind, scope)?.filter(is_enum_def)
+    {
+        // Settled on one enum, so every branch is that enum and the type in the row is its
+        // ordinal's (ADR 0050). The enum itself travels as a `TypeDef`, which this function has no
+        // way to return — `branch_user_type` is the question whose answer is that.
+        let _ = def;
+        return Ok(ColumnType::Int2);
+    }
+    let types: Vec<ColumnType> = branches
+        .iter()
+        .copied()
         .filter_map(|expr| branch_type(expr, scope))
         .collect();
     common_of(&types, kind)

@@ -408,23 +408,19 @@ fn one_enum_across_the_arms_still_answers() {
         vec![vec!["sad"], vec!["ok"]],
         "a cast to the same enum, in the ordinals' order"
     );
-    // **Two declared divergences, and neither is the enum's.** An unknown literal arm never takes
-    // the other arm's type here, whatever the other arm is: `SELECT 1 UNION ALL SELECT 'abc'` is
-    // `22P02 invalid input syntax for type integer: "abc"` on 19beta1 and `SELECT 1 UNION ALL
-    // SELECT NULL` is an `integer` there — both are this `42804`. The capture's own header
-    // (`pg19_set_operations.txt`) lists four rules for unknown arms and three of them are not
-    // built; nothing pinned it against the node until this. Written as this node answers them so
-    // the day they close, a test says so.
+    // **The two divergences this file declared are closed** — `debts-v1.1.md` #81, and these two
+    // assertions are what said so: each was written as this node's `42804` with 19beta1's answer
+    // beside it, and the fix made the two the same rows. An unknown literal arm takes the enum and
+    // comes back as a **label**; a bare NULL arm is a NULL of that enum and still a row.
     assert_eq!(
-        said(&mut node, "SELECT m FROM t UNION SELECT 'sad' ORDER BY 1"),
-        "!42804 UNION types mood and text cannot be matched",
-        "19beta1 answers two rows, `sad` then `ok`: an unknown literal takes the enum (#81). \
-         Since #57 the refusal at least names the enum rather than the `int2` it is stored as"
+        node.rows("SELECT m FROM t UNION SELECT 'sad' ORDER BY 1"),
+        vec![vec!["sad"], vec!["ok"]],
+        "19beta1's own answer, since #81"
     );
     assert_eq!(
-        said(&mut node, "SELECT m FROM t UNION SELECT NULL ORDER BY 1"),
-        "!42804 UNION types mood and text cannot be matched",
-        "19beta1 answers two rows: a bare NULL takes the other arm's type too (#81)"
+        node.rows("SELECT m FROM t UNION SELECT NULL ORDER BY 1"),
+        vec![vec!["ok"], vec!["\\N"]],
+        "a bare NULL takes the other arm's type too"
     );
 }
 
