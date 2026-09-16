@@ -2365,6 +2365,28 @@ async fn how_long_a_split_child_has_no_leader() {
     );
 }
 
+/// A refusal's message with its numbers folded away, so two refusals that differ only in a region
+/// id or a byte count group together.
+///
+/// Digits rather than words: the ids in these messages (`region 1`, `after 9 attempts`) are what
+/// makes every refusal look unique, and folding them is what turns a list into a census.
+fn refusal_shape(said: &str) -> String {
+    let mut shape = String::with_capacity(said.len());
+    let mut in_digits = false;
+    for ch in said.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                shape.push_str("<n>");
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            shape.push(ch);
+        }
+    }
+    shape
+}
+
 /// The distribution and the refusals, lifted out of the test that takes them.
 fn report(rows: i64, regions: usize, led_after: &mut [f64], refusals: &[String]) -> f64 {
     led_after.sort_by(f64::total_cmp);
@@ -2384,12 +2406,22 @@ fn report(rows: i64, regions: usize, led_after: &mut [f64], refusals: &[String])
         );
     }
     println!("  {} refusals while loading", refusals.len());
-    let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+    // **Grouped by the shape of the message, not by its first seven bytes** — #107. Seven bytes is
+    // the sqlstate bracket, and the two mechanisms that row is about arrive with the *same* one: a
+    // region that genuinely had no leader, and a client that kept asking a peer that was not the
+    // leader while one existed. What separates them is the text, which this collected and then
+    // dropped. One sample is printed verbatim per shape, because the shape is what groups and the
+    // sample is what a reader recognises.
+    let mut kinds: BTreeMap<String, (usize, &str)> = BTreeMap::new();
     for said in refusals {
-        *kinds.entry(&said[..7.min(said.len())]).or_default() += 1;
+        let seen = kinds
+            .entry(refusal_shape(said))
+            .or_insert((0, said.as_str()));
+        seen.0 += 1;
     }
-    for (code, count) in kinds {
-        println!("    {code} x{count}");
+    for (shape, (count, sample)) in &kinds {
+        println!("    x{count}  {shape}");
+        println!("          e.g. {sample}");
     }
     if led_after.is_empty() {
         0.0
