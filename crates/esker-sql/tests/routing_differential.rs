@@ -2933,29 +2933,38 @@ async fn what_the_fallback_costs_as_the_table_grows() {
         let scans = scans_for(rows);
         let mut rounds = Vec::new();
         for _ in 0..SCALE_ROUNDS {
-            rounds.push(measure_one_round(&gate, &counted, &hot, rows, scans));
-        }
-        if rows == SCALE_TIERS[0] {
-            // The control, and only here: a table nobody writes to, to show that the "met a lock"
-            // column is the writer's doing and not the scan's.
-            let cold = format!("cold{rows}");
-            gate.fill_one_at_scale(&cold, rows).await;
-            rounds.push(measure_one_round(&gate, &counted, &cold, rows, scans));
+            let round = measure_one_round(&gate, &counted, &hot, rows, scans);
+            // **Printed as it finishes, not when the tier does.** The first large-table run lost
+            // five completed rounds exactly here: the tier's table is printed after the tier, the
+            // step after those rounds panicked, and everything measured was still in a `Vec`. A
+            // round that has been printed cannot be taken away by a later failure.
+            print_round(&round, scans);
+            rounds.push(round);
         }
         tiers.push(Tier {
             rows,
             scans,
             rounds,
         });
-        // Printed after every tier, so a window that ends early still leaves what was measured.
         print_scale_report(&tiers);
     }
+
+    // **The control runs last, after every tier**, and nothing depends on it. It is the least
+    // load-bearing step here, and in the first run its own fill and readiness check were what
+    // failed — taking five measured rounds down with them.
+    let cold_rows = SCALE_TIERS[0];
+    let cold_scans = scans_for(cold_rows);
+    let cold = format!("cold{cold_rows}");
+    gate.fill_one_at_scale(&cold, cold_rows).await;
+    let cold_round = measure_one_round(&gate, &counted, &cold, cold_rows, cold_scans);
+    print_round(&cold_round, cold_scans);
 
     // As with the small measurement, the only assertion is that it measured something: a threshold
     // here would be a claim about this box rather than about the system.
     let met: u64 = tiers
         .iter()
         .flat_map(|tier| tier.rounds.iter())
+        .chain(std::iter::once(&cold_round))
         .map(|round| round.met)
         .sum();
     assert!(
@@ -2996,6 +3005,27 @@ fn measure_one_round(
         met_times,
         clean_times,
     }
+}
+
+/// One round, printed the moment it is measured.
+///
+/// The tier table below is the report; this is the receipt. A measurement that prints only when a
+/// tier completes can be erased by anything that fails after the rounds and before the print, which
+/// is how the first large-table run lost five of them.
+fn print_round(round: &Round, scans: usize) {
+    let per_lock = (u64::try_from(scans).unwrap_or(u64::MAX) * 10)
+        .checked_div(round.met)
+        .map_or_else(
+            || "never".to_owned(),
+            |tenths| format!("{}.{}", tenths / 10, tenths % 10),
+        );
+    let met_median = median_of(&round.met_times);
+    let clean_median = median_of(&round.clean_times);
+    let (table, met, clean, failed) = (round.table.as_str(), round.met, round.clean, round.failed);
+    println!(
+        "round {table}: {met} met, {clean} clean, {failed} failed, one lock every {per_lock} scans, \
+         median met {met_median:?}, median clean {clean_median:?}"
+    );
 }
 
 /// The tier table: the median **across rounds**, with the spread that median is hiding beside it.
@@ -3047,4 +3077,80 @@ fn median_u64(samples: &[u64]) -> u64 {
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
     sorted[sorted.len() / 2]
+}
+
+/// Rows the probe fills at each batch size. Large enough to swamp the one-off costs (the table, the
+/// columnar replica, the first flush), small enough that three batch sizes fit in minutes.
+const PROBE_ROWS: i64 = 20_000;
+
+/// The batch sizes compared. 500 is what the measurement uses today, and `fill_join_at_scale`'s
+/// precedent before it.
+const PROBE_BATCHES: [usize; 3] = [500, 2_000, 5_000];
+
+/// **What a bigger batch buys the fill** — the number that decides the next window's shape.
+///
+/// #88's curve is blocked on filling, not on scanning: 100k rows took 356.5 s, which is 280 rows a
+/// second and 1.78 s for one 500-row `INSERT`, so 500k costs half an hour of fill and 1M costs an
+/// hour. This times the same 20k rows at three batch sizes rather than refilling 100k three times —
+/// the ratio is the answer, and the ratio is what a fixed row count measures.
+///
+/// The columnar replica is awaited for every batch afterwards, because a fill so large that the
+/// replica is only built at the end would not be the same thing under test.
+///
+/// Prints, and asserts only that every batch finished: a threshold here would be a claim about this
+/// box rather than about the system.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "#88's fill rate: a real cluster and a few minutes"]
+async fn what_a_bigger_batch_buys_the_fill() {
+    let gate = Gate::start().await;
+    let mut filled: Vec<(usize, Duration)> = Vec::new();
+
+    for batch in PROBE_BATCHES {
+        let table = format!("fill{batch}");
+        let took = tokio::task::block_in_place(|| {
+            let mut session = gate.session();
+            settle(
+                &mut session,
+                &format!("CREATE TABLE {table} (id int8 PRIMARY KEY, n int8, note text)"),
+            );
+            settle(
+                &mut session,
+                &format!("ALTER TABLE {table} SET (columnar_replicas = 1)"),
+            );
+            let began = Instant::now();
+            for chunk in (1..=PROBE_ROWS).collect::<Vec<i64>>().chunks(batch) {
+                let values: Vec<String> = chunk
+                    .iter()
+                    .map(|id| format!("({id}, {id}, 'n{id}')"))
+                    .collect();
+                settle(
+                    &mut session,
+                    &format!("INSERT INTO {table} VALUES {}", values.join(", ")),
+                );
+            }
+            began.elapsed()
+        });
+        // Rows a second in integer tenths: a count over a time needs no float to print one decimal.
+        let tenths = (PROBE_ROWS * 10_000)
+            .checked_div(i64::try_from(took.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        println!(
+            "batch {batch:<6} {PROBE_ROWS} rows in {took:?}  ({}.{} rows/s)",
+            tenths / 10,
+            tenths % 10
+        );
+        filled.push((batch, took));
+    }
+
+    for batch in PROBE_BATCHES {
+        gate.wait_for_a_learner_that_answers(&format!("fill{batch}"))
+            .await;
+    }
+    println!("every batch's columnar learner answered");
+
+    assert_eq!(
+        filled.len(),
+        PROBE_BATCHES.len(),
+        "a batch did not finish its fill"
+    );
 }
