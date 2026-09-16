@@ -68,7 +68,8 @@ visible act rather than a side effect of reordering two struct fields
 
 ## Status
 
-**`v1.1.1`** (`main` at `82e1dc1e`, 2026-09-16) is the current release: the ActiveRecord suite
+**`v1.1.1`** (2026-09-16; `0fc6fb18` is its last code commit, and the tag sits one docs batch
+above it) is the current release: the ActiveRecord suite
 answers **10,118 of 10,134 = 99.84%** against a **real topology** — one placement driver, four
 stores, one `esker-sql` node — over a 10.49 h pass with no stopped file, no wedge and no node
 restart. What it carries, how to deploy it (**every store is upgraded before any SQL node**) and
