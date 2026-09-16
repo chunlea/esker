@@ -105,9 +105,13 @@ repository**. `tokio` stays the bought concurrency, and only at the network edge
 allowlist: `proptest`, `criterion`, `stateright`, `tempfile`, `sqllogictest` (phase 6).
 Explicitly **not** used: `tonic`/`prost` (RPC is hand-rolled framing over TCP, see DESIGN.md §9),
 `serde` (no on-disk or wire use), `zstd`/`snap`, `crc32c`/`crc32fast`, `rand`, `lru`, `pgwire`.
-Deferred decisions, ADR when reached: `sqlparser` (phase 6a — writing a full PostgreSQL parser is out
-of scope, this is the one large exception we expect to accept) and the S3 client + TLS for phase 6b (the
-pure-Rust TLS stack is the hard case; options are recorded in DESIGN.md §13).
+Both once-deferred decisions are now made: `sqlparser` is accepted by
+[ADR 0014](docs/adr/0014-sqlparser.md) (phase 6a — writing a full PostgreSQL parser is out of
+scope, and it is the one large exception), and the S3 client and TLS by
+[ADR 0025](docs/adr/0025-s3-transport-and-tls.md) and
+[ADR 0055](docs/adr/0055-the-tls-options-across-three-surfaces-measured.md) — `rustls` +
+`rustls-graviola` behind a **default-off `tls` feature**, so neither is in the default runtime
+graph. Nothing is deferred here now; a new exception still needs an ADR.
 
 ## Toolchain and conventions
 
