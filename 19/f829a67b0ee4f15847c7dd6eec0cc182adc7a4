@@ -1,0 +1,21 @@
+crates/esker-client/tests/txn.rs
+  s_8d3e4c2902bf64::t_3afbaa9484d4af 1932-1980
+crates/esker-sql/tests/bulk_insert_frame.rs
+  s_8d3e4c2902bf64::t_ddbb5517d78ce6 1-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "19f829a67b0ee4f15847c7dd6eec0cc182adc7a4",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
