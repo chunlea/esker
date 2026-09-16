@@ -68,6 +68,11 @@ visible act rather than a side effect of reordering two struct fields
 
 ## Status
 
-Phase 0 (scaffold) is complete: the workspace, the lint and dependency guards, the in-house
-primitives, the key codec, the simulator skeleton and the CLI shell. Phase 1 builds the storage
-engine.
+**`v1.1.1`** (2026-09-16; `0fc6fb18` is its last code commit, and the tag sits one docs batch
+above it) is the current release: the ActiveRecord suite
+answers **10,118 of 10,134 = 99.84%** against a **real topology** — one placement driver, four
+stores, one `esker-sql` node — over a 10.49 h pass with no stopped file, no wedge and no node
+restart. What it carries, how to deploy it (**every store is upgraded before any SQL node**) and
+what it does not claim are in [`docs/releases/v1.1.1.md`](docs/releases/v1.1.1.md); the numbers
+behind it are [`docs/acceptance/v1.1.md`](docs/acceptance/v1.1.md) §11, and the open rows are
+[`docs/plans/debts-v1.1.md`](docs/plans/debts-v1.1.md) §1.
