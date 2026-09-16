@@ -2961,10 +2961,12 @@ pub enum SqlError {
     CannotConvertBranch {
         /// `COALESCE` or `CASE/WHEN`.
         kind: &'static str,
-        /// The branch's type.
-        from: &'static str,
-        /// The type the construct settled on.
-        to: &'static str,
+        /// The branch's type — owned, because an **enum names itself** and its name is a catalog
+        /// string rather than one of [`crate::value::ColumnType`]'s (`debts-v1.1.md` #81):
+        /// `CASE/WHEN could not convert type h_mood to h_other`, measured.
+        from: String,
+        /// The type the construct settled on, named the same way.
+        to: String,
     },
 
     /// Two arms of a set operation in one category with no implicit cast between them.
