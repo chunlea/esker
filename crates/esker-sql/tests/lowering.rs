@@ -17,7 +17,7 @@
 
 use esker_sql::catalog::{ExprShape, KeyOrder};
 use esker_sql::parse::parse_statements;
-use esker_sql::plan::{IndexKeyPart, KeyPartName, Statement};
+use esker_sql::plan::{IndexKeyPart, KeyPartName, SetOp, Statement};
 use esker_sql::sqlstate;
 use esker_sql::value::ColumnType;
 
@@ -560,4 +560,62 @@ fn the_foreign_data_statements_are_refused_by_name() {
         ),
     ];
     refuses_by_name(&cases);
+}
+
+/// **`INTERSECT` binds tighter than `EXCEPT`, and the lowering has to keep that grouping** —
+/// `debts-v1.1.md` #105, and the one question its plan page says to answer before building
+/// anything: the size is Medium only if precedence is expressible in the shape the plan already
+/// has.
+///
+/// Measured on 19beta1 (`esker-coord/s2-h105.out`): `a EXCEPT b INTERSECT b` answers the rows of
+/// `a EXCEPT (b INTERSECT b)`. A left-to-right reading agrees on that data by accident, which is
+/// why the grouping is asserted here on the **plan** rather than on rows — and why it can be
+/// asserted at all today, when executing either operator is still `0A000`.
+///
+/// The discrimination is the pair. A chain of one precedence is flat and left-associative, which is
+/// what `SetArm`'s own doc describes; a chain that mixes them must nest, because a flat list cannot
+/// say which two arms bind first. If the second case came back flat, the arms would have lost the
+/// grouping and precedence would stop being a lowering change — it would be a plan-shape change
+/// that every existing `UNION` query shares, which is the risk the plan page names.
+#[test]
+fn a_mixed_set_operator_chain_keeps_its_grouping() {
+    // Same precedence: flat, and each arm joins what precedes it.
+    let Ok(Statement::Select(flat)) =
+        lower("SELECT id FROM a EXCEPT SELECT id FROM b EXCEPT SELECT id FROM c")
+    else {
+        panic!("a chain of one precedence did not lower to a select");
+    };
+    assert_eq!(
+        flat.set_arms.iter().map(|arm| arm.op).collect::<Vec<_>>(),
+        [SetOp::Except, SetOp::Except],
+        "a chain of one precedence is left-associative and flat"
+    );
+    assert!(
+        flat.set_arms
+            .iter()
+            .all(|arm| arm.select.set_arms.is_empty()),
+        "nothing nests when nothing binds tighter"
+    );
+
+    // Mixed: the tighter operator has to be inside the looser one's arm.
+    let Ok(Statement::Select(mixed)) =
+        lower("SELECT id FROM a EXCEPT SELECT id FROM b INTERSECT SELECT id FROM b")
+    else {
+        panic!("a mixed chain did not lower to a select");
+    };
+    assert_eq!(
+        mixed.set_arms.iter().map(|arm| arm.op).collect::<Vec<_>>(),
+        [SetOp::Except],
+        "`a EXCEPT b INTERSECT b` is one EXCEPT arm, not two arms side by side"
+    );
+    assert_eq!(
+        mixed.set_arms[0]
+            .select
+            .set_arms
+            .iter()
+            .map(|arm| arm.op)
+            .collect::<Vec<_>>(),
+        [SetOp::Intersect],
+        "the INTERSECT binds tighter, so it is nested inside the EXCEPT's arm"
+    );
 }
