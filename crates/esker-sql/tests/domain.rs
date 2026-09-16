@@ -285,7 +285,7 @@ fn every_information_schema_column_is_a_domain() {
 /// as an array either way. Carrying the identity through an aggregate is shape **B**, which is a
 /// different row.
 #[test]
-fn pg_typeof_names_the_domain_until_the_column_is_wrapped() {
+fn pg_typeof_keeps_a_domain_through_an_aggregate_and_loses_it_through_an_expression() {
     let mut node = parity::Node::new(&["CREATE TABLE t (a int)"]);
     let asked = |node: &mut parity::Node, expr: &str, from: &str| {
         node.rows(&format!(
@@ -311,11 +311,15 @@ fn pg_typeof_names_the_domain_until_the_column_is_wrapped() {
     );
     // The wrap: `text` here and `text` there.
     assert_eq!(asked(&mut node, "table_name || ''", "tables"), "text");
-    // The aggregate: the accepted divergence, pinned so that closing it is a decision rather than
-    // a surprise.
+    // **The aggregate keeps it too, since `debts-v1.1.md` #106.** This assertion was `name[]` and
+    // was called an accepted divergence; the oracle says otherwise and was asked directly before
+    // the pin moved (`esker-coord/s2-h106c.out`): `array_agg` of a domain, of an enum and of a
+    // composite all answer that type's own array. The rule is not "a wrap loses the domain" — it
+    // is that an **expression** over it produces a new value of the base type, while an aggregate
+    // collects the values it was given.
     assert_eq!(
         node.rows("SELECT pg_typeof(array_agg(table_name)) FROM information_schema.tables"),
-        vec![vec!["name[]"]]
+        vec![vec!["information_schema.sql_identifier[]"]]
     );
 }
 

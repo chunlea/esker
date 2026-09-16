@@ -75,19 +75,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "`array_to_string` is `0A000` by name, the same named gap.",
             "pg19_name_array.txt:107",
         ),
-        // **A domain over `name`, and this node has no domain there.**
-        // `information_schema.tables.table_name` is the `sql_identifier` domain on a real server,
-        // and an array of a domain is an array of that domain — its own oid. This node declares
-        // the column `name` and answers `name[]`: the element type right and the domain missing.
-        (
-            "SELECT pg_typeof(array_agg(table_name)) FROM (SELECT table_name FROM \
-             information_schema.tables LIMIT 2) s",
-            "`information_schema.tables.table_name` is the `sql_identifier` domain over `name` on \
-             a real server, so an aggregate over it is `information_schema.sql_identifier[]`. \
-             This node has no domain there and answers `name[]` — the element type right and the \
-             domain absent.",
-            "pg19_name_array.txt:98",
-        ),
         // `SELECT n.nspname … = ANY (current_schemas(false))` is **not** listed, and it was
         // expected to be: the two servers hold different catalogs, so the rows looked like they
         // could not agree. Both answer `public` and the column is a `name` on both, so the

@@ -29,25 +29,16 @@ mod parity;
 /// `pg_type` rows, the column declares 13361 on both protocol paths, and three of the four entries
 /// below came off under rule 2 the day it landed.
 ///
-/// **What is left is the aggregate, and it is shape B.** The identity travels on a `ColumnDef` and
-/// the query pipeline carries a `ColumnType`, so the moment a value passes through an aggregate
-/// there is nothing holding a domain to derive `_sql_identifier` from. Answering `_name` is the
-/// base type's array — the right *values* under the wrong name — and r1 accepted it in
-/// `results/run-107.md:43`: `ActiveRecord` decodes 1003 as an array either way.
+/// **The aggregate closed too, on 2026-09-16 (`debts-v1.1.md` #106).** It was the last of the four
+/// and it was shape B: the identity travelled on a `ColumnDef` while the query pipeline carried a
+/// `ColumnType`, so a value passing through an aggregate had nothing holding the domain. It answers
+/// `information_schema.sql_identifier[]` now, as a real server does — asked of the live oracle
+/// directly before the pin came off (`esker-coord/s2-h106c.out`), because the belief that replaced
+/// it was wrong in the other direction: a domain does **not** match as its base in a polymorphic
+/// argument position, and `array_agg` of a domain, an enum and a composite all keep their own type.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[
-        (
-            "SELECT pg_typeof(array_agg(table_name)) FROM (SELECT table_name FROM information_schema.tables LIMIT 2) s",
-            "**A domain's array, which this node has no type for.** `table_name` is the domain \
-             `sql_identifier` on a real server and `array_agg` of it is `_sql_identifier` (13360); \
-             here the *column* is the domain too, since #37, and the **aggregate** is what loses \
-             it: `_name` (1003), because the identity travels on a `ColumnDef` and the pipeline \
-             carries a `ColumnType`. The values are identical — a domain adds a constraint, not a \
-             representation — and what differs is the name a client is told. Accepted by r1 in \
-             `results/run-107.md:43`; closing it is ADR 0103's shape **B**.",
-            "pg19_aggregate_groups.txt:77",
-        ),
         (
             "SELECT string_agg(t, ',') FILTER (WHERE t <> 'a') FROM ag",
             "**`FILTER` is not built for any aggregate**, so this is `0A000` naming the clause \
