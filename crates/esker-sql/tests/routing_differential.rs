@@ -2679,20 +2679,38 @@ impl Gate {
             println!("  #108: {table} has no id yet, so it holds no row locks");
             return;
         };
+        let first = self.sample_locks(table, table_id, "first");
+        if first.is_empty() {
+            println!("  #108: no lock over {table} on any store — nothing to attribute");
+            return;
+        }
+        // **A second look, one lease later, and it is the whole discriminator.** `is_expired`
+        // compares `physical_ms(now)` against `physical_ms(start_ts) + ttl_ms`, and `start_ts`
+        // cannot move — so a heartbeat can only show as a **larger `ttl_ms`**. One sample says a
+        // lock is past its lease; two say whether anybody is still pushing that lease out.
+        std::thread::sleep(Duration::from_millis(esker_client::LOCK_TTL_MS));
+        let second = self.sample_locks(table, table_id, "second");
+        compare_samples(&first, &second);
+    }
+
+    /// One pass over every store, printed as it is taken.
+    fn sample_locks(&self, table: &str, table_id: u64, which: &str) -> Vec<StrandedLock> {
         let Ok(now_ts) = self.oracle.timestamp() else {
             println!("  #108: the oracle would not answer, so no lease can be judged");
-            return;
+            return Vec::new();
         };
-        let mut seen = 0usize;
+        let mut all = Vec::new();
         for (at, node) in self.nodes.iter().enumerate() {
-            let locks = locks_over_table(&node.store, TENANT, table_id, now_ts);
-            seen += locks.len();
+            let locks = locks_over_table(at, &node.store, TENANT, table_id, now_ts);
             report_stranded(at, &node.store, &locks);
+            all.extend(locks);
         }
         println!(
-            "  #108: {seen} lock(s) over {table} across {} stores, at ts {now_ts}",
+            "  #108 {which} sample: {} lock(s) over {table} across {} stores, at ts {now_ts}",
+            all.len(),
             self.nodes.len()
         );
+        all
     }
 
     /// `settle`, and if it gives up, the lock census before the panic is let through.
@@ -2997,6 +3015,11 @@ const SCALE_ROUNDS: usize = 5;
 ///
 /// A struct rather than a tuple: six fields of four types is what nobody can read at the call site.
 struct StrandedLock {
+    /// Which store this copy was read from. **Not decoration**: every replica of the region
+    /// holds the same lock row, so a census across four stores lists one logical lock four
+    /// times, and pairing the two samples by key alone would match store 0's second look
+    /// against store 2's first. The pairing is `(at, key)` for that reason.
+    at: usize,
     key: Vec<u8>,
     kind: String,
     start_ts: u64,
@@ -3015,6 +3038,7 @@ struct StrandedLock {
 /// changes a format — this walks `cf::LOCK` the way `columnar::region::unresolved_lock` does,
 /// because that is the reader whose refusal is being diagnosed.
 fn locks_over_table(
+    at: usize,
     store: &Arc<esker_store::server::Store>,
     tenant: u64,
     table_id: u64,
@@ -3040,6 +3064,7 @@ fn locks_over_table(
             let dead_at = esker_client::physical_ms(lock.start_ts).saturating_add(lock.ttl_ms);
             let past = esker_client::physical_ms(now_ts).saturating_sub(dead_at);
             found.push(StrandedLock {
+                at,
                 key: user_key,
                 kind: format!("{:?}", lock.kind),
                 start_ts: lock.start_ts,
@@ -3074,6 +3099,46 @@ fn report_stranded(at: usize, store: &Arc<esker_store::server::Store>, locks: &[
             lock.start_ts,
             lock.ttl_ms,
             printable(&lock.primary),
+        );
+    }
+}
+
+/// What two samples a lease apart say about the same locks — **#108's discriminator**.
+///
+/// A heartbeat extends a transaction's lease, and the only field it can move is `ttl_ms`: the
+/// comparison in `is_expired` is against `physical_ms(start_ts) + ttl_ms`, and `start_ts` is fixed
+/// for the life of the transaction. So a lock whose `ttl_ms` grew between the two looks has an
+/// owner that is alive and being kept alive; one whose `ttl_ms` did not move, and whose lease is
+/// long past, is stranded with nothing resolving it. That is the difference two incidents left no
+/// evidence for.
+fn compare_samples(first: &[StrandedLock], second: &[StrandedLock]) {
+    for before in first {
+        let same = |later: &&StrandedLock| later.at == before.at && later.key == before.key;
+        let verdict = match second.iter().find(same) {
+            None => "gone — something resolved it between the two looks".to_owned(),
+            Some(later) if later.start_ts != before.start_ts => format!(
+                "replaced — a different transaction holds it now ({} then {})",
+                before.start_ts, later.start_ts
+            ),
+            Some(later) if later.ttl_ms > before.ttl_ms => format!(
+                "ALIVE — its lease grew from {} ms to {} ms, so its owner is being heartbeated",
+                before.ttl_ms, later.ttl_ms
+            ),
+            Some(later) => match later.expired_by_ms {
+                Some(ms) => format!(
+                    "STRANDED — same lease of {} ms, now {ms} ms past it, and still here",
+                    later.ttl_ms
+                ),
+                None => format!(
+                    "inside its lease still ({} ms), too early to judge",
+                    later.ttl_ms
+                ),
+            },
+        };
+        println!(
+            "  #108 verdict for store {} key {}: {verdict}",
+            before.at,
+            printable(&before.key)
         );
     }
 }
