@@ -1,0 +1,21 @@
+crates/esker-sql/Cargo.toml
+  s_8d3e4c2902bf64::t_26deb94fa1b3d6 70-81
+crates/esker-sql/tests/routing_differential.rs
+  s_8d3e4c2902bf64::t_47449d0139dcdf 2933-3030
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0753feb6a7fe7fbb181460e311c38d21a10a726f",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
