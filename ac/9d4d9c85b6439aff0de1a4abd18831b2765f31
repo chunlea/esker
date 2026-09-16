@@ -1,0 +1,16 @@
+crates/esker-sql/tests/routing_differential.rs
+  h_44076b318daf9c 38,49,852-853,868-870,923-924,939-941,1132-1136,1138-1139,1141-1148,2519-2842
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ac9d4d9c85b6439aff0de1a4abd18831b2765f31",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
