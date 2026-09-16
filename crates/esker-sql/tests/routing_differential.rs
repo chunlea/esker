@@ -2610,6 +2610,40 @@ impl Gate {
             .asking_fragments_of(source),
         }
     }
+
+    /// One table of `rows` rows with a columnar copy, filled five hundred rows to a statement.
+    ///
+    /// The batching is `fill_join_at_scale`'s and for its reason: one statement per row is one
+    /// *transaction* per row, and a million of those is the measurement's own cost rather than the
+    /// thing being measured. The fill's own duration is printed because it decides how much of a
+    /// window is left for measuring.
+    async fn fill_one_at_scale(&self, table: &str, rows: i64) {
+        tokio::task::block_in_place(|| {
+            let mut session = self.session();
+            settle(
+                &mut session,
+                &format!("CREATE TABLE {table} (id int8 PRIMARY KEY, n int8, note text)"),
+            );
+            settle(
+                &mut session,
+                &format!("ALTER TABLE {table} SET (columnar_replicas = 1)"),
+            );
+            let began = Instant::now();
+            for chunk in (1..=rows).collect::<Vec<i64>>().chunks(500) {
+                let values: Vec<String> = chunk
+                    .iter()
+                    .map(|id| format!("({id}, {id}, 'n{id}')"))
+                    .collect();
+                settle(
+                    &mut session,
+                    &format!("INSERT INTO {table} VALUES {}", values.join(", ")),
+                );
+            }
+            let filled_in = began.elapsed();
+            println!("{table}: {rows} rows filled in {filled_in:?}");
+        });
+        self.wait_for_a_learner_that_answers(table).await;
+    }
 }
 
 /// Rows each table starts with. Enough that a scan is worth routing and small enough that the
@@ -2649,11 +2683,11 @@ async fn what_a_fragment_meeting_a_lock_costs() {
     for table in ["hot", "cold"] {
         let writing = Arc::new(AtomicBool::new(table == "hot"));
         let held = Arc::new(AtomicU64::new(0));
-        let writer = spawn_writer(&gate, &writing, &held);
+        let writer = spawn_writer_over(&gate, "hot", MEASURE_ROWS, &writing, &held);
 
         let scanning = Instant::now();
         let (met_times, clean_times, failed) =
-            tokio::task::block_in_place(|| scan_a_table(&gate, &counted, table));
+            tokio::task::block_in_place(|| scan_a_table_n(&gate, &counted, table, MEASURE_SCANS));
         let scanned_for = scanning.elapsed();
 
         writing.store(false, Ordering::Relaxed);
@@ -2665,7 +2699,7 @@ async fn what_a_fragment_meeting_a_lock_costs() {
             Duration::from_micros(held.load(Ordering::Relaxed))
         );
         report.push(Round {
-            table,
+            table: table.to_owned(),
             met: u64::try_from(met_times.len()).unwrap_or(u64::MAX),
             clean: u64::try_from(clean_times.len()).unwrap_or(u64::MAX),
             failed,
@@ -2691,7 +2725,7 @@ async fn what_a_fragment_meeting_a_lock_costs() {
 /// One table's worth of the measurement. A struct rather than a tuple, because six fields of two
 /// types is exactly the shape nobody can read at the call site.
 struct Round {
-    table: &'static str,
+    table: String,
     met: u64,
     clean: u64,
     failed: u64,
@@ -2733,8 +2767,10 @@ fn fill_measure_tables(gate: &Gate) {
 /// scans, which is a fact about the writer's shape and not about the system. #88 is about a scan
 /// meeting a lock whose transaction is *still open*, which is what Rails does between its `BEGIN`
 /// and its `COMMIT`.
-fn spawn_writer(
+fn spawn_writer_over(
     gate: &Gate,
+    table: &str,
+    rows: i64,
     writing: &Arc<AtomicBool>,
     held: &Arc<AtomicU64>,
 ) -> std::thread::JoinHandle<()> {
@@ -2742,19 +2778,21 @@ fn spawn_writer(
     let catalog = Arc::clone(&gate.catalog);
     let writing = Arc::clone(writing);
     let held = Arc::clone(held);
+    // The thread outlives this frame, so it owns its table's name rather than borrowing it.
+    let table = table.to_owned();
     std::thread::spawn(move || {
         let mut session = Session {
             executor: Executor::new(backend, catalog, TENANT, esker_sql::session::register()),
         };
-        let mut at = MEASURE_ROWS;
+        let mut at = rows;
         while writing.load(Ordering::Relaxed) {
             at += 1;
             let opened = Instant::now();
             let _ = session.run("BEGIN");
-            let _ = session.run(&format!("INSERT INTO hot VALUES ({at}, {at}, 'w')"));
+            let _ = session.run(&format!("INSERT INTO {table} VALUES ({at}, {at}, 'w')"));
             let _ = session.run(&format!(
-                "UPDATE hot SET n = n + 1 WHERE id = {}",
-                at % MEASURE_ROWS + 1
+                "UPDATE {table} SET n = n + 1 WHERE id = {}",
+                at % rows + 1
             ));
             std::thread::sleep(Duration::from_millis(WRITER_HOLDS_MS));
             let _ = session.run("COMMIT");
@@ -2768,16 +2806,17 @@ fn spawn_writer(
 
 /// One table's scans: the times of those that met a lock, of those that did not, and how many
 /// statements the contention refused outright.
-fn scan_a_table(
+fn scan_a_table_n(
     gate: &Gate,
     counted: &Arc<CountingFragments>,
     table: &str,
+    scans: usize,
 ) -> (Vec<Duration>, Vec<Duration>, u64) {
     let mut session = gate.session_asking(Arc::clone(counted) as Arc<dyn FragmentSource>);
     let mut met = Vec::new();
     let mut missed = Vec::new();
     let mut refused_statements = 0_u64;
-    for _ in 0..MEASURE_SCANS {
+    for _ in 0..scans {
         counted.reset();
         let at = Instant::now();
         // **Tolerant on purpose.** `rows` unwraps, and the writer beside this is making contention:
@@ -2821,7 +2860,8 @@ fn print_report(report: &[Round]) {
         } else {
             format!("{:?}", median_of(&round.met_times))
         };
-        let (table, met, clean, failed) = (round.table, round.met, round.clean, round.failed);
+        let (table, met, clean, failed) =
+            (round.table.as_str(), round.met, round.clean, round.failed);
         println!(
             "{table:<7}{scans:<7}{met:<12}{clean:<7}{failed:<24}{per_lock:<16}{met_column:<28}{:?}",
             median_of(&round.clean_times),
@@ -2835,6 +2875,174 @@ fn print_report(report: &[Round]) {
 fn median_of(samples: &[Duration]) -> Duration {
     if samples.is_empty() {
         return Duration::ZERO;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
+/// Rows per tier. The first tier is run whole before the next is filled, so a window that runs out
+/// leaves finished tiers rather than half a table.
+const SCALE_TIERS: [i64; 3] = [100_000, 500_000, 1_000_000];
+
+/// Rounds per tier. One round is not the number: the same measurement run twice on the small table
+/// met a lock 22 times in 120 scans and then 13, and put the fallback's cost at +27% and then
+/// +105% — a 1.7x spread. A median over rounds with its own spread beside it is the number.
+const SCALE_ROUNDS: usize = 5;
+
+/// Scans per round, lowered as the table grows because one `count(*)` over a million rows is not
+/// one over four hundred. The count is reported, so a reader never has to infer the sample size.
+fn scans_for(rows: i64) -> usize {
+    match rows {
+        r if r <= 100_000 => 60,
+        r if r <= 500_000 => 40,
+        _ => 30,
+    }
+}
+
+/// One tier's worth of the measurement: the table's size, the scans each round made, and a `Round`
+/// per round. A struct rather than a tuple for `Round`'s own reason.
+struct Tier {
+    rows: i64,
+    scans: usize,
+    rounds: Vec<Round>,
+}
+
+/// **What the fallback costs as the table grows** — #88's second measurement.
+///
+/// The first one priced the fallback on a four-hundred-row table (86.6 ms against 68.2 ms), and that
+/// is a constructed bargain: a table that small sits whole in the block cache, so falling back to
+/// the row path costs almost nothing. Whether [ADR 0117] is worth writing depends on the *curve*,
+/// which is why this runs three tiers rather than one big table.
+///
+/// The shape is the small measurement's — the same counting decorator, the same writer holding a
+/// transaction open, the same `SELECT count(*)` — and only the row count moves. A cold table is
+/// filled at the smallest tier only: the decisive comparison is met-a-lock against clean **on the
+/// same table**, so a second table of a million rows would spend half the window on rows that take
+/// part in no conclusion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "#88's curve: a real cluster, a writer thread, and tens of minutes of a quiet box"]
+async fn what_the_fallback_costs_as_the_table_grows() {
+    let gate = Gate::start().await;
+    let counted = Arc::new(CountingFragments::new(Arc::clone(&gate.fragments)));
+    let mut tiers: Vec<Tier> = Vec::new();
+
+    for rows in SCALE_TIERS {
+        let hot = format!("hot{rows}");
+        gate.fill_one_at_scale(&hot, rows).await;
+        let scans = scans_for(rows);
+        let mut rounds = Vec::new();
+        for _ in 0..SCALE_ROUNDS {
+            rounds.push(measure_one_round(&gate, &counted, &hot, rows, scans));
+        }
+        if rows == SCALE_TIERS[0] {
+            // The control, and only here: a table nobody writes to, to show that the "met a lock"
+            // column is the writer's doing and not the scan's.
+            let cold = format!("cold{rows}");
+            gate.fill_one_at_scale(&cold, rows).await;
+            rounds.push(measure_one_round(&gate, &counted, &cold, rows, scans));
+        }
+        tiers.push(Tier {
+            rows,
+            scans,
+            rounds,
+        });
+        // Printed after every tier, so a window that ends early still leaves what was measured.
+        print_scale_report(&tiers);
+    }
+
+    // As with the small measurement, the only assertion is that it measured something: a threshold
+    // here would be a claim about this box rather than about the system.
+    let met: u64 = tiers
+        .iter()
+        .flat_map(|tier| tier.rounds.iter())
+        .map(|round| round.met)
+        .sum();
+    assert!(
+        met > 0,
+        "no scan in any tier met a lock: the writer is not holding one"
+    );
+}
+
+/// One round over one table: start the writer, scan, stop the writer.
+///
+/// A table whose name begins with `cold` is the control and gets no writer, which is how the same
+/// helper serves both arms.
+fn measure_one_round(
+    gate: &Gate,
+    counted: &Arc<CountingFragments>,
+    table: &str,
+    rows: i64,
+    scans: usize,
+) -> Round {
+    let writing = Arc::new(AtomicBool::new(!table.starts_with("cold")));
+    let held = Arc::new(AtomicU64::new(0));
+    let writer = spawn_writer_over(gate, table, rows, &writing, &held);
+
+    let (met_times, clean_times, failed) =
+        tokio::task::block_in_place(|| scan_a_table_n(gate, counted, table, scans));
+
+    writing.store(false, Ordering::Relaxed);
+    writer.join().expect("the writer thread ends");
+    // The denominator: a ratio of encounters to scans means nothing without how much of the window
+    // a transaction was open at all.
+    let open_for = Duration::from_micros(held.load(Ordering::Relaxed));
+    println!("{table}: a transaction was open for {open_for:?} of the scanning window");
+    Round {
+        table: table.to_owned(),
+        met: u64::try_from(met_times.len()).unwrap_or(u64::MAX),
+        clean: u64::try_from(clean_times.len()).unwrap_or(u64::MAX),
+        failed,
+        met_times,
+        clean_times,
+    }
+}
+
+/// The tier table: the median **across rounds**, with the spread that median is hiding beside it.
+///
+/// Scans per lock stays integer tenths for `print_report`'s reason — a count over a count needs no
+/// float to print one decimal.
+fn print_scale_report(tiers: &[Tier]) {
+    println!(
+        "rows      scans/round  rounds  met: median (min-max)  scans per lock  median met  median clean"
+    );
+    for tier in tiers {
+        let met: Vec<u64> = tier.rounds.iter().map(|round| round.met).collect();
+        let met_median = median_u64(&met);
+        let per_lock = (u64::try_from(tier.scans).unwrap_or(u64::MAX) * 10)
+            .checked_div(met_median)
+            .map_or_else(
+                || "never".to_owned(),
+                |tenths| format!("{}.{}", tenths / 10, tenths % 10),
+            );
+        // A round that met no lock has no median to contribute; it still counts in the spread.
+        let met_times: Vec<Duration> = tier
+            .rounds
+            .iter()
+            .filter(|round| !round.met_times.is_empty())
+            .map(|round| median_of(&round.met_times))
+            .collect();
+        let clean_times: Vec<Duration> = tier
+            .rounds
+            .iter()
+            .map(|round| median_of(&round.clean_times))
+            .collect();
+        let low = met.iter().min().copied().unwrap_or(0);
+        let high = met.iter().max().copied().unwrap_or(0);
+        let spread = format!("{met_median} ({low}-{high})");
+        let (rows, scans, rounds) = (tier.rows, tier.scans, tier.rounds.len());
+        let met_time = median_of(&met_times);
+        let clean_time = median_of(&clean_times);
+        println!(
+            "{rows:<10}{scans:<13}{rounds:<8}{spread:<23}{per_lock:<16}{met_time:?}  {clean_time:?}"
+        );
+    }
+}
+
+/// [`median_of`] for counts. Empty says zero rather than being divided by.
+fn median_u64(samples: &[u64]) -> u64 {
+    if samples.is_empty() {
+        return 0;
     }
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
