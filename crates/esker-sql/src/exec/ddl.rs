@@ -5933,18 +5933,32 @@ fn folded_into_its_cast(expr: &plan::Expr) -> bool {
         // is a cast a real server keeps.
         plan::Expr::Literal(plan::Literal::String(_) | plan::Literal::Null) => true,
         plan::Expr::Literal(plan::Literal::Typed { value, .. }) => {
-            matches!(value.as_ref(), Datum::Text(_))
+            // **An interval belongs here for the same reason text does**, and it was measured
+            // rather than reasoned: `DEFAULT '3 years'::interval(3)` is one node on a real server
+            // and printed `'3 years'::interval(3)`. Without this arm the cast is not folded, the
+            // general arm below prints the operand under its own type and then names the target
+            // again, and the stored default becomes `('3 years'::interval)::interval(3)` — which
+            // `reads_back` accepts, because a doubled cast is its own fixpoint.
+            matches!(value.as_ref(), Datum::Text(_) | Datum::Interval { .. })
         }
         _ => false,
     }
 }
 
 /// That constant, printed with the type the cast named rather than the type it is held as.
-fn deparse_literal_of(expr: &plan::Expr, to: ColumnType) -> String {
+fn deparse_literal_of(expr: &plan::Expr, to: ColumnType, typmod: i32) -> String {
+    let named = crate::value::format_type(to, typmod);
     match expr {
         plan::Expr::Literal(plan::Literal::Typed { value, .. }) => match value.as_ref() {
-            Datum::Text(text) => format!("'{}'::{}", text.replace('\'', "''"), to.name()),
-            _ => deparse_literal(&plan::Literal::Null, to),
+            Datum::Text(text) => format!("'{}'::{}", text.replace('\'', "''"), named),
+            // Anything else reaching here is a datum [`folded_into_its_cast`] admits, which is an
+            // interval and nothing more today. It prints as **its own text** under the target's
+            // parameterised name; the `NULL` this used to answer was unreachable while text was
+            // the only folded datum, and would be a wrong answer now that it is not.
+            other => format!(
+                "'{}'::{named}",
+                other.to_text().unwrap_or_default().replace('\'', "''")
+            ),
         },
         plan::Expr::Literal(literal) => deparse_literal(literal, to),
         _ => String::new(),
@@ -6485,7 +6499,12 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
             plan::Literal::Integer(_) | plan::Literal::Decimal(_)
         ) || matches!(literal, plan::Literal::Typed { value, .. }
                 if matches!(**value, Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)
-                    | Datum::Numeric(_) | Datum::Real(_) | Datum::Double(_))),
+                    | Datum::Numeric(_) | Datum::Real(_) | Datum::Double(_)
+                    // **`INTERVAL '3 years'` is a typed literal with no cast around it**, which
+                    // `sqlparser` gives its own node and `parse::lower` folds to this datum. A
+                    // real server prints it `'3 years'::interval` — the bare type, not the
+                    // column's — where this node kept the text as written, `(INTERVAL '3 years')`.
+                    | Datum::Interval { .. })),
         Expr::CatalogFunc(call) => {
             (operator_operand_types(call.func).is_some() && call.args.len() == 2)
                 || matches!(
@@ -6768,7 +6787,7 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         // [`folded_into_its_cast`] is now the one predicate for both arms, because `::text` is the
         // one target that does not reach that arm.
         Expr::ToText { operand, .. } if folded_into_its_cast(operand) => {
-            deparse_literal_of(operand, ColumnType::Text)
+            deparse_literal_of(operand, ColumnType::Text, crate::value::NO_TYPMOD)
         }
         Expr::ToText { operand, .. } => format!("{}::text", parenthesise(&sub(operand))),
         // **A cast over an unadorned string literal is *one* node on a real server**, so it prints
@@ -6780,9 +6799,11 @@ fn deparse(expr: &plan::Expr, table: &TableDef, ty: ColumnType) -> String {
         // Only a **bare** string literal: `('a' || 'b')::text` really is a cast over an
         // expression, and a numeric constant under a cast is [`numeric_constant`]'s three forms
         // and debt #24's remaining case.
-        Expr::Cast { operand, to, .. } if folded_into_its_cast(operand) => {
-            deparse_literal_of(operand, *to)
-        }
+        Expr::Cast {
+            operand,
+            to,
+            typmod,
+        } if folded_into_its_cast(operand) => deparse_literal_of(operand, *to, *typmod),
         // **A cast carries its modifier into its name.** `(v)::character varying(5)` and
         // `(n)::numeric(10,2)` are what a real server prints, and this arm dropped the parameter
         // and printed the bare type — so a cast that PostgreSQL *keeps* was printed wrong even

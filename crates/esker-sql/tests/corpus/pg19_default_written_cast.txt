@@ -1,0 +1,43 @@
+# **What `pg_get_expr` prints for a column default depends on how the default was written.**
+# PostgreSQL 19beta1, 2026-09-16 (`esker-coord/s2-h103c.out`).
+#
+# `tests/captures/pg19_typmod_default.txt` already measured which *types* carry a modifier into a
+# rendered default — `interval` and nothing else — but every row of that matrix is a bare literal.
+# This file measures the other axis: **one column type, three spellings.** On a single
+# `interval(3)` column, `DEFAULT '3 years'`, `DEFAULT '3 years'::interval` and
+# `DEFAULT '3 years'::interval(3)` read back as three different strings.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **The printed cast is the one in the stored tree, not the column's.** `pg_get_expr` deparses
+#     a parse tree, so what it names is what the coercion left there. A bare literal on an
+#     `interval(3)` column is coerced to the column's type and prints `::interval(3)`; a default
+#     written `::interval` on that same column prints `::interval`, because that is the cast the
+#     user put in the tree.
+#   * **`INTERVAL '3 years'` behaves like the bare cast, not like the bare literal.** The typed
+#     literal names its own type without a modifier, so `e` prints `::interval` where `b` — the
+#     same column type, the same value, no cast written — prints `::interval(3)`.
+#   * **`interval` is the only type that carries its modifier**, and the reason is measurable
+#     rather than arbitrary: it is also the only type whose stored default is *folded through* its
+#     typmod. A `timestamp(3)` default keeps all six fractional digits and prints a bare
+#     `::timestamp without time zone`; a `varchar(5)` prints `::character varying`; a
+#     `numeric(10,2)` prints no cast at all. A modifier that changes the value is one the printed
+#     cast has to carry, and one that only bounds it is not.
+#   * **The table is created and dropped outside a transaction**, which is not tidiness: this
+#     capture's declared types come from a `\gdesc` pass that runs in a second session *after* the
+#     whole script, so anything the script destroys — by `ROLLBACK` or by `DROP` — is invisible to
+#     it and the types field comes back empty. The drop and its proof are a second pass.
+#   * **`interval hour to second(3)` is deliberately absent.** Its default reads
+#     `'01:02:03.457'::interval hour to second(3)` on a real server and this node has no
+#     representation for an interval's field list at all, so including it would make this file red
+#     for a different defect. It is measured in `esker-coord/s2-h103b.out` and carried by its own
+#     row.
+CREATE TABLE h103e (a interval DEFAULT '3 years', b interval(3) DEFAULT '3 years', c interval(3) DEFAULT '3 years'::interval, d interval(3) DEFAULT '3 years'::interval(3), e interval(3) DEFAULT INTERVAL '3 years', f timestamp(3) DEFAULT '2020-01-01 00:00:00.123456', g numeric(10,2) DEFAULT 1.5, h varchar(5) DEFAULT 'abc')		-
+SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum WHERE d.adrelid = 'h103e'::regclass ORDER BY a.attnum	name,text	a|'3 years'::interval ; b|'3 years'::interval(3) ; c|'3 years'::interval ; d|'3 years'::interval(3) ; e|'3 years'::interval ; f|'2020-01-01 00:00:00.123456'::timestamp without time zone ; g|1.5 ; h|'abc'::character varying
+SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = 'h103e'::regclass AND a.attnum > 0 ORDER BY a.attnum	name,text	a|interval ; b|interval(3) ; c|interval(3) ; d|interval(3) ; e|interval(3) ; f|timestamp(3) without time zone ; g|numeric(10,2) ; h|character varying(5)
+DROP TABLE h103e		-
+SELECT count(*) FROM pg_class WHERE relname = 'h103e'	bigint	0
