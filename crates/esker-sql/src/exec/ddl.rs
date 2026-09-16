@@ -6501,7 +6501,7 @@ fn reprinted_by_pg_get_expr(expr: &plan::Expr) -> bool {
                 if matches!(**value, Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)
                     | Datum::Numeric(_) | Datum::Real(_) | Datum::Double(_)
                     // **`INTERVAL '3 years'` is a typed literal with no cast around it**, which
-                    // `sqlparser` gives its own node and `parse::lower` folds to this datum. A
+                    // the parser gives its own node and `parse::lower` folds to this datum. A
                     // real server prints it `'3 years'::interval` — the bare type, not the
                     // column's — where this node kept the text as written, `(INTERVAL '3 years')`.
                     | Datum::Interval { .. })),
