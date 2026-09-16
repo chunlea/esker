@@ -666,11 +666,17 @@ pub(super) fn matching_rows_as(
 /// * and an **unknown literal** is neither: it takes the other arm's type and then fails to parse
 ///   as it, which is why `SELECT 1 UNION ALL SELECT 'abc'` is `22P02 invalid input syntax for type
 ///   integer` — decided in the lowering, where a literal still is one.
+// **Over clippy's line limit by three, and suppressed rather than split.** #105 added the
+// operator word to three refusals inside this function; `refusal_word` above took the
+// computation out and it is still three lines over. Splitting the last loop out needs the
+// element type of `columns` named in a signature, which is a change this unit did not measure.
+#[allow(clippy::too_many_lines)]
 pub(super) fn append(
     select: &Select,
     arms: Vec<(Option<(crate::plan::SetOp, bool)>, Planned)>,
 ) -> Result<Planned> {
     let ops: Vec<Option<(crate::plan::SetOp, bool)>> = arms.iter().map(|(op, _)| *op).collect();
+    let op_word = refusal_word(&ops);
     let mut arms = arms.into_iter().map(|(_, planned)| planned);
     let first = arms
         .next()
@@ -693,7 +699,7 @@ pub(super) fn append(
     let mut nodes = vec![first.node];
     for arm in arms {
         if arm.columns.len() != columns.len() {
-            return Err(SqlError::SetOperationArity);
+            return Err(SqlError::SetOperationArity { op: op_word });
         }
         for (at, column) in arm.columns.iter().enumerate() {
             // **An arm with no type of its own does not get a vote** (#75). PostgreSQL resolves a
@@ -735,12 +741,15 @@ pub(super) fn append(
                 column.user_type.as_ref(),
                 columns[at].ty,
                 column.ty,
-                Unifying::SetOperation,
+                Unifying::SetOperation(op_word),
             )?;
             // **The same `select_common_type` a `COALESCE` and a `CASE` ask** — this path had
             // both of its passes and the right two sentences first, and `common_of` is that rule
             // written once so the other two stopped having their own.
-            columns[at].ty = common_of(&[columns[at].ty, column.ty], Unifying::SetOperation)?;
+            columns[at].ty = common_of(
+                &[columns[at].ty, column.ty],
+                Unifying::SetOperation(op_word),
+            )?;
             // A typmod survives only where both arms agree on it, the way a `CASE`'s does: a
             // `varchar(3)` beside a `varchar(5)` is a `varchar` with no length on a real server.
             if columns[at].typmod != column.typmod {
@@ -770,6 +779,7 @@ pub(super) fn append(
             let to = columns[at].ty;
             if !reaches_implicitly(*from, to) {
                 return Err(SqlError::SetOperationCannotConvert {
+                    op: op_word,
                     from: from.name().to_owned(),
                     to: to.name().to_owned(),
                 });
@@ -821,6 +831,20 @@ pub(super) fn append(
         junk: 0,
         limit: None,
     })
+}
+
+/// The word all three of a set operation's refusals name.
+///
+/// Until #105 they all said `UNION`, because no other operator could be planned and so none could
+/// reach them; now the operator that was written is carried into them. A chain that **mixes**
+/// operators names the first one written — not measured on 19beta1, and every statement the
+/// corpora pin uses one operator throughout.
+fn refusal_word(ops: &[Option<(crate::plan::SetOp, bool)>]) -> &'static str {
+    ops.iter()
+        .flatten()
+        .map(|(op, _)| op.name())
+        .next()
+        .unwrap_or("UNION")
 }
 
 /// An `ORDER BY` written after the last arm, resolved against the set's output columns.
@@ -882,12 +906,35 @@ fn set_order_keys(select: &Select, columns: &[OutputColumn]) -> Result<Vec<SortK
 fn combine(nodes: Vec<Node>, ops: &[Option<(crate::plan::SetOp, bool)>]) -> Node {
     let mut pending: Vec<Node> = Vec::new();
     for (node, op) in nodes.into_iter().zip(ops) {
-        pending.push(node);
-        // The first arm has no operator; every other one either extends the append or closes it.
-        if matches!(op, Some((_, false))) {
-            pending = vec![Node::Distinct {
-                input: Box::new(one_of(pending)),
-            }];
+        // **`INTERSECT` and `EXCEPT` take everything to their left**, not just the arm beside
+        // them: `a UNION b EXCEPT c` is `(a ∪ b) − c`. So the arm is *not* pushed onto the
+        // pending run — the run becomes the left side and the arm becomes the right one.
+        //
+        // Precedence is already in the plan and does not have to be recovered here: a chain of
+        // equal operators lowers flat and a mixed one lowers nested, so
+        // `a EXCEPT b INTERSECT b` arrives as one `Except` arm whose own `set_arms` hold the
+        // `Intersect` — measured, by
+        // `tests/lowering.rs::a_mixed_set_operator_chain_keeps_its_grouping`.
+        if let Some((joined @ (crate::plan::SetOp::Intersect | crate::plan::SetOp::Except), all)) =
+            op
+        {
+            let left = Box::new(one_of(std::mem::take(&mut pending)));
+            let right = Box::new(node);
+            let all = *all;
+            pending.push(if matches!(joined, crate::plan::SetOp::Intersect) {
+                Node::Intersect { left, right, all }
+            } else {
+                Node::Except { left, right, all }
+            });
+        } else {
+            // The first arm has no operator; every other one either extends the append or
+            // closes it.
+            pending.push(node);
+            if matches!(op, Some((_, false))) {
+                pending = vec![Node::Distinct {
+                    input: Box::new(one_of(pending)),
+                }];
+            }
         }
     }
     one_of(pending)
@@ -1087,8 +1134,12 @@ fn coerce_arm(
 /// `CASE` alike. Measured for all three.
 #[derive(Clone, Copy)]
 pub(super) enum Unifying {
-    /// `UNION`, `INTERSECT`, `EXCEPT`.
-    SetOperation,
+    /// `UNION`, `INTERSECT`, `EXCEPT` — carrying **which one**, so all three of the set
+    /// operation's sentences can name the operator that was written.
+    ///
+    /// A `&'static str` rather than a [`crate::plan::SetOp`]: it is what the error variants hold
+    /// and what `SetOp::name` already returns, and it keeps this enum `Copy`.
+    SetOperation(&'static str),
     /// `COALESCE`, whose arguments are walked left to right.
     Coalesce,
     /// A `CASE`'s results, whose list starts at the `ELSE`.
@@ -1120,7 +1171,8 @@ impl Unifying {
     /// at its `ELSE`) beside `COALESCE types h_mood and text cannot be matched` (left to right).
     fn mismatch_named(self, left: &str, right: &str) -> SqlError {
         match self {
-            Unifying::SetOperation => SqlError::SetOperationTypes {
+            Unifying::SetOperation(op) => SqlError::SetOperationTypes {
+                op,
                 left: left.to_owned(),
                 right: right.to_owned(),
             },
@@ -1151,7 +1203,8 @@ impl Unifying {
     /// sentence spells both: `COALESCE could not convert type h_other to h_mood`, measured.
     fn cannot_convert_named(self, from: &str, to: &str) -> SqlError {
         match self {
-            Unifying::SetOperation => SqlError::SetOperationCannotConvert {
+            Unifying::SetOperation(op) => SqlError::SetOperationCannotConvert {
+                op,
                 from: from.to_owned(),
                 to: to.to_owned(),
             },
@@ -1255,6 +1308,12 @@ pub(super) fn unify(left: ColumnType, right: ColumnType) -> Result<ColumnType> {
     }
     if pg_catalog::typcategory(left) != pg_catalog::typcategory(right) {
         return Err(SqlError::SetOperationTypes {
+            // **Not a set operation's sentence, and it never was.** `unify` is the general
+            // two-type helper — `exec::subquery` and two expression paths call it — and the word
+            // it writes has said `UNION` since long before #105. It is carried as a literal so
+            // that the variant's new field does not imply this path learned an operator it does
+            // not have; giving these callers their own construct's word is its own unit.
+            op: "UNION",
             left: left.name().to_owned(),
             right: right.name().to_owned(),
         });

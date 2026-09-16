@@ -570,7 +570,6 @@ fn plan_set_of(
     };
     let mut planned = vec![(None, plan_select_of(&first, tenant, tables, outer)?)];
     for arm in &select.set_arms {
-        crate::exec::set_arm_supported(arm)?;
         planned.push((
             Some((arm.op, arm.all)),
             plan_select_of(&arm.select, tenant, tables, outer)?,
@@ -1352,6 +1351,12 @@ fn for_each_node_expr(node: &Node, visit: &mut impl FnMut(&Expr)) {
                 for_each_node_expr(arm, visit);
             }
         }
+        // Both sides, for the reason `Append` gives: an expression naming an outer column can sit
+        // in either one, and the right side of an `EXCEPT` is as much a query as the left.
+        Node::Intersect { left, right, .. } | Node::Except { left, right, .. } => {
+            for_each_node_expr(left, visit);
+            for_each_node_expr(right, visit);
+        }
         Node::Filter { input, predicate } => {
             visit(predicate);
             for_each_node_expr(input, visit);
@@ -1443,6 +1448,11 @@ fn for_each_node_expr_mut(node: &mut Node, visit: &mut impl FnMut(&mut Expr)) {
             for arm in arms {
                 for_each_node_expr_mut(arm, visit);
             }
+        }
+        // Both sides, for the reason the immutable walk gives.
+        Node::Intersect { left, right, .. } | Node::Except { left, right, .. } => {
+            for_each_node_expr_mut(left, visit);
+            for_each_node_expr_mut(right, visit);
         }
         Node::Filter { input, predicate } => {
             visit(predicate);

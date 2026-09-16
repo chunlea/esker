@@ -2937,15 +2937,23 @@ pub enum SqlError {
     ///
     /// **`42601`, the grammar's code**, not a typing one — measured.
     ///
-    /// **The operator names itself and this said it does not.** Measured on 19beta1, 2026-09-11:
-    /// `SELECT 1, 2 INTERSECT SELECT 3` is `each INTERSECT query must have the same number of
-    /// columns`. The word is left hard-coded because `INTERSECT` and `EXCEPT` are `0A000 … is not
-    /// supported` (`exec::set_arm_supported`), so no statement this node can plan reaches this
-    /// sentence with another word in it — and the two sentences below say `UNION` for the same
-    /// reason. `tests/set_operation_enum.rs` pins the `0A000`, so the day either operator is built
-    /// the test that stops passing names all three.
-    #[error("each UNION query must have the same number of columns")]
-    SetOperationArity,
+    /// **The operator names itself.** Measured on 19beta1, 2026-09-11: `SELECT 1, 2 INTERSECT
+    /// SELECT 3` is `each INTERSECT query must have the same number of columns`.
+    ///
+    /// The word was hard-coded while `INTERSECT` and `EXCEPT` were `0A000 … is not supported`,
+    /// because no statement this node could plan reached this sentence with another word in it;
+    /// `tests/set_operation_enum.rs` pinned that `0A000` so that the day either operator was built,
+    /// the test that stopped passing would name all three sentences to re-measure. **#105 is that
+    /// day.** The operator is carried here now, and the two sentences below carry it for the same
+    /// reason.
+    #[error("each {op} query must have the same number of columns")]
+    SetOperationArity {
+        /// The operator as written, from [`crate::plan::SetOp::name`].
+        ///
+        /// A chain that **mixes** operators is not measured; this names the first one written.
+        /// Every statement the corpora pin uses a single operator throughout.
+        op: &'static str,
+    },
 
     /// Two arms of a set operation whose columns have no common type.
     ///
@@ -2953,8 +2961,11 @@ pub enum SqlError {
     /// `UNION types text and integer cannot be matched` and the reverse says `integer and text`.
     /// An *unknown literal* never reaches here — it takes the other arm's type and fails to parse
     /// as it, which is `22P02` and a different sentence.
-    #[error("UNION types {left} and {right} cannot be matched")]
+    #[error("{op} types {left} and {right} cannot be matched")]
     SetOperationTypes {
+        /// The operator as written — see [`SqlError::SetOperationArity`]'s field for the one shape
+        /// that is not measured.
+        op: &'static str,
         /// The first arm's type, named as a client would write it.
         ///
         /// Owned, because an arm may be of a **user-defined** type: `SELECT m FROM t UNION SELECT
@@ -2992,8 +3003,10 @@ pub enum SqlError {
     /// `money` beside `numeric` is `42846 UNION could not convert type numeric to money`, and
     /// `json` beside `jsonb` the same — one category, no implicit cast in either direction, and
     /// the type it *could not convert* is the later arm's.
-    #[error("UNION could not convert type {from} to {to}")]
+    #[error("{op} could not convert type {from} to {to}")]
     SetOperationCannotConvert {
+        /// The operator as written — see [`SqlError::SetOperationArity`]'s field.
+        op: &'static str,
         /// The arm's type, named as a client would write it. Owned for
         /// [`SqlError::SetOperationTypes`]'s reason: **two enums** are one category, so this is the
         /// sentence they get — `UNION could not convert type other_mood to mood`, measured.
@@ -3306,7 +3319,7 @@ impl SqlError {
             | SqlError::DoubledClause(_)
             // **The grammar's, not the type system's** — measured: a set operation whose arms are
             // different widths is `42601` where two arms with no common type are `42804`.
-            | SqlError::SetOperationArity
+            | SqlError::SetOperationArity { .. }
             // PostgreSQL's type-name grammar, refusing in the same class as its statement
             // grammar: `'timestamp(-1)'::regtype` and `''::regtype` are both `42601`.
             | SqlError::TypeNameSyntax(_)

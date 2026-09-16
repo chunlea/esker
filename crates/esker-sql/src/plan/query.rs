@@ -776,6 +776,47 @@ pub enum Node {
         /// The arms, in the order written. At least two, or the planner would not have built one.
         arms: Vec<Node>,
     },
+    /// `INTERSECT [ALL]`: the rows both sides hold, counted rather than tested for membership.
+    ///
+    /// **The right side is materialised and the left side streams.** A row of the left cannot be
+    /// emitted until the right side is known in full, which is what separates these two from
+    /// [`Node::Append`] — that one is a concatenation and materialises nothing.
+    ///
+    /// `all` is the quantifier as written. `INTERSECT ALL` emits `min(left_count, right_count)` of
+    /// each value; `INTERSECT` is the same walk with both counts clamped to one. They share one
+    /// implementation rather than the second being the first under a [`Node::Distinct`], because
+    /// for [`Node::Except`] that wrapping would be wrong — its deduplication happens *before* the
+    /// subtraction, not after it.
+    Intersect {
+        /// Everything written to the left of the operator, already folded into one node. It
+        /// **streams**: its rows are pulled one at a time and answered in its own order.
+        left: Box<Node>,
+        /// The arm written to the right. It is **drained in full before the first left row is
+        /// answered**, because a row of the left cannot be judged until the right is known.
+        right: Box<Node>,
+        /// The quantifier as written. `true` keeps multiplicity — what both sides hold,
+        /// counted; `false` clamps both counts to one, which is the same walk and not a
+        /// [`Node::Distinct`] above it.
+        all: bool,
+    },
+    /// `EXCEPT [ALL]`: multiset subtraction, measured against 19beta1 and not guessed.
+    ///
+    /// `EXCEPT ALL` is **not** "`EXCEPT` without the deduplication": over `{1,2,2,3}` and
+    /// `{2,3,3,4}` it answers `1 ; 2`, because the left holds `2` twice and the right holds it
+    /// once, so one survives. `EXCEPT` over the same data answers `1` alone
+    /// (`tests/corpus/pg19_set_operators.txt`, lines 34-35).
+    Except {
+        /// Everything written to the left of the operator, already folded into one node. It
+        /// **streams**: its rows are pulled one at a time and answered in its own order.
+        left: Box<Node>,
+        /// The arm written to the right. It is **drained in full before the first left row is
+        /// answered**, because a row of the left cannot be judged until the right is known.
+        right: Box<Node>,
+        /// The quantifier as written. `true` keeps multiplicity — what the left side holds and
+        /// the right does not, counted; `false` clamps both counts to one, which is the same walk
+        /// and not a [`Node::Distinct`] above it.
+        all: bool,
+    },
     /// An aggregate evaluated on columnar replicas, one fragment per region, finished here.
     ///
     /// **It stands exactly where a [`Node::Aggregate`] stood**, and produces exactly the row that
@@ -954,6 +995,11 @@ impl Node {
             // **Every arm**, and this is the node the doc above is about: a pass that missed one
             // would hide a sequence read in the second arm of a `UNION ALL`.
             Node::Append { arms } => arms.iter_mut().collect(),
+            // Both sides, for the reason the doc above gives: the right side is a whole plan and a
+            // pass that skipped it would hide a sequence read inside an `EXCEPT`'s subtrahend.
+            Node::Intersect { left, right, .. } | Node::Except { left, right, .. } => {
+                vec![left, right]
+            }
             Node::OneRow
             | Node::Values { .. }
             // A leaf: its rows are values a round put there, and it has no input.
@@ -1189,6 +1235,22 @@ impl Node {
                 "Append".to_owned(),
                 arms.first(),
                 (arms.len() > 1).then(|| format!("Arms: {}", arms.len())),
+            ),
+            // The same shape and the same limitation as `Append` above: one child is returned, so
+            // the left side is shown and the right side is named only by the operator. Giving a
+            // node two subtrees is a change to every node's arm and is not this unit's.
+            // The parentheses are deliberate: `if a { x } else { y }.to_owned()` reads as though
+            // the call might apply to the `else` arm alone, and a reader should not have to know
+            // the precedence rule to be sure it does not.
+            Node::Intersect { left, all, .. } => (
+                (if *all { "Intersect All" } else { "Intersect" }).to_owned(),
+                Some(&**left),
+                None,
+            ),
+            Node::Except { left, all, .. } => (
+                (if *all { "Except All" } else { "Except" }).to_owned(),
+                Some(&**left),
+                None,
             ),
             Node::NestedLoop {
                 outer,

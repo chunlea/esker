@@ -33,25 +33,18 @@ const FIXTURE: &[&str] = &[
 /// What this node answers differently, and why.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
-    answers: &[
-        (
-            "SELECT 'r', m FROM h_t WHERE id = 1 EXCEPT SELECT 'r', 'sad'",
-            "**`UNION` is the only set operator this node implements.** `EXCEPT` is `0A000`, and \
-             so is the `INTERSECT` below it — the word in `SetOperationTypes` is hard-coded for \
-             that reason (`error.rs`). Each is a gap of its own and neither is this row's: the \
-             rule under test is the one the `UNION` statements above exercise, and these two are \
-             in the corpus because a real server resolves the arms of all four alike. Both were \
-             captured inside a `SAVEPOINT` of their own, so that a refusal this node writes \
-             cannot swallow the rest of the session.",
-            "pg19_enum_unknown_literal.txt:43",
-        ),
-        (
-            "SELECT 'r', m FROM h_t WHERE id = 1 INTERSECT SELECT 'r', 'ok'",
-            "`INTERSECT` is `0A000` for the same reason the `EXCEPT` above it is, and is listed \
-             separately so the ratchet can say when either one stops needing it.",
-            "pg19_enum_unknown_literal.txt:46",
-        ),
-    ],
+    // **Two entries left here on 2026-09-16, and the prose that explained them left with them.**
+    // They declared `SELECT 'r', m FROM h_t WHERE id = 1 EXCEPT SELECT 'r', 'sad'` and the
+    // `INTERSECT` beside it as divergences, on the ground that "`UNION` is the only set operator
+    // this node implements" and that the word in `SetOperationTypes` was hard-coded for that
+    // reason. #105 implemented both operators and threaded the word through
+    // `Unifying::SetOperation`, so neither statement diverges any longer — and the second entry's
+    // own promise, "listed separately so the ratchet can say when either one stops needing it",
+    // is what says to delete them rather than leave them declared and green.
+    //
+    // The two corpus rows they covered (`pg19_enum_unknown_literal.txt:43` and `:46`) are enforced
+    // from now on; 19beta1 answers `r|ok` to both, which is what this node must answer too.
+    answers: &[],
 };
 
 /// One statement's answer with the `DETAIL` and `HINT` cut off — the type names are what is being

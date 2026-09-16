@@ -628,20 +628,6 @@ const WAIT_STEP_MS: u64 = 2;
 /// statement that reaches the ceiling is behind a queue that keeps refilling.
 const MAX_STATEMENT_RESTARTS: u32 = 32;
 
-/// Whether this node runs the operator an arm joins on, or names it.
-///
-/// **`UNION` and `UNION ALL` both run**; the other two are refused by name. `INTERSECT` and
-/// `EXCEPT` answer on a real server (`tests/captures/pg19_set_operations.txt` measures both), and
-/// nothing in the suite writes one — they need a materialised side and a multiplicity rule of
-/// their own (`INTERSECT ALL` is `min(count)` per row, `EXCEPT ALL` is the difference), which is a
-/// unit rather than an arm of this one.
-pub(super) fn set_arm_supported(arm: &crate::plan::SetArm) -> Result<()> {
-    if arm.op == crate::plan::SetOp::Union {
-        return Ok(());
-    }
-    Err(SqlError::unsupported(arm.op.name()))
-}
-
 impl Executor {
     /// The table as an `Arc`, for a deferred check that outlives the statement.
     ///
@@ -2328,7 +2314,6 @@ impl Executor {
         };
         let mut planned = vec![(None, self.plan_select(txn, &first)?)];
         for arm in &select.set_arms {
-            set_arm_supported(arm)?;
             let arm_plan = self.plan_select(txn, &arm.select)?;
             // **`UNION` deduplicates, and that needs an equality operator class per column** —
             // the same question `DISTINCT` and `GROUP BY` ask, so it reads the same list. `UNION
@@ -5464,9 +5449,11 @@ impl Executor {
             //
             // **Three things move together**, which is why the dispatch is the fix rather than a
             // type rule: the oid, the **typmod** (`varchar(3) UNION varchar(5)` has none, and the
-            // head arm's 7 was going out), and the **refusal** — `set_arm_supported` is what makes
-            // `INTERSECT`/`EXCEPT` a `0A000` at `Describe` instead of a shape this node then
-            // refuses at `Execute`.
+            // head arm's 7 was going out), and — while the other two operators were refused —
+            // the **refusal**, which had to happen at `Describe` rather than as a shape this node
+            // would then decline to run. #105 built them, so what is left of that third thing is
+            // that `Describe` must answer the column `Execute` produces, which this dispatch is
+            // still what makes true (`tests/set_operation.rs`).
             Statement::Select(select) if !select.set_arms.is_empty() => Some(
                 self.plan_set_operation(txn, select)?
                     .columns

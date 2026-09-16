@@ -198,6 +198,30 @@ enum Kind<'a> {
         input: Box<Cursor<'a>>,
         seen: BTreeSet<GroupKey>,
     },
+    /// `INTERSECT`/`EXCEPT`: the third node that cannot stream both sides.
+    ///
+    /// The **right** side is drained on the first call into a count per distinct row, and the left
+    /// side then streams against it — so the output keeps the left side's order, which for a query
+    /// with no `ORDER BY` is deterministic here where a real server's is not (the same property
+    /// [`Kind::Distinct`] has and for the same reason).
+    ///
+    /// One walk answers all four forms; see [`Kind::next`] for the arithmetic.
+    SetOp {
+        left: Box<Cursor<'a>>,
+        /// `Some` until the first call drains it into `counts`, then `None` — the same
+        /// take-once shape [`Kind::Sort`] and [`Kind::Aggregate`] use to say "already drained".
+        right: Option<Box<Cursor<'a>>>,
+        /// `INTERSECT` when true, `EXCEPT` when false. The two differ by one comparison and share
+        /// everything else, which is why they are one `Kind` and not two.
+        intersect: bool,
+        /// The quantifier as written: `true` keeps multiplicity, `false` clamps both counts to one.
+        all: bool,
+        /// How many times each distinct row appears on the right — a **multiset**, which is
+        /// what makes `INTERSECT ALL` and `EXCEPT ALL` arithmetic rather than membership tests.
+        counts: BTreeMap<GroupKey, usize>,
+        /// The values already emitted, for the two non-`ALL` forms. Unused when `all`.
+        seen: BTreeSet<GroupKey>,
+    },
     /// A nested-loop join. The outer side streams; the inner side is either one probe per outer
     /// row (at most one row back) or the whole inner table, read once and paired with each.
     NestedLoop {
@@ -622,6 +646,18 @@ impl<'a> Cursor<'a> {
                 input: Box::new(Cursor::open(txn, tenant, settings, input)?),
                 seen: BTreeSet::new(),
             },
+            // Both sides are *opened* here and neither is read: opening is cheap and says nothing
+            // about when rows are pulled. The right side is drained on the first call, not now.
+            Node::Intersect { left, right, all } | Node::Except { left, right, all } => {
+                Kind::SetOp {
+                    left: Box::new(Cursor::open(txn, tenant, settings, left)?),
+                    right: Some(Box::new(Cursor::open(txn, tenant, settings, right)?)),
+                    intersect: matches!(node, Node::Intersect { .. }),
+                    all: *all,
+                    counts: BTreeMap::new(),
+                    seen: BTreeSet::new(),
+                }
+            }
             // **Resolved before the cursor is opened, never here.** A columnar node's rows come
             // from a network call to a columnar learner, which this type has no way to make and
             // deliberately does not: everything a `Cursor` does happens inside one transaction
@@ -1043,6 +1079,67 @@ impl<'a> Cursor<'a> {
                     // -- which for a `DISTINCT` with no `ORDER BY` is primary key order, and is
                     // deterministic where a real server's is not.
                     if seen.insert(GroupKey(row.clone())) {
+                        return Ok(Some(row));
+                    }
+                }
+                Ok(None)
+            }
+
+            // **One walk, four answers.** Each value's output count is a function of its count on
+            // each side, which is why this is arithmetic and not a membership test:
+            //
+            // | form | emitted per value |
+            // |---|---|
+            // | `INTERSECT ALL` | `min(left, right)` |
+            // | `EXCEPT ALL` | `max(left - right, 0)` |
+            // | `INTERSECT` | one, if the right side holds it at all |
+            // | `EXCEPT` | one, if the right side does not |
+            //
+            // The `ALL` forms get their arithmetic for free by *consuming* the right side's count
+            // as left rows arrive: an `INTERSECT ALL` emits while the count lasts, an `EXCEPT ALL`
+            // skips while it lasts and emits afterwards. Neither counts the left side, so a left
+            // side of any size streams in constant space beyond the right side's distinct values.
+            Kind::SetOp {
+                left,
+                right,
+                intersect,
+                all,
+                counts,
+                seen,
+            } => {
+                if let Some(mut source) = right.take() {
+                    while let Some(row) = source.next()? {
+                        // Bounded exactly as `Distinct` and the group table are, and for the same
+                        // reason: this is memory spent on a client's behalf, so it answers `53400`
+                        // rather than growing without a limit.
+                        if counts.len() == GROUP_LIMIT {
+                            return Err(SqlError::ConfigurationLimitExceeded(format!(
+                                "a set operation whose right side holds more than {GROUP_LIMIT} \
+                                 distinct rows needs more memory than this node will use; add a \
+                                 WHERE or a LIMIT"
+                            )));
+                        }
+                        *counts.entry(GroupKey(row)).or_insert(0) += 1;
+                    }
+                }
+                while let Some(row) = left.next()? {
+                    let key = GroupKey(row.clone());
+                    if *all {
+                        // `filter` is what makes an exhausted count read as absent, so a value the
+                        // right side has already spent does not keep matching.
+                        match (*intersect, counts.get_mut(&key).filter(|n| **n > 0)) {
+                            (true, Some(n)) => {
+                                *n -= 1;
+                                return Ok(Some(row));
+                            }
+                            (false, Some(n)) => *n -= 1,
+                            (true, None) => {}
+                            (false, None) => return Ok(Some(row)),
+                        }
+                    } else if counts.contains_key(&key) == *intersect && seen.insert(key) {
+                        // The deduplication is *here* and not in a `Distinct` above: for `EXCEPT`
+                        // it has to happen before the subtraction, and a wrapper would put it
+                        // after.
                         return Ok(Some(row));
                     }
                 }

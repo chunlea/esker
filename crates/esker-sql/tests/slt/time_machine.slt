@@ -252,10 +252,15 @@ SELECT * FROM esker_diff('d', 'd1')
 statement error (42704)
 SELECT * FROM esker_diff('d', 'no-such-checkpoint')
 
-# EXCEPT stays 0A000: implementing general set operations to reach a two-table diff would be a
-# larger feature refused in a smaller disguise.
-statement error (0A000)
+# `EXCEPT` answers since #105, and it still is not a diff. This pinned `0A000` on the reasoning that
+# "implementing general set operations to reach a two-table diff would be a larger feature refused in
+# a smaller disguise" -- they were built for their own sake instead, so the refusal is gone and the
+# comment went with it. What survives is the half that mattered: `esker_diff` is still ADR 0021's two
+# scans over one table's row range, and a set operation is not a substitute for it. A table minus
+# itself is empty, which is what this asks for now.
+query I
 SELECT id FROM d EXCEPT SELECT id FROM d
+----
 
 # --- esker_flashback
 # ADR 0021 Decision 3's fourth verb, and the one whose *design* is the point. A flashback writes the

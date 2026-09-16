@@ -995,16 +995,26 @@ fn a_diff_of_a_table_that_did_not_exist_yet_is_42p01() {
     assert_eq!(error.sqlstate(), sqlstate::UNDEFINED_TABLE);
 }
 
-/// `EXCEPT` stays `0A000`. Implementing general set operations to reach a two-table diff would be
-/// a larger feature refused in a smaller disguise, and the diff that exists is the one ADR 0021
-/// describes: two scans over one table's row range, and a merge.
+/// **`EXCEPT` answers now, and it still is not a diff.**
+///
+/// This test asserted `0A000 EXCEPT is not supported` and was named for it
+/// (`except_is_still_refused_by_name`), on the reasoning that "implementing general set operations
+/// to reach a two-table diff would be a larger feature refused in a smaller disguise". #105
+/// implemented them for their own sake rather than to reach a diff, so the refusal it pinned is
+/// gone — and the name and that paragraph went with the assertion, because a dead claim survives
+/// in both.
+///
+/// **The half that mattered survives**: `esker_diff` is still the one ADR 0021 describes — two
+/// scans over **one** table's row range, and a merge — and a set operation is not a substitute for
+/// it. So this asserts only that the operator is no longer refused; what its rows are is
+/// `tests/set_operator_rows.rs`'s question and not this file's.
 #[test]
-fn except_is_still_refused_by_name() {
+fn except_answers_and_is_still_not_a_diff() {
     let mut node = Node::new();
     node.run("CREATE TABLE t (id int8 PRIMARY KEY)").unwrap();
-    let error = node.fails("SELECT id FROM t EXCEPT SELECT id FROM t");
-    assert_eq!(error.sqlstate(), sqlstate::FEATURE_NOT_SUPPORTED);
-    assert_eq!(error.to_string(), "EXCEPT is not supported");
+    node.run("INSERT INTO t VALUES (1), (2)").unwrap();
+    node.run("SELECT id FROM t EXCEPT SELECT id FROM t")
+        .expect("EXCEPT is implemented since #105 and no longer refuses");
 }
 
 /// `ADD COLUMN` rewrites no row (ADR 0019), so a row nobody touched has the **same bytes** on both

@@ -1,13 +1,12 @@
-//! **`EXCEPT` and `INTERSECT`, the two set operators this node does not have** — `debts-v1.1.md`
-//! #105.
+//! **`EXCEPT` and `INTERSECT`, enforced against 19beta1** — `debts-v1.1.md` #105.
 //!
-//! `UNION` is implemented and these two are `0A000`, so every statement this corpus replays is one
-//! the node refuses outright today. The file is a capture of what it must answer, not of what it
-//! answers, and it is **`#[ignore]`d until #105 is paid**. Ignored rather than declared as a
-//! divergence: a divergence says "this node deliberately answers differently", and eighteen
-//! statements that are all one unimplemented feature are not eighteen decisions. The ignore names
-//! the row, so the day the feature lands the attribute comes off and the whole capture starts
-//! being enforced at once.
+//! While `UNION` was the only operator this node had, every statement here was one it refused
+//! outright, so the file was a capture of what it *must* answer and the runner was `#[ignore]`d
+//! with #105's number in the attribute — ignored rather than declared as eighteen divergences,
+//! because a divergence says "this node deliberately answers differently" and eighteen statements
+//! that are one unimplemented feature are not eighteen decisions. **#105 landed, so the attribute
+//! came off and all eighteen are enforced at once**, which is what the ignore was written to make
+//! happen.
 //!
 //! Three things the capture settles that reasoning would get wrong, all measured on 19beta1
 //! (`esker-coord/s2-h105.out`):
@@ -33,13 +32,13 @@ mod parity;
 /// Nothing: the corpus builds its own tables.
 const CORPUS_FIXTURE: &[&str] = &[];
 
-/// **Empty, and the test is ignored instead.**
+/// **Empty, and now it is a claim rather than a placeholder.**
 ///
-/// The two `EXCEPT`/`INTERSECT` statements that *are* declared as divergences live in
-/// `tests/enum_unknown_literal.rs`, where they sit among statements that do pass and would
-/// otherwise stop the file. Here every statement is the same missing feature, so declaring each one
-/// would be eighteen copies of a single fact — and a declared divergence that is really a debt
-/// hides the debt behind a green run.
+/// It was empty because the runner was ignored instead: eighteen statements that are one missing
+/// feature are not eighteen decisions, and a declared divergence that is really a debt hides the
+/// debt behind a green run. Since #105 it is empty for the opposite reason — every statement here
+/// is one this node is expected to answer exactly as 19beta1 does. The two `EXCEPT`/`INTERSECT`
+/// rows that *were* declared, in `tests/enum_unknown_literal.rs`, were deleted in the same commit.
 const DIVERGENCES: parity::Divergences = parity::Divergences {
     types: &[],
     answers: &[],
@@ -50,7 +49,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
 /// The count is asserted because a corpus that fails to load replays nothing and passes: "all zero
 /// statements agreed" is the shape of a green run that measured nothing at all.
 #[test]
-#[ignore = "#105: EXCEPT and INTERSECT are 0A000 on this node; the corpus is what they must answer"]
 fn every_set_operator_answer_is_postgresql_19_s() {
     let checked = parity::replay(
         include_str!("corpus/pg19_set_operators.txt"),

@@ -35,15 +35,14 @@
 //! `money`/`numeric` already draws in `append`'s comments — this is that rule with the identity
 //! `ColumnType` cannot spell.
 //!
-//! **The operator names itself in all three sentences, and this node cannot show it.**
+//! **The operator names itself in all three sentences, and since #105 this node shows it.**
 //! `INTERSECT could not convert`, `EXCEPT types … cannot be matched` and `each INTERSECT query
-//! must have the same number of columns` are all measured on 19beta1 —
-//! `SqlError::SetOperationArity`'s doc comment asserted the opposite ("the sentence a real server
-//! gives whichever operator is written"), a claim with no test under it. But `INTERSECT` and
-//! `EXCEPT` are `0A000 … is not supported` here (`exec::set_arm_supported`), so no statement this
-//! node can plan reaches those sentences with anything but `UNION` in it. The comments say what
-//! was measured; the word is left hard-coded rather than threaded through a path nothing can
-//! exercise, and the `0A000` is pinned below so the claim has a test under it at last.
+//! must have the same number of columns` are all measured on 19beta1. While the other two
+//! operators were `0A000 … is not supported`, no statement this node could plan reached those
+//! sentences with anything but `UNION` in it, so the word was hard-coded rather than threaded
+//! through a path nothing could exercise — and the `0A000` was pinned below so the claim had a
+//! test under it. #105 built the operators and threaded the word through `Unifying::SetOperation`,
+//! so that pin has been cashed in: the test below now asserts the two measured sentences.
 //!
 //! **Two gaps this found and does not fix.** The first is **#76**: a set operation inside a
 //! derived table or a `WITH` never reaches `Executor::resolve_user_cast`, so its arms' casts are
@@ -175,24 +174,27 @@ fn two_enums_in_one_set_operation_are_refused() {
     );
 }
 
-/// **Why the operator word cannot be shown to be wrong yet.**
+/// **The operator names itself in the sentence it was refused with** — which is the handover the
+/// test that stood here was written to make.
 ///
-/// All three of this path's sentences name the operator on 19beta1 — measured 2026-09-11 —
-/// and this crate writes `UNION` into all three. No statement reaches them with another word,
-/// because the other two operators are refused before they are planned. Pinned here so that the
-/// day `INTERSECT` is built, the test that stops passing says which sentences to re-measure.
+/// It asserted `!0A000 INTERSECT is not supported` and `!0A000 EXCEPT is not supported`, and its
+/// own failure messages carried 19beta1's answers so that whoever built the operators would not
+/// have to re-measure them: `42846 INTERSECT could not convert type other_mood to mood`, and the
+/// same sentence for `EXCEPT`. **#105 built them**, so the refusal is gone and those two measured
+/// sentences are what this asserts now — the same statements, the same capture, the word no longer
+/// hard-coded in `SqlError::SetOperationCannotConvert`.
 #[test]
-fn the_other_two_operators_are_refused_before_a_sentence_can_name_them() {
+fn the_other_two_operators_name_themselves_in_their_refusals() {
     let mut node = parity::Node::new(FIXTURE);
     assert_eq!(
         said(&mut node, "SELECT m FROM t INTERSECT SELECT n FROM t"),
-        "!0A000 INTERSECT is not supported",
-        "19beta1: 42846 INTERSECT could not convert type other_mood to mood"
+        "!42846 INTERSECT could not convert type other_mood to mood",
+        "the word comes from the operator now, not from a hard-coded `UNION`"
     );
     assert_eq!(
         said(&mut node, "SELECT m FROM t EXCEPT SELECT n FROM t"),
-        "!0A000 EXCEPT is not supported",
-        "19beta1: 42846 EXCEPT could not convert type other_mood to mood"
+        "!42846 EXCEPT could not convert type other_mood to mood",
+        "two enums are one category, so it is `42846` and not the categories' `42804`"
     );
 }
 

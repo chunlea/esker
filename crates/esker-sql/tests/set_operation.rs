@@ -338,17 +338,26 @@ fn a_body_that_names_itself_is_the_fixpoint() {
     );
 }
 
+/// **The smallest shape either operator has: two constants and no table.**
+///
+/// This test was called `what_this_commit_does_not_do_is_named` and asserted that both statements
+/// were `0A000` — its *name* was the whole claim, which is why the name went with the assertion.
+/// #105 built them, so what it pins now is what they answer. Measured on 19beta1,
+/// `esker-coord/s2-h105-constant-arms.out`.
 #[test]
-fn what_this_commit_does_not_do_is_named() {
+fn a_set_operation_over_constant_arms_answers() {
     let mut node = parity::Node::new(FIXTURE);
-    for statement in ["SELECT 1 INTERSECT SELECT 2", "SELECT 1 EXCEPT SELECT 2"] {
-        let error = node.run(statement).unwrap_err();
-        assert_eq!(
-            error.sqlstate(),
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "{statement} was not refused by name"
-        );
-    }
+    assert!(
+        node.rows("SELECT 1 INTERSECT SELECT 2").is_empty(),
+        "nothing is in both arms"
+    );
+    assert_eq!(node.rows("SELECT 1 EXCEPT SELECT 2"), [["1"]]);
+    // And the pair that agrees, which is what says the answer follows the values and not the shape.
+    assert_eq!(node.rows("SELECT 1 INTERSECT SELECT 1"), [["1"]]);
+    assert!(
+        node.rows("SELECT 1 EXCEPT SELECT 1").is_empty(),
+        "a value minus itself is nothing"
+    );
 }
 
 /// **A `WITH` written outside the set is every arm's**, not the first arm's alone.
@@ -582,9 +591,10 @@ fn greatest_takes_the_common_type_and_not_the_wider_one() {
 ///
 /// * the **typmod** is the first arm's too — `varchar(3) UNION varchar(5)` describes as
 ///   `1043/7` where the simple path says `1043/-1`, which is what a real server says;
-/// * `INTERSECT` and `EXCEPT` are `0A000` on the simple path and **answer a shape** here, so a
-///   client that prepares one is told its columns and refused at `Execute` instead of at
-///   `Describe`.
+/// * `INTERSECT` and `EXCEPT` were `0A000` on the simple path and **answered a shape** here, so a
+///   client that prepared one was told its columns and refused at `Execute` instead of at
+///   `Describe`. Since #105 they answer on both paths, and the dispatch below is what makes the
+///   two agree rather than what hides the disagreement.
 ///
 /// **Fixed** by dispatching on `set_arms` where `described_in` called `query::plan` — one call,
 /// after the parameters are typed and the views expanded, which is the order that function
@@ -648,28 +658,40 @@ fn a_prepared_set_operation_describes_the_common_typmod() {
     assert_eq!((fields[0].type_oid, fields[0].type_modifier), (1043, -1));
 }
 
-/// **A set operation this node does not have is refused at `Describe`, not after it.**
+/// **A prepared set operation describes the shape it then produces** — one answer per statement,
+/// across both paths.
 ///
-/// `INTERSECT` and `EXCEPT` are `0A000` here (`set_arm_supported`), and the `Describe` path never
-/// reached that check: it planned the head arm and answered a shape, so a client that prepares one
-/// was told its columns and then refused at `Execute`. The protocol's own order is that a
-/// statement which cannot run does not describe.
+/// This asserted the same invariant from the other side. `INTERSECT` and `EXCEPT` were `0A000`
+/// (`set_arm_supported`) and the `Describe` path did not reach that check: it planned the head arm
+/// and answered a shape, so a client that prepared one was told its columns and *then* refused at
+/// `Execute` — two answers to one statement. The fix was to dispatch on `set_arms`, and the test
+/// pinned it by asserting both paths refused alike.
+///
+/// **#105 removed the refusal, so the demonstration moves to the success side and the rule does
+/// not move at all**: `Describe` must answer the column `Execute` goes on to produce. The dispatch
+/// this pinned is what still makes that true — without it `Describe` would answer the head arm's
+/// oid and `Execute` the unified one, which is the same two-answers bug wearing a different face.
 #[test]
-fn a_prepared_intersect_is_refused_before_it_is_described() {
+fn a_prepared_set_operation_describes_the_shape_it_produces() {
     let mut node = parity::Node::new(FIXTURE);
     for sql in [
         "SELECT i FROM so INTERSECT SELECT i FROM so",
         "SELECT i FROM so EXCEPT SELECT i FROM so",
     ] {
-        let described = node.describe(sql).expect_err("describe answered a shape");
+        let described = node
+            .describe(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"))
+            .fields
+            .unwrap_or_else(|| panic!("{sql} described no fields"));
+        let esker_sql::pgwire::session::Outcome::Rows { fields, .. } = node.run(sql).unwrap()
+        else {
+            panic!("{sql} returned no rows")
+        };
         assert_eq!(
-            described.sqlstate(),
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "{sql}"
+            (described[0].type_oid, described[0].type_modifier),
+            (fields[0].type_oid, fields[0].type_modifier),
+            "{sql}: Describe and Execute must agree"
         );
-        // The same refusal the simple path gives, which is the point: one answer per statement.
-        let executed = node.run(sql).expect_err("execute answered rows");
-        assert_eq!(described.to_string(), executed.to_string(), "{sql}");
     }
 }
 
