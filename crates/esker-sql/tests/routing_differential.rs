@@ -3484,6 +3484,66 @@ fn median_phase(
 /// index probe and index put run once per index entry, and a table whose only key is its primary
 /// key has none — so the phase does not happen, which is a different statement from "it was free".
 fn print_phase_report(tiers: &[TierProfile]) {
+    // **Every field of `Counts`, checked against the struct rather than chosen.** The first version
+    // of this report printed the four phases I expected to matter and dropped the rest, which is
+    // how a measured column (`other_get`) went missing from a page that concluded about the
+    // remainder. The block below lists each field; the wide table after it stays because the
+    // earlier tiers were reported in that shape and a comparison needs one.
+    for tier in tiers {
+        let stmts = u64::try_from(tier.statements.len()).unwrap_or(1).max(1);
+        let wall_us = u64::try_from(tier.fill.as_micros())
+            .unwrap_or(u64::MAX)
+            .checked_div(stmts)
+            .unwrap_or(0);
+        let med = |of: fn(&cluster::profile::Counts) -> u64| median_phase(&tier.statements, of);
+        let (row_us, row_n) = (med(|c| c.row_get_us), med(|c| c.row_get_n));
+        let (idx_us, idx_n) = (med(|c| c.index_get_us), med(|c| c.index_get_n));
+        let (oth_us, oth_n) = (med(|c| c.other_get_us), med(|c| c.other_get_n));
+        let (unw_us, unw_n) = (med(|c| c.unwaited_get_us), med(|c| c.unwaited_get_n));
+        let (scan_us, scan_n) = (med(|c| c.scan_us), med(|c| c.scan_n));
+        let put_us = med(|c| c.put_us);
+        let (put_row, put_idx, put_oth) = (
+            med(|c| c.row_put_n),
+            med(|c| c.index_put_n),
+            med(|c| c.other_put_n),
+        );
+        let (commit_us, commit_n) = (med(|c| c.commit_us), med(|c| c.commit_n));
+        let (rollback_n, begin_n) = (med(|c| c.rollback_n), med(|c| c.begin_n));
+        let accounted = row_us
+            .saturating_add(idx_us)
+            .saturating_add(oth_us)
+            .saturating_add(unw_us)
+            .saturating_add(scan_us)
+            .saturating_add(put_us)
+            .saturating_add(commit_us);
+        let remainder = wall_us.saturating_sub(accounted);
+        // Share in integer tenths of a percent, for the reason every ratio here is integer.
+        let share = remainder
+            .saturating_mul(1000)
+            .checked_div(wall_us)
+            .unwrap_or(0);
+        let indexed = if tier.indexed { "yes" } else { "no" };
+        println!(
+            "\n  tier {} rows, index {indexed}, fill {:?}, {stmts} statements — medians per INSERT:\n\
+             \x20   get row      {row_us:>10} us  n={row_n}\n\
+             \x20   get index    {idx_us:>10} us  n={idx_n}\n\
+             \x20   get other    {oth_us:>10} us  n={oth_n}   (catalog and metadata keys)\n\
+             \x20   get unwaited {unw_us:>10} us  n={unw_n}   (view_at's version counters)\n\
+             \x20   scan         {scan_us:>10} us  n={scan_n}\n\
+             \x20   put          {put_us:>10} us  row={put_row} index={put_idx} other={put_oth}\n\
+             \x20   commit       {commit_us:>10} us  n={commit_n}\n\
+             \x20   rollback                   n={rollback_n}\n\
+             \x20   begin                      n={begin_n}\n\
+             \x20   ---------------------------------------------\n\
+             \x20   accounted    {accounted:>10} us\n\
+             \x20   statement    {wall_us:>10} us  remainder {remainder} us ({}.{}%)",
+            tier.rows,
+            tier.fill,
+            share / 10,
+            share % 10
+        );
+    }
+
     println!(
         "rows      index  fill          rows/s      stmts  pk-probe us (n)   idx-probe us (n)  \
          put us (row/idx)   commit us   commit n"
@@ -3548,6 +3608,33 @@ fn projected_fill(tiers: &[TierProfile], rows: i64) -> Duration {
             .saturating_mul(2)
             .saturating_mul(u64::try_from(rows).unwrap_or(0)),
     )
+}
+
+/// **One tier of [`what_an_insert_spends_its_time_on_as_the_table_grows`]**, for re-measuring the
+/// phases without paying for the curve.
+///
+/// The three-tier run costs about twenty-seven minutes of filling, which is the right price for a
+/// slope and the wrong one for a question about *which phases exist* — and that question is what
+/// changed: `get_without_waiting` was forwarded untimed, so the catalog's version-counter reads
+/// were in no column at all, and the report printed four phases of the eighteen `Counts` holds.
+/// Both are fixed above; this runs the smallest tier so the fix can be read in a minute rather
+/// than in half an hour. **It is not a substitute for the curve**: one tier has an intercept and
+/// no slope, and every growth claim in `esker-coord/s1-fill-window-2026-09-16/q109-data.md` comes
+/// from the three-tier run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "#109's phases at one tier: a real cluster and about two minutes"]
+async fn what_an_insert_spends_its_time_on_at_the_smallest_tier() {
+    let rows = PROFILE_TIERS[0];
+    let gate = Gate::start().await;
+    let (fill, statements) = gate.fill_profiled("t", rows, false).await;
+    let tiers = vec![TierProfile {
+        rows,
+        indexed: false,
+        fill,
+        statements,
+    }];
+    print_phase_report(&tiers);
+    gate.stop().await;
 }
 
 /// **Where an `INSERT` spends itself, as the table grows** — debt #109's profile.

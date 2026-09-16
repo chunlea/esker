@@ -14,10 +14,14 @@
 //!   microseconds counted against it are memory, not I/O. A report that shows the put phase near
 //!   zero is not a broken instrument; it is the reason `commit` is the only phase that can be
 //!   large.
-//! * **Round trips cannot be counted here, only timed.** `esker-client`'s `Transaction` keeps no
-//!   counter of its prewrite and commit requests, and `commit` hands back only the commit
-//!   timestamp. The number of round trips is *inferred* from the regions a statement touched; this
-//!   module refuses to invent it.
+//! * **Round trips are not counted *here*, and that is this module's gap rather than the
+//!   client's.** An earlier version of this paragraph said `esker-client` keeps no such counter.
+//!   It does: `esker_client::stmt_stats::Cost` carries `round_trips`, `regions`, `tso`,
+//!   `prewrites`, `commits`, `keys` and `waited`, fed by `record_call` on every wire call, and
+//!   `esker-sql`'s own `stmt_stats::Guard` already folds them up per statement. This decorator
+//!   times the `Txn` seam and reads none of it. The claim was written after grepping
+//!   `esker-client/src/txn.rs` and finding nothing — in a crate whose counter lives in
+//!   `stmt_stats.rs`.
 //! * **The columnar tee and region routing are below this seam**, inside the store's apply path.
 //!   They are not zero here — they are invisible here, which a report must say rather than round
 //!   down.
@@ -65,6 +69,11 @@ pub struct Profile {
     /// Catalog and counters: every key that is not a row or an index entry of a table.
     other_get_us: AtomicU64,
     other_get_n: AtomicU64,
+    /// [`Txn::get_without_waiting`], which is its own phase because it is its own door: the
+    /// catalog's two version-counter reads go through it and through nothing else
+    /// (`catalog/mod.rs`'s `view_at`), so a profile that times only `get` cannot see them at all.
+    unwaited_get_us: AtomicU64,
+    unwaited_get_n: AtomicU64,
     scan_us: AtomicU64,
     scan_n: AtomicU64,
     put_us: AtomicU64,
@@ -89,6 +98,8 @@ pub struct Counts {
     pub index_get_n: u64,
     pub other_get_us: u64,
     pub other_get_n: u64,
+    pub unwaited_get_us: u64,
+    pub unwaited_get_n: u64,
     pub scan_us: u64,
     pub scan_n: u64,
     pub put_us: u64,
@@ -113,6 +124,8 @@ impl Counts {
             index_get_n: self.index_get_n.saturating_sub(earlier.index_get_n),
             other_get_us: self.other_get_us.saturating_sub(earlier.other_get_us),
             other_get_n: self.other_get_n.saturating_sub(earlier.other_get_n),
+            unwaited_get_us: self.unwaited_get_us.saturating_sub(earlier.unwaited_get_us),
+            unwaited_get_n: self.unwaited_get_n.saturating_sub(earlier.unwaited_get_n),
             scan_us: self.scan_us.saturating_sub(earlier.scan_us),
             scan_n: self.scan_n.saturating_sub(earlier.scan_n),
             put_us: self.put_us.saturating_sub(earlier.put_us),
@@ -141,6 +154,8 @@ impl Profile {
             index_get_n: self.index_get_n.load(Ordering::Relaxed),
             other_get_us: self.other_get_us.load(Ordering::Relaxed),
             other_get_n: self.other_get_n.load(Ordering::Relaxed),
+            unwaited_get_us: self.unwaited_get_us.load(Ordering::Relaxed),
+            unwaited_get_n: self.unwaited_get_n.load(Ordering::Relaxed),
             scan_us: self.scan_us.load(Ordering::Relaxed),
             scan_n: self.scan_n.load(Ordering::Relaxed),
             put_us: self.put_us.load(Ordering::Relaxed),
@@ -305,8 +320,19 @@ impl Txn for ProfiledTxn {
         self.inner.locks()
     }
 
+    /// **Measured, and the reason is a bug this profile already had.** The first version of this
+    /// wrapper timed the four calls it expected to matter and forwarded the other twenty-two
+    /// untouched — and the catalog's two version-counter reads go through *this* door, not through
+    /// `get`, so they were invisible. The compiler made the wrapper complete; it could not make it
+    /// completely timed.
     fn get_without_waiting(&self, key: &[u8]) -> esker_sql::Result<Option<Bytes>> {
-        self.inner.get_without_waiting(key)
+        let began = Instant::now();
+        let answer = self.inner.get_without_waiting(key);
+        self.profile
+            .unwaited_get_us
+            .fetch_add(micros(began.elapsed()), Ordering::Relaxed);
+        self.profile.unwaited_get_n.fetch_add(1, Ordering::Relaxed);
+        answer
     }
 
     fn validate_reads(&mut self, on: bool) {
