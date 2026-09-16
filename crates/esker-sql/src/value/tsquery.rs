@@ -101,7 +101,94 @@ pub fn to_text(node: &Node) -> String {
     out
 }
 
+/// The nesting this text reaches, counted without recursing: every `(`, and every `!`, which
+/// stacks a `Not` without a bracket of its own. It can only over-count, which spends a thread that
+/// was not needed (`debts-v1.1.md` #101).
+fn nesting_of(text: &str) -> usize {
+    text.bytes()
+        .filter(|byte| *byte == b'(' || *byte == b'!')
+        .count()
+}
+
+/// Runs one whole `tsquery` operation, on a stack sized for [`crate::value::MAX_VALUE_DEPTH`] when
+/// the text is deep.
+///
+/// **The whole operation and not just the parse.** A `Node` is `Box`-linked, so walking it and
+/// dropping it each recurse once per level, and the drop happens wherever the tree is last owned.
+/// Parsing on a big stack and handing the tree back left the free running off the caller's 2 MiB:
+/// measured, the child died at **6,000 levels, about 349 bytes each**, which is a `Box` drop frame.
+/// Everything the entries below return is non-recursive, so only the answer crosses back.
+fn deeply<T: Send + 'static>(
+    text: &str,
+    run: impl FnOnce(&str) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    if nesting_of(text) > crate::value::INLINE_VALUE_DEPTH {
+        let owned = text.to_owned();
+        return crate::value::on_a_deep_stack("tsquery", move || run(&owned));
+    }
+    run(text)
+}
+
+/// A `tsquery` literal read and printed back **canonical**, which is what the type stores.
+pub fn canonical(text: &str) -> Result<String> {
+    deeply(text, |text| Ok(to_text(&from_text(text)?)))
+}
+
+/// `to_tsquery(config, text)` as the text it prints, empty when the query is all stop words —
+/// which is [`to_tsquery`]'s own `None` and not an error.
+pub fn to_tsquery_text(config: Config, text: &str) -> Result<String> {
+    deeply(text, move |text| {
+        Ok(to_tsquery(config, text)?.map_or_else(String::new, |node| to_text(&node)))
+    })
+}
+
+/// `tsvector @@ tsquery`, from the text of both. The vector is parsed inside, so nothing borrowed
+/// crosses to the sized thread.
+pub fn matches_text(vector: &str, query: &str) -> Result<bool> {
+    let vector = vector.to_owned();
+    deeply(query, move |query| {
+        Ok(matches(&tsvector::from_text(&vector)?, &from_text(query)?))
+    })
+}
+
+/// `ts_rank(tsvector, tsquery)`, from the text of both.
+pub fn rank_text(vector: &str, query: &str) -> Result<f32> {
+    let vector = vector.to_owned();
+    deeply(query, move |query| {
+        Ok(rank(&tsvector::from_text(&vector)?, &from_text(query)?))
+    })
+}
+
+/// The lexemes a query names, which is what `ts_headline` highlights.
+pub fn lexemes_of_text(query: &str) -> Result<Vec<String>> {
+    deeply(query, |query| Ok(lexemes(&from_text(query)?)))
+}
+
+/// `numnode(tsquery)`: how many nodes the query has.
+pub fn numnode_of_text(query: &str) -> Result<usize> {
+    deeply(query, |query| Ok(numnode(&from_text(query)?)))
+}
+
+/// `tsquery || tsquery`, which is an **`OR` of the two and not a splice of their text** — the
+/// printed form re-parenthesises by precedence. The one entry that owns two trees at once, so the
+/// deeper of the two decides whether they are built on a sized thread.
+pub fn or_of_texts(left: &str, right: &str) -> Result<String> {
+    let (left, right) = (left.to_owned(), right.to_owned());
+    let deepest = if nesting_of(&left) >= nesting_of(&right) {
+        left.clone()
+    } else {
+        right.clone()
+    };
+    deeply(&deepest, move |_| {
+        let (left, right) = (from_text(&left)?, from_text(&right)?);
+        Ok(to_text(&Node::Or(Box::new(left), Box::new(right))))
+    })
+}
+
 /// Parses a `tsquery` literal.
+///
+/// **Hands the tree out of the module**, which is why the sized thread is not here: whoever owns it
+/// last does the freeing, so it is the entries above that take a whole operation to a big stack.
 pub fn from_text(text: &str) -> Result<Node> {
     let chars: Vec<char> = text.chars().collect();
     let mut parser = Parser {
@@ -109,7 +196,7 @@ pub fn from_text(text: &str) -> Result<Node> {
         at: 0,
         source: text,
     };
-    let node = parser.or()?;
+    let node = parser.or(0)?;
     parser.space();
     if parser.at < parser.chars.len() {
         // Something is left over, and the commonest cause is two operands with no operator —
@@ -150,38 +237,48 @@ impl Parser<'_> {
         false
     }
 
-    fn or(&mut self) -> Result<Node> {
-        let mut left = self.and()?;
+    /// The top of the grammar, at `depth` brackets deep.
+    ///
+    /// **Two ways into the cycle and so two checks**: a `(` sends `primary` back here, and a `!`
+    /// sends `unary` to itself without passing this line (`debts-v1.1.md` #101).
+    fn or(&mut self, depth: usize) -> Result<Node> {
+        if depth > crate::value::MAX_VALUE_DEPTH {
+            return Err(SqlError::StatementTooComplex);
+        }
+        let mut left = self.and(depth)?;
         while self.eat("|") {
-            left = Node::Or(Box::new(left), Box::new(self.and()?));
+            left = Node::Or(Box::new(left), Box::new(self.and(depth)?));
         }
         Ok(left)
     }
 
-    fn and(&mut self) -> Result<Node> {
-        let mut left = self.phrase()?;
+    fn and(&mut self, depth: usize) -> Result<Node> {
+        let mut left = self.phrase(depth)?;
         while self.eat("&") {
-            left = Node::And(Box::new(left), Box::new(self.phrase()?));
+            left = Node::And(Box::new(left), Box::new(self.phrase(depth)?));
         }
         Ok(left)
     }
 
-    fn phrase(&mut self) -> Result<Node> {
-        let mut left = self.unary()?;
+    fn phrase(&mut self, depth: usize) -> Result<Node> {
+        let mut left = self.unary(depth)?;
         while self.eat("<->") {
-            left = Node::Phrase(Box::new(left), Box::new(self.unary()?));
+            left = Node::Phrase(Box::new(left), Box::new(self.unary(depth)?));
         }
         Ok(left)
     }
 
-    fn unary(&mut self) -> Result<Node> {
-        if self.eat("!") {
-            return Ok(Node::Not(Box::new(self.unary()?)));
+    fn unary(&mut self, depth: usize) -> Result<Node> {
+        if depth > crate::value::MAX_VALUE_DEPTH {
+            return Err(SqlError::StatementTooComplex);
         }
-        self.primary()
+        if self.eat("!") {
+            return Ok(Node::Not(Box::new(self.unary(depth + 1)?)));
+        }
+        self.primary(depth)
     }
 
-    fn primary(&mut self) -> Result<Node> {
+    fn primary(&mut self, depth: usize) -> Result<Node> {
         self.space();
         // **An operator with nothing after it is `no operand`, not `syntax error`.** Measured:
         // `to_tsquery('english', 'fat &')` is `no operand in tsquery: "fat &"`.
@@ -193,7 +290,7 @@ impl Parser<'_> {
         }
         if first == '(' {
             self.at += 1;
-            let inner = self.or()?;
+            let inner = self.or(depth + 1)?;
             if !self.eat(")") {
                 return Err(self.syntax());
             }
