@@ -1,0 +1,28 @@
+crates/esker-client/src/lib.rs
+  h_44076b318daf9c 57
+crates/esker-client/src/txn.rs
+  h_44076b318daf9c 2506-2571
+crates/esker-client/tests/lock_expiry.rs
+  h_44076b318daf9c 1-181
+crates/esker-sql/src/bin/esker-sql.rs
+  h_44076b318daf9c 414-417,419-426,430
+crates/esker-sql/tests/joint_gate.rs
+  h_44076b318daf9c 205-207,321
+crates/esker-sql/tests/routing_differential.rs
+  h_44076b318daf9c 45,668,1134-1136
+docs/adr/0116-a-single-node-oracle-needs-a-physical-half.md
+  h_44076b318daf9c 1-145
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,26-30,120,122-127,137,139-142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "37ed5bf53e05e6b7e7ed7b1815192b86f3d9e30e",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
