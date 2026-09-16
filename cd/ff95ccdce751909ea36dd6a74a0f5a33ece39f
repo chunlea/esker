@@ -1,0 +1,25 @@
+crates/esker-client/src/error.rs
+  s_b249f065cef854::t_3acb724ad386a8 111-125,281
+crates/esker-client/src/txn.rs
+  s_b249f065cef854::t_dd22b8082e6578 60,72-73,75,586-615,905,908-918,1632-1666,1671,1729-1763,1821-1834,1838-1848
+crates/esker-proto/src/codec.rs
+  s_b249f065cef854::t_d76d8d7398ac0c 196-200,205-207
+crates/esker-proto/src/txn.rs
+  s_b249f065cef854::t_690224df3df569 376,378-382
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cdff95ccdce751909ea36dd6a74a0f5a33ece39f",
+  "prompts": {},
+  "sessions": {
+    "s_b249f065cef854": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7c1a94ab-56c5-4769-8981-7863defc92e8",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
