@@ -108,6 +108,21 @@ pub enum Error {
         limit: usize,
     },
 
+    /// **One write is larger than a frame**, so no cut of the batch can carry it (#100).
+    ///
+    /// Named rather than counted: a transaction of a quarter of a million keys cannot be searched
+    /// for the one that is too big, and the ceiling is a real one — PostgreSQL's own is a gigabyte
+    /// a field, and this transport's is a frame.
+    #[error("the write of {bytes} bytes for key {key:?} exceeds the {limit}-byte frame limit")]
+    KeyTooLarge {
+        /// The key whose own mutation will not fit.
+        key: Bytes,
+        /// What that one mutation's request would encode to, envelope included.
+        bytes: usize,
+        /// The transport's ceiling.
+        limit: usize,
+    },
+
     /// The store answered a different method than the one that was asked. A bug or a version
     /// skew; never something to interpret.
     #[error("asked for {expected:?} and got {actual:?}")]
@@ -263,6 +278,7 @@ impl Error {
             // timestamp and a safepoint, so there is nothing they could have changed.
             Self::NoRegion { .. }
             | Self::RequestTooLarge { .. }
+            | Self::KeyTooLarge { .. }
             | Self::TxnConflict { .. }
             | Self::LockNotCleared { .. }
             | Self::SnapshotTooOld { .. }

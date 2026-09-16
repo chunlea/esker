@@ -373,9 +373,13 @@ impl TxnMutation {
         }
     }
 
-    /// What [`TxnMutation::encode`] writes, in bytes: the tag, the key, the value where there is
+    /// What `TxnMutation::encode` writes, in bytes: the tag, the key, the value where there is
     /// one, and **the read timestamp as the varint it is** rather than as a fixed allowance (#98).
-    pub(crate) fn encoded_len(&self) -> usize {
+    ///
+    /// Public because a client cutting a prewrite into frames sizes it one mutation at a time
+    /// (#99).
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
         use crate::codec::{TAG_LEN, bytes_len, varint_len};
         let stamp = |read_ts: Option<u64>| read_ts.map_or(0, varint_len);
         TAG_LEN

@@ -193,13 +193,18 @@ impl Encoder {
 }
 
 /// Bytes a varint occupies, which is what [`Encoder::put_varint`] writes.
-pub(crate) fn varint_len(value: u64) -> usize {
+///
+/// Public because a client cutting a batch into frames has to know what one more key costs
+/// (#99), and a second implementation of that arithmetic is what #98 was.
+#[must_use]
+pub fn varint_len(value: u64) -> usize {
     varint::encoded_len_u64(value)
 }
 
 /// Bytes a length-prefixed byte string occupies: its length as a varint, then the bytes
-/// ([`Encoder::put_bytes`]).
-pub(crate) fn bytes_len(value: &[u8]) -> usize {
+/// ([`Encoder::put_bytes`]). Public for the reason [`varint_len`] is.
+#[must_use]
+pub fn bytes_len(value: &[u8]) -> usize {
     varint_len(value.len() as u64) + value.len()
 }
 
