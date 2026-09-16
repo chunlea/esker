@@ -1111,7 +1111,7 @@ impl CatalogView {
             CatalogView::PgIndexes => indexes_rows(view),
             CatalogView::PgViews => views_rows(view),
             CatalogView::PgMatviews => matviews_rows(view),
-            CatalogView::PgStatActivity => stat_activity_rows(txn, tenant),
+            CatalogView::PgStatActivity => stat_activity_rows(txn),
             CatalogView::PgRoles => role_rows(txn, false),
             CatalogView::PgAuthid => role_rows(txn, true),
             CatalogView::PgLocks => Ok(locks_rows(txn, tenant, advisory)),
@@ -1963,11 +1963,18 @@ fn regtype_array(oids: &[u32]) -> Datum {
     ))
 }
 
-fn stat_activity_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<Vec<Datum>>> {
-    let datname = super::databases(txn)?
-        .into_iter()
-        .find(|(_, id)| *id == tenant)
-        .map(|(name, _)| name);
+fn stat_activity_rows(txn: &dyn crate::backend::Txn) -> Result<Vec<Vec<Datum>>> {
+    // **Resolved per row and not once** (`debts-v1.1.md` #111). The database a row names
+    // belongs to the session the row is *about*, and both it and `datid` were taken from
+    // the session *asking*: a node with sessions on three databases showed one name three
+    // times and one id three times. So `WHERE datname = …` — which is how an operator
+    // finds who is holding a database, and how the 19beta1 capture for #102 proved its
+    // second session was attached — answered every session or none, depending on who ran
+    // it.
+    //
+    // The name comes from the catalog rather than from what the session recorded, because
+    // the catalog is what survives a rename; the registry's job is to say which tenant.
+    let databases = super::databases(txn)?;
     // **One row per live session, from the one registry every session is in** — a connection, a
     // `Pair` and a `Cluster` alike (`crate::session`). It used to be a single row whose pid was
     // `std::process::id()`, the same number for every session and therefore useless to the one
@@ -1975,20 +1982,32 @@ fn stat_activity_rows(txn: &dyn crate::backend::Txn, tenant: u64) -> Result<Vec<
     // how `pg_cancel_backend` is aimed.
     Ok(crate::session::snapshot()
         .into_iter()
-        .map(|(pid, activity)| stat_activity_row(tenant, datname.clone(), pid, &activity))
+        .map(|(pid, activity)| {
+            let datname = activity.tenant.and_then(|id| {
+                databases
+                    .iter()
+                    .find(|(_, oid)| *oid == id)
+                    .map(|(name, _)| name.clone())
+            });
+            stat_activity_row(activity.tenant, datname, pid, &activity)
+        })
         .collect())
 }
 
 /// One `pg_stat_activity` row.
 fn stat_activity_row(
-    tenant: u64,
+    tenant: Option<u64>,
     datname: Option<String>,
     pid: u32,
     activity: &crate::session::Activity,
 ) -> Vec<Datum> {
     let client = &activity.client;
     vec![
-        Datum::Int8(i64::try_from(tenant).unwrap_or(i64::MAX)),
+        // NULL rather than a number for a session that has not said which database it is
+        // on, which is what a real server shows for a backend with none attached.
+        tenant.map_or(Datum::Null, |tenant| {
+            Datum::Int8(i64::try_from(tenant).unwrap_or(i64::MAX))
+        }),
         datname.map_or(Datum::Null, Datum::Text),
         Datum::Int4(i32::try_from(pid).unwrap_or(i32::MAX)),
         // Not a parallel worker: there are none, so no backend here has a leader.

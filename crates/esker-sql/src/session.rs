@@ -44,6 +44,27 @@ pub struct Backend {
 pub struct Activity {
     /// The database it connected to, or empty before it has said.
     pub database: String,
+    /// **Which tenant that database is**, or `None` before the session has said.
+    ///
+    /// The id and not the name, because that is what every other decision about a
+    /// database is already made on: `DROP DATABASE` refuses the session's own by id
+    /// rather than by name, "since comparing names would answer wrongly the moment two
+    /// spellings reach one database" (`exec/ddl.rs`). A count of the sessions on a
+    /// database has to agree with that refusal, and two sessions spelling one database
+    /// differently would make a name-keyed count disagree with it.
+    pub tenant: Option<u64>,
+    /// **Which cluster that tenant id belongs to**, or `0` before the session has said.
+    ///
+    /// A tenant id is unique inside one cluster and this registry is process-wide, which
+    /// is a distinction with no consequence in production — a process serves one cluster —
+    /// and a real one in a test binary, where every test builds its own catalog and the
+    /// ids it hands out start from the same number. Without this, two tests running in
+    /// parallel would each see the other's sessions as being on their own database.
+    ///
+    /// The value is the address of the shared `Arc<Catalog>`, compared and never
+    /// dereferenced: two live `Arc`s cannot share an address, and every session in one
+    /// process clones one `Arc`, so the token is exact on both sides.
+    pub cluster: usize,
     /// The **last** statement this session ran, running or not.
     ///
     /// **Retained when it finishes, not cleared.** PostgreSQL keeps the text on an idle session and
@@ -182,6 +203,21 @@ impl Backend {
         }
     }
 
+    /// Records which tenant this session's database is.
+    ///
+    /// Separate from [`Backend::on_database`] because the two are learned at different
+    /// moments and only one of them can be compared safely: the executor is built with
+    /// the tenant and told the name afterwards.
+    ///
+    /// `cluster` is what makes the id mean one database rather than one number; see
+    /// [`Activity::cluster`].
+    pub fn on_tenant(&self, cluster: usize, tenant: u64) {
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.tenant = Some(tenant);
+            activity.cluster = cluster;
+        }
+    }
+
     /// Marks this session as running `sql` until the guard is dropped.
     ///
     /// A guard rather than a pair of calls, because the statement can leave by an error, a panic
@@ -265,6 +301,34 @@ pub fn register() -> Backend {
         live.insert(backend.pid, backend.clone());
     }
     backend
+}
+
+/// How many **other** sessions are on one database.
+///
+/// A count rather than a yes-or-no, because the refusal it feeds names the number.
+/// Measured on 19beta1: `DETAIL: There is 1 other session using the database.` at one and
+/// `There are 2 other sessions using the database.` at two — a plural form chosen by the
+/// count, which a boolean cannot produce.
+///
+/// `excluding` is the asking session's own pid. That session is refused one check earlier
+/// by the *other* `55006` sentence, so counting it here would make two answers disagree
+/// about the same session.
+/// A database is `(cluster, tenant)` here and not `tenant` alone, because the registry is
+/// process-wide while a tenant id is only unique within one cluster — see
+/// [`Activity::cluster`] for what that costs in a test binary.
+#[must_use]
+pub fn others_on_database(cluster: usize, tenant: u64, excluding: u32) -> usize {
+    let Ok(live) = backends().lock() else {
+        return 0;
+    };
+    live.values()
+        .filter(|backend| backend.pid != excluding)
+        .filter(|backend| {
+            backend.activity.lock().is_ok_and(|activity| {
+                activity.tenant == Some(tenant) && activity.cluster == cluster
+            })
+        })
+        .count()
 }
 
 /// Every live session, for `pg_stat_activity`.

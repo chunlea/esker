@@ -301,6 +301,23 @@ pub(crate) struct Node {
     /// [`Session::run_statement`] — one implementation, two callers, rather than a third copy of
     /// the dispatch below.
     session: Session,
+    /// This session's registry pid, kept so that [`Drop`] can take it back out.
+    pid: u32,
+}
+
+/// **A test session leaves the registry when it ends.**
+///
+/// The registry is one process-wide static shared by every test in a binary, and nothing
+/// in-process ever deregistered — only a real connection and the re-driver did — so
+/// sessions accumulated across a binary's tests. Every test also builds its own `Catalog`,
+/// so tenant ids collide between tests, and a check that counts the sessions on a tenant
+/// would have seen one leaked by an earlier test and refused a `DROP DATABASE` that should
+/// succeed. The leak was visible before anything read it (`tests/redrive.rs` documents the
+/// accumulation); it only became *wrong* when the count grew a reader.
+impl Drop for Node {
+    fn drop(&mut self) {
+        esker_sql::session::deregister(self.pid);
+    }
 }
 
 impl Node {
@@ -326,12 +343,16 @@ impl Node {
         // installs it in its one shared constructor — `RUST_LOG` should work on the test somebody
         // is already debugging, without an edit to that test first.
         trace::on();
+        // Held rather than passed straight in: `deregister` takes the pid, and after the
+        // executor owns the identity there is no public way back to it.
+        let identity = esker_sql::session::register();
+        let pid = identity.pid;
         let mut node = Node {
-            executor: Executor::new(backend, catalog, tenant, esker_sql::session::register())
-                .serving_database(database),
+            executor: Executor::new(backend, catalog, tenant, identity).serving_database(database),
             in_block: false,
             failed: false,
             session: Session::new(),
+            pid,
         };
         for statement in fixture {
             node.run(statement)

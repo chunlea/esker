@@ -2129,6 +2129,23 @@ pub enum SqlError {
     #[error("cannot drop the currently open database")]
     DatabaseInUse(String),
 
+    /// `DROP DATABASE` naming one that **other** sessions are connected to.
+    ///
+    /// The same class as the line above and a different sentence, which is why it is a
+    /// second variant rather than a second caller of the first: `55006` is returned both
+    /// for the database you are in and for one somebody else is in, and a test that
+    /// asserted only the SQLSTATE could not tell a node that implements one from a node
+    /// that implements both.
+    #[error("database \"{name}\" is being accessed by other users")]
+    DatabaseAccessedByOthers {
+        /// The database named by the statement, which is the one the sentence quotes.
+        name: String,
+        /// How many **other** sessions are on it — the asking session is not among them, and
+        /// the number chooses the plural form of the `DETAIL` rather than being dropped into
+        /// one sentence.
+        sessions: usize,
+    },
+
     /// `SET TRANSACTION SNAPSHOT` after the block has already read something. Exactly right, and
     /// the reason it is worth copying: a `start_ts` cannot change under a transaction that has
     /// already read at it.
@@ -3588,7 +3605,9 @@ impl SqlError {
             SqlError::UndefinedDatabase(_) | SqlError::UndefinedTemplateDatabase(_) => {
                 sqlstate::INVALID_CATALOG_NAME
             }
-            SqlError::DatabaseInUse(_) => sqlstate::OBJECT_IN_USE,
+            SqlError::DatabaseInUse(_) | SqlError::DatabaseAccessedByOthers { .. } => {
+                sqlstate::OBJECT_IN_USE
+            }
             SqlError::NoActiveTransaction
             | SqlError::SetTransactionOutsideBlock
             | SqlError::OutsideTransactionBlock(_) => sqlstate::NO_ACTIVE_SQL_TRANSACTION,
@@ -3744,6 +3763,16 @@ impl SqlError {
     #[allow(clippy::too_many_lines)]
     pub fn detail(&self) -> Option<String> {
         match self {
+            // Measured on 19beta1 with sessions held on the target by `pg_sleep`
+            // (`esker-coord/s2-h102b.out`, `s2-h102c-plural.out`): the DETAIL is a plural
+            // **form** chosen by the count and not one sentence with a number dropped into
+            // it, so a fix that writes only the singular is wrong the moment a second
+            // session arrives.
+            SqlError::DatabaseAccessedByOthers { sessions, .. } => Some(if *sessions == 1 {
+                "There is 1 other session using the database.".to_owned()
+            } else {
+                format!("There are {sessions} other sessions using the database.")
+            }),
             SqlError::RecordNotAssigned(_) => Some(
                 "The tuple structure of a not-yet-assigned record is indeterminate.".to_owned(),
             ),

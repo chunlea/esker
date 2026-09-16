@@ -406,3 +406,123 @@ fn two_databases_hold_two_tables_of_one_name() {
         vec![vec!["arunit2".to_owned()]]
     );
 }
+
+/// **A database another session is connected to cannot be dropped** — and the sentence is not the
+/// one for the session's own database.
+///
+/// Two refusals share `55006` and differ in their message, so a test that asserted only the
+/// SQLSTATE could not tell a node that implements the first from one that implements both. Measured
+/// on 19beta1 (`esker-coord/s2-h102b.out`, `s2-h102c-plural.out`): with one other session attached
+/// the answer is `database "…" is being accessed by other users` with
+/// `DETAIL: There is 1 other session using the database.`, and with two it is
+/// `There are 2 other sessions using the database.` — a plural form chosen by the count. This node
+/// deleted the database under the other session and said nothing.
+#[test]
+fn a_database_another_session_is_on_cannot_be_dropped() {
+    use std::sync::Arc;
+
+    let backend: Arc<dyn esker_sql::backend::Backend> =
+        Arc::new(esker_sql::backend::MemoryBackend::new());
+    let catalog = Arc::new(esker_sql::catalog::Catalog::new());
+
+    let mut arunit = parity::Node::on(Arc::clone(&backend), Arc::clone(&catalog), 1, SERVING, &[]);
+    arunit.run("CREATE DATABASE arunit2").unwrap();
+    let id: u64 = arunit.rows("SELECT oid FROM pg_database WHERE datname = 'arunit2'")[0][0]
+        .parse()
+        .unwrap();
+
+    // **Bound to a name, not to `_`**: the other session has to be alive across the `DROP`, which
+    // is the whole statement under test. A `_` binding would drop it on the spot and the test would
+    // pass against a node that never learned to count.
+    let other = parity::Node::on(
+        Arc::clone(&backend),
+        Arc::clone(&catalog),
+        id,
+        "arunit2",
+        &[],
+    );
+
+    let error = arunit.run("DROP DATABASE arunit2").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::OBJECT_IN_USE);
+    assert_eq!(
+        error.to_string(),
+        "database \"arunit2\" is being accessed by other users"
+    );
+    assert_eq!(
+        error.detail().as_deref(),
+        Some("There is 1 other session using the database.")
+    );
+
+    // **And the database is still there.** A refusal that deleted it anyway would satisfy all three
+    // assertions above, which is the mechanism this test would otherwise not be testing.
+    assert_eq!(
+        arunit.rows("SELECT count(*) FROM pg_database WHERE datname = 'arunit2'")[0][0],
+        "1"
+    );
+
+    // The plural is a second form and not the same sentence with a different number, so it is
+    // pinned rather than assumed.
+    let third = parity::Node::on(
+        Arc::clone(&backend),
+        Arc::clone(&catalog),
+        id,
+        "arunit2",
+        &[],
+    );
+    let error = arunit.run("DROP DATABASE arunit2").unwrap_err();
+    assert_eq!(
+        error.detail().as_deref(),
+        Some("There are 2 other sessions using the database.")
+    );
+
+    // With every other session gone the drop is allowed, which is what says the refusal is about
+    // the sessions and not about the database.
+    drop(other);
+    drop(third);
+    arunit.run("DROP DATABASE arunit2").unwrap();
+}
+
+/// **`pg_stat_activity` names each session's own database** — `debts-v1.1.md` #111.
+///
+/// The name and the id were resolved once, from the tenant of the session running the query, and
+/// stamped onto every row, so a node with sessions on two databases showed one name twice and one
+/// `datid` twice. The query an operator uses to find who is holding a database — the same one the
+/// 19beta1 capture for #102 used to prove its second session was attached
+/// (`esker-coord/s2-h102b.out`) — therefore answered every session or none, depending on who asked.
+#[test]
+fn pg_stat_activity_names_each_sessions_own_database() {
+    use std::sync::Arc;
+
+    let backend: Arc<dyn esker_sql::backend::Backend> =
+        Arc::new(esker_sql::backend::MemoryBackend::new());
+    let catalog = Arc::new(esker_sql::catalog::Catalog::new());
+
+    let mut arunit = parity::Node::on(Arc::clone(&backend), Arc::clone(&catalog), 1, SERVING, &[]);
+    arunit.run("CREATE DATABASE arunit2").unwrap();
+    let id: u64 = arunit.rows("SELECT oid FROM pg_database WHERE datname = 'arunit2'")[0][0]
+        .parse()
+        .unwrap();
+    let _other = parity::Node::on(
+        Arc::clone(&backend),
+        Arc::clone(&catalog),
+        id,
+        "arunit2",
+        &[],
+    );
+
+    // **Asked from `arunit`, which is not on `arunit2`** — that is the whole point: before the fix
+    // this counted 0, because every row carried the asking session's own database.
+    assert_eq!(
+        arunit.rows("SELECT count(*) FROM pg_stat_activity WHERE datname = 'arunit2'")[0][0],
+        "1"
+    );
+
+    // And the asking session's own database is not doubled by the other one, which is the same
+    // defect seen from the other side: this counted 2.
+    assert_eq!(
+        arunit.rows(&format!(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = '{SERVING}'"
+        ))[0][0],
+        "1"
+    );
+}
