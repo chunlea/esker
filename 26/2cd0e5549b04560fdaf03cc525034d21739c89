@@ -1,0 +1,21 @@
+Cargo.lock
+  s_f4b2852b53accb::t_4a5d2a0a962f28 543,548
+crates/esker-sql/tests/routing_differential.rs
+  s_f4b2852b53accb::t_506024fcb487f0 3042,3086
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "262cd0e5549b04560fdaf03cc525034d21739c89",
+  "prompts": {},
+  "sessions": {
+    "s_f4b2852b53accb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc7223c3-8ba0-48df-95c8-ddb365dc093c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
