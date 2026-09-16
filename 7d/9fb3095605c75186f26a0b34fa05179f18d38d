@@ -1,0 +1,23 @@
+README.md
+  s_dc640bf0df4adb::t_d9fca9160d6146 71-72
+docs/acceptance/v1.1.md
+  s_dc640bf0df4adb::t_cb31ef8ed8f22f 710,724-731
+docs/releases/v1.1.1.md
+  s_dc640bf0df4adb::t_2b971d50f32a8a 3-13,85,91-98,101-108,249,265-270,304-321,338-339,455,471,473-474
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7d9fb3095605c75186f26a0b34fa05179f18d38d",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
