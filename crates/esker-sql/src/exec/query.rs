@@ -544,6 +544,14 @@ pub(super) struct OutputColumn {
     /// type instead of contributing its `text` to the unification (`debts-v1.1.md` #75). Everywhere
     /// else it is `false` and unread.
     pub(super) unknown: bool,
+    /// The **text** that unknown literal holds, when it holds one: a quoted string does and a bare
+    /// `NULL` does not.
+    ///
+    /// Carried for the one rule that has to *read* the literal rather than retype it — an unknown
+    /// arm beside an enum takes the enum, and reading `'sad'` as a `mood` means looking the label
+    /// up (`debts-v1.1.md` #81). By the time [`append`] unifies the arms they are planned, so the
+    /// literal's own text is gone from everything but this.
+    pub(super) unknown_text: Option<String>,
 }
 
 pub(super) struct Planned {
@@ -674,6 +682,14 @@ pub(super) fn append(
     // still have to be told apart afterwards: an unknown one is *parsed* as the settled type and
     // a typed one has to *reach* it (`debts-v1.1.md` #75).
     let mut arm_unknown = vec![first.columns.iter().map(|c| c.unknown).collect::<Vec<_>>()];
+    // And the text of each unknown literal, which is what an enum's label is looked up from.
+    let mut arm_unknown_text = vec![
+        first
+            .columns
+            .iter()
+            .map(|c| c.unknown_text.clone())
+            .collect::<Vec<_>>(),
+    ];
     let mut nodes = vec![first.node];
     for arm in arms {
         if arm.columns.len() != columns.len() {
@@ -690,23 +706,20 @@ pub(super) fn append(
             //
             // When *every* arm is unknown the column stays unknown and stays `text`, which is
             // 19beta1's answer for `SELECT NULL UNION ALL SELECT NULL` and already this node's.
-            // **Not where a user-defined type is on either side**, and that is a boundary rather
-            // than an oversight. Reading `'sad'` as a `mood` means looking its label up in the
-            // catalog, and this function has no view — a set operation's arms are already planned
-            // by the time they get here. So `SELECT m FROM t UNION SELECT 'sad'` keeps the
-            // `42804` this node writes, where 19beta1 answers the labels; it is pinned as a
-            // divergence in `tests/set_operation_enum.rs` with that answer beside it, and it is
-            // #75's remaining half rather than a second row.
-            let typed_name = columns[at].user_type.is_some() || column.user_type.is_some();
-            match (
-                columns[at].unknown && !typed_name,
-                column.unknown && !typed_name,
-            ) {
+            //
+            // **An enum is no exception** (`debts-v1.1.md` #81). It was one while reading `'sad'`
+            // as a `mood` meant a catalog view this function does not have — the arms are planned
+            // by the time they get here — so `SELECT m FROM t UNION SELECT 'sad'` was the `42804`
+            // this node wrote where 19beta1 answers the labels. The label is looked up below, from
+            // the `TypeDef` the *other* arm carries: the identity is already in this function, and
+            // the text of the literal travels beside it (`OutputColumn::unknown_text`).
+            match (columns[at].unknown, column.unknown) {
                 (true, false) => {
                     columns[at].ty = column.ty;
                     columns[at].typmod = column.typmod;
                     columns[at].user_type.clone_from(&column.user_type);
                     columns[at].unknown = false;
+                    columns[at].unknown_text = None;
                     continue;
                 }
                 (false, true) => continue,
@@ -736,7 +749,39 @@ pub(super) fn append(
         }
         arm_types.push(arm.columns.iter().map(|c| c.ty).collect());
         arm_unknown.push(arm.columns.iter().map(|c| c.unknown).collect());
+        arm_unknown_text.push(arm.columns.iter().map(|c| c.unknown_text.clone()).collect());
         nodes.push(arm.node);
+    }
+    // **An unknown arm beside an enum is read as one of its labels** (#81), which is the one
+    // conversion a cast cannot do: `'sad'` reaching an `int2` is `22P02 invalid input syntax for
+    // type smallint` and the label is a lookup, not a parse. The value is a constant, so it is
+    // resolved here — where the set's `user_type` says which enum — and projected in place of the
+    // arm's own column below. A literal that is no label of it is
+    // `22P02 invalid input value for enum h_mood: "nope"`, the sentence an `INSERT` of it gives.
+    let mut constants: Vec<Vec<Option<Datum>>> = arm_types
+        .iter()
+        .map(|types| vec![None; types.len()])
+        .collect();
+    for (at, settled) in columns.iter().enumerate() {
+        let Some(def) = settled.user_type.as_ref().filter(|def| is_enum_def(def)) else {
+            continue;
+        };
+        for (arm, unknown) in arm_unknown.iter().enumerate() {
+            if !unknown.get(at).copied().unwrap_or(false) {
+                continue;
+            }
+            // A bare `NULL` arm is a NULL of that enum and needs no lookup.
+            let Some(text) = arm_unknown_text[arm].get(at).and_then(Option::as_ref) else {
+                continue;
+            };
+            let Some(ordinal) = crate::catalog::enum_ordinal(enum_labels(def)?, text) else {
+                return Err(SqlError::InvalidEnumValue {
+                    ty: def.name.clone(),
+                    value: text.clone(),
+                });
+            };
+            constants[arm][at] = Some(Datum::Int2(ordinal));
+        }
     }
     // **Every arm has to reach the type the set settled on, by an implicit cast**: agreeing on a
     // category is not enough. `money` beside `numeric` is one category with no implicit cast either
@@ -766,8 +811,9 @@ pub(super) fn append(
     // that need it in a projection of casts and leaves the rest untouched.
     let nodes: Vec<Node> = nodes
         .into_iter()
-        .zip(arm_types)
-        .map(|(node, types)| coerce_arm(node, &types, &columns))
+        .zip(&arm_types)
+        .zip(&constants)
+        .map(|((node, types), constants)| coerce_arm(node, types, &columns, constants))
         .collect();
     let mut node = combine(nodes, &ops);
     // **The set's own clauses, over the set's own row.** An `ORDER BY` after the last arm sorts
@@ -954,8 +1000,15 @@ fn unify_user_type(
 /// A projection of casts, which is what PostgreSQL puts in each arm's target list. The `Ordinal`
 /// carries the arm's *own* type, because that is what the value in the row is; the cast is what
 /// makes it the set's.
-fn coerce_arm(node: Node, arm: &[ColumnType], columns: &[OutputColumn]) -> Node {
-    if arm.iter().zip(columns).all(|(from, to)| *from == to.ty) {
+fn coerce_arm(
+    node: Node,
+    arm: &[ColumnType],
+    columns: &[OutputColumn],
+    constants: &[Option<Datum>],
+) -> Node {
+    if constants.iter().all(Option::is_none)
+        && arm.iter().zip(columns).all(|(from, to)| *from == to.ty)
+    {
         return node;
     }
     let exprs = arm
@@ -963,6 +1016,12 @@ fn coerce_arm(node: Node, arm: &[ColumnType], columns: &[OutputColumn]) -> Node 
         .zip(columns)
         .enumerate()
         .map(|(at, (from, to))| {
+            // **An unknown literal read as an enum's label is a constant**, resolved in `append`
+            // where the enum is known, and it replaces the arm's own column rather than casting
+            // it: the value in the row is the literal's text and the set's is the ordinal (#81).
+            if let Some(value) = constants.get(at).and_then(Option::as_ref) {
+                return Expr::Literal(Literal::typed(Box::new(value.clone())));
+            }
             let operand = Expr::Ordinal {
                 at,
                 ty: *from,
@@ -4657,6 +4716,17 @@ fn is_unknown_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Literal(Literal::Null | Literal::String(_)))
 }
 
+/// The text an `unknown` literal holds, or `None` for the bare `NULL`, which holds none.
+///
+/// The one reader is a set operation's arm beside an enum, where the label has to be looked up
+/// after the arms are planned (`OutputColumn::unknown_text`, `debts-v1.1.md` #81).
+fn unknown_text_of(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Literal(Literal::String(text)) => Some(text.clone()),
+        _ => None,
+    }
+}
+
 /// Whether an operator exists between two types, as coarsely as this node's type surface allows.
 ///
 /// PostgreSQL's answer comes out of `pg_operator` and its implicit casts; ours is the same
@@ -6078,6 +6148,7 @@ fn output_columns(
                         // A `*` expands to columns, and a column's type is one the catalog holds.
                         pseudo: None,
                         unknown: false,
+                        unknown_text: None,
                     }
                 }));
             }
@@ -6155,6 +6226,7 @@ fn output_columns(
                     pseudo: *pseudo,
                     // The one thing about this column that cannot be read back off its type.
                     unknown: is_unknown_literal(expr),
+                    unknown_text: unknown_text_of(expr),
                 });
             }
         }
