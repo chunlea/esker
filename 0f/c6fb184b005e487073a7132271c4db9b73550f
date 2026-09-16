@@ -1,0 +1,19 @@
+docs/adr/0117-a-fragments-refusal-carries-the-keys-that-stopped-it.md
+  s_4b81579bfe1fd8::t_4ee5552b194a63 1-297
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0fc6fb184b005e487073a7132271c4db9b73550f",
+  "prompts": {},
+  "sessions": {
+    "s_4b81579bfe1fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8c0cc5a0-66ea-4c9a-b236-65a4db61ae34",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
