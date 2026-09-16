@@ -1978,3 +1978,212 @@ fn a_prewrite_is_refused_by_its_frame_and_not_by_an_estimate_of_it() {
         "the commit never left the process"
     );
 }
+
+/// Every `Prewrite` that went out, in order.
+fn prewrite_requests(transport: &FakeTransport) -> Vec<TxnKvReq> {
+    transport
+        .calls()
+        .iter()
+        .filter_map(|call| call.txn_body().cloned())
+        .filter(|body| matches!(body, TxnKvReq::Prewrite { .. }))
+        .collect()
+}
+
+/// The keys of every `Put` in a list of prewrites, in the order they were sent.
+fn keys_of(requests: &[TxnKvReq]) -> Vec<Bytes> {
+    let mut keys = Vec::new();
+    for request in requests {
+        if let TxnKvReq::Prewrite { mutations, .. } = request {
+            for mutation in mutations {
+                if let TxnMutation::Put { key, .. } = mutation {
+                    keys.push(key.clone());
+                }
+            }
+        }
+    }
+    keys
+}
+
+/// **A batch too large for one frame is sent as several** (#99).
+///
+/// A 65,536-row fixture load is a legal statement — PostgreSQL has no such user-visible ceiling —
+/// and refusing it because the transport carries 16 MiB at a time is this client's limitation, not
+/// the database's. Percolator already sends a transaction's keys one group per region and hangs its
+/// atomicity on the primary's commit record, so a second cut by bytes changes no isolation property:
+/// it is the same per-key work in more frames.
+#[test]
+fn a_prewrite_too_large_for_one_frame_is_sent_as_several() {
+    const ROWS: usize = 400;
+    /// Around a third of what these mutations encode to, so the cut has to happen twice.
+    const LIMIT: usize = 12_000;
+
+    let transport = Arc::new(FakeTransport::new());
+    transport.set_max_frame_size(LIMIT);
+    script_a_clean_commit(&transport);
+    let client = client(&transport);
+
+    let mut txn = client.begin().unwrap();
+    txn.begin_statement(STATEMENT_TS);
+    let value = vec![b'v'; 28];
+    for at in 0..ROWS {
+        txn.put(&wide_key(at), &value);
+    }
+    txn.commit()
+        .expect("a batch larger than a frame is cut, not refused");
+
+    let sent = prewrite_requests(&transport);
+    assert!(
+        sent.len() >= 3,
+        "a batch three frames wide went out as {} prewrites",
+        sent.len()
+    );
+    for request in &sent {
+        let frame = esker_client::wire::txn_payload_size(request)
+            + esker_client::wire::MAX_REQUEST_ENVELOPE;
+        assert!(
+            frame <= LIMIT,
+            "a chunk of {frame} bytes went out under a {LIMIT}-byte limit"
+        );
+    }
+
+    // Every row exactly once: a cut that drops or repeats a key is worse than a refusal.
+    let mut keys = keys_of(&sent);
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(keys.len(), ROWS, "the cut did not carry every key once");
+}
+
+/// **And a batch that fits still costs one frame.** The cut is not an excuse to send more round
+/// trips than the limit asks for.
+#[test]
+fn a_batch_that_fits_one_frame_is_still_one_request() {
+    const ROWS: usize = 400;
+
+    let transport = Arc::new(FakeTransport::new());
+    script_a_clean_commit(&transport);
+    let client = client(&transport);
+
+    let mut txn = client.begin().unwrap();
+    txn.begin_statement(STATEMENT_TS);
+    let value = vec![b'v'; 28];
+    for at in 0..ROWS {
+        txn.put(&wide_key(at), &value);
+    }
+    txn.commit().expect("well inside the default frame limit");
+
+    // Two prewrites and two commits: the primary alone, then every other key — which is what this
+    // transaction cost before there was a byte cut at all.
+    assert_eq!(
+        prewrite_requests(&transport).len(),
+        2,
+        "the primary and the rest, and nothing more"
+    );
+    let commits = transport
+        .calls()
+        .iter()
+        .filter(|call| matches!(call.txn_body(), Some(TxnKvReq::Commit { .. })))
+        .count();
+    assert_eq!(commits, 2, "the commit point and the secondaries");
+}
+
+/// **A chunk that fails fails the commit, and the primary is given back** — the failure path is the
+/// one a refused *group* has always taken, because a chunk is a group by another cut (#99).
+#[test]
+fn a_chunk_that_fails_takes_the_commit_with_it() {
+    const ROWS: usize = 400;
+    const LIMIT: usize = 12_000;
+
+    let transport = Arc::new(FakeTransport::new());
+    transport.set_max_frame_size(LIMIT);
+    transport
+        .script(Rule::new(Matcher::Method(Method::TxnPrewrite), Outcome::PrewriteOk).times(2))
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnPrewrite),
+                // A **definite** refusal rather than an ambiguous one: `prewrite_or_roll_back`
+                // cleans up after a failure the cluster answered and deliberately leaves an
+                // `AmbiguousResult` alone, because deciding that one on the caller's behalf turns
+                // "you do not know" into "it is dead". This chunk never reached a store.
+                Outcome::Fail(ProtoError::not_sent("the connection went away")),
+            )
+            .forever(),
+        )
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnRollback),
+                Outcome::TxnReply(TxnKvResp::Rollback {
+                    status: TxnStatus::RolledBack,
+                }),
+            )
+            .forever(),
+        )
+        .script(
+            Rule::new(
+                Matcher::Method(Method::TxnCommit),
+                Outcome::TxnReply(TxnKvResp::Commit {
+                    status: TxnStatus::Ok,
+                }),
+            )
+            .forever(),
+        );
+    let client = client(&transport);
+
+    let mut txn = client.begin().unwrap();
+    txn.begin_statement(STATEMENT_TS);
+    let value = vec![b'v'; 28];
+    for at in 0..ROWS {
+        txn.put(&wide_key(at), &value);
+    }
+    txn.commit()
+        .expect_err("the chunk that failed fails the commit");
+
+    assert!(
+        prewrite_requests(&transport).len() > 2,
+        "the failure was not mid-batch: {} prewrites went out",
+        prewrite_requests(&transport).len()
+    );
+    assert!(
+        transport
+            .calls()
+            .iter()
+            .any(|call| matches!(call.txn_body(), Some(TxnKvReq::Rollback { .. }))),
+        "a commit that died mid-batch kept the primary's lock"
+    );
+}
+
+/// **One write no frame can carry is refused by name** (#100).
+///
+/// No cut helps a single mutation wider than a frame, so this is a real refusal — and the caller
+/// has a quarter of a million keys, so it has to say which one. PostgreSQL's own ceiling is a
+/// gigabyte a field; this transport's is one frame.
+#[test]
+fn a_write_no_frame_can_carry_is_refused_by_name() {
+    const LIMIT: usize = 4_096;
+
+    let transport = Arc::new(FakeTransport::new());
+    transport.set_max_frame_size(LIMIT);
+    script_a_clean_commit(&transport);
+    let client = client(&transport);
+
+    let mut txn = client.begin().unwrap();
+    txn.begin_statement(STATEMENT_TS);
+    txn.put(b"one-huge-row", &vec![b'v'; 8_192]);
+    let error = txn.commit().expect_err("no frame can carry it");
+
+    let said = error.to_string();
+    assert!(
+        said.contains("one-huge-row"),
+        "the refusal does not say which key: {said}"
+    );
+    assert!(
+        error.changed_nothing(),
+        "nothing of this write reached a store"
+    );
+    // Not one prewrite: the refusal is decided from the mutation's own length, before anything is
+    // built into a frame. What *does* go out is the rollback a failed commit sends for its primary,
+    // which is the marker that makes this transaction dead rather than a write left in doubt.
+    assert!(
+        prewrite_requests(&transport).is_empty(),
+        "a write no frame can carry was sent anyway"
+    );
+}
