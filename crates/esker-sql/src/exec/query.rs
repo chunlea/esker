@@ -7196,6 +7196,26 @@ fn pg_typeof_of(expr: &Expr, scope: &Scope<'_>) -> Result<Datum> {
             name: crate::catalog::display_name(&def.name).into(),
         });
     }
+    // **An `array_agg` over a user type answers an array *of* it** — `d[]`, and not the
+    // base's `text[]`. Measured on 19beta1 (`esker-coord/s2-h106.out`): over a domain column
+    // `pg_typeof(array_agg(s))` is `h106d[]` while `pg_typeof(min(s))` is `text`, because that
+    // aggregate resolves through the base type's operator family and this one compares
+    // nothing — it collects. The two cannot share an answer, which is why this is a branch of
+    // its own rather than an entry in `AggregateFunc::keeps_its_argument_type`.
+    //
+    // **The oid is the type's plus one, and it is reserved rather than invented here**:
+    // `exec::typedef` allocates the array type's id beside the type's own when `CREATE TYPE`
+    // runs, and `catalog::pg_catalog::user_type_rows` emits its `pg_type` row — `_{name}`,
+    // `typelem` the type's oid, `typcategory` `A`.
+    if let Expr::Aggregate(call) = expr
+        && call.func == crate::plan::AggregateFunc::ArrayAgg
+        && let Some(def) = call.arg().and_then(|arg| branch_user_type(arg, scope))
+    {
+        return Ok(Datum::RegType {
+            oid: u32::try_from(def.oid + 1).unwrap_or(0),
+            name: format!("{}[]", crate::catalog::display_name(&def.name)).into(),
+        });
+    }
     Ok(crate::value::regtype_of_oid(expr_type(expr, scope)?.oid()))
 }
 
