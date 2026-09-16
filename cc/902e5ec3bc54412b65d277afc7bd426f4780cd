@@ -1,0 +1,21 @@
+crates/esker-sql/src/exec/query.rs
+  s_4b81579bfe1fd8::t_76a94fba5cea6e 7199-7218
+crates/esker-sql/tests/enum_unknown_literal.rs
+  s_4b81579bfe1fd8::t_5c426abb1d85cb 260-266,271
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cc902e5ec3bc54412b65d277afc7bd426f4780cd",
+  "prompts": {},
+  "sessions": {
+    "s_4b81579bfe1fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8c0cc5a0-66ea-4c9a-b236-65a4db61ae34",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
