@@ -1,0 +1,19 @@
+crates/esker-sql/tests/routing_differential.rs
+  s_8d3e4c2902bf64::t_eefa5457dd8968 2682-2697,2700,2702,2704,2706,2709-2710,2713,3018-3022,3041,3067,3106-3145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "81051f00f0354aceb30d413b3ada0e61a2355e06",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
