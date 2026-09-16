@@ -19,13 +19,13 @@
 //!   a redirect hint rather than served (`CLAUDE.md` invariant 5).
 //! * **Byte-opaque.** Nothing here interprets a key or a value (invariant 7).
 
-use bytes::Bytes;
-
 pub use esker_proto::messages::{
     DEFAULT_SCAN_LIMIT, Method, RawKvReq, RawKvResp, Request, RequestHeader, Response,
 };
 pub use esker_proto::txn::{LockInfo, TxnKvReq, TxnKvResp, TxnMutation, TxnStatus};
-pub use esker_proto::{Epoch, MAX_FRAME_SIZE, Peer, PeerRole, ProtoError, Region, RequestOutcome};
+pub use esker_proto::{
+    Epoch, MAX_FRAME_SIZE, MAX_REQUEST_ENVELOPE, Peer, PeerRole, ProtoError, Region, RequestOutcome,
+};
 
 /// What a call to a store returns: an answer, or a typed refusal.
 ///
@@ -65,7 +65,7 @@ impl Body {
         }
     }
 
-    /// A lower bound on what this encodes to, in bytes.
+    /// Exactly what this body encodes to, in bytes.
     #[must_use]
     pub fn payload_size(&self) -> usize {
         match self {
@@ -96,51 +96,10 @@ impl From<TxnKvReq> for Body {
     }
 }
 
-/// A lower bound on what a `TxnKv` request encodes to, in bytes. See [`payload_size`].
+/// **Exactly what a `TxnKv` request's body encodes to**, in bytes. See [`payload_size`].
 #[must_use]
 pub fn txn_payload_size(request: &TxnKvReq) -> usize {
-    /// Varint length prefix plus a little slack, per field.
-    const PER_FIELD: usize = 6;
-    let stamp = |read_ts: Option<u64>| read_ts.map_or(0, |_| PER_FIELD);
-    let keys =
-        |keys: &[Bytes]| keys.iter().map(|key| key.len() + PER_FIELD).sum::<usize>() + PER_FIELD;
-    match request {
-        TxnKvReq::Get { key, .. } | TxnKvReq::LatestCommit { key } => key.len() + 2 * PER_FIELD,
-        TxnKvReq::Scan { start, end, .. } => start.len() + end.len() + 5 * PER_FIELD,
-        TxnKvReq::ReclaimRange { start, end, .. } => start.len() + end.len() + 3 * PER_FIELD,
-        TxnKvReq::Prewrite {
-            primary, mutations, ..
-        } => {
-            primary.len()
-                + mutations
-                    .iter()
-                    .map(|mutation| match mutation {
-                        // A read timestamp is one more varint, on the three that can carry one.
-                        TxnMutation::Put {
-                            key,
-                            value,
-                            read_ts,
-                        } => key.len() + value.len() + 2 * PER_FIELD + stamp(*read_ts),
-                        TxnMutation::Delete { key, read_ts }
-                        | TxnMutation::Check { key, read_ts } => {
-                            key.len() + PER_FIELD + stamp(*read_ts)
-                        }
-                        // A range is two keys, and a read set of wide ranges is exactly what makes
-                        // a prewrite large enough for this estimate to matter (ADR 0062).
-                        TxnMutation::CheckRange { start, end } => {
-                            start.len() + end.len() + 2 * PER_FIELD
-                        }
-                    })
-                    .sum::<usize>()
-                + 4 * PER_FIELD
-        }
-        TxnKvReq::Commit { keys: k, .. }
-        | TxnKvReq::Rollback { keys: k, .. }
-        | TxnKvReq::ReleaseLock { keys: k, .. }
-        | TxnKvReq::ResolveLock { keys: k, .. } => keys(k) + 2 * PER_FIELD,
-        TxnKvReq::Heartbeat { primary, .. } => primary.len() + 3 * PER_FIELD,
-        TxnKvReq::GcSafepoint { .. } => PER_FIELD,
-    }
+    request.encoded_len()
 }
 
 /// The key a request routes by: the one the region cache is consulted with.
@@ -183,44 +142,17 @@ pub fn routing_key(request: &RawKvReq) -> &[u8] {
     }
 }
 
-/// A lower bound on what a request encodes to, in bytes.
+/// **Exactly what a request's body encodes to**, in bytes.
 ///
-/// Lets the client refuse an oversized request at the call site rather than have the far end
-/// tear the connection down mid-frame. It counts the payload exactly and the framing loosely:
-/// the payload is what actually gets large, and the check has margin because
-/// [`MAX_FRAME_SIZE`] sits far above any sane request.
+/// Lets the client refuse a request it cannot frame at the call site rather than have the far end
+/// tear the connection down mid-frame. The number is the encoder's own
+/// ([`RawKvReq::encoded_len`]) rather than an estimate of it: an estimate that ran high refused a
+/// prewrite of about 15.8 MB as "about 17334584 bytes" against the 16,777,216-byte limit, and one
+/// that ran low would hand the transport a frame it cannot send (#98). The envelope a frame adds
+/// on top is [`MAX_REQUEST_ENVELOPE`].
 #[must_use]
 pub fn payload_size(request: &RawKvReq) -> usize {
-    /// Varint length prefix plus a little slack, per field.
-    const PER_FIELD: usize = 6;
-    match request {
-        RawKvReq::Get { key } | RawKvReq::Delete { key, .. } => key.len() + PER_FIELD,
-        RawKvReq::BatchGet { keys } => {
-            keys.iter().map(|key| key.len() + PER_FIELD).sum::<usize>() + PER_FIELD
-        }
-        RawKvReq::Put { key, value, .. } => key.len() + value.len() + 2 * PER_FIELD,
-        RawKvReq::BatchPut { pairs, .. } => {
-            pairs
-                .iter()
-                .map(|(key, value)| key.len() + value.len() + 2 * PER_FIELD)
-                .sum::<usize>()
-                + PER_FIELD
-        }
-        RawKvReq::DeleteRange { start, end, .. } | RawKvReq::Scan { start, end, .. } => {
-            start.len() + end.len() + 4 * PER_FIELD
-        }
-        RawKvReq::CompareAndSwap {
-            key,
-            expected,
-            value,
-            ..
-        } => {
-            key.len()
-                + expected.as_ref().map_or(0, Bytes::len)
-                + value.as_ref().map_or(0, Bytes::len)
-                + 3 * PER_FIELD
-        }
-    }
+    request.encoded_len()
 }
 
 /// Whether re-sending a method changes the database differently the second time.

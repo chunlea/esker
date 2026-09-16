@@ -54,6 +54,11 @@ impl Epoch {
         out.put_varint(self.version);
     }
 
+    /// What [`Epoch::encode`] writes, in bytes.
+    pub(crate) fn encoded_len(self) -> usize {
+        crate::codec::varint_len(self.conf_ver) + crate::codec::varint_len(self.version)
+    }
+
     pub(crate) fn decode(input: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         Ok(Self {
             conf_ver: input.get_varint("epoch.conf_ver")?,

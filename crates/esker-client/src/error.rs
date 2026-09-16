@@ -100,9 +100,9 @@ pub enum Error {
 
     /// The request would not fit in one frame. Refused here rather than at the far end, where
     /// it would look like a connection failure.
-    #[error("request of about {bytes} bytes exceeds the {limit}-byte frame limit")]
+    #[error("request of {bytes} bytes exceeds the {limit}-byte frame limit")]
     RequestTooLarge {
-        /// What the request encodes to, at least.
+        /// What the request's frame encodes to, envelope included.
         bytes: usize,
         /// The transport's ceiling.
         limit: usize,

@@ -461,6 +461,18 @@ impl Method {
     }
 }
 
+/// The two bytes every request body starts with: the method ([`Encoder::put_u16`]).
+const METHOD_LEN: usize = 2;
+
+/// **The most a request's envelope can add to its body**: the frame header, the method, and a
+/// [`RequestHeader`] whose four varints are all at their widest.
+///
+/// A client asks whether a request will fit a frame before it has routed one, so it has no header
+/// to measure and reserves this instead. See [`RawKvReq::encoded_len`] for why the body's own
+/// number is exact (#98).
+pub const MAX_REQUEST_ENVELOPE: usize =
+    crate::frame::FRAME_HEADER_SIZE + METHOD_LEN + 4 * esker_base::varint::MAX_LEN_U64;
+
 /// `{ region_id, epoch, peer }` — on every key-value request (`docs/DESIGN.md` §9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RequestHeader {
@@ -487,6 +499,15 @@ impl RequestHeader {
         out.put_varint(self.region_id);
         self.epoch.encode(out);
         out.put_varint(self.peer);
+    }
+
+    /// What `RequestHeader::encode` writes, in bytes. (The encoder is private, so this names it
+    /// rather than linking to it.)
+    #[must_use]
+    pub fn encoded_len(self) -> usize {
+        crate::codec::varint_len(self.region_id)
+            + self.epoch.encoded_len()
+            + crate::codec::varint_len(self.peer)
     }
 
     fn decode(input: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -778,6 +799,50 @@ impl RawKvReq {
                 out.put_opt_bytes(expected.as_deref());
                 out.put_opt_bytes(value.as_deref());
                 out.put_bool(*sync);
+            }
+        }
+    }
+
+    /// **Exactly what this request's body encodes to**, in bytes, by the rules `RawKvReq::encode`
+    /// writes it with.
+    ///
+    /// A client refuses a request it cannot frame before sending it, and the number it refuses by
+    /// has to be the encoding's own: an estimate that runs high refuses requests that would have
+    /// gone out, and one that runs low hands the transport a frame it cannot send. Run 127 attempt
+    /// 7 met the first — a prewrite of about 15.8 MB refused as "about 17334584 bytes" against a
+    /// 16,777,216-byte limit (#98).
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        use crate::codec::{BOOL_LEN, bytes_len, opt_bytes_len, varint_len};
+        match self {
+            Self::Get { key } => bytes_len(key),
+            Self::BatchGet { keys } => {
+                varint_len(keys.len() as u64) + keys.iter().map(|key| bytes_len(key)).sum::<usize>()
+            }
+            Self::Put { key, value, .. } => bytes_len(key) + bytes_len(value) + BOOL_LEN,
+            Self::BatchPut { pairs, .. } => {
+                varint_len(pairs.len() as u64)
+                    + pairs
+                        .iter()
+                        .map(|(key, value)| bytes_len(key) + bytes_len(value))
+                        .sum::<usize>()
+                    + BOOL_LEN
+            }
+            Self::Delete { key, .. } => bytes_len(key) + BOOL_LEN,
+            Self::DeleteRange { start, end, .. } => bytes_len(start) + bytes_len(end) + BOOL_LEN,
+            Self::Scan {
+                start, end, limit, ..
+            } => bytes_len(start) + bytes_len(end) + varint_len(u64::from(*limit)) + BOOL_LEN,
+            Self::CompareAndSwap {
+                key,
+                expected,
+                value,
+                ..
+            } => {
+                bytes_len(key)
+                    + opt_bytes_len(expected.as_deref())
+                    + opt_bytes_len(value.as_deref())
+                    + BOOL_LEN
             }
         }
     }

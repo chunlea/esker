@@ -373,6 +373,25 @@ impl TxnMutation {
         }
     }
 
+    /// What [`TxnMutation::encode`] writes, in bytes: the tag, the key, the value where there is
+    /// one, and **the read timestamp as the varint it is** rather than as a fixed allowance (#98).
+    pub(crate) fn encoded_len(&self) -> usize {
+        use crate::codec::{TAG_LEN, bytes_len, varint_len};
+        let stamp = |read_ts: Option<u64>| read_ts.map_or(0, varint_len);
+        TAG_LEN
+            + match self {
+                Self::Put {
+                    key,
+                    value,
+                    read_ts,
+                } => bytes_len(key) + bytes_len(value) + stamp(*read_ts),
+                Self::Delete { key, read_ts } | Self::Check { key, read_ts } => {
+                    bytes_len(key) + stamp(*read_ts)
+                }
+                Self::CheckRange { start, end } => bytes_len(start) + bytes_len(end),
+            }
+    }
+
     fn decode(input: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         match input.get_u8("mutation.tag")? {
             1 => Ok(Self::Put {
@@ -677,6 +696,70 @@ impl TxnKvReq {
                 out.put_varint(*below_ts);
             }
             Self::LatestCommit { key } => out.put_bytes(key),
+        }
+    }
+
+    /// **Exactly what this request's body encodes to**, in bytes, by the rules `TxnKvReq::encode`
+    /// writes it with. See [`crate::RawKvReq::encoded_len`] for why a client needs the encoding's own
+    /// number and not an estimate of it (#98).
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        use crate::codec::{BOOL_LEN, bytes_len, varint_len};
+        match self {
+            Self::Get { key, ts } => bytes_len(key) + varint_len(*ts),
+            Self::Scan {
+                start,
+                end,
+                limit,
+                ts,
+                ..
+            } => {
+                bytes_len(start)
+                    + bytes_len(end)
+                    + varint_len(u64::from(*limit))
+                    + varint_len(*ts)
+                    + BOOL_LEN
+            }
+            Self::Prewrite {
+                start_ts,
+                primary,
+                ttl_ms,
+                mutations,
+            } => {
+                varint_len(*start_ts)
+                    + bytes_len(primary)
+                    + varint_len(*ttl_ms)
+                    + varint_len(mutations.len() as u64)
+                    + mutations
+                        .iter()
+                        .map(TxnMutation::encoded_len)
+                        .sum::<usize>()
+            }
+            Self::Commit {
+                start_ts,
+                commit_ts,
+                keys,
+            }
+            | Self::ResolveLock {
+                start_ts,
+                commit_ts,
+                keys,
+            } => varint_len(*start_ts) + varint_len(*commit_ts) + keys_len(keys),
+            Self::Rollback { start_ts, keys } | Self::ReleaseLock { start_ts, keys } => {
+                varint_len(*start_ts) + keys_len(keys)
+            }
+            Self::Heartbeat {
+                start_ts,
+                primary,
+                ttl_ms,
+            } => varint_len(*start_ts) + bytes_len(primary) + varint_len(*ttl_ms),
+            Self::GcSafepoint { safepoint } => varint_len(*safepoint),
+            Self::ReclaimRange {
+                start,
+                end,
+                below_ts,
+            } => bytes_len(start) + bytes_len(end) + varint_len(*below_ts),
+            Self::LatestCommit { key } => bytes_len(key),
         }
     }
 
@@ -1005,6 +1088,15 @@ fn put_keys(out: &mut Encoder, keys: &[Bytes]) {
     for key in keys {
         out.put_bytes(key);
     }
+}
+
+/// What [`put_keys`] writes, in bytes.
+fn keys_len(keys: &[Bytes]) -> usize {
+    crate::codec::varint_len(keys.len() as u64)
+        + keys
+            .iter()
+            .map(|key| crate::codec::bytes_len(key))
+            .sum::<usize>()
 }
 
 fn get_keys(input: &mut Decoder<'_>) -> Result<Vec<Bytes>, DecodeError> {
