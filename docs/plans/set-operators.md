@@ -109,6 +109,43 @@ then precedence is not a lowering change but a plan-shape change, and the arms o
 build the grouping question as a red test over `a EXCEPT b INTERSECT b` and see which layer has to
 change to answer it.
 
+## Step 1 is measured, and it settles the size (2026-09-16)
+
+The page said to answer one question before building anything: `exec::query::combine` takes a
+**flat** sequence of arms, so if the grouping `a EXCEPT b INTERSECT b` could not be recovered there,
+precedence would stop being a lowering change and become a plan-shape change every `UNION` query
+shares. Two measurements answered it, and both came back the way the page hoped.
+
+**The precedence probe** (`tests/lowering.rs::a_mixed_set_operator_chain_keeps_its_grouping`,
+committed in `7cb73410`): a same-precedence chain lowers **flat** — two top-level `Except` arms,
+nothing nesting — and a mixed chain lowers **nested**, one `Except` arm whose own `set_arms` is
+`[Intersect]`. The plan already expresses precedence.
+
+**The refusal probe** (`scratchpad/h/h105_step1.py`, applied and restored, never committed): lifting
+`exec::mod::set_arm_supported`'s refusal and changing nothing else makes the corpus fail with
+**9 of 18 statements disagreeing, every one of them on rows** — and not one `0A000`:
+
+```
+line 34  EXCEPT        PostgreSQL 1          Esker 1 ; 2 ; 3 ; 4        <- UNION's rows
+line 35  EXCEPT ALL    PostgreSQL 1 ; 2      Esker all eight
+line 36  INTERSECT     PostgreSQL 2 ; 3      Esker 1 ; 2 ; 3 ; 4
+line 40  pg_typeof(v)  PostgreSQL numeric    Esker numeric ; numeric ; numeric
+```
+
+So **the refusal was the only gate**: parsing, lowering, arm unification and type settlement all
+work for the two new operators already — line 40 is the proof, where the *type* is right
+(`numeric`, unified across an `integer` arm and a `numeric` one) and only the row count is wrong.
+What is missing is exactly what this page said: the row combination.
+
+**The probe must never be committed.** With the refusal lifted and nothing built, `INTERSECT` and
+`EXCEPT` answer `UNION`'s rows — a wrong answer where an honest `0A000` used to be, which is the one
+outcome worse than not having the feature. It exists to be applied, read and restored.
+
+**One consequence for the build order below**: step 2 as written — land the variants with the
+executor deliberately answering `Append`'s behaviour, so the failure moves from "refused" to "wrong
+rows" — buys nothing now, because the probe has already shown the failure in that shape without a
+line of code. The first slice is the combination itself.
+
 ## What exists already, for whoever builds it
 
 * `crates/esker-sql/tests/corpus/pg19_set_operators.txt` — the capture above, replayable.
