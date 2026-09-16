@@ -1,0 +1,19 @@
+crates/esker-sql/tests/captures/pg19_set_operations.txt
+  s_f4b2852b53accb::t_a937b2cc1f4cd1 5-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "82d708aad193d3e8d9f76b78de027c9e0f80df64",
+  "prompts": {},
+  "sessions": {
+    "s_f4b2852b53accb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc7223c3-8ba0-48df-95c8-ddb365dc093c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
