@@ -2617,8 +2617,8 @@ impl Gate {
     /// *transaction* per row, and a million of those is the measurement's own cost rather than the
     /// thing being measured. The fill's own duration is printed because it decides how much of a
     /// window is left for measuring.
-    async fn fill_one_at_scale(&self, table: &str, rows: i64) {
-        tokio::task::block_in_place(|| {
+    async fn fill_one_at_scale(&self, table: &str, rows: i64) -> Duration {
+        let filled_in = tokio::task::block_in_place(|| {
             let mut session = self.session();
             settle(
                 &mut session,
@@ -2641,8 +2641,10 @@ impl Gate {
             }
             let filled_in = began.elapsed();
             println!("{table}: {rows} rows filled in {filled_in:?}");
+            filled_in
         });
         self.wait_for_a_learner_that_answers(table).await;
+        filled_in
     }
 }
 
@@ -2883,7 +2885,13 @@ fn median_of(samples: &[Duration]) -> Duration {
 
 /// Rows per tier. The first tier is run whole before the next is filled, so a window that runs out
 /// leaves finished tiers rather than half a table.
-const SCALE_TIERS: [i64; 3] = [100_000, 500_000, 1_000_000];
+///
+/// **Two tiers, not three.** The first window measured the fill at 356.5 s for 100k rows and found
+/// the rate falling as the store grows (657 rows a second into an empty store, 280 into one holding
+/// 100k), which puts a 500k fill near half an hour and a 1M fill past the whole window — the third
+/// tier was never reachable, and reaching for it is what cost the first window its data. Two points
+/// give a slope, and a slope is what the ADR needs.
+const SCALE_TIERS: [i64; 2] = [100_000, 200_000];
 
 /// Rounds per tier. One round is not the number: the same measurement run twice on the small table
 /// met a lock 22 times in 120 scans and then 13, and put the fallback's cost at +27% and then
@@ -2905,6 +2913,10 @@ fn scans_for(rows: i64) -> usize {
 struct Tier {
     rows: i64,
     scans: usize,
+    /// How long this tier's table took to fill. **First-class data, not a side note**: the first
+    /// window filled 20k rows into an empty store at 657 rows a second and 100k at 280, so what an
+    /// insert costs as a table grows is something this measurement reports rather than merely pays.
+    fill: Duration,
     rounds: Vec<Round>,
 }
 
@@ -2929,7 +2941,7 @@ async fn what_the_fallback_costs_as_the_table_grows() {
 
     for rows in SCALE_TIERS {
         let hot = format!("hot{rows}");
-        gate.fill_one_at_scale(&hot, rows).await;
+        let fill = gate.fill_one_at_scale(&hot, rows).await;
         let scans = scans_for(rows);
         let mut rounds = Vec::new();
         for _ in 0..SCALE_ROUNDS {
@@ -2944,6 +2956,7 @@ async fn what_the_fallback_costs_as_the_table_grows() {
         tiers.push(Tier {
             rows,
             scans,
+            fill,
             rounds,
         });
         print_scale_report(&tiers);
@@ -2955,7 +2968,7 @@ async fn what_the_fallback_costs_as_the_table_grows() {
     let cold_rows = SCALE_TIERS[0];
     let cold_scans = scans_for(cold_rows);
     let cold = format!("cold{cold_rows}");
-    gate.fill_one_at_scale(&cold, cold_rows).await;
+    let _ = gate.fill_one_at_scale(&cold, cold_rows).await;
     let cold_round = measure_one_round(&gate, &counted, &cold, cold_rows, cold_scans);
     print_round(&cold_round, cold_scans);
 
@@ -3034,7 +3047,7 @@ fn print_round(round: &Round, scans: usize) {
 /// float to print one decimal.
 fn print_scale_report(tiers: &[Tier]) {
     println!(
-        "rows      scans/round  rounds  met: median (min-max)  scans per lock  median met  median clean"
+        "rows      scans/round  rounds  fill          rows/s      met: median (min-max)  scans per lock  median met  median clean"
     );
     for tier in tiers {
         let met: Vec<u64> = tier.rounds.iter().map(|round| round.met).collect();
@@ -3063,8 +3076,15 @@ fn print_scale_report(tiers: &[Tier]) {
         let (rows, scans, rounds) = (tier.rows, tier.scans, tier.rounds.len());
         let met_time = median_of(&met_times);
         let clean_time = median_of(&clean_times);
+        let fill = format!("{:?}", tier.fill);
+        // Rows a second in integer tenths, for the same reason the ratio above is: a count over a
+        // count (or a time) prints one decimal without ever becoming a float.
+        let rate_tenths = (tier.rows * 10_000)
+            .checked_div(i64::try_from(tier.fill.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let rate = format!("{}.{}", rate_tenths / 10, rate_tenths % 10);
         println!(
-            "{rows:<10}{scans:<13}{rounds:<8}{spread:<23}{per_lock:<16}{met_time:?}  {clean_time:?}"
+            "{rows:<10}{scans:<13}{rounds:<8}{fill:<14}{rate:<12}{spread:<23}{per_lock:<16}{met_time:?}  {clean_time:?}"
         );
     }
 }
