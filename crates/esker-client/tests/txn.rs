@@ -1929,3 +1929,52 @@ fn a_lock_refused_by_a_newer_commit_is_asked_again_at_the_re_run_s_snapshot() {
         ]
     );
 }
+
+// -- the size check ---------------------------------------------------------------------------
+
+/// A key of the width a SQL row has, so the numbers below are a real prewrite's shape.
+fn wide_key(at: usize) -> Bytes {
+    Bytes::from(format!("t\x00\x01citations\x00{at:012}"))
+}
+
+/// **A prewrite is refused by what its frame encodes to, not by an estimate of it** (#98).
+///
+/// `txn_payload_size` charges six bytes — one `PER_FIELD` — for a mutation's read timestamp, beside
+/// fields it already counts loosely, so the estimate stands six bytes per **stamped** mutation above
+/// the request itself. Every write of a READ COMMITTED statement is stamped (ADR 0057 §4), and unit
+/// K made the estimate count the stamp while the encoder had been writing it all along.
+///
+/// Run 127 attempt 7 met it on Rails' `citations` fixture: 65,536 rows over a row key and three
+/// index entries is 262,144 stamped mutations, so the estimate stood 1,572,864 bytes above the
+/// frame and the prewrite was refused as "about 17334584 bytes" against the 16,777,216-byte limit —
+/// a frame of about 15.8 MB that never went out (`associations/eager_test.rb`).
+///
+/// The limit here is shrunk to the same shape: above what this commit's frame encodes to, below
+/// what the estimate makes of it.
+#[test]
+fn a_prewrite_is_refused_by_its_frame_and_not_by_an_estimate_of_it() {
+    /// Rows this transaction writes; the prewrite of the secondaries carries all but the primary.
+    const ROWS: usize = 400;
+    /// Between the frame these mutations encode to and the estimate of them.
+    const LIMIT: usize = 27_200;
+
+    let transport = Arc::new(FakeTransport::new());
+    transport.set_max_frame_size(LIMIT);
+    script_a_clean_commit(&transport);
+    let client = client(&transport);
+
+    let mut txn = client.begin().unwrap();
+    // Every statement of a read-write transaction takes a read timestamp, and every key it writes
+    // is stamped with it — which is what makes these the stamped mutations.
+    txn.begin_statement(STATEMENT_TS);
+    let value = vec![b'v'; 28];
+    for at in 0..ROWS {
+        txn.put(&wide_key(at), &value);
+    }
+
+    txn.commit().expect("a frame that fits is sent");
+    assert!(
+        transport.call_count() > 0,
+        "the commit never left the process"
+    );
+}
