@@ -1,0 +1,14 @@
+docs/plans/debts-v1.1.md
+  h_44076b318daf9c 24,114,126
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "aaee0285d3bc6f0616b3e9e5199d494245f14d48",
+  "prompts": {},
+  "humans": {
+    "h_44076b318daf9c": {
+      "author": "chunli <git@chunli.dev>"
+    }
+  }
+}
