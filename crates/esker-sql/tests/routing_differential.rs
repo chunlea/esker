@@ -4050,6 +4050,94 @@ fn classify_planted(
     }
 }
 
+/// Rows the classifier check fills, and where it puts its own keys.
+///
+/// Clear of everything else: the fill owns `1..=RATIO_ROWS`, the planter starts at `RATIO_ROWS + 1`
+/// and steps upward without end, and the ratio test's control sits at `RATIO_ROWS + 1_000_001`.
+const CHECK_ROWS: i64 = 100;
+const CHECK_BASE: i64 = RATIO_ROWS + 5_000_001;
+
+/// Prints what a census found about one planted transaction, and nothing else.
+///
+/// **A print, not a bound**, which is this file's rule for a clock and is the right rule here for a
+/// stronger reason: one of the three outcomes this check can produce is a *finding* rather than a
+/// failure. If the stranded arm's lock cannot be sampled after its lease, that says stranded locks
+/// are resolved the moment they expire — half of ADR 0117's answer — and an assertion would dress
+/// that up as a broken fixture and invite somebody to "fix" it.
+fn report_census(arm: &str, found: &[StrandedLock], planted: u64) {
+    let mine: Vec<&StrandedLock> = found.iter().filter(|l| l.start_ts == planted).collect();
+    let inside = mine.iter().filter(|l| l.expired_by_ms.is_none()).count();
+    let past = mine.len() - inside;
+    println!(
+        "  {arm:<14} rows {} | mine {} | inside its lease {inside} | past it {past}",
+        found.len(),
+        mine.len()
+    );
+}
+
+/// **Can the classifier produce `ALIVE` and `STRANDED` at all, on inputs whose answer is known?**
+///
+/// Three runs of the ratio measurement reported `gone` for eight locks and nothing else, in both
+/// arms, every time — two keys times four stores, identical each run. A number that constant is
+/// structural, and reading the code found two causes that each suffice on their own
+/// (`q117-planter-result.md` §5): the second census is taken after the planter has been stopped, so
+/// nothing can still be there; and the first census is a single snapshot, so it holds whatever one
+/// instant holds, which is one pair.
+///
+/// Both of those are about *when* the census is taken. Neither says whether the classifier works,
+/// and the rule written before any of this ran says a control not classified alive voids the round.
+/// So this asks the narrow question directly, with no planter and no scan loop: plant one lock whose
+/// answer is known and look at it once.
+///
+/// **The readings are pre-registered** in `q117-planter-result.md` §6: both arms find their lock and
+/// disagree about the lease, and the classifier is sound and the fault is timing; the alive arm
+/// finds its lock and the stranded arm finds nothing, and expired locks are being resolved on sight,
+/// which is half of 0117's answer rather than a defect; neither arm finds anything, and the census
+/// itself is what to fix first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "0117's classifier check: a real cluster and about a minute"]
+async fn a_planted_lock_reads_alive_inside_its_lease_and_stranded_past_it() {
+    let gate = Gate::start().await;
+    let fill = gate.fill_one_at_scale("t", CHECK_ROWS).await;
+    let table_id = tokio::task::block_in_place(|| gate.table_id("t")).expect("the table has an id");
+    println!("\n0117 classifier check: {CHECK_ROWS} rows in {fill:?}, table {table_id}");
+
+    tokio::task::block_in_place(|| {
+        // Inside its lease and never committed: the census should find it and call it unexpired.
+        let alive = strand_a_secondary(
+            gate.client.router(),
+            &gate.oracle,
+            table_id,
+            CHECK_BASE + 1,
+            CHECK_BASE + 2,
+            ALIVE_TTL_MS,
+            false,
+        );
+        report_census("alive", &gate.sample_locks("t", table_id, "alive"), alive);
+
+        // Primary committed, secondary left, and read only after four leases have passed: the
+        // census should find it and call it expired — unless something resolved it first, which is
+        // the outcome that answers 0117 rather than accusing the fixture.
+        let stranded = strand_a_secondary(
+            gate.client.router(),
+            &gate.oracle,
+            table_id,
+            CHECK_BASE + 3,
+            CHECK_BASE + 4,
+            STRANDED_TTL_MS,
+            true,
+        );
+        std::thread::sleep(Duration::from_millis(STRANDED_TTL_MS * 4));
+        report_census(
+            "stranded",
+            &gate.sample_locks("t", table_id, "stranded"),
+            stranded,
+        );
+    });
+
+    gate.stop().await;
+}
+
 /// **What share of the locks a fragment meets belong to a transaction that is already finished** —
 /// ADR 0117's third question, and the number that decides whether (b′)+(c) is worth building.
 ///
