@@ -57,6 +57,7 @@
 //! lives in one key.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,9 +69,10 @@ use crate::retry::backoff_ms;
 use crate::router::{ClientOptions, Router, clamp_end, fan_out, repair_route};
 use crate::transport::StoreTransport;
 use crate::wire::{
-    Body, DEFAULT_SCAN_LIMIT, LockInfo, Method, ProtoError, Response, TxnKvReq, TxnKvResp,
-    TxnMutation, TxnStatus,
+    Body, DEFAULT_SCAN_LIMIT, LockInfo, MAX_REQUEST_ENVELOPE, Method, ProtoError, Response,
+    TxnKvReq, TxnKvResp, TxnMutation, TxnStatus,
 };
+use esker_proto::codec::{bytes_len, varint_len};
 
 /// Default time-to-live of a lock, in milliseconds (`docs/DESIGN.md` §14).
 pub const LOCK_TTL_MS: u64 = 3_000;
@@ -581,6 +583,36 @@ pub struct Transaction {
 /// different failure and one worth reporting.
 const MAX_REGROUPINGS: usize = 64;
 
+/// The longest runs of `sizes`, in order, whose sums each fit `room`.
+///
+/// This is the byte cut of #99, and it is deliberately dumb: keys keep their order, a run ends when
+/// the next one would not fit, and nothing is reordered to pack the frames better. A batch that
+/// fits comes back as one run and costs one frame, which is the property the round-trip count
+/// depends on.
+///
+/// `Err(at)` is [`Error::KeyTooLarge`]'s case: one item larger than a whole frame, which no cut can
+/// help, reported by its **index** so the caller can name the key (#100).
+fn runs_that_fit(sizes: &[usize], room: usize) -> std::result::Result<Vec<Range<usize>>, usize> {
+    let mut runs: Vec<Range<usize>> = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    for (at, size) in sizes.iter().enumerate() {
+        if *size > room {
+            return Err(at);
+        }
+        if at > start && used + size > room {
+            runs.push(start..at);
+            start = at;
+            used = 0;
+        }
+        used += size;
+    }
+    if start < sizes.len() {
+        runs.push(start..sizes.len());
+    }
+    Ok(runs)
+}
+
 /// Whether `error` says **this client's routing was wrong**, as opposed to the cluster being unable
 /// to answer.
 ///
@@ -870,17 +902,20 @@ impl Transaction {
         }
     }
 
-    /// One `ReleaseLock` per region the keys fall in.
+    /// One `ReleaseLock` per region the keys fall in, and one per frame inside that.
     fn release_keys(&self, keys: &[Bytes]) -> Result<()> {
         self.grouped(keys, |group| {
-            let request = TxnKvReq::ReleaseLock {
-                start_ts: self.start_ts,
-                keys: group.to_vec(),
-            };
-            match self.call(&request)? {
-                TxnKvResp::ReleaseLock { .. } => Ok(()),
-                other => Err(unexpected(Method::TxnReleaseLock, &other)),
-            }
+            self.in_frames(
+                group,
+                |keys| TxnKvReq::ReleaseLock {
+                    start_ts: self.start_ts,
+                    keys,
+                },
+                |request| match self.call(request)? {
+                    TxnKvResp::ReleaseLock { .. } => Ok(()),
+                    other => Err(unexpected(Method::TxnReleaseLock, &other)),
+                },
+            )
         })
     }
 
@@ -1594,11 +1629,46 @@ impl Transaction {
     /// someone else rather than a failure to make it, so it gets another round rather than an
     /// error — up to the budget.
     fn prewrite(&self, primary: &Bytes, keys: &[Bytes]) -> Result<()> {
+        let mut mutations = self.mutations_for(keys);
+        let sizes: Vec<usize> = mutations.iter().map(TxnMutation::encoded_len).collect();
+        let fixed = TxnKvReq::Prewrite {
+            start_ts: self.start_ts,
+            primary: primary.clone(),
+            ttl_ms: self.lock_ttl_ms,
+            mutations: Vec::new(),
+        }
+        .encoded_len()
+            + varint_len(mutations.len() as u64)
+            - 1;
+        let runs =
+            runs_that_fit(&sizes, self.room_for(fixed)).map_err(|at| Error::KeyTooLarge {
+                key: keys[at].clone(),
+                bytes: sizes[at] + fixed + MAX_REQUEST_ENVELOPE,
+                limit: self.router.max_frame_size(),
+            })?;
+        for run in runs {
+            // `split_off` rather than a slice's `to_vec`: the mutations are built once, and a
+            // value copied per chunk would make the cut cost what the batch costs.
+            let rest = mutations.split_off(run.end - run.start);
+            let chunk = std::mem::replace(&mut mutations, rest);
+            self.prewrite_chunk(primary, &keys[run], chunk)?;
+        }
+        Ok(())
+    }
+
+    /// One `Prewrite` request: the keys and mutations of a single frame, with the lock-resolution
+    /// loop that has always surrounded it.
+    fn prewrite_chunk(
+        &self,
+        primary: &Bytes,
+        keys: &[Bytes],
+        mutations: Vec<TxnMutation>,
+    ) -> Result<()> {
         let request = TxnKvReq::Prewrite {
             start_ts: self.start_ts,
             primary: primary.clone(),
             ttl_ms: self.lock_ttl_ms,
-            mutations: self.mutations_for(keys),
+            mutations,
         };
 
         for round in 0..=self.max_lock_resolutions {
@@ -1654,6 +1724,41 @@ impl Transaction {
         Err(Error::Internal(
             "the prewrite resolution loop fell through".to_owned(),
         ))
+    }
+
+    /// What one request may spend on its keys: the frame the transport carries, less the envelope
+    /// a frame adds and the fields the request carries besides them.
+    ///
+    /// Every number is the encoding's own (#98), so a batch cut to this size is a batch the size
+    /// check at the call site will pass rather than one it will refuse by a hair.
+    fn room_for(&self, fixed: usize) -> usize {
+        self.router
+            .max_frame_size()
+            .saturating_sub(MAX_REQUEST_ENVELOPE + fixed)
+    }
+
+    /// Sends `keys` as **as many requests as the frame limit needs and no more** (#99).
+    ///
+    /// `build` makes the request for a slice of them, and is asked for an empty one first: what it
+    /// encodes to is everything the request carries besides its keys, which is what the cut has to
+    /// leave room for. The count's own varint grows with the batch, so it is added back.
+    fn in_frames<B, S>(&self, keys: &[Bytes], build: B, send: S) -> Result<()>
+    where
+        B: Fn(Vec<Bytes>) -> TxnKvReq,
+        S: Fn(&TxnKvReq) -> Result<()>,
+    {
+        let sizes: Vec<usize> = keys.iter().map(|key| bytes_len(key)).collect();
+        let fixed = build(Vec::new()).encoded_len() + varint_len(keys.len() as u64) - 1;
+        let room = self.room_for(fixed);
+        let runs = runs_that_fit(&sizes, room).map_err(|at| Error::KeyTooLarge {
+            key: keys[at].clone(),
+            bytes: sizes[at] + fixed + MAX_REQUEST_ENVELOPE,
+            limit: self.router.max_frame_size(),
+        })?;
+        for run in runs {
+            send(&build(keys[run].to_vec()))?;
+        }
+        Ok(())
     }
 
     /// The mutations for `keys`, taken from the write buffer.
@@ -1713,28 +1818,34 @@ impl Transaction {
     }
 
     fn commit_keys(&self, commit_ts: u64, keys: &[Bytes]) -> Result<()> {
-        let request = TxnKvReq::Commit {
-            start_ts: self.start_ts,
-            commit_ts,
-            keys: keys.to_vec(),
-        };
-        match self.call(&request)? {
-            // No key: a `Commit` answers for the batch, not per key, so naming one would be a
-            // guess dressed as a fact.
-            TxnKvResp::Commit { status } => self.check(status, None, Waiting::Acquire),
-            other => Err(unexpected(Method::TxnCommit, &other)),
-        }
+        self.in_frames(
+            keys,
+            |keys| TxnKvReq::Commit {
+                start_ts: self.start_ts,
+                commit_ts,
+                keys,
+            },
+            |request| match self.call(request)? {
+                // No key: a `Commit` answers for the batch, not per key, so naming one would be a
+                // guess dressed as a fact.
+                TxnKvResp::Commit { status } => self.check(status, None, Waiting::Acquire),
+                other => Err(unexpected(Method::TxnCommit, &other)),
+            },
+        )
     }
 
     fn rollback_keys(&self, keys: &[Bytes]) -> Result<()> {
-        let request = TxnKvReq::Rollback {
-            start_ts: self.start_ts,
-            keys: keys.to_vec(),
-        };
-        match self.call(&request)? {
-            TxnKvResp::Rollback { status } => self.check(status, None, Waiting::Acquire),
-            other => Err(unexpected(Method::TxnRollback, &other)),
-        }
+        self.in_frames(
+            keys,
+            |keys| TxnKvReq::Rollback {
+                start_ts: self.start_ts,
+                keys,
+            },
+            |request| match self.call(request)? {
+                TxnKvResp::Rollback { status } => self.check(status, None, Waiting::Acquire),
+                other => Err(unexpected(Method::TxnRollback, &other)),
+            },
+        )
     }
 
     fn prewrite_grouped(&self, primary: &Bytes, keys: &[Bytes]) -> Result<()> {

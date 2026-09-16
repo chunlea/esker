@@ -54,8 +54,8 @@ pub use codec::{DecodeError, Decoder, Encoder};
 pub use error::{ProtoError, RequestOutcome};
 pub use frame::{FRAME_HEADER_SIZE, Frame, FrameDecoder, FrameKind, MAX_BODY_SIZE, MAX_FRAME_SIZE};
 pub use messages::{
-    AdminReq, AdminResp, CfEntries, CfFiles, Hello, HelloAck, Method, RawKvReq, RawKvResp,
-    RegionStatus, Request, RequestHeader, Response, SnapshotRequest,
+    AdminReq, AdminResp, CfEntries, CfFiles, Hello, HelloAck, MAX_REQUEST_ENVELOPE, Method,
+    RawKvReq, RawKvResp, RegionStatus, Request, RequestHeader, Response, SnapshotRequest,
 };
 pub use pd::{
     MemberChange, Operator, OperatorProgress, OperatorStatus, PdChannel, PdMemberInfo,

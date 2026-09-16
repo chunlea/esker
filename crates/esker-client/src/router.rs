@@ -209,8 +209,12 @@ impl Router {
         let deadline = started + self.options.call_timeout;
 
         let limit = self.transport.max_frame_size();
-        let size = body.payload_size();
-        if size >= limit {
+        // **What the frame will be, not an estimate of it** (#98): the body as it encodes, plus the
+        // most its envelope can add — this call has not routed yet, so there is no header to
+        // measure. The estimate this replaces stood six bytes above every stamped mutation and
+        // refused a 15.8 MB prewrite as "about 17334584 bytes" (run 127 attempt 7).
+        let size = body.payload_size() + crate::wire::MAX_REQUEST_ENVELOPE;
+        if size > limit {
             return Err(Error::RequestTooLarge { bytes: size, limit });
         }
 
