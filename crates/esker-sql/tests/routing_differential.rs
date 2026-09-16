@@ -3039,7 +3039,7 @@ struct StrandedLock {
 /// because that is the reader whose refusal is being diagnosed.
 fn locks_over_table(
     at: usize,
-    store: &Arc<esker_store::server::Store>,
+    store: &Arc<Store>,
     tenant: u64,
     table_id: u64,
     now_ts: u64,
@@ -3083,7 +3083,7 @@ fn locks_over_table(
 /// The primary's write record is the other half of the discriminator: a lock whose primary has
 /// **no** write record belongs to a transaction that neither committed nor rolled back, which is
 /// the shape #108 is about.
-fn report_stranded(at: usize, store: &Arc<esker_store::server::Store>, locks: &[StrandedLock]) {
+fn report_stranded(at: usize, store: &Arc<Store>, locks: &[StrandedLock]) {
     for lock in locks {
         let primary_versions = store.write_records(&lock.primary).unwrap_or(0);
         let lease = match lock.expired_by_ms {
