@@ -561,6 +561,10 @@ struct Gate {
     catalog: Arc<Catalog>,
     conn: Arc<PdConn>,
     fragments: Arc<dyn FragmentSource>,
+    /// What every statement on this cluster spent at the `Backend` seam — debt #109.
+    ///
+    /// Always present, never behind a flag: see the note where it is installed.
+    profile: Arc<cluster::profile::Profile>,
 }
 
 struct Node {
@@ -666,8 +670,22 @@ impl Gate {
         .await;
 
         let oracle: Arc<dyn TimestampOracle> = Arc::new(esker_client::WallClockOracle::new());
-        let (backend, conn, fragments) =
+        let (inner, conn, fragments) =
             tokio::task::block_in_place(|| sql_node(&addresses, pd_address, Arc::clone(&oracle)));
+
+        // **Always wrapped, never behind a flag** (debt #109). A harness with a measured build and
+        // an unmeasured one is two harnesses, and the numbers would describe the one nobody else
+        // runs. What it costs is two relaxed atomic adds per call at a seam whose cheapest
+        // operation is a buffered write.
+        //
+        // The wrapper goes on **after** `sql_node`, on purpose: the schema-lease refresher inside
+        // it keeps the bare backend, because that thread is not a statement and its round trips
+        // are nobody's `INSERT`.
+        let profile = Arc::new(cluster::profile::Profile::default());
+        let backend: Arc<dyn Backend> = Arc::new(cluster::profile::ProfiledBackend::new(
+            inner,
+            Arc::clone(&profile),
+        ));
 
         Gate {
             pd,
@@ -678,6 +696,7 @@ impl Gate {
             catalog: Arc::new(Catalog::new()),
             conn,
             fragments,
+            profile,
         }
     }
 
@@ -2727,6 +2746,79 @@ impl Gate {
         }
     }
 
+    /// [`Gate::fill_one_at_scale`], with a reading of the profile taken around every statement —
+    /// debt #109.
+    ///
+    /// **The same fill, not a second one.** It goes through `settle_or_report`, so #108's lock
+    /// forensics still fire if a statement gives up, and the rows land exactly as the #88
+    /// measurement's do. One window pays for one fill and three questions are answered from it.
+    ///
+    /// What comes back is the fill's own duration and **one reading per `INSERT`**, each the
+    /// difference between the profile before and after that statement. A median over those is a
+    /// median over *statements*, which is what #109 asks for: a total over the whole fill cannot
+    /// separate a phase that grows from a phase that is merely run more often.
+    /// `index` gives the table a **secondary** index before a single row is inserted, which is the
+    /// only way the index phases can be anything but structurally zero: the shape this fill shares
+    /// with #88's has a primary key and nothing else, so `dml.rs`'s index-entry loops never run.
+    /// A tier built this way is **not comparable** with the others and the report says so.
+    async fn fill_profiled(
+        &self,
+        table: &str,
+        rows: i64,
+        index: bool,
+    ) -> (Duration, Vec<cluster::profile::Counts>) {
+        let filled = tokio::task::block_in_place(|| {
+            let mut session = self.session();
+            self.settle_or_report(
+                &mut session,
+                &format!("CREATE TABLE {table} (id int8 PRIMARY KEY, n int8, note text)"),
+                table,
+            );
+            self.settle_or_report(
+                &mut session,
+                &format!("ALTER TABLE {table} SET (columnar_replicas = 1)"),
+                table,
+            );
+            if index {
+                // **Before the first row**, so every `INSERT` pays for it. An index built after the
+                // fill would price a different statement than the one this measures.
+                self.settle_or_report(
+                    &mut session,
+                    &format!("CREATE INDEX {table}_n ON {table} (n)"),
+                    table,
+                );
+            }
+            // **The two statements above are outside the readings on purpose.** They run once, and
+            // a per-`INSERT` median carrying a share of them would report a cost no row ever pays
+            // again — the same confound as pricing a fill by its total.
+            let mut per_statement: Vec<cluster::profile::Counts> = Vec::new();
+            let began = Instant::now();
+            for chunk in (1..=rows).collect::<Vec<i64>>().chunks(500) {
+                let values: Vec<String> = chunk
+                    .iter()
+                    .map(|id| format!("({id}, {id}, 'n{id}')"))
+                    .collect();
+                // A statement that `settle` had to retry spends the retry inside this window, which
+                // is right: what is being priced is the statement, not the attempt.
+                let before = self.profile.read();
+                self.settle_or_report(
+                    &mut session,
+                    &format!("INSERT INTO {table} VALUES {}", values.join(", ")),
+                    table,
+                );
+                per_statement.push(self.profile.read().since(before));
+            }
+            let filled_in = began.elapsed();
+            println!(
+                "{table}: {rows} rows filled in {filled_in:?}, {} statements measured",
+                per_statement.len()
+            );
+            (filled_in, per_statement)
+        });
+        self.wait_for_a_learner_that_answers(table).await;
+        filled
+    }
+
     async fn fill_one_at_scale(&self, table: &str, rows: i64) -> Duration {
         let filled_in = tokio::task::block_in_place(|| {
             let mut session = self.session();
@@ -3348,6 +3440,283 @@ fn print_scale_report(tiers: &[Tier]) {
 }
 
 /// [`median_of`] for counts. Empty says zero rather than being divided by.
+/// Rows each tier of #109's profile fills. **A fresh cluster per tier**, because the question is
+/// what an `INSERT` costs as *this table* grows, and a second tier filled into the store that
+/// already holds the first would move table size and store size together — which is the confound
+/// that made the first batch-size probe worthless (§ the `PROBE_ORDER` note above).
+const PROFILE_TIERS: [i64; 3] = [20_000, 100_000, 200_000];
+
+/// How long the fills may take before the stop rule bites, written down **before the run**.
+///
+/// At the rates the last window measured — 657 rows a second into an empty store, 280 into one
+/// holding 100k — the three tiers cost roughly half a minute, six minutes and a quarter of an
+/// hour. The budget leaves the rest of the window for the readiness waits and the lock census, and
+/// a tier that cannot start inside it is **reported as not run**, never guessed at.
+const PROFILE_BUDGET: Duration = Duration::from_secs(32 * 60);
+
+/// One tier of #109's profile.
+struct TierProfile {
+    rows: i64,
+    /// Whether this tier's table carried a secondary index. The three comparable tiers do not;
+    /// the fourth exists only so the index phases have one real number beside them.
+    indexed: bool,
+    fill: Duration,
+    /// One reading per `INSERT`. The median over these is the number this measurement reports.
+    statements: Vec<cluster::profile::Counts>,
+}
+
+/// The median of one phase across a tier's statements.
+///
+/// Sorted here rather than trusted to be sorted: a median of an unsorted vector is a number that
+/// looks like a measurement and is not one.
+fn median_phase(
+    statements: &[cluster::profile::Counts],
+    of: fn(&cluster::profile::Counts) -> u64,
+) -> u64 {
+    let mut samples: Vec<u64> = statements.iter().map(of).collect();
+    samples.sort_unstable();
+    median_u64(&samples)
+}
+
+/// What one `INSERT` of five hundred rows spent, per phase, per tier.
+///
+/// **Two columns are `n/a` and not zero** on every tier without a secondary index. `dml.rs`'s
+/// index probe and index put run once per index entry, and a table whose only key is its primary
+/// key has none — so the phase does not happen, which is a different statement from "it was free".
+fn print_phase_report(tiers: &[TierProfile]) {
+    // **Every field of `Counts`, checked against the struct rather than chosen.** The first version
+    // of this report printed the four phases I expected to matter and dropped the rest, which is
+    // how a measured column (`other_get`) went missing from a page that concluded about the
+    // remainder. The block below lists each field; the wide table after it stays because the
+    // earlier tiers were reported in that shape and a comparison needs one.
+    for tier in tiers {
+        let stmts = u64::try_from(tier.statements.len()).unwrap_or(1).max(1);
+        let wall_us = u64::try_from(tier.fill.as_micros())
+            .unwrap_or(u64::MAX)
+            .checked_div(stmts)
+            .unwrap_or(0);
+        let med = |of: fn(&cluster::profile::Counts) -> u64| median_phase(&tier.statements, of);
+        let (row_us, row_n) = (med(|c| c.row_get_us), med(|c| c.row_get_n));
+        let (idx_us, idx_n) = (med(|c| c.index_get_us), med(|c| c.index_get_n));
+        let (oth_us, oth_n) = (med(|c| c.other_get_us), med(|c| c.other_get_n));
+        let (unw_us, unw_n) = (med(|c| c.unwaited_get_us), med(|c| c.unwaited_get_n));
+        let (scan_us, scan_n) = (med(|c| c.scan_us), med(|c| c.scan_n));
+        let put_us = med(|c| c.put_us);
+        let (put_row, put_idx, put_oth) = (
+            med(|c| c.row_put_n),
+            med(|c| c.index_put_n),
+            med(|c| c.other_put_n),
+        );
+        let (commit_us, commit_n) = (med(|c| c.commit_us), med(|c| c.commit_n));
+        let (rollback_n, begin_n) = (med(|c| c.rollback_n), med(|c| c.begin_n));
+        let accounted = row_us
+            .saturating_add(idx_us)
+            .saturating_add(oth_us)
+            .saturating_add(unw_us)
+            .saturating_add(scan_us)
+            .saturating_add(put_us)
+            .saturating_add(commit_us);
+        let remainder = wall_us.saturating_sub(accounted);
+        // Share in integer tenths of a percent, for the reason every ratio here is integer.
+        let share = remainder
+            .saturating_mul(1000)
+            .checked_div(wall_us)
+            .unwrap_or(0);
+        let indexed = if tier.indexed { "yes" } else { "no" };
+        println!(
+            "\n  tier {} rows, index {indexed}, fill {:?}, {stmts} statements — medians per INSERT:\n\
+             \x20   get row      {row_us:>10} us  n={row_n}\n\
+             \x20   get index    {idx_us:>10} us  n={idx_n}\n\
+             \x20   get other    {oth_us:>10} us  n={oth_n}   (catalog and metadata keys)\n\
+             \x20   get unwaited {unw_us:>10} us  n={unw_n}   (view_at's version counters)\n\
+             \x20   scan         {scan_us:>10} us  n={scan_n}\n\
+             \x20   put          {put_us:>10} us  row={put_row} index={put_idx} other={put_oth}\n\
+             \x20   commit       {commit_us:>10} us  n={commit_n}\n\
+             \x20   rollback                   n={rollback_n}\n\
+             \x20   begin                      n={begin_n}\n\
+             \x20   ---------------------------------------------\n\
+             \x20   accounted    {accounted:>10} us\n\
+             \x20   statement    {wall_us:>10} us  remainder {remainder} us ({}.{}%)",
+            tier.rows,
+            tier.fill,
+            share / 10,
+            share % 10
+        );
+    }
+
+    println!(
+        "rows      index  fill          rows/s      stmts  pk-probe us (n)   idx-probe us (n)  \
+         put us (row/idx)   commit us   commit n"
+    );
+    for tier in tiers {
+        let stmts = tier.statements.len();
+        let pk_us = median_phase(&tier.statements, |counts| counts.row_get_us);
+        let pk_n = median_phase(&tier.statements, |counts| counts.row_get_n);
+        let put_us = median_phase(&tier.statements, |counts| counts.put_us);
+        let row_put_n = median_phase(&tier.statements, |counts| counts.row_put_n);
+        let commit_us = median_phase(&tier.statements, |counts| counts.commit_us);
+        let commit_n = median_phase(&tier.statements, |counts| counts.commit_n);
+        let idx_put_n = median_phase(&tier.statements, |counts| counts.index_put_n);
+        let (probe, puts) = if tier.indexed {
+            let idx_us = median_phase(&tier.statements, |counts| counts.index_get_us);
+            let idx_n = median_phase(&tier.statements, |counts| counts.index_get_n);
+            (
+                format!("{idx_us} ({idx_n})"),
+                format!("{put_us} ({row_put_n}/{idx_put_n})"),
+            )
+        } else {
+            (
+                "n/a (no index)".to_owned(),
+                format!("{put_us} ({row_put_n}/n/a)"),
+            )
+        };
+        // Rows a second in integer tenths, the idiom `print_scale_report` uses and for its reason:
+        // a count over a time prints one decimal without ever becoming a float.
+        let rate_tenths = (tier.rows * 10_000)
+            .checked_div(i64::try_from(tier.fill.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let rate = format!("{}.{}", rate_tenths / 10, rate_tenths % 10);
+        let fill = format!("{:?}", tier.fill);
+        let indexed = if tier.indexed { "yes" } else { "no" };
+        let (rows, pk) = (tier.rows, format!("{pk_us} ({pk_n})"));
+        println!(
+            "{rows:<10}{indexed:<7}{fill:<14}{rate:<12}{stmts:<7}{pk:<18}{probe:<18}{puts:<19}\
+             {commit_us:<12}{commit_n}"
+        );
+    }
+}
+
+/// What a tier of `rows` rows should be expected to cost, from what the tiers before it **actually**
+/// cost.
+///
+/// **Doubled, on purpose.** The fill rate falls as the table grows — 657 rows a second into an
+/// empty store, 280 into one already holding 100k — so the last tier's per-row cost is a floor and
+/// not a forecast. A projection that trusted it would start a tier it cannot finish, which is the
+/// failure the stop rule exists to prevent; doubling makes the estimate conservative in the only
+/// direction that matters. With no tier behind it there is nothing to project from, and the answer
+/// is zero: the first tier always runs.
+fn projected_fill(tiers: &[TierProfile], rows: i64) -> Duration {
+    let Some(last) = tiers.last() else {
+        return Duration::ZERO;
+    };
+    let per_row_us = u64::try_from(last.fill.as_micros())
+        .unwrap_or(u64::MAX)
+        .checked_div(u64::try_from(last.rows).unwrap_or(1))
+        .unwrap_or(0);
+    Duration::from_micros(
+        per_row_us
+            .saturating_mul(2)
+            .saturating_mul(u64::try_from(rows).unwrap_or(0)),
+    )
+}
+
+/// **One tier of [`what_an_insert_spends_its_time_on_as_the_table_grows`]**, for re-measuring the
+/// phases without paying for the curve.
+///
+/// The three-tier run costs about twenty-seven minutes of filling, which is the right price for a
+/// slope and the wrong one for a question about *which phases exist* — and that question is what
+/// changed: `get_without_waiting` was forwarded untimed, so the catalog's version-counter reads
+/// were in no column at all, and the report printed four phases of the eighteen `Counts` holds.
+/// Both are fixed above; this runs the smallest tier so the fix can be read in a minute rather
+/// than in half an hour. **It is not a substitute for the curve**: one tier has an intercept and
+/// no slope, and every growth claim in `esker-coord/s1-fill-window-2026-09-16/q109-data.md` comes
+/// from the three-tier run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "#109's phases at one tier: a real cluster and about two minutes"]
+async fn what_an_insert_spends_its_time_on_at_the_smallest_tier() {
+    let rows = PROFILE_TIERS[0];
+    let gate = Gate::start().await;
+    let (fill, statements) = gate.fill_profiled("t", rows, false).await;
+    let tiers = vec![TierProfile {
+        rows,
+        indexed: false,
+        fill,
+        statements,
+    }];
+    print_phase_report(&tiers);
+    gate.stop().await;
+}
+
+/// **Where an `INSERT` spends itself, as the table grows** — debt #109's profile.
+///
+/// The phases are the `Backend` seam's own method boundaries (`tests/cluster/profile.rs`), which is
+/// why this needs no product change to measure. What it can and cannot see is written there, and
+/// two of its limits belong in every reading of this table:
+///
+/// * **`put` buffers.** The put column is memory, not I/O; the network is entirely inside `commit`.
+/// * **Round trips are not counted, only timed.** `esker-client` keeps no counter of its prewrite
+///   and commit requests, so the number of them is inferred from the regions a statement touched
+///   and is reported as an inference or not at all.
+///
+/// The columnar tee and region routing are below this seam, inside the store's apply path. They are
+/// invisible here, which the report says rather than rounding to zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "#109's profile: three real clusters and most of a window"]
+async fn what_an_insert_spends_its_time_on_as_the_table_grows() {
+    let began = Instant::now();
+    let mut tiers: Vec<TierProfile> = Vec::new();
+
+    for rows in PROFILE_TIERS {
+        // **A stop rule that cannot stop is not a stop rule.** Asking only whether the budget has
+        // run out would happily start a quarter-hour tier at minute thirty-one, and nothing here
+        // can abort a fill once it is running. The question has to be whether this tier can
+        // *finish*, so it is asked before the tier starts and answered with `projected_fill`.
+        let projected = projected_fill(&tiers, rows);
+        if began.elapsed() + projected > PROFILE_BUDGET {
+            println!(
+                "not starting the {rows}-row tier: {:?} gone of {PROFILE_BUDGET:?}, and this tier \
+                 projects to {projected:?} at twice the last tier's per-row cost. The tiers above \
+                 are what ran; nothing is extrapolated past them.",
+                began.elapsed()
+            );
+            break;
+        }
+        // A cluster of its own, started and stopped inside the loop: see `PROFILE_TIERS`.
+        let gate = Gate::start().await;
+        let (fill, statements) = gate.fill_profiled("t", rows, false).await;
+        tiers.push(TierProfile {
+            rows,
+            indexed: false,
+            fill,
+            statements,
+        });
+        // **Printed as each tier finishes**, for the reason the tier loop above it learned the hard
+        // way: a later tier's panic must not be able to take a measured one with it.
+        print_phase_report(&tiers);
+        gate.stop().await;
+    }
+
+    // The indexed tier is last and is the first thing the budget gives up, because it answers a
+    // different question from the three above and cannot be compared with them.
+    //
+    // **Its projection is deliberately the wrong way round**: `projected_fill` reads the *last*
+    // tier, which by now is the largest, so a twenty-thousand-row table is priced at a
+    // two-hundred-thousand-row table's per-row cost and doubled on top. That over-estimates, and
+    // over-estimating can only skip a tier that would have fitted — never overrun the window. Given
+    // that this tier is the one the ruling gives up first, erring toward skipping it is the
+    // intended direction rather than an oversight.
+    let rows = PROFILE_TIERS[0];
+    if began.elapsed() + projected_fill(&tiers, rows) <= PROFILE_BUDGET {
+        let gate = Gate::start().await;
+        let (fill, statements) = gate.fill_profiled("t", rows, true).await;
+        tiers.push(TierProfile {
+            rows,
+            indexed: true,
+            fill,
+            statements,
+        });
+        print_phase_report(&tiers);
+        gate.stop().await;
+    } else {
+        println!("the indexed tier did not run: the budget was spent on the comparable ones");
+    }
+
+    assert!(
+        !tiers.is_empty(),
+        "no tier ran, so there is nothing to report"
+    );
+}
+
 fn median_u64(samples: &[u64]) -> u64 {
     if samples.is_empty() {
         return 0;
