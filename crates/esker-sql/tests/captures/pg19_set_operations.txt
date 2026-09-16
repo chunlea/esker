@@ -4,14 +4,18 @@
 # `with_test.rb` sends `WITH … AS (SELECT … UNION ALL (SELECT …) UNION ALL SELECT …) SELECT …`
 # and a `WITH RECURSIVE` whose body is a `UNION ALL`.
 #
-# **The sentence that used to stand here has expired.** It said "nothing here is built: a set
-# operation is `0A000` naming the operator (`parse::lower`)", which was true when this was
-# captured and stopped being true when `UNION` landed. Today the parser lowers all three
-# operators and the plan can say all three; the refusal that remains is one function in the
-# executor, `exec::mod::set_arm_supported`, and it covers `INTERSECT` and `EXCEPT` only
-# (`debts-v1.1.md` #105, whose plan page is `docs/plans/set-operators.md`). A recorded blocker
-# is a dated hypothesis: this one decayed in eleven days and nobody came back to the line that
-# depended on it.
+# **Two sentences have expired here, and this one refuses to be a third.** The first said
+# "nothing here is built: a set operation is `0A000` naming the operator (`parse::lower`)", true
+# when this was captured and false once `UNION` landed. The second replaced it and named the one
+# function that still refused, `exec::mod::set_arm_supported` — and #105 deleted that function
+# along with both its call sites, so the name now points at nothing.
+#
+# The lesson is the one the second sentence already drew and then repeated by example: **a recorded
+# blocker is a dated hypothesis**, and a capture header is exactly where such a hypothesis goes to
+# rot unnoticed, because nothing compiles it and no test reads it. So this header states no claim
+# about what the executor refuses today. What the node does with set operations lives in
+# `debts-v1.1.md` #105 and `docs/plans/set-operators.md`, which are maintained; what *this file*
+# holds is what 19beta1 answered on 2026-09-05, which will not change.
 #
 # ## Cross-arm type unification
 #

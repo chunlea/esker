@@ -52,6 +52,21 @@ fn except_subtracts_multiplicities_and_except_all_keeps_the_survivor() {
         node.rows("SELECT id FROM sa EXCEPT ALL SELECT id FROM sb ORDER BY 1"),
         [["1"], ["2"]]
     );
+    // **`EXCEPT` deduplicates, and the two assertions above cannot show it** — a counterfactual
+    // that stopped the deduplication left both of them passing, because the only value surviving
+    // `sa EXCEPT sb` is `1`, which `sa` holds once. Against `sc` the whole of `sa` survives, and
+    // `sa` holds `2` twice: deduplicating answers three rows, not four. Measured on 19beta1,
+    // `esker-coord/s2-h105-except-dedup.out`.
+    assert_eq!(
+        node.rows("SELECT id FROM sa EXCEPT SELECT id FROM sc ORDER BY 1"),
+        [["1"], ["2"], ["3"]],
+        "EXCEPT dedups before subtracting; without that this is 1 ; 2 ; 2 ; 3"
+    );
+    assert_eq!(
+        node.rows("SELECT id FROM sa EXCEPT ALL SELECT id FROM sc ORDER BY 1"),
+        [["1"], ["2"], ["2"], ["3"]],
+        "and ALL keeps the duplicate, which is what says the rule is the quantifier's"
+    );
 }
 
 #[test]
@@ -117,6 +132,37 @@ fn intersect_binds_tighter_than_except_and_union() {
              INTERSECT ALL SELECT id FROM sc ORDER BY 1"
         ),
         [["1"], ["2"], ["2"], ["3"]]
+    );
+}
+
+/// **The operator takes everything to its left, not just the arm beside it** — the claim
+/// `exec::query::combine` is built on, and until now nothing tested it.
+///
+/// A counterfactual that made `combine` fold only the last arm into the left side went **green**
+/// across the whole suite: with two arms `take` and `pop` are the same thing, and precedence is
+/// expressed by nesting in the lowering, so `combine` never saw more than one pending node in any
+/// test that existed. The shape that tells them apart needs a `UNION ALL` run *before* the
+/// operator.
+///
+/// Measured on 19beta1 (`esker-coord/s2-h105-accumulated-left.out`), and the two readings are
+/// three rows against six:
+///
+/// ```text
+/// sa UNION ALL sb EXCEPT sc        1 ; 2 ; 3
+/// (sa UNION ALL sb) EXCEPT sc      1 ; 2 ; 3            <- the bare form is this one
+/// sa UNION ALL (sb EXCEPT sc)      1 ; 2 ; 2 ; 2 ; 3 ; 3
+/// ```
+#[test]
+fn the_operator_takes_the_whole_accumulated_left_side() {
+    let mut node = three_sets();
+
+    assert_eq!(
+        node.rows(
+            "SELECT id FROM sa UNION ALL SELECT id FROM sb \
+             EXCEPT SELECT id FROM sc ORDER BY 1"
+        ),
+        [["1"], ["2"], ["3"]],
+        "folding only the last arm into the left side answers six rows here"
     );
 }
 
