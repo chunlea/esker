@@ -2649,16 +2649,78 @@ impl Gate {
     /// *transaction* per row, and a million of those is the measurement's own cost rather than the
     /// thing being measured. The fill's own duration is printed because it decides how much of a
     /// window is left for measuring.
+    /// The id of a table this harness created, or `None` before it exists.
+    ///
+    /// Copied from `tests/joint_gate.rs`, as the header says these helpers deliberately are. The
+    /// `Option` is not decoration: the first statement the fill settles is the `CREATE TABLE`, so
+    /// the forensics below run at an instant when this table has no id yet, and a diagnostic that
+    /// panics is the worst kind of failure to add.
+    fn table_id(&self, name: &str) -> Option<u64> {
+        let txn = self.backend.begin().ok()?;
+        let id = self
+            .catalog
+            .view(&*txn, TENANT)
+            .ok()
+            .and_then(|view| view.table(name).ok().flatten())
+            .map(|def| def.id);
+        let _ = txn.rollback();
+        id
+    }
+
+    /// **#108**: every lock every store holds over this table's rows, at the instant of a refusal.
+    ///
+    /// The two incidents this is written for ended with a fill's own lock still unclearable minutes
+    /// later, and both left only a `start_ts` because the in-process cluster dies with the test.
+    /// What separates *the transaction is still alive* from *the lock is stranded and resolution
+    /// never reaches it* is in the record — its `primary` and its lease — and in whether that
+    /// primary has a `write` record at all. Both are read here, and no format is touched.
+    fn lock_forensics(&self, table: &str) {
+        let Some(table_id) = self.table_id(table) else {
+            println!("  #108: {table} has no id yet, so it holds no row locks");
+            return;
+        };
+        let Ok(now_ts) = self.oracle.timestamp() else {
+            println!("  #108: the oracle would not answer, so no lease can be judged");
+            return;
+        };
+        let mut seen = 0usize;
+        for (at, node) in self.nodes.iter().enumerate() {
+            let locks = locks_over_table(&node.store, TENANT, table_id, now_ts);
+            seen += locks.len();
+            report_stranded(at, &node.store, &locks);
+        }
+        println!(
+            "  #108: {seen} lock(s) over {table} across {} stores, at ts {now_ts}",
+            self.nodes.len()
+        );
+    }
+
+    /// `settle`, and if it gives up, the lock census before the panic is let through.
+    ///
+    /// The panic is resumed rather than swallowed: this adds a diagnosis to the failure, it does
+    /// not turn a failure into a pass.
+    fn settle_or_report(&self, session: &mut Session, sql: &str, table: &str) {
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| settle(session, sql)));
+        if let Err(panic) = outcome {
+            println!("#108 forensics: `{sql}` gave up; the locks over {table} at this instant:");
+            self.lock_forensics(table);
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     async fn fill_one_at_scale(&self, table: &str, rows: i64) -> Duration {
         let filled_in = tokio::task::block_in_place(|| {
             let mut session = self.session();
-            settle(
+            self.settle_or_report(
                 &mut session,
                 &format!("CREATE TABLE {table} (id int8 PRIMARY KEY, n int8, note text)"),
+                table,
             );
-            settle(
+            self.settle_or_report(
                 &mut session,
                 &format!("ALTER TABLE {table} SET (columnar_replicas = 1)"),
+                table,
             );
             let began = Instant::now();
             for chunk in (1..=rows).collect::<Vec<i64>>().chunks(500) {
@@ -2666,9 +2728,10 @@ impl Gate {
                     .iter()
                     .map(|id| format!("({id}, {id}, 'n{id}')"))
                     .collect();
-                settle(
+                self.settle_or_report(
                     &mut session,
                     &format!("INSERT INTO {table} VALUES {}", values.join(", ")),
+                    table,
                 );
             }
             let filled_in = began.elapsed();
