@@ -849,7 +849,8 @@ impl Gate {
     /// which is only true on a cluster of one region. Here the count is the region count and the
     /// point is to be indifferent to it.
     async fn wait_until_the_columns_answer(&self, table: &str) {
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let began = Instant::now();
+        let deadline = began + Duration::from_secs(ROUTED_WITHIN);
         loop {
             let answered = tokio::task::block_in_place(|| {
                 let mut session = self.session();
@@ -864,7 +865,9 @@ impl Gate {
             }
             assert!(
                 Instant::now() < deadline,
-                "no routed plan over {table} was answered by the columns"
+                "no routed plan over {table} was answered by the columns after {:?}, \
+                 and the bound is {ROUTED_WITHIN} s",
+                began.elapsed()
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -917,7 +920,8 @@ impl Gate {
         })
         .await;
 
-        let deadline = Instant::now() + Duration::from_secs(PLACEMENT_WITHIN);
+        let began = Instant::now();
+        let deadline = began + Duration::from_secs(PLACEMENT_WITHIN);
         loop {
             let answered = tokio::task::block_in_place(|| {
                 let mut session = self.session();
@@ -932,7 +936,9 @@ impl Gate {
             }
             assert!(
                 Instant::now() < deadline,
-                "the columnar learner never answered a fragment over {table}"
+                "the columnar learner never answered a fragment over {table} after {:?}, \
+                 and the bound is {PLACEMENT_WITHIN} s",
+                began.elapsed()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1123,10 +1129,23 @@ fn reserve() -> std::net::TcpListener {
 /// box. Three minutes costs nothing on a run that succeeds, because a wait that is satisfied stops.
 const PLACEMENT_WITHIN: u64 = 180;
 
+/// The same shape for "a plan was routed to the columns at all": a readiness wait, so the bound is
+/// sized for the worst machine rather than for this one, and it is named rather than written as a
+/// literal at the site (#89, the four shapes of a wall-clock assertion).
+const ROUTED_WITHIN: u64 = 120;
+
 async fn wait_for<F: FnMut() -> bool>(what: &str, seconds: u64, mut ready: F) {
-    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let began = Instant::now();
+    let deadline = began + Duration::from_secs(seconds);
     while !ready() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        // **A readiness wait keeps its bound and says how long it waited** (#89). Removing the bound
+        // would turn a false red into a hang; a message without the elapsed leaves the reader unable
+        // to tell "the box was slow" from "this never happens".
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what} after {:?}, and the bound is {seconds} s",
+            began.elapsed()
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -2620,7 +2639,68 @@ const WRITER_HOLDS_MS: u64 = 3;
 #[ignore = "#88's cost: a real cluster, a writer thread, and minutes of a quiet box"]
 async fn what_a_fragment_meeting_a_lock_costs() {
     let gate = Gate::start().await;
+    fill_measure_tables(&gate);
+    gate.wait_for_a_learner_that_answers("hot").await;
+    gate.wait_for_a_learner_that_answers("cold").await;
 
+    let counted = Arc::new(CountingFragments::new(Arc::clone(&gate.fragments)));
+    let mut report: Vec<Round> = Vec::new();
+
+    for table in ["hot", "cold"] {
+        let writing = Arc::new(AtomicBool::new(table == "hot"));
+        let held = Arc::new(AtomicU64::new(0));
+        let writer = spawn_writer(&gate, &writing, &held);
+
+        let scanning = Instant::now();
+        let (met_times, clean_times, failed) =
+            tokio::task::block_in_place(|| scan_a_table(&gate, &counted, table));
+        let scanned_for = scanning.elapsed();
+
+        writing.store(false, Ordering::Relaxed);
+        writer.join().expect("the writer thread ends");
+        // The denominator the first run had no way to state: how much of the scanning window a
+        // transaction was open for at all. A ratio of encounters to scans means nothing without it.
+        println!(
+            "{table}: scanned for {scanned_for:?}, a transaction was open for {:?} of it",
+            Duration::from_micros(held.load(Ordering::Relaxed))
+        );
+        report.push(Round {
+            table,
+            met: u64::try_from(met_times.len()).unwrap_or(u64::MAX),
+            clean: u64::try_from(clean_times.len()).unwrap_or(u64::MAX),
+            failed,
+            met_times,
+            clean_times,
+        });
+    }
+
+    print_report(&report);
+
+    let scans: u64 = report.iter().map(|round| round.met + round.clean).sum();
+    assert_eq!(
+        scans,
+        2 * MEASURE_SCANS as u64,
+        "the measurement did not run every scan"
+    );
+    assert!(
+        report.iter().any(|round| round.met > 0),
+        "no scan met a lock at all: the writer's shape, not the system's, is what this measured"
+    );
+}
+
+/// One table's worth of the measurement. A struct rather than a tuple, because six fields of two
+/// types is exactly the shape nobody can read at the call site.
+struct Round {
+    table: &'static str,
+    met: u64,
+    clean: u64,
+    failed: u64,
+    met_times: Vec<Duration>,
+    clean_times: Vec<Duration>,
+}
+
+/// The hot and cold tables, each with a columnar copy and the same rows.
+fn fill_measure_tables(gate: &Gate) {
     tokio::task::block_in_place(|| {
         let mut session = gate.session();
         for table in ["hot", "cold"] {
@@ -2644,136 +2724,109 @@ async fn what_a_fragment_meeting_a_lock_costs() {
             }
         }
     });
-    gate.wait_for_a_learner_that_answers("hot").await;
-    gate.wait_for_a_learner_that_answers("cold").await;
+}
 
-    let counted = Arc::new(CountingFragments::new(Arc::clone(&gate.fragments)));
-    let mut report: Vec<(&str, u64, u64, u64, Vec<Duration>, Vec<Duration>)> = Vec::new();
-
-    for table in ["hot", "cold"] {
-        let writing = Arc::new(AtomicBool::new(table == "hot"));
-        let held = Arc::new(AtomicU64::new(0));
-        let writer = {
-            let backend = Arc::clone(&gate.backend);
-            let catalog = Arc::clone(&gate.catalog);
-            let writing = Arc::clone(&writing);
-            let held = Arc::clone(&held);
-            std::thread::spawn(move || {
-                let mut session = Session {
-                    executor: Executor::new(
-                        backend,
-                        catalog,
-                        TENANT,
-                        esker_sql::session::register(),
-                    ),
-                };
-                let mut at = MEASURE_ROWS;
-                while writing.load(Ordering::Relaxed) {
-                    at += 1;
-                    // **An open transaction, not an autocommit statement.** A statement that
-                    // commits at once leaves a lock for microseconds, and a scan meets it only by
-                    // coincidence — the first run of this measurement did exactly that and saw one
-                    // encounter in sixty scans, which is a fact about the writer's shape and not
-                    // about the system. #88 is about a scan meeting a lock whose transaction is
-                    // *still open*, which is what Rails does between its `BEGIN` and its `COMMIT`.
-                    let opened = Instant::now();
-                    let _ = session.run("BEGIN");
-                    let _ = session.run(&format!("INSERT INTO hot VALUES ({at}, {at}, 'w')"));
-                    let _ = session.run(&format!(
-                        "UPDATE hot SET n = n + 1 WHERE id = {}",
-                        at % MEASURE_ROWS + 1
-                    ));
-                    std::thread::sleep(Duration::from_millis(WRITER_HOLDS_MS));
-                    let _ = session.run("COMMIT");
-                    held.fetch_add(
-                        u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX),
-                        Ordering::Relaxed,
-                    );
-                }
-            })
+/// The writer beside the hot table: **an open transaction, not an autocommit statement**.
+///
+/// A statement that commits at once leaves a lock for microseconds, and a scan meets it only by
+/// coincidence — the first run of this measurement did exactly that and saw one encounter in sixty
+/// scans, which is a fact about the writer's shape and not about the system. #88 is about a scan
+/// meeting a lock whose transaction is *still open*, which is what Rails does between its `BEGIN`
+/// and its `COMMIT`.
+fn spawn_writer(
+    gate: &Gate,
+    writing: &Arc<AtomicBool>,
+    held: &Arc<AtomicU64>,
+) -> std::thread::JoinHandle<()> {
+    let backend = Arc::clone(&gate.backend);
+    let catalog = Arc::clone(&gate.catalog);
+    let writing = Arc::clone(writing);
+    let held = Arc::clone(held);
+    std::thread::spawn(move || {
+        let mut session = Session {
+            executor: Executor::new(backend, catalog, TENANT, esker_sql::session::register()),
         };
+        let mut at = MEASURE_ROWS;
+        while writing.load(Ordering::Relaxed) {
+            at += 1;
+            let opened = Instant::now();
+            let _ = session.run("BEGIN");
+            let _ = session.run(&format!("INSERT INTO hot VALUES ({at}, {at}, 'w')"));
+            let _ = session.run(&format!(
+                "UPDATE hot SET n = n + 1 WHERE id = {}",
+                at % MEASURE_ROWS + 1
+            ));
+            std::thread::sleep(Duration::from_millis(WRITER_HOLDS_MS));
+            let _ = session.run("COMMIT");
+            held.fetch_add(
+                u64::try_from(opened.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+    })
+}
 
-        let scanning = Instant::now();
-        let (met, missed, failed) = tokio::task::block_in_place(|| {
-            let mut session = gate.session_asking(Arc::clone(&counted) as Arc<dyn FragmentSource>);
-            let mut met: Vec<Duration> = Vec::new();
-            let mut missed: Vec<Duration> = Vec::new();
-            let mut refused_statements = 0_u64;
-            for _ in 0..MEASURE_SCANS {
-                counted.reset();
-                let at = Instant::now();
-                // **Tolerant on purpose.** `rows` unwraps, and the writer beside this is making
-                // contention: one `40001` would end a measurement rather than be part of it. A
-                // statement that fails is counted and the run carries on, because "how often does
-                // this happen" is exactly the question.
-                let answered = session
-                    .run(&format!("SELECT count(*) FROM {table}"))
-                    .is_ok();
-                let took = at.elapsed();
-                if !answered {
-                    refused_statements += 1;
-                }
-                let (_, behind, not_columnar, unsupported) = counted.taken();
-                if behind + not_columnar + unsupported > 0 {
-                    met.push(took);
-                } else {
-                    missed.push(took);
-                }
-            }
-            (met, missed, refused_statements)
-        });
-
-        let scanned_for = scanning.elapsed();
-        writing.store(false, Ordering::Relaxed);
-        writer.join().expect("the writer thread ends");
-        // The denominator the first run had no way to state: how much of the scanning window a
-        // transaction was open for at all. A ratio of encounters to scans means nothing without it.
-        let held_us = held.load(Ordering::Relaxed);
-        println!(
-            "{table}: scanned for {scanned_for:?}, a transaction was open for {:?} of it",
-            Duration::from_micros(held_us)
-        );
-        report.push((
-            table,
-            u64::try_from(met.len()).unwrap_or(u64::MAX),
-            u64::try_from(missed.len()).unwrap_or(u64::MAX),
-            failed,
-            met,
-            missed,
-        ));
+/// One table's scans: the times of those that met a lock, of those that did not, and how many
+/// statements the contention refused outright.
+fn scan_a_table(
+    gate: &Gate,
+    counted: &Arc<CountingFragments>,
+    table: &str,
+) -> (Vec<Duration>, Vec<Duration>, u64) {
+    let mut session = gate.session_asking(Arc::clone(counted) as Arc<dyn FragmentSource>);
+    let mut met = Vec::new();
+    let mut missed = Vec::new();
+    let mut refused_statements = 0_u64;
+    for _ in 0..MEASURE_SCANS {
+        counted.reset();
+        let at = Instant::now();
+        // **Tolerant on purpose.** `rows` unwraps, and the writer beside this is making contention:
+        // one `40001` would end a measurement rather than be part of it. A statement that fails is
+        // counted and the run carries on, because "how often does this happen" is the question.
+        let answered = session
+            .run(&format!("SELECT count(*) FROM {table}"))
+            .is_ok();
+        let took = at.elapsed();
+        if !answered {
+            refused_statements += 1;
+        }
+        let (_, behind, not_columnar, unsupported) = counted.taken();
+        if behind + not_columnar + unsupported > 0 {
+            met.push(took);
+        } else {
+            missed.push(took);
+        }
     }
+    (met, missed, refused_statements)
+}
 
+/// The table the measurement prints. **Scans per lock is integer tenths**, not a float: the ratio is
+/// a count divided by a count, and casting two `u64`s to `f64` to print one decimal is a precision
+/// loss with nothing to gain.
+fn print_report(report: &[Round]) {
     println!(
         "table  scans  met a lock  clean  statements that failed  scans per lock  median met  median clean"
     );
-    for (table, met, clean, failed, met_times, clean_times) in &report {
-        let scans = met + clean;
-        let per_lock = if *met == 0 {
-            "never".to_owned()
+    for round in report {
+        let scans = round.met + round.clean;
+        // `checked_div` rather than a zero check standing beside a division: clippy's
+        // `manual_checked_ops` is right that writing the guard and the operation apart is what lets
+        // the two drift. Still integers — a count over a count needs no float to print one decimal.
+        let per_lock = (scans * 10).checked_div(round.met).map_or_else(
+            || "never".to_owned(),
+            |tenths| format!("{}.{}", tenths / 10, tenths % 10),
+        );
+        let met_column = if round.met_times.len() <= 3 {
+            format!("{:?}", round.met_times)
         } else {
-            format!("{:.1}", scans as f64 / *met as f64)
+            format!("{:?}", median_of(&round.met_times))
         };
-        let met_column = if met_times.len() <= 3 {
-            format!("{met_times:?}")
-        } else {
-            format!("{:?}", median_of(met_times))
-        };
+        let (table, met, clean, failed) = (round.table, round.met, round.clean, round.failed);
         println!(
             "{table:<7}{scans:<7}{met:<12}{clean:<7}{failed:<24}{per_lock:<16}{met_column:<28}{:?}",
-            median_of(clean_times),
+            median_of(&round.clean_times),
         );
     }
-
-    let scans: u64 = report.iter().map(|row| row.1 + row.2).sum();
-    assert_eq!(
-        scans,
-        2 * MEASURE_SCANS as u64,
-        "the measurement did not run every scan"
-    );
-    assert!(
-        report.iter().any(|row| row.1 > 0),
-        "no scan met a lock at all: the writer's shape, not the system's, is what this measured"
-    );
 }
 
 /// The median of `samples`, or zero when there are none — a measurement that read nothing says so
