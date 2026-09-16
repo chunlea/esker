@@ -1,0 +1,21 @@
+crates/esker-sql/tests/corpus/pg19_domain_aggregate.txt
+  s_f4b2852b53accb::t_83dd946d68aac9 1-41
+crates/esker-sql/tests/domain_aggregate.rs
+  s_f4b2852b53accb::t_a8cf87d85b2661 1-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "178421bbb1a24c5f11e98177efd62bf7812cf718",
+  "prompts": {},
+  "sessions": {
+    "s_f4b2852b53accb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc7223c3-8ba0-48df-95c8-ddb365dc093c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
