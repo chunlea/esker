@@ -67,6 +67,18 @@ esker-store.workspace = true
 # does not depend on this crate, so there is no cycle. The same dependency `esker-store` and
 # `esker-client` take, for the same reason.
 esker-pd.workspace = true
+# **#108's forensics, and dev-only.** The probe that reads a stranded lock at the moment it refuses
+# to clear needs three names this crate does not otherwise link: `cf::LOCK` and `Db::iter`'s
+# `ReadOptions` from the engine, and `LockRecord`'s fields from the transaction layer. Both are
+# workspace crates already in this one's graph through `esker-client` and `esker-store`, so **the
+# runtime graph and `deny.toml`'s budget do not move** — the same reasoning, and the same kind of
+# dependency, as `esker-pd` above. Proved rather than asserted: `esker-cli`'s `dep_budget` test and
+# `cargo deny check` both run in this unit's self-check.
+#
+# Nothing `esker-sql` ships links either crate; a `use esker_txn::` or `use esker_engine::` outside
+# `tests/` is a review failure, for the same reason the `sqlparser` and `rustls` rules above exist.
+esker-engine.workspace = true
+esker-txn.workspace = true
 proptest.workspace = true
 sqllogictest.workspace = true
 tempfile.workspace = true
