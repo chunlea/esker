@@ -1,0 +1,19 @@
+crates/esker-store/src/server.rs
+  s_f4b2852b53accb::t_04dae350d95bfc 2608-2624
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b84ae28f50f5890274457196c854e9b7b3cade8b",
+  "prompts": {},
+  "sessions": {
+    "s_f4b2852b53accb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc7223c3-8ba0-48df-95c8-ddb365dc093c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
