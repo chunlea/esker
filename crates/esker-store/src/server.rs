@@ -2605,10 +2605,23 @@ impl Store {
         // **The columnar copy of this region is now stale, and this is the moment it is knowable.**
         //
         // A snapshot writes committed versions straight into the column families: no entry
-        // applies, so `ColumnarSlot::commit` never runs and the copy is not told. The slot itself
-        // survives the transfer — it is keyed by region on the store and `retire_region_now` stops
-        // the peer, not the slot — so what comes back is the copy that was there before, missing
-        // everything the snapshot brought.
+        // applies, so `ColumnarSlot::commit` never runs and the copy is not told, and what would
+        // come back is the copy that was there before, missing everything the snapshot brought.
+        //
+        // **On the path above, though, the slot is already gone and this call clears an empty
+        // one.** `replacing` sends step 1 through `retire_region_now`, which drops the slot from
+        // the map (it has done so since `ec0c0b78`, six days before this line was written), and
+        // `columnar_slot` below creates a fresh one to close. A slot only ever *holds* anything
+        // while its region is hosted — `ColumnarSlot::commit` is reached from the apply path
+        // alone, and a slot reaches a peer only through `host_region` — so a copy that could be
+        // stale implies a region this store hosts, which is exactly when `replacing` is true.
+        //
+        // It is kept for the case that does not go that way: a slot left behind by
+        // `retire_region`'s `announce == None` branch, where the membership still names a peer on
+        // this store and the range is deliberately left alone. A snapshot arriving after that
+        // finds `replacing` false, no retirement runs, and this is the only thing that closes the
+        // copy. That branch logs a warning and is not the ordinary road, which is why the cost of
+        // keeping this — a map lookup — buys more than removing it would.
         //
         // `ColumnarSlot::saw` already catches that gap, but only on the **next entry applied**:
         // its own documentation says "the first entry applied after the transfer is the gap, and

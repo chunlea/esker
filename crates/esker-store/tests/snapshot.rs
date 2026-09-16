@@ -2523,3 +2523,143 @@ async fn a_placed_columnar_learner_answers_for_the_rows_that_predate_it() {
     first.stop().await;
     second.stop().await;
 }
+
+/// **#77's probe: on the live path a columnar copy is never stale, so there is nothing here for a
+/// snapshot to repair.**
+///
+/// #77 asks for a test proving that `fetch_snapshot` closes the region's columnar copy. This was
+/// written to be that test and is kept as what it turned out to be: the measurement showing the
+/// state it was written for does not occur.
+///
+/// **What it measures.** A columnar learner is placed, its copy is opened over the four rows the
+/// history wrote, and then a fifth row is committed on the leader. The second read is the whole
+/// point: the learner is in the membership, so it *applies* that row through the log, and
+/// `ColumnarSlot::commit` — reached from the apply path — tells the copy as it goes. The copy holds
+/// five rows before any snapshot exists. A copy kept current by the tee has no staleness for a
+/// snapshot to close.
+///
+/// **What that says about the two mechanisms.** `fetch_snapshot` drops the slot through
+/// `retire_region_now` and then closes whatever slot is there; each covers the other, and both are
+/// defence for a state neither caller produces. The gap they are written for — a copy that is open
+/// while data arrives without applying — needs a learner that stops applying while keeping its
+/// slot, and every way to stop it (retirement) takes the slot with it.
+///
+/// **What was tried and removed.** The construction went on to announce a snapshot at an index the
+/// learner had not applied, which drove `receive_raft`'s held-region branch correctly: the peer was
+/// stopped and the replacement ran. Reading the copy during that window answered
+/// `Refused { reason: TooFarBehind, detail: "… the Raft peer stopped" }` — a refusal, because
+/// `catch_up` cannot reach the leader while the peer is down, and [`fragment_ids`] panics on any
+/// answer that is not a `Result`. That is this file's helper being intolerant of a refusal it
+/// should wait through, not the store misbehaving. The announcement is gone from here because its
+/// only outcome was that refusal; the finding above needs neither it nor the replacement.
+///
+/// The assertions are the finding, so this goes red if the tee ever stops keeping a copy current —
+/// which is the one change that would make #77's test writable.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "#77's probe: a measurement kept for its negative result, not a regression test"]
+async fn a_columnar_copy_is_kept_current_by_the_tee_so_a_snapshot_finds_nothing_stale() {
+    trace();
+    let pd = Arc::new(FakePd::new());
+    let first_address_listener = reserve();
+    let first_address = first_address_listener.local_addr().unwrap();
+    let second_address_listener = reserve();
+    let second_address = second_address_listener.local_addr().unwrap();
+    let peers = vec![
+        PeerAddress::new(1, 1, first_address),
+        PeerAddress::new(2, 2, second_address),
+    ];
+
+    let first = open(
+        first_address_listener,
+        1,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![1])),
+        1,
+    )
+    .await;
+    wait_for("a leader", || {
+        first.store.peer_of(1).is_some_and(|peer| peer.is_leader())
+    })
+    .await;
+
+    let region = first.store.regions().regions()[0].clone();
+    commit_the_history(&first.store, &region).await;
+
+    let second = open(
+        second_address_listener,
+        2,
+        &pd,
+        raft_options(peers.clone(), LogCompaction::new(), Some(vec![2])),
+        2,
+    )
+    .await;
+    place_a_columnar_learner(&pd, &first, &second).await;
+
+    // **One commit after the placement, or the first fragment never comes back.** That is #85,
+    // found by four runs of the construction this probe descends from: a freshly placed columnar
+    // learner asked with nothing committed since the conf change waits on a ReadIndex that does
+    // not arrive.
+    let region = first.store.regions().regions()[0].clone();
+    put(&[&first.store], &region, key(0), b"after the placement").await;
+
+    let leader = first.store.peer_of(1).expect("the leader");
+    let bar = leader
+        .status()
+        .await
+        .expect("the leader answers its own status")
+        .applied;
+    wait_for("the learner to reach the leader's index", || {
+        second
+            .store
+            .peer_of(1)
+            .is_some_and(|peer| peer.applied_index() >= bar)
+    })
+    .await;
+
+    let opened = fragment_ids(&second, 1, bar).await;
+    println!("#77 read 1 (the copy as it opens): {opened:?}");
+    assert_eq!(
+        opened,
+        vec![1, 2, 3, 4],
+        "the copy opens over the rows the history wrote"
+    );
+
+    let region = first.store.regions().regions()[0].clone();
+    commit_value(
+        &first.store,
+        &region,
+        table_row_key(5),
+        table_row(5, "katherine"),
+        30,
+        31,
+    )
+    .await;
+    let after = leader
+        .status()
+        .await
+        .expect("the leader answers its own status")
+        .applied;
+    wait_for("the learner to apply the fifth row", || {
+        second
+            .store
+            .peer_of(1)
+            .is_some_and(|peer| peer.applied_index() >= after)
+    })
+    .await;
+
+    // **The finding.** No snapshot has happened; the learner applied the row and the tee told the
+    // copy. There is no stale copy here for anything to close.
+    let told_by_the_tee = fragment_ids(&second, 1, after).await;
+    println!(
+        "#77 read 2 (after the fifth row is applied, before any snapshot): {told_by_the_tee:?}"
+    );
+    assert_eq!(
+        told_by_the_tee,
+        vec![1, 2, 3, 4, 5],
+        "the copy is kept current by the apply-path tee, so a snapshot has no staleness to repair \
+         on this path — if this ever fails, #77's test becomes writable and the row should reopen"
+    );
+
+    first.stop().await;
+    second.stop().await;
+}
