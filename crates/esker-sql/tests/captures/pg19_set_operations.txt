@@ -2,8 +2,16 @@
 # 19beta1, 2026-09-05. One `BEGIN … ROLLBACK`, a `SAVEPOINT` per probe.
 #
 # `with_test.rb` sends `WITH … AS (SELECT … UNION ALL (SELECT …) UNION ALL SELECT …) SELECT …`
-# and a `WITH RECURSIVE` whose body is a `UNION ALL`. Nothing here is built: a set operation is
-# `0A000` naming the operator (`parse::lower`). This is what it has to become.
+# and a `WITH RECURSIVE` whose body is a `UNION ALL`.
+#
+# **The sentence that used to stand here has expired.** It said "nothing here is built: a set
+# operation is `0A000` naming the operator (`parse::lower`)", which was true when this was
+# captured and stopped being true when `UNION` landed. Today the parser lowers all three
+# operators and the plan can say all three; the refusal that remains is one function in the
+# executor, `exec::mod::set_arm_supported`, and it covers `INTERSECT` and `EXCEPT` only
+# (`debts-v1.1.md` #105, whose plan page is `docs/plans/set-operators.md`). A recorded blocker
+# is a dated hypothesis: this one decayed in eleven days and nobody came back to the line that
+# depended on it.
 #
 # ## Cross-arm type unification
 #

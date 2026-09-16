@@ -257,16 +257,18 @@ fn a_domain_is_kept_where_postgresql_19_keeps_it() {
         "CREATE TABLE dt (id int, s d, t text)",
         "INSERT INTO dt VALUES (1, 'a', 'b')",
     ]);
-    // **`array_agg` is measured and not asserted here**, because it is a divergence this guard
-    // found rather than anything #81 touched: 19beta1 answers `d[]` for
-    // `pg_typeof(array_agg(s))` and this node answers `text[]` — an array *of the domain* against
-    // an array of its base. No patch of this row can reach it (`array_agg` is not in
-    // `keeps_its_argument_type()`, which is `Min | Max` and nothing else), so it is reported to the
-    // coordinator for a row of its own rather than given a number here.
+    // **`array_agg` is asserted here now, and it is `debts-v1.1.md` #106.** It was measured by this
+    // guard and left unasserted while it had no number: 19beta1 answers `d[]` for
+    // `pg_typeof(array_agg(s))` — an array *of the domain* — where this node answers `text[]`, an
+    // array of its base. The pair around it is what makes it a rule rather than a coincidence:
+    // `min` and `max` of the same column resolve to the **base**, because the aggregate is
+    // resolved to the base type's operator family, while `array_agg` keeps the domain. So the two
+    // cannot share an answer, and a fix that made them agree would break the two lines above.
     for (sql, answer) in [
         ("SELECT pg_typeof(s) FROM dt", "d"),
         ("SELECT pg_typeof(min(s)) FROM dt", "text"),
         ("SELECT pg_typeof(max(s)) FROM dt", "text"),
+        ("SELECT pg_typeof(array_agg(s)) FROM dt", "d[]"),
         (
             "SELECT pg_typeof(CASE WHEN true THEN s ELSE s END) FROM dt",
             "d",

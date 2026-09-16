@@ -1,0 +1,47 @@
+# **`EXCEPT` and `INTERSECT`, the two set operators this node does not have** — PostgreSQL 19beta1,
+# 2026-09-16 (`esker-coord/s2-h105.out`). `debts-v1.1.md` #105.
+#
+# `UNION` is implemented and these two are `0A000`, so every row below is a statement this node
+# refuses outright today. The file is a capture of what it must answer, not of what it answers.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`EXCEPT ALL` is multiset subtraction, not "the same rows without the dedup step".** The left
+#     side holds `2` twice and the right holds it once, so one `2` survives; `EXCEPT` dedups first
+#     and answers `1` alone. `INTERSECT ALL` is the same arithmetic from the other side — the count
+#     of each value is the *minimum* of the two sides, which is why it answers `2 ; 3` here and not
+#     the four rows a naive pairing would give.
+#   * **`INTERSECT` binds tighter than `EXCEPT`.** `a EXCEPT b INTERSECT b` is `a EXCEPT (b
+#     INTERSECT b)` and answers `1`. A left-to-right reading answers the same thing on this data by
+#     accident, which is exactly why the operator's precedence has to be taken from the grammar and
+#     not from an example.
+#   * **The arms resolve by the same rule `UNION` uses**: `integer INTERSECT numeric` settles on
+#     `numeric`, and a bare literal against a `text` column settles on `text`. So the type
+#     unification is reusable; what is not is the row combination.
+#   * **Both refusals name the operator**: `each EXCEPT query must have the same number of columns`
+#     and `INTERSECT types integer and text cannot be matched`. This node's `SetOperationTypes`
+#     hard-codes the word `UNION`, which is only correct while the other two never reach it.
+#   * The table is created and dropped outside a transaction, and the drop is a second pass, so the
+#     declared types survive the `\gdesc` pass that runs afterwards in a fresh session.
+CREATE TABLE h105a (id int, s text)		-
+CREATE TABLE h105b (id int, s text)		-
+INSERT INTO h105a VALUES (1,'a'),(2,'b'),(2,'b'),(3,'c')		-
+INSERT INTO h105b VALUES (2,'b'),(3,'c'),(3,'c'),(4,'d')		-
+SELECT id FROM h105a EXCEPT SELECT id FROM h105b ORDER BY 1	integer	1
+SELECT id FROM h105a EXCEPT ALL SELECT id FROM h105b ORDER BY 1	integer	1 ; 2
+SELECT id FROM h105a INTERSECT SELECT id FROM h105b ORDER BY 1	integer	2 ; 3
+SELECT id FROM h105a INTERSECT ALL SELECT id FROM h105b ORDER BY 1	integer	2 ; 3
+SELECT id FROM h105a UNION SELECT id FROM h105b ORDER BY 1	integer	1 ; 2 ; 3 ; 4
+SELECT id FROM h105a UNION ALL SELECT id FROM h105b ORDER BY 1	integer	1 ; 2 ; 2 ; 2 ; 3 ; 3 ; 3 ; 4
+SELECT pg_typeof(v) FROM (SELECT id AS v FROM h105a INTERSECT SELECT 1::numeric) q	regtype	numeric
+SELECT pg_typeof(v) FROM (SELECT s AS v FROM h105a EXCEPT SELECT 'a') q	regtype	text ; text
+SELECT id FROM h105a EXCEPT SELECT id, s FROM h105b	!42601 each EXCEPT query must have the same number of columns
+SELECT id FROM h105a INTERSECT SELECT s FROM h105b	!42804 INTERSECT types integer and text cannot be matched
+SELECT id FROM h105a EXCEPT SELECT id FROM h105b INTERSECT SELECT id FROM h105b ORDER BY 1	integer	1
+DROP TABLE h105a		-
+DROP TABLE h105b		-
+SELECT count(*) FROM pg_class WHERE relname LIKE 'h105%'	bigint	0
