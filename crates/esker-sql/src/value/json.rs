@@ -45,6 +45,16 @@ enum Json {
 /// What a `json` column does on the way in, and the whole of what the type promises. A NUL escape
 /// is **accepted** here and refused by `jsonb`, which is the one input that tells the two apart.
 pub(crate) fn validate(text: &str) -> Result<()> {
+    // **The whole operation on a sized thread when the value is deep** (#101): the tree is
+    // walked and freed wherever it is last owned, so only this answer crosses back.
+    if nesting_of(text) > crate::value::INLINE_VALUE_DEPTH {
+        let owned = text.to_owned();
+        return crate::value::on_a_deep_stack("json", move || validate_inner(&owned));
+    }
+    validate_inner(text)
+}
+
+fn validate_inner(text: &str) -> Result<()> {
     parse(text, Nulls::Allow).map(|_| ())
 }
 
@@ -54,6 +64,16 @@ pub(crate) fn validate(text: &str) -> Result<()> {
 /// keys are reordered **by length, then bytes**, duplicates are dropped with the **last** winning,
 /// and every colon and comma is followed by exactly one space.
 pub(crate) fn canonicalise(text: &str) -> Result<String> {
+    // **The whole operation on a sized thread when the value is deep** (#101): the tree is
+    // walked and freed wherever it is last owned, so only this answer crosses back.
+    if nesting_of(text) > crate::value::INLINE_VALUE_DEPTH {
+        let owned = text.to_owned();
+        return crate::value::on_a_deep_stack("json", move || canonicalise_inner(&owned));
+    }
+    canonicalise_inner(text)
+}
+
+fn canonicalise_inner(text: &str) -> Result<String> {
     let value = parse(text, Nulls::Refuse)?;
     let mut out = String::with_capacity(text.len());
     write_canonical(&value, &mut out);
@@ -103,6 +123,16 @@ fn key_order(left: &str, right: &str) -> std::cmp::Ordering {
 /// array on the left, and `'[1,2]' @> '[[1,2]]'` is `f` because an array on the right cannot match
 /// a scalar. A containment that flattens is wrong twice, and both are cells here.
 pub(crate) fn contains(left: &str, right: &str) -> Result<bool> {
+    // **The whole operation on a sized thread when the value is deep** (#101): the tree is
+    // walked and freed wherever it is last owned, so only this answer crosses back.
+    if nesting_of(left).max(nesting_of(right)) > crate::value::INLINE_VALUE_DEPTH {
+        let (left, right) = (left.to_owned(), right.to_owned());
+        return crate::value::on_a_deep_stack("json", move || contains_inner(&left, &right));
+    }
+    contains_inner(left, right)
+}
+
+fn contains_inner(left: &str, right: &str) -> Result<bool> {
     let (left, right) = (parse(left, Nulls::Refuse)?, parse(right, Nulls::Refuse)?);
     // The exception: an array contains a bare scalar it holds. Only here, only a scalar.
     if let (Json::Array(items), Json::Null | Json::Bool(_) | Json::Number(_) | Json::Str(_)) =
@@ -147,6 +177,16 @@ fn within(left: &Json, right: &Json) -> bool {
 /// by length before contents (`[2] < [1,1]`), objects by pair count before keys and then values.
 /// Key order is not part of the value because [`canonicalise`] already sorted it.
 pub(crate) fn compare(left: &str, right: &str) -> Result<std::cmp::Ordering> {
+    // **The whole operation on a sized thread when the value is deep** (#101): the tree is
+    // walked and freed wherever it is last owned, so only this answer crosses back.
+    if nesting_of(left).max(nesting_of(right)) > crate::value::INLINE_VALUE_DEPTH {
+        let (left, right) = (left.to_owned(), right.to_owned());
+        return crate::value::on_a_deep_stack("json", move || compare_inner(&left, &right));
+    }
+    compare_inner(left, right)
+}
+
+fn compare_inner(left: &str, right: &str) -> Result<std::cmp::Ordering> {
     Ok(order(
         &parse(left, Nulls::Refuse)?,
         &parse(right, Nulls::Refuse)?,
@@ -222,6 +262,16 @@ fn compare_in_order<'a>(pairs: impl Iterator<Item = (&'a Json, &'a Json)>) -> st
 }
 
 pub(crate) fn concat(left: &str, right: &str) -> Result<String> {
+    // **The whole operation on a sized thread when the value is deep** (#101): the tree is
+    // walked and freed wherever it is last owned, so only this answer crosses back.
+    if nesting_of(left).max(nesting_of(right)) > crate::value::INLINE_VALUE_DEPTH {
+        let (left, right) = (left.to_owned(), right.to_owned());
+        return crate::value::on_a_deep_stack("json", move || concat_inner(&left, &right));
+    }
+    concat_inner(left, right)
+}
+
+fn concat_inner(left: &str, right: &str) -> Result<String> {
     let left = parse(left, Nulls::Refuse)?;
     let right = parse(right, Nulls::Refuse)?;
     let merged = match (left, right) {
@@ -262,7 +312,36 @@ pub(crate) fn concat(left: &str, right: &str) -> Result<String> {
 /// is `20`), and is out of range rather than an error when it does not land. A key against an
 /// array, a subscript against an object, or either against a scalar is NULL and never an error —
 /// `'{"b":"b"}'::jsonb -> 'b' -> 'x'` is NULL, not `22023`.
+/// [`Key`] without the borrow, so a deep fetch can cross a thread boundary (#101). Two words and
+/// an `i64`; the shallow path never builds one.
+enum OwnedKey {
+    Member(String),
+    At(i64),
+}
+
 pub(crate) fn fetch(text: &str, key: Option<&Key<'_>>, as_text: bool) -> Result<Option<String>> {
+    // **The whole operation on a sized thread when the value is deep** (#101): the tree is walked
+    // and freed wherever it is last owned, so only this answer crosses back.
+    if nesting_of(text) > crate::value::INLINE_VALUE_DEPTH {
+        let owned = text.to_owned();
+        let key = match key {
+            Some(Key::Member(name)) => Some(OwnedKey::Member((*name).to_owned())),
+            Some(Key::At(at)) => Some(OwnedKey::At(*at)),
+            None => None,
+        };
+        return crate::value::on_a_deep_stack("json", move || {
+            let borrowed = match &key {
+                Some(OwnedKey::Member(name)) => Some(Key::Member(name)),
+                Some(OwnedKey::At(at)) => Some(Key::At(*at)),
+                None => None,
+            };
+            fetch_inner(&owned, borrowed.as_ref(), as_text)
+        });
+    }
+    fetch_inner(text, key, as_text)
+}
+
+fn fetch_inner(text: &str, key: Option<&Key<'_>>, as_text: bool) -> Result<Option<String>> {
     let Some(key) = key else { return Ok(None) };
     let found = match (parse(text, Nulls::Allow)?, key) {
         (Json::Object(members), Key::Member(name)) => members
@@ -386,14 +465,52 @@ fn invalid(text: &str) -> SqlError {
     }
 }
 
+/// The nesting this text reaches, counted **without recursing** — one pass over the bytes, so the
+/// decision below costs nothing a deep value would not already pay.
+///
+/// Strings are skipped, because a `[` inside one is a character and not a level. An over-estimate
+/// would be harmless (it spawns a thread that was not needed) and an under-estimate would not, so
+/// the escape handling is the careful half.
+fn nesting_of(text: &str) -> usize {
+    let (mut depth, mut deepest, mut in_string, mut escaped) = (0_usize, 0_usize, false, false);
+    for byte in text.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
 fn parse(text: &str, nulls: Nulls) -> Result<Json> {
+    // **The branch is not here**, though it was: parsing on a big stack and handing the tree back
+    // leaves it to be walked and freed on the caller's, one frame per level either way, and the
+    // probe measured exactly that — the child stopped dying at 750 levels and started dying at
+    // 4,500. It is the public entries below that each take the whole operation to a sized thread,
+    // because each of them returns something non-recursive and can therefore let the tree die where
+    // it was born (`debts-v1.1.md` #101).
     let mut parser = Parser {
         rest: text,
         whole: text,
         nulls,
     };
     parser.skip_space();
-    let value = parser.value()?;
+    let value = parser.value(0)?;
     parser.skip_space();
     if !parser.rest.is_empty() {
         return Err(invalid(text));
@@ -430,10 +547,20 @@ impl Parser<'_> {
         self.rest.chars().next()
     }
 
-    fn value(&mut self) -> Result<Json> {
+    /// One value, at `depth` containers deep.
+    ///
+    /// **The single place the recursion turns**, which is why the bound is here and not in the two
+    /// containers: every nested value reaches this line (`debts-v1.1.md` #101). Past it the answer
+    /// is `54001`, which is what PostgreSQL says when `max_stack_depth` is exceeded — and the stack
+    /// this runs on was sized for the bound, so reaching it means the value really is too deep
+    /// rather than the thread being too small.
+    fn value(&mut self, depth: usize) -> Result<Json> {
+        if depth > crate::value::MAX_VALUE_DEPTH {
+            return Err(SqlError::StatementTooComplex);
+        }
         match self.peek().ok_or_else(|| self.fail())? {
-            '{' => self.object(),
-            '[' => self.array(),
+            '{' => self.object(depth),
+            '[' => self.array(depth),
             '"' => self.string().map(Json::Str),
             't' => self.literal("true").map(|()| Json::Bool(true)),
             'f' => self.literal("false").map(|()| Json::Bool(false)),
@@ -447,7 +574,7 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn array(&mut self) -> Result<Json> {
+    fn array(&mut self, depth: usize) -> Result<Json> {
         self.eat('[')?;
         let mut items = Vec::new();
         self.skip_space();
@@ -457,7 +584,7 @@ impl Parser<'_> {
         }
         loop {
             self.skip_space();
-            items.push(self.value()?);
+            items.push(self.value(depth + 1)?);
             self.skip_space();
             match self.peek() {
                 Some(',') => self.rest = &self.rest[1..],
@@ -475,7 +602,7 @@ impl Parser<'_> {
     /// Last key wins — `{"a":1,"a":2}` is `{"a": 2}` — and the order is by key **length first,
     /// then bytes**. One example cannot tell that rule from plain lexicographic order, so the
     /// corpus carries two: `{"bb":1,"a":2,"ccc":3}` and `{"ab":1,"ba":2,"aa":3}`.
-    fn object(&mut self) -> Result<Json> {
+    fn object(&mut self, depth: usize) -> Result<Json> {
         self.eat('{')?;
         let mut entries: Vec<(String, Json)> = Vec::new();
         self.skip_space();
@@ -489,7 +616,7 @@ impl Parser<'_> {
             self.skip_space();
             self.eat(':')?;
             self.skip_space();
-            let value = self.value()?;
+            let value = self.value(depth + 1)?;
             match entries.iter_mut().find(|(seen, _)| *seen == key) {
                 Some(slot) => slot.1 = value,
                 None => entries.push((key, value)),
@@ -680,6 +807,16 @@ pub(crate) fn casts_to_scalar(ty: ColumnType) -> bool {
 /// and the wrong size is the number's own `22003`, because by then the shape check has passed and
 /// this function is out of the way.
 pub(crate) fn cast_to_scalar(text: &str, to: ColumnType) -> Result<Datum> {
+    // **The whole operation on a sized thread when the value is deep** (#101): the tree is
+    // walked and freed wherever it is last owned, so only this answer crosses back.
+    if nesting_of(text) > crate::value::INLINE_VALUE_DEPTH {
+        let owned = text.to_owned();
+        return crate::value::on_a_deep_stack("json", move || cast_to_scalar_inner(&owned, to));
+    }
+    cast_to_scalar_inner(text, to)
+}
+
+fn cast_to_scalar_inner(text: &str, to: ColumnType) -> Result<Datum> {
     match parse(text, Nulls::Refuse)? {
         // The one kind with no refusal: a JSON null is an SQL NULL, whatever the target.
         Json::Null => Ok(Datum::Null),

@@ -1281,6 +1281,80 @@ pub fn operator_exists(op: &str, ty: ColumnType) -> bool {
     }
 }
 
+/// How much stack one level of a **value's** tree costs, by profile.
+///
+/// **Measured, not assumed** — `tests/value_depth.rs` bisects the depth at which a child process
+/// dies parsing a nested `jsonb` on a 2 MiB thread, and it died at **750 levels**, which is about
+/// 2,796 bytes a level. **A `tsquery` level is dearer, because one bracket is five frames**
+/// (`or → and → phrase → unary → primary`): staged on a 43 MiB thread it parses 5,000 levels and
+/// dies at 10,000, which puts it between 4.3 and 8.6 KiB. The figure below is sized for the worse
+/// of the two and rounded up by half again — json's own number under-sized the thread and left a
+/// ten-thousand-level tsquery dying after `BUILT`, measured. The rest of this comment is the
+/// **2,796 bytes** a level in a debug build. Rounded up by half again the way
+/// [`crate::parse`]'s figures are, and the release number is that over four: the same ratio the
+/// nesting and plan constants use, and being wrong on the safe side costs reserved address space
+/// rather than a crash.
+const STACK_PER_VALUE_LEVEL: usize = if cfg!(debug_assertions) {
+    12 * 1024
+} else {
+    3 * 1024
+};
+
+/// How deep a **value** may nest before it is refused with `54001` (`debts-v1.1.md` #101).
+///
+/// The four bounds in [`crate::parse`] are all read off **statement text**, and the scanner that
+/// feeds them never looks inside a string literal — deliberately, since that is how `UNION` as a
+/// column name is counted and a comment is not. So `'[[[[…]]]]'::jsonb` is one token at depth one,
+/// and the tree behind it was bounded by nothing at all: `json`'s recursive descent and its four
+/// walkers, `tsquery`'s and the six walks over the `Node` it builds.
+///
+/// **Bounding the tree and not the walkers** is [`crate::parse::MAX_PLAN_DEPTH`]'s reasoning, and
+/// the reason the bound sits in the two parsers rather than in each walk: a tree that cannot be
+/// deeper than this cannot overflow any of them, including the ones not written yet.
+///
+/// **The number is given by the oracle rather than derived from a stack.** 19beta1 answers a
+/// `jsonb` nested ten thousand deep and refuses a hundred thousand with `54001 stack depth limit
+/// exceeded` (`esker-coord/s2-h101.out`), and contract C1 tolerates a limit but not a *low* one —
+/// so ten thousand is admitted and [`DEEP_VALUE_STACK_BYTES`] is sized for it, which is the order
+/// [`crate::parse::MAX_NESTING_DEPTH`] and its stack are in.
+pub(crate) const MAX_VALUE_DEPTH: usize = 10_000;
+
+/// The stack given to the thread that parses a value deeper than [`INLINE_VALUE_DEPTH`].
+///
+/// Enough for [`MAX_VALUE_DEPTH`] levels plus slack for the frames that are not per-level: about
+/// **44 MiB** in debug and 14 MiB in release. Reserved address space and not committed memory, so a
+/// value that does not nest does not pay for it — and only a value past the inline depth gets a
+/// thread at all.
+const DEEP_VALUE_STACK_BYTES: usize = MAX_VALUE_DEPTH * STACK_PER_VALUE_LEVEL + 4 * 1024 * 1024;
+
+/// Below this nesting a value is parsed on the caller's own stack: 256 levels in debug, 1,024 in
+/// release. Ordinary JSON is far below either and never leaves the caller's thread.
+///
+/// Half of the 2 MiB a `tokio` worker gets, over the per-level cost — the budget
+/// [`crate::parse`]'s own inline limit works to.
+const INLINE_VALUE_DEPTH: usize = (1024 * 1024) / STACK_PER_VALUE_LEVEL;
+
+/// Runs a parse on a thread sized for [`MAX_VALUE_DEPTH`].
+///
+/// The same shape as `crate::parse::parse_on_a_deep_stack`, including what it does with a panic: a
+/// panic in a parser is a bug here rather than something the client did, and it is reported as an
+/// internal error instead of being allowed to unwind into the session, because invariant 9 is about
+/// what a client can provoke and this must not become a dropped connection. A thread spawn costs
+/// tens of microseconds, and only a value past [`INLINE_VALUE_DEPTH`] pays it.
+pub(crate) fn on_a_deep_stack<T: Send + 'static>(
+    what: &'static str,
+    run: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let worker = std::thread::Builder::new()
+        .name(format!("esker-sql-{what}"))
+        .stack_size(DEEP_VALUE_STACK_BYTES)
+        .spawn(run)
+        .map_err(|error| SqlError::Internal(format!("could not spawn a {what} thread: {error}")))?;
+    worker
+        .join()
+        .map_err(|_| SqlError::Internal(format!("the {what} thread panicked")))?
+}
+
 /// A type as `format_type` writes it, with its typmod: what an error message and `\gdesc` say.
 #[must_use]
 pub fn format_type(ty: ColumnType, typmod: i32) -> String {
@@ -2835,7 +2909,7 @@ impl PgDatum for Datum {
             // what the type prints, so equality and ordering are the text's (`crate::value::hstore`).
             ColumnType::Hstore => Datum::Hstore(hstore::to_text(&hstore::from_text(text)?)),
             ColumnType::TsVector => Datum::TsVector(tsvector::to_text(&tsvector::from_text(text)?)),
-            ColumnType::TsQuery => Datum::TsQuery(tsquery::to_text(&tsquery::from_text(text)?)),
+            ColumnType::TsQuery => Datum::TsQuery(tsquery::canonical(text)?),
             // **As written.** The folding is the comparison's, so nothing here touches the case.
             ColumnType::Citext => Datum::Citext(text.to_owned()),
             // **As written too**, once the labels are known to be labels. Nothing is normalised —
@@ -3183,11 +3257,11 @@ impl PgDatum for Datum {
                     SqlError::ProtocolViolation("a binary tsvector is not UTF-8".into())
                 })?,
             )?)),
-            ColumnType::TsQuery => Datum::TsQuery(tsquery::to_text(&tsquery::from_text(
-                std::str::from_utf8(bytes).map_err(|_| {
-                    SqlError::ProtocolViolation("a binary tsquery is not UTF-8".into())
-                })?,
-            )?)),
+            ColumnType::TsQuery => {
+                Datum::TsQuery(tsquery::canonical(std::str::from_utf8(bytes).map_err(
+                    |_| SqlError::ProtocolViolation("a binary tsquery is not UTF-8".into()),
+                )?)?)
+            }
             // The wire carries the printed form either way, so this is `from_text`'s road with the
             // bytes read first.
             ColumnType::TsRange

@@ -1662,20 +1662,22 @@ fn same_type_concat(args: &[Datum]) -> Result<Option<Datum>> {
         }));
     }
     if args.iter().any(|value| matches!(value, Datum::TsQuery(_))) {
+        // **Owned, because a closure's argument and return lifetimes are inferred apart**: a
+        // `&str` borrowed from the `&Datum` it was handed cannot be returned from one. Two short
+        // clones on a path that is about to hand the work to another thread anyway (#101).
         let query = |value: Option<&Datum>| match value {
-            Some(Datum::TsQuery(text) | Datum::Text(text)) => {
-                crate::value::tsquery::from_text(text).map(Some)
-            }
+            Some(Datum::TsQuery(text) | Datum::Text(text)) => Ok(Some(text.clone())),
             Some(Datum::Null) | None => Ok(None),
             other => Err(wrong_type(other)),
         };
         return Ok(Some(match (query(args.first())?, query(args.get(1))?) {
             // **An OR of the two, not a concatenation of their text.** `'a & b' || 'c'` is
             // `'a' & 'b' | 'c'` — the printed form re-parenthesises by precedence, which is
-            // why the answer is built as a tree and rendered rather than spliced.
-            (Some(left), Some(right)) => Datum::TsQuery(crate::value::tsquery::to_text(
-                &crate::value::tsquery::Node::Or(Box::new(left), Box::new(right)),
-            )),
+            // why the answer is built as a tree and rendered rather than spliced. Both trees are
+            // built, joined and freed on one stack (`debts-v1.1.md` #101).
+            (Some(left), Some(right)) => {
+                Datum::TsQuery(crate::value::tsquery::or_of_texts(&left, &right)?)
+            }
             _ => Datum::Null,
         }));
     }
@@ -3465,7 +3467,7 @@ fn text_search_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Resul
             None => Datum::Null,
         },
         CatalogFunc::ToTsQuery => match text_of(subject) {
-            Some(text) => query_datum(tsquery::to_tsquery(config, &text)?),
+            Some(text) => Datum::TsQuery(tsquery::to_tsquery_text(config, &text)?),
             None => Datum::Null,
         },
         CatalogFunc::PlainToTsQuery => match text_of(subject) {
@@ -3484,9 +3486,9 @@ fn text_search_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Resul
         // which the query rather than the position doing it.
         CatalogFunc::TsMatch => match (args.first(), args.get(1)) {
             (Some(Datum::TsVector(vector)), Some(Datum::TsQuery(query)))
-            | (Some(Datum::TsQuery(query)), Some(Datum::TsVector(vector))) => Datum::Bool(
-                tsquery::matches(&tsvector::from_text(vector)?, &tsquery::from_text(query)?),
-            ),
+            | (Some(Datum::TsQuery(query)), Some(Datum::TsVector(vector))) => {
+                Datum::Bool(tsquery::matches_text(vector, query)?)
+            }
             _ => Datum::Null,
         },
         CatalogFunc::TsStrip => match args.first() {
@@ -3528,19 +3530,19 @@ fn text_search_function(func: crate::plan::CatalogFunc, args: &[Datum]) -> Resul
                 }
                 _ => return Ok(Datum::Null),
             };
-            let lexemes = tsquery::lexemes(&tsquery::from_text(query)?);
+            let lexemes = tsquery::lexemes_of_text(query)?;
             Datum::Text(tsvector::headline(config, text, &lexemes))
         }
         CatalogFunc::TsRank => match (args.first(), args.get(1)) {
-            (Some(Datum::TsVector(vector)), Some(Datum::TsQuery(query))) => Datum::Real(
-                tsquery::rank(&tsvector::from_text(vector)?, &tsquery::from_text(query)?),
-            ),
+            (Some(Datum::TsVector(vector)), Some(Datum::TsQuery(query))) => {
+                Datum::Real(tsquery::rank_text(vector, query)?)
+            }
             _ => Datum::Null,
         },
         CatalogFunc::NumNode => match args.first() {
-            Some(Datum::TsQuery(query)) => Datum::Int4(
-                i32::try_from(tsquery::numnode(&tsquery::from_text(query)?)).unwrap_or(i32::MAX),
-            ),
+            Some(Datum::TsQuery(query)) => {
+                Datum::Int4(i32::try_from(tsquery::numnode_of_text(query)?).unwrap_or(i32::MAX))
+            }
             _ => Datum::Null,
         },
         other => {
