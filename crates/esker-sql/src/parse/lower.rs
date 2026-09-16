@@ -2034,7 +2034,16 @@ fn cast_default_text(text: &str, literal: &Value, to: &DataType) -> String {
         Value::Boolean(flag) => (if *flag { "true" } else { "false" }).to_owned(),
         _ => format!("'{}'", text.replace('\'', "''")),
     };
-    format!("{printed}::{}", cast_type_name(to))
+    // **The stored text has to carry the modifier too.** `exec::ddl::deparse_default`
+    // re-parses this string and prints it again, so a `(3)` dropped here is a `(3)` the
+    // deparser can never put back: measured, the fold alone gave `'3 years'::interval`.
+    // `cast_type_name` itself stays bare — its other caller names a type in an error
+    // message, and widening that would change messages nothing here has measured.
+    let named = match lower_type(to) {
+        Ok((ty, typmod)) => value::format_type(ty, typmod),
+        Err(_) => cast_type_name(to),
+    };
+    format!("{printed}::{named}")
 }
 
 /// The three things PostgreSQL forbids in a `DEFAULT`, with the messages it uses for them.
