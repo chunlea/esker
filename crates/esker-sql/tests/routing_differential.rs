@@ -3526,6 +3526,30 @@ fn print_phase_report(tiers: &[TierProfile]) {
     }
 }
 
+/// What a tier of `rows` rows should be expected to cost, from what the tiers before it **actually**
+/// cost.
+///
+/// **Doubled, on purpose.** The fill rate falls as the table grows — 657 rows a second into an
+/// empty store, 280 into one already holding 100k — so the last tier's per-row cost is a floor and
+/// not a forecast. A projection that trusted it would start a tier it cannot finish, which is the
+/// failure the stop rule exists to prevent; doubling makes the estimate conservative in the only
+/// direction that matters. With no tier behind it there is nothing to project from, and the answer
+/// is zero: the first tier always runs.
+fn projected_fill(tiers: &[TierProfile], rows: i64) -> Duration {
+    let Some(last) = tiers.last() else {
+        return Duration::ZERO;
+    };
+    let per_row_us = u64::try_from(last.fill.as_micros())
+        .unwrap_or(u64::MAX)
+        .checked_div(u64::try_from(last.rows).unwrap_or(1))
+        .unwrap_or(0);
+    Duration::from_micros(
+        per_row_us
+            .saturating_mul(2)
+            .saturating_mul(u64::try_from(rows).unwrap_or(0)),
+    )
+}
+
 /// **Where an `INSERT` spends itself, as the table grows** — debt #109's profile.
 ///
 /// The phases are the `Backend` seam's own method boundaries (`tests/cluster/profile.rs`), which is
@@ -3546,10 +3570,16 @@ async fn what_an_insert_spends_its_time_on_as_the_table_grows() {
     let mut tiers: Vec<TierProfile> = Vec::new();
 
     for rows in PROFILE_TIERS {
-        if began.elapsed() >= PROFILE_BUDGET {
+        // **A stop rule that cannot stop is not a stop rule.** Asking only whether the budget has
+        // run out would happily start a quarter-hour tier at minute thirty-one, and nothing here
+        // can abort a fill once it is running. The question has to be whether this tier can
+        // *finish*, so it is asked before the tier starts and answered with `projected_fill`.
+        let projected = projected_fill(&tiers, rows);
+        if began.elapsed() + projected > PROFILE_BUDGET {
             println!(
-                "stopping before the {rows}-row tier: {:?} of the {PROFILE_BUDGET:?} budget is \
-                 gone. The tiers below are what ran; nothing is extrapolated past them.",
+                "not starting the {rows}-row tier: {:?} gone of {PROFILE_BUDGET:?}, and this tier \
+                 projects to {projected:?} at twice the last tier's per-row cost. The tiers above \
+                 are what ran; nothing is extrapolated past them.",
                 began.elapsed()
             );
             break;
@@ -3571,8 +3601,15 @@ async fn what_an_insert_spends_its_time_on_as_the_table_grows() {
 
     // The indexed tier is last and is the first thing the budget gives up, because it answers a
     // different question from the three above and cannot be compared with them.
-    if began.elapsed() < PROFILE_BUDGET {
-        let rows = PROFILE_TIERS[0];
+    //
+    // **Its projection is deliberately the wrong way round**: `projected_fill` reads the *last*
+    // tier, which by now is the largest, so a twenty-thousand-row table is priced at a
+    // two-hundred-thousand-row table's per-row cost and doubled on top. That over-estimates, and
+    // over-estimating can only skip a tier that would have fitted — never overrun the window. Given
+    // that this tier is the one the ruling gives up first, erring toward skipping it is the
+    // intended direction rather than an oversight.
+    let rows = PROFILE_TIERS[0];
+    if began.elapsed() + projected_fill(&tiers, rows) <= PROFILE_BUDGET {
         let gate = Gate::start().await;
         let (fill, statements) = gate.fill_profiled("t", rows, true).await;
         tiers.push(TierProfile {
