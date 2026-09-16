@@ -2930,6 +2930,104 @@ const SCALE_TIERS: [i64; 2] = [100_000, 200_000];
 /// +105% — a 1.7x spread. A median over rounds with its own spread beside it is the number.
 const SCALE_ROUNDS: usize = 5;
 
+/// One stranded lock as the forensics print it — #108.
+///
+/// A struct rather than a tuple: six fields of four types is what nobody can read at the call site.
+struct StrandedLock {
+    key: Vec<u8>,
+    kind: String,
+    start_ts: u64,
+    ttl_ms: u64,
+    primary: Vec<u8>,
+    /// How far past its lease it is, in physical milliseconds; `None` while it is still inside one.
+    expired_by_ms: Option<u64>,
+}
+
+/// Every lock one store holds over a table's rows, decoded — **#108's forensics**.
+///
+/// Two incidents have ended with a fill's own lock still unclearable minutes later, and both left
+/// only a `start_ts` because the in-process cluster dies with the test. What separates *the
+/// transaction is still alive* from *the lock is stranded and resolution never reaches it* is the
+/// record itself: its `primary` and its lease. Both are already in `LockRecord`, so nothing here
+/// changes a format — this walks `cf::LOCK` the way `columnar::region::unresolved_lock` does,
+/// because that is the reader whose refusal is being diagnosed.
+fn locks_over_table(
+    store: &Arc<esker_store::server::Store>,
+    tenant: u64,
+    table_id: u64,
+    now_ts: u64,
+) -> Vec<StrandedLock> {
+    let (table_start, table_end) = esker_keys::row::table_row_range(tenant, table_id);
+    let low = esker_txn::key::prefix(&table_start);
+    let high = esker_txn::key::prefix(&table_end);
+    let mut found = Vec::new();
+    let Ok(mut iter) = store.db().iter(
+        esker_engine::cf::LOCK,
+        &esker_engine::ReadOptions::default(),
+    ) else {
+        return found;
+    };
+    iter.seek(&low);
+    while iter.valid() && iter.key() < high.as_slice() {
+        if let Ok(user_key) = esker_txn::key::split_lock(iter.key())
+            && let Ok(lock) = esker_txn::LockRecord::decode(iter.value())
+        {
+            // Integer milliseconds throughout: `is_expired` compares physical halves, and a
+            // saturating subtraction says "not yet" as zero rather than wrapping.
+            let dead_at = esker_client::physical_ms(lock.start_ts).saturating_add(lock.ttl_ms);
+            let past = esker_client::physical_ms(now_ts).saturating_sub(dead_at);
+            found.push(StrandedLock {
+                key: user_key,
+                kind: format!("{:?}", lock.kind),
+                start_ts: lock.start_ts,
+                ttl_ms: lock.ttl_ms,
+                primary: lock.primary.to_vec(),
+                expired_by_ms: (past > 0).then_some(past),
+            });
+        }
+        iter.next();
+    }
+    found
+}
+
+/// Prints one store's stranded locks, and what the `write` column family says about each primary.
+///
+/// The primary's write record is the other half of the discriminator: a lock whose primary has
+/// **no** write record belongs to a transaction that neither committed nor rolled back, which is
+/// the shape #108 is about.
+fn report_stranded(at: usize, store: &Arc<esker_store::server::Store>, locks: &[StrandedLock]) {
+    for lock in locks {
+        let primary_versions = store.write_records(&lock.primary).unwrap_or(0);
+        let lease = match lock.expired_by_ms {
+            Some(ms) => format!("expired {ms} ms ago"),
+            None => "still inside its lease".to_owned(),
+        };
+        let is_primary = lock.key == lock.primary;
+        println!(
+            "  store {at}: key={} kind={} start_ts={} ttl_ms={} {lease} \
+             is_primary={is_primary} primary={} primary_write_records={primary_versions}",
+            printable(&lock.key),
+            lock.kind,
+            lock.start_ts,
+            lock.ttl_ms,
+            printable(&lock.primary),
+        );
+    }
+}
+
+/// A key as a reader can recognise it, without pulling in a hex crate for a diagnostic.
+fn printable(key: &[u8]) -> String {
+    key.iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() {
+                (*byte as char).to_string()
+            } else {
+                format!("\\x{byte:02x}")
+            }
+        })
+        .collect()
+}
+
 /// Scans per round, lowered as the table grows because one `count(*)` over a million rows is not
 /// one over four hundred. The count is reported, so a reader never has to infer the sample size.
 fn scans_for(rows: i64) -> usize {
