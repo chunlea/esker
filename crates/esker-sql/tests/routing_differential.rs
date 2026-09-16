@@ -3954,7 +3954,7 @@ const STRANDED_TTL_MS: u64 = 300;
 /// it and the census read the control's own lock as `expired 35 ms ago` with `ttl_ms=60000` beside
 /// it. The arithmetic was right — `physical_ms` is applied to both sides — and the fixture's
 /// parameter was wrong. The lease has to outlast the arm that reads it.
-const ALIVE_TTL_MS: u64 = 600_000;
+const ALIVE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// Encounters below which a share is not reported (pre-registered in `q117-ratio-design.md` §④).
 const RATIO_FLOOR: usize = 20;
 
@@ -3985,7 +3985,7 @@ fn scan_and_collect(
     table_id: u64,
     scans: usize,
     tally: &mut Verdicts,
-    at_first_encounter: &mut Option<Vec<StrandedLock>>,
+    planted: &Arc<std::sync::Mutex<Vec<u64>>>,
 ) {
     let mut session = gate.session_asking(Arc::clone(counted) as Arc<dyn FragmentSource>);
     for _ in 0..scans {
@@ -4016,8 +4016,24 @@ fn scan_and_collect(
         // census, so the silence in that log was an absence of locks rather than a failure to
         // match them. The design said "forensics at the encounter"; this is the line that was
         // missing.
-        if drained > 0 && at_first_encounter.is_none() {
-            *at_first_encounter = Some(gate.sample_locks(table, table_id, "at the encounter"));
+        // **Both looks, at every encounter, while whatever is planting still is.** The first
+        // version took one look for the whole arm and left the second to the caller, who took it
+        // after stopping the planter — so the second census always saw a stopped system with `gap`
+        // milliseconds to roll the last pair forward, and `gone` was the only reachable verdict.
+        // On known inputs the classifier produces `alive` and `stranded` both
+        // (`q117-planter-result.md` §6b), so the fault was never the classifier: it was that one
+        // instant's snapshot holds one pair, and the second one was taken too late.
+        if drained > 0 {
+            let first = gate.sample_locks(table, table_id, "at the encounter");
+            // **A third of a lease, derived rather than passed.** The interval is only meaningful
+            // against the lease it samples: at a whole lease every planted lock is gone or expired
+            // by the second look, which is what three runs produced. A caller free to choose both
+            // could set an interval longer than the lease and see nothing but `gone` without the
+            // number ever looking wrong.
+            std::thread::sleep(Duration::from_millis(STRANDED_TTL_MS / 3));
+            let second = gate.sample_locks(table, table_id, "a gap later");
+            let seen = planted.lock().map_or_else(|_| Vec::new(), |s| s.clone());
+            classify_planted(&seen, tally, &first, &second);
         }
     }
 }
@@ -4028,17 +4044,24 @@ fn scan_and_collect(
 /// here: the control arm is alive because it is *inside* the lease it chose, so a second look a
 /// full `LOCK_TTL_MS` later would find it expired and call it stranded — and the pre-registered
 /// reading treats a control that is not `ALIVE` as a broken classifier.
+/// Classifies one encounter's pair of looks.
+///
+/// **Both censuses come from the caller now, and that is the fix.** This used to take the second
+/// look itself, which meant it ran wherever the caller happened to call it — and the caller called
+/// it after `planting.store(false)`, so the second look always saw a system that had stopped
+/// planting and had been given `gap` milliseconds to roll the last pair forward. Every lock was
+/// therefore `gone`, in three runs, in both arms, and no other verdict was reachable.
+///
+/// The classifier itself was never the problem: on known inputs it produces both
+/// `alive` and `stranded` (`q117-planter-result.md` §6b — a lock inside a ten-minute lease reads
+/// unexpired, one past a 300 ms lease reads expired 915 ms later and is still there). What was
+/// wrong was when the looks were taken, so taking them is now the caller's job.
 fn classify_planted(
-    gate: &Gate,
-    table: &str,
-    table_id: u64,
     planted: &[u64],
-    gap: Duration,
     tally: &mut Verdicts,
     first: &[StrandedLock],
+    second: &[StrandedLock],
 ) {
-    std::thread::sleep(gap);
-    let second = gate.sample_locks(table, table_id, "second");
     for before in first.iter().filter(|lock| planted.contains(&lock.start_ts)) {
         let same = |later: &&StrandedLock| later.at == before.at && later.key == before.key;
         match second.iter().find(same) {
@@ -4180,7 +4203,6 @@ async fn what_share_of_met_locks_are_already_finished() {
     // answers and there is nothing to disagree about (`joint_gate.rs`).
     std::thread::sleep(Duration::from_millis(STRANDED_TTL_MS * 4));
     tokio::task::block_in_place(|| {
-        let mut met_at = None;
         scan_and_collect(
             &gate,
             &counted,
@@ -4188,25 +4210,14 @@ async fn what_share_of_met_locks_are_already_finished() {
             table_id,
             RATIO_SCANS,
             &mut stranded,
-            &mut met_at,
-        );
-        planting.store(false, Ordering::Relaxed);
-        let seen = planted.lock().map_or_else(|_| Vec::new(), |s| s.clone());
-        classify_planted(
-            &gate,
-            "t",
-            table_id,
-            &seen,
-            // **Shorter than the lease, not longer.** At a gap of a whole lease every planted lock
-            // is guaranteed to be gone or expired by the second look, which is exactly what the
-            // first run produced: `gone` for all of them and no other verdict. A third of a lease
-            // still lets an expired lock be seen as expired, without giving the row path time to
-            // roll every one of them forward first.
-            Duration::from_millis(STRANDED_TTL_MS / 3),
-            &mut stranded,
-            met_at.as_deref().unwrap_or(&[]),
+            &planted,
         );
     });
+    // **Stopped after the scans, not before the classifying.** It used to stop here and *then* the
+    // caller took its second census, so that census always saw a system that had quit planting —
+    // which is why `gone` was the only verdict three runs running. Classifying happens inside the
+    // loop now, while this is still placing pairs.
+    planting.store(false, Ordering::Relaxed);
     let pairs = planted.lock().map_or(0, |seen| seen.len());
     planting_thread.join().expect("the planting thread ends");
     println!("  stranded arm planted {pairs} pairs");
@@ -4229,8 +4240,12 @@ async fn what_share_of_met_locks_are_already_finished() {
             false,
         )
     });
+    // One planted lock, where the stranded arm has many: the control's job is a single
+    // recognisable ALIVE, not volume. Wrapped the same way the planter's list is, so both arms
+    // hand `scan_and_collect` the same type — a control that took a different shape is how a
+    // fixture ends up with one arm wired and the other not.
+    let held_only = Arc::new(std::sync::Mutex::new(vec![held]));
     tokio::task::block_in_place(|| {
-        let mut met_at = None;
         scan_and_collect(
             &gate,
             &counted,
@@ -4238,18 +4253,7 @@ async fn what_share_of_met_locks_are_already_finished() {
             table_id,
             RATIO_SCANS,
             &mut alive,
-            &mut met_at,
-        );
-        classify_planted(
-            &gate,
-            "t",
-            table_id,
-            // One planted lock, where the stranded arm has many: the control's job is a single
-            // recognisable ALIVE, not volume.
-            &[held],
-            Duration::from_millis(500),
-            &mut alive,
-            met_at.as_deref().unwrap_or(&[]),
+            &held_only,
         );
     });
     print_verdicts("alive (control)", &alive);
