@@ -860,6 +860,14 @@ impl Executor {
         tenant: u64,
         identity: crate::session::Backend,
     ) -> Self {
+        // **Every session passes through here**, which is what makes the registry able to
+        // answer "who is on this database" at all: a connection, a `Pair` and a
+        // `Cluster` all build an executor, so none of them needs to remember to say so.
+        //
+        // The catalog's address is the cluster's identity — compared, never dereferenced —
+        // because a tenant id alone is only unique within one cluster and this registry is
+        // process-wide.
+        identity.on_tenant(Arc::as_ptr(&catalog) as usize, tenant);
         let locks = Arc::new(crate::advisory::Locks::new());
         let session = locks.session();
         Executor {
@@ -921,6 +929,11 @@ impl Executor {
     #[must_use]
     pub fn serving_database(mut self, name: impl Into<String>) -> Self {
         self.database = name.into();
+        // `Backend::on_database` was written for this and had **no caller at all** until
+        // here, so every row of `pg_stat_activity` carried an empty `datname` and the view
+        // filled it in with the asking session's own database. Wiring it is the other half
+        // of the same fact the line above records.
+        self.identity.on_database(&self.database);
         self
     }
 

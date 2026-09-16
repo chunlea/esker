@@ -4016,6 +4016,23 @@ pub(super) fn drop_database(
         if catalog::is_template_database(name) {
             return Err(SqlError::CannotDropTemplateDatabase);
         }
+        // **After the template check and not before it**, which is where a real server
+        // puts it too; the order is only observable for a template somebody is connected
+        // to, which is not a shape that has been measured, so it is left as it was.
+        //
+        // By tenant id, for the same reason the check above is: the id is what the
+        // directory answered, and two spellings of one name would split the count.
+        let others = crate::session::others_on_database(
+            std::sync::Arc::as_ptr(&executor.catalog) as usize,
+            id,
+            executor.identity.pid,
+        );
+        if others > 0 {
+            return Err(SqlError::DatabaseAccessedByOthers {
+                name: name.clone(),
+                sessions: others,
+            });
+        }
         catalog::drop_database(txn, name, id)?;
     }
     Ok(Outcome::done("DROP DATABASE"))
