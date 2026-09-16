@@ -1,0 +1,126 @@
+# An unknown literal beside an enum — debt #81, the enum half of #75 — as a real PostgreSQL 19beta1 answers it.
+#
+# Captured 2026-09-16 by lane s2-plpgsql with `sesscap.py` — `esker-coord/s2-h81.stmts` (an unknown literal beside
+# an enum in every construct that resolves a common type) `s2-h81b.stmts` (what those constructs say when the
+# branches are two different enums, or an enum beside another category) and `s2-h81c.stmts` (the same for `GREATEST`
+# and `LEAST`, the third construct the rule reaches). Three sessions inside
+# `BEGIN … ROLLBACK` with a type and a table of its own, every refusal in its own `SAVEPOINT` / `ROLLBACK TO` — and so are the `EXCEPT` and the
+# `INTERSECT`, which PostgreSQL answers and this node refuses outright (`0A000`: `UNION` is the only set operator it
+# implements), an abort that would otherwise swallow the rest of the session; the last
+# line proves nothing was left behind. The `\gdesc` pass runs on a connection where that type does not exist, so the
+# declared-types column is empty for the statements that name it.
+#
+#!escaped
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **An unknown literal takes the enum, in every construct that resolves a common type**: a set operation's arm, a
+#     `CASE`'s result, a `COALESCE`'s argument, `GREATEST`/`LEAST`. `SELECT m … UNION SELECT 'sad'` is two rows and
+#     `CASE WHEN false THEN m ELSE 'sad' END` is `sad` — the label, not the ordinal and not a refusal.
+#   * **A literal that is no label of that enum fails as that enum**: `22P02 invalid input value for enum h_mood:
+#     "nope"`, the same sentence an `INSERT` of it gives — not a type mismatch, because the literal was read as the
+#     enum rather than compared with it.
+#   * **The value comes back as a label**, so the column is the enum and not the `smallint` its ordinal is stored in.
+#
+#   * **A branch of another enum is `42846`, and of another category `42804`**, each construct writing its own word
+#     and its own order: `CASE/WHEN could not convert type h_mood to h_other` (a `CASE`'s list starts at its `ELSE`)
+#     beside `COALESCE could not convert type h_other to h_mood`, and `CASE types text and h_mood cannot be matched`
+#     beside `COALESCE types h_mood and text cannot be matched`.
+#   * **A NULL branch leaves the enum alone**: `CASE WHEN true THEN m ELSE NULL END` is `ok`, and so is
+#     `GREATEST(m, NULL)` — `GREATEST` and `LEAST` are not strict.
+#
+BEGIN		-
+CREATE TYPE h_mood AS ENUM ('sad', 'ok', 'happy')		-
+CREATE TABLE h_t (id int, m h_mood)		-
+INSERT INTO h_t VALUES (1, 'ok'), (2, 'happy')		-
+SELECT 'r', m FROM h_t WHERE id = 1 UNION SELECT 'r', 'sad' ORDER BY 2		r|sad ; r|ok
+SELECT 'r', m FROM h_t WHERE id = 1 UNION ALL SELECT 'r', 'sad'		r|ok ; r|sad
+SAVEPOINT e		-
+SELECT 'r', m FROM h_t WHERE id = 1 EXCEPT SELECT 'r', 'sad'		r|ok
+ROLLBACK TO e		-
+SAVEPOINT i		-
+SELECT 'r', m FROM h_t WHERE id = 1 INTERSECT SELECT 'r', 'ok'		r|ok
+ROLLBACK TO i		-
+SAVEPOINT a		-
+SELECT 'r', m FROM h_t UNION SELECT 'r', 'nope'	!22P02 invalid input value for enum h_mood: "nope"
+ROLLBACK TO a		-
+SELECT 'r', CASE WHEN true THEN m ELSE 'sad' END FROM h_t WHERE id = 1		r|ok
+SELECT 'r', CASE WHEN false THEN m ELSE 'sad' END FROM h_t WHERE id = 1		r|sad
+SAVEPOINT b		-
+SELECT 'r', CASE WHEN false THEN m ELSE 'nope' END FROM h_t WHERE id = 1	!22P02 invalid input value for enum h_mood: "nope"
+ROLLBACK TO b		-
+SELECT 'r', COALESCE(m, 'sad') FROM h_t WHERE id = 1		r|ok
+SELECT 'r', COALESCE(NULL::h_mood, 'sad')		r|sad
+SAVEPOINT c		-
+SELECT 'r', COALESCE(m, 'nope') FROM h_t WHERE id = 1	!22P02 invalid input value for enum h_mood: "nope"
+ROLLBACK TO c		-
+SELECT 'r', GREATEST(m, 'sad'), LEAST(m, 'happy') FROM h_t WHERE id = 1		r|ok|ok
+SELECT 'r', m IN ('ok', 'sad') FROM h_t WHERE id = 1		r|t
+SELECT 'r', m = 'ok' FROM h_t WHERE id = 1		r|t
+ROLLBACK		-
+SELECT count(*) FROM pg_type WHERE typname = 'h_mood'	bigint	0
+# the sentences when the branches have no type in common
+BEGIN		-
+CREATE TYPE h_mood AS ENUM ('sad', 'ok', 'happy')		-
+CREATE TYPE h_other AS ENUM ('sad', 'ok')		-
+CREATE TABLE h_u (id int, m h_mood, n h_other)		-
+INSERT INTO h_u VALUES (1, 'ok', 'sad')		-
+SAVEPOINT a		-
+SELECT 'r', CASE WHEN true THEN m ELSE n END FROM h_u	!42846 CASE/WHEN could not convert type h_mood to h_other
+ROLLBACK TO a		-
+SAVEPOINT b		-
+SELECT 'r', COALESCE(m, n) FROM h_u	!42846 COALESCE could not convert type h_other to h_mood
+ROLLBACK TO b		-
+SAVEPOINT c		-
+SELECT 'r', CASE WHEN true THEN m ELSE 'sad'::text END FROM h_u	!42804 CASE types text and h_mood cannot be matched
+ROLLBACK TO c		-
+SAVEPOINT d		-
+SELECT 'r', COALESCE(m, 'sad'::text) FROM h_u	!42804 COALESCE types h_mood and text cannot be matched
+ROLLBACK TO d		-
+SAVEPOINT e		-
+SELECT 'r', CASE WHEN true THEN m ELSE 1::integer END FROM h_u	!42804 CASE types integer and h_mood cannot be matched
+ROLLBACK TO e		-
+SAVEPOINT f		-
+SELECT 'r', COALESCE(m, 1::smallint) FROM h_u	!42804 COALESCE types h_mood and smallint cannot be matched
+ROLLBACK TO f		-
+SAVEPOINT g		-
+SELECT 'r', GREATEST(m, n) FROM h_u	!42846 GREATEST could not convert type h_other to h_mood
+ROLLBACK TO g		-
+SAVEPOINT h		-
+SELECT 'r', GREATEST(m, 'sad'::text) FROM h_u	!42804 GREATEST types h_mood and text cannot be matched
+ROLLBACK TO h		-
+SELECT 'r', CASE WHEN true THEN m ELSE NULL END FROM h_u		r|ok
+SELECT 'r', COALESCE(NULL, m) FROM h_u		r|ok
+ROLLBACK		-
+SELECT count(*) FROM pg_type WHERE typname IN ('h_mood', 'h_other')	bigint	0
+# GREATEST and LEAST, the same rule's third construct
+BEGIN		-
+CREATE TYPE h_mood AS ENUM ('sad', 'ok', 'happy')		-
+CREATE TYPE h_other AS ENUM ('sad', 'ok')		-
+CREATE TABLE h_g (id int, m h_mood, n h_other)		-
+INSERT INTO h_g VALUES (1, 'ok', 'sad')		-
+SELECT 'r', GREATEST(m, 'sad'), LEAST(m, 'happy') FROM h_g		r|ok|ok
+SELECT 'r', GREATEST(m, m), LEAST(m, m) FROM h_g		r|ok|ok
+SELECT 'r', GREATEST(m, NULL), LEAST(m, NULL) FROM h_g		r|ok|ok
+SAVEPOINT a		-
+SELECT 'r', GREATEST(m, 'nope') FROM h_g	!22P02 invalid input value for enum h_mood: "nope"
+ROLLBACK TO a		-
+SAVEPOINT b		-
+SELECT 'r', LEAST(m, 'nope') FROM h_g	!22P02 invalid input value for enum h_mood: "nope"
+ROLLBACK TO b		-
+SAVEPOINT c		-
+SELECT 'r', LEAST(m, n) FROM h_g	!42846 LEAST could not convert type h_other to h_mood
+ROLLBACK TO c		-
+SAVEPOINT d		-
+SELECT 'r', LEAST(m, 'sad'::text) FROM h_g	!42804 LEAST types h_mood and text cannot be matched
+ROLLBACK TO d		-
+SAVEPOINT e		-
+SELECT 'r', LEAST(m, 1::integer) FROM h_g	!42804 LEAST types h_mood and integer cannot be matched
+ROLLBACK TO e		-
+SELECT 'r', pg_typeof(GREATEST(m, 'sad')) FROM h_g		r|h_mood
+ROLLBACK		-
+SELECT count(*) FROM pg_type WHERE typname IN ('h_mood', 'h_other')	bigint	0
