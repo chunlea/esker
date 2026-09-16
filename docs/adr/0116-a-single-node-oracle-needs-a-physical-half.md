@@ -55,19 +55,30 @@ half, so a mode with no physical half has no renewal either.
 
 ## Options
 
-### (a) Give the single-node oracle a physical half, from the clock seam that already exists
+### (a) Give the single-node oracle a physical half, the way the in-memory backend already has one
 
-`esker-client` has `Clock` / `SystemClock` / `FakeClock` (`crates/esker-client/src/clock.rs`) — the
-seam its retry loops are tested through. A single-node oracle mints `ts = now_ms << 18 | logical`
-from it, with the logical counter restarting each millisecond, which is the layout PD already mints.
+A single-node oracle mints `ts = now_ms << 18 | logical`, the layout PD mints, with the logical
+counter carrying on inside a millisecond.
+
+**Where `now_ms` comes from matters, and it is not `Clock`.** `esker_client::Clock` is the *retry*
+seam — `now() -> Instant` and `sleep(Duration)` — and a monotonic instant has no epoch, so nothing
+can be shifted into a physical half from it. The reading has to be a wall clock, which is what
+`backend::Versions` already does for `MemoryBackend`: a private `unix_now_ms()` over
+`SystemTime::now()`, with the justification written beside it — *"`CLAUDE.md` invariant 6 is that no
+node uses its wall clock for ordering, and this does not break it: `Versions` is the timestamp
+oracle's stand-in, and reading the clock is what an oracle is for"*. The single-node oracle is the
+same object for the real backend, so it reads the clock the same way and carries the same sentence.
 
 * **No new crate edge**: `esker-sql` links `esker-client` today.
 * **No format change and no wire change**: a timestamp is a `u64` everywhere it is written or sent;
   only which numbers get minted changes.
-* Tests can drive it, because `FakeClock` is the same seam the rest of the client is tested through.
-* Monotonicity across restarts has to be decided explicitly: taking the clock alone repeats
-  timestamps after a backwards jump. Either keep PD's rule — a persisted high-water mark, and start
-  at `max(clock, mark)` — or accept the clock and say so.
+* Tests drive it by injecting the reading (a `now_ms` the test sets), not through `FakeClock`, which
+  moves a monotonic instant and cannot move an epoch.
+* Monotonicity is the rule `Versions` already writes for one process: **the mark is the greater of
+  the last timestamp handed out and the wall clock**, so a clock that stands still is carried by the
+  logical half and a clock that jumps backwards loses to the mark. Surviving a *restart* additionally
+  needs the mark on disk, as PD keeps it; without that, a restart after a backwards jump can repeat
+  timestamps, and this ADR proposes to say so rather than to pretend otherwise.
 
 ### (b) Reuse PD's oracle in-process
 
@@ -94,10 +105,11 @@ until the data directory is cleared.
 
 ## Recommendation
 
-**(a)**, with the monotonicity question answered rather than left open: mint from the `Clock` seam,
-and keep a high-water mark beside the node's data when there is a directory to keep it in, starting
-at `max(clock, mark)` as PD does. It is the only option that changes no format, no wire and no crate
-graph, and it makes `is_expired` mean what it says in every mode the binary offers.
+**(a)**, with the monotonicity question answered rather than left open: mint from a wall-clock
+reading with `Versions`' in-process rule — the mark is the greater of the last timestamp and the
+clock — and keep that mark beside the node's data when there is a directory to keep it in, as PD
+does. It is the only option that changes no format, no wire and no crate graph, and it makes
+`is_expired` mean what it says in every mode the binary offers.
 
 (b) is the better engineering if the edge is acceptable — it reuses rules that are already
 crash-tested rather than restating them — and this ADR is happy to be overruled that way. (c) is
@@ -112,7 +124,7 @@ single-node.
 
 ## Tests this would need
 
-* An orphaned lock that **expires**: a lock minted at `start_ts`, the fake clock advanced past
+* An orphaned lock that **expires**: a lock minted at `start_ts`, the oracle's reading advanced past
   `LOCK_TTL_MS`, and `classify` answering settled rather than `Alive` — red today on the single-node
   path, and the shape `statement_across_a_leader_kill` met on a real cluster.
 * Two timestamps inside one millisecond stay ordered, and a batch never straddles a millisecond.
