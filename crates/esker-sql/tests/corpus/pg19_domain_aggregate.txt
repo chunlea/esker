@@ -1,0 +1,41 @@
+# **A domain survives `array_agg` and does not survive `min`/`max`** — PostgreSQL 19beta1,
+# 2026-09-16 (`esker-coord/s2-h106.out`). `debts-v1.1.md` #106.
+#
+# Two corpora already cover the two axes and neither covers the pair: `pg19_domain.txt` and
+# `pg19_domain_schema.txt` never aggregate, and the twenty-odd files that name `array_agg` never
+# declare a domain. The defect lives in the cross product, which is where the last one lived too.
+#
+#   statement <tab> types <tab> rows      the result, and the types `\gdesc` declared for it
+#   statement <tab> <tab> -               a command with no result set, only a tag
+#   statement <tab> !SQLSTATE message     PostgreSQL refused it; DETAIL and HINT follow
+#
+# THINGS REASONING WOULD GET WRONG
+#
+#   * **`min`/`max` and `array_agg` of the same column answer differently, and both are right.**
+#     `min(s)` is `text` because the aggregate resolves to the base type's operator family, while
+#     `array_agg(s)` is `h106d[]` because it does not compare anything — it collects. So a fix that
+#     made the three agree would break two lines to pay one.
+#   * **`array_agg(t)` over a plain `text` column is the control.** It answers `text[]` here and
+#     there, which is what says the divergence is about the *domain* and not about `array_agg`.
+#   * **`DISTINCT` does not lower it to the base either**: `array_agg(DISTINCT s)` is still
+#     `h106d[]`, although `DISTINCT` does compare. The comparison is inside the aggregate; the
+#     type it answers is still an array of what it collected.
+#   * **The table and the domain are created and dropped outside a transaction**, and the drop is a
+#     second pass: the declared types come from a `\gdesc` pass that runs in a fresh session *after*
+#     the whole script, so anything the script destroys is invisible to it and the types field comes
+#     back empty — which the corpus reader refuses.
+CREATE DOMAIN h106d AS text		-
+CREATE TABLE h106t (id int, s h106d, t text)		-
+INSERT INTO h106t VALUES (1, 'a', 'b')		-
+SELECT pg_typeof(s) FROM h106t	regtype	h106d
+SELECT pg_typeof(min(s)) FROM h106t	regtype	text
+SELECT pg_typeof(max(s)) FROM h106t	regtype	text
+SELECT pg_typeof(array_agg(s)) FROM h106t	regtype	h106d[]
+SELECT pg_typeof(array_agg(t)) FROM h106t	regtype	text[]
+SELECT pg_typeof(array_agg(DISTINCT s)) FROM h106t	regtype	h106d[]
+SELECT pg_typeof(CASE WHEN true THEN s ELSE s END) FROM h106t	regtype	h106d
+SELECT pg_typeof(COALESCE(s, s)) FROM h106t	regtype	h106d
+SELECT pg_typeof(GREATEST(s, s)) FROM h106t	regtype	h106d
+DROP TABLE h106t		-
+DROP DOMAIN h106d		-
+SELECT count(*) FROM pg_type WHERE typname = 'h106d'	bigint	0
