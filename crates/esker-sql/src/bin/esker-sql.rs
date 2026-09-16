@@ -411,15 +411,23 @@ fn connect(
         Arc<dyn esker_client::RegionResolver>,
         Arc<dyn esker_client::TimestampOracle>,
     ) = if pd.is_empty() {
-        // **A local counter is a correct oracle for exactly one node**, and without `--pd` there is
-        // no driver to ask. It is *not* correct for two: two processes counting from one hand the
-        // same `start_ts` to different transactions, which is `CLAUDE.md` invariant 6 gone and
-        // every MVCC decision with it (`tests/two_nodes_one_clock.rs`). So this arm is the
+        // **A local oracle is correct for exactly one node**, and without `--pd` there is no
+        // driver to ask. It is *not* correct for two: two processes minting from their own clocks
+        // hand the same `start_ts` to different transactions, which is `CLAUDE.md` invariant 6 gone
+        // and every MVCC decision with it (`tests/two_nodes_one_clock.rs`). So this arm is the
         // single-node one and says so.
+        //
+        // **And it mints a physical half, because a lease is judged in one** (debt #84,
+        // [ADR 0116](../../../docs/adr/0116-a-single-node-oracle-needs-a-physical-half.md)). The
+        // counter that stood here had a physical half of zero for ever, so `is_expired` never fired
+        // and a lock left behind by a prewrite whose commit never landed was immortal: every later
+        // statement on that key spent the client's resolution budget and answered `40001`, and
+        // restarting the node did not help because the counter started again at zero. This comment
+        // used to argue only about ordering, which is how the omission reached three places.
         let store_ids = transport.store_ids();
         (
             Arc::new(esker_client::StaticRegion::replicated(1, &store_ids)) as Arc<_>,
-            Arc::new(esker_client::CountingOracle::starting_at(1)) as Arc<_>,
+            Arc::new(esker_client::WallClockOracle::new()) as Arc<_>,
         )
     } else {
         let conn = Arc::new(

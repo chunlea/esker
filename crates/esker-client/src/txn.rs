@@ -2503,6 +2503,72 @@ impl TimestampOracle for CountingOracle {
     }
 }
 
+/// A [`TimestampOracle`] that turns this process's wall clock into timestamps: physical
+/// milliseconds in the high bits and a counter in the low ones, which is the shape PD's TSO hands
+/// out.
+///
+/// **This is the oracle a single node needs, and the reason is lock expiry** — debt #84, and
+/// [ADR 0116](../../../docs/adr/0116-a-single-node-oracle-needs-a-physical-half.md). Percolator
+/// resolves a lock whose owner vanished by deciding it is dead, and [`is_expired`] decides that on
+/// the *physical half* of the timestamps, deliberately, so that no node judges another's
+/// transaction by its own clock. Under [`CountingOracle`] that half is zero and stays zero:
+/// `physical_ms(1009)` is 0, `physical_ms(now)` is 0, and a lock left behind by a write whose
+/// answer was lost can never expire. Anything that then touches those rows spins against it for as
+/// long as it is willing to wait — seen exactly so, as `a lock from the transaction at 1009 could
+/// not be cleared … for a read`, for thirty seconds.
+///
+/// **Monotonic whatever the clock does.** The timestamp issued is the greater of the next one this
+/// oracle owes and the clock's own, so a clock that stands still is carried by the logical half and
+/// a clock that jumps backwards loses. Surviving a *restart* after a backwards jump would need the
+/// mark on disk, as `esker_pd::tso` keeps it; this one holds it in memory, which is what a
+/// single-node binary can promise (ADR 0116).
+///
+/// **Reading a clock here does not break `CLAUDE.md` invariant 6.** The invariant is that no node
+/// uses its wall clock *for ordering*; an oracle turning a clock into timestamps is the one
+/// component whose job that is, and every ordering decision above it still reads the numbers this
+/// hands out. It is correct for **one** process, like [`CountingOracle`] and for the same reason:
+/// two of these minting from two clocks would hand the same `start_ts` to different transactions.
+#[derive(Debug)]
+pub struct WallClockOracle {
+    /// The next timestamp to issue, never below the last one handed out.
+    next: std::sync::Mutex<u64>,
+}
+
+impl WallClockOracle {
+    /// An oracle that starts wherever the clock is.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            next: std::sync::Mutex::new(0),
+        }
+    }
+}
+
+impl Default for WallClockOracle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TimestampOracle for WallClockOracle {
+    fn tso(&self, count: u32) -> std::result::Result<u64, ProtoError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+        let mut next = self
+            .next
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Monotonic whatever the clock does, and never repeating inside one millisecond: the
+        // logical bits are what a second caller in the same millisecond gets.
+        let issued = (*next).max(now_ms << TSO_LOGICAL_BITS);
+        *next = issued.saturating_add(u64::from(count.max(1)));
+        Ok(issued)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

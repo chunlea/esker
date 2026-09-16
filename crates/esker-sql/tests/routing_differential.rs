@@ -42,7 +42,7 @@ use esker_client::region_cache::RegionResolver;
 use esker_client::router::{ClientOptions, Router};
 use esker_client::{TcpStores, TimestampOracle, TxnClient};
 use esker_pd::{Pd, PdOptions, PdService};
-use esker_proto::{PeerRole, ProtoError, Server, ServerHandle, Service, TransportConfig};
+use esker_proto::{PeerRole, Server, ServerHandle, Service, TransportConfig};
 use esker_sql::backend::{Backend, SchemaLease as SchemaLeaseSource};
 use esker_sql::catalog::Catalog;
 use esker_sql::exec::Executor;
@@ -665,7 +665,7 @@ impl Gate {
         })
         .await;
 
-        let oracle: Arc<dyn TimestampOracle> = Arc::new(WallClockOracle::new());
+        let oracle: Arc<dyn TimestampOracle> = Arc::new(esker_client::WallClockOracle::new());
         let (backend, conn, fragments) =
             tokio::task::block_in_place(|| sql_node(&addresses, pd_address, Arc::clone(&oracle)));
 
@@ -1131,43 +1131,9 @@ async fn wait_for<F: FnMut() -> bool>(what: &str, seconds: u64, mut ready: F) {
     }
 }
 
-/// Physical milliseconds in the high bits and a counter in the low ones — the shape PD's TSO hands
-/// out.
-///
-/// `CountingOracle` cannot be used on a cluster that can strand a lock: `esker_client::is_expired`
-/// judges a lock by the *physical half* of a timestamp, which under a plain counter is zero for
-/// ever, so a lock left behind by a write whose answer was lost can never expire. Nothing here
-/// reads a clock to order anything (`CLAUDE.md` invariant 6); this stands in for PD's TSO, whose
-/// job is to turn a clock into timestamps.
-#[derive(Debug)]
-struct WallClockOracle {
-    next: std::sync::Mutex<u64>,
-}
-
-impl WallClockOracle {
-    fn new() -> Self {
-        Self {
-            next: std::sync::Mutex::new(0),
-        }
-    }
-}
-
-impl TimestampOracle for WallClockOracle {
-    fn tso(&self, count: u32) -> Result<u64, ProtoError> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| {
-                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-            });
-        let mut next = self
-            .next
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let issued = (*next).max(now_ms << esker_client::TSO_LOGICAL_BITS);
-        *next = issued.saturating_add(u64::from(count.max(1)));
-        Ok(issued)
-    }
-}
+// The oracle this test needs lives in `esker-client` now: `WallClockOracle`, promoted out
+// of this file and `routing_differential.rs`, which had the same copy for the same reason
+// (debt #84, ADR 0116). Its doc carries the argument that used to be here.
 
 /// A statement that has to succeed, retried through the leadership gap a saturated machine
 /// produces (`docs/plans/phase-9-rails.md` §8).

@@ -202,54 +202,9 @@ enum Cell {
     Null,
 }
 
-/// The gate's timestamp source: physical milliseconds in the high bits and a counter in the low
-/// ones, which is the shape PD's TSO hands out.
-///
-/// **`CountingOracle` cannot be used here, and the reason is lock expiry.** Percolator resolves a
-/// lock whose owner vanished by deciding it is dead, and `esker_client::is_expired` decides that
-/// on the *physical half* of the timestamps — deliberately, so that no node judges another's
-/// transaction by its own clock. Under a plain counter that half is zero and stays zero:
-/// `physical_ms(1009)` is 0, `physical_ms(now)` is 0, and a lock left behind by a write whose
-/// answer was lost can never expire. Anything that then touches those rows spins against it for
-/// as long as it is willing to wait — seen exactly so, as `a lock from the transaction at 1009
-/// could not be cleared`, for thirty seconds. (ADR 0104 §4 gave that sentence a suffix naming
-/// which of the three waits gave up, so what a run prints today ends `… for a read`.)
-///
-/// The other tests in this crate never orphan a lock, which is why they can count and this cannot.
-/// Nothing here reads a clock to *order* anything (`CLAUDE.md` invariant 6): this stands in for
-/// PD's TSO, which is the one component whose job is to turn a clock into timestamps.
-#[derive(Debug)]
-struct WallClockOracle {
-    /// The next timestamp to issue, never below the last one handed out.
-    next: std::sync::Mutex<u64>,
-}
-
-impl WallClockOracle {
-    fn new() -> Self {
-        Self {
-            next: std::sync::Mutex::new(0),
-        }
-    }
-}
-
-impl TimestampOracle for WallClockOracle {
-    fn tso(&self, count: u32) -> Result<u64, ProtoError> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| {
-                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-            });
-        let mut next = self
-            .next
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Monotonic whatever the clock does, and never repeating inside one millisecond: the
-        // logical bits are what a second caller in the same millisecond gets.
-        let issued = (*next).max(now_ms << esker_client::TSO_LOGICAL_BITS);
-        *next = issued.saturating_add(u64::from(count.max(1)));
-        Ok(issued)
-    }
-}
+// The oracle this test needs lives in `esker-client` now: `WallClockOracle`, promoted out
+// of this file and `routing_differential.rs`, which had the same copy for the same reason
+// (debt #84, ADR 0116). Its doc carries the argument that used to be here.
 
 /// The whole cluster: a placement driver, four stores, and one SQL node over them.
 struct Gate {
@@ -363,7 +318,7 @@ impl Gate {
             .unwrap()
             .expect("a region covers the key space");
         let region_id = route.region.id;
-        let oracle: Arc<dyn TimestampOracle> = Arc::new(WallClockOracle::new());
+        let oracle: Arc<dyn TimestampOracle> = Arc::new(esker_client::WallClockOracle::new());
         let (backend, conn) = tokio::task::block_in_place(|| {
             sql_node(&addresses, &route.region, pd_address, Arc::clone(&oracle))
         });
