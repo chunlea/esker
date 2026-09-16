@@ -1,6 +1,6 @@
 # 0116 — A single-node oracle needs a physical half, or its locks never expire
 
-Status: **Proposed**, 2026-09-16 — debt #84, the number issued by the coordinator. Builds on
+Status: **Accepted**, 2026-09-16 — debt #84, the number issued by the coordinator. Builds on
 [ADR 0088](0088-a-row-lock-across-nodes.md) (the lease a row lock carries) and
 [ADR 0021](0021-time-machine.md) decision 1 (a timestamp's high bits *are* milliseconds).
 

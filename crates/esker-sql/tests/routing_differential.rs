@@ -2649,16 +2649,96 @@ impl Gate {
     /// *transaction* per row, and a million of those is the measurement's own cost rather than the
     /// thing being measured. The fill's own duration is printed because it decides how much of a
     /// window is left for measuring.
+    /// The id of a table this harness created, or `None` before it exists.
+    ///
+    /// Copied from `tests/joint_gate.rs`, as the header says these helpers deliberately are. The
+    /// `Option` is not decoration: the first statement the fill settles is the `CREATE TABLE`, so
+    /// the forensics below run at an instant when this table has no id yet, and a diagnostic that
+    /// panics is the worst kind of failure to add.
+    fn table_id(&self, name: &str) -> Option<u64> {
+        let txn = self.backend.begin().ok()?;
+        let id = self
+            .catalog
+            .view(&*txn, TENANT)
+            .ok()
+            .and_then(|view| view.table(name).ok().flatten())
+            .map(|def| def.id);
+        let _ = txn.rollback();
+        id
+    }
+
+    /// **#108**: every lock every store holds over this table's rows, at the instant of a refusal.
+    ///
+    /// The two incidents this is written for ended with a fill's own lock still unclearable minutes
+    /// later, and both left only a `start_ts` because the in-process cluster dies with the test.
+    /// What separates *the transaction is still alive* from *the lock is stranded and resolution
+    /// never reaches it* is in the record — its `primary` and its lease — and in whether that
+    /// primary has a `write` record at all. Both are read here, and no format is touched.
+    fn lock_forensics(&self, table: &str) {
+        let Some(table_id) = self.table_id(table) else {
+            println!("  #108: {table} has no id yet, so it holds no row locks");
+            return;
+        };
+        let first = self.sample_locks(table, table_id, "first");
+        if first.is_empty() {
+            println!("  #108: no lock over {table} on any store — nothing to attribute");
+            return;
+        }
+        // **A second look, one lease later, and it is the whole discriminator.** `is_expired`
+        // compares `physical_ms(now)` against `physical_ms(start_ts) + ttl_ms`, and `start_ts`
+        // cannot move — so a heartbeat can only show as a **larger `ttl_ms`**. One sample says a
+        // lock is past its lease; two say whether anybody is still pushing that lease out.
+        std::thread::sleep(Duration::from_millis(esker_client::LOCK_TTL_MS));
+        let second = self.sample_locks(table, table_id, "second");
+        compare_samples(&first, &second);
+    }
+
+    /// One pass over every store, printed as it is taken.
+    fn sample_locks(&self, table: &str, table_id: u64, which: &str) -> Vec<StrandedLock> {
+        let Ok(now_ts) = self.oracle.timestamp() else {
+            println!("  #108: the oracle would not answer, so no lease can be judged");
+            return Vec::new();
+        };
+        let mut all = Vec::new();
+        for (at, node) in self.nodes.iter().enumerate() {
+            let locks = locks_over_table(at, &node.store, TENANT, table_id, now_ts);
+            report_stranded(at, &node.store, &locks);
+            all.extend(locks);
+        }
+        println!(
+            "  #108 {which} sample: {} lock(s) over {table} across {} stores, at ts {now_ts}",
+            all.len(),
+            self.nodes.len()
+        );
+        all
+    }
+
+    /// `settle`, and if it gives up, the lock census before the panic is let through.
+    ///
+    /// The panic is resumed rather than swallowed: this adds a diagnosis to the failure, it does
+    /// not turn a failure into a pass.
+    fn settle_or_report(&self, session: &mut Session, sql: &str, table: &str) {
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| settle(session, sql)));
+        if let Err(panic) = outcome {
+            println!("#108 forensics: `{sql}` gave up; the locks over {table} at this instant:");
+            self.lock_forensics(table);
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     async fn fill_one_at_scale(&self, table: &str, rows: i64) -> Duration {
         let filled_in = tokio::task::block_in_place(|| {
             let mut session = self.session();
-            settle(
+            self.settle_or_report(
                 &mut session,
                 &format!("CREATE TABLE {table} (id int8 PRIMARY KEY, n int8, note text)"),
+                table,
             );
-            settle(
+            self.settle_or_report(
                 &mut session,
                 &format!("ALTER TABLE {table} SET (columnar_replicas = 1)"),
+                table,
             );
             let began = Instant::now();
             for chunk in (1..=rows).collect::<Vec<i64>>().chunks(500) {
@@ -2666,9 +2746,10 @@ impl Gate {
                     .iter()
                     .map(|id| format!("({id}, {id}, 'n{id}')"))
                     .collect();
-                settle(
+                self.settle_or_report(
                     &mut session,
                     &format!("INSERT INTO {table} VALUES {}", values.join(", ")),
+                    table,
                 );
             }
             let filled_in = began.elapsed();
@@ -2929,6 +3010,151 @@ const SCALE_TIERS: [i64; 2] = [100_000, 200_000];
 /// met a lock 22 times in 120 scans and then 13, and put the fallback's cost at +27% and then
 /// +105% — a 1.7x spread. A median over rounds with its own spread beside it is the number.
 const SCALE_ROUNDS: usize = 5;
+
+/// One stranded lock as the forensics print it — #108.
+///
+/// A struct rather than a tuple: six fields of four types is what nobody can read at the call site.
+struct StrandedLock {
+    /// Which store this copy was read from. **Not decoration**: every replica of the region
+    /// holds the same lock row, so a census across four stores lists one logical lock four
+    /// times, and pairing the two samples by key alone would match store 0's second look
+    /// against store 2's first. The pairing is `(at, key)` for that reason.
+    at: usize,
+    key: Vec<u8>,
+    kind: String,
+    start_ts: u64,
+    ttl_ms: u64,
+    primary: Vec<u8>,
+    /// How far past its lease it is, in physical milliseconds; `None` while it is still inside one.
+    expired_by_ms: Option<u64>,
+}
+
+/// Every lock one store holds over a table's rows, decoded — **#108's forensics**.
+///
+/// Two incidents have ended with a fill's own lock still unclearable minutes later, and both left
+/// only a `start_ts` because the in-process cluster dies with the test. What separates *the
+/// transaction is still alive* from *the lock is stranded and resolution never reaches it* is the
+/// record itself: its `primary` and its lease. Both are already in `LockRecord`, so nothing here
+/// changes a format — this walks `cf::LOCK` the way `columnar::region::unresolved_lock` does,
+/// because that is the reader whose refusal is being diagnosed.
+fn locks_over_table(
+    at: usize,
+    store: &Arc<Store>,
+    tenant: u64,
+    table_id: u64,
+    now_ts: u64,
+) -> Vec<StrandedLock> {
+    let (table_start, table_end) = esker_keys::row::table_row_range(tenant, table_id);
+    let low = esker_txn::key::prefix(&table_start);
+    let high = esker_txn::key::prefix(&table_end);
+    let mut found = Vec::new();
+    let Ok(mut iter) = store.db().iter(
+        esker_engine::cf::LOCK,
+        &esker_engine::ReadOptions::default(),
+    ) else {
+        return found;
+    };
+    iter.seek(&low);
+    while iter.valid() && iter.key() < high.as_slice() {
+        if let Ok(user_key) = esker_txn::key::split_lock(iter.key())
+            && let Ok(lock) = esker_txn::LockRecord::decode(iter.value())
+        {
+            // Integer milliseconds throughout: `is_expired` compares physical halves, and a
+            // saturating subtraction says "not yet" as zero rather than wrapping.
+            let dead_at = esker_client::physical_ms(lock.start_ts).saturating_add(lock.ttl_ms);
+            let past = esker_client::physical_ms(now_ts).saturating_sub(dead_at);
+            found.push(StrandedLock {
+                at,
+                key: user_key,
+                kind: format!("{:?}", lock.kind),
+                start_ts: lock.start_ts,
+                ttl_ms: lock.ttl_ms,
+                primary: lock.primary.to_vec(),
+                expired_by_ms: (past > 0).then_some(past),
+            });
+        }
+        iter.next();
+    }
+    found
+}
+
+/// Prints one store's stranded locks, and what the `write` column family says about each primary.
+///
+/// The primary's write record is the other half of the discriminator: a lock whose primary has
+/// **no** write record belongs to a transaction that neither committed nor rolled back, which is
+/// the shape #108 is about.
+fn report_stranded(at: usize, store: &Arc<Store>, locks: &[StrandedLock]) {
+    for lock in locks {
+        let primary_versions = store.write_records(&lock.primary).unwrap_or(0);
+        let lease = match lock.expired_by_ms {
+            Some(ms) => format!("expired {ms} ms ago"),
+            None => "still inside its lease".to_owned(),
+        };
+        let is_primary = lock.key == lock.primary;
+        println!(
+            "  store {at}: key={} kind={} start_ts={} ttl_ms={} {lease} \
+             is_primary={is_primary} primary={} primary_write_records={primary_versions}",
+            printable(&lock.key),
+            lock.kind,
+            lock.start_ts,
+            lock.ttl_ms,
+            printable(&lock.primary),
+        );
+    }
+}
+
+/// What two samples a lease apart say about the same locks — **#108's discriminator**.
+///
+/// A heartbeat extends a transaction's lease, and the only field it can move is `ttl_ms`: the
+/// comparison in `is_expired` is against `physical_ms(start_ts) + ttl_ms`, and `start_ts` is fixed
+/// for the life of the transaction. So a lock whose `ttl_ms` grew between the two looks has an
+/// owner that is alive and being kept alive; one whose `ttl_ms` did not move, and whose lease is
+/// long past, is stranded with nothing resolving it. That is the difference two incidents left no
+/// evidence for.
+fn compare_samples(first: &[StrandedLock], second: &[StrandedLock]) {
+    for before in first {
+        let same = |later: &&StrandedLock| later.at == before.at && later.key == before.key;
+        let verdict = match second.iter().find(same) {
+            None => "gone — something resolved it between the two looks".to_owned(),
+            Some(later) if later.start_ts != before.start_ts => format!(
+                "replaced — a different transaction holds it now ({} then {})",
+                before.start_ts, later.start_ts
+            ),
+            Some(later) if later.ttl_ms > before.ttl_ms => format!(
+                "ALIVE — its lease grew from {} ms to {} ms, so its owner is being heartbeated",
+                before.ttl_ms, later.ttl_ms
+            ),
+            Some(later) => match later.expired_by_ms {
+                Some(ms) => format!(
+                    "STRANDED — same lease of {} ms, now {ms} ms past it, and still here",
+                    later.ttl_ms
+                ),
+                None => format!(
+                    "inside its lease still ({} ms), too early to judge",
+                    later.ttl_ms
+                ),
+            },
+        };
+        println!(
+            "  #108 verdict for store {} key {}: {verdict}",
+            before.at,
+            printable(&before.key)
+        );
+    }
+}
+
+/// A key as a reader can recognise it, without pulling in a hex crate for a diagnostic.
+fn printable(key: &[u8]) -> String {
+    key.iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() {
+                (*byte as char).to_string()
+            } else {
+                format!("\\x{byte:02x}")
+            }
+        })
+        .collect()
+}
 
 /// Scans per round, lowered as the table grows because one `count(*)` over a million rows is not
 /// one over four hundred. The count is reported, so a reader never has to infer the sample size.
