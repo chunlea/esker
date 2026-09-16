@@ -3050,7 +3050,8 @@ fn fill_measure_tables(gate: &Gate) {
 /// Answers the `start_ts`, which is how a caller recognises **its own** lock in the forensics
 /// rather than one the fill happened to leave.
 fn strand_a_secondary(
-    gate: &Gate,
+    router: &Arc<Router>,
+    oracle: &Arc<dyn TimestampOracle>,
     table_id: u64,
     primary_id: i64,
     secondary_id: i64,
@@ -3078,8 +3079,10 @@ fn strand_a_secondary(
                 .expect("a row key"),
         )
     };
+    // **The router and the oracle rather than the gate**, so a planting thread can hold them: a
+    // thread needs `'static`, and `&Gate` is not. Both are `Arc` on the gate already, so a planter
+    // clones them out and plants into the same cluster the scans are reading.
     let (primary, secondary) = (key(primary_id), key(secondary_id));
-    let router = gate.client.router();
     let send = |request: esker_proto::txn::TxnKvReq| match router
         .call(&request.into())
         .expect("the router answered")
@@ -3088,7 +3091,7 @@ fn strand_a_secondary(
         other => panic!("a TxnKv request came back as {other:?}"),
     };
 
-    let start_ts = gate.oracle.timestamp().expect("a timestamp");
+    let start_ts = oracle.timestamp().expect("a timestamp");
     let prewritten = send(esker_proto::txn::TxnKvReq::Prewrite {
         start_ts,
         primary: primary.clone(),
@@ -3113,7 +3116,7 @@ fn strand_a_secondary(
     );
 
     if commit_primary {
-        let commit_ts = gate.oracle.timestamp().expect("a timestamp");
+        let commit_ts = oracle.timestamp().expect("a timestamp");
         let committed = send(esker_proto::txn::TxnKvReq::Commit {
             start_ts,
             commit_ts,
@@ -3131,6 +3134,58 @@ fn strand_a_secondary(
         );
     }
     start_ts
+}
+
+/// Keeps planting stranded pairs until told to stop, and remembers every `start_ts` it planted.
+///
+/// **This is what the 12:09 window was missing, and the reason it is missing is worth keeping.**
+/// That run planted *one* pair per arm and scanned sixty times, and met a lock three times in a
+/// hundred and twenty scans — far under the floor of twenty written down before the run. The
+/// classifier was not the problem and neither was the workload: a single pair is met a handful of
+/// times and then the row path rolls it forward, so **the encounter rate was capped by the fixture
+/// itself**. A planter lifts that cap without touching what is being measured.
+///
+/// **Not [`spawn_writer_over`]**, which commits after three milliseconds and therefore strands
+/// nothing: what it makes is contention, and what this makes is #86's shape.
+///
+/// Every planted pair gets fresh row ids from `next_id`, so one round's locks are never mistaken
+/// for the previous round's, and the `start_ts` list is how [`classify_planted`] tells a lock this
+/// fixture placed from one the fill happened to leave.
+fn spawn_planter(
+    gate: &Gate,
+    table_id: u64,
+    first_id: i64,
+    ttl_ms: u64,
+    commit_primary: bool,
+    every: Duration,
+    planting: &Arc<AtomicBool>,
+    planted: &Arc<std::sync::Mutex<Vec<u64>>>,
+) -> std::thread::JoinHandle<()> {
+    // Cloned out of the gate rather than borrowed from it: a thread outlives this frame, and both
+    // of these are `Arc` precisely so that it can.
+    let router = Arc::clone(gate.client.router());
+    let oracle = Arc::clone(&gate.oracle);
+    let planting = Arc::clone(planting);
+    let planted = Arc::clone(planted);
+    std::thread::spawn(move || {
+        let mut next_id = first_id;
+        while planting.load(Ordering::Relaxed) {
+            let start_ts = strand_a_secondary(
+                &router,
+                &oracle,
+                table_id,
+                next_id,
+                next_id + 1,
+                ttl_ms,
+                commit_primary,
+            );
+            if let Ok(mut seen) = planted.lock() {
+                seen.push(start_ts);
+            }
+            next_id += 2;
+            std::thread::sleep(every);
+        }
+    })
 }
 
 fn spawn_writer_over(
@@ -3969,14 +4024,14 @@ fn classify_planted(
     gate: &Gate,
     table: &str,
     table_id: u64,
-    planted: u64,
+    planted: &[u64],
     gap: Duration,
     tally: &mut Verdicts,
     first: &[StrandedLock],
 ) {
     std::thread::sleep(gap);
     let second = gate.sample_locks(table, table_id, "second");
-    for before in first.iter().filter(|lock| lock.start_ts == planted) {
+    for before in first.iter().filter(|lock| planted.contains(&lock.start_ts)) {
         let same = |later: &&StrandedLock| later.at == before.at && later.key == before.key;
         match second.iter().find(same) {
             None => tally.gone += 1,
@@ -4009,16 +4064,25 @@ async fn what_share_of_met_locks_are_already_finished() {
     // lock inside its lease is one the row path waits on rather than rolls forward, and then
     // neither engine answers and there is nothing to disagree about (`joint_gate.rs`).
     let mut stranded = Verdicts::default();
-    let planted = tokio::task::block_in_place(|| {
-        strand_a_secondary(
-            &gate,
-            table_id,
-            RATIO_ROWS + 1,
-            RATIO_ROWS + 2,
-            STRANDED_TTL_MS,
-            true,
-        )
-    });
+    // **A planter, not one pair.** The 12:09 run met a lock three times in a hundred and twenty
+    // scans because it planted once and then scanned: a single pair is met a handful of times and
+    // the row path rolls it forward. The encounter rate was capped by the fixture, so the fixture
+    // is what changes — nothing about what is being measured moves.
+    let planting = Arc::new(AtomicBool::new(true));
+    let planted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let planter = spawn_planter(
+        &gate,
+        table_id,
+        RATIO_ROWS + 1,
+        STRANDED_TTL_MS,
+        true,
+        Duration::from_millis(STRANDED_TTL_MS / 2),
+        &planting,
+        &planted,
+    );
+    // Long enough that the first pairs are past their lease before the scans start: a lock inside
+    // its lease is one the row path waits on rather than rolls forward, and then neither engine
+    // answers and there is nothing to disagree about (`joint_gate.rs`).
     std::thread::sleep(Duration::from_millis(STRANDED_TTL_MS * 4));
     tokio::task::block_in_place(|| {
         let mut met_at = None;
@@ -4031,26 +4095,38 @@ async fn what_share_of_met_locks_are_already_finished() {
             &mut stranded,
             &mut met_at,
         );
+        planting.store(false, Ordering::Relaxed);
+        let seen = planted.lock().map(|seen| seen.clone()).unwrap_or_default();
         classify_planted(
             &gate,
             "t",
             table_id,
-            planted,
+            &seen,
             Duration::from_millis(STRANDED_TTL_MS),
             &mut stranded,
             met_at.as_deref().unwrap_or(&[]),
         );
     });
+    planter.join().expect("the planting thread ends");
+    println!(
+        "  stranded arm planted {} pairs",
+        planted.lock().map(|seen| seen.len()).unwrap_or(0)
+    );
     print_verdicts("stranded", &stranded);
 
     // **The control.** A long lease and no commit at all, read well inside it.
     let mut alive = Verdicts::default();
     let held = tokio::task::block_in_place(|| {
         strand_a_secondary(
-            &gate,
+            gate.client.router(),
+            &gate.oracle,
             table_id,
-            RATIO_ROWS + 3,
-            RATIO_ROWS + 4,
+            // **Clear of the planter's range, not next to it.** The planter starts at
+            // `RATIO_ROWS + 1` and steps by two without end, so it reaches `+ 3` within a few
+            // milliseconds: the control's pair has to sit somewhere the planter will not arrive,
+            // or the two fixtures write the same rows and the control stops meaning anything.
+            RATIO_ROWS + 1_000_001,
+            RATIO_ROWS + 1_000_002,
             ALIVE_TTL_MS,
             false,
         )
@@ -4070,7 +4146,9 @@ async fn what_share_of_met_locks_are_already_finished() {
             &gate,
             "t",
             table_id,
-            held,
+            // One planted lock, where the stranded arm has many: the control's job is a single
+            // recognisable ALIVE, not volume.
+            &[held],
             Duration::from_millis(500),
             &mut alive,
             met_at.as_deref().unwrap_or(&[]),
