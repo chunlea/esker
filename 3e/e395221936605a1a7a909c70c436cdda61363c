@@ -1,0 +1,25 @@
+crates/esker-sql/tests/cluster/mod.rs
+  s_8d3e4c2902bf64::t_9600978b726599 39-40
+crates/esker-sql/tests/cluster/profile.rs
+  s_8d3e4c2902bf64::t_53aaa6deb35759 1-405
+crates/esker-sql/tests/routing_differential.rs
+  s_8d3e4c2902bf64::t_ecaae29e165bd5 564-567,673,676-689,699,2749-2821,3443-3719
+docs/plans/debts-v1.1.md
+  s_8d3e4c2902bf64::t_c80cd8504c003b 113-114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3ee395221936605a1a7a909c70c436cdda61363c",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
