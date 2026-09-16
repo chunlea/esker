@@ -565,6 +565,9 @@ struct Gate {
     ///
     /// Always present, never behind a flag: see the note where it is installed.
     profile: Arc<cluster::profile::Profile>,
+    /// The transaction client the node's backend is built on — 0117's stranded-lock fixture drives
+    /// it directly, because a SQL session cannot leave a lock behind.
+    client: Arc<TxnClient>,
 }
 
 struct Node {
@@ -670,7 +673,7 @@ impl Gate {
         .await;
 
         let oracle: Arc<dyn TimestampOracle> = Arc::new(esker_client::WallClockOracle::new());
-        let (inner, conn, fragments) =
+        let (inner, conn, fragments, client) =
             tokio::task::block_in_place(|| sql_node(&addresses, pd_address, Arc::clone(&oracle)));
 
         // **Always wrapped, never behind a flag** (debt #109). A harness with a measured build and
@@ -697,6 +700,7 @@ impl Gate {
             conn,
             fragments,
             profile,
+            client,
         }
     }
 
@@ -1044,7 +1048,12 @@ fn sql_node(
     addresses: &[SocketAddr],
     pd_address: SocketAddr,
     oracle: Arc<dyn TimestampOracle>,
-) -> (Arc<dyn Backend>, Arc<PdConn>, Arc<dyn FragmentSource>) {
+) -> (
+    Arc<dyn Backend>,
+    Arc<PdConn>,
+    Arc<dyn FragmentSource>,
+    Arc<TxnClient>,
+) {
     let stores = TcpStores::connect_all(addresses, TransportConfig::new()).unwrap();
     let conn = Arc::new(PdConn::new(pd_address));
     let router = Arc::new(Router::with_options(
@@ -1074,7 +1083,12 @@ fn sql_node(
         .unwrap();
 
     let fragments: Arc<dyn FragmentSource> = Arc::new(ClientFragments::new(router));
-    (backend, conn, fragments)
+    // **The client comes back too**, for 0117's stranded-lock fixture: a transaction that takes a
+    // Percolator lock and is then abandoned has to be driven through `TxnClient`, because a SQL
+    // session cannot leave one behind — `COMMIT` commits everything and `ROLLBACK` releases
+    // everything. It is the same `Arc` the backend holds, so the fixture's locks and the node's
+    // statements meet in one cluster rather than in two.
+    (backend, conn, fragments, client)
 }
 
 async fn open_store(
@@ -2584,6 +2598,20 @@ struct CountingFragments {
     too_far_behind: AtomicU64,
     not_columnar: AtomicU64,
     unsupported: AtomicU64,
+    /// **One entry per encounter with a lock** — 0117's third question, and the reason this
+    /// wrapper records rather than classifies.
+    ///
+    /// `TooFarBehind` is **not** the unresolved-lock refusal's own reason: #86 reused it on purpose
+    /// (*"`TooFarBehind` and not a reason of its own"*), so a learner that is genuinely behind
+    /// answers the same tag. The only thing that separates them is the detail, which #86 writes as
+    /// *"a transaction at {start_ts} still holds a lock on … in region …"*. The detail is kept
+    /// verbatim here and read by the caller; parsing the key back out of it is **not** possible,
+    /// because `printable` is not reversible.
+    ///
+    /// Recording rather than classifying keeps the forensics where the table is known: this
+    /// wrapper sees a shard, and deriving `(tenant, table_id)` from a shard's start key is a
+    /// guess when the region begins before the table does.
+    encounters: std::sync::Mutex<Vec<(u64, String)>>,
 }
 
 impl CountingFragments {
@@ -2594,6 +2622,7 @@ impl CountingFragments {
             too_far_behind: AtomicU64::new(0),
             not_columnar: AtomicU64::new(0),
             unsupported: AtomicU64::new(0),
+            encounters: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -2612,6 +2641,12 @@ impl CountingFragments {
         self.too_far_behind.store(0, Ordering::Relaxed);
         self.not_columnar.store(0, Ordering::Relaxed);
         self.unsupported.store(0, Ordering::Relaxed);
+        // **Cleared with the counters, not left to accumulate.** A round's encounters belong to
+        // that round: a list that outlived `reset` would let one round's locks be counted in the
+        // next one's ratio, which is the arithmetic this measurement exists to get right.
+        if let Ok(mut met) = self.encounters.lock() {
+            met.clear();
+        }
     }
 }
 
@@ -2635,13 +2670,24 @@ impl FragmentSource for CountingFragments {
     ) -> esker_sql::Result<Answer> {
         self.asked.fetch_add(1, Ordering::Relaxed);
         let answer = self.inner.evaluate(shard, fragment, ts, min_apply_index);
-        if let Ok(Answer::Refused { reason, .. }) = &answer {
+        // **`detail` is bound rather than discarded**, which is the whole of this hook: the counter
+        // above says a fragment was refused, and only the detail says whether a *lock* was what
+        // refused it.
+        if let Ok(Answer::Refused { reason, detail }) = &answer {
             match reason {
                 RefusalReason::TooFarBehind => &self.too_far_behind,
                 RefusalReason::NotColumnar => &self.not_columnar,
                 RefusalReason::Unsupported => &self.unsupported,
             }
             .fetch_add(1, Ordering::Relaxed);
+            // #86's own words, and the one string that tells its refusal from a learner that is
+            // simply behind. Matched on the stable head of the sentence, not on the whole of it:
+            // the tail carries a printed key and a region id that change every time.
+            if *reason == RefusalReason::TooFarBehind && detail.contains("still holds a lock on") {
+                if let Ok(mut met) = self.encounters.lock() {
+                    met.push((ts, detail.clone()));
+                }
+            }
         }
         answer
     }
@@ -2974,6 +3020,113 @@ fn fill_measure_tables(gate: &Gate) {
 /// scans, which is a fact about the writer's shape and not about the system. #88 is about a scan
 /// meeting a lock whose transaction is *still open*, which is what Rails does between its `BEGIN`
 /// and its `COMMIT`.
+/// Leaves **#86's shape** behind the caller: a prewrite over two keys, and then — if asked — a
+/// commit of the **primary alone**, so the secondary's lock stays with nobody coming back for it.
+///
+/// **Why the wire and not the client.** `esker-client`'s `Transaction` does not expose prewrite on
+/// its own; both phases happen inside `commit`, so a transaction driven through it either commits
+/// everything or leaves nothing committed. The store's request API is what separates them, which is
+/// how `joint_gate.rs::strand_a_secondary_lock` builds the same state. This one sends through
+/// [`esker_client::router::Router::call`] rather than copying that file's election-retry helper:
+/// the router already looks up the leader, carries the epoch, retries and re-routes.
+///
+/// **Two arms, one helper.** The lock's life is `ttl_ms`, a field of the prewrite rather than the
+/// client's `LOCK_TTL_MS`, so the caller picks it:
+///
+/// * **stranded** — a short `ttl_ms`, `commit_primary = true`, and the caller waits past the TTL
+///   before reading. Past its lease the lock is *resolvable*, which is what makes the row path roll
+///   it forward and the fragment refuse.
+/// * **alive (the control)** — a long `ttl_ms`, `commit_primary = false`, and the caller reads well
+///   inside the lease. `joint_gate.rs`'s own comment is why the distinction matters: *"a lock still
+///   inside its lease is one the row path waits on rather than rolls forward, and then neither
+///   engine answers and there is nothing to disagree about."*
+///
+/// Answers the `start_ts`, which is how a caller recognises **its own** lock in the forensics
+/// rather than one the fill happened to leave.
+fn strand_a_secondary(
+    gate: &Gate,
+    table_id: u64,
+    primary_id: i64,
+    secondary_id: i64,
+    ttl_ms: u64,
+    commit_primary: bool,
+) -> u64 {
+    let row = |id: i64, note: &str| {
+        esker_keys::row::encode_row(
+            &[
+                esker_keys::value::ColumnType::Int8,
+                esker_keys::value::ColumnType::Int8,
+                esker_keys::value::ColumnType::Text,
+            ],
+            &[
+                esker_keys::value::Datum::Int8(id),
+                esker_keys::value::Datum::Int8(id),
+                esker_keys::value::Datum::Text(note.to_owned()),
+            ],
+        )
+        .expect("a row value")
+    };
+    let key = |id: i64| {
+        Bytes::from(
+            esker_keys::row::row_key(TENANT, table_id, &[esker_keys::value::Datum::Int8(id)])
+                .expect("a row key"),
+        )
+    };
+    let (primary, secondary) = (key(primary_id), key(secondary_id));
+    let router = gate.client.router();
+    let send = |request: esker_proto::txn::TxnKvReq| match router
+        .call(&request.into())
+        .expect("the router answered")
+    {
+        esker_client::wire::Response::TxnKv(answer) => answer,
+        other => panic!("a TxnKv request came back as {other:?}"),
+    };
+
+    let start_ts = gate.oracle.timestamp().expect("a timestamp");
+    let prewritten = send(esker_proto::txn::TxnKvReq::Prewrite {
+        start_ts,
+        primary: primary.clone(),
+        ttl_ms,
+        mutations: vec![
+            esker_proto::txn::TxnMutation::Put {
+                key: primary.clone(),
+                value: Bytes::from(row(primary_id, "primary")),
+                read_ts: None,
+            },
+            esker_proto::txn::TxnMutation::Put {
+                key: secondary.clone(),
+                value: Bytes::from(row(secondary_id, "secondary")),
+                read_ts: None,
+            },
+        ],
+    });
+    assert_eq!(
+        prewritten,
+        esker_proto::txn::TxnKvResp::prewrite_ok(2),
+        "the prewrite this fixture is built on was refused, so no lock was left to find"
+    );
+
+    if commit_primary {
+        let commit_ts = gate.oracle.timestamp().expect("a timestamp");
+        let committed = send(esker_proto::txn::TxnKvReq::Commit {
+            start_ts,
+            commit_ts,
+            keys: vec![primary],
+        });
+        assert!(
+            matches!(
+                committed,
+                esker_proto::txn::TxnKvResp::Commit {
+                    status: esker_proto::txn::TxnStatus::Ok
+                }
+            ),
+            "the primary did not commit, so the secondary is not stranded but merely locked: \
+             {committed:?}"
+        );
+    }
+    start_ts
+}
+
 fn spawn_writer_over(
     gate: &Gate,
     table: &str,
