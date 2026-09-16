@@ -1,0 +1,29 @@
+crates/esker-sql/src/error.rs
+  s_8d3e4c2902bf64::t_a80b6d707b721c 2964-2969
+crates/esker-sql/src/exec/query.rs
+  s_8d3e4c2902bf64::t_6401e6ff2b8ca6 547-554,685-692,709-716,722,738,752,755-757,786-788,934,947,962,970-1014,1020-1028,1036-1041,1096-1108,1114-1121,1124-1125,1128,1131-1137,1147-1152,1155-1156,1160-1161,1165-1176,4167-4184,4565-4584,4631-4638,4783-4793,5589-5714,6231,6296-6304,6315,7177-7180,7312-7332
+crates/esker-sql/tests/corpus/pg19_enum_unknown_literal.txt
+  s_8d3e4c2902bf64::t_fdbe97d0bf8159 1-126
+crates/esker-sql/tests/enum_unknown_literal.rs
+  s_8d3e4c2902bf64::t_74950fa12670b0 1-320
+crates/esker-sql/tests/set_operation_enum.rs
+  s_8d3e4c2902bf64::t_55d52d13138baa 411-414,416-418,421-423
+docs/plans/debts-v1.1.md
+  s_8d3e4c2902bf64::t_74839f93a1bd34 24,111-113,125
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a6d7ba11942133ea6a1c665f0a590007f597991e",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
