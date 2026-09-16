@@ -36,6 +36,8 @@
 )]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod profile;
+
 /// The subscriber, shared with every test binary that includes this harness.
 ///
 /// **Declared once per binary, here.** Clippy's `duplicate_mod` refuses the same file loaded as
