@@ -1,0 +1,29 @@
+crates/esker-client/src/lib.rs
+  s_f4b2852b53accb::t_d085fa7ea01145 57
+crates/esker-client/src/txn.rs
+  s_f4b2852b53accb::t_3e0c1547e6eaed 2506-2571
+crates/esker-client/tests/lock_expiry.rs
+  s_f4b2852b53accb::t_f62b76cbda4978 1-181
+crates/esker-sql/src/bin/esker-sql.rs
+  s_f4b2852b53accb::t_6b63963bb3af85 414-417,419-426,430
+crates/esker-sql/tests/joint_gate.rs
+  s_f4b2852b53accb::t_22fd56560facaa 205-207,321
+crates/esker-sql/tests/routing_differential.rs
+  s_f4b2852b53accb::t_425404dbbeed4b 45,668,1134-1136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2021e5635a18249846c1c9638c688b4a5f64e2d7",
+  "prompts": {},
+  "sessions": {
+    "s_f4b2852b53accb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc7223c3-8ba0-48df-95c8-ddb365dc093c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
