@@ -3083,9 +3083,15 @@ fn median_u64(samples: &[u64]) -> u64 {
 /// columnar replica, the first flush), small enough that three batch sizes fit in minutes.
 const PROBE_ROWS: i64 = 20_000;
 
-/// The batch sizes compared. 500 is what the measurement uses today, and `fill_join_at_scale`'s
-/// precedent before it.
-const PROBE_BATCHES: [usize; 3] = [500, 2_000, 5_000];
+/// The batch sizes, run **forward and then back**: 500, 2000, 5000, 5000, 2000, 500.
+///
+/// The probe's first run could not answer its own question. The three fills shared one cluster and
+/// ran in order, so "a bigger batch is slower" and "a fill into a store that already holds more is
+/// slower" were the same measurement — 657, 406 and 275 rows a second, and no way to say which
+/// effect that was. Giving each batch **two positions symmetric about the middle** separates them:
+/// the store only grows, so a position effect largely cancels in a pair's mean while a batch effect
+/// does not. If the two halves disagree about the ranking, the ranking was never about the batch.
+const PROBE_ORDER: [usize; 6] = [500, 2_000, 5_000, 5_000, 2_000, 500];
 
 /// **What a bigger batch buys the fill** — the number that decides the next window's shape.
 ///
@@ -3094,7 +3100,7 @@ const PROBE_BATCHES: [usize; 3] = [500, 2_000, 5_000];
 /// hour. This times the same 20k rows at three batch sizes rather than refilling 100k three times —
 /// the ratio is the answer, and the ratio is what a fixed row count measures.
 ///
-/// The columnar replica is awaited for every batch afterwards, because a fill so large that the
+/// The columnar replica is awaited for every fill afterwards, because a fill so large that the
 /// replica is only built at the end would not be the same thing under test.
 ///
 /// Prints, and asserts only that every batch finished: a threshold here would be a claim about this
@@ -3105,8 +3111,8 @@ async fn what_a_bigger_batch_buys_the_fill() {
     let gate = Gate::start().await;
     let mut filled: Vec<(usize, Duration)> = Vec::new();
 
-    for batch in PROBE_BATCHES {
-        let table = format!("fill{batch}");
+    for (position, batch) in PROBE_ORDER.into_iter().enumerate() {
+        let table = format!("fill{position}_{batch}");
         let took = tokio::task::block_in_place(|| {
             let mut session = gate.session();
             settle(
@@ -3135,22 +3141,30 @@ async fn what_a_bigger_batch_buys_the_fill() {
             .checked_div(i64::try_from(took.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
         println!(
-            "batch {batch:<6} {PROBE_ROWS} rows in {took:?}  ({}.{} rows/s)",
+            "position {position} batch {batch:<6} {PROBE_ROWS} rows in {took:?}  ({}.{} rows/s)",
             tenths / 10,
             tenths % 10
         );
         filled.push((batch, took));
     }
 
-    for batch in PROBE_BATCHES {
-        gate.wait_for_a_learner_that_answers(&format!("fill{batch}"))
+    // The pair means are the comparison the design exists for: same batch, symmetric positions.
+    for batch in [500_usize, 2_000, 5_000] {
+        let pair: Vec<Duration> = filled
+            .iter()
+            .filter(|(b, _)| *b == batch)
+            .map(|(_, took)| *took)
+            .collect();
+        let total: Duration = pair.iter().sum();
+        let mean = total / u32::try_from(pair.len().max(1)).unwrap_or(1);
+        println!("batch {batch:<6} mean over its two positions: {mean:?}  (samples {pair:?})");
+    }
+
+    for (position, batch) in PROBE_ORDER.into_iter().enumerate() {
+        gate.wait_for_a_learner_that_answers(&format!("fill{position}_{batch}"))
             .await;
     }
-    println!("every batch's columnar learner answered");
+    println!("every fill's columnar learner answered");
 
-    assert_eq!(
-        filled.len(),
-        PROBE_BATCHES.len(),
-        "a batch did not finish its fill"
-    );
+    assert_eq!(filled.len(), PROBE_ORDER.len(), "a fill did not finish");
 }
