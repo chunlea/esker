@@ -1,0 +1,19 @@
+crates/esker-sql/src/exec/query.rs
+  s_f4b2852b53accb::t_23d0a9faf12d32 547-554,685-692,709-716,722,752,755-785,814-816,1003-1011,1019-1024,4719-4729,6151,6229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6c37caffcaeb074c33c35f68ba26dd4646f098ff",
+  "prompts": {},
+  "sessions": {
+    "s_f4b2852b53accb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc7223c3-8ba0-48df-95c8-ddb365dc093c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
