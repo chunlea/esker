@@ -69,6 +69,20 @@ node uses its wall clock for ordering, and this does not break it: `Versions` is
 oracle's stand-in, and reading the clock is what an oracle is for"*. The single-node oracle is the
 same object for the real backend, so it reads the clock the same way and carries the same sentence.
 
+**This object already exists — twice.** `crates/esker-sql/tests/joint_gate.rs` and
+`crates/esker-sql/tests/routing_differential.rs` each define a private `WallClockOracle` with the
+same body: Unix milliseconds from `SystemTime::now()`, `issued = max(next, ms << TSO_LOGICAL_BITS)`,
+`next = issued + count`, behind a `Mutex<u64>`. Each carries a doc comment that states this ADR's
+context in its own words — *"`CountingOracle` cannot be used here, and the reason is lock expiry …
+under a plain counter that half is zero and stays zero"* — and each was written because its own test
+strands a lock. Two tests arriving independently at the same object is the strongest evidence this
+ADR has that the shape is right.
+
+So (a) is **not a design but a promotion**: move that oracle into `esker-client` beside
+`CountingOracle`, use it in the binary's no-`--pd` arm, and let both tests take the promoted one.
+That also removes a duplicated implementation — two copies of one rule that can drift apart, which
+is what a third caller would copy next.
+
 * **No new crate edge**: `esker-sql` links `esker-client` today.
 * **No format change and no wire change**: a timestamp is a `u64` everywhere it is written or sent;
   only which numbers get minted changes.
@@ -105,10 +119,10 @@ until the data directory is cleared.
 
 ## Recommendation
 
-**(a)**, with the monotonicity question answered rather than left open: mint from a wall-clock
-reading with `Versions`' in-process rule — the mark is the greater of the last timestamp and the
-clock — and keep that mark beside the node's data when there is a directory to keep it in, as PD
-does. It is the only option that changes no format, no wire and no crate graph, and it makes
+**(a)**, as a promotion rather than a design: take the `WallClockOracle` the tests already wrote,
+put it in `esker-client` beside `CountingOracle`, and use it where the binary has no driver to ask.
+Its rule is `Versions`' in-process one — the mark is the greater of the last timestamp and the clock
+— and the mark belongs beside the node's data when there is a directory to keep it in, as PD does. It is the only option that changes no format, no wire and no crate graph, and it makes
 `is_expired` mean what it says in every mode the binary offers.
 
 (b) is the better engineering if the edge is acceptable — it reuses rules that are already
