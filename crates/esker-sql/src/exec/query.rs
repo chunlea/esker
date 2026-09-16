@@ -666,6 +666,11 @@ pub(super) fn matching_rows_as(
 /// * and an **unknown literal** is neither: it takes the other arm's type and then fails to parse
 ///   as it, which is why `SELECT 1 UNION ALL SELECT 'abc'` is `22P02 invalid input syntax for type
 ///   integer` — decided in the lowering, where a literal still is one.
+// **Over clippy's line limit by three, and suppressed rather than split.** #105 added the
+// operator word to three refusals inside this function; `refusal_word` above took the
+// computation out and it is still three lines over. Splitting the last loop out needs the
+// element type of `columns` named in a signature, which is a change this unit did not measure.
+#[allow(clippy::too_many_lines)]
 pub(super) fn append(
     select: &Select,
     arms: Vec<(Option<(crate::plan::SetOp, bool)>, Planned)>,
@@ -759,7 +764,28 @@ pub(super) fn append(
     // **An unknown arm beside an enum is read as one of its labels** (#81), resolved here because
     // this is where the set's `user_type` says which enum, and projected below.
     let constants = unknown_arms_as_labels(&columns, &arm_types, &arm_unknown, &arm_unknown_text)?;
-    every_arm_reaches(&columns, &arm_types, &arm_unknown, op_word)?;
+    // **Every arm has to reach the type the set settled on, by an implicit cast**: agreeing on a
+    // category is not enough. `money` beside `numeric` is one category with no implicit cast either
+    // way, which a real server refuses as `42846 UNION could not convert type numeric to money` —
+    // a different sentence from the categories' `42804`, measured beside it.
+    for (types, unknown) in arm_types.iter().zip(&arm_unknown) {
+        for (at, from) in types.iter().enumerate() {
+            // An unknown literal is **read as** the settled type rather than converted to it, so
+            // there is no implicit cast to require: `'abc'` reaching an `integer` is a `22P02`
+            // about the value and never a `42846` about the types (#75).
+            if unknown.get(at).copied().unwrap_or(false) {
+                continue;
+            }
+            let to = columns[at].ty;
+            if !reaches_implicitly(*from, to) {
+                return Err(SqlError::SetOperationCannotConvert {
+                    op: op_word,
+                    from: from.name().to_owned(),
+                    to: to.name().to_owned(),
+                });
+            }
+        }
+    }
     // **Unifying the declared type is only half of it: the values have to follow.** An arm that
     // produced an `int4` where the set is a `bigint` would answer rows of two different types
     // under one column — `pg_typeof` reads the value, and a client binding by the declared type
@@ -819,42 +845,6 @@ fn refusal_word(ops: &[Option<(crate::plan::SetOp, bool)>]) -> &'static str {
         .map(|(op, _)| op.name())
         .next()
         .unwrap_or("UNION")
-}
-
-/// **Every arm has to reach the type the set settled on, by an implicit cast** — agreeing on a
-/// category is not enough.
-///
-/// `money` beside `numeric` is one category with no implicit cast either way, which a real server
-/// refuses as `42846 UNION could not convert type numeric to money` — a different sentence from the
-/// categories' `42804`, measured beside it.
-///
-/// An **unknown literal** is read *as* the settled type rather than converted to it, so there is no
-/// implicit cast to require: `'abc'` reaching an `integer` is a `22P02` about the value and never a
-/// `42846` about the types (`debts-v1.1.md` #75). That is why `arm_unknown` is a parameter and not
-/// something this could recompute — by the time the arms are planned the literal is already a
-/// `text`.
-fn every_arm_reaches(
-    columns: &[OutputColumn],
-    arm_types: &[Vec<ColumnType>],
-    arm_unknown: &[Vec<bool>],
-    op_word: &'static str,
-) -> Result<()> {
-    for (types, unknown) in arm_types.iter().zip(arm_unknown) {
-        for (at, from) in types.iter().enumerate() {
-            if unknown.get(at).copied().unwrap_or(false) {
-                continue;
-            }
-            let to = columns[at].ty;
-            if !reaches_implicitly(*from, to) {
-                return Err(SqlError::SetOperationCannotConvert {
-                    op: op_word,
-                    from: from.name().to_owned(),
-                    to: to.name().to_owned(),
-                });
-            }
-        }
-    }
-    Ok(())
 }
 
 /// An `ORDER BY` written after the last arm, resolved against the set's output columns.
