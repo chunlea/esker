@@ -7177,25 +7177,6 @@ fn pg_typeof_of(expr: &Expr, scope: &Scope<'_>) -> Result<Datum> {
     // **The same question `OutputColumn::user_type` answers**, asked of the expression and not only
     // of a position: a `CASE` or a `COALESCE` over an enum is that enum here too (#81), and the two
     // readers cannot disagree because they are one function.
-    if let Some(def) = branch_user_type(expr, scope) {
-        return Ok(Datum::RegType {
-            oid: u32::try_from(def.oid).unwrap_or(0),
-            // **The stored name as a sentence spells it**, which is a NUL apart from what it
-            // holds: a type in a schema is `schema ++ NUL ++ name` on disk, and `pg_typeof` was
-            // handing that byte to a client — `s\0dom_probe` where a real server says
-            // `s.dom_probe`. `format_type` had it right one screen away, which is how it was
-            // found — and it is `information_schema.sql_identifier` that needs it, since every
-            // column of those views is a domain now (ADR 0103).
-            //
-            // **Qualified for anything outside `public`**, which is `qualify`'s rule read back
-            // and not quite PostgreSQL's: a real server qualifies a type that is not in the
-            // *session's* search path, so a schema a client has put on its path prints bare there
-            // and qualified here. `exec::cursor`'s `type_qualified_for` asks the session and is
-            // the right answer; this function has no `Settings` to ask, and the narrower
-            // divergence is not the one that was putting a NUL on the wire.
-            name: crate::catalog::display_name(&def.name).into(),
-        });
-    }
     // **An `array_agg` over a user type answers an array *of* it** — `d[]`, and not the
     // base's `text[]`. Measured on 19beta1 (`esker-coord/s2-h106.out`): over a domain column
     // `pg_typeof(array_agg(s))` is `h106d[]` while `pg_typeof(min(s))` is `text`, because that
@@ -7214,6 +7195,25 @@ fn pg_typeof_of(expr: &Expr, scope: &Scope<'_>) -> Result<Datum> {
         return Ok(Datum::RegType {
             oid: u32::try_from(def.oid + 1).unwrap_or(0),
             name: format!("{}[]", crate::catalog::display_name(&def.name)).into(),
+        });
+    }
+    if let Some(def) = branch_user_type(expr, scope) {
+        return Ok(Datum::RegType {
+            oid: u32::try_from(def.oid).unwrap_or(0),
+            // **The stored name as a sentence spells it**, which is a NUL apart from what it
+            // holds: a type in a schema is `schema ++ NUL ++ name` on disk, and `pg_typeof` was
+            // handing that byte to a client — `s\0dom_probe` where a real server says
+            // `s.dom_probe`. `format_type` had it right one screen away, which is how it was
+            // found — and it is `information_schema.sql_identifier` that needs it, since every
+            // column of those views is a domain now (ADR 0103).
+            //
+            // **Qualified for anything outside `public`**, which is `qualify`'s rule read back
+            // and not quite PostgreSQL's: a real server qualifies a type that is not in the
+            // *session's* search path, so a schema a client has put on its path prints bare there
+            // and qualified here. `exec::cursor`'s `type_qualified_for` asks the session and is
+            // the right answer; this function has no `Settings` to ask, and the narrower
+            // divergence is not the one that was putting a NUL on the wire.
+            name: crate::catalog::display_name(&def.name).into(),
         });
     }
     Ok(crate::value::regtype_of_oid(expr_type(expr, scope)?.oid()))

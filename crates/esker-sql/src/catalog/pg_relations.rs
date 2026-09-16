@@ -275,6 +275,32 @@ impl Relations {
         self.user_types.get(&oid).map(|def| def.name.as_str())
     }
 
+    /// The user-defined type with this oid **or the array of one**, as `format_type` prints it.
+    ///
+    /// Separate from [`Self::user_type_name`], which answers a narrower question and still answers
+    /// it correctly: an oid that is a *type's* is that type's name. This one is what `format_type`
+    /// needs, because `pg_type` carries a row for the array too — `exec::typedef` allocates its id
+    /// as the type's plus one when `CREATE TYPE` runs, and `pg_catalog::user_type_rows` publishes
+    /// it as `_{name}` with `typelem` pointing back. Nothing could name that oid, so an oid this
+    /// node had itself handed out printed as its own digits.
+    ///
+    /// **The brackets go on the stored name, before qualification.** A type in a schema is stored
+    /// `schema ++ NUL ++ name` and `exec::cursor::type_qualified_for` splits on that separator, so
+    /// `schema\0d` becomes `schema\0d[]` and qualifies to `schema.d[]`. Bracketing the qualified
+    /// form would put them on the wrong side of the dot.
+    ///
+    /// Measured on 19beta1 (`esker-coord/s2-h106b.out`), over a domain and an enum alike:
+    /// `format_type(t.oid, NULL)` is `d` and `format_type(t.typarray, NULL)` is `d[]`, while the
+    /// array row's `typname` is `_d` — the stored name and the printed form are not the same thing.
+    #[must_use]
+    pub fn user_type_name_or_array(&self, oid: u64) -> Option<String> {
+        if let Some(def) = self.user_types.get(&oid) {
+            return Some(def.name.clone());
+        }
+        let element = self.user_types.get(&oid.checked_sub(1)?)?;
+        Some(format!("{}[]", element.name))
+    }
+
     /// The user-defined type of this **name**, or `None` — the reverse of
     /// [`Self::user_type_name`].
     ///

@@ -4194,8 +4194,11 @@ fn catalog_function(
                     // `user_type_name` cannot see them, and `pg_attribute.atttypid` reports one
                     // for every `information_schema` column (ADR 0103). Without this arm the
                     // catalog printed `???` for the oids it had itself just handed out.
-                    let named = env.relations()?.user_type_name(oid).map_or_else(
-                        || crate::catalog::pg_catalog::information_schema_domain_name(oid),
+                    let named = env.relations()?.user_type_name_or_array(oid).map_or_else(
+                        || {
+                            crate::catalog::pg_catalog::information_schema_domain_name(oid)
+                                .map(str::to_owned)
+                        },
                         Some,
                     );
                     match named {
@@ -4203,7 +4206,7 @@ fn catalog_function(
                         // `schema ++ NUL ++ name` (`catalog::SCHEMA_SEPARATOR`), and printing it
                         // raw put a NUL on the wire where PostgreSQL writes a dot — measured,
                         // `ds_s.ds`.
-                        Some(name) => Datum::Text(type_qualified_for(env.settings, name)),
+                        Some(name) => Datum::Text(type_qualified_for(env.settings, &name)),
                         None => built_in,
                     }
                 }
