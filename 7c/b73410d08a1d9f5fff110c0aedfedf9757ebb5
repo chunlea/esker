@@ -1,0 +1,23 @@
+crates/esker-sql/tests/corpus/pg19_set_operators.txt
+  s_4b81579bfe1fd8::t_e136c86ba76b0d 1-47
+crates/esker-sql/tests/lowering.rs
+  s_4b81579bfe1fd8::t_2d584401eb6b17 20,564-621
+crates/esker-sql/tests/set_operators.rs
+  s_4b81579bfe1fd8::t_968abb003e2458 1-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7cb73410d08a1d9f5fff110c0aedfedf9757ebb5",
+  "prompts": {},
+  "sessions": {
+    "s_4b81579bfe1fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8c0cc5a0-66ea-4c9a-b236-65a4db61ae34",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
