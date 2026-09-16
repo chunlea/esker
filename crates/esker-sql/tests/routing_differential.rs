@@ -1044,16 +1044,21 @@ impl Gate {
 /// **`PdConn` is the resolver**, which is the piece milestone 4 added: a static routing table
 /// cannot answer "which peer is the columnar learner", because a learner joins through a conf
 /// change after the table was written down.
-fn sql_node(
-    addresses: &[SocketAddr],
-    pd_address: SocketAddr,
-    oracle: Arc<dyn TimestampOracle>,
-) -> (
+/// What [`sql_node`] hands back: the backend a session runs on, the placement driver's connection,
+/// the fragment source, and the transaction client — the last for fixtures that have to speak the
+/// wire directly, which a SQL session cannot do.
+type SqlNode = (
     Arc<dyn Backend>,
     Arc<PdConn>,
     Arc<dyn FragmentSource>,
     Arc<TxnClient>,
-) {
+);
+
+fn sql_node(
+    addresses: &[SocketAddr],
+    pd_address: SocketAddr,
+    oracle: Arc<dyn TimestampOracle>,
+) -> SqlNode {
     let stores = TcpStores::connect_all(addresses, TransportConfig::new()).unwrap();
     let conn = Arc::new(PdConn::new(pd_address));
     let router = Arc::new(Router::with_options(
@@ -1071,7 +1076,7 @@ fn sql_node(
 
     let lease = Arc::new(PdLease::new());
     let backend: Arc<dyn Backend> = Arc::new(
-        esker_sql::backend::StoreBackend::new(client, oracle)
+        esker_sql::backend::StoreBackend::new(Arc::clone(&client), oracle)
             .with_schema_lease(Arc::clone(&lease) as Arc<dyn SchemaLeaseSource>),
     );
     let refresher = LeaseRefresher::new(Arc::clone(&conn), lease)
@@ -2604,7 +2609,7 @@ struct CountingFragments {
     /// `TooFarBehind` is **not** the unresolved-lock refusal's own reason: #86 reused it on purpose
     /// (*"`TooFarBehind` and not a reason of its own"*), so a learner that is genuinely behind
     /// answers the same tag. The only thing that separates them is the detail, which #86 writes as
-    /// *"a transaction at {start_ts} still holds a lock on … in region …"*. The detail is kept
+    /// *"a transaction at `{start_ts}` still holds a lock on … in region …"*. The detail is kept
     /// verbatim here and read by the caller; parsing the key back out of it is **not** possible,
     /// because `printable` is not reversible.
     ///
@@ -2683,10 +2688,11 @@ impl FragmentSource for CountingFragments {
             // #86's own words, and the one string that tells its refusal from a learner that is
             // simply behind. Matched on the stable head of the sentence, not on the whole of it:
             // the tail carries a printed key and a region id that change every time.
-            if *reason == RefusalReason::TooFarBehind && detail.contains("still holds a lock on") {
-                if let Ok(mut met) = self.encounters.lock() {
-                    met.push((ts, detail.clone()));
-                }
+            if *reason == RefusalReason::TooFarBehind
+                && detail.contains("still holds a lock on")
+                && let Ok(mut met) = self.encounters.lock()
+            {
+                met.push((ts, detail.clone()));
             }
         }
         answer
@@ -3067,7 +3073,7 @@ fn strand_a_secondary(
         .expect("a row value")
     };
     let key = |id: i64| {
-        Bytes::from(
+        bytes::Bytes::from(
             esker_keys::row::row_key(TENANT, table_id, &[esker_keys::value::Datum::Int8(id)])
                 .expect("a row key"),
         )
@@ -3090,12 +3096,12 @@ fn strand_a_secondary(
         mutations: vec![
             esker_proto::txn::TxnMutation::Put {
                 key: primary.clone(),
-                value: Bytes::from(row(primary_id, "primary")),
+                value: bytes::Bytes::from(row(primary_id, "primary")),
                 read_ts: None,
             },
             esker_proto::txn::TxnMutation::Put {
                 key: secondary.clone(),
-                value: Bytes::from(row(secondary_id, "secondary")),
+                value: bytes::Bytes::from(row(secondary_id, "secondary")),
                 read_ts: None,
             },
         ],
@@ -3867,6 +3873,244 @@ async fn what_an_insert_spends_its_time_on_as_the_table_grows() {
     assert!(
         !tiers.is_empty(),
         "no tier ran, so there is nothing to report"
+    );
+}
+
+/// Rows the ratio measurement fills before it strands anything. Small on purpose: the question is
+/// about locks, and every second spent filling is a second not spent meeting them.
+const RATIO_ROWS: i64 = 2_000;
+/// Scans per arm.
+const RATIO_SCANS: usize = 60;
+/// The stranded arm's lease, `joint_gate.rs`'s number. Short, because the arm waits it out.
+const STRANDED_TTL_MS: u64 = 300;
+/// The control arm's lease. Long enough that every read in this test lands **inside** it, which is
+/// what makes the lock read as alive rather than as stranded.
+///
+/// **Ten minutes, and the first number was sixty seconds, which was wrong.** The control plants its
+/// lock and *then* scans sixty times; that loop took most of a minute, so the lease expired inside
+/// it and the census read the control's own lock as `expired 35 ms ago` with `ttl_ms=60000` beside
+/// it. The arithmetic was right — `physical_ms` is applied to both sides — and the fixture's
+/// parameter was wrong. The lease has to outlast the arm that reads it.
+const ALIVE_TTL_MS: u64 = 600_000;
+/// Encounters below which a share is not reported (pre-registered in `q117-ratio-design.md` §④).
+const RATIO_FLOOR: usize = 20;
+
+/// One arm's tally: how each lock **this fixture planted** was classified when a fragment met it.
+#[derive(Debug, Default)]
+struct Verdicts {
+    alive: usize,
+    stranded: usize,
+    replaced: usize,
+    gone: usize,
+    /// Refusals whose detail names a lock, i.e. #86's check firing.
+    blocked: usize,
+    /// Refusals that carried `TooFarBehind` for the other reason — a learner simply behind.
+    behind: usize,
+    scans: usize,
+}
+
+/// Scans `table` `scans` times, draining the encounters **after every scan**.
+///
+/// **Not [`scan_a_table_n`]**, and the difference is the whole point: that one calls
+/// `counted.reset()` at the top of each scan, and `reset` now clears `encounters` — so reusing it
+/// would throw every sample away between scans. That is exactly the shape #107 lost a window to,
+/// where the discriminator was collected and then discarded before it was read.
+fn scan_and_collect(
+    gate: &Gate,
+    counted: &Arc<CountingFragments>,
+    table: &str,
+    table_id: u64,
+    scans: usize,
+    tally: &mut Verdicts,
+    at_first_encounter: &mut Option<Vec<StrandedLock>>,
+) {
+    let mut session = gate.session_asking(Arc::clone(counted) as Arc<dyn FragmentSource>);
+    for _ in 0..scans {
+        counted.reset();
+        let _ = session.run(&format!("SELECT count(*) FROM {table}"));
+        tally.scans += 1;
+        let (_, too_far, _, _) = counted.taken();
+        // **This scan's count, not the running one.** `too_far` is per scan, because `reset` runs
+        // at the top of the loop; subtracting the cumulative total from it would drive the other
+        // tally negative and `saturating_sub` would hide that as a zero.
+        let drained = match counted.encounters.lock() {
+            Ok(mut met) => {
+                let n = met.len();
+                met.clear();
+                n
+            }
+            Err(_) => 0,
+        };
+        tally.blocked += drained;
+        // A `TooFarBehind` that named no lock is the other cause sharing the tag.
+        tally.behind += usize::try_from(too_far)
+            .unwrap_or(0)
+            .saturating_sub(drained);
+        // **The first look is taken here, at the encounter, not after the arm.** The first run of
+        // this test classified nothing at all — four zeroes in both arms — because it sampled once
+        // the sixty scans were done, and by then the row path had had sixty chances to roll the
+        // planted lock forward. `report_stranded` prints a line per lock and nothing for an empty
+        // census, so the silence in that log was an absence of locks rather than a failure to
+        // match them. The design said "forensics at the encounter"; this is the line that was
+        // missing.
+        if drained > 0 && at_first_encounter.is_none() {
+            *at_first_encounter = Some(gate.sample_locks(table, table_id, "at the encounter"));
+        }
+    }
+}
+
+/// Classifies the locks this fixture planted, by taking two looks a fraction of `ttl_ms` apart.
+///
+/// **The interval is the arm's own `ttl_ms`, not a lease of the client's.** Nothing heartbeats
+/// here: the control arm is alive because it is *inside* the lease it chose, so a second look a
+/// full `LOCK_TTL_MS` later would find it expired and call it stranded — and the pre-registered
+/// reading treats a control that is not `ALIVE` as a broken classifier.
+fn classify_planted(
+    gate: &Gate,
+    table: &str,
+    table_id: u64,
+    planted: u64,
+    gap: Duration,
+    tally: &mut Verdicts,
+    first: &[StrandedLock],
+) {
+    std::thread::sleep(gap);
+    let second = gate.sample_locks(table, table_id, "second");
+    for before in first.iter().filter(|lock| lock.start_ts == planted) {
+        let same = |later: &&StrandedLock| later.at == before.at && later.key == before.key;
+        match second.iter().find(same) {
+            None => tally.gone += 1,
+            Some(later) if later.start_ts != before.start_ts => tally.replaced += 1,
+            Some(later) if later.expired_by_ms.is_some() => tally.stranded += 1,
+            Some(_) => tally.alive += 1,
+        }
+    }
+}
+
+/// **What share of the locks a fragment meets belong to a transaction that is already finished** —
+/// ADR 0117's third question, and the number that decides whether (b′)+(c) is worth building.
+///
+/// Two arms from one helper, as `q117-ratio-design.md` §① sets out: a **stranded** arm whose
+/// primary is committed and whose secondary's lock is past its lease, and an **alive** control
+/// whose lease is long and whose commit never comes. The control is not decoration — a rig that
+/// can only produce `STRANDED` cannot show that it recognises `ALIVE`, and §④ says a control that
+/// is not classified alive voids the round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "0117's ratio: a real cluster, planted locks, and a few minutes"]
+async fn what_share_of_met_locks_are_already_finished() {
+    let began = Instant::now();
+    let gate = Gate::start().await;
+    let fill = gate.fill_one_at_scale("t", RATIO_ROWS).await;
+    let table_id = tokio::task::block_in_place(|| gate.table_id("t")).expect("the table has an id");
+    let counted = Arc::new(CountingFragments::new(Arc::clone(&gate.fragments)));
+    println!("\n0117 ratio: {RATIO_ROWS} rows filled in {fill:?}, table {table_id}");
+
+    // **The stranded arm.** Commit the primary, leave the secondary, and wait past the lease: a
+    // lock inside its lease is one the row path waits on rather than rolls forward, and then
+    // neither engine answers and there is nothing to disagree about (`joint_gate.rs`).
+    let mut stranded = Verdicts::default();
+    let planted = tokio::task::block_in_place(|| {
+        strand_a_secondary(
+            &gate,
+            table_id,
+            RATIO_ROWS + 1,
+            RATIO_ROWS + 2,
+            STRANDED_TTL_MS,
+            true,
+        )
+    });
+    std::thread::sleep(Duration::from_millis(STRANDED_TTL_MS * 4));
+    tokio::task::block_in_place(|| {
+        let mut met_at = None;
+        scan_and_collect(
+            &gate,
+            &counted,
+            "t",
+            table_id,
+            RATIO_SCANS,
+            &mut stranded,
+            &mut met_at,
+        );
+        classify_planted(
+            &gate,
+            "t",
+            table_id,
+            planted,
+            Duration::from_millis(STRANDED_TTL_MS),
+            &mut stranded,
+            met_at.as_deref().unwrap_or(&[]),
+        );
+    });
+    print_verdicts("stranded", &stranded);
+
+    // **The control.** A long lease and no commit at all, read well inside it.
+    let mut alive = Verdicts::default();
+    let held = tokio::task::block_in_place(|| {
+        strand_a_secondary(
+            &gate,
+            table_id,
+            RATIO_ROWS + 3,
+            RATIO_ROWS + 4,
+            ALIVE_TTL_MS,
+            false,
+        )
+    });
+    tokio::task::block_in_place(|| {
+        let mut met_at = None;
+        scan_and_collect(
+            &gate,
+            &counted,
+            "t",
+            table_id,
+            RATIO_SCANS,
+            &mut alive,
+            &mut met_at,
+        );
+        classify_planted(
+            &gate,
+            "t",
+            table_id,
+            held,
+            Duration::from_millis(500),
+            &mut alive,
+            met_at.as_deref().unwrap_or(&[]),
+        );
+    });
+    print_verdicts("alive (control)", &alive);
+
+    let met = stranded.blocked + alive.blocked;
+    println!(
+        "\n0117: {met} encounters over {} scans in {:?}",
+        stranded.scans + alive.scans,
+        began.elapsed()
+    );
+    if met < RATIO_FLOOR {
+        println!(
+            "**sample too small**: {met} encounters is under the pre-registered floor of \
+             {RATIO_FLOOR}. Raw counts above; **no share is reported and nothing is extrapolated**, \
+             and this neither confirms nor refutes #88's one-in-30, whose workload is not this one."
+        );
+    }
+    assert!(
+        alive.alive > 0 || alive.blocked == 0,
+        "the control's lock was planted with a {ALIVE_TTL_MS} ms lease and read inside it, so a \
+         classifier that did not call it alive is the thing to fix before any share is believed: \
+         {alive:?}"
+    );
+    gate.stop().await;
+}
+
+/// One arm's line, counts first and shares only where the floor allows.
+fn print_verdicts(arm: &str, tally: &Verdicts) {
+    println!(
+        "  {arm:<16} scans {} | met {} | behind {} | ALIVE {} STRANDED {} replaced {} gone {}",
+        tally.scans,
+        tally.blocked,
+        tally.behind,
+        tally.alive,
+        tally.stranded,
+        tally.replaced,
+        tally.gone
     );
 }
 
