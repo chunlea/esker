@@ -171,7 +171,10 @@ fn run_staged(depth: usize, stack: usize) -> Vec<String> {
 /// the one that should be speaking.
 #[test]
 fn which_step_dies_on_a_worker_stack() {
-    // The sized thread `value::tsquery` hands a deep value to: MAX_VALUE_DEPTH * 4 KiB + 4 MiB.
+    // The sized thread `value::tsquery` hands a deep value to: MAX_VALUE_DEPTH * 12 KiB + 4 MiB.
+    // **Copied rather than derived**, because `DEEP_VALUE_STACK_BYTES` is private to `value`. That
+    // is why this figure drifts from the constant whenever the per-level cost moves; it drifted
+    // once already, and the comment said 4 KiB while the line below said 12.
     let deep_stack = 10_000 * 12 * 1024 + 4 * 1024 * 1024;
     for stack in [WORKER_STACK_BYTES, deep_stack] {
         for depth in [1_000, 5_000, 10_000] {
@@ -366,11 +369,10 @@ fn a_value_postgresql_19_answers_is_answered_here() {
 /// `crate::error::` path prefixes back into `value::on_a_deep_stack` — a change clippy asks to
 /// remove and which cannot alter a stack — took the same file from three reds to 6/6 green. A path
 /// prefix does not change a stack size, and these probes sit near the margin (a tsquery level is
-/// five frames and the 121 MiB thread was sized from a bracket that may be optimistic), so
+/// five frames and the 124 MiB thread was sized from a bracket that may be optimistic), so
 /// **flakiness at the edge explains the evidence just as well**. Separating them is a few runs of
 /// each form, not an argument, and until that is done nothing here is attributed.
 #[test]
-#[ignore = "#101's tsquery half is unpaid: ten thousand levels kill the child, parallel and serial"]
 fn a_deep_tsquery_is_refused_and_never_kills_the_child() {
     assert!(
         run_probe(10_000, "tsquery").is_some(),
