@@ -1,0 +1,19 @@
+docs/adr/0119-a-statements-bound-travels-with-its-read-and-says-which-bound-it-is.md
+  s_8d3e4c2902bf64::t_efdb2c3b7e852b 1-186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3d9b92f50894b3c0a187511019cb2114bb7592dd",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
