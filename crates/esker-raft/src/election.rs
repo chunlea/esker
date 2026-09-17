@@ -334,4 +334,6 @@ impl<S: LogStorage> Raft<S> {
 }
 
 #[cfg(test)]
+mod churn;
+#[cfg(test)]
 mod tests;
