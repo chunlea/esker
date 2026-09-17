@@ -951,13 +951,27 @@ pub(crate) fn printable(key: &[u8]) -> String {
 ///
 /// Cheap by shape: the `lock` family holds one entry per key with an *unfinished* transaction on
 /// it, so this walk is over the cluster's in-flight writes in this range and not over its data.
+/// What [`unresolved_lock`] stopped at: the key, and **the lock's own terms**.
+///
+/// `ttl_ms` is this lock's, not the default: it is a parameter of `Prewrite`, so a judge that used
+/// `esker_txn::LOCK_TTL_MS` would be a proxy. The record is decoded here anyway — carrying two more
+/// fields out of it costs no read and no decode.
+pub(crate) struct UnresolvedLock {
+    /// The user key the walk stopped at.
+    pub key: Vec<u8>,
+    /// The transaction holding it.
+    pub start_ts: u64,
+    /// How long that lock lives without a heartbeat, from `start_ts`'s physical part.
+    pub ttl_ms: u64,
+}
+
 pub(crate) fn unresolved_lock(
     db: &Db,
     ts: u64,
     tenant: u64,
     table_id: u64,
     region: &(Vec<u8>, Vec<u8>),
-) -> Result<Option<(Vec<u8>, u64)>> {
+) -> Result<Option<UnresolvedLock>> {
     let (table_start, table_end) = esker_keys::row::table_row_range(tenant, table_id);
     let (start, end) = intersect(&table_start, &table_end, region);
     if start >= end {
@@ -975,7 +989,11 @@ pub(crate) fn unresolved_lock(
         let lock = LockRecord::decode(iter.value())
             .map_err(|error| bootstrap(&format!("a lock record: {error}")))?;
         if lock.start_ts <= ts && lock.kind != Kind::Lock {
-            return Ok(Some((user_key, lock.start_ts)));
+            return Ok(Some(UnresolvedLock {
+                key: user_key,
+                start_ts: lock.start_ts,
+                ttl_ms: lock.ttl_ms,
+            }));
         }
         iter.next();
     }

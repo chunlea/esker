@@ -57,6 +57,7 @@ pub mod heartbeat;
 // the snapshot, the reclaim and the split so there is one mapping rather than three. The module's
 // own `//!` docs say the rest; a `///` here would collide with them.
 mod keyspace;
+pub mod lock_stats;
 pub mod meta;
 pub mod pd;
 pub mod pd_remote;

@@ -4255,6 +4255,139 @@ fn classify_planted(
     }
 }
 
+/// **The counter of [ADR 0118] counts the encounters it is given, and no others.**
+///
+/// **This one is not `#[ignore]`d, and that is deliberate**: it is an assertion, not a measurement,
+/// and it is the only thing that will notice when the counter stops counting — which ADR 0118 §⑤
+/// calls the difference between a counter and a decoration. It starts a cluster, as
+/// `joint_gate.rs` already does in the gate. The only clock in it is a **readiness wait**: a lock
+/// past its lease stays past it, so sleeping four times a 300 ms TTL waits for a state that is
+/// monotone once reached, and asserts nothing about how long anything took.
+///
+/// Three steps, each an equality rather than a `> 0`, because a counter wired to the wrong door
+/// also passes `> 0`:
+///
+/// 1. a lock past the lease it asked for, scanned once — `expired` is one higher;
+/// 2. a lock well inside a long lease, scanned once — `alive` is one higher;
+/// 3. nothing planted, scanned again — **both stand still**, which is the only guard against a
+///    counter that is counting somebody else's locks.
+///
+/// **Increments, not absolutes**: this fixture runs four stores in one process and they share the
+/// counter's statics, where production runs one store per process (`esker_store::lock_stats`).
+///
+/// One scan meets one refusal: `unresolved_lock` returns the first lock it finds and stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lock_encounter_counter_counts_what_it_is_given() {
+    const BASE: i64 = RATIO_ROWS + 7_000_001;
+    /// Long enough that a fragment meets the lock **inside** its lease, short enough that the row
+    /// path's wait on it ends on its own. Step 2 says why both halves matter, and why the margin
+    /// is this wide.
+    const BRIEFLY_ALIVE_TTL_MS: u64 = 10_000;
+    let gate = Gate::start().await;
+    let fill = gate.fill_one_at_scale("t", RATIO_ROWS).await;
+    let table_id = tokio::task::block_in_place(|| gate.table_id("t")).expect("the table has an id");
+    let counted = Arc::new(CountingFragments::new(Arc::clone(&gate.fragments)));
+    println!("\n0118 counter: {RATIO_ROWS} rows filled in {fill:?}, table {table_id}");
+
+    // 1. Past its lease. The primary commits, so nothing will come back to clear this secondary.
+    let before = esker_store::lock_stats::lock_encounters();
+    tokio::task::block_in_place(|| {
+        strand_a_secondary(
+            gate.client.router(),
+            &gate.oracle,
+            table_id,
+            BASE + 1,
+            BASE + 2,
+            STRANDED_TTL_MS,
+            true,
+        );
+        std::thread::sleep(Duration::from_millis(STRANDED_TTL_MS * 4));
+        let mut session = gate.session_asking(Arc::clone(&counted) as Arc<dyn FragmentSource>);
+        let _ = session.run("SELECT count(*) FROM t");
+    });
+    let after_expired = esker_store::lock_stats::lock_encounters();
+    assert_eq!(
+        after_expired.expired,
+        before.expired + 1,
+        "a scan that met a lock past its lease should have counted exactly one: {before:?} then {after_expired:?}"
+    );
+
+    // 2. Inside its lease when the fragment sees it, and **briefly** so.
+    //
+    // **Why not a long lease.** The row path *waits* on a lock inside its lease rather than rolling
+    // it forward, and that wait is not bounded by `statement_timeout` (debt #115, measured
+    // 2026-09-17: a 24-hour lease and one `SELECT count(*)` had not returned after 300 s). A step
+    // that plants a long lease hangs, which is how #115 was found.
+    //
+    // **Why not the fragment door directly.** Nothing in this file constructs a fragment request:
+    // every path builds it in the planner, and `CountingFragments` only decorates. Reaching
+    // `FragmentSource::evaluate` here would mean hand-writing a wire blob to dodge a wait.
+    //
+    // **So: ten seconds.** The scan is issued immediately after the planting, the fragment meets
+    // the lock inside its lease and counts it alive, the row path then waits at most the lease, the
+    // lock expires, it is rolled forward, and the statement returns. Bounded by construction rather
+    // than by a timeout that does not bind.
+    //
+    // **The margin is the point, and it is not free-floating.** "Alive" here means the scan reached
+    // the store *before* the lock expired, so the lease is a race the fixture has to win. Three
+    // seconds wins it on an idle box and would lose it in the gate, where this runs beside some
+    // 4,900 other tests and a few seconds between planting and arriving is ordinary. Ten makes that
+    // margin wide enough to ignore; the cost is a few seconds in step 2, which this file already
+    // spends elsewhere.
+    tokio::task::block_in_place(|| {
+        strand_a_secondary(
+            gate.client.router(),
+            &gate.oracle,
+            table_id,
+            BASE + 3,
+            BASE + 4,
+            BRIEFLY_ALIVE_TTL_MS,
+            false,
+        );
+        let mut session = gate.session_asking(Arc::clone(&counted) as Arc<dyn FragmentSource>);
+        let _ = session.run("SELECT count(*) FROM t");
+    });
+    let after_alive = esker_store::lock_stats::lock_encounters();
+    assert_eq!(
+        after_alive.alive,
+        after_expired.alive + 1,
+        "a scan that met a lock inside its lease should have counted exactly one: {after_expired:?} then {after_alive:?}"
+    );
+
+    // 3. Nothing planted. **This is the step that catches a counter counting somebody else.**
+    //
+    // **The mop-up comes first, and it is a readiness wait rather than a measurement.** Each of the
+    // steps above plants a *pair* of keys, and one scan resolves the lock it meets — the first run
+    // of this test failed here with `expired` one higher, because step 2's second key was still
+    // sitting there waiting to be met. Scanning until the counter stops moving reaches a state that
+    // cannot come back, since nothing plants after this point; only then is a scan that meets
+    // nothing something this step can assert about.
+    let mut quiet = esker_store::lock_stats::lock_encounters();
+    for _ in 0..8 {
+        tokio::task::block_in_place(|| {
+            let mut session = gate.session_asking(Arc::clone(&counted) as Arc<dyn FragmentSource>);
+            let _ = session.run("SELECT count(*) FROM t");
+        });
+        let now = esker_store::lock_stats::lock_encounters();
+        if (now.alive, now.expired) == (quiet.alive, quiet.expired) {
+            break;
+        }
+        quiet = now;
+    }
+    tokio::task::block_in_place(|| {
+        let mut session = gate.session_asking(Arc::clone(&counted) as Arc<dyn FragmentSource>);
+        let _ = session.run("SELECT count(*) FROM t");
+    });
+    let idle = esker_store::lock_stats::lock_encounters();
+    assert_eq!(
+        (idle.alive, idle.expired),
+        (quiet.alive, quiet.expired),
+        "a scan that met nothing moved the counter: {quiet:?} then {idle:?}"
+    );
+
+    gate.stop().await;
+}
+
 /// Rows the classifier check fills, and where it puts its own keys.
 ///
 /// Clear of everything else: the fill owns `1..=RATIO_ROWS`, the planter starts at `RATIO_ROWS + 1`

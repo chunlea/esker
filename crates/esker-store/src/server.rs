@@ -3028,13 +3028,20 @@ impl Store {
             &bounds,
         ) {
             Ok(None) => {}
-            Ok(Some((key, start_ts))) => {
+            Ok(Some(found)) => {
+                // **The door of ADR 0118**: the one place that knows a fragment met a lock, and the
+                // only one that holds what judging it needs — this read's own `ts` and the lock's
+                // own `ttl_ms`. The node cannot: it drops the detail one line after receiving it
+                // (`esker-sql/src/exec/fragment.rs`), and the key in that detail has been through
+                // `printable`, which does not reverse.
+                crate::lock_stats::met(found.start_ts, found.ttl_ms, request.ts);
                 return Ok(refused(
                     RefusalReason::TooFarBehind,
                     format!(
-                        "a transaction at {start_ts} still holds a lock on {} in region {}, and \
+                        "a transaction at {} still holds a lock on {} in region {}, and \
                          a columnar copy holds no version for a key until that lock is resolved",
-                        crate::columnar::region::printable(&key),
+                        found.start_ts,
+                        crate::columnar::region::printable(&found.key),
                         header.region_id
                     ),
                 ));
