@@ -2672,7 +2672,22 @@ pub trait PgDatum: Sized {
     /// Where the real input function accepts something this one does not, the answer is contract
     /// C2's `0A000` naming the construct — never a wrong value and never a syntax error about
     /// valid input. `tests/value_parity.rs` holds the list of those from both sides.
-    fn from_text(ty: ColumnType, text: &str) -> Result<Datum>;
+    fn from_text_with(ty: ColumnType, text: &str, typmod: i32) -> Result<Datum>;
+
+    /// The same, for a value that has no modifier.
+    ///
+    /// **Passing nothing is a statement, not a default.** A caller reaches this form to say the
+    /// value is being read without a type modifier — not because it has not thought about one. The
+    /// distinction matters because `interval` is a type whose modifier changes how a literal
+    /// *parses*: its typmod carries a field mask, and `'1 2'` is a day and two hours under
+    /// `day to hour` where it is `22007` with no mask at all. A precision can be applied after the
+    /// fact; a field mask cannot, because without it there is no value to apply anything to.
+    ///
+    /// One implementation, two arities. A second *function* could drift from the first, which is
+    /// the shape `debts-v1.1.md` #102 paid for once; a default argument cannot.
+    fn from_text(ty: ColumnType, text: &str) -> Result<Datum> {
+        Self::from_text_with(ty, text, NO_TYPMOD)
+    }
     /// The bytes PostgreSQL puts in a **binary**-format field, or `None` when there are none to
     /// put there.
     ///
@@ -2788,7 +2803,9 @@ impl PgDatum for Datum {
         reason = "one input function per type, in one match; splitting it would put a type's \
                   reading somewhere other than beside every other type's"
     )]
-    fn from_text(ty: ColumnType, text: &str) -> Result<Datum> {
+    // `_typmod` until the commit that reads it: this one changes no behaviour, and a bound
+    // parameter nothing uses is a `-D warnings` failure. The `interval` arm is where it lands.
+    fn from_text_with(ty: ColumnType, text: &str, _typmod: i32) -> Result<Datum> {
         Ok(match ty {
             // **The first *byte*, printed the way the output function prints it.** `'abc'` is
             // `a` and `'é'` is the first byte of a two-byte character, which is not valid UTF-8
