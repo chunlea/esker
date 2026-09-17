@@ -17,6 +17,30 @@
 //!   it.
 //! * **State Machine Safety** — everything below two nodes' commit indices is byte-identical.
 //!   Those entries have been handed to a state machine and cannot be taken back.
+//! * **No two nodes name each other as leader**, which is Election Safety seen from the client's
+//!   side rather than a fourth independent claim. `debts-v1.1.md` #107 built a client fixture on
+//!   exactly that input — two live peers whose `NotLeader` hints point at each other, which costs
+//!   a call its whole retry budget — and the input is unreachable here: `Raft::reset` clears
+//!   `leader` on every term change (`core.rs:297`), so a node's belief is only ever about its
+//!   *current* term. `P` naming `Q` and `Q` naming `P` therefore needs either one term with two
+//!   leaders, or each node to have led a term it never reached. The proof is two lines of code;
+//!   this is the machine-checked half of it, and it is here rather than in a test of its own
+//!   because a schedule is what would find the exception.
+//!
+//!   **The proof is universal and this check is a sample of it**, which is the honest way round.
+//!   Two lines of `core.rs` settle it for every execution; what runs here is three voters and a
+//!   learner over `testkit`'s schedule space — no delay, no crash-restart — so a green run adds
+//!   confidence rather than the conclusion. It is worth having because the exception, if there is
+//!   one, is a schedule, and this is the only thing in the crate that searches schedules.
+//!
+//!   **No mutation has yet been found that makes this property fail, and that is recorded rather
+//!   than hidden.** Three were tried: removing `reset`'s `self.leader = None`, making the
+//!   higher-term path keep the old belief instead of `become_follower(term, None)`, and both at
+//!   once — each stayed green, the first also over 20,000 cases. The likely reading is that the
+//!   invariant is over-determined: several sites clear the belief and a single-site mutation is
+//!   caught by the next one. The other reading is that this check is weaker than it looks. Until
+//!   a mutation reddens it, treat it as the invariant written down with a search behind it, not
+//!   as a guard proven able to fail.
 //!
 //! The network here loses, reorders and duplicates messages, which is all a real one does to a
 //! correct Raft. What it does not do is crash and restart a node — that needs the storage to be
@@ -102,6 +126,21 @@ fn run_with_learner(
     )
 }
 
+/// The first pair naming each other as leader, which should always be `None`.
+///
+/// A pair and not a single node: a node naming *itself* is what a leader does, and the store's
+/// hint filters that out before a client ever sees it
+/// (`esker-store/src/peer.rs:1061`, `filter(|id| *id != self.peer_id)`).
+fn naming_each_other(group: &Harness, ids: &[NodeId]) -> Option<(NodeId, NodeId)> {
+    let believes = |who: NodeId| group.node(who).leader();
+    ids.iter().enumerate().find_map(|(at, one)| {
+        ids[at + 1..]
+            .iter()
+            .find(|other| believes(*one) == Some(**other) && believes(**other) == Some(*one))
+            .map(|other| (*one, *other))
+    })
+}
+
 fn run_group(
     mut group: Harness,
     ids: &[NodeId],
@@ -160,6 +199,16 @@ fn run_group(
         // quorum, so a grant buys nothing and costs the granter its vote for the term and, for a
         // real vote, its leader — which is a loop that does not end, because the next round starts
         // from the same place.
+        // **Nobody names the peer that names them** (`debts-v1.1.md` #107). Checked after every
+        // action rather than at the end, for the reason the header gives: a schedule that ends
+        // healthy can pass through the state this rules out.
+        if let Some((one, other)) = naming_each_other(&group, ids) {
+            return Err(TestCaseError::fail(format!(
+                "after action {at} ({action:?}): node {one} names {other} as leader while {other} \
+                 names {one} — each belief is about its own term, so this needs two leaders in one \
+                 term or a node that led a term it never reached"
+            )));
+        }
         for message in group.pending_messages() {
             if let crate::message::Message::RequestVoteResponse {
                 from,
