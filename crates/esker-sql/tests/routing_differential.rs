@@ -2230,16 +2230,19 @@ struct Refusal {
 /// **PD is asked by key, not by region id**, so the key comes from whichever store hosts it. PD's
 /// `term` is not reachable this way at all — `Route` carries the region and the leader and nothing
 /// else — which is why every term printed by this probe is a **store-side** term.
-fn cluster_view(
-    stores: &[Arc<Store>],
-    conn: &PdConn,
-    region_id: u64,
-) -> (
-    Vec<(u64, u64, Option<u64>, u64)>,
-    Vec<u64>,
-    Option<u64>,
-    Vec<u64>,
-) {
+#[derive(Default)]
+struct ClusterView {
+    /// `(store, peer, that peer's leader, that peer's term)`, one row per store that hosts it.
+    peers: Vec<(u64, u64, Option<u64>, u64)>,
+    /// Stores whose own `region_statuses` calls them the leader. **Self-reported.**
+    claims: Vec<u64>,
+    /// The peer id PD answers with — the other half of candidate C.
+    pd_leader: Option<u64>,
+    /// The region's peer order as PD gives it.
+    order: Vec<u64>,
+}
+
+fn cluster_view(stores: &[Arc<Store>], conn: &PdConn, region_id: u64) -> ClusterView {
     let mut peers = Vec::new();
     let mut claims = Vec::new();
     let mut a_key: Option<bytes::Bytes> = None;
@@ -2263,7 +2266,12 @@ fn cluster_view(
     let order = route.map_or_else(Vec::new, |route| {
         route.region.peers.iter().map(|peer| peer.peer_id).collect()
     });
-    (peers, claims, pd_leader, order)
+    ClusterView {
+        peers,
+        claims,
+        pd_leader,
+        order,
+    }
 }
 
 /// The writer that makes the table split under itself.
@@ -2321,19 +2329,19 @@ fn spawn_loader(
                     let region = refused_region(&error);
                     // Only a `NotLeader` gets the census: every other refusal is a different
                     // mechanism, and asking four stores about a region costs a round trip each.
-                    let (peers, claims, pd_leader, order) = if text.contains("not the leader") {
+                    let view = if text.contains("not the leader") {
                         cluster_view(&stores, &conn, region)
                     } else {
-                        (Vec::new(), Vec::new(), None, Vec::new())
+                        ClusterView::default()
                     };
                     seen.push(Refusal {
                         sqlstate: error.sqlstate().to_owned(),
                         text,
                         region,
-                        peers,
-                        claims,
-                        pd_leader,
-                        order,
+                        peers: view.peers,
+                        claims: view.claims,
+                        pd_leader: view.pd_leader,
+                        order: view.order,
                     });
                 }
                 id += 50;
