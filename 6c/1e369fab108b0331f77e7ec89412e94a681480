@@ -1,0 +1,31 @@
+crates/esker-cli/src/server.rs
+  s_dc640bf0df4adb::t_5120f0d3e59616 164-239,242
+crates/esker-sql/src/bin/esker-sql.rs
+  s_f4b2852b53accb::t_c0929e83a2c50a 28-103,107
+crates/esker-sql/tests/rust_log_keeps_info.rs
+  s_dc640bf0df4adb::t_8b4440a95505b8 1-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6c1e369fab108b0331f77e7ec89412e94a681480",
+  "prompts": {},
+  "sessions": {
+    "s_dc640bf0df4adb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9480982a-f9e2-4fa5-a999-4cf3f4cc2076",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    },
+    "s_f4b2852b53accb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc7223c3-8ba0-48df-95c8-ddb365dc093c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
