@@ -298,7 +298,9 @@ fn a_value_too_deep_is_54001_and_not_something_else() {
 /// boundary and fails**; after it, no depth kills the child and the search runs out, which is the
 /// permanent assertion — a refusal is always reached before any stack is.
 ///
-/// `tsquery` is not probed here: its half of #101 is unpaid and lives in the `#[ignore]`d test below.
+/// `tsquery` is not probed here. It has a test of its own below, which measures the same bound
+/// from the other side: a refusal at twenty thousand, rather than a search for the depth at which
+/// a stack dies.
 #[test]
 fn the_bound_is_below_the_depth_at_which_a_stack_dies() {
     for shape in ["array"] {
@@ -355,23 +357,29 @@ fn a_value_postgresql_19_answers_is_answered_here() {
     );
 }
 
-/// **The tsquery half of #101, and it is not paid.** `#[ignore]` because it fails, not because it is
-/// slow: the row is committed as *partial payment* with json's half done.
+/// **The tsquery half of #101 — measured, and it needs no change on this tree.** The row stays open
+/// anyway, which is the distinction this comment exists to keep: *nothing to fix here* is not
+/// *paid*.
 ///
 /// What is measured. 19beta1 answers `a&(…)` nested **6,000** and refuses **10,000** with `54001`
-/// (`esker-coord/s2-h101c.out`). Here a tsquery of ten thousand **kills the child** — in parallel
-/// and, when that was checked, **serially too**, so the probes starving each other is not the
-/// explanation. A twenty-thousand query should be the bound's own `54001`, and the counterfactual
-/// showed the bound is otherwise unreached, so this test is also the only thing that would redden if
-/// it were removed.
+/// (`esker-coord/s2-h101c.out`). This node answers ten thousand and refuses twenty thousand, which
+/// is **a declared divergence and not a defect**: the ruling is one bound for both parsers rather
+/// than one apiece, so a resource ceiling that sits above PostgreSQL's is a ceiling in the same
+/// place for `jsonb` and for `tsquery`. This test carried an `#[ignore]` for a window on the belief
+/// that ten thousand levels killed the child; taken off, it passed **five runs out of five**, with
+/// no line of `value` changed to get there.
 ///
-/// **One difference is measured and deliberately not claimed as a cause.** Putting four
-/// `crate::error::` path prefixes back into `value::on_a_deep_stack` — a change clippy asks to
-/// remove and which cannot alter a stack — took the same file from three reds to 6/6 green. A path
-/// prefix does not change a stack size, and these probes sit near the margin (a tsquery level is
-/// five frames and the 124 MiB thread was sized from a bracket that may be optimistic), so
-/// **flakiness at the edge explains the evidence just as well**. Separating them is a few runs of
-/// each form, not an argument, and until that is done nothing here is attributed.
+/// **The bound is watched by a pair of guards, and either one alone is untested.** Removing the
+/// guard in `tsquery::or` is green on its own — `tsquery::unary` carries the same three lines and
+/// sits on every level's descent path — and only removing **both** reddens the assertion below. So
+/// a counterfactual that takes out one of them proves nothing, which is the likeliest reading of an
+/// earlier one that removed this bound and reddened nothing at all.
+///
+/// **What the five greens do not say.** They are five executions on an idle machine, and the reds
+/// this row was opened for happened with another lane's whole suite running beside them. An earlier
+/// comment here blamed four `crate::error::` path prefixes that clippy asks to remove; those runs
+/// were done, neither that form nor edge flakiness reproduced anything on this tree, and the
+/// original form is not in git, so **no cause is claimed** — only that it does not reproduce here.
 #[test]
 fn a_deep_tsquery_is_refused_and_never_kills_the_child() {
     assert!(

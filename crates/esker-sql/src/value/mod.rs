@@ -1289,7 +1289,7 @@ pub fn operator_exists(op: &str, ty: ColumnType) -> bool {
 /// (`or → and → phrase → unary → primary`): staged on a 43 MiB thread it parses 5,000 levels and
 /// dies at 10,000, which puts it between 4.3 and 8.6 KiB. **The figure below is 12 KiB a level in a
 /// debug build**: json's own 2,796 bytes raised for the dearer of the two parsers and rounded up by
-/// half again, the way [`crate::parse`]'s figures are — json's own number under-sized the thread and
+/// half again, the way [`crate::parse`]'s figures are — that number under-sized the thread and
 /// left a ten-thousand-level tsquery dying after `BUILT`, measured. The release number is that over
 /// four: the same ratio the nesting and plan constants use, and being wrong on the safe side costs
 /// reserved address space rather than a crash.
