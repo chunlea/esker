@@ -26,14 +26,7 @@ const CORPUS_FIXTURE: &[&str] = &[];
 
 /// What this node answers differently, and why.
 /// One of `DIVERGENCES`' reasons: the typmod is a **bitmask** and this node drops it.
-const TYPMOD: &str = "**`interval`'s typmod is a field mask, not a number** — `interval day` is \
-     589823 and `interval day to hour` is 67698687, fields in the high bits and precision in the \
-     low — and it does more than name a width: it says which fields the value *keeps*, so \
-     `'1 2'` means one day and two hours **because** the column is `day to hour`. This node \
-     parses the syntax and drops the mask, so such a column stores every field and a literal \
-     that only has meaning under one is refused — which is exactly what a real server does with \
-     the same literal and no typmod: `'1 2'::interval` is `22007` there too. Everything reading \
-     that table follows, because the rows were never inserted.";
+const TYPMOD: &str = "**The mask is stored now; what is missing is the literal reader.** #112's representation half landed: a declared field list is packed into the typmod exactly as PostgreSQL packs it, spelled back by `format_type`, folded into a stored value, and a typmod with a zero field mask is refused rather than printed. What `interval::from_text` still cannot do is let the mask decide how a literal *reads* — `'1 2'` is one day and two hours **because** the column is `day to hour`, and `'1-2'` a year and two months under `year to month`. Without that the inserts below are refused, which is what a real server does with the same literal and **no** typmod (`'1 2'::interval` is `22007` there too), and every row that reads the table follows because the rows were never inserted. The thirteen entries left here are that one gap seen from thirteen places.";
 
 /// Functions this node has for no type.
 const FUNCTIONS: &str = "A function this node does not implement for any type, named rather than \
@@ -51,22 +44,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // `typlen` always agreed. The row itself never changed a character.
     types: &[],
     answers: &[
-        (
-            "SELECT attname, atttypmod, format_type(atttypid, atttypmod) FROM \
-             pg_attribute WHERE attrelid = 'iv'::regclass AND attnum > 0 ORDER BY attnum",
-            TYPMOD,
-            "pg19_interval.txt:61",
-        ),
-        (
-            "SELECT format_type(1186, 3)",
-            TYPMOD,
-            "pg19_format_type.txt:62",
-        ),
-        (
-            "SELECT format_type(1186, 32767)",
-            TYPMOD,
-            "pg19_interval.txt:63",
-        ),
         (
             "INSERT INTO iv VALUES (1, '1 year 2 mons 3 days 04:05:06', '1.5 seconds', \
              '1 day', '1 2', '1-2')",
@@ -124,11 +101,6 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
             "SELECT INTERVAL '1 day', INTERVAL '1' DAY, INTERVAL '1 2' DAY TO HOUR",
             TYPMOD,
             "pg19_interval.txt:82",
-        ),
-        (
-            "SELECT '1 year 1 month'::interval::interval year",
-            TYPMOD,
-            "pg19_interval.txt:98",
         ),
         (
             "SELECT justify_days('35 days'::interval), justify_hours('27 \

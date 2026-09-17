@@ -4281,7 +4281,7 @@ fn catalog_function(
             }
             let oid = type_oid_argument(args.first())?;
             let built_in =
-                crate::catalog::def_functions::format_type(oid, typmod_argument(args.get(1))?);
+                crate::catalog::def_functions::format_type(oid, typmod_argument(args.get(1))?)?;
             match (&built_in, oid.and_then(|oid| u64::try_from(oid).ok())) {
                 (Datum::Text(printed), Some(oid))
                     if printed == crate::catalog::def_functions::UNKNOWN_TYPE =>

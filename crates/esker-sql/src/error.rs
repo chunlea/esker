@@ -3261,6 +3261,17 @@ pub enum SqlError {
     /// A bug here, not a mistake there. Nothing driven by user input may produce this.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// `format_type(1186, …)` handed a number that is not an interval typmod: `XX000`, and
+    /// PostgreSQL's own sentence.
+    ///
+    /// **Its own variant rather than [`SqlError::Internal`]**, which shares the SQLSTATE: that one
+    /// is documented as a bug here and forbidden to user input, and this is reachable by writing
+    /// `SELECT format_type(1186, 3)`. It would also print `internal error: ` where a real server
+    /// writes the bare sentence. Measured on all three shapes a zero mask can take —
+    /// `0`, `3` and `32767` (`esker-coord/s2-h112-gaps.out`).
+    #[error("invalid INTERVAL typmod: 0x{0:x}")]
+    InvalidIntervalTypmod(i32),
 }
 
 impl SqlError {
@@ -3734,7 +3745,9 @@ impl SqlError {
             SqlError::DataCorrupted(_) => sqlstate::DATA_CORRUPTED,
             // `StatementMustRestart` is a signal, not an answer — it reaches a client only if
             // something forgot to catch it, which is exactly an internal error.
-            SqlError::Internal(_) | SqlError::StatementMustRestart => sqlstate::INTERNAL_ERROR,
+            SqlError::Internal(_)
+            | SqlError::InvalidIntervalTypmod(_)
+            | SqlError::StatementMustRestart => sqlstate::INTERNAL_ERROR,
         }
     }
 

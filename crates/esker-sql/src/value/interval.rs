@@ -388,6 +388,93 @@ fn clock(micros: i64) -> String {
     out
 }
 
+use super::{
+    INTERVAL_MASK_DAY as MASK_DAY, INTERVAL_MASK_HOUR as MASK_HOUR,
+    INTERVAL_MASK_MINUTE as MASK_MINUTE, INTERVAL_MASK_MONTH as MASK_MONTH,
+    INTERVAL_MASK_SECOND as MASK_SECOND, INTERVAL_MASK_YEAR as MASK_YEAR,
+};
+
+/// The thirteen spellings PostgreSQL has for a field list, with the mask each produces.
+///
+/// Ordered widest first so that a lookup by mask finds the range before either end of it; the
+/// masks are distinct, so the order is for reading rather than for correctness.
+pub(super) const MASK_SPELLINGS: &[(i32, &str)] = &[
+    (MASK_YEAR | MASK_MONTH, "year to month"),
+    (
+        MASK_DAY | MASK_HOUR | MASK_MINUTE | MASK_SECOND,
+        "day to second",
+    ),
+    (MASK_DAY | MASK_HOUR | MASK_MINUTE, "day to minute"),
+    (MASK_DAY | MASK_HOUR, "day to hour"),
+    (MASK_HOUR | MASK_MINUTE | MASK_SECOND, "hour to second"),
+    (MASK_HOUR | MASK_MINUTE, "hour to minute"),
+    (MASK_MINUTE | MASK_SECOND, "minute to second"),
+    (MASK_YEAR, "year"),
+    (MASK_MONTH, "month"),
+    (MASK_DAY, "day"),
+    (MASK_HOUR, "hour"),
+    (MASK_MINUTE, "minute"),
+    (MASK_SECOND, "second"),
+];
+
+/// The words for a field mask, or `None` for one PostgreSQL does not spell.
+///
+/// [`super::INTERVAL_FULL_RANGE`] is not in the table on purpose: `interval` and `interval(p)` print without a field
+/// list, which is what makes the full range the absence of one rather than a thirteenth spelling.
+#[must_use]
+pub(super) fn spell_mask(mask: i32) -> Option<&'static str> {
+    MASK_SPELLINGS
+        .iter()
+        .find(|(bits, _)| *bits == mask)
+        .map(|(_, words)| *words)
+}
+
+/// A field mask cut down to the value it keeps.
+///
+/// **Only the lowest field the mask names does anything**, which is measured rather than reasoned
+/// about (`esker-coord/s2-h112-truncate.out`): `interval day to hour` folds a value exactly as
+/// `interval hour` does, and `interval year` drops the months. Everything at or above the floor
+/// survives — the range's upper end never clamps the top, so `'1 year 2 mons 3 days'::interval day`
+/// keeps the year and the months.
+///
+/// **Truncation, not rounding, and toward zero**: `'1 day 02:03:59.999'` is `1 day 02:03:00` under
+/// `hour to minute`, where rounding would have carried it to `02:04`. A negative value truncates
+/// the same way — `-04:05:06.789` is `-04:05:00` — which is what Rust's integer division already
+/// does. The fraction of a second is the *precision's* business and not the mask's, so a floor of
+/// `second` leaves the value alone.
+#[must_use]
+pub(super) fn truncate_to_mask(value: &Interval, mask: i32) -> Interval {
+    let months = value.months;
+    let (months, days, micros) = if mask & MASK_SECOND != 0 {
+        (months, value.days, value.micros)
+    } else if mask & MASK_MINUTE != 0 {
+        (
+            months,
+            value.days,
+            value.micros / MICROS_PER_MINUTE * MICROS_PER_MINUTE,
+        )
+    } else if mask & MASK_HOUR != 0 {
+        (
+            months,
+            value.days,
+            value.micros / MICROS_PER_HOUR * MICROS_PER_HOUR,
+        )
+    } else if mask & MASK_DAY != 0 {
+        (months, value.days, 0)
+    } else if mask & MASK_MONTH != 0 {
+        (months, 0, 0)
+    } else if mask & MASK_YEAR != 0 {
+        (months / 12 * 12, 0, 0)
+    } else {
+        (months, value.days, value.micros)
+    };
+    Interval {
+        months,
+        days,
+        micros,
+    }
+}
+
 /// PostgreSQL's `interval_in`, for the shapes this node reads.
 ///
 /// Three grammars in one, all measured: a **unit list** (`1 year 2 mons 3 days 04:05:06`, with

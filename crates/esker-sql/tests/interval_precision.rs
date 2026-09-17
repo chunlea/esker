@@ -28,6 +28,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use esker_sql::sqlstate;
+
 #[path = "parity_harness/mod.rs"]
 mod parity;
 
@@ -201,4 +203,130 @@ fn a_cast_to_an_interval_precision_rounds_too() {
         node.rows("SELECT pg_typeof('1.5 seconds'::interval(3))"),
         [["interval".to_owned()]]
     );
+}
+
+/// **A declared field list is stored, spelled and folded** — #112's representation half.
+///
+/// The numbers are 19beta1's, read off `atttypmod` rather than derived
+/// (`esker-coord/s2-h112-fields.out`): the mask is the OR of the fields the range spans and sits in
+/// the high half, so `interval day to hour` is `(8 | 1024) << 16 | 0xFFFF`.
+#[test]
+fn a_declared_field_list_is_stored_and_spelled() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE g1_f (a interval day, b interval day to hour, c interval year to month, \
+         d interval hour to second(3), e interval(3), f interval)",
+    ]);
+    assert_eq!(
+        node.rows(
+            "SELECT attname, atttypmod, format_type(atttypid, atttypmod) FROM pg_attribute \
+             WHERE attrelid = 'g1_f'::regclass AND attnum > 0 ORDER BY attnum"
+        ),
+        [
+            [
+                "a".to_owned(),
+                "589823".to_owned(),
+                "interval day".to_owned()
+            ],
+            [
+                "b".to_owned(),
+                "67698687".to_owned(),
+                "interval day to hour".to_owned()
+            ],
+            [
+                "c".to_owned(),
+                "458751".to_owned(),
+                "interval year to month".to_owned()
+            ],
+            [
+                "d".to_owned(),
+                "469762051".to_owned(),
+                "interval hour to second(3)".to_owned()
+            ],
+            [
+                "e".to_owned(),
+                "2147418115".to_owned(),
+                "interval(3)".to_owned()
+            ],
+            ["f".to_owned(), "-1".to_owned(), "interval".to_owned()],
+        ]
+    );
+}
+
+/// **Only the mask's lowest field touches the value**, which is the rule a reader would get
+/// backwards: the range's upper end does nothing, so `day to hour` folds exactly as `hour` does and
+/// `interval year` drops the months. Measured (`esker-coord/s2-h112-truncate.out`).
+///
+/// And a **dropped field truncates** where a **precision rounds**: `02:03:59.999` is `02:03:00`
+/// under `hour to minute`, where rounding would have carried it to `02:04`.
+#[test]
+fn the_field_list_truncates_at_its_lowest_field_and_does_not_round() {
+    let mut node = parity::Node::new(&[]);
+    for (ty, expected) in [
+        ("interval year", "1 year"),
+        ("interval month", "1 year 2 mons"),
+        ("interval day", "1 year 2 mons 3 days"),
+        ("interval hour", "1 year 2 mons 3 days 04:00:00"),
+        ("interval day to hour", "1 year 2 mons 3 days 04:00:00"),
+        ("interval minute", "1 year 2 mons 3 days 04:05:00"),
+        ("interval hour to minute", "1 year 2 mons 3 days 04:05:00"),
+        ("interval second", "1 year 2 mons 3 days 04:05:06.789"),
+    ] {
+        assert_eq!(
+            node.rows(&format!(
+                "SELECT CAST('1 year 2 mons 3 days 04:05:06.789'::interval AS {ty})"
+            ))[0][0],
+            expected,
+            "{ty}"
+        );
+    }
+    assert_eq!(
+        node.rows("SELECT CAST('1 day 02:03:59.999'::interval AS interval hour to minute)")[0][0],
+        "1 day 02:03:00",
+        "a dropped field truncates and never carries"
+    );
+}
+
+/// **An assignment into a column folds the same way a cast does**, so the mask is not a cast-only
+/// rule. Measured on 19beta1 with an `INSERT` (`esker-coord/s2-h112-truncate.out`).
+#[test]
+fn a_column_folds_its_field_list_on_assignment() {
+    let mut node = parity::Node::new(&[
+        "CREATE TABLE g1_fa (a interval hour to minute, b interval day, c interval year to month)",
+    ]);
+    node.run(
+        "INSERT INTO g1_fa VALUES ('1 year 2 mons 3 days 04:05:06.789'::interval, \
+         '1 year 2 mons 3 days 04:05:06.789'::interval, \
+         '1 year 2 mons 3 days 04:05:06.789'::interval)",
+    )
+    .unwrap();
+    assert_eq!(
+        node.rows("SELECT a, b, c FROM g1_fa"),
+        [[
+            "1 year 2 mons 3 days 04:05:00".to_owned(),
+            "1 year 2 mons 3 days".to_owned(),
+            "1 year 2 mons".to_owned(),
+        ]]
+    );
+}
+
+/// **A number that is not an interval typmod is refused, not printed.** An interval's typmod is
+/// `(mask << 16) | precision`, so a zero mask names nothing — and all three shapes a zero mask can
+/// take raise on a real server (`esker-coord/s2-h112-gaps.out`).
+///
+/// Its own error rather than `SqlError::Internal`, which shares the SQLSTATE: that one is
+/// documented as a bug here and forbidden to user input, and this is reachable by typing.
+#[test]
+fn a_typmod_with_no_field_mask_is_refused() {
+    let mut node = parity::Node::new(&[]);
+    for (typmod, message) in [
+        (0, "invalid INTERVAL typmod: 0x0"),
+        (3, "invalid INTERVAL typmod: 0x3"),
+        (32767, "invalid INTERVAL typmod: 0x7fff"),
+    ] {
+        let error = node
+            .run(&format!("SELECT format_type(1186, {typmod})"))
+            .unwrap_err();
+        assert_eq!(error.sqlstate(), sqlstate::INTERNAL_ERROR, "{typmod}");
+        assert_eq!(error.to_string(), message, "{typmod}");
+    }
 }

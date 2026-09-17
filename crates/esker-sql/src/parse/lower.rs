@@ -19,10 +19,11 @@ use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, BinaryOperator, CharacterLength, ColumnOption,
     ConstraintReferenceMatchKind, CreateTableOptions, DataType, DeferrableInitial, Distinct,
     DollarQuotedString, ExactNumberInfo, Expr, FromTable, FunctionArg, FunctionArgExpr,
-    GeneratedAs, GroupByExpr, Ident, IndexColumn, IndexType, JoinConstraint, JoinOperator,
-    LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows, OrderByKind, Query,
-    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableConstraint, TableFactor,
-    TableObject, TimezoneInfo, TrimWhereField, UnaryOperator, UtilityOption, Value,
+    GeneratedAs, GroupByExpr, Ident, IndexColumn, IndexType, IntervalFields, JoinConstraint,
+    JoinOperator, LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows,
+    OrderByKind, Query, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
+    TableConstraint, TableFactor, TableObject, TimezoneInfo, TrimWhereField, UnaryOperator,
+    UtilityOption, Value,
 };
 
 use crate::catalog::{self, KeyOrder, fold_identifier};
@@ -239,6 +240,30 @@ impl Parsed {
             apply_alter_collation(&mut lowered, written)?;
         }
         Ok(lowered)
+    }
+}
+
+/// The mask a declared `INTERVAL <fields>` produces, measured against 19beta1
+/// (`esker-coord/s2-h112-fields.out`): a range is the OR of the fields it spans.
+fn interval_field_mask(fields: IntervalFields) -> i32 {
+    use crate::value::{
+        INTERVAL_MASK_DAY as DAY, INTERVAL_MASK_HOUR as HOUR, INTERVAL_MASK_MINUTE as MINUTE,
+        INTERVAL_MASK_MONTH as MONTH, INTERVAL_MASK_SECOND as SECOND, INTERVAL_MASK_YEAR as YEAR,
+    };
+    match fields {
+        IntervalFields::Year => YEAR,
+        IntervalFields::Month => MONTH,
+        IntervalFields::Day => DAY,
+        IntervalFields::Hour => HOUR,
+        IntervalFields::Minute => MINUTE,
+        IntervalFields::Second => SECOND,
+        IntervalFields::YearToMonth => YEAR | MONTH,
+        IntervalFields::DayToHour => DAY | HOUR,
+        IntervalFields::DayToMinute => DAY | HOUR | MINUTE,
+        IntervalFields::DayToSecond => DAY | HOUR | MINUTE | SECOND,
+        IntervalFields::HourToMinute => HOUR | MINUTE,
+        IntervalFields::HourToSecond => HOUR | MINUTE | SECOND,
+        IntervalFields::MinuteToSecond => MINUTE | SECOND,
     }
 }
 
@@ -9347,24 +9372,25 @@ pub(super) fn lower_type(data_type: &DataType) -> Result<(ColumnType, i32)> {
         DataType::Varchar(Some(length)) | DataType::CharacterVarying(Some(length)) => {
             Ok((ColumnType::Varchar, string_typmod(length, "varchar")?))
         }
-        // **`interval(p)` carries a typmod; `interval <fields>` still does not.** The precision is
-        // a width and this node keeps it; the field mask says which fields a value *keeps*, which
-        // is semantics, and stays the declared divergence `tests/interval.rs` records.
+        // **Both halves of an interval's typmod are kept now**: the precision, which is a width,
+        // and the field list, which says which fields a value keeps. The mask is the OR of the
+        // fields the range spans and is packed into the high half exactly as PostgreSQL packs it —
+        // `interval(3)`'s typmod is `2147418115` on both servers, bit for bit.
         //
         // A precision past six is **reduced rather than refused** — measured, `interval(7)` is
         // `WARNING: INTERVAL(7) precision reduced to maximum allowed, 6` and the column is created
-        // as `interval(6)`. The clamp lives in `value::interval_typmod_of_precision`; the warning
-        // itself is not emitted here, because lowering has no notice channel, and that gap is
-        // named in `tests/interval_precision.rs`.
-        DataType::Interval {
-            fields: None,
-            precision: Some(precision),
-        } => Ok((
-            ColumnType::Interval,
-            value::interval_typmod_of_precision(
-                u32::try_from(*precision).unwrap_or(value::MAX_TIME_PRECISION),
-            ),
-        )),
+        // as `interval(6)`, and `interval hour to second(7)` is reduced the same way. The clamp
+        // lives in `value::interval_typmod_of`; the warning itself is not emitted here, because
+        // lowering has no notice channel, and that gap is named in `tests/interval_precision.rs`.
+        DataType::Interval { fields, precision } if fields.is_some() || precision.is_some() => {
+            let mask = (*fields).map_or(value::INTERVAL_FULL_RANGE, interval_field_mask);
+            let precision =
+                precision.map(|p| u32::try_from(p).unwrap_or(value::MAX_TIME_PRECISION));
+            Ok((
+                ColumnType::Interval,
+                value::interval_typmod_of(mask, precision),
+            ))
+        }
         // `numeric` and `decimal` are one type under two spellings, which is PostgreSQL's own
         // model: `'decimal(3,2)'::regtype` is `numeric(3,2)` there. A **bare precision means
         // scale zero**, not "no scale" — `numeric(10)` is `numeric(10,0)` and rounds — which is

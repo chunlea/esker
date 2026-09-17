@@ -28,9 +28,13 @@
 //!   is `bpchar`. PostgreSQL calls the distinction `typemod_given`, and `character(n)` is the one
 //!   type whose bare spelling is not its parameterised one. Everything else is unmoved by it.
 //!
-//! It does not clamp and it does not validate: `format_type(1114, 7)` is
+//! It does not clamp, and it validates **one** thing: an `interval` typmod whose field mask is
+//! zero is refused rather than printed. `format_type(1114, 7)` is still
 //! `timestamp(7) without time zone`, a precision no `CREATE TABLE` will store, because DDL clamps
-//! `7` to `6` with a `WARNING` and this function prints what it is handed.
+//! `7` to `6` with a `WARNING` and this function prints what it is handed — but
+//! `format_type(1186, 3)` is `XX000 invalid INTERVAL typmod: 0x3` on a real server, and so is
+//! `(1186, 0)` and `(1186, 32767)`. An interval's typmod is `(mask << 16) | precision` and a zero
+//! mask is not a typmod at all, which is the one shape a number can take here that names no type.
 //!
 //! # Whose types does it know?
 //!
@@ -56,25 +60,36 @@ const INVALID_OID: &str = "-";
 ///
 /// `oid` is `None` for SQL NULL, and so is `typmod` — which is not the same as `Some(-1)`; see the
 /// module note.
-#[must_use]
-pub fn format_type(oid: Option<i64>, typmod: Option<i32>) -> Datum {
+pub fn format_type(oid: Option<i64>, typmod: Option<i32>) -> crate::error::Result<Datum> {
     let Some(oid) = oid else {
-        return Datum::Null;
+        return Ok(Datum::Null);
     };
     if oid == 0 {
-        return Datum::Text(INVALID_OID.to_owned());
+        return Ok(Datum::Text(INVALID_OID.to_owned()));
     }
     let Some(ty) = type_of_oid(oid) else {
-        return Datum::Text(UNKNOWN_TYPE.to_owned());
+        return Ok(Datum::Text(UNKNOWN_TYPE.to_owned()));
     };
-    Datum::Text(spell(ty, typmod))
+    Ok(Datum::Text(spell(ty, typmod)?))
 }
 
 /// The name and typmod together, as `format_type` writes them.
-fn spell(ty: ColumnType, typmod: Option<i32>) -> String {
-    match typmod {
+fn spell(ty: ColumnType, typmod: Option<i32>) -> crate::error::Result<String> {
+    Ok(match typmod {
         // A typmod was given and it is not negative: print the parameterised spelling, which
         // `value::format_type` already holds because two wire surfaces are defined as it.
+        //
+        // **An interval is the one type that can be handed a number that is not a typmod.** Its
+        // typmod is `(mask << 16) | precision`, so a zero mask names no field list and no bare
+        // interval either; a real server raises rather than printing, measured on `0`, `3` and
+        // `32767`.
+        Some(typmod)
+            if typmod >= 0
+                && ty == ColumnType::Interval
+                && value::interval_mask_of_typmod(typmod).is_none() =>
+        {
+            return Err(crate::error::SqlError::InvalidIntervalTypmod(typmod));
+        }
         Some(typmod) if typmod >= 0 => value::format_type(ty, typmod),
         // A typmod was given and it is negative. `character` is the one type this differs for:
         // `bpchar` is what a `character` column with no length is called, and `value::format_type`
@@ -86,7 +101,7 @@ fn spell(ty: ColumnType, typmod: Option<i32>) -> String {
             ColumnType::Bpchar => ty.name().to_owned(),
             other => value::format_type(other, value::NO_TYPMOD),
         },
-    }
+    })
 }
 
 /// The type an oid names, if this server has it.
@@ -242,6 +257,12 @@ fn numeric_literal(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// `format_type` can refuse now — one interval typmod shape does. These tests are about
+    /// what it *prints*, so they unwrap here rather than at forty call sites.
+    fn ft(oid: Option<i64>, typmod: Option<i32>) -> Datum {
+        format_type(oid, typmod).expect("these inputs all print")
+    }
+
     use super::*;
 
     /// The capture's own rows, for the types this node has. The corpus replays all 28 statements;
@@ -249,97 +270,79 @@ mod tests {
     #[test]
     fn the_four_rules_are_the_captured_ones() {
         // An unknown oid is not an error, and neither is oid 0.
-        assert_eq!(format_type(Some(999_999), None), Datum::Text("???".into()));
-        assert_eq!(
-            format_type(Some(999_999), Some(4)),
-            Datum::Text("???".into())
-        );
-        assert_eq!(format_type(Some(0), None), Datum::Text("-".into()));
-        assert_eq!(format_type(None, None), Datum::Null);
-        assert_eq!(format_type(None, Some(4)), Datum::Null);
+        assert_eq!(ft(Some(999_999), None), Datum::Text("???".into()));
+        assert_eq!(ft(Some(999_999), Some(4)), Datum::Text("???".into()));
+        assert_eq!(ft(Some(0), None), Datum::Text("-".into()));
+        assert_eq!(ft(None, None), Datum::Null);
+        assert_eq!(ft(None, Some(4)), Datum::Null);
 
         // A typmod on a type that takes none is ignored.
-        assert_eq!(format_type(Some(23), None), Datum::Text("integer".into()));
-        assert_eq!(
-            format_type(Some(23), Some(-1)),
-            Datum::Text("integer".into())
-        );
-        assert_eq!(
-            format_type(Some(23), Some(4)),
-            Datum::Text("integer".into())
-        );
+        assert_eq!(ft(Some(23), None), Datum::Text("integer".into()));
+        assert_eq!(ft(Some(23), Some(-1)), Datum::Text("integer".into()));
+        assert_eq!(ft(Some(23), Some(4)), Datum::Text("integer".into()));
 
         // `varchar` is length + 4, so 0, 1 and 4 are all bare and 5 is the first real one.
         for bare in [None, Some(-1), Some(0), Some(1), Some(4)] {
             assert_eq!(
-                format_type(Some(1043), bare),
+                ft(Some(1043), bare),
                 Datum::Text("character varying".into()),
                 "varchar with typmod {bare:?}"
             );
         }
         assert_eq!(
-            format_type(Some(1043), Some(5)),
+            ft(Some(1043), Some(5)),
             Datum::Text("character varying(1)".into())
         );
         assert_eq!(
-            format_type(Some(1043), Some(9)),
+            ft(Some(1043), Some(9)),
             Datum::Text("character varying(5)".into())
         );
         assert_eq!(
-            format_type(Some(1043), Some(1028)),
+            ft(Some(1043), Some(1028)),
             Datum::Text("character varying(1024)".into())
         );
 
         // `timestamp` is the precision itself, so 0 is real and only a negative is bare.
         assert_eq!(
-            format_type(Some(1114), None),
+            ft(Some(1114), None),
             Datum::Text("timestamp without time zone".into())
         );
         assert_eq!(
-            format_type(Some(1114), Some(-2)),
+            ft(Some(1114), Some(-2)),
             Datum::Text("timestamp without time zone".into())
         );
         assert_eq!(
-            format_type(Some(1114), Some(0)),
+            ft(Some(1114), Some(0)),
             Datum::Text("timestamp(0) without time zone".into())
         );
         assert_eq!(
-            format_type(Some(1114), Some(3)),
+            ft(Some(1114), Some(3)),
             Datum::Text("timestamp(3) without time zone".into())
         );
         // It does not clamp: 7 is a precision no column can hold.
         assert_eq!(
-            format_type(Some(1114), Some(7)),
+            ft(Some(1114), Some(7)),
             Datum::Text("timestamp(7) without time zone".into())
         );
         assert_eq!(
-            format_type(Some(1184), Some(6)),
+            ft(Some(1184), Some(6)),
             Datum::Text("timestamp(6) with time zone".into())
         );
 
         // A NULL typmod and a typmod of -1 differ for `character` and for nothing else.
-        assert_eq!(
-            format_type(Some(1042), None),
-            Datum::Text("character".into())
-        );
-        assert_eq!(
-            format_type(Some(1042), Some(-1)),
-            Datum::Text("bpchar".into())
-        );
-        assert_eq!(
-            format_type(Some(1042), Some(7)),
-            Datum::Text("character(3)".into())
-        );
+        assert_eq!(ft(Some(1042), None), Datum::Text("character".into()));
+        assert_eq!(ft(Some(1042), Some(-1)), Datum::Text("bpchar".into()));
+        assert_eq!(ft(Some(1042), Some(7)), Datum::Text("character(3)".into()));
     }
 
     /// Every type this node has answers, which is what keeps the function from being written out.
     #[test]
     fn every_type_this_node_has_is_named() {
         for ty in ColumnType::ALL {
-            let named = format_type(Some(i64::from(ty.oid())), None);
+            let named = ft(Some(i64::from(ty.oid())), None);
             assert_eq!(
                 named,
-                Datum::Text(spell(ty, None)),
+                Datum::Text(spell(ty, None).unwrap()),
                 "{ty:?} is not reachable by its own oid"
             );
             assert_ne!(named, Datum::Text(UNKNOWN_TYPE.to_owned()), "{ty:?}");

@@ -322,7 +322,26 @@ pub fn precision_of_typmod(typmod: i32) -> Option<u32> {
 pub const MAX_TIME_PRECISION: u32 = 6;
 
 /// Every interval field kept — the high half of a typmod written as `interval(p)`.
-const INTERVAL_FULL_RANGE: i32 = 0x7FFF;
+///
+/// Public because `crate::parse`'s lowering is the one place that turns a declared field list into
+/// a mask, and it cannot live there: the mapping reads `sqlparser`'s `IntervalFields`, and ADR 0014
+/// keeps that name inside `crate::parse` (`tests/containment.rs`).
+pub const INTERVAL_FULL_RANGE: i32 = 0x7FFF;
+
+/// The interval field-mask bits, **measured** (`esker-coord/s2-h112-fields.out`): a column's
+/// `atttypmod` is `(mask << 16) | precision`, and a range's mask is the OR of the fields it spans —
+/// `interval day to hour` is `8 | 1024 = 1032`, which is what 19beta1 stores.
+pub const INTERVAL_MASK_YEAR: i32 = 4;
+/// `MONTH`; `year to month` is this and [`INTERVAL_MASK_YEAR`] together.
+pub const INTERVAL_MASK_MONTH: i32 = 2;
+/// `DAY`.
+pub const INTERVAL_MASK_DAY: i32 = 8;
+/// `HOUR`.
+pub const INTERVAL_MASK_HOUR: i32 = 1024;
+/// `MINUTE`.
+pub const INTERVAL_MASK_MINUTE: i32 = 2048;
+/// `SECOND`.
+pub const INTERVAL_MASK_SECOND: i32 = 4096;
 
 /// The low half of an interval typmod when **no** precision was written.
 const INTERVAL_NO_PRECISION: i32 = 0xFFFF;
@@ -345,8 +364,37 @@ const INTERVAL_NO_PRECISION: i32 = 0xFFFF;
 /// divergence — it says which fields a value *keeps*, which is semantics and not a width.
 #[must_use]
 pub fn interval_typmod_of_precision(precision: u32) -> i32 {
-    let precision = i32::try_from(precision.min(MAX_TIME_PRECISION)).unwrap_or(0);
-    (INTERVAL_FULL_RANGE << 16) | precision
+    interval_typmod_of(INTERVAL_FULL_RANGE, Some(precision))
+}
+
+/// The typmod a declared field list and precision make, packed the way PostgreSQL packs them.
+///
+/// `mask` is the OR of the fields the range spans (`interval::MASK_SPELLINGS`, named and not
+/// linked: it is private, and a public item may not link into the private half of a module), or
+/// [`INTERVAL_FULL_RANGE`] for `interval` and `interval(p)`, which carry no field list. `None` for
+/// the precision is the `0xFFFF` low half a declaration without one gets — **not** a zero, which is
+/// `interval(0)` and a different type.
+#[must_use]
+pub fn interval_typmod_of(mask: i32, precision: Option<u32>) -> i32 {
+    let low = match precision {
+        Some(precision) => i32::try_from(precision.min(MAX_TIME_PRECISION)).unwrap_or(0),
+        None => INTERVAL_NO_PRECISION,
+    };
+    (mask << 16) | low
+}
+
+/// The field mask out of an interval typmod, or `None` for one that has none.
+///
+/// A mask of zero is not "no fields": it is a typmod PostgreSQL refuses outright, which is why this
+/// answers `None` for it and `catalog::def_functions::format_type` turns that into the
+/// `XX000` a real server raises rather than printing a bare name.
+#[must_use]
+pub fn interval_mask_of_typmod(typmod: i32) -> Option<i32> {
+    if typmod < 0 {
+        return None;
+    }
+    let mask = typmod >> 16;
+    (mask != 0).then_some(mask)
 }
 
 /// The declared precision back out of an interval typmod, or `None` for one that has none.
@@ -859,14 +907,40 @@ pub fn fit_to_typmod(value: Datum, ty: ColumnType, typmod: i32) -> Result<Datum>
                 micros,
             },
             ColumnType::Interval,
-        ) => match interval_precision_of_typmod(typmod) {
-            Some(precision) => Datum::Interval {
-                months: *months,
-                days: *days,
-                micros: timestamp::round_to_precision(*micros, precision),
-            },
-            None => value,
-        },
+        ) => {
+            // **The mask first, then the precision, and they are different operations.** The mask
+            // drops whole fields below its lowest one by truncation; the precision rounds the
+            // fraction of a second and may carry. Measured both ways round on the same value
+            // (`esker-coord/s2-h112-truncate.out`): `'1 day 02:03:59.999'` is `1 day 02:03:00`
+            // under `hour to minute` and `1 day 02:04:00` under `day to second(0)`.
+            let folded = match interval_mask_of_typmod(typmod) {
+                Some(mask) if mask != INTERVAL_FULL_RANGE => interval::truncate_to_mask(
+                    &interval::Interval {
+                        months: *months,
+                        days: *days,
+                        micros: *micros,
+                    },
+                    mask,
+                ),
+                _ => interval::Interval {
+                    months: *months,
+                    days: *days,
+                    micros: *micros,
+                },
+            };
+            match interval_precision_of_typmod(typmod) {
+                Some(precision) => Datum::Interval {
+                    months: folded.months,
+                    days: folded.days,
+                    micros: timestamp::round_to_precision(folded.micros, precision),
+                },
+                None => Datum::Interval {
+                    months: folded.months,
+                    days: folded.days,
+                    micros: folded.micros,
+                },
+            }
+        }
         (Datum::Timestamp(micros), ColumnType::Timestamp) => match precision_of_typmod(typmod) {
             Some(precision) => Datum::Timestamp(timestamp::round_to_precision(*micros, precision)),
             None => value,
@@ -1406,10 +1480,22 @@ pub fn format_type(ty: ColumnType, typmod: i32) -> String {
         },
         // `interval(3)` — a suffix, unlike `timestamp`'s, and read out of a packed typmod
         // rather than off the number itself ([`interval_typmod_of_precision`]).
-        (ColumnType::Interval, _) => match interval_precision_of_typmod(typmod) {
-            Some(precision) => format!("interval({precision})"),
-            None => ty.name().to_owned(),
-        },
+        // `interval(3)`, `interval day to hour`, `interval hour to second(3)` — a field list
+        // and a precision, both read out of the packed typmod ([`interval_typmod_of`]). The full
+        // range prints **no** field list, which is what makes `interval(3)` and
+        // `interval second(3)` different spellings of different masks.
+        (ColumnType::Interval, _) => {
+            let precision = interval_precision_of_typmod(typmod);
+            let words = interval_mask_of_typmod(typmod)
+                .filter(|mask| *mask != INTERVAL_FULL_RANGE)
+                .and_then(interval::spell_mask);
+            match (words, precision) {
+                (Some(words), Some(precision)) => format!("interval {words}({precision})"),
+                (Some(words), None) => format!("interval {words}"),
+                (None, Some(precision)) => format!("interval({precision})"),
+                (None, None) => ty.name().to_owned(),
+            }
+        }
         // `numeric(10,2)`, and `numeric(11,-2)` — the scale is signed and prints signed.
         (ColumnType::Numeric, _) => numeric::format_typmod(typmod),
         _ => ty.name().to_owned(),
