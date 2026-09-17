@@ -513,6 +513,16 @@ pub struct DropDatabase {
     /// `IF EXISTS`, which covers absence and nothing else — the database the session is connected
     /// to is still `55006` with the clause written, because it is there rather than missing.
     pub if_exists: bool,
+    /// `WITH (FORCE)`, which on a real server ends the other sessions on the database and then
+    /// drops it.
+    ///
+    /// **Carried but not yet acted on** (#110's parse half). The executor still answers a
+    /// forced drop exactly as it answers an unforced one, and the oracle says what it will
+    /// have to keep doing when the other half lands: `FORCE` does *not* reach past the
+    /// refusals in front of the session count — a template is `42809` and the currently open
+    /// database is `55006` with the clause written, both measured on 19beta1
+    /// (`esker-coord/s2-h110-force.out`).
+    pub force: bool,
 }
 
 /// `ALTER SCHEMA name RENAME TO other`.

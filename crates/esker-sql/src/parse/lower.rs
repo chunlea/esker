@@ -230,6 +230,11 @@ impl Parsed {
         if let plan::Statement::CreateDatabase(create) = &mut lowered {
             apply_database_options(create, self.database_options())?;
         }
+        if let plan::Statement::DropDatabase(drop) = &mut lowered {
+            // `WITH (FORCE)` was cut out of the source so the statement would parse
+            // (`crate::parse::strip_drop_database_force`).
+            drop.force = self.force();
+        }
         if let Some(written) = self.alter_column_collation() {
             apply_alter_collation(&mut lowered, written)?;
         }
@@ -887,6 +892,10 @@ fn lower_statement(
                     plan::Statement::DropDatabase(plan::DropDatabase {
                         names,
                         if_exists: *if_exists,
+                        // Set by `Parsed::lower_inline`, which is where the facts cut out of
+                        // the source are re-attached; this function is free-standing and has
+                        // no `Parsed` to read.
+                        force: false,
                     })
                 }
                 other => return Err(SqlError::unsupported(format!("DROP {other}"))),

@@ -354,6 +354,14 @@ pub struct Parsed {
     /// arrangement `exclude` uses for a clause the parser cannot read
     /// ([`strip_create_database_options`]).
     database_options: Vec<Opt>,
+    /// Whether a `DROP DATABASE` was written `WITH (FORCE)`.
+    ///
+    /// The clause is cut out of the source so the statement parses
+    /// ([`strip_drop_database_force`]), the same arrangement `database_options` uses. A
+    /// **bool rather than a silent rewrite**, for a sharper reason than `concurrently`'s:
+    /// dropping the word would hand a *forced* drop -- one that ends other people's
+    /// sessions -- to somebody who asked for the ordinary one.
+    force: bool,
     /// What [`strip_on_conflict_target`] took out of an `ON CONFLICT` clause: the `WHERE`
     /// predicate that names a partial index, and the expression entries of the target list.
     ///
@@ -634,6 +642,13 @@ impl Parsed {
         &self.database_options
     }
 
+    /// Whether a `DROP DATABASE` said `WITH (FORCE)`, which came off the source so it would
+    /// parse ([`strip_drop_database_force`]).
+    #[must_use]
+    pub fn force(&self) -> bool {
+        self.force
+    }
+
     /// The statement rendered back to SQL, for `EXPLAIN` output and diagnostics.
     #[must_use]
     pub fn rendered(&self) -> String {
@@ -664,6 +679,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
     let database_options = strip_create_database_options(sql, &scanned)
         .map(|(_, options)| options)
         .unwrap_or_default();
+    let force = strip_drop_database_force(sql, &scanned).is_some();
     // A `DO` block in PL/pgSQL becomes a placeholder the lowering discards, and its body travels on
     // `Parsed`. A `DO` in any other language is left alone, fails to parse, and is `42704` where
     // the parse failure is turned into a refusal.
@@ -756,6 +772,7 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Parsed>> {
                 concurrently,
                 exclude: exclude.clone(),
                 database_options: database_options.clone(),
+                force,
                 unlogged,
                 conflict: conflict
                     .as_ref()
@@ -1977,6 +1994,71 @@ fn skip_name(bytes: &[u8], at: usize) -> Option<usize> {
     (end > at).then_some(end)
 }
 
+/// `WITH (FORCE)` cut off a `DROP DATABASE` so the statement would parse.
+///
+/// **`sqlparser` 0.62.0 stops at the `WITH`.** Its `Drop` statement has no option list at all, so
+/// `DROP DATABASE d WITH (FORCE)` is a *syntax error* rather than a clause the lowering declines --
+/// contract C1's shortfall and this module's standing fix, the one
+/// [`strip_create_database_options`] makes for the other half of the same pair of statements.
+///
+/// **Only the exact clause, and the oracle is why** (`esker-coord/s2-h110-force.out`, 19beta1).
+/// `FORCE` without `WITH`, an empty list, an unknown option, and `FORCE` beside an unknown option
+/// are all `42601` on a real server, so each of them is left here for `sqlparser` to refuse as the
+/// syntax error PostgreSQL agrees it is. Only `WITH (FORCE)` is cut, case-insensitively -- 19beta1
+/// takes `WITH (force)`. A cutter that swallowed a list it could not read would turn one of those
+/// four into a silently accepted statement, which is the direction that costs.
+fn strip_drop_database_force(sql: &str, scanned: &Scan<'_>) -> Option<String> {
+    let [first, second, ..] = scanned.words.as_slice() else {
+        return None;
+    };
+    if !first.eq_ignore_ascii_case("DROP") || !second.eq_ignore_ascii_case("DATABASE") {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let at = after_drop_database_name(bytes)?;
+    let mut at = skip_blank(bytes, at);
+    at = skip_blank(bytes, eat_word(bytes, at, "WITH")?);
+    if bytes.get(at) != Some(&b'(') {
+        return None;
+    }
+    at = skip_blank(bytes, at + 1);
+    at = skip_blank(bytes, eat_word(bytes, at, "FORCE")?);
+    if bytes.get(at) != Some(&b')') {
+        return None;
+    }
+    // Nothing but a semicolon may follow, or this is a statement with more in it than the clause
+    // being cut and the offsets after the cut would be somebody else's.
+    let end = skip_blank(bytes, at + 1);
+    let end = if bytes.get(end) == Some(&b';') {
+        skip_blank(bytes, end + 1)
+    } else {
+        end
+    };
+    if end != bytes.len() {
+        return None;
+    }
+    let kept = after_drop_database_name(bytes)?;
+    Some(sql.get(..kept)?.to_owned())
+}
+
+/// The byte offset just past a `DROP DATABASE`'s name, or `None` if this is not one.
+///
+/// `IF EXISTS` and not `IF NOT EXISTS`: PostgreSQL's `DROP` takes the two-word form, which is why
+/// this is its own function rather than a parameter on [`after_database_name`].
+fn after_drop_database_name(bytes: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    for keyword in ["DROP", "DATABASE"] {
+        at = eat_word(bytes, skip_blank(bytes, at), keyword)?;
+    }
+    at = skip_blank(bytes, at);
+    if let Some(after_if) = eat_word(bytes, at, "IF")
+        && let Some(after_exists) = eat_word(bytes, skip_blank(bytes, after_if), "EXISTS")
+    {
+        at = after_exists;
+    }
+    skip_name(bytes, skip_blank(bytes, at))
+}
+
 /// A `CREATE DATABASE` option list as `(NAME, value)` pairs, or `None` when it is not one.
 ///
 /// The grammar PostgreSQL documents: an optional `WITH`, then `name [=] value` repeated, where a
@@ -2566,6 +2648,7 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         .or_else(|| strip_unlogged(sql, &scanned))
         .or_else(|| strip_exclude_constraints(sql, &scanned).map(|(kept, _)| kept))
         .or_else(|| strip_create_database_options(sql, &scanned).map(|(kept, _)| kept))
+        .or_else(|| strip_drop_database_force(sql, &scanned))
         // **Here as well as in `parse_statements`**, and for the reason `strip_unlogged` is in
         // both: this function is an entry point of its own, and a clause that only comes off on
         // the other path makes the same statement parse through one door and not the other.
@@ -3143,9 +3226,11 @@ const UNSUPPORTED: &[Unsupported] = &[
     u("CLUSTER", &["CLUSTER"], &[]),
     u("CHECKPOINT", &["CHECKPOINT"], &[]),
     u("MOVE", &["MOVE"], &[]),
-    // `DROP DATABASE … WITH (FORCE)` disconnects the sessions on it, which needs a session
-    // registry this node does not have — so it is refused rather than quietly dropped.
-    u("DROP DATABASE ... FORCE", &["DROP", "DATABASE"], &["FORCE"]),
+    // **`WITH (FORCE)` has no row here any more**: it parses now
+    // ([`strip_drop_database_force`]), so a row for it could never be reached — this table is
+    // consulted only after a parse has failed. The row that was here named a session registry
+    // this node did not have, and #102 built one. What stays is the row for every *other*
+    // option list, which PostgreSQL also refuses, and which still fails to parse.
     u("DROP DATABASE ... WITH", &["DROP", "DATABASE"], &["WITH"]),
     u("ALTER DATABASE", &["ALTER", "DATABASE"], &[]),
     u("ALTER SYSTEM", &["ALTER", "SYSTEM"], &[]),

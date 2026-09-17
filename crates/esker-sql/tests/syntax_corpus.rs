@@ -171,7 +171,6 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     // G26 -- cursor MOVE
     ("MOVE BACKWARD 1 IN c;", "G26"),
     // G27 -- database and system admin
-    ("DROP DATABASE IF EXISTS d WITH (FORCE);", "G27"),
     ("ALTER DATABASE d RENAME TO e;", "G27"),
     ("ALTER SYSTEM SET work_mem = '64MB';", "G27"),
     ("ALTER SYSTEM RESET ALL;", "G27"),
