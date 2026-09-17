@@ -249,7 +249,8 @@ impl Router {
         // corpse in a group of three used to come round every third attempt, and each visit cost
         // a connection refused plus a backoff — time spent on a peer this call had already
         // watched fail, while the election it is really waiting for ran on the others.
-        let mut corpses: Vec<u64> = Vec::new();
+        // …and every peer that *answered* `NotLeader` to it; `worth_believing` reads both.
+        let (mut corpses, mut refused): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
         let mut peers: Vec<esker_proto::Peer> = Vec::new();
         loop {
             if self.clock.now() >= deadline {
@@ -299,6 +300,8 @@ impl Router {
                                     corpses.push(target.store_id);
                                 }
                                 peers.clone_from(&route.region.peers);
+                            } else if matches!(error, ProtoError::NotLeader { .. }) {
+                                refused.push(target.peer_id);
                             }
                             error
                         }
@@ -320,7 +323,7 @@ impl Router {
                 self.on_terminal(&error, region_id, body.routing_key());
                 return Err(terminal(error, method));
             };
-            let redirect = Self::without_the_corpse(redirect, unreachable, &peers);
+            let redirect = Self::worth_believing(redirect, unreachable, &peers, &refused);
             self.repair(&redirect, region_id);
             // **The budget counts failures, and a refusal that taught this client where the
             // region went is not one.** Reset rather than decremented: a call that keeps being
@@ -451,11 +454,24 @@ impl Router {
     /// and the next call starts with no opinion at all. The hint is a peer id, so it is resolved
     /// against the peer list the failing attempt was routed by — the same resolution
     /// [`crate::RegionCache::set_leader`] does.
-    fn without_the_corpse(
+    /// **And the same question's other half**: `refused` holds every peer that has answered
+    /// `NotLeader` to this call, and a hint naming one of them is honest but not news.
+    /// Answering `None` puts the call back on the rota it uses when no leader is known
+    /// ([`crate::RegionCache::target_at_skipping`]), which reaches the peers it has not
+    /// heard from — and one of those is the only place a leader can be. The two live on
+    /// one function because they answer one question, and `Router::call` is a function
+    /// `clippy::too_many_lines` already watches.
+    fn worth_believing(
         redirect: Redirect,
         unreachable: Option<u64>,
         peers: &[esker_proto::Peer],
+        refused: &[u64],
     ) -> Redirect {
+        if let Redirect::Leader { hint: Some(hint) } = &redirect
+            && refused.contains(hint)
+        {
+            return Redirect::Leader { hint: None };
+        }
         let (Redirect::Leader { hint: Some(hint) }, Some(store_id)) = (&redirect, unreachable)
         else {
             return redirect;

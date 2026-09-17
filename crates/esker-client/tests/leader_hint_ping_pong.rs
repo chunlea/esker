@@ -38,8 +38,8 @@ use bytes::Bytes;
 use esker_client::clock::FakeClock;
 use esker_client::region_cache::{RegionResolver, RegionTable, Route};
 use esker_client::testing::{FakeTransport, Matcher, Outcome, Rule};
-use esker_client::wire::{Epoch, Peer, ProtoError, Region};
-use esker_client::{ClientOptions, Error, RawClient};
+use esker_client::wire::{Epoch, Peer, ProtoError, RawKvResp, Region};
+use esker_client::{ClientOptions, RawClient};
 
 /// Store 1 holds peer 10, store 2 peer 20, store 3 peer 30.
 const P: (u64, u64) = (1, 10);
@@ -90,9 +90,24 @@ struct Harness {
     transport: Arc<FakeTransport>,
 }
 
+/// `store` is the region's actual leader and answers.
+///
+/// Before the fix this rule was never reached — the call never got past `P` and `Q` — which is
+/// why the file could assert the third peer was *never asked*. It is the third hop now.
+fn leads(store: u64) -> Rule {
+    Rule::new(
+        Matcher::Store(store),
+        Outcome::Reply(RawKvResp::Get { value: None }),
+    )
+    .times(50)
+}
+
 fn harness() -> Harness {
     let transport = Arc::new(FakeTransport::new());
-    transport.script(names(P.0, Q.1)).script(names(Q.0, P.1));
+    transport
+        .script(names(P.0, Q.1))
+        .script(names(Q.0, P.1))
+        .script(leads(R.0));
     let client = RawClient::with_options(
         transport.clone(),
         one_region_led_by_p(),
@@ -110,44 +125,49 @@ fn stores(transport: &FakeTransport) -> Vec<u64> {
     transport.calls().iter().map(|call| call.store_id).collect()
 }
 
-/// **Nine attempts, alternating between two live peers, and the third never asked.**
+/// **A pair that names each other costs one extra hop, not the whole budget.**
 ///
-/// The sequence is the assertion, not just the error: a fake scripted wrongly could refuse
-/// everything and produce the same `RetriesExhausted` without any ping-pong at all.
+/// Before the fix this was nine attempts alternating `P, Q, P, Q …` and then `RetriesExhausted`.
+/// The sequence is still the assertion rather than the outcome: a fake scripted wrongly could
+/// succeed for the wrong reason, and `[P, Q, R]` is the only walk that means what this claims.
+///
+/// **Three, and the third is the cost.** `P` is the cached leader and refuses; `Q` is its hint and
+/// refuses; `Q`'s hint names `P`, which has already refused *this call*, so it stops being news and
+/// the rota resumes — reaching `R`, the one peer that had not answered and the only one that could
+/// be leading. Asserting the length is what keeps "this got one hop longer" from reading as a
+/// regression later: it is the price of the gate, and it is written down
+/// (`s1-107-loopfix-review.md` §5.1).
 #[test]
-fn two_peers_naming_each_other_spend_the_whole_budget() {
+fn a_pair_that_names_each_other_costs_one_extra_hop() {
     let harness = harness();
 
-    let error = harness.client.get(b"k").unwrap_err();
-    let Error::RetriesExhausted { attempts, source } = &error else {
-        panic!("the budget is what gives up here, not the deadline: {error:?}");
-    };
-    assert_eq!(*attempts, 9, "one attempt plus MAX_RETRIES: {error:?}");
-    assert!(
-        source.to_string().contains("not the leader of region 1"),
-        "the incident's own sentence: {source}"
-    );
+    harness
+        .client
+        .get(b"k")
+        .expect("the rota reaches the peer that is actually leading");
 
     assert_eq!(
         stores(&harness.transport),
-        vec![P.0, Q.0, P.0, Q.0, P.0, Q.0, P.0, Q.0, P.0],
-        "the cached leader is sent to unconditionally, so the call ping-pongs"
+        vec![P.0, Q.0, R.0],
+        "the cycle is cut after the second refusal and the rota finds the leader"
     );
 }
 
-/// **The third peer is never asked**, which is the half that says this is not a rotation.
+/// **A cached leader that keeps refusing is rotated past.**
 ///
-/// Stated as its own test rather than folded into the sequence above: if `target_at_skipping` ever
-/// starts rotating past a known leader, this is the assertion that should say so, and a reader
-/// should not have to work out which element of a nine-long vector carried that meaning.
+/// The inverse of what this file asserted before the fix, and kept as its own test for the same
+/// reason: a reader should not have to work out which element of a vector carried the meaning. A
+/// cached leader is still sent to first (`region_cache.rs:90`) — what changed is that its hint
+/// stops being followed once it has refused, so the rota can reach a peer this call has not heard
+/// from.
 #[test]
-fn a_known_leader_is_never_rotated_past() {
+fn a_leader_that_keeps_refusing_is_rotated_past() {
     let harness = harness();
     let _ = harness.client.get(b"k");
 
     assert!(
-        !stores(&harness.transport).contains(&R.0),
-        "a client that rotated would reach the third peer within three attempts: {:?}",
+        stores(&harness.transport).contains(&R.0),
+        "the peer that never refused is the only one that can be leading: {:?}",
         stores(&harness.transport)
     );
 }
@@ -168,19 +188,19 @@ fn the_epoch_never_moves() {
         .iter()
         .filter_map(|call| call.header().map(|header| header.epoch))
         .collect();
-    assert_eq!(epochs.len(), 9, "every attempt carried a header");
+    // **The property survives the fix; the count did not.** This assertion said `9` while the
+    // call ping-ponged, and saying "this test is unaffected by the fix" was wrong twice before it
+    // was checked against the walk. Three hops now, and the epoch is still what it was.
+    assert_eq!(epochs.len(), 3, "every attempt carried a header");
     assert!(
         epochs.iter().all(|epoch| *epoch == Epoch::INITIAL),
         "a NotLeader hint moves no epoch: {epochs:?}"
     );
 }
 
-/// **The fix's own test, and it is red today** — a call should not spend its whole budget on two
-/// peers that have each already refused it.
-///
-/// `#[ignore]` everywhere else in this crate means *slow*, so the reason string says what this one
-/// is instead: it is a claim about behaviour that does not exist yet. Deleting the ignore is how
-/// the next window starts, and the assertion below is what it has to turn green.
+/// **The fix's own test.** It shipped red and ignored one commit before the gate that made it
+/// pass, which is the only reason its assertion is worded as a claim rather than as a
+/// description: it was written down before it was true.
 ///
 /// **Why the third peer is the observable.** The client cannot tell a stale hint from a fresh one —
 /// a follower naming its believed leader is answering honestly — so the fix is not "distrust the
@@ -189,7 +209,6 @@ fn the_epoch_never_moves() {
 /// already does when the leader is unknown (`region_cache.rs:104`). `R` is then reached, and `R` is
 /// the only one of the three that could be leading.
 #[test]
-#[ignore = "#107: the client has no cycle guard for NotLeader hints; this is next window's red"]
 fn a_call_stops_asking_two_peers_that_have_both_refused_it() {
     let harness = harness();
     let _ = harness.client.get(b"k");
@@ -202,38 +221,29 @@ fn a_call_stops_asking_two_peers_that_have_both_refused_it() {
     );
 }
 
-/// **The second call is no better off than the first**, which is the thirty seconds.
+/// **The bad leader does not outlive the call that learned it**, which is where the thirty
+/// seconds went.
 ///
 /// A call resets `fruitless` and `corpses`, but the bad leader lives in the `RegionCache` on the
 /// `Router` (`region_cache.rs:312`) and no call clears it. That is the only piece of this state
 /// that outlives a call, and it is what turns one budget into a wall clock: six of these fill the
 /// thirty seconds the incident's `settle` spent.
 #[test]
-fn the_bad_leader_outlives_the_call_that_learned_it() {
+fn the_bad_leader_does_not_outlive_the_call() {
     let harness = harness();
 
-    let first = harness.client.get(b"k").unwrap_err();
-    assert!(matches!(first, Error::RetriesExhausted { attempts: 9, .. }));
+    harness.client.get(b"k").expect("the first call recovers");
 
     harness.transport.clear_log();
-    let second = harness.client.get(b"k").unwrap_err();
+    harness
+        .client
+        .get(b"k")
+        .expect("and so does the next one, from a cache that was not left lying");
 
-    let Error::RetriesExhausted { attempts, .. } = &second else {
-        panic!("the second call gives up the same way: {second:?}");
-    };
     assert_eq!(
-        *attempts, 9,
-        "a fresh call, the same cached lie: {second:?}"
-    );
-
-    let visited = stores(&harness.transport);
-    assert_eq!(visited.len(), 9, "{visited:?}");
-    assert!(
-        visited.iter().all(|store| *store == P.0 || *store == Q.0),
-        "still only the two that name each other: {visited:?}"
-    );
-    assert!(
-        visited.windows(2).all(|pair| pair[0] != pair[1]),
-        "still alternating: {visited:?}"
+        stores(&harness.transport),
+        vec![P.0, Q.0, R.0],
+        "the second call walks the same three, which means it did not start from a stale leader \
+         that the first call had already found wanting"
     );
 }
