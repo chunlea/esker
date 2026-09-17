@@ -25,13 +25,86 @@ use esker_sql::pgwire::tls::TlsConfig;
 /// The tenant every connection is served as, until there is a way to say otherwise.
 const TENANT: u64 = 1;
 
+/// The filter this binary installs: the operator's directives, with `info` still underneath.
+///
+/// **`RUST_LOG` replaces the filter, it does not add to it.** The shape this replaces —
+/// `try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))` — falls back to `info` only
+/// when the variable is *absent*, so `RUST_LOG=esker_store::transport=debug` silenced every `INFO`
+/// this binary emits. A readiness check waiting for one waited out its whole deadline: that is how
+/// `store_starts_before_its_driver` cost a gate 30 s on 2026-09-17.
+///
+/// Three cases, and the third is why this is not one line:
+///
+/// * nothing set — `info`, as before;
+/// * targets named — those targets, and `info` for everything else;
+/// * a bare level (`RUST_LOG=warn`) — **the operator wins**, and `info` is not added back.
+///
+/// The third cannot be had from `add_directive` alone. `DirectiveSet::add` orders by specificity
+/// and *replaces* on an exact match, and two targetless directives are equally specific — so
+/// adding `info` on top of a bare `warn` would overwrite it rather than sit under it.
+fn env_filter() -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::filter::LevelFilter;
+
+    let Ok(raw) = std::env::var("RUST_LOG") else {
+        return EnvFilter::new("info");
+    };
+    // A filter that will not parse is not worth failing a process over; the old shape said the
+    // same thing by falling back, and this keeps that.
+    let Ok(filter) = EnvFilter::try_new(&raw) else {
+        return EnvFilter::new("info");
+    };
+    if names_a_global_level(&raw) {
+        filter
+    } else {
+        filter.add_directive(LevelFilter::INFO.into())
+    }
+}
+
+/// Whether any directive in `raw` sets a level for **everything** rather than for one target.
+///
+/// A directive with no `=` is not necessarily a level: `RUST_LOG=esker_store` names a *target* and
+/// means trace for it. Only the level words are global, which is why this matches on them rather
+/// than on the absence of a target.
+fn names_a_global_level(raw: &str) -> bool {
+    raw.split(',').any(|directive| {
+        let directive = directive.trim();
+        !directive.contains('=')
+            && matches!(
+                directive.to_ascii_lowercase().as_str(),
+                "trace" | "debug" | "info" | "warn" | "error" | "off"
+            )
+    })
+}
+
+#[cfg(test)]
+mod env_filter_tests {
+    use super::names_a_global_level;
+
+    /// **Nothing set** is not this function's case, but the two that follow are, and this names the
+    /// boundary: a bare target is not a level.
+    #[test]
+    fn a_bare_target_is_not_a_global_level() {
+        assert!(!names_a_global_level("esker_store::transport=debug"));
+        assert!(!names_a_global_level("esker_store"));
+        assert!(!names_a_global_level(
+            "esker_raft=debug,esker_store::transport=debug"
+        ));
+    }
+
+    /// **A bare level is one**, in any case and in any position.
+    #[test]
+    fn a_bare_level_is_a_global_level() {
+        for raw in ["warn", "WARN", " warn ", "off", "esker_raft=debug,warn"] {
+            assert!(names_a_global_level(raw), "{raw}");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(env_filter())
         .init();
 
     // `esker-sql [--pd HOST:PORT] [listen] [store...]`. With no stores the node runs on the
