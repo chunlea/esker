@@ -1,0 +1,21 @@
+crates/esker-client/src/router.rs
+  s_f4b2852b53accb::t_9adb949ab3b735 252-253,303-304,326,457-464,468,470-474
+crates/esker-client/tests/leader_hint_ping_pong.rs
+  s_f4b2852b53accb::t_8dd49926202eb6 41-42,93-104,107-110,128-132,134-139,141,144-147,151-152,156,158-162,164,169-170,191-194,201-203,224-225,232,235,238-241,244-247
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0e998c3fa003a63ba50e2b55cc5010caba406e7a",
+  "prompts": {},
+  "sessions": {
+    "s_f4b2852b53accb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc7223c3-8ba0-48df-95c8-ddb365dc093c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
