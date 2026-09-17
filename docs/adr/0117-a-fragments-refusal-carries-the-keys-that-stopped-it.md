@@ -275,6 +275,16 @@ the `lock` column family, and two samples one lease apart tell a heartbeated loc
 one. **The number this page wants before the ruling is one number**: of the locks a fragment meets
 under a real write workload, what share belong to transactions that have already finished.
 
+**Where the third question is answered, decided 2026-09-17.** The share this page needs — of the
+locks a fragment meets, how many belong to transactions that have already finished — is not
+measurable by a test: any test writer's constants decide it, and the control arm that would have
+validated such a measurement cannot be built at all. It is answered instead by the aggregated
+lock-encounter counter of [ADR 0118](0118-a-counter-is-placed-at-a-door-and-counts-events.md),
+read over real traffic. **What that counter reports is a floor**: it separates a lock past its lease
+from one inside it, and a transaction whose primary has committed while this secondary's lock is
+still young is counted as live, so a near-zero reading rules out the expired mechanism and says
+nothing about the young-but-finished one.
+
 ### A fourth shape, which the code suggests and the brief did not ask for
 
 If the answer to that number is "few", none of (a)–(c) helps much, and the code already holds the

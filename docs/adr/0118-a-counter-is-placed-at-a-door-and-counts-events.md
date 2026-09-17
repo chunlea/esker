@@ -1,6 +1,6 @@
 # 0118 — A counter is placed at a door, and counts events
 
-Status: **Proposed**, 2026-09-17 — debt [#109](../plans/debts-v1.1.md), the number issued by the
+Status: **Accepted**, 2026-09-17 — debt [#109](../plans/debts-v1.1.md), the number issued by the
 coordinator. **This page stops at the design.** Nothing below is built; what follows is where a
 counter belongs, what it may count, what each kind costs, and the test that has to go red when it
 stops counting.
@@ -164,8 +164,17 @@ It is the **aggregated** kind: node-local, and it does not cross the wire, so §
 change. What it produces is read under the threshold registered in §④ and over an observation
 period, not statement by statement.
 
-**This page stays Proposed until that counter lands**; it turns Accepted when the counter and the
-test of §⑤ exist, because until then what is written here is a design and not a description.
+**Both now exist, which is what turns this page Accepted.** The counter is
+`crates/esker-store/src/lock_stats.rs`, judged at the door in `server.rs` by the lock's own `ttl_ms`
+against the read's own `ts`; the test is `the_lock_encounter_counter_counts_what_it_is_given` in
+`crates/esker-sql/tests/routing_differential.rs`, three steps of equality on increments, the last of
+which plants nothing and asserts the counter stands still.
+
+**One thing the test had to learn the hard way, recorded because the next reader will meet it.** A
+step that plants a lock inside a *long* lease and then scans does not return: the row path waits on
+a live lock, and that wait is not bounded by `statement_timeout` — which is now debt
+[#115](../plans/debts-v1.1.md). The step therefore plants a ten-second lease and lets it expire,
+which is bounded by construction rather than by a timeout that does not bind.
 
 **Not attempted**: any measurement of where the time goes in production. The profile in
 `q109-profile.md` describes a dev build of a single-process fixture, and the next table that would
