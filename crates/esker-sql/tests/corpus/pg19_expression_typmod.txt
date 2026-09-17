@@ -79,4 +79,21 @@ SELECT 1.5::numeric(10,0)	numeric(10,0)	2
 SELECT 1.5::numeric(10)	numeric(10,0)	2
 SELECT 1.5::numeric	numeric	1.5
 SELECT 1.5::numeric(10,2), 1.5::numeric(10,0), 1.5::numeric(10)	numeric(10,2),numeric(10,0),numeric(10,0)	1.50|2|2
+# ## The typed-literal spelling, which is the same rule one syntax over
+#
+# `TIMESTAMP(3) '…'`, `TIME(2) '…'` and `INTERVAL '…' DAY TO HOUR` declare themselves exactly as
+# the casts they are equivalent to — measured on 19beta1 through `\gdesc`
+# (`esker-coord/s2-114-types.out`). The first two are `TypedString`s and reach `lower_cast`, so
+# they are here as the **control**: they say whether this is one arm or a whole family.
+#
+# **A leading field also folds the value**, which is the half that is not about types at all:
+# `INTERVAL '1 day 2 hours' DAY` is `1 day` and `INTERVAL '1 year 5 mons 3 days' YEAR` is
+# `1 year`, both identical to the cast. `debts-v1.1.md` #114.
+SELECT INTERVAL '1' DAY	interval day	1 day
+SELECT INTERVAL '1 day 2 hours' DAY	interval day	1 day
+SELECT INTERVAL '1 year 5 mons 3 days' YEAR	interval year	1 year
+SELECT INTERVAL '1 2' DAY TO HOUR	interval day to hour	1 day 02:00:00
+SELECT INTERVAL '1.23456 sec' SECOND(3)	interval second(3)	00:00:01.235
+SELECT TIMESTAMP(3) '2020-01-01 01:02:03.456789'	timestamp(3) without time zone	2020-01-01 01:02:03.457
+SELECT TIME(2) '01:02:03.456789'	time(2) without time zone	01:02:03.46
 ROLLBACK		-

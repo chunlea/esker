@@ -4565,7 +4565,7 @@ fn lower_expr_inner(expr: &Expr) -> Result<plan::Expr> {
         // field** names the unit the bare number is in — `INTERVAL '1' DAY` is one day — and a
         // trailing one bounds the range, and that range is carried as a typmod now
         // (`interval_range_mask`) — the value reads under it, though the type a literal
-        // *reports* still does not carry it; `tests/interval.rs`'s `LITERAL_TYPE` says so.
+        // *reports* is the cast's too, which is what the `Expr::Cast` below is for (#114).
         Expr::Interval(interval) => {
             let text = cast_literal_text(&interval.value)?
                 .ok_or_else(|| SqlError::unsupported("an INTERVAL over a non-literal"))?;
@@ -4586,16 +4586,54 @@ fn lower_expr_inner(expr: &Expr) -> Result<plan::Expr> {
                 (Some(field), None) => format!("{text} {field}"),
                 (None, None) => text.clone(),
             };
-            let typmod =
+            let read_typmod =
                 range_mask.map_or(NO_TYPMOD, |mask| value::interval_typmod_of(mask, None));
-            let value = value::interval::from_text(&spelled, typmod)?;
-            Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
-                Datum::Interval {
-                    months: value.months,
-                    days: value.days,
-                    micros: value.micros,
+            let value = value::interval::from_text(&spelled, read_typmod)?;
+            let literal = plan::Expr::Literal(plan::Literal::typed(Box::new(Datum::Interval {
+                months: value.months,
+                days: value.days,
+                micros: value.micros,
+            })));
+            // **A typed literal declares itself as the cast it is equivalent to, and this is the
+            // one spelling that has to say so by hand.** `TIMESTAMP(3) '…'` and `TIME(2) '…'` are
+            // `TypedString`s and reach `lower_cast`, which keeps the modifier in
+            // `Expr::Cast { typmod }` where `exec::query::typmod_of` reads it. `sqlparser` gives
+            // `INTERVAL` a node of its own, so the mask was computed a few lines up and then
+            // dropped, and `\gdesc` answered a bare `interval` for all three spellings.
+            //
+            // **And it is not only the name.** A leading field *folds the value*:
+            // `INTERVAL '1 day 2 hours' DAY` is `1 day` on 19beta1, identical to
+            // `'1 day 2 hours'::interval day`, and `INTERVAL '1 year 5 mons 3 days' YEAR` is
+            // `1 year`. The cast carries the fold and the name together, which is why this is a
+            // cast rather than a modifier bolted to the literal
+            // (`esker-coord/s2-114-types.out`).
+            //
+            // **The operand is the value, already read, and not the text.** Reading `'1 2'` a
+            // second time with no mask is `22007`, so the cast has to start from what the mask
+            // already read; over a value it changes the declared type and folds, nothing else.
+            let declared = range_mask.or_else(|| {
+                let leading = interval.leading_field.as_ref()?;
+                interval_range_mask(leading, leading)
+            });
+            // `SECOND(3)` is the one field that takes a precision, and `sqlparser` puts a single
+            // number in `leading_precision`; the two-argument `SECOND(m, n)` puts the fractional
+            // half where its name says.
+            let precision = matches!(interval.leading_field, Some(DateTimeField::Second))
+                .then(|| {
+                    interval
+                        .fractional_seconds_precision
+                        .or(interval.leading_precision)
+                })
+                .flatten()
+                .and_then(|precision| u32::try_from(precision).ok());
+            Ok(match declared {
+                None => literal,
+                Some(mask) => plan::Expr::Cast {
+                    operand: Box::new(literal),
+                    to: ColumnType::Interval,
+                    typmod: value::interval_typmod_of(mask, precision),
                 },
-            ))))
+            })
         }
         // **`ARRAY( SELECT … )` is a sixth spelling**, and `sqlparser` gives it as a *function*
         // named `ARRAY` whose arguments are a subquery — which is why it refused as "the function

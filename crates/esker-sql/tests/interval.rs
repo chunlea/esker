@@ -37,16 +37,13 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // propagation (#28) — a cast carries its modifier now — and the `pg_type` row left when the
     // last of its five columns stopped diverging: `typname` is a `name` (ADR 0084), `typcategory`
     // a `"char"` (ADR 0095), `typinput` a `regproc` (ADR 0098) and `oid` an `oid` (ADR 0097).
-    // `typlen` always agreed. The row itself never changed a character.
-    // **The values agree; the type reported for them does not.** #112 gave the field mask to the
-    // parser, so `INTERVAL '1 2' DAY TO HOUR` is a day and two hours here as it is there — the
-    // rows on this line match. What still differs is the *type* each expression announces: 19beta1
-    // says `interval day` and `interval day to hour`, this node says a bare `interval` three
-    // times. The mask reaches the **value** through the typmod now and not the **type**, because
-    // `plan::Literal::typed` carries a `ColumnType` and no modifier, so a literal has nowhere to
-    // put one on its way to a `RowDescription`. A different layer from the one #112 paid for, and
-    // recorded in its row rather than argued here.
-    types: &["SELECT INTERVAL '1 day', INTERVAL '1' DAY, INTERVAL '1 2' DAY TO HOUR"],
+    //
+    // **`types` is empty too, since #114.** Its one entry was
+    // `SELECT INTERVAL '1 day', INTERVAL '1' DAY, INTERVAL '1 2' DAY TO HOUR`, whose rows agreed
+    // while its declared types did not: a typed `INTERVAL` literal reported a bare `interval`
+    // because `sqlparser` gives it a node of its own and the arm dropped the mask it had just
+    // computed. It lowers to an `Expr::Cast` now, like every other typed literal in the grammar.
+    types: &[],
     answers: &[
         (
             "SELECT justify_days('35 days'::interval), justify_hours('27 \
