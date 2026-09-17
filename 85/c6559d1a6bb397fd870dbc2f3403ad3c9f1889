@@ -1,0 +1,27 @@
+crates/esker-sql/tests/routing_differential.rs
+  s_8d3e4c2902bf64::t_8655f78ec79bad 4258-4390
+crates/esker-store/src/columnar/region.rs
+  s_8d3e4c2902bf64::t_cef91a5a589bf4 954-967,974,992-996
+crates/esker-store/src/lock_stats.rs
+  s_8d3e4c2902bf64::t_c6386b4139140e 1-110
+crates/esker-store/src/server.rs
+  s_8d3e4c2902bf64::t_5866548423a8b7 3031-3037,3041,3043-3044
+crates/esker-store/src/lib.rs
+  s_8d3e4c2902bf64::t_9ee953ba5f63f4 60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "85c6559d1a6bb397fd870dbc2f3403ad3c9f1889",
+  "prompts": {},
+  "sessions": {
+    "s_8d3e4c2902bf64": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "659d2e1a-5f3d-4bce-b89c-3a0e26ad5c90",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
