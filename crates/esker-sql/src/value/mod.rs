@@ -1287,13 +1287,12 @@ pub fn operator_exists(op: &str, ty: ColumnType) -> bool {
 /// dies parsing a nested `jsonb` on a 2 MiB thread, and it died at **750 levels**, which is about
 /// 2,796 bytes a level. **A `tsquery` level is dearer, because one bracket is five frames**
 /// (`or → and → phrase → unary → primary`): staged on a 43 MiB thread it parses 5,000 levels and
-/// dies at 10,000, which puts it between 4.3 and 8.6 KiB. The figure below is sized for the worse
-/// of the two and rounded up by half again — json's own number under-sized the thread and left a
-/// ten-thousand-level tsquery dying after `BUILT`, measured. The rest of this comment is the
-/// **2,796 bytes** a level in a debug build. Rounded up by half again the way
-/// [`crate::parse`]'s figures are, and the release number is that over four: the same ratio the
-/// nesting and plan constants use, and being wrong on the safe side costs reserved address space
-/// rather than a crash.
+/// dies at 10,000, which puts it between 4.3 and 8.6 KiB. **The figure below is 12 KiB a level in a
+/// debug build**: json's own 2,796 bytes raised for the dearer of the two parsers and rounded up by
+/// half again, the way [`crate::parse`]'s figures are — json's own number under-sized the thread and
+/// left a ten-thousand-level tsquery dying after `BUILT`, measured. The release number is that over
+/// four: the same ratio the nesting and plan constants use, and being wrong on the safe side costs
+/// reserved address space rather than a crash.
 const STACK_PER_VALUE_LEVEL: usize = if cfg!(debug_assertions) {
     12 * 1024
 } else {
@@ -1322,12 +1321,12 @@ pub(crate) const MAX_VALUE_DEPTH: usize = 10_000;
 /// The stack given to the thread that parses a value deeper than [`INLINE_VALUE_DEPTH`].
 ///
 /// Enough for [`MAX_VALUE_DEPTH`] levels plus slack for the frames that are not per-level: about
-/// **44 MiB** in debug and 14 MiB in release. Reserved address space and not committed memory, so a
+/// **124 MiB** in debug and 34 MiB in release. Reserved address space and not committed memory, so a
 /// value that does not nest does not pay for it — and only a value past the inline depth gets a
 /// thread at all.
 const DEEP_VALUE_STACK_BYTES: usize = MAX_VALUE_DEPTH * STACK_PER_VALUE_LEVEL + 4 * 1024 * 1024;
 
-/// Below this nesting a value is parsed on the caller's own stack: 256 levels in debug, 1,024 in
+/// Below this nesting a value is parsed on the caller's own stack: 85 levels in debug, 341 in
 /// release. Ordinary JSON is far below either and never leaves the caller's thread.
 ///
 /// Half of the 2 MiB a `tokio` worker gets, over the per-level cost — the budget
