@@ -475,13 +475,43 @@ pub(super) fn truncate_to_mask(value: &Interval, mask: i32) -> Interval {
     }
 }
 
+/// The unit a bare number takes under a field mask: the mask's **lowest** field.
+///
+/// Measured (`esker-coord/s2-h112-gaps.out`): `'5'::interval day to hour` is `05:00:00` — five
+/// hours, not five days — and `'5'::interval year to month` is five months. It is the same rule
+/// [`truncate_to_mask`] follows, and for the same reason: for a value, a range's upper end does
+/// nothing.
+///
+/// The full range has [`MASK_SECOND`] set, so `interval` and `interval(p)` land on `seconds`, which
+/// is what a bare number meant here before any of this. That is why there is no special case for
+/// them.
+#[must_use]
+pub(super) fn floor_unit(mask: i32) -> &'static str {
+    if mask & MASK_SECOND != 0 {
+        "seconds"
+    } else if mask & MASK_MINUTE != 0 {
+        "minutes"
+    } else if mask & MASK_HOUR != 0 {
+        "hours"
+    } else if mask & MASK_DAY != 0 {
+        "days"
+    } else if mask & MASK_MONTH != 0 {
+        "months"
+    } else if mask & MASK_YEAR != 0 {
+        "years"
+    } else {
+        "seconds"
+    }
+}
+
 /// PostgreSQL's `interval_in`, for the shapes this node reads.
 ///
 /// Three grammars in one, all measured: a **unit list** (`1 year 2 mons 3 days 04:05:06`, with
 /// `ago` negating the whole thing), the **ISO-8601** form (`P1Y2M3DT4H5M6S`), and the SQL forms
 /// `1-2` (year-month) and `3 4:05:06` (day and time). A fractional unit **cascades into the next
 /// one down**: `1.5 months` is `1 mon 15 days` and `1.5 days` is `1 day 12:00:00`.
-pub fn from_text(text: &str) -> Result<Interval> {
+pub fn from_text(text: &str, typmod: i32) -> Result<Interval> {
+    let mask = super::interval_mask_of_typmod(typmod).unwrap_or(super::INTERVAL_FULL_RANGE);
     let body = text.trim();
     if body.is_empty() {
         return Err(invalid(text));
@@ -502,6 +532,29 @@ pub fn from_text(text: &str) -> Result<Interval> {
     // Whether a clock has already given the time part, which is what makes `'5 days 3'` three
     // seconds and `'1:00 5'` an error. Measured, both.
     let mut clocked = false;
+    // **`'1 2'` under `day to hour`, and under nothing else.** This is SQL's day-to-hour form:
+    // two bare numbers, the range's two ends. Measured on 19beta1 — `day to hour` reads it as a day
+    // and two hours while `day to minute`, `day to second`, `year to month`, `hour to minute` and
+    // the bare type all answer `22007`, so the rule is written as narrowly as it was measured and
+    // is **not** generalised to "two numbers map onto any range's ends".
+    if mask == MASK_DAY | MASK_HOUR {
+        let parts: Vec<&str> = body.split_whitespace().collect();
+        if let [days, hours] = parts.as_slice()
+            && is_plain_decimal(days)
+            && is_plain_decimal(hours)
+        {
+            let days: f64 = days.parse().map_err(|_| invalid(text))?;
+            let hours: f64 = hours.parse().map_err(|_| invalid(text))?;
+            let mut total = Interval {
+                months: 0,
+                days: 0,
+                micros: 0,
+            };
+            apply_unit(&mut total, days, "days", text)?;
+            apply_unit(&mut total, hours, "hours", text)?;
+            return Ok(total);
+        }
+    }
     let mut tokens = body.split_whitespace().peekable();
     while let Some(token) = tokens.next() {
         // `04:05:06` and `-12:00:00`: a clock, wherever it appears in the list.
@@ -536,7 +589,7 @@ pub fn from_text(text: &str) -> Result<Interval> {
         // `'1 day ago'` is not). The spelling is stricter than a `f64` parse, because `'3e2'` is
         // `22007` there and `"inf"` and `"nan"` parse as floats here.
         if tokens.peek().is_none() && !clocked && !negate && is_plain_decimal(token) {
-            apply_unit(&mut total, amount, "seconds", text)?;
+            apply_unit(&mut total, amount, floor_unit(mask), text)?;
             seen = true;
             continue;
         }

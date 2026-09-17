@@ -330,3 +330,31 @@ fn a_typmod_with_no_field_mask_is_refused() {
         assert_eq!(error.to_string(), message, "{typmod}");
     }
 }
+
+/// **A bare number takes its unit from the mask's lowest field**, which is the rule that reads
+/// backwards: `'5'::interval day to hour` is five *hours*, not five days.
+///
+/// Measured (`esker-coord/s2-h112-gaps.out`). The full range has `second` in it, so a plain
+/// `interval` still reads a bare number as seconds — that answer comes out of the same branch
+/// rather than out of a special case, which is why it is pinned here beside the others.
+#[test]
+fn a_bare_number_takes_the_masks_lowest_unit() {
+    let mut node = parity::Node::new(&[]);
+    for (ty, expected) in [
+        ("interval", "00:00:05"),
+        ("interval day", "5 days"),
+        ("interval hour", "05:00:00"),
+        ("interval minute", "00:05:00"),
+        ("interval year", "5 years"),
+        ("interval day to hour", "05:00:00"),
+        ("interval hour to second", "00:00:05"),
+        ("interval year to month", "5 mons"),
+        ("interval minute to second", "00:00:05"),
+    ] {
+        assert_eq!(
+            node.rows(&format!("SELECT CAST('5'::text AS {ty})"))[0][0],
+            expected,
+            "{ty}"
+        );
+    }
+}

@@ -2602,7 +2602,14 @@ impl Literal {
         clippy::too_many_lines,
         reason = "one arm per literal kind per column type, and a `_` would hide the next one"
     )]
-    pub fn assign(&self, ty: ColumnType, column: &str) -> Result<Datum> {
+    /// `typmod` is the column's modifier, or [`crate::value::NO_TYPMOD`] when the target has
+    /// none — assigning to `?column?` rather than to a column, say.
+    ///
+    /// It is here because **`interval`'s modifier changes how a literal parses**, not only how it
+    /// is folded afterwards: `'1 2'` is a day and two hours for a `day to hour` column and `22007`
+    /// for a plain one. A value that cannot be read cannot be folded, so the modifier has to
+    /// arrive with the text.
+    pub fn assign(&self, ty: ColumnType, column: &str, typmod: i32) -> Result<Datum> {
         let mismatch = || {
             Err(SqlError::DatatypeMismatchInColumn {
                 column: column.to_owned(),
@@ -2617,7 +2624,7 @@ impl Literal {
 
             // The `unknown` literal: whatever the column is, read it as that. This is one
             // function, checked against a real server for all six types, rather than six rules.
-            Literal::String(text) => Datum::from_text(ty, text),
+            Literal::String(text) => Datum::from_text_with(ty, text, typmod),
 
             Literal::Integer(value) => match ty {
                 // **An integer is a `regtype`**, printing as the type it names or as its own
@@ -3026,9 +3033,12 @@ impl Expr {
     ///
     /// A `$1` with nothing bound to it is `42P02`, which is what PostgreSQL answers a simple query
     /// that contains one — the simple query protocol has no way to carry a parameter.
-    pub fn evaluate(&self, ty: ColumnType, column: &str) -> Result<Datum> {
+    /// `typmod` is the column's modifier, for the same reason [`Literal::assign`] takes one:
+    /// an `interval`'s mask decides how its literal *parses*, so it has to arrive with the
+    /// text rather than be applied to a value that could not be read.
+    pub fn evaluate(&self, ty: ColumnType, column: &str, typmod: i32) -> Result<Datum> {
         match self {
-            Expr::Literal(literal) => literal.assign(ty, column),
+            Expr::Literal(literal) => literal.assign(ty, column, typmod),
             Expr::Parameter(number) => Err(SqlError::UndefinedParameter(*number)),
             other => Err(SqlError::unsupported(format!(
                 "{} in a VALUES list",

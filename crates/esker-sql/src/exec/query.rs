@@ -3288,7 +3288,7 @@ fn collect_bounds(
                 return;
             }
             let column = &table.columns[ordinal];
-            if let Ok(value) = literal.assign(column.ty, &column.name)
+            if let Ok(value) = literal.assign(column.ty, &column.name, column.typmod)
                 && !matches!(value, Datum::Null)
             {
                 found.push((op, value));
@@ -3378,7 +3378,7 @@ fn collect_equalities(
             };
             let column = &table.columns[ordinal];
             // A literal that will not assign is not a plan decision; the filter will report it.
-            if let Ok(value) = pair.1.assign(column.ty, &column.name)
+            if let Ok(value) = pair.1.assign(column.ty, &column.name, column.typmod)
                 && !matches!(value, Datum::Null)
             {
                 found.push((ordinal, value));
@@ -3488,7 +3488,7 @@ fn pinned_across_join(
         if position_of(reference, scope)? != tied_to {
             return None;
         }
-        match literal.assign(column.ty, &column.name) {
+        match literal.assign(column.ty, &column.name, column.typmod) {
             Ok(Datum::Int8(oid)) => Some(oid),
             _ => None,
         }
@@ -6010,7 +6010,9 @@ fn retype(
             crate::value::reg_namespace::unnamed(oid),
         )));
     }
-    match literal.assign(ty, "?column?") {
+    // `?column?` is an expression's own type, not a column's, so there is no modifier to
+    // carry — the one call here that means `NO_TYPMOD` rather than having forgotten one.
+    match literal.assign(ty, "?column?", crate::value::NO_TYPMOD) {
         // Reduced to a value of the column's own type, so the comparison is between two of them.
         Ok(value) => Ok(match value {
             Datum::Int8(value) => Literal::Integer(value),
@@ -7636,7 +7638,9 @@ pub(super) fn expr_type(expr: &Expr, scope: &Scope<'_>) -> Result<ColumnType> {
 /// A `LIMIT` or `OFFSET` value: an integer, and not a negative one.
 fn count(expr: Option<&Expr>, what: &'static str) -> Result<Option<usize>> {
     let Some(expr) = expr else { return Ok(None) };
-    let value = expr.evaluate(ColumnType::Int8, what)?;
+    // An `int8` has no modifier to carry, and this is a `LIMIT`/`OFFSET` count rather than a
+    // column — `NO_TYPMOD` here is the answer, not an omission.
+    let value = expr.evaluate(ColumnType::Int8, what, crate::value::NO_TYPMOD)?;
     match value {
         // `LIMIT NULL` means no limit, which is PostgreSQL's rule and not an oversight.
         Datum::Null => Ok(None),

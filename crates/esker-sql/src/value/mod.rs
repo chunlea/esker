@@ -2803,9 +2803,7 @@ impl PgDatum for Datum {
         reason = "one input function per type, in one match; splitting it would put a type's \
                   reading somewhere other than beside every other type's"
     )]
-    // `_typmod` until the commit that reads it: this one changes no behaviour, and a bound
-    // parameter nothing uses is a `-D warnings` failure. The `interval` arm is where it lands.
-    fn from_text_with(ty: ColumnType, text: &str, _typmod: i32) -> Result<Datum> {
+    fn from_text_with(ty: ColumnType, text: &str, typmod: i32) -> Result<Datum> {
         Ok(match ty {
             // **The first *byte*, printed the way the output function prints it.** `'abc'` is
             // `a` and `'é'` is the first byte of a two-byte character, which is not valid UTF-8
@@ -3052,7 +3050,7 @@ impl PgDatum for Datum {
             ColumnType::Uuid => Datum::Uuid(uuid::from_text(text)?),
             ColumnType::Oid => Datum::Oid(oid::from_text(text)?),
             ColumnType::Interval => {
-                let value = interval::from_text(text)?;
+                let value = interval::from_text(text, typmod)?;
                 Datum::Interval {
                     months: value.months,
                     days: value.days,

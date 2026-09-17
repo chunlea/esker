@@ -17,8 +17,8 @@
 
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, BinaryOperator, CharacterLength, ColumnOption,
-    ConstraintReferenceMatchKind, CreateTableOptions, DataType, DeferrableInitial, Distinct,
-    DollarQuotedString, ExactNumberInfo, Expr, FromTable, FunctionArg, FunctionArgExpr,
+    ConstraintReferenceMatchKind, CreateTableOptions, DataType, DateTimeField, DeferrableInitial,
+    Distinct, DollarQuotedString, ExactNumberInfo, Expr, FromTable, FunctionArg, FunctionArgExpr,
     GeneratedAs, GroupByExpr, Ident, IndexColumn, IndexType, IntervalFields, JoinConstraint,
     JoinOperator, LimitClause, NullsDistinctOption, ObjectName, ObjectType, OffsetRows,
     OrderByKind, Query, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
@@ -265,6 +265,32 @@ fn interval_field_mask(fields: IntervalFields) -> i32 {
         IntervalFields::HourToSecond => HOUR | MINUTE | SECOND,
         IntervalFields::MinuteToSecond => MINUTE | SECOND,
     }
+}
+
+/// The mask a `… <leading> TO <last>` range names, or `None` for a pair this node cannot place.
+///
+/// The fields are ordered as PostgreSQL orders them and the mask is the **OR of everything between
+/// the two ends**, which is what 19beta1 stores: `day to second` is `8 | 1024 | 2048 | 4096 = 7176`
+/// (`esker-coord/s2-h112-fields.out`). `sqlparser`'s `DateTimeField` carries more variants than an
+/// interval range can use — `WEEK`, `DOY`, a timezone — and a pair this cannot place answers `None`
+/// rather than guessing, which leaves the statement to be read exactly as it was before.
+fn interval_range_mask(leading: &DateTimeField, last: &DateTimeField) -> Option<i32> {
+    use crate::value::{
+        INTERVAL_MASK_DAY as DAY, INTERVAL_MASK_HOUR as HOUR, INTERVAL_MASK_MINUTE as MINUTE,
+        INTERVAL_MASK_MONTH as MONTH, INTERVAL_MASK_SECOND as SECOND, INTERVAL_MASK_YEAR as YEAR,
+    };
+    const ORDER: [i32; 6] = [YEAR, MONTH, DAY, HOUR, MINUTE, SECOND];
+    let place = |field: &DateTimeField| match field {
+        DateTimeField::Year => Some(0),
+        DateTimeField::Month => Some(1),
+        DateTimeField::Day => Some(2),
+        DateTimeField::Hour => Some(3),
+        DateTimeField::Minute => Some(4),
+        DateTimeField::Second => Some(5),
+        _ => None,
+    };
+    let (from, to) = (place(leading)?, place(last)?);
+    (from <= to).then(|| ORDER[from..=to].iter().fold(0, |mask, bit| mask | bit))
 }
 
 /// The `COLLATE` an `ALTER COLUMN … TYPE` named, which came off the source so the statement would
@@ -4531,17 +4557,32 @@ fn lower_expr_inner(expr: &Expr) -> Result<plan::Expr> {
         // `INTERVAL '1 day'` and `INTERVAL '1' DAY`: SQL's typed-literal spelling for this one
         // type, which `sqlparser` gives its own node rather than a `TypedString`. A **leading
         // field** names the unit the bare number is in — `INTERVAL '1' DAY` is one day — and a
-        // trailing one bounds the range, which is the typmod this node drops.
+        // trailing one bounds the range, and that range is carried as a typmod now
+        // (`interval_range_mask`) — the value reads under it, though the type a literal
+        // *reports* still does not carry it; `tests/interval.rs`'s `LITERAL_TYPE` says so.
         Expr::Interval(interval) => {
             let text = cast_literal_text(&interval.value)?
                 .ok_or_else(|| SqlError::unsupported("an INTERVAL over a non-literal"))?;
-            let spelled = match &interval.leading_field {
+            // **`… DAY TO HOUR` is a range, and a range is a mask.** A single leading field is
+            // still appended to the text — `INTERVAL '1' DAY` is read as `1 DAY` — because that
+            // is the unit the literal is missing. A *range* cannot be appended: `'1 2' DAY` is
+            // not a spelling of anything. It is carried as the typmod instead, which is what lets
+            // `INTERVAL '1 2' DAY TO HOUR` be a day and two hours, measured on 19beta1.
+            let range_mask = interval.last_field.as_ref().and_then(|last| {
+                let leading = interval.leading_field.as_ref()?;
+                interval_range_mask(leading, last)
+            });
+            let spelled = match (&interval.leading_field, range_mask) {
+                // A range reads under its mask; appending words would spoil the text.
+                (_, Some(_)) => text.clone(),
                 // Already carries its own units, so the field adds nothing.
                 _ if text.contains(|c: char| c.is_ascii_alphabetic()) => text.clone(),
-                Some(field) => format!("{text} {field}"),
-                None => text.clone(),
+                (Some(field), None) => format!("{text} {field}"),
+                (None, None) => text.clone(),
             };
-            let value = value::interval::from_text(&spelled)?;
+            let typmod =
+                range_mask.map_or(NO_TYPMOD, |mask| value::interval_typmod_of(mask, None));
+            let value = value::interval::from_text(&spelled, typmod)?;
             Ok(plan::Expr::Literal(plan::Literal::typed(Box::new(
                 Datum::Interval {
                     months: value.months,
@@ -6792,7 +6833,14 @@ fn lower_cast(expr: &Expr, data_type: &DataType) -> Result<plan::Expr> {
                 };
                 let value = match converted {
                     Some(value) => value,
-                    None => value::truncate_to_typmod(Datum::from_text(ty, &text)?, ty, typmod)?,
+                    // **The modifier reaches the read, not only the fold.** An interval's
+                    // mask decides how the text parses — `'5'::interval day` is five days
+                    // and not five seconds truncated to none.
+                    None => value::truncate_to_typmod(
+                        Datum::from_text_with(ty, &text, typmod)?,
+                        ty,
+                        typmod,
+                    )?,
                 };
                 // **A folded cast still carries the type it named.** Several types share one
                 // `Datum` — `text`, `varchar`, `bpchar` and `name` are all a `Datum::Text` — so

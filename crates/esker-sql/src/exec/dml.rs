@@ -1055,7 +1055,9 @@ fn value_for_column(
         );
     }
     match expr {
-        crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name),
+        crate::plan::Expr::Literal(literal) => {
+            literal.assign(column.ty, &column.name, column.typmod)
+        }
         // A `$1` with nothing bound to it. The simple query protocol has no way to carry one, and
         // the extended protocol has already substituted it by the time a plan reaches here.
         crate::plan::Expr::Parameter(number) => Err(SqlError::UndefinedParameter(*number)),
@@ -1067,7 +1069,7 @@ fn value_for_column(
         // of a planner bug, which is a worse thing to tell a client than the name of the gap.
         crate::plan::Expr::Aggregate(_)
         | crate::plan::Expr::SetFunc(_)
-        | crate::plan::Expr::Subquery(_) => expr.evaluate(column.ty, &column.name),
+        | crate::plan::Expr::Subquery(_) => expr.evaluate(column.ty, &column.name, column.typmod),
         other => {
             let resolved = query::resolve(other, &query::Scope::empty())?;
             super::assign::into_column(
@@ -1190,7 +1192,7 @@ fn assigned_value(
             Ok((value, user, Some(named)))
         }
         crate::plan::Expr::Literal(literal) => literal
-            .assign(at.column.ty, &at.column.name)
+            .assign(at.column.ty, &at.column.name, at.column.typmod)
             .map(|value| (value, None, None)),
         other => {
             let resolved = query::resolve_against_scope(other, at.scope)?;
@@ -2091,7 +2093,9 @@ fn apply_conflict_update(
             })?;
         let column = &table.columns[ordinal];
         let evaluated = match value {
-            crate::plan::Expr::Literal(literal) => literal.assign(column.ty, &column.name)?,
+            crate::plan::Expr::Literal(literal) => {
+                literal.assign(column.ty, &column.name, column.typmod)?
+            }
             other => {
                 // **`excluded.nosuchcol` has its own sentence** — qualified and unquoted — where a
                 // missing column of the table keeps the ordinary one. Measured, one pair.

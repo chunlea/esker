@@ -5029,7 +5029,9 @@ fn cast_one_value(
     // The modifier the cast wrote, applied the way a column's is: `$1::varchar(3)` bounds the
     // string exactly as a `varchar(3)` column would — and for an array it is the **element's**
     // modifier, which is the one `lower_type` puts on the array cast.
-    crate::value::truncate_to_typmod(Datum::from_text(to, &text)?, to, typmod)
+    // The modifier reaches the read as well as the fold: an interval's mask decides how the
+    // text parses, so `'5'::interval day` is five days rather than five seconds truncated.
+    crate::value::truncate_to_typmod(Datum::from_text_with(to, &text, typmod)?, to, typmod)
 }
 
 /// **`regclassin`'s own rule**: all digits are an oid, anything else is a relation name.

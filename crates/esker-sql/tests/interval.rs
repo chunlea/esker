@@ -24,10 +24,6 @@ mod parity;
 /// Nothing: the corpus builds its own table.
 const CORPUS_FIXTURE: &[&str] = &[];
 
-/// What this node answers differently, and why.
-/// One of `DIVERGENCES`' reasons: the typmod is a **bitmask** and this node drops it.
-const TYPMOD: &str = "**The mask is stored now; what is missing is the literal reader.** #112's representation half landed: a declared field list is packed into the typmod exactly as PostgreSQL packs it, spelled back by `format_type`, folded into a stored value, and a typmod with a zero field mask is refused rather than printed. What `interval::from_text` still cannot do is let the mask decide how a literal *reads* — `'1 2'` is one day and two hours **because** the column is `day to hour`, and `'1-2'` a year and two months under `year to month`. Without that the inserts below are refused, which is what a real server does with the same literal and **no** typmod (`'1 2'::interval` is `22007` there too), and every row that reads the table follows because the rows were never inserted. The thirteen entries left here are that one gap seen from thirteen places.";
-
 /// Functions this node has for no type.
 const FUNCTIONS: &str = "A function this node does not implement for any type, named rather than \
      answered: `justify_days`/`justify_hours`/`justify_interval` are the three that do the \
@@ -42,66 +38,16 @@ const DIVERGENCES: parity::Divergences = parity::Divergences {
     // last of its five columns stopped diverging: `typname` is a `name` (ADR 0084), `typcategory`
     // a `"char"` (ADR 0095), `typinput` a `regproc` (ADR 0098) and `oid` an `oid` (ADR 0097).
     // `typlen` always agreed. The row itself never changed a character.
-    types: &[],
+    // **The values agree; the type reported for them does not.** #112 gave the field mask to the
+    // parser, so `INTERVAL '1 2' DAY TO HOUR` is a day and two hours here as it is there — the
+    // rows on this line match. What still differs is the *type* each expression announces: 19beta1
+    // says `interval day` and `interval day to hour`, this node says a bare `interval` three
+    // times. The mask reaches the **value** through the typmod now and not the **type**, because
+    // `plan::Literal::typed` carries a `ColumnType` and no modifier, so a literal has nowhere to
+    // put one on its way to a `RowDescription`. A different layer from the one #112 paid for, and
+    // recorded in its row rather than argued here.
+    types: &["SELECT INTERVAL '1 day', INTERVAL '1' DAY, INTERVAL '1 2' DAY TO HOUR"],
     answers: &[
-        (
-            "INSERT INTO iv VALUES (1, '1 year 2 mons 3 days 04:05:06', '1.5 seconds', \
-             '1 day', '1 2', '1-2')",
-            TYPMOD,
-            "pg19_interval.txt:64",
-        ),
-        (
-            "INSERT INTO iv VALUES (2, '1 mon', '00:00:00', '2 days', '0 0', '0-0')",
-            TYPMOD,
-            "pg19_interval.txt:65",
-        ),
-        (
-            "INSERT INTO iv VALUES (3, '30 days', '00:00:00', '3 days', '0 0', '0-0')",
-            TYPMOD,
-            "pg19_interval.txt:66",
-        ),
-        (
-            "INSERT INTO iv VALUES (4, '-1 day', '00:00:00', '-1 days', '0 0', '0-0')",
-            TYPMOD,
-            "pg19_interval.txt:67",
-        ),
-        (
-            "SELECT id, a, b, c, d, e FROM iv ORDER BY id",
-            TYPMOD,
-            "pg19_interval.txt:69",
-        ),
-        (
-            "SELECT id, a FROM iv ORDER BY a",
-            TYPMOD,
-            "pg19_interval.txt:70",
-        ),
-        (
-            "SELECT id, a FROM iv ORDER BY a DESC",
-            TYPMOD,
-            "pg19_interval.txt:71",
-        ),
-        (
-            "SELECT id FROM iv WHERE a = '1 mon' ORDER BY id",
-            TYPMOD,
-            "pg19_interval.txt:73",
-        ),
-        (
-            "SELECT id FROM iv WHERE a > '1 day' ORDER BY id",
-            TYPMOD,
-            "pg19_interval.txt:74",
-        ),
-        (
-            "SELECT count(*), count(a), min(a), max(a) FROM iv",
-            TYPMOD,
-            "pg19_interval.txt:75",
-        ),
-        ("SELECT sum(a) FROM iv", TYPMOD, "pg19_interval.txt:76"),
-        ("SELECT avg(a) FROM iv", TYPMOD, "pg19_interval.txt:77"),
-        (
-            "SELECT INTERVAL '1 day', INTERVAL '1' DAY, INTERVAL '1 2' DAY TO HOUR",
-            TYPMOD,
-            "pg19_interval.txt:82",
-        ),
         (
             "SELECT justify_days('35 days'::interval), justify_hours('27 \
              hours'::interval), justify_interval('1 mon 33 days 27 hours'::interval)",
