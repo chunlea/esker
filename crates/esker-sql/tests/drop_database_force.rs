@@ -16,13 +16,17 @@
 //! connection loop and holds its pid privately.
 //!
 //! That has a sharp consequence worth stating rather than leaving to be rediscovered: **deleting
-//! the terminate call would redden nothing here.** With it gone the `FORCE` branch is empty, the
-//! drop still proceeds, and the test below still passes — because everything observable about
-//! `FORCE` on this node comes from *skipping the refusal*, not from ending anything. The flag has
-//! no public reader and it is set on sessions belonging to a database that no longer exists. So
-//! what the tests below defend is the skip and the predicate; **the termination itself is
-//! defended by no test here**, and proving it would need a real-socket fixture where the victim
-//! genuinely dies, the shape `tests/terminate_over_a_socket.rs` already has.
+//! the terminate call would redden nothing *in this file*.** With it gone the `FORCE` branch is
+//! empty, the drop still proceeds, and the tests below still pass — because everything observable
+//! about `FORCE` from an in-process `Node` comes from *skipping the refusal*, not from ending
+//! anything. The flag has no public reader and it is set on sessions belonging to a database that
+//! no longer exists. So what the tests below defend is the skip and the predicate.
+//!
+//! **The termination itself is defended in `tests/drop_database_force_over_a_socket.rs`** (#113),
+//! where the victim is a real connection and genuinely dies: it answers before the drop, is told
+//! `57P01` after it, and its socket is then closed rather than merely errored. That file also
+//! carries the control — a plain `DROP` in the same state is `55006` and the victim goes on
+//! answering — so the ending is attributed to the clause and not to dropping a database at all.
 //!
 //! The two-session fixture here is **newly built** — `terminate_over_a_socket.rs` does the same
 //! thing over real sockets and there was no in-process precedent for one `Node` ending another.
