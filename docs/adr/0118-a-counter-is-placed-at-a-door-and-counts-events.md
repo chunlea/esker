@@ -124,8 +124,13 @@ returned ([#58](../plans/debts-v1.1.md)'s shape, where steps grew and results di
 **Decided**: counters are placed by door and count events; aggregated counters need no ruling;
 a per-request store-side counter needs a wire bump and is not owed by anything identified today.
 
-**Not decided, and deliberately left to the human**: whether to build the lock-encounter counter at
-all — that is 0117's option B, and it is a product change with an observation period attached.
+**Decided 2026-09-17**: the lock-encounter counter of §① **is to be built** — 0117's option B.
+It is the **aggregated** kind: node-local, and it does not cross the wire, so §③ owes it no format
+change. What it produces is read under the threshold registered in §④ and over an observation
+period, not statement by statement.
+
+**This page stays Proposed until that counter lands**; it turns Accepted when the counter and the
+test of §⑤ exist, because until then what is written here is a design and not a description.
 
 **Not attempted**: any measurement of where the time goes in production. The profile in
 `q109-profile.md` describes a dev build of a single-process fixture, and the next table that would
