@@ -1,21 +1,66 @@
-//! `DROP DATABASE … WITH (FORCE)`: the parse half of debt #110, and **only** the parse half.
+//! `DROP DATABASE … WITH (FORCE)`: debt #110, both halves.
 //!
-//! The clause reaches `plan::DropDatabase` now. **It is not acted on yet**, deliberately: a forced
-//! drop still meets exactly the refusals an unforced one meets, and the executor is untouched. That
-//! is a half-built state and these tests name it rather than papering over it, so that a reader who
-//! finds `force: true` travelling into an executor that ignores it knows it is scheduled rather
-//! than broken.
+//! The clause is read off the source, travels on `plan::DropDatabase`, and now **acts**: a forced
+//! drop ends the other sessions on the database instead of being refused by them.
 //!
-//! What 19beta1 answers is captured in `esker-coord/s2-h110-force.out`, and two of its rows decide
-//! what the executor half will have to do when it lands: `FORCE` does **not** reach past the checks
-//! in front of the session count. A template is `42809` with the clause written, and the database
-//! the session is connected to is `55006` with it written. So `FORCE` replaces one refusal, not the
-//! rest of them.
+//! **`FORCE` replaces one refusal and nothing in front of it**, which is measured rather than
+//! chosen (`esker-coord/s2-h110-force.out`, 19beta1): a template is `42809` with the clause
+//! written, the database the session is connected to is `55006` with it written, and one that is
+//! not there is `3D000`. Only the session count gives way.
+//!
+//! **What ending a session means here, and what it does not.** `terminate_others_on_database` sets
+//! the same flag `pg_terminate_backend` sets, and the victim's own connection loop reads it on its
+//! next round — nothing deregisters another session from the thread running the `DROP`. A real
+//! server's `FORCE` returns after the backends are gone; this one returns before they have
+//! noticed. So **the termination itself is not observable from `parity::Node`**, which is not a
+//! connection loop and holds its pid privately.
+//!
+//! That has a sharp consequence worth stating rather than leaving to be rediscovered: **deleting
+//! the terminate call would redden nothing here.** With it gone the `FORCE` branch is empty, the
+//! drop still proceeds, and the test below still passes — because everything observable about
+//! `FORCE` on this node comes from *skipping the refusal*, not from ending anything. The flag has
+//! no public reader and it is set on sessions belonging to a database that no longer exists. So
+//! what the tests below defend is the skip and the predicate; **the termination itself is
+//! defended by no test here**, and proving it would need a real-socket fixture where the victim
+//! genuinely dies, the shape `tests/terminate_over_a_socket.rs` already has.
+//!
+//! The two-session fixture here is **newly built** — `terminate_over_a_socket.rs` does the same
+//! thing over real sockets and there was no in-process precedent for one `Node` ending another.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::sync::Arc;
+
 use esker_sql::parse::{parse, parse_statements};
-use esker_sql::plan;
+use esker_sql::{plan, sqlstate};
+
+#[path = "parity_harness/mod.rs"]
+mod parity;
+
+/// The database every session here is already connected to, as in `tests/database.rs`.
+const SERVING: &str = "esker";
+
+/// A cluster, and a second database on it with `count` sessions held open on that database.
+///
+/// The sessions are **returned to the caller**, never dropped here: a session that ends when this
+/// function does would leave nothing for the statement under test to meet, and the test would pass
+/// against a node that never learned to count. `tests/database.rs` names the same trap.
+fn cluster_with(name: &str, count: usize) -> (parity::Node, Vec<parity::Node>, u64) {
+    let backend: Arc<dyn esker_sql::backend::Backend> =
+        Arc::new(esker_sql::backend::MemoryBackend::new());
+    let catalog = Arc::new(esker_sql::catalog::Catalog::new());
+    let mut serving = parity::Node::on(Arc::clone(&backend), Arc::clone(&catalog), 1, SERVING, &[]);
+    serving.run(&format!("CREATE DATABASE {name}")).unwrap();
+    let id: u64 = serving.rows(&format!(
+        "SELECT oid FROM pg_database WHERE datname = '{name}'"
+    ))[0][0]
+        .parse()
+        .unwrap();
+    let held = (0..count)
+        .map(|_| parity::Node::on(Arc::clone(&backend), Arc::clone(&catalog), id, name, &[]))
+        .collect();
+    (serving, held, id)
+}
 
 /// Lower one statement, or panic saying which one would not.
 fn lowered(sql: &str) -> plan::Statement {
@@ -134,4 +179,98 @@ fn both_doors_answer_alike_for_every_rewritten_statement() {
             "{sql} parses through one door and not the other"
         );
     }
+}
+
+/// **The unit's point, and the control comes first.** An unforced drop is refused by the sessions
+/// on the database; the same statement with `WITH (FORCE)` ends them and proceeds.
+///
+/// The refusal in the middle is not decoration: without it a fixture that failed to attach its
+/// sessions would let the forced drop succeed for the wrong reason, and this test would pass
+/// against a node that never learned to terminate anything.
+#[test]
+fn a_forced_drop_ends_the_sessions_an_ordinary_one_is_refused_by() {
+    let (mut serving, _held, _id) = cluster_with("arunit2", 2);
+
+    let error = serving.run("DROP DATABASE arunit2").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::OBJECT_IN_USE);
+    assert_eq!(
+        error.detail().as_deref(),
+        Some("There are 2 other sessions using the database."),
+        "the refusal counts the sessions, and the count is what FORCE is about to act on"
+    );
+
+    serving.run("DROP DATABASE arunit2 WITH (FORCE)").unwrap();
+    assert_eq!(
+        serving.rows("SELECT count(*) FROM pg_database WHERE datname = 'arunit2'")[0][0],
+        "0",
+        "the database is gone, not merely unrefused"
+    );
+}
+
+/// **A session somebody has already ended is not a user of the database** — the predicate's own
+/// test, and it has nothing to do with `FORCE`.
+///
+/// `pg_terminate_backend` sets a flag the victim's loop reads later, so the registry row outlives
+/// the decision to end it. Counting that row would refuse an ordinary `DROP DATABASE` on behalf of
+/// a session that is already finished. The victim is **held across the whole test**, so the drop at
+/// the end cannot succeed because the session went away — only because it was terminated.
+#[test]
+fn a_terminated_session_no_longer_refuses_an_ordinary_drop() {
+    let (mut serving, held, _id) = cluster_with("h110_t", 1);
+
+    // The victim is really attached — the evidence, not the assumption.
+    assert_eq!(
+        serving.rows("SELECT count(*) FROM pg_stat_activity WHERE datname = 'h110_t'")[0][0],
+        "1"
+    );
+
+    // **The control.** While it is live the ordinary drop is refused, which is what says the
+    // success at the end is the termination's doing.
+    let error = serving.run("DROP DATABASE h110_t").unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::OBJECT_IN_USE);
+
+    let pid =
+        serving.rows("SELECT pid FROM pg_stat_activity WHERE datname = 'h110_t'")[0][0].clone();
+    assert_eq!(
+        serving.rows(&format!("SELECT pg_terminate_backend({pid})"))[0][0],
+        "t",
+        "the pid has to be one the registry holds, or nothing was terminated"
+    );
+
+    serving.run("DROP DATABASE h110_t").unwrap();
+    assert_eq!(
+        serving.rows("SELECT count(*) FROM pg_database WHERE datname = 'h110_t'")[0][0],
+        "0"
+    );
+    drop(held);
+}
+
+/// The refusals in front of the session count stand with the clause written — each one measured on
+/// 19beta1 rather than reasoned about (`esker-coord/s2-h110-force.out`).
+#[test]
+fn force_does_not_reach_past_the_refusals_in_front_of_it() {
+    let (mut serving, _held, _id) = cluster_with("h110_u", 0);
+
+    let own = serving
+        .run(&format!("DROP DATABASE {SERVING} WITH (FORCE)"))
+        .unwrap_err();
+    assert_eq!(own.sqlstate(), sqlstate::OBJECT_IN_USE);
+    assert_eq!(own.to_string(), "cannot drop the currently open database");
+
+    let template = serving
+        .run("DROP DATABASE template1 WITH (FORCE)")
+        .unwrap_err();
+    assert_eq!(template.sqlstate(), sqlstate::WRONG_OBJECT_TYPE);
+    assert_eq!(template.to_string(), "cannot drop a template database");
+
+    let missing = serving
+        .run("DROP DATABASE nosuchdb_h110 WITH (FORCE)")
+        .unwrap_err();
+    assert_eq!(missing.sqlstate(), sqlstate::INVALID_CATALOG_NAME);
+
+    // And `IF EXISTS` still covers absence with the clause written, which is a notice and not an
+    // error on both servers.
+    serving
+        .run("DROP DATABASE IF EXISTS nosuchdb_h110 WITH (FORCE)")
+        .unwrap();
 }

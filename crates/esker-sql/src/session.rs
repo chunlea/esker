@@ -321,14 +321,63 @@ pub fn others_on_database(cluster: usize, tenant: u64, excluding: u32) -> usize 
     let Ok(live) = backends().lock() else {
         return 0;
     };
-    live.values()
-        .filter(|backend| backend.pid != excluding)
-        .filter(|backend| {
+    in_use_on_database(live.values(), cluster, tenant, excluding).count()
+}
+
+/// The sessions **in use** on one database: on it, not the asking one, and **not already
+/// terminated**.
+///
+/// One predicate with two callers — [`others_on_database`] counts what this yields and
+/// [`terminate_others_on_database`] flags it. Two copies of "on this database" is a shape this
+/// module has already paid for once: a tenant id is unique only inside one cluster, so a second
+/// copy is a second chance to forget that.
+///
+/// **A terminated session is not a user of the database.** That is a statement about what
+/// `pg_terminate_backend` means for `DROP DATABASE`, and it is older than `FORCE`: a session
+/// somebody has already ended should not go on refusing a drop. The flag is read by the victim's
+/// own connection loop on its next round, so its registry row outlives the decision to end it, and
+/// without this the drop would be refused on behalf of a session that is already finished.
+///
+/// A first draft of this comment justified the rule by a database **rebuilt under the same name**
+/// being refused by the lingering rows. That cannot happen here and the claim is not made:
+/// `catalog::allocate_database_id` only ever counts up and `catalog::drop_database` never returns
+/// an id, which that function's own doc states as *ids never repeat* — so a rebuilt database is a
+/// new tenant, and rows carrying the old one could not match it either way.
+fn in_use_on_database<'a>(
+    live: impl Iterator<Item = &'a Backend>,
+    cluster: usize,
+    tenant: u64,
+    excluding: u32,
+) -> impl Iterator<Item = &'a Backend> {
+    live.filter(move |backend| backend.pid != excluding)
+        .filter(|backend| !backend.terminate.load(Ordering::Relaxed))
+        .filter(move |backend| {
             backend.activity.lock().is_ok_and(|activity| {
                 activity.tenant == Some(tenant) && activity.cluster == cluster
             })
         })
-        .count()
+}
+
+/// Ends every other session on one database, for `DROP DATABASE … WITH (FORCE)`. Answers how many
+/// were flagged.
+///
+/// **Flags; it does not deregister.** The same contract [`terminate_pid`] has, and for the same
+/// reason: the connection loop that owns a session's stream is the only thing that may end it. So a
+/// forced drop returns before its victims have noticed, where a real server's returns after they
+/// are gone — a difference of one round, which `in_use_on_database` keeps from meaning anything.
+/// (Named, not linked: that one is private, and a public item may not link into the private half
+/// of a module — `RUSTDOCFLAGS=-D warnings` makes it an error, which is how the gate caught the
+/// same mistake in this unit's parse half.)
+pub fn terminate_others_on_database(cluster: usize, tenant: u64, excluding: u32) -> usize {
+    let Ok(live) = backends().lock() else {
+        return 0;
+    };
+    let mut ended = 0;
+    for backend in in_use_on_database(live.values(), cluster, tenant, excluding) {
+        backend.terminate.store(true, Ordering::Relaxed);
+        ended += 1;
+    }
+    ended
 }
 
 /// Every live session, for `pg_stat_activity`.

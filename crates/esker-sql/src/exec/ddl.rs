@@ -4022,16 +4022,21 @@ pub(super) fn drop_database(
         //
         // By tenant id, for the same reason the check above is: the id is what the
         // directory answered, and two spellings of one name would split the count.
-        let others = crate::session::others_on_database(
-            std::sync::Arc::as_ptr(&executor.catalog) as usize,
-            id,
-            executor.identity.pid,
-        );
-        if others > 0 {
-            return Err(SqlError::DatabaseAccessedByOthers {
-                name: name.clone(),
-                sessions: others,
-            });
+        let cluster = std::sync::Arc::as_ptr(&executor.catalog) as usize;
+        if drop.force {
+            // **`FORCE` replaces this refusal and nothing in front of it.** Measured on 19beta1
+            // (`esker-coord/s2-h110-force.out`): the currently open database is still `55006` with
+            // the clause written and a template is still `42809`, so the two checks above stand.
+            // What `FORCE` does is act on what this check found rather than report it.
+            crate::session::terminate_others_on_database(cluster, id, executor.identity.pid);
+        } else {
+            let others = crate::session::others_on_database(cluster, id, executor.identity.pid);
+            if others > 0 {
+                return Err(SqlError::DatabaseAccessedByOthers {
+                    name: name.clone(),
+                    sessions: others,
+                });
+            }
         }
         catalog::drop_database(txn, name, id)?;
     }
