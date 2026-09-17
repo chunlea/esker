@@ -64,6 +64,24 @@ thread names. The profile showed that filter is wrong in both directions: `tokio
 SQL work *and* engine work, while `raft-driver-*` carries only some of the store's. A counter placed
 by thread would have reported a split that does not exist.
 
+**The first counter this rule places is the lock-encounter one, and its door is the store's.** The
+refusal is built at `crates/esker-store/src/server.rs:3031`, in the arm where
+`columnar::region::unresolved_lock` has just found a lock; everything the verdict needs is already in
+hand there — the read's own `request.ts` (passed in at `:3025`) and the lock's own `ttl_ms`
+(`esker-txn/src/codec.rs:117`), which `unresolved_lock` already decodes and then drops
+(`esker-store/src/columnar/region.rs:975`, returning only the key and `start_ts` at `:978`).
+
+**The node cannot host this counter, and the reason is worth recording because it is not obvious.**
+The store puts `start_ts`, a key and the region into the refusal's detail (`server.rs:3031-3039`),
+and the node discards all of it one line after receiving it: `Answer::Refused { reason, .. }`
+(`esker-sql/src/exec/fragment.rs:1580`), after which `refusal_text` maps the reason to a
+`&'static str` (`:1704-1710`). Even binding `detail` would not be enough — the key in it has been
+through `printable()` (`server.rs:3037`), which is **not reversible**, so the node cannot read the
+lock back. A node-side counter could only compare the lock's age against the *default* `LOCK_TTL_MS`,
+and `ttl_ms` is a parameter of `Prewrite` rather than a constant. **Store-side the judge is exact;
+node-side it is a proxy** — which is what "at a door" means in practice: the door is where the facts
+are, not where the question was asked.
+
 ## ③ What each kind costs
 
 | Kind | Where it is read | Cost |
@@ -102,6 +120,15 @@ convenient:
 - **A share near zero is a result, not a failure**: it rules the mechanism out, which is the outcome
   0117 has been unable to reach for three windows.
 
+**And the share it reports is a lower bound, which has to be said wherever the number is.** The
+verdict is `esker_txn::is_expired(start_ts, ttl_ms, request.ts)` (`esker-txn/src/lib.rs:82`), so it
+separates *expired* from *inside its lease* exactly. It cannot see the third case: a transaction whose
+primary has already committed while this secondary's lock is still young — **finished, and counted as
+alive**. Recognising that one means reading the primary's `write` record (`LockRecord.primary`,
+`codec.rs:118-120`), which is another read per encounter and is not built here. So **`expired` is a
+floor under the share of encounters that are already finished**, and a near-zero reading rules out
+only the expired mechanism, never the young-but-finished one.
+
 ## ⑤ The shape of the test that must go red
 
 A counter with no test that reddens when it stops counting is a decoration. The shape is **not**
@@ -114,6 +141,14 @@ For the lock-encounter counter the fixture already exists, and there is an inver
 share it produced was a property of the planter's constants. **That same fixture is exactly right for
 testing a counter**, because the question changes: not "what does the world look like" but "did you
 count what I planted". The constants stop being a confound and become the ground truth.
+
+Concretely, and because one scan meets one lock — `unresolved_lock` returns the first it finds and
+stops (`esker-store/src/columnar/region.rs:978`), so **one encounter is one refusal** — the test is
+three independent steps, each asserting an **equality**: plant one short-TTL lock and sleep past its
+lease, scan once, `expired` is one higher; plant one long-TTL lock, scan once, `alive` is one higher;
+stop planting, scan again, **both are unchanged**. The last step is the only guard against a counter
+that is counting somebody else's locks. The assertions are on **increments**, because in the
+in-process fixture every store shares one set of statics while production runs one store per process.
 
 The same rule covers the other candidates: a statement over a known number of regions must report
 that many round trips; a scan over a known range must report the keys it walked, not the keys it
