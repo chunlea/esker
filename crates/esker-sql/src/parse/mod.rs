@@ -298,6 +298,12 @@ impl StatementClass {
 /// one file would already be false. So the AST stays inside and everything outside works with the
 /// class, the rendering, and (from unit 6) the lowered plan.
 #[derive(Debug, Clone)]
+// **Four bools, and they are four independent facts rather than one machine's states.** Each is a
+// clause cut out of the source because `sqlparser` 0.62.0 cannot carry it, and a statement may
+// have any combination of them — `CREATE UNLOGGED TABLE` says nothing about `DROP DATABASE …
+// WITH (FORCE)`. The lint's suggested two-variant enums would name each one twice and read worse,
+// and a state machine would claim a sequencing between them that does not exist.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Parsed {
     statement: Statement,
     class: StatementClass,
