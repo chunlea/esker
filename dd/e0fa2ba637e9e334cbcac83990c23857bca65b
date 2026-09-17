@@ -1,0 +1,19 @@
+crates/esker-sql/tests/drop_database_force_over_a_socket.rs
+  s_f4b2852b53accb::t_4ea6688738f32f 67,69,84,112,114,120
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "dde0fa2ba637e9e334cbcac83990c23857bca65b",
+  "prompts": {},
+  "sessions": {
+    "s_f4b2852b53accb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc7223c3-8ba0-48df-95c8-ddb365dc093c",
+        "model": "unknown"
+      },
+      "human_author": "chunli <git@chunli.dev>"
+    }
+  }
+}
