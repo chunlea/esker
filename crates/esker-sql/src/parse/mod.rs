@@ -649,7 +649,9 @@ impl Parsed {
     }
 
     /// Whether a `DROP DATABASE` said `WITH (FORCE)`, which came off the source so it would
-    /// parse ([`strip_drop_database_force`]).
+    /// parse — by `strip_drop_database_force`, named here rather than linked because it is
+    /// private and a public item may not link into the private half of a module. The field's own
+    /// doc carries the link, the way `database_options` does.
     #[must_use]
     pub fn force(&self) -> bool {
         self.force
