@@ -64,9 +64,9 @@ async fn a_node() -> std::net::SocketAddr {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_forced_drop_ends_the_other_sessions_connection() {
     let address = a_node().await;
-    let mut dropper = Client::connect(address).await;
+    let mut admin = Client::connect(address).await;
 
-    dropper.query("CREATE DATABASE h113_forced").await;
+    admin.query("CREATE DATABASE h113_forced").await;
     let mut victim = Client::connect_to(address, "h113_forced")
         .await
         .expect("a database that was just created is one a client can connect to");
@@ -81,9 +81,7 @@ async fn a_forced_drop_ends_the_other_sessions_connection() {
          {alive:?}"
     );
 
-    let dropped = dropper
-        .query("DROP DATABASE h113_forced WITH (FORCE)")
-        .await;
+    let dropped = admin.query("DROP DATABASE h113_forced WITH (FORCE)").await;
     assert!(
         dropped.sqlstate.is_none(),
         "the forced drop is the statement under test and must itself succeed: {dropped:?}"
@@ -111,15 +109,15 @@ async fn a_forced_drop_ends_the_other_sessions_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_plain_drop_is_refused_and_the_other_session_lives() {
     let address = a_node().await;
-    let mut dropper = Client::connect(address).await;
+    let mut admin = Client::connect(address).await;
 
-    dropper.query("CREATE DATABASE h113_plain").await;
+    admin.query("CREATE DATABASE h113_plain").await;
     let mut victim = Client::connect_to(address, "h113_plain")
         .await
         .expect("a database that was just created is one a client can connect to");
     victim.query("SELECT 1").await;
 
-    let refused = dropper.query("DROP DATABASE h113_plain").await;
+    let refused = admin.query("DROP DATABASE h113_plain").await;
     assert_eq!(
         refused.sqlstate.as_deref(),
         Some("55006"),
