@@ -2198,16 +2198,92 @@ async fn where_a_bulk_load_into_a_splitting_table_breaks() {
     gate.stop().await;
 }
 
+/// One refusal, with what the cluster looked like at the moment it happened — #107.
+///
+/// **The hint is not in here, and cannot be.** `ProtoError::NotLeader`'s `Display` prints only the
+/// region (`esker-proto/src/error.rs`), and `SqlError` does not carry the typed error, so by the
+/// time a statement fails the `leader_hint` is gone — there is no later place that still holds it.
+/// What stands in for it is the fact a hint is a *report of*: what every peer of that region
+/// thought, and what PD thought, at that instant.
+#[derive(Clone, Debug)]
+struct Refusal {
+    sqlstate: String,
+    text: String,
+    /// Parsed from the message, which is the one field its `Display` does print.
+    region: u64,
+    /// `(store, peer, that peer's leader, that peer's term)` — the store side, one row per store.
+    peers: Vec<(u64, u64, Option<u64>, u64)>,
+    /// Stores whose own `region_statuses` calls them the leader of it. **Self-reported.**
+    claims: Vec<u64>,
+    /// The peer id PD answers with — a different question from the line above, and the one
+    /// candidate C is about.
+    pd_leader: Option<u64>,
+    /// The region's peer order as PD gives it: B's signature is a hint equal to `peers[0]`.
+    order: Vec<u64>,
+}
+
+/// What every store thought about one region, without awaiting anything.
+///
+/// [`who_answers_for`] is the async cousin that also asks `RaftPeer::status`; a loader thread
+/// cannot await, and `leader()`/`term()` are published atomics that answer without it.
+///
+/// **PD is asked by key, not by region id**, so the key comes from whichever store hosts it. PD's
+/// `term` is not reachable this way at all — `Route` carries the region and the leader and nothing
+/// else — which is why every term printed by this probe is a **store-side** term.
+fn cluster_view(
+    stores: &[Arc<Store>],
+    conn: &PdConn,
+    region_id: u64,
+) -> (
+    Vec<(u64, u64, Option<u64>, u64)>,
+    Vec<u64>,
+    Option<u64>,
+    Vec<u64>,
+) {
+    let mut peers = Vec::new();
+    let mut claims = Vec::new();
+    let mut a_key: Option<bytes::Bytes> = None;
+    for store in stores {
+        if let Some(peer) = store.peer_of(region_id) {
+            peers.push((store.store_id(), peer.peer_id(), peer.leader(), peer.term()));
+        }
+        for status in store.region_statuses() {
+            if status.region.id == region_id {
+                a_key.get_or_insert_with(|| status.region.start_key.clone());
+                if status.is_leader {
+                    claims.push(store.store_id());
+                }
+            }
+        }
+    }
+    let route = a_key.and_then(|key| conn.get_region(&key).ok().flatten());
+    let pd_leader = route
+        .as_ref()
+        .and_then(|route| route.leader.map(|peer| peer.peer_id));
+    let order = route.map_or_else(Vec::new, |route| {
+        route.region.peers.iter().map(|peer| peer.peer_id).collect()
+    });
+    (peers, claims, pd_leader, order)
+}
+
 /// The writer that makes the table split under itself.
 fn spawn_loader(
     gate: &Gate,
     stop: &Arc<AtomicBool>,
-    refusals: &Arc<std::sync::Mutex<Vec<String>>>,
-) -> std::thread::JoinHandle<i64> {
+    refusals: &Arc<std::sync::Mutex<Vec<Refusal>>>,
+) -> std::thread::JoinHandle<(i64, BTreeMap<u64, u64>, u64)> {
     let backend = Arc::clone(&gate.backend);
     let catalog = Arc::clone(&gate.catalog);
     let stop = Arc::clone(stop);
     let refusals = Arc::clone(refusals);
+    // Cloned out for the thread: `peer_of` and `region_statuses` are synchronous, which is what
+    // lets a plain loader thread read them at the instant it is refused.
+    let stores: Vec<Arc<Store>> = gate
+        .nodes
+        .iter()
+        .map(|node| Arc::clone(&node.store))
+        .collect();
+    let conn = Arc::clone(&gate.conn);
     std::thread::Builder::new()
         .name("splitting-loader".to_owned())
         .spawn(move || {
@@ -2215,19 +2291,54 @@ fn spawn_loader(
                 executor: Executor::new(backend, catalog, TENANT, esker_sql::session::register()),
             };
             let mut id = 1_i64;
+            // **Read here or not at all.** `Cost.not_sent` lives in a thread-local, so it can only
+            // be read on the thread that ran the statement. It is also drained by
+            // `esker_sql::stmt_stats`'s `Guard` — but only when *that* instrument is on, and it is
+            // off by default (`Guard::began` is `None` and its `Drop` returns early). Turning the
+            // SQL-side statistics on would silently empty every reading below.
+            esker_client::stmt_stats::force_on();
+            let mut not_sent: BTreeMap<u64, u64> = BTreeMap::new();
+            // **The probe's own self-check.** An all-zero `not_sent` in a round with no refusals
+            // says nothing on its own: it reads the same whether the count is truly zero or the
+            // thread-local was never reached. A non-zero round-trip total from the same `taken()`
+            // proves the path reaches data, so that the zero beside it means something.
+            let mut trips = 0_u64;
             while !stop.load(Ordering::Relaxed) && id < 4_000 {
                 let values: Vec<String> = (id..id + 50)
                     .map(|n| format!("({n}, 'pad-{n}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')"))
                     .collect();
-                if let Err(error) =
-                    session.run(&format!("INSERT INTO t VALUES {}", values.join(", ")))
+                esker_client::stmt_stats::reset();
+                let outcome = session.run(&format!("INSERT INTO t VALUES {}", values.join(", ")));
+                let cost = esker_client::stmt_stats::taken();
+                trips += cost.round_trips;
+                for (store, count) in cost.not_sent {
+                    *not_sent.entry(store).or_insert(0) += count;
+                }
+                if let Err(error) = outcome
                     && let Ok(mut seen) = refusals.lock()
                 {
-                    seen.push(format!("[{}] {error}", error.sqlstate()));
+                    let text = error.to_string();
+                    let region = refused_region(&error);
+                    // Only a `NotLeader` gets the census: every other refusal is a different
+                    // mechanism, and asking four stores about a region costs a round trip each.
+                    let (peers, claims, pd_leader, order) = if text.contains("not the leader") {
+                        cluster_view(&stores, &conn, region)
+                    } else {
+                        (Vec::new(), Vec::new(), None, Vec::new())
+                    };
+                    seen.push(Refusal {
+                        sqlstate: error.sqlstate().to_owned(),
+                        text,
+                        region,
+                        peers,
+                        claims,
+                        pd_leader,
+                        order,
+                    });
                 }
                 id += 50;
             }
-            id
+            (id, not_sent, trips)
         })
         .unwrap()
 }
@@ -2240,8 +2351,14 @@ struct Sightings {
     inherited: usize,
     /// Children whose first leader was somebody else.
     elsewhere: usize,
-    /// What the loader was refused, as `[sqlstate] message`.
-    refusals: Vec<String>,
+    /// What the loader was refused, with the census #107 needs beside each one.
+    refusals: Vec<Refusal>,
+    /// `NotSent` per store over the whole round — **printed even when empty**, because zero is
+    /// the reading that separates "could not reach a store" from "was refused by one".
+    not_sent: BTreeMap<u64, u64>,
+    /// Round trips the same `taken()` reported, so that an empty `not_sent` can be told apart
+    /// from a reading that never reached the thread-local it lives in.
+    trips: u64,
     rows: i64,
     regions: usize,
 }
@@ -2266,7 +2383,7 @@ fn watch_a_splitting_load(gate: &Gate) -> Sightings {
     });
 
     let stop = Arc::new(AtomicBool::new(false));
-    let refusals = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let refusals = Arc::new(std::sync::Mutex::new(Vec::<Refusal>::new()));
     let loader = spawn_loader(gate, &stop, &refusals);
 
     let mut first_seen: BTreeMap<u64, Instant> = BTreeMap::new();
@@ -2334,13 +2451,15 @@ fn watch_a_splitting_load(gate: &Gate) -> Sightings {
         std::thread::sleep(Duration::from_millis(2));
     }
     stop.store(true, Ordering::Relaxed);
-    let rows = loader.join().unwrap();
+    let (rows, not_sent, trips) = loader.join().unwrap();
     let refusals = refusals.lock().map(|seen| seen.clone()).unwrap_or_default();
     Sightings {
         led_after,
         inherited,
         elsewhere,
         refusals,
+        not_sent,
+        trips,
         rows,
         regions: gate.regions(),
     }
@@ -2395,7 +2514,14 @@ async fn how_long_a_split_child_has_no_leader() {
     let gate = Gate::start_splitting(8 * 1024).await;
     let mut seen = tokio::task::block_in_place(|| watch_a_splitting_load(&gate));
     gate.stop().await;
-    report(seen.rows, seen.regions, &mut seen.led_after, &seen.refusals);
+    report(
+        seen.rows,
+        seen.regions,
+        &mut seen.led_after,
+        &seen.refusals,
+        &seen.not_sent,
+        seen.trips,
+    );
     println!(
         "  {} of {} children were led by their parent's leader",
         seen.inherited,
@@ -2426,7 +2552,14 @@ fn refusal_shape(said: &str) -> String {
 }
 
 /// The distribution and the refusals, lifted out of the test that takes them.
-fn report(rows: i64, regions: usize, led_after: &mut [f64], refusals: &[String]) -> f64 {
+fn report(
+    rows: i64,
+    regions: usize,
+    led_after: &mut [f64],
+    refusals: &[Refusal],
+    not_sent: &BTreeMap<u64, u64>,
+    trips: u64,
+) -> f64 {
     led_after.sort_by(f64::total_cmp);
     println!("\n  {rows} rows loaded, {regions} regions");
     println!(
@@ -2453,13 +2586,54 @@ fn report(rows: i64, regions: usize, led_after: &mut [f64], refusals: &[String])
     let mut kinds: BTreeMap<String, (usize, &str)> = BTreeMap::new();
     for said in refusals {
         let seen = kinds
-            .entry(refusal_shape(said))
-            .or_insert((0, said.as_str()));
+            .entry(refusal_shape(&said.text))
+            .or_insert((0, said.text.as_str()));
         seen.0 += 1;
     }
     for (shape, (count, sample)) in &kinds {
         println!("    x{count}  {shape}");
         println!("          e.g. {sample}");
+    }
+    // **#107's reading, and what it can and cannot say.** The hint the client was given is gone by
+    // the time a statement fails, so what is grouped here is the fact behind it: for the region
+    // named in the refusal, did any store claim to lead it at that instant, and what did PD say.
+    // A hint equal to `peers[0]` — candidate B's real signature — cannot be checked from here.
+    // Every term below is a **store-side** term; PD's is not reachable through `Route`.
+    println!(
+        "  NotSent per store this round: {not_sent:?}, over {trips} round trips \
+         (the trips are what say the reading reached its thread-local at all)"
+    );
+    let met: Vec<&Refusal> = refusals
+        .iter()
+        .filter(|said| said.text.contains("not the leader"))
+        .collect();
+    if met.is_empty() {
+        println!("  #107: no NotLeader refusal in this round");
+    } else {
+        let mut by: BTreeMap<(u64, bool, bool), usize> = BTreeMap::new();
+        for said in &met {
+            let claimed = !said.claims.is_empty();
+            let agrees = match (said.pd_leader, said.claims.first()) {
+                (Some(_), Some(_)) => said.pd_leader.is_some() && claimed,
+                _ => false,
+            };
+            *by.entry((said.region, claimed, agrees)).or_insert(0) += 1;
+        }
+        for ((region, claimed, agrees), count) in &by {
+            println!(
+                "    #107 region {region} · a store claimed to lead it: {claimed} · PD also named one: {agrees} · x{count}"
+            );
+        }
+        for said in met.iter().take(3) {
+            println!(
+                "      [{}] region {} · peers(store,peer,leader,term) {:?}",
+                said.sqlstate, said.region, said.peers
+            );
+            println!(
+                "          claims(self-reported) {:?} · pd_leader {:?} · peer order {:?}",
+                said.claims, said.pd_leader, said.order
+            );
+        }
     }
     if led_after.is_empty() {
         0.0
