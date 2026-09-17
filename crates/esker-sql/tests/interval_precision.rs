@@ -358,3 +358,36 @@ fn a_bare_number_takes_the_masks_lowest_unit() {
         );
     }
 }
+
+/// **A stored `DEFAULT` is read under the column's field mask**, not only folded by it.
+///
+/// Measured on 19beta1 (`esker-coord/s2-h112-defaults-and-params.out`): the default is accepted and
+/// stored as `'1 day 02:00:00'::interval day to hour`, so `'1 2'` was read as a day and two hours
+/// before anything folded it. The DDL runs through `run` rather than the fixture so that a refusal
+/// is this test's own error and not a panic inside the harness.
+#[test]
+fn a_stored_default_is_read_under_the_columns_mask() {
+    let mut node = parity::Node::new(&[]);
+    node.run("CREATE TABLE g1_fd (x interval day to hour DEFAULT '1 2')")
+        .unwrap();
+    node.run("INSERT INTO g1_fd DEFAULT VALUES").unwrap();
+    assert_eq!(node.rows("SELECT x FROM g1_fd")[0][0], "1 day 02:00:00");
+}
+
+/// **And a default the mask cannot read is refused**, which is the half a fix that simply accepted
+/// everything would get wrong: `'1 2'` means nothing under `day to minute`, and 19beta1 answers
+/// `22007` for it exactly as it does for a plain `interval`.
+///
+/// **This one was green before the fix and is a guard, not a red.** A modifier-less parse refuses
+/// `'1 2'` under every mask, so nothing about passing the typmod is what makes it pass — which
+/// means it needs a counterfactual of its own to be worth anything. It has one: widening
+/// `value::interval`'s two-number rule from exactly `day to hour` to any mask containing `day`
+/// reddens this test, and reddens the interval corpus with it.
+#[test]
+fn a_default_the_mask_cannot_read_is_refused() {
+    let mut node = parity::Node::new(&[]);
+    let error = node
+        .run("CREATE TABLE g1_fe (y interval day to minute DEFAULT '1 2')")
+        .unwrap_err();
+    assert_eq!(error.sqlstate(), sqlstate::INVALID_DATETIME_FORMAT);
+}

@@ -197,6 +197,14 @@ pub(super) fn substitute(
         let value = match slot {
             None => Ok(Datum::Null),
             Some(bytes) => match params.format(at) {
+                // **A parameter's declared type carries no modifier, and that is
+                // PostgreSQL's answer rather than a gap here.** `PREPARE p (interval day
+                // to hour) AS SELECT $1` is accepted, `EXECUTE p ('1 2')` is `22007`, and
+                // `pg_prepared_statements.parameter_types` reports a bare `{interval}` —
+                // the field mask does not survive `PREPARE`
+                // (`esker-coord/s2-h112-defaults-and-params.out`). Handing the column's
+                // modifier in here would make this node read a literal a real server
+                // refuses, so the two-argument form is the measured answer.
                 0 => std::str::from_utf8(bytes)
                     .map_err(|_| SqlError::InvalidByteSequence(bytes.first().copied().unwrap_or(0)))
                     .and_then(|text| Datum::from_text(ty, text)),

@@ -2018,7 +2018,13 @@ pub(super) fn column_default(
         // `int4`, because the cast is one step of a coercion that ends at the column. A literal
         // the type cannot take is that type's own input error, exactly as it would be in a
         // `VALUES` list — `DEFAULT 'not a date'` on a `date` column is `22007` here and there.
-        let value = fit_default(Datum::from_text(ty, &text)?, ty, typmod)?;
+        //
+        // **And read *under* the modifier, not merely folded by it.** An `interval`'s field
+        // mask decides how a literal parses: `DEFAULT '1 2'` is a day and two hours on a
+        // `day to hour` column and `22007` on a `day to minute` one, both measured
+        // (`esker-coord/s2-h112-defaults-and-params.out`). A value the mask cannot read is
+        // not a value to fold.
+        let value = fit_default(Datum::from_text_with(ty, &text, typmod)?, ty, typmod)?;
         return Ok((
             Some(value),
             cast.map(|to| cast_default_text(&text, literal, to)),
